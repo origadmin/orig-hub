@@ -108,7 +108,7 @@ func runGUI() {
 	defer func() { _ = db.Close() }()
 
 	service := core.NewLocalService(manager, db)
-	app := NewApp(service)
+	app := NewApp(service, cfg)
 
 	appMenu := createAppMenu(app)
 

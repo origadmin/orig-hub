@@ -15,19 +15,19 @@ interface AddDownloadDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   onAdd: (url: string, filename?: string, destPath?: string) => void
+  defaultDir: string
 }
 
-export function AddDownloadDialog({ open, onOpenChange, onAdd }: AddDownloadDialogProps) {
+export function AddDownloadDialog({ open, onOpenChange, onAdd, defaultDir }: AddDownloadDialogProps) {
   const [url, setUrl] = useState('')
   const [filename, setFilename] = useState('')
-  const [destPath, setDestPath] = useState('')
+  const [destPath, setDestPath] = useState(defaultDir)
 
   const handleAdd = () => {
     if (!url.trim()) return
-    onAdd(url, filename || undefined, destPath || undefined)
+    onAdd(url, filename || undefined, destPath || defaultDir || undefined)
     setUrl('')
     setFilename('')
-    setDestPath('')
     onOpenChange(false)
   }
 
@@ -54,16 +54,16 @@ export function AddDownloadDialog({ open, onOpenChange, onAdd }: AddDownloadDial
             <Label htmlFor="filename">Filename (optional)</Label>
             <Input
               id="filename"
-              placeholder="Leave blank to use default"
+              placeholder="Leave blank to auto-detect"
               value={filename}
               onChange={(e) => setFilename(e.target.value)}
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="destPath">Output Path (optional)</Label>
+            <Label htmlFor="destPath">Save to</Label>
             <Input
               id="destPath"
-              placeholder="Leave blank to use default"
+              placeholder={defaultDir || 'Downloads folder'}
               value={destPath}
               onChange={(e) => setDestPath(e.target.value)}
             />

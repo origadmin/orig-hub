@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/origadmin/orig-hub/internal/config"
 	"github.com/origadmin/orig-hub/internal/core"
 	"github.com/origadmin/orig-hub/internal/engine/types"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -13,11 +14,13 @@ type App struct {
 	ctx             context.Context
 	downloadService core.DownloadService
 	cancelPolling   context.CancelFunc
+	cfg             *config.Settings
 }
 
-func NewApp(downloadService core.DownloadService) *App {
+func NewApp(downloadService core.DownloadService, cfg *config.Settings) *App {
 	return &App{
 		downloadService: downloadService,
+		cfg:             cfg,
 	}
 }
 
@@ -53,6 +56,9 @@ func (a *App) pollDownloadStatus(ctx context.Context) {
 }
 
 func (a *App) AddDownload(url, outputPath, filename string, mirrors []string, headers map[string]string) (string, error) {
+	if outputPath == "" {
+		outputPath = a.cfg.Download.OutputDir
+	}
 	id, err := a.downloadService.Add(a.ctx, url, outputPath, filename, mirrors, headers)
 	if err != nil {
 		return "", err
@@ -98,4 +104,8 @@ func (a *App) ListDownloads() ([]types.DownloadStatus, error) {
 
 func (a *App) GetDownloadHistory() ([]types.DownloadEntry, error) {
 	return a.downloadService.History()
+}
+
+func (a *App) GetDefaultDownloadDir() string {
+	return a.cfg.Download.OutputDir
 }

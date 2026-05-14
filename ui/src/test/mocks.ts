@@ -17,6 +17,7 @@ export const mockWailsApp = {
   ListDownloads: jest.fn().mockResolvedValue([]),
   GetDownloadStatus: jest.fn().mockResolvedValue(null),
   GetDownloadHistory: jest.fn().mockResolvedValue([]),
+  GetDefaultDownloadDir: jest.fn().mockResolvedValue('/home/user/Downloads'),
 }
 
 jest.mock('wailsjs/runtime/runtime.js', () => ({
@@ -38,6 +39,7 @@ jest.mock('wailsjs/go/main/App.js', () => ({
   ListDownloads: mockWailsApp.ListDownloads,
   GetDownloadStatus: mockWailsApp.GetDownloadStatus,
   GetDownloadHistory: mockWailsApp.GetDownloadHistory,
+  GetDefaultDownloadDir: mockWailsApp.GetDefaultDownloadDir,
 }))
 
 export function createMockDownload(overrides: Record<string, unknown> = {}): Record<string, unknown> {

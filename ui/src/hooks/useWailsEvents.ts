@@ -1,6 +1,6 @@
 import { useEffect, useCallback } from 'react'
 import { EventsOn, EventsOff } from 'wailsjs/runtime/runtime.js'
-import { AddDownload, PauseDownload, ResumeDownload, CancelDownload, ListDownloads, GetDownloadHistory } from 'wailsjs/go/main/App.js'
+import { AddDownload, PauseDownload, ResumeDownload, CancelDownload, ListDownloads, GetDownloadHistory, GetDefaultDownloadDir } from 'wailsjs/go/main/App.js'
 import { useStore } from '../store/useStore'
 import { DownloadStatus, DownloadStatusValue, DownloadEntry } from '../types'
 
@@ -112,6 +112,10 @@ export function useWailsActions() {
     return raw.map(toDownloadEntry)
   }, [])
 
+  const handleGetDefaultDownloadDir = useCallback(async (): Promise<string> => {
+    return await GetDefaultDownloadDir()
+  }, [])
+
   return {
     addDownload: handleAddDownload,
     pauseDownload: handlePauseDownload,
@@ -119,5 +123,6 @@ export function useWailsActions() {
     cancelDownload: handleCancelDownload,
     listDownloads: handleListDownloads,
     getHistory: handleGetHistory,
+    getDefaultDownloadDir: handleGetDefaultDownloadDir,
   }
 }

@@ -9,22 +9,33 @@ import { SettingsPanel } from './components/SettingsPanel'
 import { ThemeToggle } from './components/ThemeToggle'
 import { useWailsEvents, useWailsActions } from './hooks/useWailsEvents'
 import { EventsOn } from 'wailsjs/runtime/runtime.js'
+import { toast } from 'sonner'
 
 function App() {
   const [activeTab, setActiveTab] = useState('downloads')
   const [dialogOpen, setDialogOpen] = useState(false)
-  const { downloads } = useStore()
+  const [defaultDir, setDefaultDir] = useState('')
+  const { downloads, updateDownloads } = useStore()
 
   useWailsEvents()
   const wailsActions = useWailsActions()
 
   useEffect(() => {
-    wailsActions.listDownloads().then((list) => {
-      if (list && list.length > 0) {
-        useStore.getState().updateDownloads(list)
+    wailsActions.getDefaultDownloadDir().then((dir) => {
+      if (dir) {
+        setDefaultDir(dir)
+        useStore.getState().updateSettings({ downloadDirectory: dir })
       }
     })
   }, [wailsActions])
+
+  useEffect(() => {
+    wailsActions.listDownloads().then((list) => {
+      if (list && list.length > 0) {
+        updateDownloads(list)
+      }
+    })
+  }, [wailsActions, updateDownloads])
 
   useEffect(() => {
     EventsOn('menu:add-download', () => {
@@ -37,33 +48,42 @@ function App() {
 
   const handleAddDownload = async (url: string, filename?: string, destPath?: string) => {
     try {
-      await wailsActions.addDownload(url, destPath || '', filename || '', [], {})
+      const outputPath = destPath || defaultDir || ''
+      await wailsActions.addDownload(url, outputPath, filename || '', [], {})
+      toast.success('Download added')
     } catch (err) {
-      console.error('Failed to add download:', err)
+      const msg = err instanceof Error ? err.message : String(err)
+      toast.error(`Failed to add download: ${msg}`)
     }
   }
 
   const handlePause = async (id: string) => {
     try {
       await wailsActions.pauseDownload(id)
+      toast.info('Download paused')
     } catch (err) {
-      console.error('Failed to pause download:', err)
+      const msg = err instanceof Error ? err.message : String(err)
+      toast.error(`Failed to pause: ${msg}`)
     }
   }
 
   const handleResume = async (id: string) => {
     try {
       await wailsActions.resumeDownload(id)
+      toast.info('Download resumed')
     } catch (err) {
-      console.error('Failed to resume download:', err)
+      const msg = err instanceof Error ? err.message : String(err)
+      toast.error(`Failed to resume: ${msg}`)
     }
   }
 
   const handleCancel = async (id: string) => {
     try {
       await wailsActions.cancelDownload(id)
+      toast.info('Download cancelled')
     } catch (err) {
-      console.error('Failed to cancel download:', err)
+      const msg = err instanceof Error ? err.message : String(err)
+      toast.error(`Failed to cancel: ${msg}`)
     }
   }
 
@@ -91,11 +111,7 @@ function App() {
         return (
           <div className="space-y-4">
             <h2 className="text-2xl font-bold">History</h2>
-            <Card>
-              <CardHeader>
-                <CardTitle>No history yet</CardTitle>
-              </CardHeader>
-            </Card>
+            <HistoryList />
           </div>
         )
       case 'settings':
@@ -112,8 +128,42 @@ function App() {
         open={dialogOpen}
         onOpenChange={setDialogOpen}
         onAdd={handleAddDownload}
+        defaultDir={defaultDir}
       />
     </MainLayout>
+  )
+}
+
+function HistoryList() {
+  const [entries, setEntries] = useState<Array<{ id: string; url: string; filename: string; status: string; total_size: number }>>([])
+  const wailsActions = useWailsActions()
+
+  useEffect(() => {
+    wailsActions.getHistory().then((list) => {
+      if (list) setEntries(list)
+    })
+  }, [wailsActions])
+
+  if (entries.length === 0) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>No history yet</CardTitle>
+        </CardHeader>
+      </Card>
+    )
+  }
+
+  return (
+    <div className="space-y-2">
+      {entries.map((entry) => (
+        <Card key={entry.id}>
+          <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+            <CardTitle className="text-sm font-medium">{entry.filename || entry.url}</CardTitle>
+          </CardHeader>
+        </Card>
+      ))}
+    </div>
   )
 }
 
