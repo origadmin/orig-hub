@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-all-platforms:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows/amd64
+            ext: .exe
+          - os: ubuntu-latest
+            platform: linux/amd64
+            ext: ""
+          - os: macos-latest
+            platform: darwin/amd64
+            ext: ""
+          - os: macos-latest
+            platform: darwin/arm64
+            ext: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev
+
+      - name: Build Wails app
+        run: wails build -platform ${{ matrix.platform }}
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          cd build/bin
+          for f in *; do
+            if [ -f "$f" ]; then
+              mv "$f" "orig-hub-${{ matrix.platform }}${{ matrix.ext }}"
+            fi
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: orig-hub-${{ matrix.platform }}
+          path: build/bin/orig-hub-${{ matrix.platform }}${{ matrix.ext }}
+
+  create-release:
+    name: Create Release
+    needs: build-all-platforms
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*

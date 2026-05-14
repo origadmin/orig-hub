@@ -1,0 +1,56 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go
+go.work
+go.work.sum
+*.test
+*.out
+*.prof
+coverage.out
+coverage.html
+coverage
+
+# Frontend build output
+ui/dist/
+
+# Frontend dependencies
+ui/node_modules/
+
+# Wails generated bindings
+ui/wailsjs/
+
+# Bun
+ui/bun.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Data (runtime generated)
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Build artifacts
+build/windows/installer/project.nsi
+build/windows/wails.exe.manifest
+
+# Misc
+*.log
+.env
+.env.*
