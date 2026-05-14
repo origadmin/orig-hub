@@ -28,6 +28,10 @@ ui/wailsjs/
 # Bun
 ui/bun.lock
 
+# npm (project uses bun)
+ui/package-lock.json
+ui/package.json.md5
+
 # IDE
 .idea/
 .vscode/

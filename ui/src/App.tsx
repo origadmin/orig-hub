@@ -44,15 +44,27 @@ function App() {
   }
 
   const handlePause = async (id: string) => {
-    await wailsActions.pauseDownload(id)
+    try {
+      await wailsActions.pauseDownload(id)
+    } catch (err) {
+      console.error('Failed to pause download:', err)
+    }
   }
 
   const handleResume = async (id: string) => {
-    await wailsActions.resumeDownload(id)
+    try {
+      await wailsActions.resumeDownload(id)
+    } catch (err) {
+      console.error('Failed to resume download:', err)
+    }
   }
 
   const handleCancel = async (id: string) => {
-    await wailsActions.cancelDownload(id)
+    try {
+      await wailsActions.cancelDownload(id)
+    } catch (err) {
+      console.error('Failed to cancel download:', err)
+    }
   }
 
   const renderTabContent = () => {

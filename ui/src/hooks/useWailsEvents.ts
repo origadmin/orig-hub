@@ -1,35 +1,75 @@
-import { useEffect } from 'react'
+import { useEffect, useCallback } from 'react'
 import { EventsOn, EventsOff } from 'wailsjs/runtime/runtime.js'
 import { AddDownload, PauseDownload, ResumeDownload, CancelDownload, ListDownloads, GetDownloadHistory } from 'wailsjs/go/main/App.js'
 import { useStore } from '../store/useStore'
 import { DownloadStatus, DownloadStatusValue, DownloadEntry } from '../types'
 
+function toDownloadStatus(raw: Record<string, unknown>): DownloadStatus {
+  return {
+    id: String(raw.id ?? ''),
+    url: String(raw.url ?? ''),
+    filename: String(raw.filename ?? ''),
+    dest_path: String(raw.dest_path ?? ''),
+    total_size: Number(raw.total_size ?? 0),
+    downloaded: Number(raw.downloaded ?? 0),
+    progress: Number(raw.progress ?? 0),
+    speed: Number(raw.speed ?? 0),
+    status: String(raw.status ?? 'queued') as DownloadStatusValue,
+    error: String(raw.error ?? ''),
+    eta: Number(raw.eta ?? 0),
+    connections: Number(raw.connections ?? 0),
+    added_at: Number(raw.added_at ?? 0),
+    time_taken: Number(raw.time_taken ?? 0),
+    avg_speed: Number(raw.avg_speed ?? 0),
+  }
+}
+
+function toDownloadEntry(raw: Record<string, unknown>): DownloadEntry {
+  return {
+    id: String(raw.id ?? ''),
+    url_hash: String(raw.url_hash ?? ''),
+    url: String(raw.url ?? ''),
+    dest_path: String(raw.dest_path ?? ''),
+    filename: String(raw.filename ?? ''),
+    status: String(raw.status ?? ''),
+    total_size: Number(raw.total_size ?? 0),
+    downloaded: Number(raw.downloaded ?? 0),
+    completed_at: Number(raw.completed_at ?? 0),
+    time_taken: Number(raw.time_taken ?? 0),
+    avg_speed: Number(raw.avg_speed ?? 0),
+    mirrors: Array.isArray(raw.mirrors) ? raw.mirrors as string[] : [],
+  }
+}
+
 export function useWailsEvents() {
   const { updateDownloads, updateDownload, removeDownload } = useStore()
 
   useEffect(() => {
-    EventsOn('download:status', (rawStatuses: Record<string, unknown>[]) => {
-      const statuses: DownloadStatus[] = rawStatuses.map((s: Record<string, unknown>) => ({
-        ...s,
-        status: s.status as DownloadStatusValue,
-      }))
+    EventsOn('download:status', (...args: unknown[]) => {
+      const rawStatuses = args[0] as Record<string, unknown>[]
+      if (!Array.isArray(rawStatuses)) return
+      const statuses: DownloadStatus[] = rawStatuses.map(toDownloadStatus)
       updateDownloads(statuses)
     })
 
-    EventsOn('download:added', (id: string) => {
-      console.log('Download added:', id)
+    EventsOn('download:added', (_id: unknown) => {
+      ListDownloads().then((raw) => {
+        if (raw && raw.length > 0) {
+          updateDownloads(raw.map(toDownloadStatus))
+        }
+      })
     })
 
-    EventsOn('download:paused', (id: string) => {
-      updateDownload(id, { status: 'paused' })
+    EventsOn('download:paused', (id: unknown) => {
+      updateDownload(String(id), { status: 'paused' })
     })
 
-    EventsOn('download:resumed', (id: string) => {
-      updateDownload(id, { status: 'downloading' })
+    EventsOn('download:resumed', (id: unknown) => {
+      updateDownload(String(id), { status: 'downloading' })
     })
 
-    EventsOn('download:cancelled', (id: string) => {
-      removeDownload(id)
+    EventsOn('download:cancelled', (id: unknown) => {
+      removeDownload(String(id))
     })
 
     return () => {
@@ -43,65 +83,34 @@ export function useWailsEvents() {
 }
 
 export function useWailsActions() {
-  const handleAddDownload = async (url: string, outputPath: string, filename: string, mirrors: string[] = [], headers: Record<string, string> = {}) => {
-    try {
-      const id = await AddDownload(url, outputPath, filename, mirrors, headers)
-      return id
-    } catch (err) {
-      console.error('Failed to add download:', err)
-      throw err
-    }
-  }
+  const handleAddDownload = useCallback(async (url: string, outputPath: string, filename: string, mirrors: string[] = [], headers: Record<string, string> = {}): Promise<string> => {
+    const id = await AddDownload(url, outputPath, filename, mirrors, headers)
+    return id
+  }, [])
 
-  const handlePauseDownload = async (id: string) => {
-    try {
-      await PauseDownload(id)
-    } catch (err) {
-      console.error('Failed to pause download:', err)
-    }
-  }
+  const handlePauseDownload = useCallback(async (id: string): Promise<void> => {
+    await PauseDownload(id)
+  }, [])
 
-  const handleResumeDownload = async (id: string) => {
-    try {
-      await ResumeDownload(id)
-    } catch (err) {
-      console.error('Failed to resume download:', err)
-    }
-  }
+  const handleResumeDownload = useCallback(async (id: string): Promise<void> => {
+    await ResumeDownload(id)
+  }, [])
 
-  const handleCancelDownload = async (id: string) => {
-    try {
-      await CancelDownload(id)
-    } catch (err) {
-      console.error('Failed to cancel download:', err)
-    }
-  }
+  const handleCancelDownload = useCallback(async (id: string): Promise<void> => {
+    await CancelDownload(id)
+  }, [])
 
-  const handleListDownloads = async (): Promise<DownloadStatus[]> => {
-    try {
-      const raw = await ListDownloads()
-      return (raw || []).map((s: Record<string, unknown>) => ({
-        ...s,
-        status: s.status as DownloadStatusValue,
-      }))
-    } catch (err) {
-      console.error('Failed to list downloads:', err)
-      return []
-    }
-  }
+  const handleListDownloads = useCallback(async (): Promise<DownloadStatus[]> => {
+    const raw = await ListDownloads()
+    if (!raw) return []
+    return raw.map(toDownloadStatus)
+  }, [])
 
-  const handleGetHistory = async (): Promise<DownloadEntry[]> => {
-    try {
-      const raw = await GetDownloadHistory()
-      return (raw || []).map((e: Record<string, unknown>) => ({
-        ...e,
-        mirrors: (e.mirrors as string[]) || [],
-      }))
-    } catch (err) {
-      console.error('Failed to get history:', err)
-      return []
-    }
-  }
+  const handleGetHistory = useCallback(async (): Promise<DownloadEntry[]> => {
+    const raw = await GetDownloadHistory()
+    if (!raw) return []
+    return raw.map(toDownloadEntry)
+  }, [])
 
   return {
     addDownload: handleAddDownload,
