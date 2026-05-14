@@ -69,7 +69,7 @@ describe('DownloadItem', () => {
 
     it('should show the status badge', () => {
       renderDownloadItem({ status: 'downloading' })
-      expect(screen.getByText('downloading')).toBeInTheDocument()
+      expect(screen.getByText('Downloading')).toBeInTheDocument()
     })
   })
 

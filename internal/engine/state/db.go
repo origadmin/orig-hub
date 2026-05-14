@@ -195,6 +195,16 @@ func (d *DB) UpdateStatus(id string, status string, downloaded int64) error {
 	return err
 }
 
+func (d *DB) UpdateDownloadEntry(entry *types.DownloadEntry) error {
+	_, err := d.db.Exec(`
+		UPDATE downloads SET status = ?, completed_at = ?, time_taken = ?, avg_speed = ?,
+		total_size = ?, downloaded = ?, filename = ?
+		WHERE id = ?`,
+		entry.Status, entry.CompletedAt, entry.TimeTaken, entry.AvgSpeed,
+		entry.TotalSize, entry.Downloaded, entry.Filename, entry.ID)
+	return err
+}
+
 func (d *DB) SaveTasks(downloadID string, tasks []types.Task) error {
 	tx, err := d.db.Begin()
 	if err != nil {

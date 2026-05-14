@@ -12,6 +12,16 @@ interface DownloadItemProps {
   onCancel: (id: string) => void
 }
 
+const statusLabels: Record<string, string> = {
+  queued: 'Queued',
+  probing: 'Probing',
+  downloading: 'Downloading',
+  paused: 'Paused',
+  completed: 'Completed',
+  cancelled: 'Cancelled',
+  error: 'Error',
+}
+
 export function DownloadItem({ download, onPause, onResume, onCancel }: DownloadItemProps) {
   const formatBytes = (bytes: number): string => {
     if (bytes === 0) return '0 B'
@@ -30,7 +40,7 @@ export function DownloadItem({ download, onPause, onResume, onCancel }: Download
   }
 
   const formatTime = (seconds: number): string => {
-    if (seconds === 0) return ''
+    if (seconds <= 0) return '--'
     const mins = Math.floor(seconds / 60)
     const secs = Math.floor(seconds % 60)
     if (mins > 60) {
@@ -38,35 +48,49 @@ export function DownloadItem({ download, onPause, onResume, onCancel }: Download
       const remainingMins = mins % 60
       return `${hours}h ${remainingMins}m`
     }
-    return `${mins}m ${secs}s`
+    if (mins > 0) {
+      return `${mins}m ${secs}s`
+    }
+    return `${secs}s`
   }
 
-  const statusVariant = download.status === 'downloading' ? 'default' : 'secondary'
-  const isActive = download.status === 'downloading' || download.status === 'queued'
+  const statusVariant = download.status === 'downloading' || download.status === 'probing' ? 'default' : 'secondary'
+  const isActive = download.status === 'downloading' || download.status === 'queued' || download.status === 'probing'
+  const isCompleted = download.status === 'completed'
+  const isError = download.status === 'error'
+
+  const displayName = download.filename || download.url
 
   return (
     <Card>
       <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
         <div className="flex items-center gap-2 min-w-0">
           <ProtocolBadge url={download.url} />
-          <CardTitle className="text-sm font-medium truncate">{download.filename}</CardTitle>
+          <CardTitle className="text-sm font-medium truncate">{displayName}</CardTitle>
         </div>
-        <Badge variant={statusVariant}>
-          {download.status}
+        <Badge variant={isError ? 'destructive' : statusVariant}>
+          {statusLabels[download.status] || download.status}
         </Badge>
       </CardHeader>
       <CardContent className="space-y-3">
-        <Progress value={download.progress} />
+        {!isCompleted && !isError && (
+          <Progress value={download.progress} />
+        )}
         <div className="flex justify-between text-sm text-muted-foreground">
           <span>
-            {formatBytes(download.downloaded)} / {formatBytes(download.total_size)}
+            {formatBytes(download.downloaded)}{download.total_size > 0 ? ` / ${formatBytes(download.total_size)}` : ''}
           </span>
-          <span>{download.progress.toFixed(1)}%</span>
+          <span>{download.progress > 0 ? `${download.progress.toFixed(1)}%` : ''}</span>
         </div>
-        <div className="flex justify-between text-sm text-muted-foreground">
-          <span>{formatSpeed(download.speed)}</span>
-          <span>ETA: {formatTime(download.eta)}</span>
-        </div>
+        {download.speed > 0 && (
+          <div className="flex justify-between text-sm text-muted-foreground">
+            <span>{formatSpeed(download.speed)}</span>
+            <span>ETA: {formatTime(download.eta)}</span>
+          </div>
+        )}
+        {isError && download.error && (
+          <div className="text-sm text-destructive">{download.error}</div>
+        )}
         <div className="flex gap-2">
           {download.status === 'downloading' ? (
             <Button variant="outline" size="sm" onClick={() => onPause(download.id)}>

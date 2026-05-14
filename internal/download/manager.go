@@ -11,12 +11,15 @@ import (
 	"github.com/origadmin/orig-hub/internal/protocol"
 )
 
+type OnDownloadDone func(id string, status string, err error)
+
 type Manager struct {
 	registry *protocol.ProtocolRegistry
 	runtime  *types.RuntimeConfig
 	active   map[string]*activeDownload
 	mu       sync.RWMutex
 	nextID   atomic.Int64
+	onDone   OnDownloadDone
 }
 
 type activeDownload struct {
@@ -37,6 +40,10 @@ func NewManager(registry *protocol.ProtocolRegistry, runtime *types.RuntimeConfi
 		runtime:  runtime,
 		active:   make(map[string]*activeDownload),
 	}
+}
+
+func (m *Manager) SetOnDone(fn OnDownloadDone) {
+	m.onDone = fn
 }
 
 func (m *Manager) Add(ctx context.Context, cfg *protocol.DownloadConfig) (string, error) {
@@ -82,10 +89,23 @@ func (m *Manager) Add(ctx context.Context, cfg *protocol.DownloadConfig) (string
 	m.mu.Unlock()
 
 	go func() {
-		_ = downloader.Download(downloadCtx)
+		dlErr := downloader.Download(downloadCtx)
+		if dlErr != nil && dlErr == context.Canceled {
+			m.notifyDone(id, "cancelled", nil)
+		} else if dlErr != nil {
+			m.notifyDone(id, "error", dlErr)
+		} else {
+			m.notifyDone(id, "completed", nil)
+		}
 	}()
 
 	return id, nil
+}
+
+func (m *Manager) notifyDone(id string, status string, err error) {
+	if m.onDone != nil {
+		m.onDone(id, status, err)
+	}
 }
 
 func (m *Manager) Pause(id string) error {
@@ -185,11 +205,15 @@ func (m *Manager) GetStatus(id string) (*types.DownloadStatus, error) {
 }
 
 func (m *Manager) List() ([]types.DownloadStatus, error) {
+	ids := make([]string, 0)
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	for id := range m.active {
+		ids = append(ids, id)
+	}
+	m.mu.RUnlock()
 
 	var statuses []types.DownloadStatus
-	for id := range m.active {
+	for _, id := range ids {
 		status, err := m.GetStatus(id)
 		if err != nil {
 			continue

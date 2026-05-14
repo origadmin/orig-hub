@@ -49,9 +49,9 @@ type DownloadState struct {
 }
 
 type CancelResult struct {
-	Found     bool
-	Filename  string
-	DestPath  string
-	Completed bool
-	WasQueued bool
+	Found     bool   `json:"found"`
+	Filename  string `json:"filename"`
+	DestPath  string `json:"dest_path"`
+	Completed bool   `json:"completed"`
+	WasQueued bool   `json:"was_queued"`
 }

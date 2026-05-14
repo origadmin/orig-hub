@@ -1,4 +1,4 @@
-export type DownloadStatusValue = 'queued' | 'downloading' | 'paused' | 'completed' | 'cancelled' | 'error'
+export type DownloadStatusValue = 'queued' | 'probing' | 'downloading' | 'paused' | 'completed' | 'cancelled' | 'error'
 
 export interface DownloadStatus {
   id: string

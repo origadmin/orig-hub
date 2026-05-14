@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"time"
 
 	"github.com/origadmin/orig-hub/internal/download"
 	"github.com/origadmin/orig-hub/internal/engine/state"
@@ -26,10 +27,25 @@ type LocalService struct {
 }
 
 func NewLocalService(manager *download.Manager, db *state.DB) *LocalService {
-	return &LocalService{
+	s := &LocalService{
 		manager: manager,
 		db:      db,
 	}
+	manager.SetOnDone(s.onDownloadDone)
+	return s
+}
+
+func (s *LocalService) onDownloadDone(id string, status string, err error) {
+	now := time.Now().Unix()
+	entry := &types.DownloadEntry{
+		ID:          id,
+		Status:      status,
+		CompletedAt: now,
+	}
+	if err != nil {
+		entry.Status = "error"
+	}
+	_ = s.db.UpdateDownloadEntry(entry)
 }
 
 func (s *LocalService) Add(ctx context.Context, url, outputPath, filename string, mirrors []string, headers map[string]string) (string, error) {
