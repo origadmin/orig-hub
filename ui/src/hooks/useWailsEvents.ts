@@ -1,6 +1,6 @@
 import { useEffect, useCallback } from 'react'
 import { EventsOn, EventsOff } from 'wailsjs/runtime/runtime.js'
-import { AddDownload, PauseDownload, ResumeDownload, CancelDownload, ListDownloads, GetDownloadHistory, GetDefaultDownloadDir } from 'wailsjs/go/main/App.js'
+import { AddDownload, PauseDownload, ResumeDownload, CancelDownload, RemoveDownload, ListDownloads, GetDownloadHistory, GetDefaultDownloadDir, OpenDirectoryDialog, SaveSettings } from 'wailsjs/go/main/App.js'
 import { useStore } from '../store/useStore'
 import { DownloadStatus, DownloadStatusValue, DownloadEntry } from '../types'
 
@@ -69,7 +69,7 @@ export function useWailsEvents() {
     })
 
     EventsOn('download:cancelled', (id: unknown) => {
-      removeDownload(String(id))
+      updateDownload(String(id), { status: 'cancelled' })
     })
 
     return () => {
@@ -100,6 +100,10 @@ export function useWailsActions() {
     await CancelDownload(id)
   }, [])
 
+  const handleRemoveDownload = useCallback(async (id: string): Promise<void> => {
+    await RemoveDownload(id)
+  }, [])
+
   const handleListDownloads = useCallback(async (): Promise<DownloadStatus[]> => {
     const raw = await ListDownloads()
     if (!raw) return []
@@ -116,13 +120,25 @@ export function useWailsActions() {
     return await GetDefaultDownloadDir()
   }, [])
 
+  const handleOpenDirectoryDialog = useCallback(async (title: string): Promise<string> => {
+    const dir = await OpenDirectoryDialog(title)
+    return dir || ''
+  }, [])
+
+  const handleSaveSettings = useCallback(async (outputDir: string, maxConnections: number): Promise<void> => {
+    await SaveSettings(outputDir, maxConnections)
+  }, [])
+
   return {
     addDownload: handleAddDownload,
     pauseDownload: handlePauseDownload,
     resumeDownload: handleResumeDownload,
     cancelDownload: handleCancelDownload,
+    removeDownload: handleRemoveDownload,
     listDownloads: handleListDownloads,
     getHistory: handleGetHistory,
     getDefaultDownloadDir: handleGetDefaultDownloadDir,
+    openDirectoryDialog: handleOpenDirectoryDialog,
+    saveSettings: handleSaveSettings,
   }
 }

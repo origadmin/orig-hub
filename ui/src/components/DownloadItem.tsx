@@ -10,6 +10,7 @@ interface DownloadItemProps {
   onPause: (id: string) => void
   onResume: (id: string) => void
   onCancel: (id: string) => void
+  onRemove: (id: string) => void
 }
 
 const statusLabels: Record<string, string> = {
@@ -22,7 +23,7 @@ const statusLabels: Record<string, string> = {
   error: 'Error',
 }
 
-export function DownloadItem({ download, onPause, onResume, onCancel }: DownloadItemProps) {
+export function DownloadItem({ download, onPause, onResume, onCancel, onRemove }: DownloadItemProps) {
   const formatBytes = (bytes: number): string => {
     if (bytes === 0) return '0 B'
     const k = 1024
@@ -54,10 +55,12 @@ export function DownloadItem({ download, onPause, onResume, onCancel }: Download
     return `${secs}s`
   }
 
-  const statusVariant = download.status === 'downloading' || download.status === 'probing' ? 'default' : 'secondary'
   const isActive = download.status === 'downloading' || download.status === 'queued' || download.status === 'probing'
   const isCompleted = download.status === 'completed'
   const isError = download.status === 'error'
+  const isCancelled = download.status === 'cancelled'
+  const isFinished = isCompleted || isError || isCancelled
+  const statusVariant = isActive ? 'default' : isError ? 'destructive' : 'secondary'
 
   const displayName = download.filename || download.url
 
@@ -68,12 +71,12 @@ export function DownloadItem({ download, onPause, onResume, onCancel }: Download
           <ProtocolBadge url={download.url} />
           <CardTitle className="text-sm font-medium truncate">{displayName}</CardTitle>
         </div>
-        <Badge variant={isError ? 'destructive' : statusVariant}>
+        <Badge variant={statusVariant}>
           {statusLabels[download.status] || download.status}
         </Badge>
       </CardHeader>
       <CardContent className="space-y-3">
-        {!isCompleted && !isError && (
+        {!isFinished && (
           <Progress value={download.progress} />
         )}
         <div className="flex justify-between text-sm text-muted-foreground">
@@ -91,6 +94,11 @@ export function DownloadItem({ download, onPause, onResume, onCancel }: Download
         {isError && download.error && (
           <div className="text-sm text-destructive">{download.error}</div>
         )}
+        {isCompleted && download.dest_path && (
+          <div className="text-sm text-muted-foreground truncate" title={download.dest_path}>
+            Saved to: {download.dest_path}
+          </div>
+        )}
         <div className="flex gap-2">
           {download.status === 'downloading' ? (
             <Button variant="outline" size="sm" onClick={() => onPause(download.id)}>
@@ -104,6 +112,11 @@ export function DownloadItem({ download, onPause, onResume, onCancel }: Download
           {isActive && (
             <Button variant="destructive" size="sm" onClick={() => onCancel(download.id)}>
               Cancel
+            </Button>
+          )}
+          {isFinished && (
+            <Button variant="outline" size="sm" onClick={() => onRemove(download.id)}>
+              Remove
             </Button>
           )}
         </div>

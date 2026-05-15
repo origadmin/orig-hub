@@ -29,6 +29,7 @@ type activeDownload struct {
 	cancelFunc context.CancelFunc
 	config     *protocol.DownloadConfig
 	addedAt    time.Time
+	lastErr    string
 }
 
 func NewManager(registry *protocol.ProtocolRegistry, runtime *types.RuntimeConfig) *Manager {
@@ -91,10 +92,13 @@ func (m *Manager) Add(ctx context.Context, cfg *protocol.DownloadConfig) (string
 	go func() {
 		dlErr := downloader.Download(downloadCtx)
 		if dlErr != nil && dlErr == context.Canceled {
+			ad.lastErr = ""
 			m.notifyDone(id, "cancelled", nil)
 		} else if dlErr != nil {
+			ad.lastErr = dlErr.Error()
 			m.notifyDone(id, "error", dlErr)
 		} else {
+			ad.lastErr = ""
 			m.notifyDone(id, "completed", nil)
 		}
 	}()
@@ -144,11 +148,18 @@ func (m *Manager) Cancel(id string) error {
 	err := ad.downloader.Cancel()
 	ad.cancelFunc()
 
-	m.mu.Lock()
-	delete(m.active, id)
-	m.mu.Unlock()
-
 	return err
+}
+
+func (m *Manager) Remove(id string) error {
+	m.mu.Lock()
+	ad, ok := m.active[id]
+	if ok {
+		ad.cancelFunc()
+		delete(m.active, id)
+	}
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *Manager) GetStatus(id string) (*types.DownloadStatus, error) {
@@ -197,6 +208,7 @@ func (m *Manager) GetStatus(id string) (*types.DownloadStatus, error) {
 		status.Status = "completed"
 	case protocol.DownloadStateError:
 		status.Status = "error"
+		status.Error = ad.lastErr
 	case protocol.DownloadStateCancelled:
 		status.Status = "cancelled"
 	}

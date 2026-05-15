@@ -120,7 +120,7 @@ func (s *APIServer) handleDownloadByID(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "unknown action", http.StatusBadRequest)
 		}
 	case http.MethodDelete:
-		if err := s.service.Cancel(id); err != nil {
+		if err := s.service.Remove(id); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}

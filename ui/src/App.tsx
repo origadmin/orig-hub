@@ -87,6 +87,16 @@ function App() {
     }
   }
 
+  const handleRemove = async (id: string) => {
+    try {
+      await wailsActions.removeDownload(id)
+      useStore.getState().removeDownload(id)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      toast.error(`Failed to remove: ${msg}`)
+    }
+  }
+
   const renderTabContent = () => {
     switch (activeTab) {
       case 'downloads':
@@ -104,6 +114,7 @@ function App() {
               onPause={handlePause}
               onResume={handleResume}
               onCancel={handleCancel}
+              onRemove={handleRemove}
             />
           </div>
         )

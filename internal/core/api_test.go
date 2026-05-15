@@ -16,6 +16,7 @@ type mockService struct {
 	pauseFunc    func(id string) error
 	resumeFunc   func(ctx context.Context, id string) error
 	cancelFunc   func(id string) error
+	removeFunc   func(id string) error
 	statusFunc   func(id string) (*types.DownloadStatus, error)
 	listFunc     func() ([]types.DownloadStatus, error)
 	historyFunc  func() ([]types.DownloadEntry, error)
@@ -46,6 +47,13 @@ func (m *mockService) Resume(ctx context.Context, id string) error {
 func (m *mockService) Cancel(id string) error {
 	if m.cancelFunc != nil {
 		return m.cancelFunc(id)
+	}
+	return nil
+}
+
+func (m *mockService) Remove(id string) error {
+	if m.removeFunc != nil {
+		return m.removeFunc(id)
 	}
 	return nil
 }
@@ -314,13 +322,13 @@ func TestCancelDownload(t *testing.T) {
 }
 
 func TestDeleteDownload(t *testing.T) {
-	cancelled := false
+	removed := false
 	svc := &mockService{
-		cancelFunc: func(id string) error {
+		removeFunc: func(id string) error {
 			if id != "test-id" {
 				t.Errorf("expected id 'test-id', got %q", id)
 			}
-			cancelled = true
+			removed = true
 			return nil
 		},
 	}
@@ -333,8 +341,8 @@ func TestDeleteDownload(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
-	if !cancelled {
-		t.Error("expected cancel to be called for delete")
+	if !removed {
+		t.Error("expected remove to be called for delete")
 	}
 
 	var resp map[string]string

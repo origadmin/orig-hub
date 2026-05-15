@@ -26,6 +26,7 @@ function renderDownloadItem(overrides: Partial<DownloadStatus> = {}) {
   const onPause = jest.fn()
   const onResume = jest.fn()
   const onCancel = jest.fn()
+  const onRemove = jest.fn()
   const download = { ...baseDownload, ...overrides }
 
   const result = render(
@@ -34,10 +35,11 @@ function renderDownloadItem(overrides: Partial<DownloadStatus> = {}) {
       onPause={onPause}
       onResume={onResume}
       onCancel={onCancel}
+      onRemove={onRemove}
     />
   )
 
-  return { onPause, onResume, onCancel, ...result }
+  return { onPause, onResume, onCancel, onRemove, ...result }
 }
 
 describe('DownloadItem', () => {
@@ -88,6 +90,11 @@ describe('DownloadItem', () => {
       renderDownloadItem({ status: 'downloading' })
       expect(screen.queryByRole('button', { name: 'Resume' })).not.toBeInTheDocument()
     })
+
+    it('should not show Remove button', () => {
+      renderDownloadItem({ status: 'downloading' })
+      expect(screen.queryByRole('button', { name: 'Remove' })).not.toBeInTheDocument()
+    })
   })
 
   describe('paused status', () => {
@@ -125,9 +132,27 @@ describe('DownloadItem', () => {
   })
 
   describe('completed status', () => {
-    it('should not show any action buttons', () => {
+    it('should show Remove button', () => {
       renderDownloadItem({ status: 'completed' })
-      expect(screen.queryByRole('button')).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Remove' })).toBeInTheDocument()
+    })
+
+    it('should not show Pause or Cancel buttons', () => {
+      renderDownloadItem({ status: 'completed' })
+      expect(screen.queryByRole('button', { name: 'Pause' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument()
+    })
+  })
+
+  describe('error status', () => {
+    it('should show Remove button', () => {
+      renderDownloadItem({ status: 'error', error: 'connection failed' })
+      expect(screen.getByRole('button', { name: 'Remove' })).toBeInTheDocument()
+    })
+
+    it('should show error message', () => {
+      renderDownloadItem({ status: 'error', error: 'connection failed' })
+      expect(screen.getByText('connection failed')).toBeInTheDocument()
     })
   })
 
@@ -154,6 +179,14 @@ describe('DownloadItem', () => {
       await user.click(screen.getByRole('button', { name: 'Cancel' }))
       expect(onCancel).toHaveBeenCalledWith('dl-1')
       expect(onCancel).toHaveBeenCalledTimes(1)
+    })
+
+    it('should call onRemove with correct id when Remove is clicked', async () => {
+      const user = userEvent.setup()
+      const { onRemove } = renderDownloadItem({ status: 'completed' })
+      await user.click(screen.getByRole('button', { name: 'Remove' }))
+      expect(onRemove).toHaveBeenCalledWith('dl-1')
+      expect(onRemove).toHaveBeenCalledTimes(1)
     })
   })
 })

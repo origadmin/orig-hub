@@ -32,6 +32,7 @@ function renderDownloadList(downloads: DownloadStatus[] = []) {
   const onPause = jest.fn()
   const onResume = jest.fn()
   const onCancel = jest.fn()
+  const onRemove = jest.fn()
 
   const result = render(
     <DownloadList
@@ -39,10 +40,11 @@ function renderDownloadList(downloads: DownloadStatus[] = []) {
       onPause={onPause}
       onResume={onResume}
       onCancel={onCancel}
+      onRemove={onRemove}
     />
   )
 
-  return { onPause, onResume, onCancel, ...result }
+  return { onPause, onResume, onCancel, onRemove, ...result }
 }
 
 describe('DownloadList', () => {

@@ -10,6 +10,7 @@ import {
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { Label } from './ui/label'
+import { useWailsActions } from '../hooks/useWailsEvents'
 
 interface AddDownloadDialogProps {
   open: boolean
@@ -22,6 +23,14 @@ export function AddDownloadDialog({ open, onOpenChange, onAdd, defaultDir }: Add
   const [url, setUrl] = useState('')
   const [filename, setFilename] = useState('')
   const [destPath, setDestPath] = useState(defaultDir)
+  const { openDirectoryDialog } = useWailsActions()
+
+  const handleBrowse = async () => {
+    const dir = await openDirectoryDialog('Select Download Folder')
+    if (dir) {
+      setDestPath(dir)
+    }
+  }
 
   const handleAdd = () => {
     if (!url.trim()) return
@@ -61,12 +70,18 @@ export function AddDownloadDialog({ open, onOpenChange, onAdd, defaultDir }: Add
           </div>
           <div className="space-y-2">
             <Label htmlFor="destPath">Save to</Label>
-            <Input
-              id="destPath"
-              placeholder={defaultDir || 'Downloads folder'}
-              value={destPath}
-              onChange={(e) => setDestPath(e.target.value)}
-            />
+            <div className="flex gap-2">
+              <Input
+                id="destPath"
+                placeholder={defaultDir || 'Downloads folder'}
+                value={destPath}
+                onChange={(e) => setDestPath(e.target.value)}
+                className="flex-1"
+              />
+              <Button variant="outline" onClick={handleBrowse} type="button">
+                Browse
+              </Button>
+            </div>
           </div>
         </div>
         <DialogFooter>

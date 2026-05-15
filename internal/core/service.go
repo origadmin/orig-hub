@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/origadmin/orig-hub/internal/download"
@@ -15,6 +16,7 @@ type DownloadService interface {
 	Pause(id string) error
 	Resume(ctx context.Context, id string) error
 	Cancel(id string) error
+	Remove(id string) error
 	GetStatus(id string) (*types.DownloadStatus, error)
 	List() ([]types.DownloadStatus, error)
 	History() ([]types.DownloadEntry, error)
@@ -45,7 +47,23 @@ func (s *LocalService) onDownloadDone(id string, status string, err error) {
 	if err != nil {
 		entry.Status = "error"
 	}
-	_ = s.db.UpdateDownloadEntry(entry)
+
+	dlStatus, statusErr := s.manager.GetStatus(id)
+	if statusErr == nil && dlStatus != nil {
+		entry.TotalSize = dlStatus.TotalSize
+		entry.Downloaded = dlStatus.Downloaded
+		entry.Filename = dlStatus.Filename
+		if dlStatus.TotalSize > 0 && dlStatus.AddedAt > 0 {
+			entry.TimeTaken = now - dlStatus.AddedAt
+			if entry.TimeTaken > 0 {
+				entry.AvgSpeed = float64(dlStatus.Downloaded) / float64(entry.TimeTaken)
+			}
+		}
+	}
+
+	if dbErr := s.db.UpdateDownloadEntry(entry); dbErr != nil {
+		_ = fmt.Errorf("failed to update download entry %s: %w", id, dbErr)
+	}
 }
 
 func (s *LocalService) Add(ctx context.Context, url, outputPath, filename string, mirrors []string, headers map[string]string) (string, error) {
@@ -101,6 +119,10 @@ func (s *LocalService) Cancel(id string) error {
 	}
 	_ = s.db.UpdateStatus(id, "cancelled", 0)
 	return nil
+}
+
+func (s *LocalService) Remove(id string) error {
+	return s.manager.Remove(id)
 }
 
 func (s *LocalService) GetStatus(id string) (*types.DownloadStatus, error) {

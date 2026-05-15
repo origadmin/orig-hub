@@ -94,6 +94,10 @@ func (a *App) CancelDownload(id string) error {
 	return nil
 }
 
+func (a *App) RemoveDownload(id string) error {
+	return a.downloadService.Remove(id)
+}
+
 func (a *App) GetDownloadStatus(id string) (*types.DownloadStatus, error) {
 	return a.downloadService.GetStatus(id)
 }
@@ -108,4 +112,20 @@ func (a *App) GetDownloadHistory() ([]types.DownloadEntry, error) {
 
 func (a *App) GetDefaultDownloadDir() string {
 	return a.cfg.Download.OutputDir
+}
+
+func (a *App) OpenDirectoryDialog(title string) (string, error) {
+	return wailsRuntime.OpenDirectoryDialog(a.ctx, wailsRuntime.OpenDialogOptions{
+		Title: title,
+	})
+}
+
+func (a *App) SaveSettings(outputDir string, maxConnections int) error {
+	if outputDir != "" {
+		a.cfg.Download.OutputDir = outputDir
+	}
+	if maxConnections > 0 {
+		a.cfg.Download.MaxConnections = maxConnections
+	}
+	return a.cfg.Save(config.ConfigFile())
 }

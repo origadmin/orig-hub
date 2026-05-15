@@ -14,7 +14,8 @@ const config: Config = {
   },
   moduleNameMapper: {
     '^@/(.*)$': '<rootDir>/src/$1',
-    '^wailsjs/(.*)$': '<rootDir>/wailsjs/$1',
+    '^wailsjs/go/(.*)$': '<rootDir>/src/test/__mocks__/wailsGo.js',
+    '^wailsjs/runtime/(.*)$': '<rootDir>/src/test/__mocks__/wailsRuntime.js',
     '\\.(css|less|scss|sass)$': '<rootDir>/src/test/__mocks__/style.js',
   },
   setupFiles: ['<rootDir>/src/test/setup.ts'],

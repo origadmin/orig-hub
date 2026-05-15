@@ -6,9 +6,10 @@ interface DownloadListProps {
   onPause: (id: string) => void
   onResume: (id: string) => void
   onCancel: (id: string) => void
+  onRemove: (id: string) => void
 }
 
-export function DownloadList({ downloads, onPause, onResume, onCancel }: DownloadListProps) {
+export function DownloadList({ downloads, onPause, onResume, onCancel, onRemove }: DownloadListProps) {
   if (downloads.length === 0) {
     return (
       <div className="flex h-64 items-center justify-center text-muted-foreground">
@@ -26,6 +27,7 @@ export function DownloadList({ downloads, onPause, onResume, onCancel }: Downloa
           onPause={onPause}
           onResume={onResume}
           onCancel={onCancel}
+          onRemove={onRemove}
         />
       ))}
     </div>

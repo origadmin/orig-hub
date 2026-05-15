@@ -3,23 +3,6 @@ import { useStore } from './store/useStore'
 import { DownloadStatus } from './types'
 import { AddDownload, PauseDownload, ResumeDownload, CancelDownload, GetDefaultDownloadDir } from 'wailsjs/go/main/App.js'
 
-jest.mock('wailsjs/runtime/runtime.js', () => ({
-  EventsOn: jest.fn(),
-  EventsOff: jest.fn(),
-  EventsEmit: jest.fn(),
-}))
-
-jest.mock('wailsjs/go/main/App.js', () => ({
-  AddDownload: jest.fn().mockResolvedValue('test-id-1'),
-  PauseDownload: jest.fn().mockResolvedValue(undefined),
-  ResumeDownload: jest.fn().mockResolvedValue(undefined),
-  CancelDownload: jest.fn().mockResolvedValue(undefined),
-  ListDownloads: jest.fn().mockResolvedValue([]),
-  GetDownloadStatus: jest.fn().mockResolvedValue(null),
-  GetDownloadHistory: jest.fn().mockResolvedValue([]),
-  GetDefaultDownloadDir: jest.fn().mockResolvedValue('/home/user/Downloads'),
-}))
-
 jest.mock('sonner', () => ({
   toast: { success: jest.fn(), error: jest.fn(), info: jest.fn() },
   Toaster: () => null,
