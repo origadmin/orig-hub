@@ -54,6 +54,9 @@ data/
 build/windows/installer/project.nsi
 build/windows/wails.exe.manifest
 
+# Docs (internal, not for repo)
+_docs/
+
 # Misc
 *.log
 .env
