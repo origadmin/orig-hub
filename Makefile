@@ -1,11 +1,11 @@
-.PHONY: build test test-integration test-frontend test-e2e test-screenshots lint cover clean daemon gui
+.PHONY: build test test-integration test-frontend test-e2e test-screenshots lint cover clean gui
 
-BINARY=bin/orig-hub
+BINARY=bin/orighub
 GO=go
 WAILS=wails
 
 build:
-	$(GO) build -o $(BINARY) ./cmd/orig-hub
+	$(GO) build -o $(BINARY) .
 
 test:
 	$(GO) test -race ./...
@@ -14,13 +14,13 @@ test-integration:
 	$(GO) test -race -tags=integration ./...
 
 test-frontend:
-	cd frontend && bun install && bun test
+	cd ui && npm install && npm test
 
 test-e2e:
-	cd frontend && bun run test:e2e
+	cd ui && npm run test:e2e
 
 test-screenshots:
-	cd frontend && bun run test:e2e -- --screenshot
+	cd ui && npm run test:e2e -- --screenshot
 
 lint:
 	golangci-lint run
@@ -31,9 +31,6 @@ cover:
 
 clean:
 	rm -rf bin/ build/ coverage.out coverage.html
-
-daemon:
-	$(GO) run ./cmd/orig-hub daemon
 
 gui:
 	$(WAILS) dev

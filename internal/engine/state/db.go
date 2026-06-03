@@ -185,6 +185,51 @@ func (d *DB) ListDownloads(status string) ([]types.DownloadEntry, error) {
 	return entries, nil
 }
 
+func (d *DB) ListFinishedDownloads() ([]types.DownloadEntry, error) {
+	rows, err := d.db.Query(`
+		SELECT id, url, dest_path, filename, status, total_size, downloaded, url_hash,
+		       completed_at, time_taken, mirrors, avg_speed
+		FROM downloads WHERE status IN ('completed', 'error', 'cancelled') ORDER BY completed_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var entries []types.DownloadEntry
+	for rows.Next() {
+		var entry types.DownloadEntry
+		var mirrorsJSON string
+		var completedAt, timeTaken sql.NullInt64
+		var avgSpeed sql.NullFloat64
+
+		err := rows.Scan(&entry.ID, &entry.URL, &entry.DestPath, &entry.Filename, &entry.Status,
+			&entry.TotalSize, &entry.Downloaded, &entry.URLHash,
+			&completedAt, &timeTaken, &mirrorsJSON, &avgSpeed)
+		if err != nil {
+			return nil, err
+		}
+
+		if completedAt.Valid {
+			entry.CompletedAt = completedAt.Int64
+		}
+		if timeTaken.Valid {
+			entry.TimeTaken = timeTaken.Int64
+		}
+		if avgSpeed.Valid {
+			entry.AvgSpeed = avgSpeed.Float64
+		}
+		if mirrorsJSON != "" {
+			if err := json.Unmarshal([]byte(mirrorsJSON), &entry.Mirrors); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal mirrors: %w", err)
+			}
+		}
+
+		entries = append(entries, entry)
+	}
+
+	return entries, nil
+}
+
 func (d *DB) DeleteDownload(id string) error {
 	_, err := d.db.Exec("DELETE FROM downloads WHERE id = ?", id)
 	return err

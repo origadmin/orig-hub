@@ -1,11 +1,24 @@
 import '@testing-library/jest-dom'
 import { useStore } from './store/useStore'
 import { DownloadStatus } from './types'
-import { AddDownload, PauseDownload, ResumeDownload, CancelDownload, GetDefaultDownloadDir } from 'wailsjs/go/main/App.js'
+import { AddDownload, PauseDownload, ResumeDownload, CancelDownload, GetDefaultDownloadDir } from '../bindings/github.com/origadmin/orig-hub/internal/app/downloadservice'
 
 jest.mock('sonner', () => ({
   toast: { success: jest.fn(), error: jest.fn(), info: jest.fn() },
   Toaster: () => null,
+}))
+
+jest.mock('../bindings/github.com/origadmin/orig-hub/internal/app/downloadservice', () => ({
+  AddDownload: jest.fn(),
+  PauseDownload: jest.fn(),
+  ResumeDownload: jest.fn(),
+  CancelDownload: jest.fn(),
+  RemoveDownload: jest.fn(),
+  ListDownloads: jest.fn(),
+  GetDownloadHistory: jest.fn(),
+  GetDefaultDownloadDir: jest.fn().mockResolvedValue('/home/user/Downloads'),
+  OpenDirectoryDialog: jest.fn(),
+  SaveSettings: jest.fn(),
 }))
 
 function createMockDownload(overrides: Partial<DownloadStatus> = {}): DownloadStatus {

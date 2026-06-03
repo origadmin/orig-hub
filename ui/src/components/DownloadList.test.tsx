@@ -48,9 +48,9 @@ function renderDownloadList(downloads: DownloadStatus[] = []) {
 }
 
 describe('DownloadList', () => {
-  it('should show "No downloads yet" when list is empty', () => {
+  it('should show empty message when list is empty', () => {
     renderDownloadList([])
-    expect(screen.getByText('No downloads yet')).toBeInTheDocument()
+    expect(screen.getByText(/No downloads yet/)).toBeInTheDocument()
   })
 
   it('should render a DownloadItem for each download', () => {
@@ -59,29 +59,29 @@ describe('DownloadList', () => {
     expect(screen.getByText('file2.zip')).toBeInTheDocument()
   })
 
-  it('should not show "No downloads yet" when there are downloads', () => {
+  it('should not show empty message when there are downloads', () => {
     renderDownloadList([mockDownload])
-    expect(screen.queryByText('No downloads yet')).not.toBeInTheDocument()
+    expect(screen.queryByText(/No downloads yet/)).not.toBeInTheDocument()
   })
 
   it('should pass onPause callback to DownloadItem', async () => {
     const user = userEvent.setup()
     const { onPause } = renderDownloadList([mockDownload])
-    await user.click(screen.getByRole('button', { name: 'Pause' }))
+    await user.click(screen.getByTitle('Pause'))
     expect(onPause).toHaveBeenCalledWith('dl-1')
   })
 
   it('should pass onResume callback to DownloadItem', async () => {
     const user = userEvent.setup()
     const { onResume } = renderDownloadList([{ ...mockDownload, status: 'paused' }])
-    await user.click(screen.getByRole('button', { name: 'Resume' }))
+    await user.click(screen.getByTitle('Resume'))
     expect(onResume).toHaveBeenCalledWith('dl-1')
   })
 
   it('should pass onCancel callback to DownloadItem', async () => {
     const user = userEvent.setup()
     const { onCancel } = renderDownloadList([mockDownload])
-    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    await user.click(screen.getByTitle('Cancel'))
     expect(onCancel).toHaveBeenCalledWith('dl-1')
   })
 })

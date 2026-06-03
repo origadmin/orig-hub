@@ -4,9 +4,21 @@
     <meta charset="UTF-8"/>
     <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
     <title>orig-hub-gui</title>
+    <style>
+        html, body, #root { margin: 0; padding: 0; height: 100%; width: 100%; background: transparent; background-color: transparent; }
+    </style>
+    <script>
+        (function() {
+            if (window.location.hash === '#float' || window.location.search.indexOf('window=float') !== -1) {
+                window.__OW__ = 'float';
+                document.documentElement.classList.add('float-window');
+            } else {
+                window.__OW__ = 'main';
+            }
+        })();
+    </script>
 </head>
 <body>
 <div id="root"></div>
 </body>
 </html>
-

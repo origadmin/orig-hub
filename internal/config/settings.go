@@ -9,9 +9,15 @@ import (
 )
 
 type Settings struct {
+	General  GeneralSettings  `toml:"general"`
 	Daemon   DaemonSettings   `toml:"daemon"`
 	Download DownloadSettings `toml:"download"`
 	Network  NetworkSettings  `toml:"network"`
+}
+
+type GeneralSettings struct {
+	Locale             string `toml:"locale"`
+	FloatingBarEnabled bool   `toml:"floating_bar_enabled"`
 }
 
 type DaemonSettings struct {
@@ -36,6 +42,9 @@ type NetworkSettings struct {
 func DefaultSettings() *Settings {
 	homeDir, _ := os.UserHomeDir()
 	return &Settings{
+		General: GeneralSettings{
+			FloatingBarEnabled: true,
+		},
 		Daemon: DaemonSettings{
 			Port:    8080,
 			Token:   "",

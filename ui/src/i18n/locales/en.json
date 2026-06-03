@@ -1,0 +1,38 @@
+{
+  "app": {
+    "title": "Orig Hub",
+    "version": "Version"
+  },
+  "nav": {
+    "downloading": "Downloading",
+    "completed": "Completed",
+    "library": "Library",
+    "player": "Player",
+    "scheduler": "Scheduler",
+    "settings": "Settings"
+  },
+  "actions": {
+    "addDownload": "Add Download",
+    "pause": "Pause",
+    "resume": "Resume",
+    "cancel": "Cancel",
+    "remove": "Remove",
+    "pauseAll": "Pause All",
+    "resumeAll": "Resume All",
+    "confirm": "Confirm",
+    "cancelBtn": "Cancel",
+    "browse": "Browse",
+    "save": "Save",
+    "close": "Close"
+  },
+  "addDownloadDialog": {
+    "title": "Add Download",
+    "description": "Enter the URL of the file you want to download",
+    "urlLabel": "Download URL",
+    "urlPlaceholder": "https://example.com/file.zip",
+    "filenameLabel": "Filename (optional)",
+    "filenamePlaceholder": "custom-filename.zip",
+    "destPathLabel": "Download Folder",
+    "selectFolder": "Select Folder",
+    "addButton": "Add Download",
+    "invalidUrl": "Please enter

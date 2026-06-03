@@ -4,13 +4,13 @@ export interface DownloadStatus {
   id: string
   url: string
   filename: string
-  dest_path: string
+  dest_path?: string
   total_size: number
   downloaded: number
   progress: number
   speed: number
-  status: DownloadStatusValue
-  error: string
+  status: DownloadStatusValue | string
+  error?: string
   eta: number
   connections: number
   added_at: number
@@ -30,7 +30,7 @@ export interface DownloadEntry {
   completed_at: number
   time_taken: number
   avg_speed: number
-  mirrors: string[]
+  mirrors?: string[]
 }
 
 export type ThemeValue = 'light' | 'dark' | 'system'
@@ -41,4 +41,5 @@ export interface AppSettings {
   autoStart: boolean
   notifications: boolean
   theme: ThemeValue
+  floatingBarEnabled: boolean
 }

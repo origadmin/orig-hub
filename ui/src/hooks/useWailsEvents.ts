@@ -1,6 +1,7 @@
-import { useEffect, useCallback } from 'react'
-import { EventsOn, EventsOff } from 'wailsjs/runtime/runtime.js'
-import { AddDownload, PauseDownload, ResumeDownload, CancelDownload, RemoveDownload, ListDownloads, GetDownloadHistory, GetDefaultDownloadDir, OpenDirectoryDialog, SaveSettings } from 'wailsjs/go/main/App.js'
+import { useEffect, useCallback, useRef } from 'react'
+import { Events } from '@wailsio/runtime'
+import { AddDownload, PauseDownload, ResumeDownload, CancelDownload, RemoveDownload, ListDownloads, GetDownloadHistory, GetDefaultDownloadDir, OpenDirectoryDialog, SaveSettings } from '../../bindings/github.com/origadmin/orig-hub/internal/app/downloadservice'
+import { EnterFloatingMode, RestoreFromFloating, SetFloatingBarEnabled } from '../../bindings/github.com/origadmin/orig-hub/internal/app/guicontroller'
 import { useStore } from '../store/useStore'
 import { DownloadStatus, DownloadStatusValue, DownloadEntry } from '../types'
 
@@ -41,45 +42,132 @@ function toDownloadEntry(raw: Record<string, unknown>): DownloadEntry {
   }
 }
 
+let backendAvailable: boolean | null = null
+
+async function checkBackend(): Promise<boolean> {
+  if (backendAvailable !== null) return backendAvailable
+  try {
+    await ListDownloads()
+    backendAvailable = true
+    return true
+  } catch {
+    backendAvailable = false
+    return false
+  }
+}
+
 export function useWailsEvents() {
-  const { updateDownloads, updateDownload, removeDownload } = useStore()
+  const { updateDownloads, updateDownload } = useStore()
 
   useEffect(() => {
-    EventsOn('download:status', (...args: unknown[]) => {
-      const rawStatuses = args[0] as Record<string, unknown>[]
-      if (!Array.isArray(rawStatuses)) return
-      const statuses: DownloadStatus[] = rawStatuses.map(toDownloadStatus)
-      updateDownloads(statuses)
-    })
-
-    EventsOn('download:added', (_id: unknown) => {
-      ListDownloads().then((raw) => {
-        if (raw && raw.length > 0) {
-          updateDownloads(raw.map(toDownloadStatus))
+    const off1 = Events.On('download:status', (statuses: unknown) => {
+      let rawStatuses: unknown[]
+      if (Array.isArray(statuses)) {
+        rawStatuses = statuses
+      } else if (statuses && typeof statuses === 'object') {
+        const arr = Object.values(statuses as Record<string, unknown>)
+        if (arr.length > 0 && Array.isArray(arr[0])) {
+          rawStatuses = arr[0] as unknown[]
+        } else {
+          rawStatuses = [statuses]
         }
-      })
+      } else {
+        return
+      }
+      if (!Array.isArray(rawStatuses)) return
+      const list: DownloadStatus[] = rawStatuses.map((item) => {
+        if (item && typeof item === 'object') {
+          return toDownloadStatus(item as Record<string, unknown>)
+        }
+        return null
+      }).filter((item): item is DownloadStatus => item !== null)
+      if (list.length > 0) {
+        updateDownloads(list)
+      }
     })
 
-    EventsOn('download:paused', (id: unknown) => {
+    const off2 = Events.On('download:added', () => {
+      ListDownloads().then((list) => {
+        if (list && list.length > 0) {
+          updateDownloads(list)
+        }
+      }).catch(() => {})
+    })
+
+    const off3 = Events.On('download:paused', (id: unknown) => {
       updateDownload(String(id), { status: 'paused' })
     })
 
-    EventsOn('download:resumed', (id: unknown) => {
+    const off4 = Events.On('download:resumed', (id: unknown) => {
       updateDownload(String(id), { status: 'downloading' })
     })
 
-    EventsOn('download:cancelled', (id: unknown) => {
+    const off5 = Events.On('download:cancelled', (id: unknown) => {
       updateDownload(String(id), { status: 'cancelled' })
     })
 
     return () => {
-      EventsOff('download:status')
-      EventsOff('download:added')
-      EventsOff('download:paused')
-      EventsOff('download:resumed')
-      EventsOff('download:cancelled')
+      off1()
+      off2()
+      off3()
+      off4()
+      off5()
     }
-  }, [updateDownloads, updateDownload, removeDownload])
+  }, [updateDownloads, updateDownload])
+}
+
+export function useDownloadPolling() {
+  const updateDownloads = useStore((s) => s.updateDownloads)
+  const enableMockData = useStore((s) => s.enableMockData)
+  const useMockData = useStore((s) => s.useMockData)
+  const tickMockDownloads = useStore((s) => s.tickMockDownloads)
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const mockTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const list = await ListDownloads()
+        backendAvailable = true
+        if (list && list.length > 0) {
+          updateDownloads(list)
+        } else if (!useMockData) {
+          enableMockData()
+        }
+      } catch {
+        if (!useMockData) {
+          enableMockData()
+        }
+      }
+    }
+
+    timerRef.current = setInterval(poll, 2000)
+    poll()
+
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current)
+      }
+    }
+  }, [updateDownloads, enableMockData, useMockData])
+
+  useEffect(() => {
+    if (useMockData) {
+      mockTimerRef.current = setInterval(() => {
+        tickMockDownloads()
+      }, 1000)
+    } else {
+      if (mockTimerRef.current) {
+        clearInterval(mockTimerRef.current)
+        mockTimerRef.current = null
+      }
+    }
+    return () => {
+      if (mockTimerRef.current) {
+        clearInterval(mockTimerRef.current)
+      }
+    }
+  }, [useMockData, tickMockDownloads])
 }
 
 export function useWailsActions() {
@@ -105,15 +193,15 @@ export function useWailsActions() {
   }, [])
 
   const handleListDownloads = useCallback(async (): Promise<DownloadStatus[]> => {
-    const raw = await ListDownloads()
-    if (!raw) return []
-    return raw.map(toDownloadStatus)
+    const list = await ListDownloads()
+    if (!list) return []
+    return list
   }, [])
 
   const handleGetHistory = useCallback(async (): Promise<DownloadEntry[]> => {
-    const raw = await GetDownloadHistory()
-    if (!raw) return []
-    return raw.map(toDownloadEntry)
+    const list = await GetDownloadHistory()
+    if (!list) return []
+    return list
   }, [])
 
   const handleGetDefaultDownloadDir = useCallback(async (): Promise<string> => {
@@ -129,6 +217,18 @@ export function useWailsActions() {
     await SaveSettings(outputDir, maxConnections)
   }, [])
 
+  const handleEnterFloatingMode = useCallback(async (): Promise<void> => {
+    await EnterFloatingMode()
+  }, [])
+
+  const handleRestoreFromFloating = useCallback(async (): Promise<void> => {
+    await RestoreFromFloating()
+  }, [])
+
+  const handleSetFloatingBarEnabled = useCallback(async (enabled: boolean): Promise<void> => {
+    await SetFloatingBarEnabled(enabled)
+  }, [])
+
   return {
     addDownload: handleAddDownload,
     pauseDownload: handlePauseDownload,
@@ -140,5 +240,8 @@ export function useWailsActions() {
     getDefaultDownloadDir: handleGetDefaultDownloadDir,
     openDirectoryDialog: handleOpenDirectoryDialog,
     saveSettings: handleSaveSettings,
+    enterFloatingMode: handleEnterFloatingMode,
+    restoreFromFloating: handleRestoreFromFloating,
+    setFloatingBarEnabled: handleSetFloatingBarEnabled,
   }
 }

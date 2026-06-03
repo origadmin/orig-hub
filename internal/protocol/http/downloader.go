@@ -17,6 +17,8 @@ import (
 	"github.com/origadmin/orig-hub/internal/protocol"
 )
 
+const maxRetries = 3
+
 type HTTPDownloader struct {
 	cfg        *protocol.DownloadConfig
 	runtime    *types.RuntimeConfig
@@ -217,6 +219,31 @@ func (d *HTTPDownloader) updateProgress(downloaded, total int64, speed float64) 
 	}
 }
 
+func (d *HTTPDownloader) makeHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 0,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return types.ErrMaxRedirects
+			}
+			if len(via) > 0 {
+				for key, val := range d.cfg.Headers {
+					if key != "Range" {
+						req.Header.Set(key, val)
+					}
+				}
+			}
+			return nil
+		},
+		Transport: &http.Transport{
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+			DisableCompression:  true,
+		},
+	}
+}
+
 func (d *HTTPDownloader) concurrentDownload(ctx context.Context, file *os.File, totalSize int64) error {
 	maxConns := d.cfg.MaxConns
 	if maxConns <= 0 {
@@ -282,11 +309,32 @@ func (d *HTTPDownloader) concurrentDownload(ctx context.Context, file *os.File, 
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			err := d.downloadChunk(ctx, file, t.offset, t.length, totalSize)
-			if err != nil {
-				errCh <- err
+			var chunkErr error
+			for attempt := 0; attempt < maxRetries; attempt++ {
+				if attempt > 0 {
+					select {
+					case <-ctx.Done():
+						errCh <- ctx.Err()
+						return
+					case <-time.After(time.Duration(attempt) * time.Second):
+					}
+				}
+
+				chunkErr = d.downloadChunk(ctx, file, t.offset, t.length, totalSize)
+				if chunkErr == nil {
+					break
+				}
+				if ctx.Err() != nil {
+					errCh <- ctx.Err()
+					return
+				}
+			}
+
+			if chunkErr != nil {
+				errCh <- chunkErr
 				return
 			}
+
 			newDownloaded := downloaded.Add(t.length)
 			elapsed := time.Since(startTime).Seconds()
 			var speed float64
@@ -310,21 +358,7 @@ func (d *HTTPDownloader) concurrentDownload(ctx context.Context, file *os.File, 
 }
 
 func (d *HTTPDownloader) downloadChunk(ctx context.Context, file *os.File, offset, length, totalSize int64) error {
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return types.ErrMaxRedirects
-			}
-			if len(via) > 0 {
-				for key, val := range d.cfg.Headers {
-					if key != "Range" {
-						req.Header.Set(key, val)
-					}
-				}
-			}
-			return nil
-		},
-	}
+	client := d.makeHTTPClient()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.cfg.URL, nil)
 	if err != nil {
@@ -333,6 +367,7 @@ func (d *HTTPDownloader) downloadChunk(ctx context.Context, file *os.File, offse
 
 	req.Header.Set("User-Agent", d.runtime.GetUserAgent())
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+	req.Header.Set("Connection", "keep-alive")
 
 	for key, val := range d.cfg.Headers {
 		if key != "Range" {
@@ -391,14 +426,7 @@ func (d *HTTPDownloader) downloadChunk(ctx context.Context, file *os.File, offse
 }
 
 func (d *HTTPDownloader) sequentialDownload(ctx context.Context, file *os.File) error {
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return types.ErrMaxRedirects
-			}
-			return nil
-		},
-	}
+	client := d.makeHTTPClient()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.cfg.URL, nil)
 	if err != nil {
@@ -406,8 +434,40 @@ func (d *HTTPDownloader) sequentialDownload(ctx context.Context, file *os.File) 
 	}
 
 	req.Header.Set("User-Agent", d.runtime.GetUserAgent())
+	req.Header.Set("Connection", "keep-alive")
 	for key, val := range d.cfg.Headers {
 		req.Header.Set(key, val)
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+		}
+
+		lastErr = d.doSequentialRequest(ctx, client, req, file)
+		if lastErr == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+	}
+
+	return lastErr
+}
+
+func (d *HTTPDownloader) doSequentialRequest(ctx context.Context, client *http.Client, origReq *http.Request, file *os.File) error {
+	req := origReq.Clone(ctx)
+
+	currentProgress := d.Progress()
+	resumeOffset := currentProgress.Downloaded
+	if resumeOffset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeOffset))
 	}
 
 	resp, err := client.Do(req)
@@ -416,12 +476,19 @@ func (d *HTTPDownloader) sequentialDownload(ctx context.Context, file *os.File) 
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return fmt.Errorf("rate limited (429)")
+	}
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && resumeOffset > 0 {
+			return nil
+		}
 		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 
 	buf := make([]byte, d.runtime.GetWorkerBufferSize())
-	var downloaded int64
+	var downloaded int64 = resumeOffset
 	startTime := time.Now()
 
 	for {
@@ -442,9 +509,9 @@ func (d *HTTPDownloader) sequentialDownload(ctx context.Context, file *os.File) 
 			elapsed := time.Since(startTime).Seconds()
 			var speed float64
 			if elapsed > 0 {
-				speed = float64(downloaded) / elapsed
+				speed = float64(downloaded-resumeOffset) / elapsed
 			}
-			d.updateProgress(downloaded, d.cfg.TotalSize, speed)
+			d.updateProgress(downloaded, d.progress.TotalSize, speed)
 		}
 
 		if readErr != nil {

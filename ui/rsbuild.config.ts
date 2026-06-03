@@ -6,6 +6,9 @@ const projectRoot = path.resolve(__dirname)
 
 export default defineConfig({
   plugins: [pluginReact()],
+  cache: {
+    enable: false,
+  },
   source: {
     entry: {
       index: './src/main.tsx',
@@ -13,6 +16,12 @@ export default defineConfig({
   },
   html: {
     template: './index.html',
+  },
+  output: {
+    distPath: {
+      root: 'dist',
+    },
+    assetPrefix: '/',
   },
   resolve: {
     alias: {
@@ -30,14 +39,8 @@ export default defineConfig({
       },
     },
   },
-  output: {
-    distPath: {
-      root: 'dist',
-    },
-    assetPrefix: '/',
-  },
   server: {
-    port: 3000,
+    port: 9245,
     strictPort: true,
   },
   dev: {

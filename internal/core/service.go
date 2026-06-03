@@ -122,7 +122,9 @@ func (s *LocalService) Cancel(id string) error {
 }
 
 func (s *LocalService) Remove(id string) error {
-	return s.manager.Remove(id)
+	err := s.manager.Remove(id)
+	s.manager.Cleanup(id)
+	return err
 }
 
 func (s *LocalService) GetStatus(id string) (*types.DownloadStatus, error) {
@@ -134,7 +136,7 @@ func (s *LocalService) List() ([]types.DownloadStatus, error) {
 }
 
 func (s *LocalService) History() ([]types.DownloadEntry, error) {
-	return s.db.ListDownloads("completed")
+	return s.db.ListFinishedDownloads()
 }
 
 func (s *LocalService) Shutdown() error {

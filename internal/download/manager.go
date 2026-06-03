@@ -3,6 +3,7 @@ package download
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,12 +15,12 @@ import (
 type OnDownloadDone func(id string, status string, err error)
 
 type Manager struct {
-	registry *protocol.ProtocolRegistry
-	runtime  *types.RuntimeConfig
-	active   map[string]*activeDownload
-	mu       sync.RWMutex
-	nextID   atomic.Int64
-	onDone   OnDownloadDone
+	registry    *protocol.ProtocolRegistry
+	runtime     *types.RuntimeConfig
+	active      map[string]*activeDownload
+	mu          sync.RWMutex
+	nextID      atomic.Int64
+	onDone      OnDownloadDone
 }
 
 type activeDownload struct {
@@ -55,7 +56,16 @@ func (m *Manager) Add(ctx context.Context, cfg *protocol.DownloadConfig) (string
 		return "", types.ErrDestRequired
 	}
 
-	p, _, err := m.registry.MatchURL(cfg.URL)
+	rawURL := cfg.URL
+	if !strings.HasPrefix(strings.ToLower(rawURL), "http://") && !strings.HasPrefix(strings.ToLower(rawURL), "https://") {
+		if strings.Contains(rawURL, "://") {
+			return "", fmt.Errorf("unsupported URL scheme, only http and https are supported (got: %s)", rawURL)
+		}
+		rawURL = "https://" + rawURL
+		cfg.URL = rawURL
+	}
+
+	p, _, err := m.registry.MatchURL(rawURL)
 	if err != nil {
 		return "", fmt.Errorf("no protocol found for URL: %w", err)
 	}
@@ -110,6 +120,12 @@ func (m *Manager) notifyDone(id string, status string, err error) {
 	if m.onDone != nil {
 		m.onDone(id, status, err)
 	}
+}
+
+func (m *Manager) Cleanup(id string) {
+	m.mu.Lock()
+	delete(m.active, id)
+	m.mu.Unlock()
 }
 
 func (m *Manager) Pause(id string) error {

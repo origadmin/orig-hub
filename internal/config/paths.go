@@ -57,3 +57,7 @@ func EnsureDirs() error {
 	}
 	return nil
 }
+
+func LocaleDir() string {
+	return filepath.Join(ConfigDir(), "locales")
+}
