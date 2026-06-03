@@ -26,7 +26,7 @@ type HTTPDownloader struct {
 	stateMu    sync.Mutex
 	progress   protocol.Progress
 	progressMu sync.Mutex
-	cancelFunc context.CancelFunc
+	cancelFunc atomic.Pointer[context.CancelFunc]
 	done       atomic.Bool
 	err        atomic.Pointer[error]
 }
@@ -49,7 +49,7 @@ func (d *HTTPDownloader) Download(ctx context.Context) error {
 	d.setState(protocol.DownloadStateDownloading)
 
 	downloadCtx, cancel := context.WithCancel(ctx)
-	d.cancelFunc = cancel
+	d.cancelFunc.Store(&cancel)
 	defer cancel()
 
 	outputPath := d.cfg.OutputPath
@@ -148,8 +148,8 @@ func (d *HTTPDownloader) Pause() error {
 	defer d.stateMu.Unlock()
 	if d.state == protocol.DownloadStateDownloading {
 		d.state = protocol.DownloadStatePausing
-		if d.cancelFunc != nil {
-			d.cancelFunc()
+		if cf := d.cancelFunc.Load(); cf != nil {
+			(*cf)()
 		}
 	}
 	return nil
@@ -179,8 +179,8 @@ func (d *HTTPDownloader) Cancel() error {
 	d.stateMu.Lock()
 	d.state = protocol.DownloadStateCancelled
 	d.stateMu.Unlock()
-	if d.cancelFunc != nil {
-		d.cancelFunc()
+	if cf := d.cancelFunc.Load(); cf != nil {
+		(*cf)()
 	}
 	return nil
 }

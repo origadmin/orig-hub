@@ -122,18 +122,68 @@ func (m *Manager) Shutdown() {
 }
 
 func (s *sessionImpl) run(ctx context.Context) {
+	// 进度轮询: 每 200ms 检查一次 downloader 状态
+	pollDone := make(chan struct{})
+	go s.pollProgress(ctx, pollDone)
+
 	err := s.downloader.Download(ctx)
+	close(pollDone)
+
 	if err != nil {
 		s.mu.Lock()
 		s.err = err.Error()
 		s.mu.Unlock()
-		s.done <- err
-	} else {
-		s.done <- nil
 	}
-	close(s.done)
+
+	// 完成/错误/取消时各触发一次
 	if s.handler != nil {
+		s.handler.OnStateChanged(s.id, s.downloader.State())
+		if p := s.downloader.Progress(); p != nil {
+			s.handler.OnProgress(s.id, p)
+		}
 		s.handler.OnCompleted(s.id, err)
+	}
+
+	s.done <- err
+	close(s.done)
+}
+
+// pollProgress: 在 run() 期间每 200ms 触发 OnStateChanged/OnProgress (只在状态/进度变化时)
+// 避免高频事件轰炸, 只有 Downloaded 增长超过 64KB 或状态变化时才 emit
+func (s *sessionImpl) pollProgress(ctx context.Context, done <-chan struct{}) {
+	const interval = 200 * time.Millisecond
+	const progressThreshold = 64 * 1024 // 64KB
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var lastDownloaded int64
+	var lastState protocol.DownloadState
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			if s.handler == nil {
+				continue
+			}
+			curState := s.downloader.State()
+			if curState != lastState {
+				lastState = curState
+				s.handler.OnStateChanged(s.id, curState)
+			}
+			p := s.downloader.Progress()
+			if p == nil {
+				continue
+			}
+			if p.Downloaded-lastDownloaded >= progressThreshold || curState == protocol.DownloadStateCompleted || curState == protocol.DownloadStateError || curState == protocol.DownloadStateCancelled {
+				lastDownloaded = p.Downloaded
+				s.handler.OnProgress(s.id, p)
+			}
+		}
 	}
 }
 

@@ -9,6 +9,8 @@ type BlockScheduler struct {
 	mu           sync.RWMutex
 	pieces       map[int]*PieceState
 	totalPieces  int
+	pieceSize    int64
+	totalSize    int64
 	allocations  map[int]string
 	failedCount  map[string]int
 }
@@ -28,11 +30,13 @@ func NewBlockScheduler() *BlockScheduler {
 	}
 }
 
-func (s *BlockScheduler) Init(totalPieces int) {
+func (s *BlockScheduler) Init(totalPieces int, pieceSize, totalSize int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.totalPieces = totalPieces
+	s.pieceSize = pieceSize
+	s.totalSize = totalSize
 	s.pieces = make(map[int]*PieceState)
 	s.allocations = make(map[int]string)
 
@@ -51,9 +55,14 @@ func (s *BlockScheduler) Allocate(sourceName string, cap SourceCapability) *Piec
 
 	for i, state := range s.pieces {
 		if !state.Downloaded && !state.Failed && state.AssignedTo == "" {
+			offset := int64(i) * s.pieceSize
+			size := s.pieceSize
+			if offset+size > s.totalSize {
+				size = s.totalSize - offset
+			}
 			state.AssignedTo = sourceName
 			s.allocations[i] = sourceName
-			return &Piece{Index: i}
+			return &Piece{Index: i, Offset: offset, Size: size}
 		}
 	}
 

@@ -74,6 +74,7 @@ func main() {
 	defer func() { _ = db.Close() }()
 
 	svc := service.NewLocalService(registry, cfg, db)
+	// 延迟注入 wailsApp.Event emitter (需先创建 wailsApp)
 
 	subFS, err := fs.Sub(assets, "ui/dist")
 	if err != nil {
@@ -89,6 +90,9 @@ func main() {
 			application.NewService(app.NewDownloadService(svc, cfg)),
 		},
 	})
+
+	// 把 wailsApp 的事件总线注入 LocalService, 让 download 进度/状态 emit 到前端
+	svc.SetEmitter(wailsApp.Event)
 
 	mainWindow := wailsApp.Window.NewWithOptions(application.WebviewWindowOptions{
 		Title:                      "Orig Hub",

@@ -106,12 +106,37 @@ export function useWailsEvents() {
       updateDownload(String(id), { status: 'cancelled' })
     })
 
+    // download:progress: 高频进度事件 (每下载 64KB 一次)
+    const off6 = Events.On('download:progress', (evt: unknown) => {
+      if (!evt || typeof evt !== 'object') return
+      const e = evt as Record<string, unknown>
+      const id = String(e.id ?? '')
+      if (!id) return
+      const downloaded = Number(e.downloaded ?? 0)
+      const total_size = Number(e.total_size ?? 0)
+      const speed = Number(e.speed ?? 0)
+      const progress = Number(e.progress ?? 0)
+      updateDownload(id, { downloaded, total_size, speed, progress })
+    })
+
+    // download:state: 状态变更事件 (后端 OnStateChanged emit)
+    const off7 = Events.On('download:state', (evt: unknown) => {
+      if (!evt || typeof evt !== 'object') return
+      const e = evt as Record<string, unknown>
+      const id = String(e.id ?? '')
+      const state = String(e.state ?? '')
+      if (!id || !state) return
+      updateDownload(id, { status: state as DownloadStatusValue })
+    })
+
     return () => {
       off1()
       off2()
       off3()
       off4()
       off5()
+      off6()
+      off7()
     }
   }, [updateDownloads, updateDownload])
 }
@@ -132,9 +157,11 @@ export function useDownloadPolling() {
         if (list && list.length > 0) {
           updateDownloads(list)
         } else if (!useMockData) {
-          enableMockData()
+          // 后端可达但无任务: 不 mock, 让 UI 显示空状态
+          updateDownloads([])
         }
       } catch {
+        // 后端不可达: fallback 到 mock (仅作为离线开发预览)
         if (!useMockData) {
           enableMockData()
         }

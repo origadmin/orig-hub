@@ -17,6 +17,7 @@ type LocalService struct {
 	taskQueue  task.Queue
 	db         *state.DB
 	cfg        *config.Settings
+	emitter    EventEmitter
 }
 
 func NewLocalService(registry *protocol.ProtocolRegistry, cfg *config.Settings, db *state.DB) *LocalService {
@@ -25,9 +26,40 @@ func NewLocalService(registry *protocol.ProtocolRegistry, cfg *config.Settings, 
 		taskQueue:  task.NewQueue(),
 		db:         db,
 		cfg:        cfg,
+		emitter:    noopEmitter{},
 	}
 	svc.sessionMgr.SetEventHandler(svc)
 	return svc
+}
+
+// SetEmitter: 注入事件发射器 (Wails application.Event / 其他实现)
+func (s *LocalService) SetEmitter(e EventEmitter) {
+	s.emitter = e
+}
+
+// EventEmitter: LocalService 通过该接口向前端 emit 事件
+// 返回值: true 表示 emit 成功 (与 wails application.EventManager.Emit 一致)
+type EventEmitter interface {
+	Emit(eventName string, data ...any) bool
+}
+
+type noopEmitter struct{}
+
+func (noopEmitter) Emit(string, ...any) bool { return true }
+
+// 下载状态变更的 wire 格式 (与 wails TypeScript 一致)
+type downloadProgressEvent struct {
+	ID          string  `json:"id"`
+	Downloaded  int64   `json:"downloaded"`
+	TotalSize   int64   `json:"total_size"`
+	Speed       int64   `json:"speed"`
+	Connections int     `json:"connections"`
+	Progress    float64 `json:"progress"`
+}
+
+type downloadStateEvent struct {
+	ID    string `json:"id"`
+	State string `json:"state"`
 }
 
 func (s *LocalService) Add(ctx context.Context, url, outputPath, filename string, mirrors []string, headers map[string]string) (string, error) {
@@ -191,5 +223,47 @@ func (s *LocalService) OnCompleted(id string, err error) {
 	_ = s.db.UpdateDownloadEntry(entry)
 }
 
-func (s *LocalService) OnStateChanged(id string, state protocol.DownloadState) {}
-func (s *LocalService) OnProgress(id string, progress *protocol.Progress)   {}
+func (s *LocalService) OnStateChanged(id string, state protocol.DownloadState) {
+	wire := downloadStateEvent{ID: id, State: stateToWire(state)}
+	s.emitter.Emit("download:state", wire)
+}
+
+// stateToWire: 将 protocol.DownloadState 转为前端期望的小写字符串
+// (state.String() 返回 "Queued"/"Downloading" 等, 前端用 'queued'/'downloading')
+func stateToWire(state protocol.DownloadState) string {
+	switch state {
+	case protocol.DownloadStateQueued:
+		return "queued"
+	case protocol.DownloadStateProbing:
+		return "probing"
+	case protocol.DownloadStateDownloading:
+		return "downloading"
+	case protocol.DownloadStatePausing, protocol.DownloadStatePaused:
+		return "paused"
+	case protocol.DownloadStateCompleted:
+		return "completed"
+	case protocol.DownloadStateCancelled:
+		return "cancelled"
+	case protocol.DownloadStateError:
+		return "error"
+	default:
+		return "queued"
+	}
+}
+
+func (s *LocalService) OnProgress(id string, progress *protocol.Progress) {
+	if progress == nil {
+		return
+	}
+	wire := downloadProgressEvent{
+		ID:          id,
+		Downloaded:  progress.Downloaded,
+		TotalSize:   progress.TotalSize,
+		Speed:       int64(progress.Speed),
+		Connections: progress.Connections,
+	}
+	if progress.TotalSize > 0 {
+		wire.Progress = float64(progress.Downloaded) / float64(progress.TotalSize) * 100
+	}
+	s.emitter.Emit("download:progress", wire)
+}

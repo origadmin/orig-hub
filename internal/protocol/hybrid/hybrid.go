@@ -522,7 +522,7 @@ type HybridDownloader struct {
 	stateMu    sync.RWMutex
 	progress   protocol.Progress
 	progressMu sync.RWMutex
-	cancel     context.CancelFunc
+	cancel     atomic.Pointer[context.CancelFunc]
 	done       chan struct{}
 	started    atomic.Bool
 }
@@ -534,7 +534,7 @@ func (d *HybridDownloader) Download(ctx context.Context) error {
 
 	d.setState(protocol.DownloadStateDownloading)
 	downloadCtx, cancel := context.WithCancel(ctx)
-	d.cancel = cancel
+	d.cancel.Store(&cancel)
 	d.done = make(chan struct{})
 
 	defer close(d.done)
@@ -550,11 +550,23 @@ func (d *HybridDownloader) Download(ctx context.Context) error {
 		return fmt.Errorf("get metadata: %w", err)
 	}
 
+	if meta.FileSize <= 0 {
+		d.setState(protocol.DownloadStateError)
+		return fmt.Errorf("invalid file size: %d", meta.FileSize)
+	}
+	if meta.PieceSize <= 0 {
+		meta.PieceSize = 1024 * 1024 // 1MB default
+	}
+	if meta.PieceCount <= 0 {
+		meta.PieceCount = int((meta.FileSize + meta.PieceSize - 1) / meta.PieceSize)
+	}
+
 	if err := d.pieceMgr.Init(meta.FileSize, meta.PieceSize); err != nil {
 		d.setState(protocol.DownloadStateError)
 		return fmt.Errorf("init piece manager: %w", err)
 	}
 
+	d.scheduler.Init(meta.PieceCount, meta.PieceSize, meta.FileSize)
 	d.startSourceWorkers(downloadCtx, meta)
 
 	err = d.waitForCompletion(downloadCtx, meta.FileSize)
@@ -576,6 +588,10 @@ func (d *HybridDownloader) discoverSources(ctx context.Context) error {
 	for _, src := range d.sources {
 		if err := src.Open(ctx); err != nil {
 			return fmt.Errorf("open source %s: %w", src.Name(), err)
+		}
+		// 预热 metadata,避免 FetchPiece 第一次调用时 s.metadata 为 nil
+		if _, err := src.GetMetadata(ctx); err != nil {
+			return fmt.Errorf("get metadata from %s: %w", src.Name(), err)
 		}
 	}
 	if len(d.sources) == 0 {
@@ -696,8 +712,8 @@ func (d *HybridDownloader) Resume(ctx context.Context) error {
 }
 
 func (d *HybridDownloader) Cancel() error {
-	if d.cancel != nil {
-		d.cancel()
+	if cf := d.cancel.Load(); cf != nil {
+		(*cf)()
 	}
 	d.setState(protocol.DownloadStateCancelled)
 	return nil
