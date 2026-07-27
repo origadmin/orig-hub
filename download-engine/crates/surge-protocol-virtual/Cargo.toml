@@ -1,0 +1,11 @@
+[package]
+name = "surge-protocol-virtual"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libsurge = { path = "../libsurge" }
+async-trait.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

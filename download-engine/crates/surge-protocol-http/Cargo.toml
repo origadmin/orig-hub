@@ -1,0 +1,14 @@
+[package]
+name = "surge-protocol-http"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libsurge = { path = "../libsurge" }
+async-trait.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+reqwest.workspace = true
+futures.workspace = true

@@ -1,0 +1,7 @@
+# Rust 构建产物
+/target
+**/target
+
+# 验收脚本产生的临时文件
+/verify/dl_test
+*.log

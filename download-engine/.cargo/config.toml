@@ -1,0 +1,10 @@
+# 国内 cargo 镜像源（rsproxy.cn），加速 crates.io 依赖拉取。
+# 仅作用于本 download-engine workspace，不污染用户全局 ~/.cargo 配置。
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[registries.rsproxy]
+index = "sparse+https://rsproxy.cn/index/"
