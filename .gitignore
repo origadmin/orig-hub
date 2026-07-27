@@ -70,14 +70,11 @@ _gitstatus.txt
 _back/
 
 # team-flow v3 runtime (per-flow state, not for repo)
-.team/state/
-.team/sessions/
-.team/.flow_update_cache.json
-.team/state.yaml
-.team/constraints.md
-.team/project.yaml
-.team/skills-resolved.yaml
-.team/flows/
+# Whole .team/ is the AI-rules / assistant runtime dir — PURGED from git
+# history on 2026-07-27. Ignore the entire directory so it can never be
+# re-committed (the previously committed .team/project.md and .team/version
+# were removed from all of history).
+.team/**
 
 # Beads runtime (issue tracker local state, NEVER commit)
 .beads/
