@@ -337,11 +337,12 @@ async fn events(
 
 /// 枚举本机网卡（供 UI 多网卡配置页展示）。
 ///
-/// 返回**所有 up 网卡**（含未启用的附属候选），附 enabled 标记；
-/// 主网卡 always enabled。前端据此渲染「主网卡（固定）+ 附属网卡（可选开关）」。
+/// 返回**全部适配器**（含断开/无 IP 的物理网卡，附 `connected` 标记）；
+/// 主网卡 always enabled；虚拟网卡（Hyper-V/WSL/隧道等）标记 is_virtual 由前端折叠。
+/// 前端据此渲染：主网卡（固定）+ 可用附属网卡（可选开关）+ 未连接网卡（禁用）。
 async fn list_interfaces() -> axum::Json<serde_json::Value> {
-    // 全部网卡（up 非虚拟；含主网卡标记）
-    let all = surge_net::list_interfaces().unwrap_or_default();
+    // 全部适配器（Windows: GetAdaptersAddresses；其它平台退化为 up 网卡）
+    let all = surge_net::list_all_adapters().unwrap_or_default();
     // 默认池（主网卡）用于判断 enabled
     let pool = surge_net::InterfacePool::resolve(None)
         .unwrap_or_else(|_| surge_net::InterfacePool::default());
@@ -355,15 +356,15 @@ async fn list_interfaces() -> axum::Json<serde_json::Value> {
     let mut primary_out: Option<serde_json::Value> = None;
     let mut secondaries: Vec<serde_json::Value> = Vec::new();
     for nic in all {
-        // 只展示 up 且非虚拟的物理/逻辑网卡（虚拟网卡不进多网卡选择）
-        if nic.is_virtual {
-            continue;
-        }
+        let connected = nic.ip.is_some() && nic.is_up;
         let entry = serde_json::json!({
             "name": nic.name,
-            "ip": nic.ip.to_string(),
+            "description": nic.description,
+            "ip": nic.ip.map(|i| i.to_string()),
             "is_default": nic.is_default,
-            "enabled": enabled_names.contains(&nic.name),
+            "connected": connected,
+            "is_virtual": nic.is_virtual,
+            "enabled": connected && (nic.is_default || enabled_names.contains(&nic.name)),
             "weight": if nic.is_default || enabled_names.contains(&nic.name) {
                 pool.members().iter().find(|m| m.name == nic.name).map(|m| m.weight).unwrap_or(1)
             } else {
@@ -381,13 +382,14 @@ async fn list_interfaces() -> axum::Json<serde_json::Value> {
             "name": pool.primary.name,
             "ip": pool.primary.ip.to_string(),
             "is_default": true,
+            "connected": true,
+            "is_virtual": false,
             "enabled": true,
             "weight": pool.primary.weight,
         })),
         "secondaries": secondaries,
     }))
 }
-
 /// 构造路由树（含鉴权中间件）。
 pub fn router(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()

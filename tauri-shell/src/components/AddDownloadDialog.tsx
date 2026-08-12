@@ -167,50 +167,66 @@ export function AddDownloadDialog({ open, onClose }: Props) {
                 {ifaces.length === 0 && (
                   <p className="text-xs text-muted">未检测到网卡</p>
                 )}
-                {ifaces.map((nic) => (
-                  <div
-                    key={nic.name}
-                    className="flex items-center justify-between gap-2 text-xs"
-                  >
-                    <label
-                      className={`flex flex-1 cursor-pointer items-center gap-2 ${
-                        nic.is_default ? '' : 'cursor-pointer'
+                {ifaces.map((nic) => {
+                  const usable = nic.connected && !nic.is_virtual
+                  return (
+                    <div
+                      key={nic.name}
+                      className={`flex items-center justify-between gap-2 text-xs ${
+                        usable ? '' : 'opacity-50'
                       }`}
                     >
-                      <input
-                        type="checkbox"
-                        checked={enabled[nic.name] ?? nic.is_default}
-                        disabled={nic.is_default}
-                        onChange={() => toggleIface(nic.name, nic.is_default)}
-                        className="accent-accent"
-                      />
-                      <span className="font-medium text-zinc-200">{nic.name}</span>
-                      {nic.is_default && (
-                        <span className="text-[9px] text-accent">主</span>
-                      )}
-                      <span className="font-mono text-muted">{nic.ip}</span>
-                    </label>
-                    <div className="flex items-center gap-1">
-                      <span className="text-[10px] text-muted">权重</span>
-                      <Input
-                        type="number"
-                        min={1}
-                        max={99}
-                        value={weights[nic.name] ?? '1'}
-                        onChange={(e) =>
-                          setWeights((w) => ({
-                            ...w,
-                            [nic.name]: e.target.value,
-                          }))
-                        }
-                        disabled={!(enabled[nic.name] ?? nic.is_default)}
-                        className="h-6 w-14 px-1.5 text-xs"
-                      />
+                      <label
+                        className={`flex flex-1 items-center gap-2 ${
+                          usable && !nic.is_default ? 'cursor-pointer' : ''
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={enabled[nic.name] ?? nic.is_default}
+                          disabled={nic.is_default || !usable}
+                          onChange={() => toggleIface(nic.name, nic.is_default)}
+                          className="accent-accent"
+                        />
+                        <span className="font-medium text-zinc-200">{nic.name}</span>
+                        {nic.is_default && (
+                          <span className="text-[9px] text-accent">主</span>
+                        )}
+                        {nic.is_virtual && (
+                          <span className="text-[9px] text-muted">虚拟</span>
+                        )}
+                        {!nic.connected && (
+                          <span className="text-[9px] text-danger">未连接</span>
+                        )}
+                        <span className="font-mono text-muted">
+                          {nic.ip ?? '—'}
+                        </span>
+                      </label>
+                      <div className="flex items-center gap-1">
+                        <span className="text-[10px] text-muted">权重</span>
+                        <Input
+                          type="number"
+                          min={1}
+                          max={99}
+                          value={weights[nic.name] ?? '1'}
+                          onChange={(e) =>
+                            setWeights((w) => ({
+                              ...w,
+                              [nic.name]: e.target.value,
+                            }))
+                          }
+                          disabled={
+                            !(enabled[nic.name] ?? nic.is_default) || !usable
+                          }
+                          className="h-6 w-14 px-1.5 text-xs"
+                        />
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  )
+                })}
                 <p className="pt-1 text-[10px] leading-relaxed text-muted">
-                  主网卡固定参与；勾选附属网卡并按权重分配并发连接（默认 1:1）。
+                  主网卡固定参与；已连接的非虚拟网卡可勾选并按权重分配并发（默认 1:1）。
+                  未连接或虚拟网卡不可用。
                 </p>
               </div>
             )}
