@@ -14,4 +14,4 @@ pub mod pool;
 pub mod probe;
 
 pub use pool::{InterfacePool, InterfaceSpec, PoolMember, Weight};
-pub use probe::{NetInterface, ProbeError, list_interfaces, primary_interface};
+pub use probe::{AdapterInfo, NetInterface, ProbeError, list_all_adapters, list_interfaces, primary_interface};

@@ -30,8 +30,15 @@ export interface DownloadStatus {
 
 export interface NetworkInterface {
   name: string
-  ip: string
+  /** Windows 友好名（如 Intel(R) Ethernet Connection），非 Windows 为 null */
+  description?: string | null
+  /** 主 IPv4；未连接/无地址为 null */
+  ip: string | null
   is_default: boolean
+  /** 是否已连接（有 IP 且 up）——只有 connected 才能参与加速 */
+  connected: boolean
+  /** 虚拟网卡（Hyper-V/WSL/隧道/Wi-Fi Direct） */
+  is_virtual: boolean
   /** 是否在默认参与池（主网卡 true） */
   enabled: boolean
   /** 权重（≥1，默认 1） */
