@@ -4,10 +4,32 @@ import {
   addDownload as apiAddDownload,
   downloadAction as apiDownloadAction,
   listDownloads,
+  listInterfaces,
   removeDownload as apiRemoveDownload,
   subscribeEvents,
 } from '../api/daemon'
 import type { AddDownloadRequest } from '../types'
+
+const SETTINGS_KEY = 'orig-hub:settings'
+
+/** 读取持久化设置（localStorage）；不存在时返回默认值 */
+function loadSettings(): AppSettings {
+  const defaults: AppSettings = {
+    maxConnections: 8,
+    downloadDirectory: '',
+    autoStart: true,
+    notifications: true,
+    theme: 'dark',
+    enabledInterfaces: {},
+  }
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY)
+    if (!raw) return defaults
+    return { ...defaults, ...(JSON.parse(raw) as Partial<AppSettings>) }
+  } catch {
+    return defaults
+  }
+}
 
 interface DownloadState {
   /** 当前任务列表 */
@@ -30,19 +52,14 @@ interface DownloadState {
   remove: (id: string) => Promise<void>
   clearCompleted: () => Promise<void>
   updateSettings: (patch: Partial<AppSettings>) => void
+  applyInterfaces: () => Promise<void>
   setError: (e: string | null) => void
 }
 
 export const useStore = create<DownloadState>((set, get) => ({
   downloads: [],
   daemon: null,
-  settings: {
-    maxConnections: 8,
-    downloadDirectory: '',
-    autoStart: true,
-    notifications: true,
-    theme: 'dark',
-  },
+  settings: loadSettings(),
   connected: false,
   loading: false,
   error: null,
@@ -145,7 +162,38 @@ export const useStore = create<DownloadState>((set, get) => ({
   },
 
   updateSettings: (patch) =>
-    set((s) => ({ settings: { ...s.settings, ...patch } })),
+    set((s) => {
+      const settings = { ...s.settings, ...patch }
+      try {
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings))
+      } catch {
+        // 忽略持久化失败（隐私模式等）
+      }
+      return { settings }
+    }),
+
+  /** 设置页保存后应用到 daemon（默认多网卡池）。 */
+  applyInterfaces: async () => {
+    // 已连接的非虚拟网卡，且在主网卡之外被勾选 → 提交为默认池
+    const { settings } = get()
+    try {
+      const { primary, secondaries } = await listInterfaces()
+      const enabled: Record<string, number> = {}
+      for (const nic of [primary, ...(secondaries ?? [])]) {
+        if (!nic || nic.is_default) continue
+        if (nic.connected && !nic.is_virtual && settings.enabledInterfaces[nic.name]) {
+          enabled[nic.name] =
+            Math.max(1, Number(settings.enabledInterfaces[nic.name]) || 1)
+        }
+      }
+      // TODO(phase): daemon 暂无「设置默认池」端点；此处预留：
+      //   await apiSetDefaultInterfaces(enabled)
+      // 当前实现：全局选择仅持久化 + 下载弹窗自动带入。
+      void enabled
+    } catch {
+      // daemon 不可达时静默失败
+    }
+  },
 
   setError: (e) => set({ error: e }),
 }))
