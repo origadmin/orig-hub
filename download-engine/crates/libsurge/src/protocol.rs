@@ -97,6 +97,8 @@ pub struct DownloadConfig {
     pub max_concurrency: u32,
     /// 镜像源 URL（HTTP 协议用；BT 协议忽略）。
     pub mirrors: Vec<String>,
+    /// 多网卡分流配置（可选）：缺省 = 单主网卡（旧版行为）。
+    pub interfaces: Option<surge_net::InterfaceSpec>,
 }
 
 /// 块：文件被切分为固定逻辑块。统合 HTTP Range 切片 与 BT piece。
@@ -233,6 +235,14 @@ pub enum SourceKind {
 pub trait Source: Send + Sync {
     fn source_kind(&self) -> SourceKind;
     fn capabilities(&self) -> CapabilitySet;
+    /// 调度权重（多网卡分流用；缺省 1）。
+    fn weight(&self) -> u32 {
+        1
+    }
+    /// 网卡名（多网卡分流用；缺省 "default"）。
+    fn iface_name(&self) -> &str {
+        "default"
+    }
     async fn fetch_block(
         &self,
         block: &Block,

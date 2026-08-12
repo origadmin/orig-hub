@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 libsurge = { path = "../libsurge" }
+surge-net = { path = "../surge-net" }
 surge-protocol-virtual = { path = "../surge-protocol-virtual" }
 surge-protocol-http = { path = "../surge-protocol-http" }
 async-trait.workspace = true

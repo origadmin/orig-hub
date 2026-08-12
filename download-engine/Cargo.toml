@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/libsurge",
+    "crates/surge-net",
     "crates/surge-protocol-virtual",
     "crates/surge-protocol-http",
     "crates/surge-daemon",
@@ -24,3 +25,4 @@ uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 thiserror = "1"
 reqwest = { version = "0.12", features = ["stream"] }
+if-addrs = "0.13"
