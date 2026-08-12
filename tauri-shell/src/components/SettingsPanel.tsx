@@ -12,13 +12,27 @@ export function SettingsPanel() {
   const [interfaces, setInterfaces] = useState<NetworkInterface[]>([])
   const [maxConnections, setMaxConnections] = useState(String(settings.maxConnections))
   const [dir, setDir] = useState(settings.downloadDirectory)
+  // 局部编辑态：全局选中 + 权重（保存时写入 settings.enabledInterfaces）
+  const [enabled, setEnabled] = useState<Record<string, boolean>>({})
+  const [weights, setWeights] = useState<Record<string, string>>({})
+  const [saved, setSaved] = useState(false)
 
   useEffect(() => {
     listInterfaces()
       .then(({ primary, secondaries }) => {
-        setInterfaces([primary, ...(secondaries ?? [])].filter(Boolean))
+        const all = [primary, ...(secondaries ?? [])].filter(Boolean)
+        setInterfaces(all)
+        const en: Record<string, boolean> = {}
+        const w: Record<string, string> = {}
+        for (const nic of all) {
+          en[nic.name] = settings.enabledInterfaces[nic.name] != null
+          w[nic.name] = String(settings.enabledInterfaces[nic.name] ?? 1)
+        }
+        setEnabled(en)
+        setWeights(w)
       })
       .catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   return (
@@ -63,6 +77,7 @@ export function SettingsPanel() {
           )}
           {interfaces.map((iface) => {
             const usable = iface.connected && !iface.is_virtual
+            const isOn = enabled[iface.name] ?? false
             return (
               <div
                 key={iface.name}
@@ -70,7 +85,20 @@ export function SettingsPanel() {
                   usable ? '' : 'opacity-50'
                 }`}
               >
-                <div className="flex items-center gap-2">
+                <label
+                  className={`flex flex-1 items-center gap-2 ${
+                    usable && !iface.is_default ? 'cursor-pointer' : ''
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={iface.is_default || isOn}
+                    disabled={iface.is_default || !usable}
+                    onChange={() =>
+                      setEnabled((e) => ({ ...e, [iface.name]: !isOn }))
+                    }
+                    className="accent-accent"
+                  />
                   <span
                     className={`h-1.5 w-1.5 rounded-full ${
                       iface.connected ? 'bg-success' : 'bg-muted'
@@ -86,24 +114,38 @@ export function SettingsPanel() {
                   {!iface.connected && (
                     <Badge variant="outline" className="text-[9px] text-danger">未连接</Badge>
                   )}
-                </div>
+                </label>
                 <div className="flex items-center gap-2">
                   {iface.description && (
-                    <span className="hidden max-w-[220px] truncate text-[10px] text-muted md:inline">
+                    <span className="hidden max-w-[180px] truncate text-[10px] text-muted md:inline">
                       {iface.description}
                     </span>
                   )}
-                  <span className="font-mono text-muted">
-                    {iface.ip ?? '—'} · w{iface.weight}
+                  <span className="hidden font-mono text-muted md:inline">
+                    {iface.ip ?? '—'}
                   </span>
+                  <div className="flex items-center gap-1">
+                    <span className="text-[10px] text-muted">权重</span>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={99}
+                      value={weights[iface.name] ?? '1'}
+                      onChange={(e) =>
+                        setWeights((w) => ({ ...w, [iface.name]: e.target.value }))
+                      }
+                      disabled={iface.is_default || !usable || !isOn}
+                      className="h-6 w-14 px-1.5 text-xs"
+                    />
+                  </div>
                 </div>
               </div>
             )
           })}
         </div>
         <p className="text-[11px] leading-relaxed text-muted">
-          主网卡自动参与；已连接的非虚拟网卡可加入多网卡加速（在下载弹窗中开启）；
-          未连接（无 IP）或虚拟网卡不可用。
+          勾选要参与分流的网卡并设置权重；主网卡自动参与。保存后全局生效，
+          新建下载时自动带入；未连接（无 IP）或虚拟网卡不可用。
         </p>
       </section>
 
@@ -131,13 +173,25 @@ export function SettingsPanel() {
         <Button variant="ghost">恢复默认</Button>
         <Button
           onClick={() => {
+            // 组装全局启用的网卡（主网卡不在此列）
+            const enabledInterfaces: Record<string, number> = {}
+            for (const nic of interfaces) {
+              if (nic.is_default) continue
+              if (nic.connected && !nic.is_virtual && enabled[nic.name]) {
+                enabledInterfaces[nic.name] =
+                  Math.max(1, Number(weights[nic.name]) || 1)
+              }
+            }
             updateSettings({
               maxConnections: Number(maxConnections) || 8,
               downloadDirectory: dir,
+              enabledInterfaces,
             })
+            setSaved(true)
+            setTimeout(() => setSaved(false), 1500)
           }}
         >
-          保存
+          {saved ? '已保存 ✓' : '保存'}
         </Button>
       </div>
     </div>
