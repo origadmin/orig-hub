@@ -74,4 +74,6 @@ export interface AppSettings {
   autoStart: boolean
   notifications: boolean
   theme: ThemeValue
+  /** 全局启用的多网卡名单（网卡名 → 权重）；主网卡始终参与不在此列 */
+  enabledInterfaces: Record<string, number>
 }

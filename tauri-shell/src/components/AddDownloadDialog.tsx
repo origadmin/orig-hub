@@ -13,7 +13,7 @@ interface Props {
 }
 
 export function AddDownloadDialog({ open, onClose }: Props) {
-  const { addDownload, setError } = useStore()
+  const { addDownload, setError, settings } = useStore()
   const [url, setUrl] = useState('')
   const [filename, setFilename] = useState('')
   const [outputPath, setOutputPath] = useState('')
@@ -35,13 +35,18 @@ export function AddDownloadDialog({ open, onClose }: Props) {
         const en: Record<string, boolean> = {}
         const w: Record<string, string> = {}
         for (const nic of all) {
-          en[nic.name] = nic.is_default || nic.enabled
-          w[nic.name] = String(nic.weight || 1)
+          // 全局设置优先：勾选过的附属网卡默认选中；否则回退 daemon 的 enabled
+          const globalOn = settings.enabledInterfaces[nic.name] != null
+          en[nic.name] = nic.is_default || globalOn || nic.enabled
+          w[nic.name] = String(
+            settings.enabledInterfaces[nic.name] ?? nic.weight ?? 1,
+          )
         }
         setEnabled(en)
         setWeights(w)
       })
       .catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
 
   if (!open) return null
