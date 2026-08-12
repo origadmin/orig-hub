@@ -50,6 +50,9 @@ pub struct AddReq {
     pub mirrors: Vec<String>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// 多网卡分流配置（可选）：{"primary_weight":1,"secondaries":{"网卡名":2}}
+    #[serde(default)]
+    pub interfaces: Option<surge_net::InterfaceSpec>,
 }
 
 #[derive(Deserialize)]
@@ -182,6 +185,7 @@ async fn add(
         block_size: 1 << 20,
         max_concurrency: st.config.max_connections,
         mirrors: req.mirrors.clone(),
+        interfaces: req.interfaces.clone(),
     };
 
     let sources = match proto.create_sources(&parsed, &cfg).await {
@@ -331,6 +335,27 @@ async fn events(
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
+/// 枚举本机网卡（供 UI 多网卡配置页展示）。
+async fn list_interfaces() -> axum::Json<serde_json::Value> {
+    let pool = surge_net::InterfacePool::resolve(None)
+        .unwrap_or_else(|_| surge_net::InterfacePool::default());
+    axum::Json(serde_json::json!({
+        "primary": {
+            "name": pool.primary.name,
+            "ip": pool.primary.ip.to_string(),
+            "weight": pool.primary.weight,
+            "is_default": true,
+        },
+        "secondaries": pool.secondaries.iter().map(|m| {
+            serde_json::json!({
+                "name": m.name,
+                "ip": m.ip.to_string(),
+                "weight": m.weight,
+            })
+        }).collect::<Vec<_>>(),
+    }))
+}
+
 /// 构造路由树（含鉴权中间件）。
 pub fn router(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()
@@ -341,6 +366,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             get(get_one).post(action).delete(delete_one),
         )
         .route("/api/events", get(events))
+        .route("/api/interfaces", get(list_interfaces))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
