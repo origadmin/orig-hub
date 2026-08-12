@@ -53,39 +53,57 @@ export function SettingsPanel() {
       <section className="space-y-3 rounded-lg border border-border-subtle bg-surface p-4">
         <div className="flex items-center justify-between">
           <h3 className="text-sm font-medium text-zinc-200">多网卡分流</h3>
-          <Badge variant="secondary">{interfaces.length} 个网卡</Badge>
+          <Badge variant="secondary">
+            {interfaces.filter((i) => i.connected).length} 个已连接
+          </Badge>
         </div>
         <div className="max-h-56 space-y-1.5 overflow-y-auto pr-1">
           {interfaces.length === 0 && (
             <p className="text-xs text-muted">daemon 未连接，无法枚举网卡</p>
           )}
-          {interfaces.map((iface) => (
-            <div
-              key={iface.name}
-              className="flex items-center justify-between rounded-md bg-surface-2/60 px-3 py-2 text-xs"
-            >
-              <div className="flex items-center gap-2">
-                <span
-                  className={`h-1.5 w-1.5 rounded-full ${
-                    iface.enabled ? 'bg-success' : 'bg-muted'
-                  }`}
-                />
-                <span className="font-medium text-zinc-200">{iface.name}</span>
-                {iface.is_default && (
-                  <Badge variant="default" className="text-[9px]">主</Badge>
-                )}
-                {!iface.enabled && !iface.is_default && (
-                  <Badge variant="outline" className="text-[9px]">未启用</Badge>
-                )}
+          {interfaces.map((iface) => {
+            const usable = iface.connected && !iface.is_virtual
+            return (
+              <div
+                key={iface.name}
+                className={`flex items-center justify-between rounded-md bg-surface-2/60 px-3 py-2 text-xs ${
+                  usable ? '' : 'opacity-50'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${
+                      iface.connected ? 'bg-success' : 'bg-muted'
+                    }`}
+                  />
+                  <span className="font-medium text-zinc-200">{iface.name}</span>
+                  {iface.is_default && (
+                    <Badge variant="default" className="text-[9px]">主</Badge>
+                  )}
+                  {iface.is_virtual && (
+                    <Badge variant="outline" className="text-[9px]">虚拟</Badge>
+                  )}
+                  {!iface.connected && (
+                    <Badge variant="outline" className="text-[9px] text-danger">未连接</Badge>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  {iface.description && (
+                    <span className="hidden max-w-[220px] truncate text-[10px] text-muted md:inline">
+                      {iface.description}
+                    </span>
+                  )}
+                  <span className="font-mono text-muted">
+                    {iface.ip ?? '—'} · w{iface.weight}
+                  </span>
+                </div>
               </div>
-              <span className="font-mono text-muted">
-                {iface.ip} · w{iface.weight}
-              </span>
-            </div>
-          ))}
+            )
+          })}
         </div>
         <p className="text-[11px] leading-relaxed text-muted">
-          主网卡自动参与；附属网卡需在下载配置中显式开启才参与调度。
+          主网卡自动参与；已连接的非虚拟网卡可加入多网卡加速（在下载弹窗中开启）；
+          未连接（无 IP）或虚拟网卡不可用。
         </p>
       </section>
 

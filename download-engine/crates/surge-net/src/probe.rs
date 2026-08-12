@@ -164,3 +164,149 @@ fn default_route_iface_name() -> Option<String> {
 pub fn parse_ipv4(s: &str) -> Option<Ipv4Addr> {
     s.parse().ok()
 }
+
+/// 完整适配器（含未连接/无 IP 的物理网卡）。
+/// 与 `list_interfaces`（只返回有 IP 的 up 网卡）互补：
+/// - Windows：`GetAdaptersAddresses` 枚举全部适配器，附 OperStatus（up/down）与友好名；
+/// - 非 Windows：退化为 `list_interfaces`（getifaddrs 语义）。
+/// 用于 UI「所有网卡」视图，让用户看到断开/未启用的物理网卡（如 Wi-Fi 未连接）。
+#[derive(Debug, Clone, Serialize)]
+pub struct AdapterInfo {
+    /// 适配器名（如 `以太网` / `WLAN`）。
+    pub name: String,
+    /// Windows 友好名（如 `Intel(R) Ethernet Connection (16) I219-V`），非 Windows 为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 主 IPv4（无则 None，表示未连接/无地址）。
+    pub ip: Option<Ipv4Addr>,
+    pub is_up: bool,
+    pub is_default: bool,
+    pub is_virtual: bool,
+}
+
+/// 枚举全部适配器（含断开/无 IP）。
+#[cfg(windows)]
+pub fn list_all_adapters() -> Result<Vec<AdapterInfo>, ProbeError> {
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_SUCCESS};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, GAA_FLAG_INCLUDE_PREFIX,
+        IF_TYPE_SOFTWARE_LOOPBACK,
+    };
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_UNSPEC, SOCKADDR, SOCKADDR_IN,
+    };
+
+    // 先查所需缓冲区大小
+    let mut size: u32 = 0;
+    let ret = unsafe {
+        GetAdaptersAddresses(
+            AF_UNSPEC as u32,
+            GAA_FLAG_INCLUDE_PREFIX,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if ret != ERROR_BUFFER_OVERFLOW {
+        // 无适配器或其它错误
+        return Ok(Vec::new());
+    }
+
+    let mut buf = vec![0u8; size as usize];
+    let ret = unsafe {
+        GetAdaptersAddresses(
+            AF_UNSPEC as u32,
+            GAA_FLAG_INCLUDE_PREFIX,
+            std::ptr::null(),
+            buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+            &mut size,
+        )
+    };
+    if ret != ERROR_SUCCESS {
+        return Err(ProbeError::Other(format!(
+            "GetAdaptersAddresses failed: {ret}"
+        )));
+    }
+
+    let mut out = Vec::new();
+    let mut cur = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    while !cur.is_null() {
+        let a = unsafe { &*cur };
+        let name = unsafe { wide_to_string(a.FriendlyName) }
+            .unwrap_or_else(|| "unknown".to_string());
+        let description = unsafe { wide_to_string(a.Description) };
+        let is_up = a.OperStatus == 1; // IfOperStatusUp
+        let is_virtual = is_virtual_name(&name)
+            || is_virtual_name(description.as_deref().unwrap_or(""));
+        let is_loopback = a.IfType == IF_TYPE_SOFTWARE_LOOPBACK;
+
+        // 取第一个 IPv4 单播地址
+        let mut ip: Option<Ipv4Addr> = None;
+        let mut ua = a.FirstUnicastAddress;
+        while !ua.is_null() && ip.is_none() {
+            let sockaddr = unsafe { &*(*ua).Address.lpSockaddr as *const SOCKADDR };
+            let family = unsafe { (*sockaddr).sa_family };
+            if family == AF_INET as u16 {
+                let sa_in = unsafe { &*(sockaddr as *const SOCKADDR_IN) };
+                ip = Some(Ipv4Addr::from(unsafe { sa_in.sin_addr.S_un.S_addr }.to_ne_bytes()));
+            }
+            ua = unsafe { (*ua).Next };
+        }
+
+        if !is_loopback {
+            out.push(AdapterInfo {
+                name,
+                description,
+                ip,
+                is_up,
+                is_default: false,
+                is_virtual,
+            });
+        }
+        cur = unsafe { (*cur).Next };
+    }
+
+    // 主网卡标记：默认路由接口 IP
+    if let Some(primary_ip) = default_route_iface_ip() {
+        for a in out.iter_mut() {
+            if a.ip == Some(primary_ip) {
+                a.is_default = true;
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 枚举全部适配器（非 Windows 退化：只有有 IP 的 up 网卡）。
+#[cfg(not(windows))]
+pub fn list_all_adapters() -> Result<Vec<AdapterInfo>, ProbeError> {
+    Ok(list_interfaces()?
+        .into_iter()
+        .map(|i| AdapterInfo {
+            name: i.name,
+            description: None,
+            ip: Some(i.ip),
+            is_up: i.is_up,
+            is_default: i.is_default,
+            is_virtual: i.is_virtual,
+        })
+        .collect())
+}
+
+/// 把 UTF-16 宽字符串转 String（GetAdaptersAddresses 的 FriendlyName/Description）。
+#[cfg(windows)]
+unsafe fn wide_to_string(ptr: *const u16) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let len = (0..).take_while(|&i| *ptr.add(i) != 0).count();
+    if len == 0 {
+        return None;
+    }
+    let slice = std::slice::from_raw_parts(ptr, len);
+    Some(String::from_utf16_lossy(slice))
+}
+
+
+
