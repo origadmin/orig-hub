@@ -336,23 +336,55 @@ async fn events(
 }
 
 /// 枚举本机网卡（供 UI 多网卡配置页展示）。
+///
+/// 返回**所有 up 网卡**（含未启用的附属候选），附 enabled 标记；
+/// 主网卡 always enabled。前端据此渲染「主网卡（固定）+ 附属网卡（可选开关）」。
 async fn list_interfaces() -> axum::Json<serde_json::Value> {
+    // 全部网卡（up 非虚拟；含主网卡标记）
+    let all = surge_net::list_interfaces().unwrap_or_default();
+    // 默认池（主网卡）用于判断 enabled
     let pool = surge_net::InterfacePool::resolve(None)
         .unwrap_or_else(|_| surge_net::InterfacePool::default());
+    let primary_name = pool.primary.name.clone();
+    let enabled_names: std::collections::HashSet<String> = pool
+        .members()
+        .iter()
+        .map(|m| m.name.clone())
+        .collect();
+
+    let mut primary_out: Option<serde_json::Value> = None;
+    let mut secondaries: Vec<serde_json::Value> = Vec::new();
+    for nic in all {
+        // 只展示 up 且非虚拟的物理/逻辑网卡（虚拟网卡不进多网卡选择）
+        if nic.is_virtual {
+            continue;
+        }
+        let entry = serde_json::json!({
+            "name": nic.name,
+            "ip": nic.ip.to_string(),
+            "is_default": nic.is_default,
+            "enabled": enabled_names.contains(&nic.name),
+            "weight": if nic.is_default || enabled_names.contains(&nic.name) {
+                pool.members().iter().find(|m| m.name == nic.name).map(|m| m.weight).unwrap_or(1)
+            } else {
+                1
+            },
+        });
+        if nic.is_default || nic.name == primary_name {
+            primary_out = Some(entry);
+        } else {
+            secondaries.push(entry);
+        }
+    }
     axum::Json(serde_json::json!({
-        "primary": {
+        "primary": primary_out.unwrap_or_else(|| serde_json::json!({
             "name": pool.primary.name,
             "ip": pool.primary.ip.to_string(),
-            "weight": pool.primary.weight,
             "is_default": true,
-        },
-        "secondaries": pool.secondaries.iter().map(|m| {
-            serde_json::json!({
-                "name": m.name,
-                "ip": m.ip.to_string(),
-                "weight": m.weight,
-            })
-        }).collect::<Vec<_>>(),
+            "enabled": true,
+            "weight": pool.primary.weight,
+        })),
+        "secondaries": secondaries,
     }))
 }
 
