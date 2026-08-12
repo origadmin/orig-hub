@@ -32,7 +32,27 @@ async fn main() {
     let (events_tx, _rx) = tokio::sync::broadcast::channel(1024);
     let state = Arc::new(AppState::new(registry, events_tx, config.clone()));
 
-    let app: Router = routes::router(state);
+    let app: Router = routes::router(state).layer(
+        // CORS：允许 Tauri WebView（dev vite 1420 / 生产 tauri://localhost）跨域访问
+        tower_http::cors::CorsLayer::new()
+            .allow_origin([
+                "http://localhost:1420".parse().unwrap(),
+                "http://127.0.0.1:1420".parse().unwrap(),
+                "tauri://localhost".parse().unwrap(),
+                "https://tauri.localhost".parse().unwrap(),
+            ])
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::DELETE,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers([
+                axum::http::header::HeaderName::from_static("content-type"),
+                axum::http::header::HeaderName::from_static("authorization"),
+            ])
+            .max_age(std::time::Duration::from_secs(3600)),
+    );
 
     let port = config.port;
     let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
