@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 libsurge = { path = "../libsurge" }
+surge-net = { path = "../surge-net" }
 async-trait.workspace = true
 serde.workspace = true
 thiserror.workspace = true
