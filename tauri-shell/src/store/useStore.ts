@@ -20,6 +20,8 @@ function loadSettings(): AppSettings {
     autoStart: true,
     notifications: true,
     theme: 'dark',
+    primaryInterface: undefined,
+    primaryWeight: 100,
     enabledInterfaces: {},
   }
   try {

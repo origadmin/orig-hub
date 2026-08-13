@@ -1,9 +1,10 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Button } from './ui/button'
 import { Badge } from './ui/badge'
 import { Stepper } from './ui/stepper'
 import { DirectoryPicker } from './DirectoryPicker'
 import { InterfacePickerDialog, type InterfaceSelection } from './InterfacePickerDialog'
+import { listInterfaces } from '../api/daemon'
 import { useStore } from '../store/useStore'
 
 type SettingsTab = 'general' | 'downloads' | 'network' | 'about'
@@ -27,18 +28,48 @@ export function SettingsPanel() {
   // 网卡选择：局部编辑态（含主网卡），保存时写入 settings
   const [pickerOpen, setPickerOpen] = useState(false)
   const [sel, setSel] = useState<InterfaceSelection>({
-    primary: undefined,
+    primary: settings.primaryInterface,
+    primaryWeight: settings.primaryWeight,
     weights: settings.enabledInterfaces,
   })
   const [saved, setSaved] = useState(false)
+  // 默认主网卡名（自动识别），用于外部展示
+  const [autoPrimary, setAutoPrimary] = useState<string | null>(null)
 
-  const enabledCount = Object.keys(sel.weights).length
-  const totalWeight = Object.values(sel.weights).reduce((a, b) => a + b, 0)
+  useEffect(() => {
+    listInterfaces()
+      .then(({ primary }) => setAutoPrimary(primary?.name ?? null))
+      .catch(() => {})
+  }, [pickerOpen])
+
+  // 参与列表（始终含主网卡）：name → { role, pct }，pct 为相对占比
+  const primaryName = sel.primary ?? autoPrimary
+  const secEntries = Object.entries(sel.weights)
+  const totalW = sel.primaryWeight + secEntries.reduce((a, [, w]) => a + w, 0)
+  const rows = [
+    ...(primaryName
+      ? [
+          {
+            name: primaryName,
+            isPrimary: true,
+            pct: totalW > 0 ? Math.round((sel.primaryWeight / totalW) * 100) : 100,
+          },
+        ]
+      : []),
+    ...secEntries.map(([name, w]) => ({
+      name,
+      isPrimary: false,
+      pct: totalW > 0 ? Math.round((w / totalW) * 100) : 0,
+    })),
+  ]
+  const totalCards = rows.length
 
   const handleSave = () => {
     updateSettings({
       maxConnections,
       downloadDirectory: dir,
+      primaryInterface: sel.primary,
+      primaryWeight: sel.primaryWeight,
       enabledInterfaces: sel.weights,
     })
     setSaved(true)
@@ -48,7 +79,7 @@ export function SettingsPanel() {
   const handleReset = () => {
     setMaxConnections(8)
     setDir('')
-    setSel({ primary: undefined, weights: {} })
+    setSel({ primary: undefined, primaryWeight: 100, weights: {} })
   }
 
   return (
@@ -122,30 +153,48 @@ export function SettingsPanel() {
                 <div className="min-w-0">
                   <p className="text-[13px] font-medium text-zinc-100">参与分流的网卡</p>
                   <p className="mt-0.5 text-[11px] text-muted">
-                    {enabledCount > 0
-                      ? `已启用 ${enabledCount} 个附加网卡，权重合计 ${totalWeight}%（按相对比率分配并发）`
-                      : '仅主网卡参与（默认）。勾选更多已连接网卡可并行加速'}
+                    主网卡始终参与；勾选更多已连接网卡可并行加速
                   </p>
                 </div>
-                <Badge variant={enabledCount > 0 ? 'success' : 'secondary'} className="shrink-0">
-                  {enabledCount > 0 ? `${enabledCount} 个附加` : '未启用'}
+                <Badge variant={totalCards > 1 ? 'success' : 'secondary'} className="shrink-0">
+                  {totalCards > 0 ? `${totalCards} 个网卡参与` : '未检测到网卡'}
                 </Badge>
               </div>
 
-              {enabledCount > 0 && (
-                <div className="rounded-md bg-surface-2/60 px-3 py-2.5">
-                  <p className="break-all text-xs leading-relaxed text-zinc-300">
-                    {sel.primary && (
-                      <span className="font-medium text-accent">
-                        {sel.primary}（主） +{' '}
+              {/* 参与列表（始终显示，含主网卡） */}
+              <div className="divide-y divide-border-subtle/50 rounded-md bg-surface-2/60 px-3">
+                {rows.map((row) => (
+                  <div
+                    key={row.name}
+                    className="flex items-center justify-between gap-3 py-2.5"
+                  >
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span className="min-w-0 truncate text-xs font-medium text-zinc-200">
+                        {row.name}
                       </span>
-                    )}
-                    {Object.entries(sel.weights)
-                      .map(([name, w]) => `${name} ${w}%`)
-                      .join('、')}
+                      {row.isPrimary && (
+                        <Badge variant="default" className="shrink-0 text-[9px]">主</Badge>
+                      )}
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      <div className="h-1 w-16 overflow-hidden rounded-full bg-surface-3">
+                        <div
+                          className={`h-full rounded-full ${row.isPrimary ? 'bg-accent' : 'bg-success'}`}
+                          style={{ width: `${Math.min(100, row.pct)}%` }}
+                        />
+                      </div>
+                      <span className="w-9 text-right font-mono text-[11px] text-zinc-300">
+                        {row.pct}%
+                      </span>
+                    </div>
+                  </div>
+                ))}
+                {rows.length === 0 && (
+                  <p className="py-3 text-xs text-muted">
+                    daemon 未连接，无法枚举网卡
                   </p>
-                </div>
-              )}
+                )}
+              </div>
 
               <div className="flex justify-end">
                 <Button variant="secondary" size="sm" onClick={() => setPickerOpen(true)}>

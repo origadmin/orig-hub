@@ -76,6 +76,10 @@ export interface AppSettings {
   autoStart: boolean
   notifications: boolean
   theme: ThemeValue
+  /** 指定主网卡（网卡名，可选；缺省自动识别） */
+  primaryInterface?: string
+  /** 主网卡权重（百分比，默认 100） */
+  primaryWeight: number
   /** 全局启用的多网卡名单（网卡名 → 权重）；主网卡始终参与不在此列 */
   enabledInterfaces: Record<string, number>
 }
