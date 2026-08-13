@@ -1,14 +1,14 @@
 //! 网卡探测：枚举系统网卡 + 主网卡（默认路由）识别。
 //!
-//! ## 实现（跨平台，零原生依赖）
-//! - `if-addrs`：枚举所有网卡地址（name + IPv4 + is_loopback）
-//! - Windows：额外解析 `route print` 找默认路由（0.0.0.0 行）→ 主网卡；
-//!   非 Windows：主网卡 = 第一个 up 非回环非虚拟网卡（启发式）
+//! ## 实现（跨平台）
+//! - `if-addrs`：枚举所有网卡地址（name + IPv4 + is_loopback）——跨平台基础
+//! - Windows：`GetAdaptersAddresses` 枚举全部适配器（含断开/无 IP，OperStatus + 友好名）；
+//!   主网卡用 `route print` 解析默认路由（0.0.0.0 行，metric 最小）
+//! - Linux：`rtnetlink`（netlink socket）枚举全部链路（RTM_GETLINK，含 down/无 IP，
+//!   IFF_UP 判定 connected），IPv4 地址关联（RTM_GETADDR），默认路由识别
+//!   （RTM_GETROUTE，dst 0.0.0.0/0，table main，priority 最小）；无需 root
+//! - macOS/BSD：退化为 if-addrs（只有有 IP 的 up 网卡）+ 启发式主网卡
 //! - 虚拟网卡启发式：名称含 Virtual/VMware/VirtualBox/TAP/TUN/WSL/vEthernet/Hyper-V 等
-//!
-//! ## 说明
-//! `if-addrs` 只返回**已配置地址**的接口（隐含 is_up）。默认路由识别
-//! Windows 用 route print（UTF-8 输出，可靠）；这是主网卡语义的唯一准确来源。
 
 use serde::Serialize;
 use std::net::Ipv4Addr;
@@ -37,6 +37,9 @@ pub enum ProbeError {
 const VIRTUAL_HINTS: &[&str] = &[
     "virtual", "vmware", "virtualbox", "vbox", "tap", "tun", "wsl", "vethernet",
     "hyper-v", "hyperv", "loopback", "docker", "zerotier", "tailscale", "wg", "ppp",
+    // Linux 容器/虚拟化/隧道前缀
+    "br-", "veth", "virbr", "docker0", "lxc", "cni", "flannel", "cali", "cilium",
+    "kube", "vxlan", "gretap", "ip6tnl", "sit@", "dummy", "tunl", "erspan",
 ];
 
 fn is_virtual_name(name: &str) -> bool {
@@ -84,7 +87,8 @@ pub fn primary_interface() -> Result<NetInterface, ProbeError> {
 /// 主网卡标记：
 /// - Windows：`route print` 里 `0.0.0.0 ... 0.0.0.0 <网关> <metric>` 行对应的接口名
 ///   （网络目标 0.0.0.0 + 掩码 0.0.0.0 = 默认路由；取 metric 最小行）
-/// - 非 Windows：第一个非回环非虚拟网卡（启发式）
+/// - Linux：rtnetlink 默认路由（dst 0.0.0.0/0）的 oif 网卡
+/// - 其它：第一个非回环非虚拟网卡（启发式）
 fn mark_primary(list: &mut [NetInterface]) {
     #[cfg(windows)]
     {
@@ -96,23 +100,35 @@ fn mark_primary(list: &mut [NetInterface]) {
             }
         }
         // 回退：第一个非回环非虚拟
-        if let Some(i) = list.iter_mut().find(|i| !i.ip.is_loopback() && !i.is_virtual) {
-            i.is_default = true;
-            return;
-        }
-        if let Some(i) = list.iter_mut().find(|i| !i.ip.is_loopback()) {
-            i.is_default = true;
-        }
+        fallback_primary(list);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        if let Some(i) = list.iter_mut().find(|i| !i.ip.is_loopback() && !i.is_virtual) {
-            i.is_default = true;
-            return;
+        // rtnetlink 默认路由 oif → 按名字匹配（list_all_adapters 里已标记 is_default）
+        if let Ok(all) = list_all_adapters() {
+            if let Some(def) = all.iter().find(|a| a.is_default) {
+                if let Some(i) = list.iter_mut().find(|i| i.name == def.name) {
+                    i.is_default = true;
+                    return;
+                }
+            }
         }
-        if let Some(i) = list.iter_mut().find(|i| !i.ip.is_loopback()) {
-            i.is_default = true;
-        }
+        fallback_primary(list);
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        fallback_primary(list);
+    }
+}
+
+/// 回退：第一个非回环非虚拟 → 第一个非回环。
+fn fallback_primary(list: &mut [NetInterface]) {
+    if let Some(i) = list.iter_mut().find(|i| !i.ip.is_loopback() && !i.is_virtual) {
+        i.is_default = true;
+        return;
+    }
+    if let Some(i) = list.iter_mut().find(|i| !i.ip.is_loopback()) {
+        i.is_default = true;
     }
 }
 
@@ -152,11 +168,6 @@ fn default_route_iface_ip() -> Option<Ipv4Addr> {
         }
     }
     best.map(|(_, ip)| ip)
-}
-
-#[cfg(not(windows))]
-fn default_route_iface_name() -> Option<String> {
-    None
 }
 
 /// 把接口 IP 字符串解析为 Ipv4Addr（route print 结果是 IP，不是名字）。
@@ -279,7 +290,7 @@ pub fn list_all_adapters() -> Result<Vec<AdapterInfo>, ProbeError> {
 }
 
 /// 枚举全部适配器（非 Windows 退化：只有有 IP 的 up 网卡）。
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn list_all_adapters() -> Result<Vec<AdapterInfo>, ProbeError> {
     Ok(list_interfaces()?
         .into_iter()
@@ -294,6 +305,147 @@ pub fn list_all_adapters() -> Result<Vec<AdapterInfo>, ProbeError> {
         .collect())
 }
 
+/// 在 tokio 运行时内/外统一执行异步探测（rtnetlink 需要运行时）。
+/// - 已在 tokio 上下文：`block_in_place` + 当前 handle（不 panic）
+/// - 非 tokio 上下文：临时 current_thread runtime
+#[cfg(target_os = "linux")]
+fn block_on_rtnetlink<F, T>(fut: F) -> Result<T, ProbeError>
+where
+    F: std::future::Future<Output = Result<T, ProbeError>>,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle
+                .block_on(fut)
+        }),
+        Err(_) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| ProbeError::Other(e.to_string()))?;
+            rt.block_on(fut)
+        }
+    }
+}
+
+/// Linux：rtnetlink 枚举全部适配器（等价 GetAdaptersAddresses）。
+/// - RTM_GETLINK：全部接口（含 down） + flags（IFF_UP/IFF_LOOPBACK）
+/// - RTM_GETADDR：按 ifindex 关联 IPv4 地址
+/// - RTM_GETROUTE：默认路由（dst 0.0.0.0/0, table main）→ 主网卡
+#[cfg(target_os = "linux")]
+pub fn list_all_adapters() -> Result<Vec<AdapterInfo>, ProbeError> {
+    block_on_rtnetlink(async {
+        use futures::StreamExt;
+        use rtnetlink::packet_route::{
+            address::AddressAttribute,
+            link::{LinkAttribute, LinkFlags},
+            route::{RouteAttribute, RouteHeader, RouteMessage, RouteType},
+            AddressFamily,
+        };
+        use rtnetlink::new_connection;
+
+        let (conn, handle, _) = new_connection()
+            .map_err(|e| ProbeError::Other(format!("netlink connect: {e}")))?;
+        tokio::spawn(conn);
+
+        // 1. 全部链路（含 down/无 IP）
+        let mut links: Vec<(u32, String, LinkFlags, bool)> = Vec::new();
+        let mut link_stream = handle.link().get().execute();
+        while let Some(msg) = link_stream.next().await {
+            let Ok(msg) = msg else { continue };
+            let mut ifname = String::new();
+            for attr in &msg.attributes {
+                if let LinkAttribute::IfName(n) = attr {
+                    ifname = n.clone();
+                }
+            }
+            // loopback 过滤：flags 或名 lo
+            let is_loopback = msg.header.flags.contains(LinkFlags::Loopback)
+                || ifname == "lo";
+            links.push((msg.header.index, ifname, msg.header.flags, is_loopback));
+        }
+
+        // 2. IPv4 地址按 ifindex 关联
+        let mut addr_map: std::collections::HashMap<u32, Ipv4Addr> =
+            std::collections::HashMap::new();
+        let mut addr_stream = handle.address().get().execute();
+        while let Some(msg) = addr_stream.next().await {
+            let Ok(msg) = msg else { continue };
+            if msg.header.family != AddressFamily::Inet {
+                continue; // 只取 IPv4
+            }
+            let mut ip: Option<Ipv4Addr> = None;
+            for attr in &msg.attributes {
+                if let AddressAttribute::Address(std::net::IpAddr::V4(v4)) = attr {
+                    ip = Some(*v4);
+                    break;
+                }
+            }
+            if let Some(ip) = ip {
+                addr_map.insert(msg.header.index, ip);
+            }
+        }
+
+        // 3. 默认路由（IPv4, table main, dst 0.0.0.0/0）→ 主网卡 ifindex
+        let mut default_oif: Option<u32> = None;
+        let mut best_prio: u32 = u32::MAX;
+        let mut route_stream = handle
+            .route()
+            .get(RouteMessage::default())
+            .execute();
+        while let Some(msg) = route_stream.next().await {
+            let Ok(msg) = msg else { continue };
+            if msg.header.table != RouteHeader::RT_TABLE_MAIN
+                || msg.header.kind != RouteType::Unicast
+                || msg.header.destination_prefix_length != 0
+            {
+                continue;
+            }
+            // 确认 dst 0.0.0.0/0（无 Destination 属性 = 默认）
+            let mut oif = None;
+            let mut prio = 0u32;
+            let mut has_dst = false;
+            for attr in &msg.attributes {
+                match attr {
+                    RouteAttribute::Oif(o) => oif = Some(*o),
+                    RouteAttribute::Priority(p) => prio = *p,
+                    RouteAttribute::Destination(_) => has_dst = true,
+                    _ => {}
+                }
+            }
+            if has_dst {
+                continue; // 有显式 dst 不是默认路由
+            }
+            if let Some(oif) = oif {
+                if prio < best_prio {
+                    best_prio = prio;
+                    default_oif = Some(oif);
+                }
+            }
+        }
+
+        // 4. 组装
+        let mut out: Vec<AdapterInfo> = Vec::new();
+        for (idx, name, flags, is_loopback) in links {
+            if is_loopback {
+                continue;
+            }
+            let ip = addr_map.get(&idx).copied();
+            let is_up = flags.contains(LinkFlags::Up);
+            let is_virtual = is_virtual_name(&name);
+            out.push(AdapterInfo {
+                name,
+                description: None,
+                ip,
+                is_up,
+                is_default: Some(idx) == default_oif,
+                is_virtual,
+            });
+        }
+        Ok(out)
+    })
+}
+
 /// 把 UTF-16 宽字符串转 String（GetAdaptersAddresses 的 FriendlyName/Description）。
 #[cfg(windows)]
 unsafe fn wide_to_string(ptr: *const u16) -> Option<String> {
@@ -306,6 +458,40 @@ unsafe fn wide_to_string(ptr: *const u16) -> Option<String> {
     }
     let slice = std::slice::from_raw_parts(ptr, len);
     Some(String::from_utf16_lossy(slice))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// Linux 实机/容器验证：枚举全部适配器，结构完整且主网卡存在。
+    /// 需要 netlink 权限（普通用户即可，无需 root）。
+    #[test]
+    fn linux_list_all_adapters_ok() {
+        let adapters = list_all_adapters().expect("list_all_adapters should work on linux");
+        assert!(!adapters.is_empty(), "should have at least loopback-adjacent ifaces");
+        // 主网卡（默认路由）必须存在
+        assert!(
+            adapters.iter().any(|a| a.is_default),
+            "default-route interface should be marked: {adapters:?}"
+        );
+        // 非虚拟网卡至少有一个物理网卡
+        assert!(
+            adapters.iter().any(|a| !a.is_virtual),
+            "at least one physical iface expected: {:?}",
+            adapters
+        );
+    }
+
+    /// Linux：list_interfaces（if-addrs）与 list_all_adapters（netlink）主网卡一致。
+    #[test]
+    fn linux_primary_consistent() {
+        let a = list_all_adapters().expect("netlink adapters");
+        let b = list_interfaces().expect("if-addrs interfaces");
+        let a_primary = a.iter().find(|x| x.is_default).map(|x| x.name.clone());
+        let b_primary = b.iter().find(|x| x.is_default).map(|x| x.name.clone());
+        assert_eq!(a_primary, b_primary, "primary iface should agree");
+    }
 }
 
 
