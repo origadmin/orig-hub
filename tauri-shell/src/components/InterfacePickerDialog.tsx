@@ -1,40 +1,34 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Button } from './ui/button'
 import { Badge } from './ui/badge'
-import { Slider } from './ui/slider'
 import { listInterfaces } from '../api/daemon'
 import type { NetworkInterface } from '../types'
 
 export interface InterfaceSelection {
   /** 主网卡名（undefined = 自动识别） */
   primary?: string
-  /** 主网卡权重（百分比） */
-  primaryWeight: number
-  /** 启用网卡名 → 权重（百分比，附属网卡） */
-  weights: Record<string, number>
+  /** 参与分流的附属网卡名（主网卡不在内，始终参与） */
+  enabledNames: string[]
 }
 
 interface Props {
   open: boolean
   onClose: () => void
-  /** 当前已选（含主网卡） */
+  /** 当前已选 */
   selected: InterfaceSelection
   onConfirm: (sel: InterfaceSelection) => void
 }
 
-
 /**
- * 多网卡选择弹窗 v2：
- * - 主网卡可下拉切换（默认自动识别的默认网卡）
- * - 权重 = 滑块 + 百分比（总和 100%，拖拽自动再分配）
- * - 未连接/虚拟网卡禁用；名称单行省略不换行
+ * 多网卡选择弹窗（纯选择，无任何权重配置）：
+ * - 顶部「主网卡」下拉：唯一指定（默认自动识别默认路由网卡）
+ * - 下方网卡列表：勾选参与分流的网卡（可多选；主网卡固定勾选禁用）
+ * - 未连接 / 虚拟网卡禁用并标注；名称单行省略不换行
  */
 export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Props) {
   const [ifaces, setIfaces] = useState<NetworkInterface[]>([])
   const [primary, setPrimary] = useState<string | undefined>(selected.primary)
-  const [primaryWeight, setPrimaryWeight] = useState(selected.primaryWeight)
-  const [enabled, setEnabled] = useState<Record<string, boolean>>({})
-  const [weights, setWeights] = useState<Record<string, number>>({})
+  const [checked, setChecked] = useState<Record<string, boolean>>({})
 
   useEffect(() => {
     if (!open) return
@@ -44,20 +38,17 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
         setIfaces(all)
         // 主网卡：沿用上次选择；无则自动识别
         const autoPrimary = p?.name
-        const curPrimary = selected.primary && all.some((i) => i.name === selected.primary)
-          ? selected.primary
-          : autoPrimary
+        const curPrimary =
+          selected.primary && all.some((i) => i.name === selected.primary)
+            ? selected.primary
+            : autoPrimary
         setPrimary(curPrimary)
-        // 启用：默认主网卡开启；其余按 selected
-        const en: Record<string, boolean> = {}
-        const w: Record<string, number> = {}
+        // 勾选态：主网卡始终开；附属按上次选择
+        const ck: Record<string, boolean> = {}
         for (const nic of all) {
-          en[nic.name] = nic.name === curPrimary || selected.weights[nic.name] != null
-          w[nic.name] = selected.weights[nic.name] ?? 0
+          ck[nic.name] = nic.name === curPrimary || selected.enabledNames.includes(nic.name)
         }
-        setEnabled(en)
-        setWeights(w)
-        setPrimaryWeight(selected.primaryWeight)
+        setChecked(ck)
       })
       .catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -66,59 +57,16 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
   const usable = (nic: NetworkInterface) => nic.connected && !nic.is_virtual
 
   const connIfaces = useMemo(() => ifaces.filter(usable), [ifaces])
-  const enabledNonPrimary = useMemo(
-    () => ifaces.filter((i) => usable(i) && enabled[i.name] && i.name !== primary).length,
-    [ifaces, enabled, primary],
-  )
-
-  // 附属权重合计
-  const secondaryTotal = useMemo(
-    () => ifaces.reduce((s, i) => s + (enabled[i.name] && i.name !== primary ? weights[i.name] ?? 0 : 0), 0),
-    [ifaces, enabled, weights, primary],
-  )
-
-  /** 附属网卡权重变化：固定它，主网卡吃剩余 */
-  const setSecondaryWeight = (name: string, v: number) => {
-    const vv = Math.max(0, Math.min(100, v))
-    setWeights((w) => ({ ...w, [name]: vv }))
-    setPrimaryWeight(Math.max(0, 100 - (secondaryTotal - (weights[name] ?? 0) + vv)))
-  }
-
-  /** 主网卡权重变化：固定它，启用的附属按比例缩放 */
-  const setPrimaryWeightFor = (v: number) => {
-    const vv = Math.max(0, Math.min(100, v))
-    setPrimaryWeight(vv)
-    const enabledSec = ifaces.filter((i) => enabled[i.name] && i.name !== primary)
-    if (enabledSec.length === 0) return
-    const cur = enabledSec.reduce((s, i) => s + (weights[i.name] ?? 0), 0)
-    if (cur === 0) return
-    const scale = Math.max(0, 100 - vv) / cur
-    const next: Record<string, number> = {}
-    for (const i of enabledSec) next[i.name] = Math.round((weights[i.name] ?? 0) * scale)
-    setWeights((w) => ({ ...w, ...next }))
-  }
 
   const toggle = (name: string) => {
-    setEnabled((e) => {
-      const next = { ...e, [name]: !e[name] }
-      // 重新计算主网卡权重 = 剩余
-      const secTotal = ifaces.reduce(
-        (s, i) => s + (next[i.name] && i.name !== primary ? weights[i.name] ?? 0 : 0),
-        0,
-      )
-      setPrimaryWeight(Math.max(0, 100 - secTotal))
-      return next
-    })
+    setChecked((c) => ({ ...c, [name]: !c[name] }))
   }
 
   const handleConfirm = () => {
-    const result: Record<string, number> = {}
-    for (const nic of ifaces) {
-      if (nic.name === primary || !usable(nic) || !enabled[nic.name]) continue
-      const v = Math.max(1, Math.round(weights[nic.name] ?? 0))
-      result[nic.name] = v
-    }
-    onConfirm({ primary, primaryWeight: Math.max(1, Math.round(primaryWeight)), weights: result })
+    const enabledNames = ifaces
+      .filter((nic) => nic.name !== primary && usable(nic) && checked[nic.name])
+      .map((nic) => nic.name)
+    onConfirm({ primary, enabledNames })
     onClose()
   }
 
@@ -134,10 +82,8 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between">
-          <h2 className="text-base font-semibold text-zinc-100">多网卡分流</h2>
-          <Badge variant="secondary">
-            {enabledNonPrimary > 0 ? `${enabledNonPrimary} 个附加网卡` : '仅主网卡'}
-          </Badge>
+          <h2 className="text-base font-semibold text-zinc-100">选择网卡</h2>
+          <Badge variant="secondary">参与加速</Badge>
         </div>
 
         {/* 主网卡选择 */}
@@ -152,7 +98,7 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
               onChange={(e) => {
                 const name = e.target.value
                 setPrimary(name)
-                setEnabled((en) => ({ ...en, [name]: true }))
+                setChecked((c) => ({ ...c, [name]: true }))
               }}
               className="max-w-[60%] flex-1 truncate rounded-md border border-border-subtle bg-surface px-2 py-1.5 text-xs text-zinc-100 focus:outline-none focus:ring-2 focus:ring-accent/50"
             >
@@ -165,11 +111,11 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
             </select>
           </div>
           <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
-            参与分流的「主」网卡；切换后自动识别网卡将作为普通网卡参与。
+            主网卡始终参与分流，可在下方列表中切换指定。
           </p>
         </div>
 
-        {/* 网卡列表 */}
+        {/* 网卡列表（多选） */}
         <div className="mt-3 max-h-64 space-y-1.5 overflow-y-auto pr-1">
           {ifaces.length === 0 && (
             <p className="text-xs text-muted">daemon 未连接，无法枚举网卡</p>
@@ -177,7 +123,7 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
           {ifaces.map((nic) => {
             const u = usable(nic)
             const isPrimary = nic.name === primary
-            const isOn = enabled[nic.name] ?? isPrimary
+            const isOn = checked[nic.name] ?? isPrimary
             return (
               <div
                 key={nic.name}
@@ -212,39 +158,13 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
                     <Badge variant="outline" className="shrink-0 text-[9px] text-danger">未连接</Badge>
                   )}
                 </div>
-                {/* 权重滑块（仅启用时显示） */}
-                {isOn && u && (
-                  <div className="mt-1.5 flex items-center gap-2 pl-6">
-                    <Slider
-                      value={isPrimary ? primaryWeight : weights[nic.name] ?? 0}
-                      min={0}
-                      max={100}
-                      onChange={(v) =>
-                        isPrimary ? setPrimaryWeightFor(v) : setSecondaryWeight(nic.name, v)
-                      }
-                    />
-                    <span className="w-10 shrink-0 text-right font-mono text-[11px] text-zinc-300">
-                      {isPrimary ? primaryWeight : weights[nic.name] ?? 0}%
-                    </span>
-                  </div>
-                )}
               </div>
             )
           })}
         </div>
 
-        <div className="mt-3 flex items-center justify-between rounded-md bg-surface-2/40 px-3 py-2">
-          <span className="text-[11px] text-muted">权重合计（主 + 附加）</span>
-          <span
-            className={`font-mono text-xs ${
-              primaryWeight + secondaryTotal === 100 ? 'text-success' : 'text-warning'
-            }`}
-          >
-            {primaryWeight + secondaryTotal}% / 100%
-          </span>
-        </div>
         <p className="mt-2 text-[11px] leading-relaxed text-muted">
-          权重为相对比率：60%:40% 表示约 6:4 的并发分配。主网卡始终参与；未连接或虚拟网卡不可选。
+          勾选已连接的网卡参与分流（可多选）；主网卡固定参与。权重在设置页「多网卡」中按比例自动分配。
         </p>
 
         <div className="mt-4 flex justify-end gap-2">
