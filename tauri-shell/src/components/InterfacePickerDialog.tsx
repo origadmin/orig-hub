@@ -6,9 +6,11 @@ import { listInterfaces } from '../api/daemon'
 import type { NetworkInterface } from '../types'
 
 export interface InterfaceSelection {
-  /** 主网卡名（可为空 = 自动识别） */
+  /** 主网卡名（undefined = 自动识别） */
   primary?: string
-  /** 启用网卡名 → 权重（百分比，总和 100） */
+  /** 主网卡权重（百分比） */
+  primaryWeight: number
+  /** 启用网卡名 → 权重（百分比，附属网卡） */
   weights: Record<string, number>
 }
 
@@ -30,6 +32,7 @@ interface Props {
 export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Props) {
   const [ifaces, setIfaces] = useState<NetworkInterface[]>([])
   const [primary, setPrimary] = useState<string | undefined>(selected.primary)
+  const [primaryWeight, setPrimaryWeight] = useState(selected.primaryWeight)
   const [enabled, setEnabled] = useState<Record<string, boolean>>({})
   const [weights, setWeights] = useState<Record<string, number>>({})
 
@@ -54,6 +57,7 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
         }
         setEnabled(en)
         setWeights(w)
+        setPrimaryWeight(selected.primaryWeight)
       })
       .catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -67,43 +71,54 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
     [ifaces, enabled, primary],
   )
 
-  // 权重合计与归一化（总和 100）
-  const totalWeight = useMemo(
-    () => ifaces.reduce((s, i) => s + (enabled[i.name] ? weights[i.name] ?? 0 : 0), 0),
-    [ifaces, enabled, weights],
+  // 附属权重合计
+  const secondaryTotal = useMemo(
+    () => ifaces.reduce((s, i) => s + (enabled[i.name] && i.name !== primary ? weights[i.name] ?? 0 : 0), 0),
+    [ifaces, enabled, weights, primary],
   )
 
-  const setWeightFor = (name: string, v: number) => {
-    const next = { ...weights, [name]: v }
-    const total = ifaces.reduce(
-      (s, i) => s + (enabled[i.name] && i.name !== name ? next[i.name] ?? 0 : 0),
-      0,
-    )
-    // 拖动当前滑块：固定它，其余按比例缩放至总和 100
-    const others = ifaces.filter((i) => enabled[i.name] && i.name !== name)
-    if (others.length > 0 && total > 0) {
-      const scale = Math.max(0, 100 - v) / total
-      for (const o of others) {
-        next[o.name] = Math.round((next[o.name] ?? 0) * scale)
-      }
-    }
-    setWeights(next)
+  /** 附属网卡权重变化：固定它，主网卡吃剩余 */
+  const setSecondaryWeight = (name: string, v: number) => {
+    const vv = Math.max(0, Math.min(100, v))
+    setWeights((w) => ({ ...w, [name]: vv }))
+    setPrimaryWeight(Math.max(0, 100 - (secondaryTotal - (weights[name] ?? 0) + vv)))
+  }
+
+  /** 主网卡权重变化：固定它，启用的附属按比例缩放 */
+  const setPrimaryWeightFor = (v: number) => {
+    const vv = Math.max(0, Math.min(100, v))
+    setPrimaryWeight(vv)
+    const enabledSec = ifaces.filter((i) => enabled[i.name] && i.name !== primary)
+    if (enabledSec.length === 0) return
+    const cur = enabledSec.reduce((s, i) => s + (weights[i.name] ?? 0), 0)
+    if (cur === 0) return
+    const scale = Math.max(0, 100 - vv) / cur
+    const next: Record<string, number> = {}
+    for (const i of enabledSec) next[i.name] = Math.round((weights[i.name] ?? 0) * scale)
+    setWeights((w) => ({ ...w, ...next }))
   }
 
   const toggle = (name: string) => {
-    setEnabled((e) => ({ ...e, [name]: !e[name] }))
+    setEnabled((e) => {
+      const next = { ...e, [name]: !e[name] }
+      // 重新计算主网卡权重 = 剩余
+      const secTotal = ifaces.reduce(
+        (s, i) => s + (next[i.name] && i.name !== primary ? weights[i.name] ?? 0 : 0),
+        0,
+      )
+      setPrimaryWeight(Math.max(0, 100 - secTotal))
+      return next
+    })
   }
 
   const handleConfirm = () => {
     const result: Record<string, number> = {}
-    let sum = 0
     for (const nic of ifaces) {
       if (nic.name === primary || !usable(nic) || !enabled[nic.name]) continue
       const v = Math.max(1, Math.round(weights[nic.name] ?? 0))
       result[nic.name] = v
-      sum += v
     }
-    onConfirm({ primary, weights: result })
+    onConfirm({ primary, primaryWeight: Math.max(1, Math.round(primaryWeight)), weights: result })
     onClose()
   }
 
@@ -198,16 +213,18 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
                   )}
                 </div>
                 {/* 权重滑块（仅启用时显示） */}
-                {isOn && !isPrimary && u && (
+                {isOn && u && (
                   <div className="mt-1.5 flex items-center gap-2 pl-6">
                     <Slider
-                      value={weights[nic.name] ?? 0}
+                      value={isPrimary ? primaryWeight : weights[nic.name] ?? 0}
                       min={0}
                       max={100}
-                      onChange={(v) => setWeightFor(nic.name, v)}
+                      onChange={(v) =>
+                        isPrimary ? setPrimaryWeightFor(v) : setSecondaryWeight(nic.name, v)
+                      }
                     />
                     <span className="w-10 shrink-0 text-right font-mono text-[11px] text-zinc-300">
-                      {weights[nic.name] ?? 0}%
+                      {isPrimary ? primaryWeight : weights[nic.name] ?? 0}%
                     </span>
                   </div>
                 )}
@@ -217,13 +234,13 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
         </div>
 
         <div className="mt-3 flex items-center justify-between rounded-md bg-surface-2/40 px-3 py-2">
-          <span className="text-[11px] text-muted">权重合计</span>
+          <span className="text-[11px] text-muted">权重合计（主 + 附加）</span>
           <span
             className={`font-mono text-xs ${
-              totalWeight === 100 ? 'text-success' : 'text-warning'
+              primaryWeight + secondaryTotal === 100 ? 'text-success' : 'text-warning'
             }`}
           >
-            {totalWeight}% / 100%
+            {primaryWeight + secondaryTotal}% / 100%
           </span>
         </div>
         <p className="mt-2 text-[11px] leading-relaxed text-muted">
