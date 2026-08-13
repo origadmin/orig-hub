@@ -23,11 +23,10 @@ export function AddDownloadDialog({ open, onClose }: Props) {
   const [maxConnections, setMaxConnections] = useState(8)
   const [submitting, setSubmitting] = useState(false)
 
-  // 多网卡：弹窗选择（全局设置默认带入）
+  // 多网卡：弹窗选择（全局设置默认带入，纯选择）
   const [ifaces, setIfaces] = useState<InterfaceSelection>({
     primary: settings.primaryInterface,
-    primaryWeight: settings.primaryWeight,
-    weights: settings.enabledInterfaces,
+    enabledNames: Object.keys(settings.enabledInterfaces),
   })
   const [pickerOpen, setPickerOpen] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
@@ -48,10 +47,10 @@ export function AddDownloadDialog({ open, onClose }: Props) {
       setError('请输入下载 URL')
       return
     }
-    // 组装 interfaces（仅当有附属网卡被启用时提交）
+    // 组装 interfaces：主网卡权重 2 份，附属各 1 份（公式 N+1，主 2 份）
     const secondaries: Record<string, number> = {}
-    for (const [name, w] of Object.entries(ifaces.weights)) {
-      secondaries[name] = Math.max(1, Math.round(w))
+    for (const name of ifaces.enabledNames) {
+      secondaries[name] = 1
     }
     const hasSecondaries = Object.keys(secondaries).length > 0
     setSubmitting(true)
@@ -65,7 +64,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
           hasSecondaries || ifaces.primary
             ? {
                 primary: ifaces.primary || undefined,
-                primary_weight: Math.max(1, Math.round(ifaces.primaryWeight)),
+                primary_weight: 2,
                 secondaries: hasSecondaries ? secondaries : undefined,
               }
             : undefined,
@@ -73,7 +72,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
       setUrl('')
       setFilename('')
       setOutputPath('')
-      setIfaces({ primary: undefined, primaryWeight: 100, weights: {} })
+      setIfaces({ primary: undefined, enabledNames: [] })
       onClose()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -152,13 +151,11 @@ export function AddDownloadDialog({ open, onClose }: Props) {
                     <p className="break-all text-zinc-300">
                       {ifaces.primary && (
                         <span className="font-medium text-accent">
-                          {ifaces.primary}（主）{ifaces.primaryWeight}% +{' '}
+                          {ifaces.primary}（主） +{' '}
                         </span>
                       )}
-                      {Object.entries(ifaces.weights)
-                        .map(([name, w]) => `${name} ${w}%`)
-                        .join('、')}
-                      {!ifaces.primary && Object.keys(ifaces.weights).length === 0 && (
+                      {ifaces.enabledNames.join('、')}
+                      {!ifaces.primary && ifaces.enabledNames.length === 0 && (
                         <span className="text-muted">仅主网卡参与（自动识别）</span>
                       )}
                     </p>
@@ -172,7 +169,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
                   </Button>
                 </div>
                 <p className="pt-1 text-[10px] leading-relaxed text-muted">
-                  主网卡可切换；已连接的非虚拟网卡可勾选并按百分比权重分配并发。
+                  勾选参与网卡；权重按公式自动分配（主 2 份 / 附属 1 份）。
                 </p>
               </div>
             )}
