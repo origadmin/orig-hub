@@ -17,16 +17,55 @@ use std::net::Ipv4Addr;
 /// 权重类型：正整数（≥1）。
 pub type Weight = u32;
 
+/// 附属网卡配置：权重 + 该网卡专属 URL（URL↔网卡绑定）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SecondarySpec {
+    /// 权重（≥1，缺省 1）。
+    #[serde(default = "default_weight")]
+    pub weight: Weight,
+    /// 该网卡专属镜像 URL（可选）。缺省时回退主 URL。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+fn default_weight() -> Weight {
+    1
+}
+
+/// 兼容两种 secondaries 值格式：数字（旧）或对象（新）。
+/// 数字 → SecondarySpec { weight: n, url: None }。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SecondaryValue {
+    Weight(Weight),
+    Spec(SecondarySpec),
+}
+
+impl From<SecondaryValue> for SecondarySpec {
+    fn from(v: SecondaryValue) -> Self {
+        match v {
+            SecondaryValue::Weight(w) => SecondarySpec {
+                weight: w.max(1),
+                url: None,
+            },
+            SecondaryValue::Spec(s) => SecondarySpec {
+                weight: s.weight.max(1),
+                url: s.url,
+            },
+        }
+    }
+}
+
 /// 请求级网卡配置（REST body 可选字段 / 配置层）。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct InterfaceSpec {
     /// 主网卡权重（缺省 1）。
     #[serde(default)]
     pub primary_weight: Option<Weight>,
-    /// 附属网卡启用列表：网卡名 → 权重。
+    /// 附属网卡启用列表：网卡名 → 权重或 {weight, url}。
     /// **只有出现在这里的网卡才会参与下载。**
     #[serde(default)]
-    pub secondaries: HashMap<String, Weight>,
+pub secondaries: HashMap<String, SecondarySpec>,
 }
 
 /// 池成员：一个参与下载的网卡。
@@ -36,6 +75,9 @@ pub struct PoolMember {
     pub ip: Ipv4Addr,
     /// 已规范化权重（≥1）。
     pub weight: Weight,
+    /// 该网卡专属 URL（可选）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// 任务级网卡池（已解析、已过滤、不可变）。
@@ -52,6 +94,7 @@ impl Default for InterfacePool {
                 name: "primary".into(),
                 ip: Ipv4Addr::LOCALHOST,
                 weight: 1,
+                url: None,
             },
             secondaries: Vec::new(),
         }
@@ -126,6 +169,7 @@ impl InterfacePool {
                 .and_then(|s| s.primary_weight)
                 .filter(|w| *w > 0)
                 .unwrap_or(1),
+            url: None,
         };
 
         let mut secondaries = Vec::new();
@@ -136,7 +180,8 @@ impl InterfacePool {
                 let mut names: Vec<&String> = spec.secondaries.keys().collect();
                 names.sort();
                 for name in names {
-                    let w = spec.secondaries.get(name).copied().filter(|w| *w > 0).unwrap_or(1);
+                    let sec = spec.secondaries.get(name).cloned().unwrap_or_default();
+                    let w = sec.weight.max(1);
                     // 跳过与主网卡同名
                     if *name == primary.name {
                         continue;
@@ -152,6 +197,7 @@ impl InterfacePool {
                                 name: ni.name.clone(),
                                 ip: ni.ip,
                                 weight: w,
+                                url: sec.url,
                             });
                         }
                     }
@@ -197,6 +243,7 @@ mod tests {
                 name: n.to_string(),
                 ip: Ipv4Addr::LOCALHOST,
                 weight: *w,
+                url: None,
             });
         }
         InterfacePool {
@@ -204,6 +251,7 @@ mod tests {
                 name: "primary".into(),
                 ip: Ipv4Addr::LOCALHOST,
                 weight: primary_w,
+                url: None,
             },
             secondaries,
         }
