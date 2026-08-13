@@ -59,13 +59,27 @@ impl From<SecondaryValue> for SecondarySpec {
 /// 请求级网卡配置（REST body 可选字段 / 配置层）。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct InterfaceSpec {
+    /// 指定主网卡（网卡名，可选）。缺省时自动探测默认路由网卡。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
     /// 主网卡权重（缺省 1）。
     #[serde(default)]
     pub primary_weight: Option<Weight>,
     /// 附属网卡启用列表：网卡名 → 权重或 {weight, url}。
-    /// **只有出现在这里的网卡才会参与下载。**
-    #[serde(default)]
-pub secondaries: HashMap<String, SecondarySpec>,
+    /// **只有出现在这里的网卡才会参与下载。** 兼容数字与对象两种值格式。
+    #[serde(default, deserialize_with = "deserialize_secondaries")]
+    pub secondaries: HashMap<String, SecondarySpec>,
+}
+
+/// secondaries 值兼容两种格式：数字（权重）或对象（{weight, url}）。
+fn deserialize_secondaries<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, SecondarySpec>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = HashMap::<String, SecondaryValue>::deserialize(deserializer)?;
+    Ok(raw.into_iter().map(|(k, v)| (k, v.into())).collect())
 }
 
 /// 池成员：一个参与下载的网卡。
@@ -158,12 +172,32 @@ impl InterfacePool {
     /// 从请求配置解析网卡池。
     /// - spec = None → 仅主网卡（旧版行为）
     /// - spec = Some → 主网卡强制加入 + 附属按白名单过滤（仅保留真实存在且 up 的）
+    /// - `spec.primary` 指定主网卡名；缺省自动探测默认路由网卡
     /// - 附属网卡名与主网卡重复 → 忽略
     pub fn resolve(spec: Option<&InterfaceSpec>) -> Result<InterfacePool, ResolveError> {
-        let primary = primary_interface()?;
-        let primary_ip = primary.ip;
+        // 主网卡：优先用户指定（spec.primary），否则自动探测。
+        let primary_name = spec.and_then(|s| s.primary.clone());
+        let (primary_iface, all) = match &primary_name {
+            Some(name) => {
+                let all = list_interfaces()?;
+                match all.iter().find(|i| i.name == *name && i.is_up) {
+                    Some(ni) => (ni.clone(), all),
+                    None => {
+                        // 指定网卡不存在/未启用 → 回退自动探测（保持向后兼容）
+                        let p = primary_interface()?;
+                        (p, all)
+                    }
+                }
+            }
+            None => {
+                let p = primary_interface()?;
+                let all = list_interfaces()?;
+                (p, all)
+            }
+        };
+        let primary_ip = primary_iface.ip;
         let primary = PoolMember {
-            name: primary.name.clone(),
+            name: primary_iface.name.clone(),
             ip: primary_ip,
             weight: spec
                 .and_then(|s| s.primary_weight)
@@ -175,7 +209,6 @@ impl InterfacePool {
         let mut secondaries = Vec::new();
         if let Some(spec) = spec {
             if !spec.secondaries.is_empty() {
-                let all = list_interfaces()?;
                 // 按用户声明顺序（HashMap 无序 → 收集后按名字排序，保证确定性）。
                 let mut names: Vec<&String> = spec.secondaries.keys().collect();
                 names.sort();
