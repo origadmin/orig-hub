@@ -33,9 +33,11 @@ async fn main() {
     let state = Arc::new(AppState::new(registry, events_tx, config.clone()));
 
     let app: Router = routes::router(state).layer(
-        // CORS：允许 Tauri WebView（dev vite 1420 / 生产 tauri://localhost）跨域访问
+        // CORS：允许 Tauri WebView（dev vite 5180 / 生产 tauri://localhost）跨域访问
         tower_http::cors::CorsLayer::new()
             .allow_origin([
+                "http://localhost:5180".parse().unwrap(),
+                "http://127.0.0.1:5180".parse().unwrap(),
                 "http://localhost:1420".parse().unwrap(),
                 "http://127.0.0.1:1420".parse().unwrap(),
                 "tauri://localhost".parse().unwrap(),

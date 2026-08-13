@@ -1,11 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { DirectoryPicker } from './DirectoryPicker'
+import { InterfacePickerDialog } from './InterfacePickerDialog'
 import { useStore } from '../store/useStore'
-import { listInterfaces } from '../api/daemon'
 import { filenameFromUrl } from '../lib/utils'
-import type { NetworkInterface } from '../types'
 
 interface Props {
   open: boolean
@@ -20,34 +19,12 @@ export function AddDownloadDialog({ open, onClose }: Props) {
   const [maxConnections, setMaxConnections] = useState('8')
   const [submitting, setSubmitting] = useState(false)
 
-  // 多网卡：所有候选 + 勾选状态 + 权重
-  const [ifaces, setIfaces] = useState<NetworkInterface[]>([])
-  const [enabled, setEnabled] = useState<Record<string, boolean>>({})
-  const [weights, setWeights] = useState<Record<string, string>>({})
+  // 多网卡：弹窗选择（全局设置默认带入）
+  const [ifacesEnabled, setIfacesEnabled] = useState<Record<string, number>>(
+    settings.enabledInterfaces,
+  )
+  const [pickerOpen, setPickerOpen] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
-
-  useEffect(() => {
-    if (!open) return
-    listInterfaces()
-      .then(({ primary, secondaries }) => {
-        const all = [primary, ...(secondaries ?? [])].filter(Boolean)
-        setIfaces(all)
-        const en: Record<string, boolean> = {}
-        const w: Record<string, string> = {}
-        for (const nic of all) {
-          // 全局设置优先：勾选过的附属网卡默认选中；否则回退 daemon 的 enabled
-          const globalOn = settings.enabledInterfaces[nic.name] != null
-          en[nic.name] = nic.is_default || globalOn || nic.enabled
-          w[nic.name] = String(
-            settings.enabledInterfaces[nic.name] ?? nic.weight ?? 1,
-          )
-        }
-        setEnabled(en)
-        setWeights(w)
-      })
-      .catch(() => {})
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
 
   if (!open) return null
 
@@ -60,11 +37,6 @@ export function AddDownloadDialog({ open, onClose }: Props) {
     }
   }
 
-  const toggleIface = (name: string, isDefault: boolean) => {
-    if (isDefault) return // 主网卡固定参与
-    setEnabled((e) => ({ ...e, [name]: !e[name] }))
-  }
-
   const handleSubmit = async () => {
     if (!url.trim()) {
       setError('请输入下载 URL')
@@ -72,11 +44,8 @@ export function AddDownloadDialog({ open, onClose }: Props) {
     }
     // 组装 interfaces（仅当有附属网卡被启用时提交）
     const secondaries: Record<string, number> = {}
-    for (const nic of ifaces) {
-      if (nic.is_default) continue
-      if (enabled[nic.name]) {
-        secondaries[nic.name] = Math.max(1, Number(weights[nic.name]) || 1)
-      }
+    for (const [name, w] of Object.entries(ifacesEnabled)) {
+      secondaries[name] = Math.max(1, w)
     }
     setSubmitting(true)
     try {
@@ -93,8 +62,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
       setUrl('')
       setFilename('')
       setOutputPath('')
-      setEnabled({})
-      setWeights({})
+      setIfacesEnabled({})
       onClose()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -169,69 +137,28 @@ export function AddDownloadDialog({ open, onClose }: Props) {
             </button>
             {showAdvanced && (
               <div className="mt-2 space-y-1.5 rounded-md border border-border-subtle bg-surface-2/40 p-2.5">
-                {ifaces.length === 0 && (
-                  <p className="text-xs text-muted">未检测到网卡</p>
-                )}
-                {ifaces.map((nic) => {
-                  const usable = nic.connected && !nic.is_virtual
-                  return (
-                    <div
-                      key={nic.name}
-                      className={`flex items-center justify-between gap-2 text-xs ${
-                        usable ? '' : 'opacity-50'
-                      }`}
-                    >
-                      <label
-                        className={`flex flex-1 items-center gap-2 ${
-                          usable && !nic.is_default ? 'cursor-pointer' : ''
-                        }`}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={enabled[nic.name] ?? nic.is_default}
-                          disabled={nic.is_default || !usable}
-                          onChange={() => toggleIface(nic.name, nic.is_default)}
-                          className="accent-accent"
-                        />
-                        <span className="font-medium text-zinc-200">{nic.name}</span>
-                        {nic.is_default && (
-                          <span className="text-[9px] text-accent">主</span>
-                        )}
-                        {nic.is_virtual && (
-                          <span className="text-[9px] text-muted">虚拟</span>
-                        )}
-                        {!nic.connected && (
-                          <span className="text-[9px] text-danger">未连接</span>
-                        )}
-                        <span className="font-mono text-muted">
-                          {nic.ip ?? '—'}
-                        </span>
-                      </label>
-                      <div className="flex items-center gap-1">
-                        <span className="text-[10px] text-muted">权重</span>
-                        <Input
-                          type="number"
-                          min={1}
-                          max={99}
-                          value={weights[nic.name] ?? '1'}
-                          onChange={(e) =>
-                            setWeights((w) => ({
-                              ...w,
-                              [nic.name]: e.target.value,
-                            }))
-                          }
-                          disabled={
-                            !(enabled[nic.name] ?? nic.is_default) || !usable
-                          }
-                          className="h-6 w-14 px-1.5 text-xs"
-                        />
-                      </div>
-                    </div>
-                  )
-                })}
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0 text-xs">
+                    {Object.keys(ifacesEnabled).length > 0 ? (
+                      <p className="truncate text-zinc-300">
+                        {Object.entries(ifacesEnabled)
+                          .map(([name, w]) => `${name} ×${w}`)
+                          .join('、')}
+                      </p>
+                    ) : (
+                      <p className="text-muted">仅主网卡参与（跟随全局设置）</p>
+                    )}
+                  </div>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => setPickerOpen(true)}
+                  >
+                    选择网卡
+                  </Button>
+                </div>
                 <p className="pt-1 text-[10px] leading-relaxed text-muted">
-                  主网卡固定参与；已连接的非虚拟网卡可勾选并按权重分配并发（默认 1:1）。
-                  未连接或虚拟网卡不可用。
+                  主网卡固定参与；已连接的非虚拟网卡可勾选并按权重分配并发。
                 </p>
               </div>
             )}
@@ -246,6 +173,13 @@ export function AddDownloadDialog({ open, onClose }: Props) {
             {submitting ? '添加中…' : '开始下载'}
           </Button>
         </div>
+
+        <InterfacePickerDialog
+          open={pickerOpen}
+          onClose={() => setPickerOpen(false)}
+          selected={ifacesEnabled}
+          onConfirm={(sel) => setIfacesEnabled(sel)}
+        />
       </div>
     </div>
   )
