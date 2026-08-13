@@ -25,7 +25,8 @@ export function AddDownloadDialog({ open, onClose }: Props) {
 
   // 多网卡：弹窗选择（全局设置默认带入）
   const [ifaces, setIfaces] = useState<InterfaceSelection>({
-    primary: undefined,
+    primary: settings.primaryInterface,
+    primaryWeight: settings.primaryWeight,
     weights: settings.enabledInterfaces,
   })
   const [pickerOpen, setPickerOpen] = useState(false)
@@ -64,6 +65,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
           hasSecondaries || ifaces.primary
             ? {
                 primary: ifaces.primary || undefined,
+                primary_weight: Math.max(1, Math.round(ifaces.primaryWeight)),
                 secondaries: hasSecondaries ? secondaries : undefined,
               }
             : undefined,
@@ -71,7 +73,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
       setUrl('')
       setFilename('')
       setOutputPath('')
-      setIfaces({ primary: undefined, weights: {} })
+      setIfaces({ primary: undefined, primaryWeight: 100, weights: {} })
       onClose()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -147,24 +149,19 @@ export function AddDownloadDialog({ open, onClose }: Props) {
               <div className="mt-2 space-y-1.5 rounded-md border border-border-subtle bg-surface-2/40 p-2.5">
                 <div className="flex items-center justify-between gap-2">
                   <div className="min-w-0 text-xs">
-                    {Object.keys(ifaces.weights).length > 0 ? (
-                      <p className="break-all text-zinc-300">
-                        {ifaces.primary && (
-                          <span className="font-medium text-accent">
-                            {ifaces.primary}（主） +{' '}
-                          </span>
-                        )}
-                        {Object.entries(ifaces.weights)
-                          .map(([name, w]) => `${name} ${w}%`)
-                          .join('、')}
-                      </p>
-                    ) : (
-                      <p className="text-muted">
-                        {ifaces.primary
-                          ? `主网卡：${ifaces.primary}（跟随全局设置）`
-                          : '仅主网卡参与（跟随全局设置）'}
-                      </p>
-                    )}
+                    <p className="break-all text-zinc-300">
+                      {ifaces.primary && (
+                        <span className="font-medium text-accent">
+                          {ifaces.primary}（主）{ifaces.primaryWeight}% +{' '}
+                        </span>
+                      )}
+                      {Object.entries(ifaces.weights)
+                        .map(([name, w]) => `${name} ${w}%`)
+                        .join('、')}
+                      {!ifaces.primary && Object.keys(ifaces.weights).length === 0 && (
+                        <span className="text-muted">仅主网卡参与（自动识别）</span>
+                      )}
+                    </p>
                   </div>
                   <Button
                     variant="secondary"
