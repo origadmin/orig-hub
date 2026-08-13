@@ -49,7 +49,9 @@ export interface NetworkInterface {
 export interface InterfaceSpec {
   /** 指定主网卡（网卡名，可选；缺省自动识别） */
   primary?: string
+  /** 主网卡权重份数（默认 2：主网卡占 2 份） */
   primary_weight?: number
+  /** 附属网卡名 → 权重份数（默认 1） */
   secondaries?: Record<string, number>
 }
 
@@ -78,8 +80,6 @@ export interface AppSettings {
   theme: ThemeValue
   /** 指定主网卡（网卡名，可选；缺省自动识别） */
   primaryInterface?: string
-  /** 主网卡权重（百分比，默认 100） */
-  primaryWeight: number
-  /** 全局启用的多网卡名单（网卡名 → 权重）；主网卡始终参与不在此列 */
+  /** 全局启用的附属网卡名单（网卡名 → 权重份数，默认 1）；主网卡始终参与不在此列 */
   enabledInterfaces: Record<string, number>
 }
