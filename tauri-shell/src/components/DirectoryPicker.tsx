@@ -75,8 +75,29 @@ export function DirectoryPicker({
           onChange={(e) => onChange(e.target.value)}
           placeholder={placeholder}
           disabled={disabled}
-          onFocus={() => setOpenList(true)}
         />
+        {showHistory && recent.length > 0 && (
+          <button
+            type="button"
+            onClick={() => setOpenList((v) => !v)}
+            disabled={disabled}
+            title="历史目录"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border-subtle bg-surface-2 text-muted transition-colors hover:bg-surface-2/80 hover:text-zinc-100 disabled:opacity-50"
+          >
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </button>
+        )}
         <Button
           type="button"
           variant="secondary"

@@ -1,8 +1,12 @@
 import { useState } from 'react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
+import { Stepper } from './ui/stepper'
 import { DirectoryPicker } from './DirectoryPicker'
-import { InterfacePickerDialog } from './InterfacePickerDialog'
+import {
+  InterfacePickerDialog,
+  type InterfaceSelection,
+} from './InterfacePickerDialog'
 import { useStore } from '../store/useStore'
 import { filenameFromUrl } from '../lib/utils'
 
@@ -16,13 +20,14 @@ export function AddDownloadDialog({ open, onClose }: Props) {
   const [url, setUrl] = useState('')
   const [filename, setFilename] = useState('')
   const [outputPath, setOutputPath] = useState('')
-  const [maxConnections, setMaxConnections] = useState('8')
+  const [maxConnections, setMaxConnections] = useState(8)
   const [submitting, setSubmitting] = useState(false)
 
   // 多网卡：弹窗选择（全局设置默认带入）
-  const [ifacesEnabled, setIfacesEnabled] = useState<Record<string, number>>(
-    settings.enabledInterfaces,
-  )
+  const [ifaces, setIfaces] = useState<InterfaceSelection>({
+    primary: undefined,
+    weights: settings.enabledInterfaces,
+  })
   const [pickerOpen, setPickerOpen] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
 
@@ -44,25 +49,29 @@ export function AddDownloadDialog({ open, onClose }: Props) {
     }
     // 组装 interfaces（仅当有附属网卡被启用时提交）
     const secondaries: Record<string, number> = {}
-    for (const [name, w] of Object.entries(ifacesEnabled)) {
-      secondaries[name] = Math.max(1, w)
+    for (const [name, w] of Object.entries(ifaces.weights)) {
+      secondaries[name] = Math.max(1, Math.round(w))
     }
+    const hasSecondaries = Object.keys(secondaries).length > 0
     setSubmitting(true)
     try {
       await addDownload({
         url: url.trim(),
         filename: filename.trim() || undefined,
         output_path: outputPath.trim() || undefined,
-        max_connections: Number(maxConnections) || undefined,
+        max_connections: maxConnections,
         interfaces:
-          Object.keys(secondaries).length > 0
-            ? { secondaries }
+          hasSecondaries || ifaces.primary
+            ? {
+                primary: ifaces.primary || undefined,
+                secondaries: hasSecondaries ? secondaries : undefined,
+              }
             : undefined,
       })
       setUrl('')
       setFilename('')
       setOutputPath('')
-      setIfacesEnabled({})
+      setIfaces({ primary: undefined, weights: {} })
       onClose()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -110,12 +119,11 @@ export function AddDownloadDialog({ open, onClose }: Props) {
           </div>
           <div>
             <label className="mb-1 block text-xs text-muted">最大连接数</label>
-            <Input
-              type="number"
+            <Stepper
+              value={maxConnections}
+              onChange={setMaxConnections}
               min={1}
               max={64}
-              value={maxConnections}
-              onChange={(e) => setMaxConnections(e.target.value)}
             />
           </div>
 
@@ -139,14 +147,23 @@ export function AddDownloadDialog({ open, onClose }: Props) {
               <div className="mt-2 space-y-1.5 rounded-md border border-border-subtle bg-surface-2/40 p-2.5">
                 <div className="flex items-center justify-between gap-2">
                   <div className="min-w-0 text-xs">
-                    {Object.keys(ifacesEnabled).length > 0 ? (
-                      <p className="truncate text-zinc-300">
-                        {Object.entries(ifacesEnabled)
-                          .map(([name, w]) => `${name} ×${w}`)
+                    {Object.keys(ifaces.weights).length > 0 ? (
+                      <p className="break-all text-zinc-300">
+                        {ifaces.primary && (
+                          <span className="font-medium text-accent">
+                            {ifaces.primary}（主） +{' '}
+                          </span>
+                        )}
+                        {Object.entries(ifaces.weights)
+                          .map(([name, w]) => `${name} ${w}%`)
                           .join('、')}
                       </p>
                     ) : (
-                      <p className="text-muted">仅主网卡参与（跟随全局设置）</p>
+                      <p className="text-muted">
+                        {ifaces.primary
+                          ? `主网卡：${ifaces.primary}（跟随全局设置）`
+                          : '仅主网卡参与（跟随全局设置）'}
+                      </p>
                     )}
                   </div>
                   <Button
@@ -158,7 +175,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
                   </Button>
                 </div>
                 <p className="pt-1 text-[10px] leading-relaxed text-muted">
-                  主网卡固定参与；已连接的非虚拟网卡可勾选并按权重分配并发。
+                  主网卡可切换；已连接的非虚拟网卡可勾选并按百分比权重分配并发。
                 </p>
               </div>
             )}
@@ -177,8 +194,8 @@ export function AddDownloadDialog({ open, onClose }: Props) {
         <InterfacePickerDialog
           open={pickerOpen}
           onClose={() => setPickerOpen(false)}
-          selected={ifacesEnabled}
-          onConfirm={(sel) => setIfacesEnabled(sel)}
+          selected={ifaces}
+          onConfirm={(sel) => setIfaces(sel)}
         />
       </div>
     </div>
