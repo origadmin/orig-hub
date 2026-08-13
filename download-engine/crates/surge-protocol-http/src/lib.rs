@@ -55,7 +55,8 @@ impl BoundSource {
         weight: u32,
         iface_name: String,
     ) -> Result<Self> {
-        let mut builder = reqwest::Client::builder().pool_max_idle_per_host(8);
+        // 下载流量绝不走系统代理（Windows 系统代理会劫持 localhost/局域网请求并返回 502）。
+        let mut builder = reqwest::Client::builder().no_proxy().pool_max_idle_per_host(8);
         if let Some(ip) = bind_ip {
             builder = builder.local_address(IpAddr::V4(ip));
         }
@@ -221,6 +222,7 @@ impl Protocol for HttpProtocol {
 
     async fn probe(&self, url: &ParsedUrl) -> Result<Metadata> {
         let client = reqwest::Client::builder()
+            .no_proxy()
             .build()
             .map_err(|e| SurgeError::Other(format!("http client: {e}")))?;
         let resp = client
@@ -277,22 +279,31 @@ impl Protocol for HttpProtocol {
             }
         }
 
-        // 多网卡分流：interfaces 配置 → 每网卡一个绑定源
+        // 多网卡分流：interfaces 配置 → 每网卡一个绑定源（URL↔网卡绑定）
         if let Some(spec) = &cfg.interfaces {
             let pool = surge_net::InterfacePool::resolve(Some(spec))
                 .map_err(|e| SurgeError::Other(format!("resolve interfaces: {e}")))?;
             let mut sources: Vec<Box<dyn Source>> = Vec::with_capacity(pool.len());
-            // 主网卡
+            // 主网卡：主 URL + mirrors 回退
             sources.push(Box::new(BoundSource::new(
                 urls.clone(),
                 Some(pool.primary.ip),
                 pool.primary.weight,
                 pool.primary.name.clone(),
             )?));
-            // 附属网卡（白名单：只有用户开启的）
+            // 附属网卡（白名单：只有用户开启的）：专属 URL 优先，主 URL 兜底
             for m in &pool.secondaries {
+                let mut murls = Vec::new();
+                if let Some(u) = &m.url {
+                    murls.push(u.clone());
+                }
+                for u in &urls {
+                    if !murls.iter().any(|x| x == u) {
+                        murls.push(u.clone());
+                    }
+                }
                 sources.push(Box::new(BoundSource::new(
-                    urls.clone(),
+                    murls,
                     Some(m.ip),
                     m.weight,
                     m.name.clone(),
