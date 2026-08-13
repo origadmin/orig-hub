@@ -45,8 +45,10 @@ export interface NetworkInterface {
   weight: number
 }
 
-/** daemon AddReq.interfaces 契约：{primary_weight?, secondaries: {网卡名: 权重}} */
+/** daemon AddReq.interfaces 契约：{primary?, primary_weight?, secondaries: {网卡名: 权重}} */
 export interface InterfaceSpec {
+  /** 指定主网卡（网卡名，可选；缺省自动识别） */
+  primary?: string
   primary_weight?: number
   secondaries?: Record<string, number>
 }

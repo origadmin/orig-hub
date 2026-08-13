@@ -29,6 +29,71 @@ body {
   @apply bg-background text-foreground font-sans antialiased;
 }
 
+/* ── 自定义滚动条（细条 + 圆角 + 半透明） ── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(113, 113, 122, 0.5) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(113, 113, 122, 0.45);
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(113, 113, 122, 0.7);
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ── 滑块 thumb 美化（配合 slider.tsx） ── */
+.slider-input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: #fafafa;
+  border: 2px solid #10b981;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+  transition: transform 0.15s ease;
+  margin-top: -5px;
+}
+.slider-input::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+}
+.slider-input::-webkit-slider-thumb:active {
+  transform: scale(1.05);
+}
+.slider-input:disabled::-webkit-slider-thumb {
+  cursor: not-allowed;
+  border-color: #52525b;
+  background: #71717a;
+}
+.slider-input::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: #fafafa;
+  border: 2px solid #10b981;
+  cursor: pointer;
+}
+.slider-input::-moz-range-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: #27272a;
+}
+
 @keyframes spring {
   0% { transform: scale(0.95); }
   60% { transform: scale(1.02); }
