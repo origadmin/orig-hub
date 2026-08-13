@@ -20,4 +20,9 @@ windows-sys = { version = "0.59", features = [
 ] }
 network-interface = "2.0.5"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = "0.22"
+futures = { workspace = true }
+tokio = { workspace = true }
+
 [dev-dependencies]

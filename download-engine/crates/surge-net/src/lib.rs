@@ -7,8 +7,9 @@
 //!   （白名单语义：**未开启的附属网卡不进 pool → 不创建 Client、不参与调度**）
 //! - 权重归一化（GCD）+ 按权重分配并发连接数（conn_split）
 //!
-//! 平台实现：Windows 用 `windows` crate 的 GetAdaptersAddresses；
-//! 其它平台用 `if-addrs`（无默认路由信息，主网卡按「第一个 up 非回环」启发式）。
+//! 平台实现：Windows 用 `windows-sys` GetAdaptersAddresses（全部适配器 + OperStatus + 友好名）；
+//! Linux 用 `rtnetlink`（netlink socket，全部链路 + IFF_UP 状态 + 默认路由识别，无需 root）；
+//! macOS/BSD 用 `if-addrs`（只有有 IP 的 up 网卡，主网卡按启发式）。
 
 pub mod pool;
 pub mod probe;
