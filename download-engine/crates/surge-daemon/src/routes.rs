@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use libsurge::engine::Task;
 use libsurge::protocol::{DownloadConfig, ParsedUrl, SseEvent};
-use crate::config::resolve_output;
+use crate::config::{resolve_output, resolve_output_classified};
 use crate::state::{AppState, DownloadTask};
 use crate::status::DownloadStatus;
 
@@ -53,6 +53,9 @@ pub struct AddReq {
     /// 多网卡分流配置（可选）：{"primary_weight":1,"secondaries":{"网卡名":2}}
     #[serde(default)]
     pub interfaces: Option<surge_net::InterfaceSpec>,
+    /// 自动分类（R3）：true=强制开启 / false=强制关闭 / None=用配置默认。
+    #[serde(default)]
+    pub classify: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -169,8 +172,15 @@ async fn add(
         })
         .unwrap_or_else(|| format!("{id}.bin"));
 
-    // 三层目录解析：请求 output_path → 配置 download_dir → 平台默认（~/Downloads）。
-    let output = resolve_output(req.output_path.as_deref(), &st.config, &filename);
+    // 三层目录解析 + 自动分类（R3）：
+    // - 请求显式指定 output_path → 尊重用户选择，不分类
+    // - classify=true 或（classify=None 且配置开启）→ 按扩展名归档子目录
+    // - 否则 → 默认下载目录根（回归）
+    let classify_on = req.classify.unwrap_or(st.config.classify.enabled);    let output = if classify_on {
+        resolve_output_classified(req.output_path.as_deref(), &st.config, &filename, classify_on)
+    } else {
+        resolve_output(req.output_path.as_deref(), &st.config, &filename)
+    };
     if let Some(parent) = output.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
             return (
