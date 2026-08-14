@@ -22,6 +22,7 @@ function loadSettings(): AppSettings {
     theme: 'dark',
     primaryInterface: undefined,
     enabledInterfaces: {},
+    autoClassify: false,
   }
   try {
     const raw = localStorage.getItem(SETTINGS_KEY)

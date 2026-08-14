@@ -62,6 +62,8 @@ export interface AddDownloadRequest {
   headers?: Record<string, string>
   interfaces?: InterfaceSpec
   max_connections?: number
+  /** 自动分类（R3）：true=强制开启 / false=强制关闭 / 缺省=daemon 配置 */
+  classify?: boolean
 }
 
 export interface DaemonStatus {
@@ -82,4 +84,6 @@ export interface AppSettings {
   primaryInterface?: string
   /** 全局启用的附属网卡名单（网卡名 → 权重份数，默认 1）；主网卡始终参与不在此列 */
   enabledInterfaces: Record<string, number>
+  /** 自动分类下载（R3）：默认值，可在新建下载时覆盖 */
+  autoClassify: boolean
 }

@@ -7,6 +7,7 @@ import {
   InterfacePickerDialog,
   type InterfaceSelection,
 } from './InterfacePickerDialog'
+import { Switch } from './ui/switch'
 import { useStore } from '../store/useStore'
 import { filenameFromUrl } from '../lib/utils'
 
@@ -29,6 +30,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
     enabledNames: Object.keys(settings.enabledInterfaces),
   })
   const [pickerOpen, setPickerOpen] = useState(false)
+  const [classify, setClassify] = useState(settings.autoClassify)
   const [showAdvanced, setShowAdvanced] = useState(false)
 
   if (!open) return null
@@ -68,11 +70,13 @@ export function AddDownloadDialog({ open, onClose }: Props) {
                 secondaries: hasSecondaries ? secondaries : undefined,
               }
             : undefined,
+        classify,
       })
       setUrl('')
       setFilename('')
       setOutputPath('')
       setIfaces({ primary: undefined, enabledNames: [] })
+      setClassify(settings.autoClassify)
       onClose()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -173,6 +177,15 @@ export function AddDownloadDialog({ open, onClose }: Props) {
                 </p>
               </div>
             )}
+          </div>
+
+          {/* 自动分类（R3） */}
+          <div className="flex items-center justify-between gap-3 rounded-md border border-border-subtle bg-surface-2/40 p-2.5">
+            <div className="min-w-0">
+              <p className="text-xs font-medium text-zinc-200">自动分类</p>
+              <p className="mt-0.5 text-[10px] leading-relaxed text-muted">按扩展名归档到子目录（视频/音频/图片/文档/压缩包）</p>
+            </div>
+            <Switch checked={classify} onChange={setClassify} />
           </div>
         </div>
 
