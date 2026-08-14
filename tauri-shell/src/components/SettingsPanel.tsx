@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Button } from './ui/button'
 import { Badge } from './ui/badge'
 import { Stepper } from './ui/stepper'
+import { Switch } from './ui/switch'
 import { DirectoryPicker } from './DirectoryPicker'
 import { InterfacePickerDialog, type InterfaceSelection } from './InterfacePickerDialog'
 import { listInterfaces } from '../api/daemon'
@@ -38,6 +39,8 @@ export function SettingsPanel() {
   const [activeTab, setActiveTab] = useState<SettingsTab>('downloads')
   const [maxConnections, setMaxConnections] = useState(settings.maxConnections)
   const [dir, setDir] = useState(settings.downloadDirectory)
+  // 自动分类（R3）：编辑态，保存时写入
+  const [autoClassify, setAutoClassify] = useState(settings.autoClassify)
   // 网卡选择：局部编辑态（纯选择），保存时写入 settings
   const [pickerOpen, setPickerOpen] = useState(false)
   const [sel, setSel] = useState<InterfaceSelection>({
@@ -72,6 +75,7 @@ export function SettingsPanel() {
       downloadDirectory: dir,
       primaryInterface: sel.primary,
       enabledInterfaces,
+      autoClassify,
     })
     setSaved(true)
     setTimeout(() => setSaved(false), 1500)
@@ -81,6 +85,7 @@ export function SettingsPanel() {
   const handleReset = () => {
     setMaxConnections(8)
     setDir('')
+    setAutoClassify(false)
     setSel({ primary: undefined, enabledNames: [] })
   }
 
@@ -140,6 +145,14 @@ export function SettingsPanel() {
                     <p className="mt-0.5 text-[11px] text-muted">单个任务的并发块数（1-64）</p>
                   </div>
                   <Stepper value={maxConnections} onChange={setMaxConnections} min={1} max={64} />
+                </div>
+                <div className="h-px bg-border-subtle/60" />
+                <div className="flex items-center justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="text-[13px] font-medium text-zinc-100">自动分类</p>
+                    <p className="mt-0.5 text-[11px] text-muted">按扩展名归档到子目录（视频/音频/图片/文档/压缩包），可单任务覆盖</p>
+                  </div>
+                  <Switch checked={autoClassify} onChange={setAutoClassify} />
                 </div>
               </div>
             </div>
