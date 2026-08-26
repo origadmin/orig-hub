@@ -96,19 +96,32 @@ fn daemon_status(state: tauri::State<'_, DaemonState>) -> serde_json::Value {
 #[tauri::command]
 fn ensure_daemon(app: tauri::AppHandle, state: tauri::State<'_, DaemonState>) -> Result<serde_json::Value, String> {
     eprintln!("[ensure_daemon] called");
-    if daemon_alive() {
-        eprintln!("[ensure_daemon] alive=true, reusing");
-        return Ok(serde_json::json!({"started": false, "reason": "already-running"}));
+    let alive = daemon_alive();
+    let mut need_kill = false;
+    if alive {
+        // 仅当 9876 上的监听进程确为本外壳对应的 orig-daemon 时才复用；
+        // 否则（如改名前残留的旧 surge-daemon）杀掉并重新拉起，避免“还是旧的”。
+        if port_owner_is_daemon() {
+            eprintln!("[ensure_daemon] alive=true, reusing our daemon");
+            return Ok(serde_json::json!({"started": false, "reason": "already-running"}));
+        }
+        eprintln!("[ensure_daemon] alive=true but owner mismatch, will kill stale");
+        need_kill = true;
+    } else {
+        eprintln!("[ensure_daemon] alive=false, checking port");
+        // 端口被占但 health 不可用 → 杀掉旧 daemon（无论是否由本外壳托管）
+        let port_busy = TcpStream::connect_timeout(
+            &format!("127.0.0.1:{DAEMON_PORT}").parse().unwrap(),
+            Duration::from_millis(300),
+        )
+        .is_ok();
+        if port_busy {
+            eprintln!("[ensure_daemon] port busy, will kill owner");
+            need_kill = true;
+        }
     }
-    eprintln!("[ensure_daemon] alive=false, checking port");
-    // 端口被占但 health 不可用 → 杀掉旧 daemon（无论是否由本外壳托管）
-    let port_busy = TcpStream::connect_timeout(
-        &format!("127.0.0.1:{DAEMON_PORT}").parse().unwrap(),
-        Duration::from_millis(300),
-    )
-    .is_ok();
-    if port_busy {
-        eprintln!("[ensure_daemon] port busy, killing owner");
+    if need_kill {
+        eprintln!("[ensure_daemon] killing port owner");
         kill_port_owner(DAEMON_PORT);
         // 等端口释放
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -130,6 +143,66 @@ fn ensure_daemon(app: tauri::AppHandle, state: tauri::State<'_, DaemonState>) ->
     eprintln!("[ensure_daemon] daemon spawned ok");
     *state.child.lock().unwrap() = Some(child);
     Ok(serde_json::json!({"started": true, "port": DAEMON_PORT}))
+}
+
+/// 返回 9876 上的监听进程是否确为本外壳对应的 orig-daemon（按可执行文件名判断）。
+/// 用于避免复用改名前残留的旧 daemon（如 surge-daemon）。
+fn port_owner_is_daemon() -> bool {
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        let pid = Command::new("netstat")
+            .args(["-ano", "-p", "tcp"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                let text = String::from_utf8_lossy(&o.stdout);
+                text.lines()
+                    .find(|l| l.contains("LISTENING") && l.contains(&format!(":{DAEMON_PORT}")))
+                    .and_then(|l| l.split_whitespace().last())
+                    .and_then(|s| s.parse::<u32>().ok())
+            });
+        let pid = match pid {
+            Some(p) => p,
+            None => return false,
+        };
+        let out = Command::new("wmic")
+            .args(["process", "where", &format!("ProcessId={pid}"), "get", "ExecutablePath"])
+            .output()
+            .ok();
+        if let Some(o) = out {
+            let text = String::from_utf8_lossy(&o.stdout);
+            for l in text.lines() {
+                let t = l.trim();
+                if t.to_lowercase().ends_with(".exe") {
+                    if let Some(stem) = std::path::Path::new(t).file_stem() {
+                        return stem.to_string_lossy().eq_ignore_ascii_case(DAEMON_BIN);
+                    }
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        use std::process::Command;
+        let out = Command::new("lsof")
+            .args(["-ti", &format!("tcp:{DAEMON_PORT}")])
+            .output()
+            .ok();
+        if let Some(o) = out {
+            if let Some(pid) = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .and_then(|l| l.trim().parse::<u32>().ok())
+            {
+                if let Ok(c) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+                    return c.trim().eq_ignore_ascii_case(DAEMON_BIN);
+                }
+            }
+        }
+        false
+    }
 }
 
 /// 杀掉占用指定端口的进程（Windows: taskkill /PID，其他: kill）。
