@@ -150,7 +150,7 @@ impl Protocol for VirtualProtocol {
         })
     }
 
-    async fn probe(&self, url: &ParsedUrl) -> Result<Metadata> {
+    async fn probe(&self, url: &ParsedUrl, _proxy: Option<&ProxyConfig>) -> Result<Metadata> {
         let size = url
             .query
             .get("size")

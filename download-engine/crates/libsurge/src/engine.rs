@@ -226,10 +226,13 @@ pub struct Task {
     selector: WeightedSelector,
     /// 引擎级速度采样。
     speed: SpeedTracker,
+    /// 服务器是否支持 Range：false → 降级为单 worker 单块顺序下载。
+    supports_range: bool,
 }
 
 impl Task {
     /// 构造一个任务（返回 Arc，便于在 HTTP 层共享与跨线程控制）。
+    /// `supports_range = false` 时强制单 worker 单块顺序下载（无断点续传）。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
@@ -240,7 +243,14 @@ impl Task {
         events: tokio::sync::broadcast::Sender<SseEvent>,
         protocol_name: String,
         max_concurrency: u32,
+        supports_range: bool,
     ) -> Arc<Self> {
+        // 服务器不支持 Range → 强制单 worker 单块（整个文件为一个块），禁止并发多块
+        let (block_size, max_concurrency) = if supports_range {
+            (block_size, max_concurrency)
+        } else {
+            (total.max(1), 1)
+        };
         let selector = WeightedSelector::new(&sources);
         Arc::new(Self {
             id,
@@ -255,12 +265,21 @@ impl Task {
             final_hash: std::sync::RwLock::new(None),
             selector,
             speed: SpeedTracker::new(),
+            supports_range,
         })
     }
 
     pub async fn progress(&self) -> Progress {
         let bm = self.block_map.read().await;
-        let speed = self.speed.sample(self.downloaded.load(Ordering::SeqCst));
+        // 单块顺序模式（不支持 Range）：直接从文件读大小作为下载进度源，
+        // 保证 SSE/轮询实时反映实际写入字节（不要等待块完成）。
+        let downloaded = if !self.supports_range {
+            std::fs::metadata(&self.output).map(|m| m.len()).unwrap_or(0)
+        } else {
+            self.downloaded.load(Ordering::SeqCst)
+        };
+        self.downloaded.store(downloaded, Ordering::SeqCst);
+        let speed = self.speed.sample(downloaded);
         let (status, eta) = if self.control.cancel.is_cancelled() {
             (DownloadStatus::Cancelled, -1i64)
         } else if self.control.paused.load(Ordering::SeqCst) {
@@ -273,7 +292,7 @@ impl Task {
         Progress {
             id: self.id.clone(),
             status,
-            downloaded: self.downloaded.load(Ordering::SeqCst),
+            downloaded,
             total: bm.total,
             speed,
             eta_sec: eta,
@@ -359,6 +378,42 @@ impl Task {
             };
             let block = self.block_at(idx).await;
 
+            // 单块顺序下载（不支持 Range 的源）：轮询文件大小估算已下载字节，
+            // 以便 SSE/轮询能反映实时进度（progress() 现在直接读文件 size）。
+            let progress_ticker = if !self.supports_range {
+                let ev = self.events.clone();
+                let id = self.id.clone();
+                let downloaded = self.downloaded.clone();
+                let total = self.block_map.read().await.total;
+                let output = self.output.clone();
+                let mut speed_track = SpeedTracker::new();
+                Some(tokio::spawn(async move {
+                    let mut iv = tokio::time::interval(Duration::from_millis(500));
+                    loop {
+                        iv.tick().await;
+                        let len = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
+                        downloaded.store(len, Ordering::SeqCst);
+                        let speed = speed_track.sample(len);
+                        let p = Progress {
+                            id: id.clone(),
+                            status: DownloadStatus::Downloading,
+                            downloaded: len,
+                            total,
+                            speed,
+                            eta_sec: -1,
+                            protocol: String::new(),
+                            hash_sha256: None,
+                        };
+                        if ev.send(SseEvent::Progress(p)).is_err() {
+                            break;
+                        }
+                        if len >= total { break; }
+                    }
+                }))
+            } else {
+                None
+            };
+
             match self.pick_source(&block) {
                 Some(si) => {
                     file.seek(SeekFrom::Start(block.offset)).await?;
@@ -366,6 +421,10 @@ impl Task {
                     let r = self.sources[si].fetch_block(&block, &token, &mut file).await;
                     match r {
                         Ok(()) => {
+                            // 停掉进度轮询 ticker（如果是单块顺序模式）。
+                            if let Some(h) = progress_ticker {
+                                h.abort();
+                            }
                             let elapsed = started.elapsed();
                             self.selector.health(si).record_ok(block.len, elapsed);
                             self.block_map
@@ -383,6 +442,9 @@ impl Task {
                             // 多网卡容错：块不终止任务，回到调度池由健康源接管；
                             // 源连续失败 ≥ 阈值会被临时禁用（selector 自动避开），
                             // 全部源不可用时 pick_source 返回 None → 任务以 NoSource 终止。
+                            if let Some(h) = progress_ticker {
+                                h.abort();
+                            }
                             self.selector.health(si).record_fail(self.selector.fail_threshold);
                             self.block_map
                                 .write()

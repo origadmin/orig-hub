@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use libsurge::engine::Task;
 use libsurge::protocol::SseEvent;
@@ -28,7 +28,8 @@ pub struct AppState {
     /// 进行中的任务：id -> DownloadTask（Arc 共享，控制句柄在 Task 内）。
     pub tasks: Mutex<HashMap<String, DownloadTask>>,
     pub events: broadcast::Sender<SseEvent>,
-    pub config: Config,
+    /// daemon 配置（RwLock：设置页可运行时更新自动分类规则）。
+    pub config: RwLock<Config>,
 }
 
 impl AppState {
@@ -37,7 +38,7 @@ impl AppState {
             registry,
             tasks: Mutex::new(HashMap::new()),
             events,
-            config,
+            config: RwLock::new(config),
         }
     }
 }

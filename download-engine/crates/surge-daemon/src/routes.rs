@@ -24,7 +24,7 @@ use axum::http::{StatusCode, header::AUTHORIZATION};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json;
@@ -56,6 +56,13 @@ pub struct AddReq {
     /// 自动分类（R3）：true=强制开启 / false=强制关闭 / None=用配置默认。
     #[serde(default)]
     pub classify: Option<bool>,
+    /// 覆盖下载：目标文件已存在时先删除再重新下载（默认 false）。
+    #[serde(default)]
+    pub overwrite: bool,
+    /// 本次下载的代理配置（可选）：缺省用 daemon 配置 [proxy] 段；
+    /// 传 {mode:"direct"} 强制直连，{mode:"custom",url:"http://..."} 指定代理。
+    #[serde(default)]
+    pub proxy: Option<libsurge::protocol::ProxyConfig>,
 }
 
 #[derive(Deserialize)]
@@ -70,7 +77,8 @@ async fn auth_middleware(
     req: axum::extract::Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if let Some(token) = &state.config.token {
+    let token = state.config.read().unwrap().token.clone();
+    if let Some(token) = token {
         let auth = req
             .headers()
             .get(AUTHORIZATION)
@@ -147,7 +155,12 @@ async fn add(
         }
     };
 
-    let meta = match proto.probe(&parsed).await {
+    // 代理：请求级覆盖 > daemon 配置 [proxy] 段（探测与下载同路径）
+    let proxy = req
+        .proxy
+        .clone()
+        .or_else(|| Some(st.config.read().unwrap().proxy.clone()));
+    let meta = match proto.probe(&parsed, proxy.as_ref()).await {
         Ok(m) => m,
         Err(e) => {
             return (
@@ -176,10 +189,29 @@ async fn add(
     // - 请求显式指定 output_path → 尊重用户选择，不分类
     // - classify=true 或（classify=None 且配置开启）→ 按扩展名归档子目录
     // - 否则 → 默认下载目录根（回归）
-    let classify_on = req.classify.unwrap_or(st.config.classify.enabled);    let output = if classify_on {
-        resolve_output_classified(req.output_path.as_deref(), &st.config, &filename, classify_on)
-    } else {
-        resolve_output(req.output_path.as_deref(), &st.config, &filename)
+    let (mut output, mut cfg) = {
+        let cfg_guard = st.config.read().unwrap();
+        let classify_on = req.classify.unwrap_or(cfg_guard.classify.enabled);
+        let output = if classify_on {
+            resolve_output_classified(
+                req.output_path.as_deref(),
+                &cfg_guard,
+                &filename,
+                classify_on,
+            )
+        } else {
+            resolve_output(req.output_path.as_deref(), &cfg_guard, &filename)
+        };
+        let cfg = DownloadConfig {
+            destination: output.parent().map(PathBuf::from),
+            block_size: 1 << 20,
+            max_concurrency: cfg_guard.max_connections,
+            mirrors: req.mirrors.clone(),
+            interfaces: req.interfaces.clone(),
+            supports_range: Some(meta.supports_range),
+            proxy: proxy.clone(),
+        };
+        (output, cfg)
     };
     if let Some(parent) = output.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -190,13 +222,63 @@ async fn add(
         }
     }
 
-    let cfg = DownloadConfig {
-        destination: output.parent().map(PathBuf::from),
-        block_size: 1 << 20,
-        max_concurrency: st.config.max_connections,
-        mirrors: req.mirrors.clone(),
-        interfaces: req.interfaces.clone(),
-    };
+    // 完整度检测：目标文件已存在且大小等于探测到的总大小 → 拒绝重复下载。
+    // 完整度检测：目标文件已存在且大小等于探测到的总大小 → 处理重复下载。
+    // （引擎的断点续传会把已有长度标记为已完成，若 len >= total 会“秒完成”且无校验，
+    //   用户无法判断文件是否完整，这里拦截处理。）
+    // overwrite=true → 删除旧文件重新下载；否则 → 自动重命名（name (1).ext）继续下载。
+    let mut renamed = false;
+    if meta.total_size > 0 {
+        if let Ok(md) = tokio::fs::metadata(&output).await {
+            if md.is_file() && md.len() == meta.total_size {
+                if req.overwrite {
+                    match tokio::fs::remove_file(&output).await {
+                        Ok(()) => {}
+                        Err(e) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                axum::Json(serde_json::json!({
+                                    "error": "remove old file",
+                                    "detail": format!("删除旧文件失败: {e}")
+                                })),
+                            );
+                        }
+                    }
+                } else {
+                    // 自动重命名：name (1).ext / name (2).ext … 直到不冲突
+                    let parent = output.parent().unwrap_or_else(|| std::path::Path::new("."));
+                    let stem = output
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "download".to_string());
+                    let ext = output
+                        .extension()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let mut idx = 1;
+                    let new_output = loop {
+                        let candidate = if ext.is_empty() {
+                            parent.join(format!("{stem} ({idx})"))
+                        } else {
+                            parent.join(format!("{stem} ({idx}).{ext}"))
+                        };
+                        if tokio::fs::metadata(&candidate).await.is_err() {
+                            break candidate;
+                        }
+                        idx += 1;
+                    };
+                    eprintln!(
+                        "[download] file exists, auto-rename {} -> {}",
+                        output.display(),
+                        new_output.display()
+                    );
+                    output = new_output;
+                    cfg.destination = output.parent().map(PathBuf::from);
+                    renamed = true;
+                }
+            }
+        }
+    }
 
     let sources = match proto.create_sources(&parsed, &cfg).await {
         Ok(s) => s,
@@ -217,19 +299,22 @@ async fn add(
         st.events.clone(),
         proto.name().to_string(),
         cfg.max_concurrency,
+        meta.supports_range,
     );
 
     let added_at = now_secs();
     let dt = DownloadTask {
         task: task.clone(),
         url: req.url.clone(),
-        filename: filename.clone(),
+        filename: if renamed { output.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| filename.clone()) } else { filename.clone() },
         output: output.clone(),
         added_at,
         max_concurrency: cfg.max_concurrency,
         error: tokio::sync::Mutex::new(None),
     };
 
+
+    let resp_filename = output.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| filename.clone());
     // 后台运行；完成后依据状态写入错误。
     let task_run = task.clone();
     let st_run = st.clone();
@@ -252,11 +337,11 @@ async fn add(
             eprintln!("[download] task {id_run} completed");
         }
     });
-
     st.tasks.lock().await.insert(id.clone(), dt);
+
     (
         StatusCode::CREATED,
-        axum::Json(serde_json::json!({"id": id})),
+        axum::Json(serde_json::json!({"id": id, "filename": resp_filename})),
     )
 }
 
@@ -345,6 +430,120 @@ async fn events(
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
+/// GET /api/config — 当前 daemon 配置（供设置页初始化）。
+async fn get_config(State(st): State<Arc<AppState>>) -> axum::Json<serde_json::Value> {
+    let cfg = st.config.read().unwrap();
+    let map = cfg.classify.merged_map();
+    let mut sorted: Vec<(String, String)> = map.into_iter().collect();
+    sorted.sort();
+    let rules: serde_json::Map<String, serde_json::Value> = sorted
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::Value::String(v)))
+        .collect();
+    axum::Json(serde_json::json!({
+        "download_dir": cfg.download_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        "max_connections": cfg.max_connections,
+        "classify_enabled": cfg.classify.enabled,
+        "classify_rules": rules,
+        "proxy": {
+            "mode": match cfg.proxy.mode {
+                libsurge::protocol::ProxyMode::Direct => "direct",
+                libsurge::protocol::ProxyMode::System => "system",
+                libsurge::protocol::ProxyMode::Custom => "custom",
+            },
+            "url": cfg.proxy.url,
+        },
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct ClassifyUpdateReq {
+    pub enabled: bool,
+    /// 扩展名（小写，无点）→ 分类目录名；完整覆盖用户自定义部分。
+    pub rules: HashMap<String, String>,
+}
+
+/// PUT /api/config/classify — 保存自动分类规则（运行时生效 + 持久化到 download-engine.toml）。
+/// body: {"enabled": bool, "rules": {"mp4": "Videos", ...}}
+/// rules 为完整覆盖：先合并内置默认，再应用用户覆盖（未提供的扩展名回退默认分类）。
+async fn put_config_classify(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<ClassifyUpdateReq>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    // 完整覆盖写入
+    {
+        let mut cfg = st.config.write().unwrap();
+        cfg.classify.map = req.rules;
+        cfg.classify.enabled = req.enabled;
+        // 持久化（读锁已释放）
+        cfg.save_classify_map(&cfg.classify.map).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persist classify config: {e}"),
+            )
+        })?;
+    }
+    let merged = st.config.read().unwrap().classify.merged_map();
+    let mut sorted: Vec<(String, String)> = merged.into_iter().collect();
+    sorted.sort();
+    let rules: serde_json::Map<String, serde_json::Value> = sorted
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::Value::String(v)))
+        .collect();
+    Ok(axum::Json(serde_json::json!({
+        "ok": true,
+        "classify_enabled": st.config.read().unwrap().classify.enabled,
+        "classify_rules": rules,
+    })))
+}
+
+/// PUT /api/config/proxy — 保存 HTTP 下载代理配置（运行时生效 + 持久化到 download-engine.toml）。
+/// body: {"mode": "direct"|"system"|"custom", "url": "http://..."|"socks5://..."}
+#[derive(Deserialize)]
+pub struct ProxyUpdateReq {
+    pub mode: String,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+async fn put_config_proxy(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<ProxyUpdateReq>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let mode = match req.mode.as_str() {
+        "system" => libsurge::protocol::ProxyMode::System,
+        "custom" => libsurge::protocol::ProxyMode::Custom,
+        _ => libsurge::protocol::ProxyMode::Direct,
+    };
+    // custom 模式必须给 url
+    if mode == libsurge::protocol::ProxyMode::Custom {
+        let url = req.url.as_deref().unwrap_or("");
+        if url.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "custom proxy requires url".into()));
+        }
+    }
+    let url = req.url.filter(|u| !u.is_empty());
+    {
+        let mut cfg = st.config.write().unwrap();
+        cfg.proxy.mode = mode;
+        cfg.proxy.url = url;
+        cfg.save_proxy("download-engine.toml")
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("persist proxy config: {e}")))?;
+    }
+    let cfg = st.config.read().unwrap();
+    Ok(axum::Json(serde_json::json!({
+        "ok": true,
+        "proxy": {
+            "mode": match cfg.proxy.mode {
+                libsurge::protocol::ProxyMode::Direct => "direct",
+                libsurge::protocol::ProxyMode::System => "system",
+                libsurge::protocol::ProxyMode::Custom => "custom",
+            },
+            "url": cfg.proxy.url,
+        },
+    })))
+}
+
 /// 枚举本机网卡（供 UI 多网卡配置页展示）。
 ///
 /// 返回**全部适配器**（含断开/无 IP 的物理网卡，附 `connected` 标记）；
@@ -411,6 +610,9 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         )
         .route("/api/events", get(events))
         .route("/api/interfaces", get(list_interfaces))
+        .route("/api/config", get(get_config))
+        .route("/api/config/classify", axum::routing::put(put_config_classify))
+        .route("/api/config/proxy", axum::routing::put(put_config_proxy))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -424,3 +626,14 @@ fn now_secs() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+
+
+
+
+
+
+
+
+
+
