@@ -41,6 +41,10 @@ pub struct DownloadStatus {
     pub added_at: i64,
     pub time_taken: i64,
     pub avg_speed: f64,
+    /// 自动分类名（按设置 classify_rules 推导：Videos/Music/.../Others）。
+    /// 前端据此在「全部文件」下按分类筛选。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
 
 /// 把引擎内部状态词映射为 orig-hub 的字符串词表。
@@ -68,6 +72,7 @@ impl DownloadStatus {
         prog: &Progress,
         now: i64,
         error: Option<String>,
+        category: Option<String>,
     ) -> Self {
         let total = prog.total;
         let downloaded = prog.downloaded;
@@ -109,6 +114,7 @@ impl DownloadStatus {
             added_at,
             time_taken,
             avg_speed,
+            category,
         }
     }
 }

@@ -14,7 +14,7 @@ export function MainLayout() {
   const [view, setView] = useState<ViewId>('downloading')
   const [collapsed, setCollapsed] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
-  const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast } = useStore()
+  const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter } = useStore()
 
   useEffect(() => {
     init()
@@ -48,14 +48,25 @@ export function MainLayout() {
   const aggTotal = aggregate.reduce((sum, d) => sum + (d.total_size || 0), 0)
   const globalProgress = aggTotal > 0 ? Math.min(100, (aggDownloaded / aggTotal) * 100) : 0
 
-  const visible =
+  // 切换视图时清空分类筛选；保持「全部文件」下钻与顶层视图互斥。
+  const handleView = (v: ViewId) => {
+    setCategoryFilter(null)
+    setView(v)
+  }
+
+  const baseVisible =
     view === 'settings'
       ? downloads
       : view === 'completed'
         ? completed
-        : downloads.filter(
-            (d) => d.status === 'downloading' || d.status === 'queued' || d.status === 'paused' || d.status === 'idle' || d.status === 'error',
-          )
+        : view === 'downloading'
+          ? downloads.filter(
+              (d) => d.status === 'downloading' || d.status === 'queued' || d.status === 'paused' || d.status === 'idle' || d.status === 'error',
+            )
+          : downloads
+  const visible = categoryFilter
+    ? baseVisible.filter((d) => d.category === categoryFilter)
+    : baseVisible
 
   const busy = active.length > 0
 
@@ -67,10 +78,13 @@ export function MainLayout() {
       <div className="flex min-h-0 flex-1">
         <Sidebar
           view={view}
-          onViewChange={setView}
+          onViewChange={handleView}
+          categories={categories}
+          categoryFilter={categoryFilter}
+          onCategoryChange={setCategoryFilter}
           collapsed={collapsed}
           onToggle={() => setCollapsed((c) => !c)}
-          counts={{ active: active.length, completed: completed.length }}
+          counts={{ active: active.length, completed: completed.length, total: downloads.length }}
         />
 
         <div className="flex min-w-0 flex-1 flex-col">

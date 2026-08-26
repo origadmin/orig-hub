@@ -1,14 +1,19 @@
-import type { JSX } from 'react'
+import { useState, type JSX } from 'react'
 import { cn } from '../lib/utils'
 
-export type ViewId = 'downloading' | 'completed' | 'settings'
+export type ViewId = 'all' | 'downloading' | 'completed' | 'settings'
 
 interface Props {
   view: ViewId
   onViewChange: (v: ViewId) => void
+  /** 自动分类清单（来自 daemon classify_rules 去重）；「全部文件」下钻子项 */
+  categories: string[]
+  /** 当前选中的分类（null = 不过滤） */
+  categoryFilter: string | null
+  onCategoryChange: (c: string | null) => void
   collapsed: boolean
   onToggle: () => void
-  counts: { active: number; completed: number }
+  counts: { active: number; completed: number; total: number }
 }
 
 const NAV_ITEMS: { id: ViewId; label: string; icon: JSX.Element }[] = [
@@ -42,13 +47,31 @@ const NAV_ITEMS: { id: ViewId; label: string; icon: JSX.Element }[] = [
   },
 ]
 
+const FolderIcon = (
+  <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+    <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 6.75A2.25 2.25 0 014.5 4.5h3.879a2.25 2.25 0 011.59.659l1.171 1.171a2.25 2.25 0 001.59.659H19.5a2.25 2.25 0 012.25 2.25v8.25A2.25 2.25 0 0119.5 19.5H4.5A2.25 2.25 0 012.25 17.25V6.75z" />
+  </svg>
+)
+
+const ChevronIcon = (
+  <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+    <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
+  </svg>
+)
+
 export function Sidebar({
   view,
   onViewChange,
+  categories,
+  categoryFilter,
+  onCategoryChange,
   collapsed,
   onToggle,
   counts,
 }: Props) {
+  const [catOpen, setCatOpen] = useState(false)
+  const allActive = view === 'all' && categoryFilter === null
+
   return (
     <aside
       className={cn(
@@ -56,7 +79,7 @@ export function Sidebar({
         collapsed ? 'w-12' : 'w-48',
       )}
     >
-      {/* Logo + 折叠/展开（合并到顶部一行：折叠按钮紧贴 Logo，避免独立按钮占位） */}
+      {/* Logo + 折叠/展开 */}
       <div
         className={cn(
           'flex h-12 items-center gap-2 px-3',
@@ -83,7 +106,7 @@ export function Sidebar({
         )}
       </div>
 
-      {/* 折叠态：Logo 下方一个独立的展开按钮（双箭头）作为出口 */}
+      {/* 折叠态：独立展开按钮 */}
       {collapsed && (
         <button
           onClick={onToggle}
@@ -99,6 +122,66 @@ export function Sidebar({
 
       {/* 导航 */}
       <nav className="flex-1 space-y-1 px-2">
+        {/* 全部文件（可展开分类下钻） */}
+        <div>
+          <button
+            onClick={() => {
+              onCategoryChange(null)
+              onViewChange('all')
+              setCatOpen((o) => !o)
+            }}
+            title="全部文件"
+            className={cn(
+              'flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-sm transition-all duration-200',
+              collapsed && 'justify-center px-0',
+              allActive
+                ? 'bg-accent/15 text-accent'
+                : 'text-fg-soft hover:bg-surface-2 hover:text-fg-mid',
+            )}
+          >
+            <span className="shrink-0">{FolderIcon}</span>
+            {!collapsed && (
+              <>
+                <span className="flex-1 text-left">全部文件</span>
+                {counts.total > 0 && (
+                  <span className="rounded-full bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-fg-soft">
+                    {counts.total}
+                  </span>
+                )}
+                <span className={cn('shrink-0 text-muted transition-transform duration-200', catOpen && 'rotate-90')}>
+                  {ChevronIcon}
+                </span>
+              </>
+            )}
+          </button>
+
+          {catOpen && !collapsed && categories.length > 0 && (
+            <div className="mt-0.5 space-y-0.5">
+              {categories.map((cat) => {
+                const active = view === 'all' && categoryFilter === cat
+                return (
+                  <button
+                    key={cat}
+                    onClick={() => {
+                      onViewChange('all')
+                      onCategoryChange(cat)
+                    }}
+                    title={cat}
+                    className={cn(
+                      'flex w-full items-center gap-2 rounded-md py-1.5 pl-9 pr-2.5 text-[13px] transition-colors',
+                      active
+                        ? 'bg-accent/15 text-accent'
+                        : 'text-fg-soft hover:bg-surface-2 hover:text-fg-mid',
+                    )}
+                  >
+                    <span className="flex-1 truncate text-left">{cat}</span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
+        </div>
+
         {NAV_ITEMS.map((item) => {
           const active = view === item.id
           const count =
