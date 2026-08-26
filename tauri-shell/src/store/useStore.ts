@@ -23,6 +23,7 @@ function loadSettings(): AppSettings {
     primaryInterface: undefined,
     enabledInterfaces: {},
     autoClassify: false,
+    classifyRules: {},
   }
   try {
     const raw = localStorage.getItem(SETTINGS_KEY)
@@ -31,6 +32,30 @@ function loadSettings(): AppSettings {
   } catch {
     return defaults
   }
+}
+
+/** 解析最终主题：dark | light（system → 跟随 prefers-color-scheme） */
+export function resolveTheme(theme: AppSettings['theme']): 'dark' | 'light' {
+  if (theme === 'system') {
+    return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
+  }
+  return theme
+}
+
+/** 将主题应用到 <html data-theme>（并同步 body 类名） */
+export function applyTheme(theme: AppSettings['theme']) {
+  const resolved = resolveTheme(theme)
+  document.documentElement.setAttribute('data-theme', resolved)
+  document.documentElement.classList.toggle('dark', resolved === 'dark')
+  document.documentElement.classList.toggle('light', resolved === 'light')
+}
+
+/** 监听系统配色变化：system 模式下实时跟随 */
+export function watchSystemTheme(theme: () => AppSettings['theme']) {
+  const mq = window.matchMedia?.('(prefers-color-scheme: light)')
+  if (!mq || typeof mq.addEventListener !== 'function') return
+  const handler = () => applyTheme(theme())
+  mq.addEventListener('change', handler)
 }
 
 interface DownloadState {
@@ -52,6 +77,8 @@ interface DownloadState {
   resume: (id: string) => Promise<void>
   cancel: (id: string) => Promise<void>
   remove: (id: string) => Promise<void>
+  pauseAll: () => Promise<void>
+  resumeAll: () => Promise<void>
   clearCompleted: () => Promise<void>
   updateSettings: (patch: Partial<AppSettings>) => void
   applyInterfaces: () => Promise<void>
@@ -67,6 +94,8 @@ export const useStore = create<DownloadState>((set, get) => ({
   error: null,
 
   init: async () => {
+    // 0. system 主题实时跟随系统配色
+    watchSystemTheme(() => get().settings.theme)
     // 1. 订阅 SSE 实时进度
     subscribeEvents(
       (evt) => {
@@ -153,6 +182,26 @@ export const useStore = create<DownloadState>((set, get) => ({
     await get().refresh()
   },
 
+  /** 全部暂停（仅作用于下载中/排队中任务） */
+  pauseAll: async () => {
+    const targets = get().downloads.filter(
+      (d) => d.status === 'downloading' || d.status === 'queued',
+    )
+    for (const d of targets) {
+      await apiDownloadAction(d.id, 'pause').catch(() => {})
+    }
+    await get().refresh()
+  },
+
+  /** 全部开始（仅作用于已暂停任务） */
+  resumeAll: async () => {
+    const targets = get().downloads.filter((d) => d.status === 'paused')
+    for (const d of targets) {
+      await apiDownloadAction(d.id, 'resume').catch(() => {})
+    }
+    await get().refresh()
+  },
+
   clearCompleted: async () => {
     const completed = get().downloads.filter(
       (d) => d.status === 'completed' || d.status === 'error' || d.status === 'cancelled',
@@ -171,6 +220,8 @@ export const useStore = create<DownloadState>((set, get) => ({
       } catch {
         // 忽略持久化失败（隐私模式等）
       }
+      // 主题切换即时生效（含 system → 跟随系统）
+      if (patch.theme) applyTheme(settings.theme)
       return { settings }
     }),
 

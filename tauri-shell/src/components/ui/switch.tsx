@@ -15,7 +15,7 @@ export function Switch({ checked, onChange, disabled, id }: SwitchProps) {
       disabled={disabled}
       onClick={() => onChange(!checked)}
       className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 ${
-        checked ? 'bg-accent' : 'bg-zinc-700'
+        checked ? 'bg-accent' : 'bg-track'
       }`}
     >
       <span

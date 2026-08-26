@@ -39,7 +39,7 @@ export function Stepper({
         type="button"
         onClick={() => stepTo(-1)}
         disabled={disabled || value <= min}
-        className="flex h-full w-8 items-center justify-center text-muted transition-colors hover:bg-surface-2 hover:text-zinc-100 disabled:cursor-not-allowed disabled:opacity-40"
+        className="flex h-full w-8 items-center justify-center text-muted transition-colors hover:bg-surface-2 hover:text-fg-strong disabled:cursor-not-allowed disabled:opacity-40"
         aria-label="减少"
       >
         −
@@ -68,13 +68,13 @@ export function Stepper({
             stepTo(-1)
           }
         }}
-        className="h-full w-10 border-x border-border-subtle bg-transparent text-center text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-accent/50"
+        className="h-full w-10 border-x border-border-subtle bg-transparent text-center text-sm text-fg-strong focus:outline-none focus:ring-2 focus:ring-inset focus:ring-accent/50"
       />
       <button
         type="button"
         onClick={() => stepTo(1)}
         disabled={disabled || value >= max}
-        className="flex h-full w-8 items-center justify-center text-muted transition-colors hover:bg-surface-2 hover:text-zinc-100 disabled:cursor-not-allowed disabled:opacity-40"
+        className="flex h-full w-8 items-center justify-center text-muted transition-colors hover:bg-surface-2 hover:text-fg-strong disabled:cursor-not-allowed disabled:opacity-40"
         aria-label="增加"
       >
         +
