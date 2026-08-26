@@ -32,6 +32,12 @@ pub struct DownloadStatus {
     pub blocks_done: u32,
     #[serde(default)]
     pub blocks_pending: u32,
+    /// 每块负责源下标（255 = 未分配）；与 blocks 同门控（BUG-002 增强：按网卡着色）。
+    #[serde(default)]
+    pub block_source: Vec<u8>,
+    /// 是否支持 Range（决定是否分块并发；前端据此判断是否渲染块网格）。
+    #[serde(default)]
+    pub supports_range: bool,
     pub added_at: i64,
     pub time_taken: i64,
     pub avg_speed: f64,
@@ -98,6 +104,8 @@ impl DownloadStatus {
             blocks_total: prog.blocks_total,
             blocks_done: prog.blocks_done,
             blocks_pending: prog.blocks_pending,
+            block_source: prog.block_source.clone(),
+            supports_range: prog.supports_range,
             added_at,
             time_taken,
             avg_speed,

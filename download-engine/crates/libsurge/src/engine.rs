@@ -351,6 +351,12 @@ impl Task {
         } else {
             Vec::new()
         };
+        // 每块负责源（与 blocks 同门控）；255 = 未分配。
+        let block_source: Vec<u8> = if bm.blocks.len() <= 4096 {
+            bm.block_source.clone()
+        } else {
+            Vec::new()
+        };
 
         Progress {
             id: self.id.clone(),
@@ -366,6 +372,8 @@ impl Task {
             blocks_total,
             blocks_done,
             blocks_pending,
+            block_source,
+            supports_range: self.supports_range,
         }
     }
 
@@ -474,6 +482,8 @@ impl Task {
 
             match self.pick_source(&block) {
                 Some(si) => {
+                    // 记录该块负责源（前端按网卡着色用）；重试会覆盖为新源。
+                    self.block_map.write().await.set_source(idx, si as u8);
                     file.seek(SeekFrom::Start(block.offset)).await?;
                     let started = Instant::now();
                     let r = self.sources[si].fetch_block(&block, &token, &mut file).await;
