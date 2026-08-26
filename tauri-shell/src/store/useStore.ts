@@ -68,6 +68,8 @@ interface DownloadState {
   connected: boolean
   loading: boolean
   error: string | null
+  /** 全局瞬时提示（toast）：按钮/操作失败时的用户可见反馈，避免“点击无反应” */
+  toast: string | null
 
   init: () => Promise<void>
   refresh: () => Promise<void>
@@ -83,6 +85,7 @@ interface DownloadState {
   updateSettings: (patch: Partial<AppSettings>) => void
   applyInterfaces: () => Promise<void>
   setError: (e: string | null) => void
+  clearToast: () => void
 }
 
 export const useStore = create<DownloadState>((set, get) => ({
@@ -92,6 +95,7 @@ export const useStore = create<DownloadState>((set, get) => ({
   connected: false,
   loading: false,
   error: null,
+  toast: null,
 
   init: async () => {
     // 0. system 主题实时跟随系统配色
@@ -250,5 +254,6 @@ export const useStore = create<DownloadState>((set, get) => ({
     }
   },
 
-  setError: (e) => set({ error: e }),
+  setError: (e) => set({ error: e, toast: e }),
+  clearToast: () => set({ toast: null }),
 }))
