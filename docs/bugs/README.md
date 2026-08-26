@@ -34,3 +34,4 @@
 | BUG-002 | 无法查看每连接状态与分块进度 | open | engine+shell |
 | BUG-003 | 速度统计失准（完成仍显示/进行中不准） | open | engine+shell |
 | BUG-004 | 无全局进度状态，状态栏仅计数无实时速度 | open | shell |
+| BUG-005 | 「打开文件/打开目录」按钮无效 + 纯文字样式不一致 | closed | shell |
