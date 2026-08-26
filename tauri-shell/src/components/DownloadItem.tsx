@@ -28,7 +28,7 @@ const statusMeta: Record<
 }
 
 export function DownloadItem({ item }: { item: DownloadStatus }) {
-  const { pause, resume, cancel, remove } = useStore()
+  const { pause, resume, cancel, remove, setError } = useStore()
   const meta = statusMeta[item.status] ?? statusMeta.idle
   const isActive = item.status === 'downloading'
 
@@ -40,6 +40,7 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
       await revealItemInDir(item.dest_path)
     } catch (e) {
       console.error('reveal failed', e)
+      setError(`打开文件失败：${e instanceof Error ? e.message : String(e)}`)
     }
   }
 
@@ -52,6 +53,7 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
       await openPath(dir || item.dest_path)
     } catch (e) {
       console.error('open dir failed', e)
+      setError(`打开目录失败：${e instanceof Error ? e.message : String(e)}`)
     }
   }
 
@@ -71,20 +73,29 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
           </p>
         </div>
 
-        {/* 操作按钮 */}
+        {/* 操作按钮（图标+文字，悬停显示） */}
         <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
           {isActive && (
             <Button size="sm" variant="ghost" onClick={() => pause(item.id)} title="暂停">
+              <svg className="mr-1 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M8 5v14M16 5v14" />
+              </svg>
               暂停
             </Button>
           )}
           {item.status === 'paused' && (
             <Button size="sm" variant="ghost" onClick={() => resume(item.id)} title="恢复">
+              <svg className="mr-1 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86a1 1 0 0 0-1.5.86z" />
+              </svg>
               恢复
             </Button>
           )}
           {(isActive || item.status === 'paused' || item.status === 'queued' || item.status === 'idle') && (
             <Button size="sm" variant="ghost" onClick={() => cancel(item.id)} title="取消">
+              <svg className="mr-1 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M18 6 6 18M6 6l12 12" />
+              </svg>
               取消
             </Button>
           )}
@@ -92,15 +103,24 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
             <>
               {item.status === 'completed' && isTauri() && item.dest_path && (
                 <>
-                  <Button size="sm" variant="ghost" onClick={handleReveal} title="在资源管理器中显示文件">
+                  <Button size="sm" variant="ghost" onClick={() => { void handleReveal(); }} title="在资源管理器中显示文件">
+                    <svg className="mr-1 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M6 14l1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.55 6a2 2 0 0 1-1.94 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.93a2 2 0 0 1 1.66.9l.82 1.2a2 2 0 0 0 1.66.9H18a2 2 0 0 1 2 2v2" />
+                    </svg>
                     打开文件
                   </Button>
-                  <Button size="sm" variant="ghost" onClick={handleOpenDir} title="打开下载目录">
+                  <Button size="sm" variant="ghost" onClick={() => { void handleOpenDir(); }} title="打开下载目录">
+                    <svg className="mr-1 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+                    </svg>
                     打开目录
                   </Button>
                 </>
               )}
               <Button size="sm" variant="ghost" onClick={() => remove(item.id)} title="删除">
+                <svg className="mr-1 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6" />
+                </svg>
                 删除
               </Button>
             </>
