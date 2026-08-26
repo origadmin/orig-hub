@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/libsurge",
-    "crates/surge-net",
-    "crates/surge-protocol-virtual",
-    "crates/surge-protocol-http",
-    "crates/surge-daemon",
+    "crates/orig-core",
+    "crates/orig-net",
+    "crates/orig-protocol-virtual",
+    "crates/orig-protocol-http",
+    "crates/orig-daemon",
 ]
 
 [workspace.package]

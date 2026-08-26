@@ -1,10 +1,10 @@
 [package]
-name = "surge-protocol-virtual"
+name = "orig-protocol-virtual"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-libsurge = { path = "../libsurge" }
+orig-core = { path = "../orig-core" }
 async-trait.workspace = true
 sha2.workspace = true
 tokio.workspace = true

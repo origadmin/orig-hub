@@ -729,7 +729,7 @@ export function SettingsPanel() {
               <div className="space-y-5 rounded-xl border border-border-subtle bg-surface p-5">
                 <div className="flex items-center justify-between gap-4">
                   <div>
-                    <p className="text-[13px] font-medium text-fg-strong">下载引擎 (surge-daemon)</p>
+                    <p className="text-[13px] font-medium text-fg-strong">下载引擎 (orig-daemon)</p>
                     <p className="mt-0.5 text-[11px] text-muted">
                       {daemon?.managed ? '由本应用托管（sidecar）' : '外部 daemon'}
                     </p>

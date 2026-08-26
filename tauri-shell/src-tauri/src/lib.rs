@@ -1,7 +1,7 @@
 //! Orig Hub — Tauri v2 桌面外壳。
 //!
 //! 职责：
-//! - 拉起/管理 surge-daemon sidecar（Rust 下载内核，HTTP REST + SSE on 9876）
+//! - 拉起/管理 orig-daemon sidecar（Rust 下载内核，HTTP REST + SSE on 9876）
 //! - 单实例锁 + 系统托盘
 //! - 向前端暴露 daemon 状态查询命令
 
@@ -14,7 +14,7 @@ use tauri_plugin_shell::process::CommandChild;
 use tauri_plugin_shell::ShellExt;
 
 /// 侧边进程名（与 tauri.conf.json externalBin 对应）。
-const DAEMON_BIN: &str = "surge-daemon";
+const DAEMON_BIN: &str = "orig-daemon";
 /// daemon 默认监听端口。
 const DAEMON_PORT: u16 = 9876;
 

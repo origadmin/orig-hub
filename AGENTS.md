@@ -6,7 +6,7 @@
 
 | 舱 | 路径 | 说明 |
 |---|---|---|
-| 下载内核 | `download-engine/` | Rust Cargo workspace，crate：`libsurge`(引擎)、`surge-net`、`surge-protocol-{http,virtual}`、`surge-daemon`(REST/SSE 守护进程) |
+| 下载内核 | `download-engine/` | Rust Cargo workspace，crate：`orig-core`(引擎)、`orig-net`、`orig-protocol-{http,virtual}`、`orig-daemon`(REST/SSE 守护进程) |
 | 桌面壳 | `tauri-shell/` | Tauri v2 壳，`src-tauri/`(Rust) + `src/`(React 前端) |
 
 > 不在仓库保留 Wails/Go 残留（`ui/`、`go.work*` 已清理）。内核通过 sidecar 模式被 Tauri 壳调用，**非 cgo FFI**。

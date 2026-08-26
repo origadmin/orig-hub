@@ -12,14 +12,14 @@ HTTP / BT / FTP / Mock）。HTTP Range 与 BT piece 都归约为「往 offset �
 
 ```
 download-engine/
-  Cargo.toml              workspace（成员：libsurge / surge-protocol-* / surge-daemon）
+  Cargo.toml              workspace（成员：orig-core / orig-protocol-* / orig-daemon）
   .cargo/config.toml      rsproxy.cn 国内镜像（构建免翻墙）
   rust-toolchain.toml     stable
   crates/
-    libsurge/             核心：BlockMap + Source + engine 并发调度 + Registry
-    surge-protocol-virtual/  零网络自检源（mock://，确定性字节）
-    surge-protocol-http/      真实 HTTP 源（reqwest Range 并发 + 429 退避 + 镜像回退）
-    surge-daemon/         axum HTTP REST + SSE 守护进程
+    orig-core/             核心：BlockMap + Source + engine 并发调度 + Registry
+    orig-protocol-virtual/  零网络自检源（mock://，确定性字节）
+    orig-protocol-http/      真实 HTTP 源（reqwest Range 并发 + 429 退避 + 镜像回退）
+    orig-daemon/         axum HTTP REST + SSE 守护进程
   verify/                 verify_http.py（自动化验收）+ run_verify.sh
 ```
 
@@ -63,22 +63,22 @@ cd download-engine
 cargo build                              # 国内 rsproxy 镜像，免翻墙
 
 # 运行（守护进程，监听 9876）
-SURGE_DOWNLOAD_DIR=~/Downloads PORT=9876 cargo run -p surge-daemon
+SURGE_DOWNLOAD_DIR=~/Downloads PORT=9876 cargo run -p orig-daemon
 
 # 鉴权（可选）
-SURGE_TOKEN=secret cargo run -p surge-daemon   # 此后所有路由含 /health 需 Bearer
+SURGE_TOKEN=secret cargo run -p orig-daemon   # 此后所有路由含 /health 需 Bearer
 ```
 
-> **Windows 构建陷阱**：若上一次 `surge-daemon` 进程没退出，会锁住
+> **Windows 构建陷阱**：若上一次 `orig-daemon` 进程没退出，会锁住
 > `target/debug/incremental` 导致 `cargo build` 报 `os error 5`。
-> 先释放进程再构建：`taskkill //F //IM surge-daemon.exe`；
+> 先释放进程再构建：`taskkill //F //IM orig-daemon.exe`；
 > 或设置 `CARGO_INCREMENTAL=0` 规避坏增量缓存。
 
 ## 自动化验收（强制）
 
 ```sh
 ./verify/run_verify.sh
-# 等价于：cargo build && python3 verify/verify_http.py --daemon target/debug/surge-daemon
+# 等价于：cargo build && python3 verify/verify_http.py --daemon target/debug/orig-daemon
 ```
 
 验收门：
@@ -98,5 +98,5 @@ SURGE_TOKEN=secret cargo run -p surge-daemon   # 此后所有路由含 /health �
 ## 下一步
 
 - Phase 1.5：与 orig-hub Go 侧行为差异对比（分块边界 / 续传 / 429 / 镜像回退）。
-- 协议插件：`surge-protocol-bittorrent`、`surge-protocol-ftp`。
+- 协议插件：`orig-protocol-bittorrent`、`orig-protocol-ftp`。
 - UI 迁移：Tauri v2（悬浮窗 + 系统托盘）。

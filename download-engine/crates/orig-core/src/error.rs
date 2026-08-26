@@ -2,7 +2,7 @@ use thiserror::Error;
 
 /// 统一错误类型。
 #[derive(Debug, Error)]
-pub enum SurgeError {
+pub enum OrigError {
     #[error("unsupported scheme or protocol: {0}")]
     Unsupported(String),
 
@@ -28,4 +28,4 @@ pub enum SurgeError {
     Other(String),
 }
 
-pub type Result<T> = std::result::Result<T, SurgeError>;
+pub type Result<T> = std::result::Result<T, OrigError>;

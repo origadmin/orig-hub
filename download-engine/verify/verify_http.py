@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-surge-daemon 自动化验收（纯标准库，无第三方依赖）。
+orig-daemon 自动化验收（纯标准库，无第三方依赖）。
 
 覆盖既定验收门：
   1. 真实 HTTP 下载（Range GET）端到端跑通；
@@ -11,7 +11,7 @@ surge-daemon 自动化验收（纯标准库，无第三方依赖）。
   4. 完成文件 size 与 sha256 与源完全一致（校验正确性）。
 
 用法：
-  python3 verify_http.py --daemon target/debug/surge-daemon [--port 9876] [--token xxx]
+  python3 verify_http.py --daemon target/debug/orig-daemon [--port 9876] [--token xxx]
 """
 import argparse
 import hashlib
@@ -135,7 +135,7 @@ def fail(msg):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--daemon", default="target/debug/surge-daemon")
+    ap.add_argument("--daemon", default="target/debug/orig-daemon")
     ap.add_argument("--port", type=int, default=9876)
     ap.add_argument("--token", default=None)
     args = ap.parse_args()

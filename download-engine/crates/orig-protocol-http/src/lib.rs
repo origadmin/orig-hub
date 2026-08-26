@@ -7,7 +7,7 @@
 //! - 429 退避：读 `Retry-After`，否则指数退避。
 //! - 镜像回退：主源失败后按顺序尝试 `mirrors` 中的备用 URL。
 //!
-//! ## 多网卡分流（surge-net 集成）
+//! ## 多网卡分流（orig-net 集成）
 //! - `create_sources` 读取 `cfg.interfaces`（`InterfaceSpec`）→ 解析为 `InterfacePool`。
 //! - **每网卡一个 `BoundSource`**：独立的 reqwest Client，`local_address(网卡IP)` 绑定，
 //!   该网卡所有流量从对应 IP 发出（OS 路由保证）。
@@ -16,8 +16,8 @@
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use libsurge::error::{Result, SurgeError};
-use libsurge::protocol::*;
+use orig_core::error::{Result, OrigError};
+use orig_core::protocol::*;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RANGE, RETRY_AFTER};
 use reqwest::StatusCode;
 use std::net::{IpAddr, Ipv4Addr};
@@ -147,7 +147,7 @@ impl BoundSource {
         }
         let client = builder
             .build()
-            .map_err(|e| SurgeError::Other(format!("http client: {e}")))?;
+            .map_err(|e| OrigError::Other(format!("http client: {e}")))?;
         Ok(BoundSource {
             client,
             urls,
@@ -195,13 +195,13 @@ impl Source for BoundSource {
         writer: &mut (dyn AsyncWrite + Unpin + Send),
     ) -> Result<()> {
         let end = block.offset + block.len - 1;
-        let mut last_err = SurgeError::NoSource;
+        let mut last_err = OrigError::NoSource;
         // 依次尝试主源 + 各镜像源。
         for url in &self.urls {
             let mut attempt: u32 = 0;
             loop {
                 if token.is_cancelled() {
-                    return Err(SurgeError::Cancelled);
+                    return Err(OrigError::Cancelled);
                 }
                 // 不支持 Range 的服务器：不带 Range 头，整文件流（引擎保证 offset=0, len=total）
                 let resp = if self.supports_range {
@@ -221,7 +221,7 @@ impl Source for BoundSource {
                             "[fetch_block] GET {} (range={}) transport error: {}",
                             url, self.supports_range, e
                         );
-                        last_err = SurgeError::Other(format!("http get {url}: {e}"));
+                        last_err = OrigError::Other(format!("http get {url}: {e}"));
                         break;
                     }
                 };
@@ -233,7 +233,7 @@ impl Source for BoundSource {
                         let mut remaining = block.len;
                         while remaining > 0 {
                             if token.is_cancelled() {
-                                return Err(SurgeError::Cancelled);
+                                return Err(OrigError::Cancelled);
                             }
                             match stream.next().await {
                                 Some(Ok(chunk)) => {
@@ -242,7 +242,7 @@ impl Source for BoundSource {
                                     remaining -= n as u64;
                                 }
                                 Some(Err(e)) => {
-                                    last_err = SurgeError::Other(format!("http body {url}: {e}"));
+                                    last_err = OrigError::Other(format!("http body {url}: {e}"));
                                     break;
                                 }
                                 None => break,
@@ -253,7 +253,7 @@ impl Source for BoundSource {
                             return Ok(());
                         }
                         // 流提前结束（不足 block.len）→ 切下一个镜像。
-                        last_err = SurgeError::Other(format!(
+                        last_err = OrigError::Other(format!(
                             "http range stream ended early ({url}): missing {} bytes",
                             remaining
                         ));
@@ -263,7 +263,7 @@ impl Source for BoundSource {
                         // 429：退避后重试同一 URL。
                         attempt += 1;
                         if attempt > MAX_RETRIES {
-                            last_err = SurgeError::Other(format!("http 429 exhausted ({url})"));
+                            last_err = OrigError::Other(format!("http 429 exhausted ({url})"));
                             break;
                         }
                         let wait = parse_retry_after(resp.headers().get(RETRY_AFTER));
@@ -277,7 +277,7 @@ impl Source for BoundSource {
                         let mut remaining = block.len;
                         while remaining > 0 {
                             if token.is_cancelled() {
-                                return Err(SurgeError::Cancelled);
+                                return Err(OrigError::Cancelled);
                             }
                             match stream.next().await {
                                 Some(Ok(chunk)) => {
@@ -286,7 +286,7 @@ impl Source for BoundSource {
                                     remaining -= n as u64;
                                 }
                                 Some(Err(e)) => {
-                                    last_err = SurgeError::Other(format!("http body {url}: {e}"));
+                                    last_err = OrigError::Other(format!("http body {url}: {e}"));
                                     break;
                                 }
                                 None => break,
@@ -297,7 +297,7 @@ impl Source for BoundSource {
                             return Ok(());
                         }
                         // 流提前结束（不足 block.len）→ 切下一个镜像。
-                        last_err = SurgeError::Other(format!(
+                        last_err = OrigError::Other(format!(
                             "http stream ended early ({url}): missing {} bytes",
                             remaining
                         ));
@@ -314,7 +314,7 @@ impl Source for BoundSource {
                                 url, self.supports_range, attempt - 1, s
                             );
                             last_err =
-                                SurgeError::Other(format!("http 5xx exhausted ({url}) last={s}"));
+                                OrigError::Other(format!("http 5xx exhausted ({url}) last={s}"));
                             break;
                         }
                         let wait = parse_retry_after(resp.headers().get(RETRY_AFTER))
@@ -336,7 +336,7 @@ impl Source for BoundSource {
                             "[fetch_block] GET {} (range={}) status {} (url={})",
                             url, self.supports_range, s, url
                         );
-                        last_err = SurgeError::Other(format!("http status {s} ({url})"));
+                        last_err = OrigError::Other(format!("http status {s} ({url})"));
                         break;
                     }
                 }
@@ -472,7 +472,7 @@ impl Protocol for HttpProtocol {
         builder = apply_proxy(builder, proxy);
         let client = builder
             .build()
-            .map_err(|e| SurgeError::Other(format!("http client: {e}")))?;
+            .map_err(|e| OrigError::Other(format!("http client: {e}")))?;
 
         // Step 1: HEAD 请求（优先，快捷，可直接拿 Content-Length + Accept-Ranges）
         // WAF 站点（如 ZOL）对请求概率性返回 503，HEAD 也重试几次。
@@ -498,12 +498,12 @@ impl Protocol for HttpProtocol {
                 }
                 Err(e) => {
                     // 网络不可达 / 超时 → 直接失败
-                    return Err(SurgeError::Other(format!("http head {}: {}", url.raw, e)));
+                    return Err(OrigError::Other(format!("http head {}: {}", url.raw, e)));
                 }
             }
         }
         let head_resp = head_resp.ok_or_else(|| {
-            SurgeError::Other(format!("http head {}: 5xx exhausted", url.raw))
+            OrigError::Other(format!("http head {}: 5xx exhausted", url.raw))
         })?;
 
         // 优先从 HEAD 响应拿 Content-Length（注意：HEAD 的 Content-Length 可能是
@@ -522,7 +522,7 @@ impl Protocol for HttpProtocol {
             .header(RANGE, "bytes=0-")
             .send()
             .await
-            .map_err(|e| SurgeError::Other(format!("http range probe {}: {}", url.raw, e)))?;
+            .map_err(|e| OrigError::Other(format!("http range probe {}: {}", url.raw, e)))?;
 
         let (total_size, supports_range) = match range_resp.status() {
             StatusCode::PARTIAL_CONTENT => {
@@ -534,7 +534,7 @@ impl Protocol for HttpProtocol {
                     .and_then(|v| v.split('/').nth(1))
                     .and_then(|v| v.parse::<u64>().ok())
                     .ok_or_else(|| {
-                        SurgeError::Other("server returned 206 but missing Content-Range header".into())
+                        OrigError::Other("server returned 206 but missing Content-Range header".into())
                     })?;
                 (total_size, true)
             }
@@ -548,7 +548,7 @@ impl Protocol for HttpProtocol {
                     .and_then(|v| v.parse::<u64>().ok())
                     .or(head_cl)
                     .ok_or_else(|| {
-                        SurgeError::Other(
+                        OrigError::Other(
                             "http: server returned 200 without Content-Length (chunked encoding not supported for unknown-size downloads)".into(),
                         )
                     })?;
@@ -570,7 +570,7 @@ impl Protocol for HttpProtocol {
                         (cl, false)
                     }
                     _ => {
-                        return Err(SurgeError::Other(format!(
+                        return Err(OrigError::Other(format!(
                             "http range probe {}: unexpected status {} (server refused range probe; HEAD Content-Length {:?} not trustworthy)",
                             url.raw, status, head_cl
                         )));
@@ -603,7 +603,7 @@ impl Protocol for HttpProtocol {
                 .to_lowercase()
                 .ends_with(".shtml");
         if content_type.contains("text/html") && !url_looks_html {
-            return Err(SurgeError::Other(format!(
+            return Err(OrigError::Other(format!(
                 "server returned HTML page instead of file (content-type={} size={}); likely anti-scraping redirect or dead link: {}",
                 content_type, total_size, url.raw
             )));
@@ -655,8 +655,8 @@ impl Protocol for HttpProtocol {
 
         // 多网卡分流：interfaces 配置 → 每网卡一个绑定源（URL↔网卡绑定）
         if let Some(spec) = &cfg.interfaces {
-            let pool = surge_net::InterfacePool::resolve(Some(spec))
-                .map_err(|e| SurgeError::Other(format!("resolve interfaces: {e}")))?;
+            let pool = orig_net::InterfacePool::resolve(Some(spec))
+                .map_err(|e| OrigError::Other(format!("resolve interfaces: {e}")))?;
             let mut sources: Vec<Box<dyn Source>> = Vec::with_capacity(pool.len());
             // 主网卡：主 URL + mirrors 回退
             sources.push(Box::new(BoundSource::new(
@@ -723,7 +723,7 @@ fn parse_query(q: &str) -> std::collections::HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libsurge::protocol::*;
+    use orig_core::protocol::*;
     use std::net::Ipv4Addr;
 
     /// 验证 BoundSource 携带正确的 weight 和 iface_name。
@@ -800,14 +800,14 @@ mod tests {
         };
         // secondaries 给一个真实存在的网卡名（主网卡自动探测加入）
         // 这里用主网卡名（重复名会被跳过），验证至少 1 个源（主网卡）。
-        let pool = surge_net::InterfacePool::resolve(None);
+        let pool = orig_net::InterfacePool::resolve(None);
         let cfg = match &pool {
             Ok(p) => DownloadConfig {
                 destination: None,
                 block_size: 1 << 20,
                 max_concurrency: 4,
                 mirrors: vec![],
-                interfaces: Some(surge_net::InterfaceSpec {
+                interfaces: Some(orig_net::InterfaceSpec {
                     primary: None,
                     primary_weight: Some(2),
                     secondaries: std::collections::HashMap::new(),
