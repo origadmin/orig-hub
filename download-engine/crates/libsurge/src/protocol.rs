@@ -89,6 +89,32 @@ pub struct ParsedUrl {
     pub query: HashMap<String, String>,
 }
 
+/// 代理模式：direct=直连 / system=系统代理 / custom=自定义代理地址。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyMode {
+    Direct,
+    System,
+    Custom,
+}
+
+/// 代理配置（HTTP 下载用；BT/DHT 未来独立配置，同结构复用）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyConfig {
+    pub mode: ProxyMode,
+    /// custom 模式下的代理地址，如 `http://127.0.0.1:7897` / `socks5://127.0.0.1:1080`。
+    pub url: Option<String>,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            mode: ProxyMode::Direct,
+            url: None,
+        }
+    }
+}
+
 /// 下载配置。
 #[derive(Debug, Clone)]
 pub struct DownloadConfig {
@@ -99,6 +125,12 @@ pub struct DownloadConfig {
     pub mirrors: Vec<String>,
     /// 多网卡分流配置（可选）：缺省 = 单主网卡（旧版行为）。
     pub interfaces: Option<surge_net::InterfaceSpec>,
+    /// 服务器是否支持 Range（来自 probe；影响 Source 能力声明与引擎调度策略）。
+    /// 为 None 时，BoundSource 默认假设支持 Range（保守行为，probe 已保证可用性）。
+    pub supports_range: Option<bool>,
+    /// 代理配置：None = 走系统默认（reqwest 默认行为）；Some(Direct) = 强制直连（no_proxy）；
+    /// Some(System) = 显式跟随系统代理；Some(Custom(url)) = 走指定代理。
+    pub proxy: Option<ProxyConfig>,
 }
 
 /// 块：文件被切分为固定逻辑块。统合 HTTP Range 切片 与 BT piece。
@@ -258,7 +290,10 @@ pub trait Protocol: Send + Sync {
     fn schemes(&self) -> &[&'static str];
 
     async fn parse_url(&self, raw: &str) -> Result<ParsedUrl>;
-    async fn probe(&self, url: &ParsedUrl) -> Result<Metadata>;
+
+    /// 探测 URL 元信息（大小 / Range 支持等）。`proxy` 为探测请求使用的代理配置
+    /// （None = 默认直连；Some = 按模式应用，与下载源一致，保证探测与下载同路径）。
+    async fn probe(&self, url: &ParsedUrl, proxy: Option<&ProxyConfig>) -> Result<Metadata>;
     fn capabilities(&self) -> CapabilitySet;
 
     /// 为该 URL 创建一组 `Source`。

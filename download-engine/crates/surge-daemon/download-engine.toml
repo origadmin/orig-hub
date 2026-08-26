@@ -1,0 +1,8 @@
+[classify]
+enabled = true
+[[classify.map]]
+ext = "mkv"
+category = "Films"
+[[classify.map]]
+ext = "mp4"
+category = "Films"
