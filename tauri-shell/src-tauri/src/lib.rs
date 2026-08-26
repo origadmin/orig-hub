@@ -5,6 +5,7 @@
 //! - 单实例锁 + 系统托盘
 //! - 向前端暴露 daemon 状态查询命令
 
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -22,13 +23,36 @@ struct DaemonState {
     child: Mutex<Option<CommandChild>>,
 }
 
-/// 检查 daemon 端口是否已有服务在跑。
+/// 检查 daemon 是否真正可用：TCP 能连上且 GET /health 返回 200。
+/// 只做端口连通性检查会漏掉"进程活着但 handler 已坏"的情况（前端 Failed to fetch）。
 fn daemon_alive() -> bool {
-    TcpStream::connect_timeout(
+    let Ok(mut stream) = TcpStream::connect_timeout(
         &format!("127.0.0.1:{DAEMON_PORT}").parse().unwrap(),
         Duration::from_millis(300),
-    )
-    .is_ok()
+    ) else {
+        return false;
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_millis(800)))
+        .ok();
+    stream
+        .set_write_timeout(Some(Duration::from_millis(800)))
+        .ok();
+    // 最小 HTTP/1.1 GET /health，不引入额外依赖
+    let req = format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{DAEMON_PORT}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    let n = match stream.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    if n == 0 {
+        return false;
+    }
+    let head = String::from_utf8_lossy(&buf[..n]);
+    head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
 }
 
 /// 用 Tauri sidecar 拉起 daemon（阻塞直到端口就绪或超时）。
@@ -67,14 +91,91 @@ fn daemon_status(state: tauri::State<'_, DaemonState>) -> serde_json::Value {
 }
 
 /// 前端命令：确保 daemon 运行（幂等）。
+/// 若端口被占用但 /health 不可用（进程活着但 handler 坏了），
+/// 先杀掉旧实例再拉起新实例，避免前端 Failed to fetch。
 #[tauri::command]
 fn ensure_daemon(app: tauri::AppHandle, state: tauri::State<'_, DaemonState>) -> Result<serde_json::Value, String> {
+    eprintln!("[ensure_daemon] called");
     if daemon_alive() {
+        eprintln!("[ensure_daemon] alive=true, reusing");
         return Ok(serde_json::json!({"started": false, "reason": "already-running"}));
     }
+    eprintln!("[ensure_daemon] alive=false, checking port");
+    // 端口被占但 health 不可用 → 杀掉旧 daemon（无论是否由本外壳托管）
+    let port_busy = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{DAEMON_PORT}").parse().unwrap(),
+        Duration::from_millis(300),
+    )
+    .is_ok();
+    if port_busy {
+        eprintln!("[ensure_daemon] port busy, killing owner");
+        kill_port_owner(DAEMON_PORT);
+        // 等端口释放
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if TcpStream::connect_timeout(
+                &format!("127.0.0.1:{DAEMON_PORT}").parse().unwrap(),
+                Duration::from_millis(200),
+            )
+            .is_err()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // 无论是否释放都继续尝试拉起；若没杀掉则 spawn 会失败报错
+    }
+    eprintln!("[ensure_daemon] spawning daemon");
     let child = spawn_daemon(&app)?;
+    eprintln!("[ensure_daemon] daemon spawned ok");
     *state.child.lock().unwrap() = Some(child);
     Ok(serde_json::json!({"started": true, "port": DAEMON_PORT}))
+}
+
+/// 杀掉占用指定端口的进程（Windows: taskkill /PID，其他: kill）。
+fn kill_port_owner(port: u16) {
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        let out = Command::new("netstat")
+            .args(["-ano", "-p", "tcp"])
+            .output();
+        if let Ok(out) = out {
+            // 中文 Windows 的 netstat 输出含 GBK 字节，用 lossy 转换避免整段丢弃
+            let text = String::from_utf8_lossy(&out.stdout);
+                let mut pids = std::collections::HashSet::new();
+                for line in text.lines() {
+                    // 找 LISTENING 且本地端口匹配的行
+                    if line.contains("LISTENING") && line.contains(&format!(":{port}")) {
+                        if let Some(pid) = line.split_whitespace().last() {
+                            if let Ok(pid) = pid.parse::<u32>() {
+                                pids.insert(pid);
+                            }
+                        }
+                    }
+                }
+                for pid in pids {
+                    let _ = Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/F"])
+                        .output();
+                }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        use std::process::Command;
+        let out = Command::new("lsof")
+            .args(["-ti", &format!("tcp:{port}")])
+            .output();
+        if let Ok(out) = out {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                if let Ok(pid) = line.trim().parse::<u32>() {
+                    let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+                }
+            }
+        }
+    }
 }
 
 /// 前端命令：强制停止由本外壳管理的 daemon（未托管的不动）。

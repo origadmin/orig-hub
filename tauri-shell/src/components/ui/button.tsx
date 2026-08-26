@@ -6,13 +6,13 @@ type ButtonSize = 'default' | 'sm' | 'lg' | 'icon'
 
 const variantClasses: Record<ButtonVariant, string> = {
   default:
-    'bg-accent text-zinc-950 hover:bg-accent/90 shadow-sm font-medium',
+    'bg-accent text-white hover:bg-accent/90 shadow-sm font-medium',
   secondary:
-    'bg-surface-2 text-zinc-100 hover:bg-surface-2/80 border border-border-subtle',
-  ghost: 'text-zinc-300 hover:bg-surface-2 hover:text-zinc-100',
+    'bg-surface-2 text-fg-strong hover:bg-surface-2/80 border border-border-subtle',
+  ghost: 'text-fg-mid hover:bg-surface-2 hover:text-fg-strong',
   destructive: 'bg-danger text-white hover:bg-danger/90',
   outline:
-    'border border-border-subtle bg-transparent text-zinc-200 hover:bg-surface-2',
+    'border border-border-subtle bg-transparent text-fg-mid hover:bg-surface-2',
 }
 
 const sizeClasses: Record<ButtonSize, string> = {

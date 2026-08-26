@@ -5,11 +5,11 @@ type BadgeVariant = 'default' | 'secondary' | 'success' | 'warning' | 'danger' |
 
 const variantClasses: Record<BadgeVariant, string> = {
   default: 'bg-accent/15 text-accent border-accent/30',
-  secondary: 'bg-surface-2 text-zinc-300 border-border-subtle',
+  secondary: 'bg-surface-2 text-fg-mid border-border-subtle',
   success: 'bg-success/15 text-success border-success/30',
   warning: 'bg-warning/15 text-warning border-warning/30',
   danger: 'bg-danger/15 text-danger border-danger/30',
-  outline: 'border-border-subtle text-zinc-400',
+  outline: 'border-border-subtle text-fg-soft',
 }
 
 export interface BadgeProps extends React.HTMLAttributes<HTMLSpanElement> {

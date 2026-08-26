@@ -56,31 +56,46 @@ export function Sidebar({
         collapsed ? 'w-12' : 'w-48',
       )}
     >
-      {/* Logo */}
-      <div className={cn('flex h-14 items-center gap-2 px-3', collapsed && 'justify-center px-0')}>
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent/20">
-          <span className="text-sm font-bold text-accent">O</span>
+      {/* Logo + 折叠/展开（合并到顶部一行：折叠按钮紧贴 Logo，避免独立按钮占位） */}
+      <div
+        className={cn(
+          'flex h-12 items-center gap-2 px-3',
+          collapsed ? 'justify-center' : 'justify-between',
+        )}
+      >
+        <div className="flex min-w-0 items-center gap-2">
+          <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-accent/20">
+            <span className="text-xs font-bold text-accent">O</span>
+          </div>
+          {!collapsed && <span className="truncate text-sm font-semibold text-fg-strong">Orig Hub</span>}
         </div>
-        {!collapsed && <span className="text-sm font-semibold text-zinc-100">Orig Hub</span>}
+        {!collapsed && (
+          <button
+            onClick={onToggle}
+            className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid"
+            title="折叠侧边栏"
+            aria-label="折叠侧边栏"
+          >
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
+            </svg>
+          </button>
+        )}
       </div>
 
-      {/* 折叠开关 */}
-      <button
-        onClick={onToggle}
-        className={cn(
-          'mx-2 mb-2 flex h-7 items-center justify-center rounded-md text-muted transition-colors hover:bg-surface-2 hover:text-zinc-200',
-          collapsed ? 'w-8' : 'w-9',
-        )}
-        title={collapsed ? '展开' : '折叠'}
-      >
-        <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-          {collapsed ? (
-            <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
-          ) : (
-            <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
-          )}
-        </svg>
-      </button>
+      {/* 折叠态：Logo 下方一个独立的展开按钮（双箭头）作为出口 */}
+      {collapsed && (
+        <button
+          onClick={onToggle}
+          className="mx-auto mb-1 flex h-6 w-6 items-center justify-center rounded-md text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid"
+          title="展开侧边栏"
+          aria-label="展开侧边栏"
+        >
+          <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
+          </svg>
+        </button>
+      )}
 
       {/* 导航 */}
       <nav className="flex-1 space-y-1 px-2">
@@ -102,7 +117,7 @@ export function Sidebar({
                 collapsed && 'justify-center px-0',
                 active
                   ? 'bg-accent/15 text-accent'
-                  : 'text-zinc-400 hover:bg-surface-2 hover:text-zinc-200',
+                  : 'text-fg-soft hover:bg-surface-2 hover:text-fg-mid',
               )}
             >
               <span className="shrink-0">{item.icon}</span>
@@ -110,7 +125,7 @@ export function Sidebar({
                 <>
                   <span className="flex-1 text-left">{item.label}</span>
                   {count > 0 && (
-                    <span className="rounded-full bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400">
+                    <span className="rounded-full bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-fg-soft">
                       {count}
                     </span>
                   )}
