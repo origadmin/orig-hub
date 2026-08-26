@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use libsurge::engine::Task;
-use libsurge::protocol::SseEvent;
-use libsurge::registry::Registry;
+use orig_core::engine::Task;
+use orig_core::protocol::SseEvent;
+use orig_core::registry::Registry;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::config::Config;

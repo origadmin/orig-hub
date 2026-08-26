@@ -11,7 +11,7 @@
 //!   GET  /api/events                    -> SSE 实时进度（REST+SSE 设计；原 Go 端由 Wails 轮询，此处补充）
 //!
 //! 下载流程：parse_url → probe(取总大小) → create_sources(一组 Source) →
-//! 用 `BlockMap` + `Task` 调度（见 `libsurge::engine`）。
+//! 用 `BlockMap` + `Task` 调度（见 `orig_core::engine`）。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -31,8 +31,8 @@ use serde_json;
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
-use libsurge::engine::Task;
-use libsurge::protocol::{DownloadConfig, ParsedUrl, SseEvent};
+use orig_core::engine::Task;
+use orig_core::protocol::{DownloadConfig, ParsedUrl, SseEvent};
 use crate::config::{resolve_output, resolve_output_classified};
 use crate::state::{AppState, DownloadTask};
 use crate::status::DownloadStatus;
@@ -52,7 +52,7 @@ pub struct AddReq {
     pub headers: HashMap<String, String>,
     /// 多网卡分流配置（可选）：{"primary_weight":1,"secondaries":{"网卡名":2}}
     #[serde(default)]
-    pub interfaces: Option<surge_net::InterfaceSpec>,
+    pub interfaces: Option<orig_net::InterfaceSpec>,
     /// 自动分类（R3）：true=强制开启 / false=强制关闭 / None=用配置默认。
     #[serde(default)]
     pub classify: Option<bool>,
@@ -62,7 +62,7 @@ pub struct AddReq {
     /// 本次下载的代理配置（可选）：缺省用 daemon 配置 [proxy] 段；
     /// 传 {mode:"direct"} 强制直连，{mode:"custom",url:"http://..."} 指定代理。
     #[serde(default)]
-    pub proxy: Option<libsurge::protocol::ProxyConfig>,
+    pub proxy: Option<orig_core::protocol::ProxyConfig>,
 }
 
 #[derive(Deserialize)]
@@ -449,9 +449,9 @@ async fn get_config(State(st): State<Arc<AppState>>) -> axum::Json<serde_json::V
         "classify_rules": rules,
         "proxy": {
             "mode": match cfg.proxy.mode {
-                libsurge::protocol::ProxyMode::Direct => "direct",
-                libsurge::protocol::ProxyMode::System => "system",
-                libsurge::protocol::ProxyMode::Custom => "custom",
+                orig_core::protocol::ProxyMode::Direct => "direct",
+                orig_core::protocol::ProxyMode::System => "system",
+                orig_core::protocol::ProxyMode::Custom => "custom",
             },
             "url": cfg.proxy.url,
         },
@@ -513,12 +513,12 @@ async fn put_config_proxy(
     Json(req): Json<ProxyUpdateReq>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
     let mode = match req.mode.as_str() {
-        "system" => libsurge::protocol::ProxyMode::System,
-        "custom" => libsurge::protocol::ProxyMode::Custom,
-        _ => libsurge::protocol::ProxyMode::Direct,
+        "system" => orig_core::protocol::ProxyMode::System,
+        "custom" => orig_core::protocol::ProxyMode::Custom,
+        _ => orig_core::protocol::ProxyMode::Direct,
     };
     // custom 模式必须给 url
-    if mode == libsurge::protocol::ProxyMode::Custom {
+    if mode == orig_core::protocol::ProxyMode::Custom {
         let url = req.url.as_deref().unwrap_or("");
         if url.is_empty() {
             return Err((StatusCode::BAD_REQUEST, "custom proxy requires url".into()));
@@ -537,9 +537,9 @@ async fn put_config_proxy(
         "ok": true,
         "proxy": {
             "mode": match cfg.proxy.mode {
-                libsurge::protocol::ProxyMode::Direct => "direct",
-                libsurge::protocol::ProxyMode::System => "system",
-                libsurge::protocol::ProxyMode::Custom => "custom",
+                orig_core::protocol::ProxyMode::Direct => "direct",
+                orig_core::protocol::ProxyMode::System => "system",
+                orig_core::protocol::ProxyMode::Custom => "custom",
             },
             "url": cfg.proxy.url,
         },
@@ -553,10 +553,10 @@ async fn put_config_proxy(
 /// 前端据此渲染：主网卡（固定）+ 可用附属网卡（可选开关）+ 未连接网卡（禁用）。
 async fn list_interfaces() -> axum::Json<serde_json::Value> {
     // 全部适配器（Windows: GetAdaptersAddresses；其它平台退化为 up 网卡）
-    let all = surge_net::list_all_adapters().unwrap_or_default();
+    let all = orig_net::list_all_adapters().unwrap_or_default();
     // 默认池（主网卡）用于判断 enabled
-    let pool = surge_net::InterfacePool::resolve(None)
-        .unwrap_or_else(|_| surge_net::InterfacePool::default());
+    let pool = orig_net::InterfacePool::resolve(None)
+        .unwrap_or_else(|_| orig_net::InterfacePool::default());
     let primary_name = pool.primary.name.clone();
     let enabled_names: std::collections::HashSet<String> = pool
         .members()

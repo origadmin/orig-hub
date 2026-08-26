@@ -23,7 +23,7 @@
 
 | 目录/文件 | 性质 | 说明 | 处置 |
 |---|---|---|---|
-| `download-engine/` | ✅ 活跃 | Rust 下载内核（Cargo workspace，5 个 crate：libsurge/surge-net/surge-protocol-*/surge-daemon） | 保留 |
+| `download-engine/` | ✅ 活跃 | Rust 下载内核（Cargo workspace，5 个 crate：orig-core/orig-net/orig-protocol-*/orig-daemon） | 保留 |
 | `tauri-shell/` | ✅ 活跃 | Tauri v2 + React 桌面壳（`src-tauri/`=Rust 壳，`src/`=React 前端） | 保留 |
 | `ui/` | ❌ 废弃 | **Wails/Go 前端遗留**：`package.json` 为空，仅剩 `wailsjs/`、`bindings/`、`dist/`、`node_modules/` 残留 | **删除** |
 | `go.work` / `go.work.sum` | ❌ 残留 | Go 工作区文件，项目已纯 Rust+UI，无 Go 代码 | **删除** |
@@ -94,9 +94,9 @@
 
 **根因（已定位）**：文件名仅从 URL 路径推导，从不解析 `Content-Disposition`，也不做 `Content-Type → 扩展名` 嗅探。
 
-- `download-engine/crates/surge-protocol-http/src/lib.rs:522`：`Metadata.filename` 由 `url.path.rsplit('/').next()` 得到（纯 URL 段）。
-- `download-engine/crates/surge-daemon/src/routes.rs:174-186`：文件名解析顺序为 `req.filename` → URL path → `<id>.bin`，**无 Content-Disposition 解析、无 Content-Type 嗅探**。
-- `surge-protocol-http/src/lib.rs:497`：`probe()` 已读取 `Content-Type`（用于 HTML 防误下判断），但该信息**未回传给命名逻辑**。
+- `download-engine/crates/orig-protocol-http/src/lib.rs:522`：`Metadata.filename` 由 `url.path.rsplit('/').next()` 得到（纯 URL 段）。
+- `download-engine/crates/orig-daemon/src/routes.rs:174-186`：文件名解析顺序为 `req.filename` → URL path → `<id>.bin`，**无 Content-Disposition 解析、无 Content-Type 嗅探**。
+- `orig-protocol-http/src/lib.rs:497`：`probe()` 已读取 `Content-Type`（用于 HTML 防误下判断），但该信息**未回传给命名逻辑**。
 
 **修复方向**：在 `probe()` 阶段解析响应头 `Content-Disposition: attachment; filename="..."` 得到真实文件名（用户显式 `filename` 仍优先覆盖）；并依据 `Content-Type` 对缺失/错误扩展名做纠正（如服务器返回 `image/jpeg` 但 URL 无扩展名 → 补 `.jpg`）。需同步把 `Metadata.filename` 透传到 `routes.rs` 的解析链。
 
@@ -104,8 +104,8 @@
 
 **根因（已定位）**：引擎状态模型只暴露**聚合字段**，无每连接/分块明细。
 
-- `download-engine/crates/surge-daemon/src/status.rs` 的 `DownloadStatus`：仅有 `downloaded/total/connections(仅数量)/speed/eta`，**无每连接状态、无分块进度**。
-- `download-engine/crates/libsurge/src/protocol.rs:312` 的 `Progress`：同样只有聚合 `downloaded/total/speed`。
+- `download-engine/crates/orig-daemon/src/status.rs` 的 `DownloadStatus`：仅有 `downloaded/total/connections(仅数量)/speed/eta`，**无每连接状态、无分块进度**。
+- `download-engine/crates/orig-core/src/protocol.rs:312` 的 `Progress`：同样只有聚合 `downloaded/total/speed`。
 - `engine.rs` 内部存在 `block_map`（分块完成位图）与多 `Source`（连接），但**未序列化对外暴露**；前端 `DownloadItem.tsx` 也无详情展开区。
 
 **修复方向**：在 `Progress`/`DownloadStatus` 增加 `blocks: [{index, start, end, done, downloading}]` 与 `connections: [{id, speed, state, bytes}]`；`DownloadItem.tsx` 增加可展开“详情”面板渲染连接/分块。工作量最大（引擎+前端+类型），建议放最后。

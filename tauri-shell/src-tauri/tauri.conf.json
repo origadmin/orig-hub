@@ -31,7 +31,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["../../download-engine/target/release/surge-daemon"],
+    "externalBin": ["../../download-engine/target/release/orig-daemon"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

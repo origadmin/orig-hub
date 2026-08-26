@@ -8,7 +8,7 @@
 //! - 续传：启动前若输出文件已存在，按已有长度恢复完成位图。
 //! - 完成：全块 Done 后计算文件 sha256，随 `Completed` 事件下发。
 //!
-//! ## 多网卡分流（surge-net 集成）
+//! ## 多网卡分流（orig-net 集成）
 //! - `pick_source` 升级为 `WeightedSelector`：按各源 `weight` × 健康度打分选源。
 //! - 每源维护 `SourceHealth`（EMA 速度 / 连续失败 / 临时禁用），失败块自动
 //!   回退 Pending 并在下次调度避开问题网卡（健康网卡接管）。
@@ -16,7 +16,7 @@
 //!
 //! 引擎只跟 `Source` / `BlockMap` 对话，不感知具体协议——加 BT 不改这里。
 
-use crate::error::{Result, SurgeError};
+use crate::error::{Result, OrigError};
 use crate::protocol::*;
 use sha2::{Digest, Sha256};
 use std::io::SeekFrom;
@@ -400,7 +400,7 @@ impl Task {
         }
 
         // 收集第一个硬错误（其余 worker 也会自然退出）。
-        let mut hard_err: Option<SurgeError> = None;
+        let mut hard_err: Option<OrigError> = None;
         for h in handles {
             if let Ok(Err(e)) = h.await {
                 if hard_err.is_none() {
@@ -438,13 +438,13 @@ impl Task {
 
         loop {
             if token.is_cancelled() {
-                return Err(SurgeError::Cancelled);
+                return Err(OrigError::Cancelled);
             }
             // 暂停：阻塞直到被 resume 唤醒。
             while self.control.paused.load(Ordering::SeqCst) {
                 self.control.resume.notified().await;
                 if token.is_cancelled() {
-                    return Err(SurgeError::Cancelled);
+                    return Err(OrigError::Cancelled);
                 }
             }
 
@@ -531,7 +531,7 @@ impl Task {
                                 .ok();
                             // 看门狗：所有源都被禁用（冷却中）→ 无法继续，终止任务。
                             if self.selector.all_disabled() {
-                                return Err(SurgeError::NoSource);
+                                return Err(OrigError::NoSource);
                             }
                             // 短暂退避后继续：让健康源重试该块（避免同一 worker 忙循环
                             // 反复认领同一失败块；连续失败的源会被 selector 禁用并避开）
@@ -551,7 +551,7 @@ impl Task {
                             message: "no available source".into(),
                         })
                         .ok();
-                    return Err(SurgeError::NoSource);
+                    return Err(OrigError::NoSource);
                 }
             }
         }

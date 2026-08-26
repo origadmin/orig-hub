@@ -1,4 +1,4 @@
-//! libsurge — Surge 下载内核核心（Rust 侧）。
+//! orig-core — Orig 下载内核核心（Rust 侧）。
 //!
 //! 定义协议插件总线：
 //! - `Protocol` trait（从 URL 创建 `Source` 集合）
@@ -14,6 +14,6 @@ pub mod error;
 pub mod protocol;
 pub mod registry;
 
-pub use error::{Result, SurgeError};
+pub use error::{Result, OrigError};
 pub use protocol::*;
 pub use registry::Registry;

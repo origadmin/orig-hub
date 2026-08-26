@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Range 测试服务器：为 surge-daemon 提供支持 Range 的确定性内容。"""
+"""Range 测试服务器：为 orig-daemon 提供支持 Range 的确定性内容。"""
 import hashlib
 import http.server
 import sys

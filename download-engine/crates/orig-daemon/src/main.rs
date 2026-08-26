@@ -1,9 +1,9 @@
 #![windows_subsystem = "windows"]
 
-//! surge-daemon —— orig-hub 下载内核的 Rust sidecar（HTTP REST + SSE）。
+//! orig-daemon —— orig-hub 下载内核的 Rust sidecar（HTTP REST + SSE）。
 //!
 //! 对齐 orig-hub `internal/core/api.go` 的真实契约，复刻 Go 守护进程行为；
-//! 下载内核用 libsurge（BlockMap + Source 调度），HTTP 源走 reqwest。
+//! 下载内核用 orig-core（BlockMap + Source 调度），HTTP 源走 reqwest。
 
 mod config;
 mod routes;
@@ -13,9 +13,9 @@ mod status;
 use std::sync::Arc;
 
 use axum::Router;
-use libsurge::registry::Registry;
-use surge_protocol_http::HttpProtocol;
-use surge_protocol_virtual::VirtualProtocol;
+use orig_core::registry::Registry;
+use orig_protocol_http::HttpProtocol;
+use orig_protocol_virtual::VirtualProtocol;
 
 use crate::config::Config;
 use crate::state::AppState;
@@ -62,7 +62,7 @@ async fn main() {
 
     let port = config.port;
     let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
-    eprintln!("surge-daemon listening on http://{addr}");
+    eprintln!("orig-daemon listening on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

@@ -4,7 +4,7 @@ import type {
   NetworkInterface,
 } from '../types'
 
-/** surge-daemon 默认端口（与 Rust 侧 DAEMON_PORT 一致） */
+/** orig-daemon 默认端口（与 Rust 侧 DAEMON_PORT 一致） */
 export const DAEMON_PORT = 9876
 
 /** 开发模式下 daemon 可能不在 9876（可被环境变量覆盖） */

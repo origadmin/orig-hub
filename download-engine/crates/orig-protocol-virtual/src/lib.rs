@@ -12,8 +12,8 @@
 //! 无论以何种顺序/分块写入，最终文件字节与 sha256 完全一致 —— 续传安全。
 
 use async_trait::async_trait;
-use libsurge::error::{Result, SurgeError};
-use libsurge::protocol::*;
+use orig_core::error::{Result, OrigError};
+use orig_core::protocol::*;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -106,7 +106,7 @@ impl Source for MockSource {
         let mut buf = [0u8; 1 << 16];
         while off < end {
             if token.is_cancelled() {
-                return Err(SurgeError::Cancelled);
+                return Err(OrigError::Cancelled);
             }
             let n = (end - off).min(buf.len() as u64) as usize;
             for i in 0..n {
@@ -193,10 +193,10 @@ impl Protocol for VirtualProtocol {
     }
 }
 
-// 让未使用的 SurgeError 变体在迁移过程中保持被引用（避免告警噪音）。
+// 让未使用的 OrigError 变体在迁移过程中保持被引用（避免告警噪音）。
 #[allow(dead_code)]
 fn _assert_error_variants() -> Result<()> {
-    Err(SurgeError::Other("placeholder".into()))
+    Err(OrigError::Other("placeholder".into()))
 }
 
 // 避免部分辅助函数在未启用真实校验时的「未使用」告警。
