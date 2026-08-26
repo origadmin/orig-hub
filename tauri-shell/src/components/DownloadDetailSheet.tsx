@@ -75,7 +75,11 @@ export function DownloadDetailSheet({
   const hasArray = blocks.length > 0
 
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center">
+    <div
+      className="fixed inset-0 z-50 flex items-end justify-center"
+      // 阻止点击冒泡到外层下载卡片的 onClick（否则 X/遮罩关闭会被卡片的“重新打开”即时抵消，表现为“按钮无效”）
+      onClick={(e) => e.stopPropagation()}
+    >
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
       <div className="relative z-10 flex max-h-[86vh] w-full flex-col overflow-hidden rounded-t-2xl border border-border-subtle bg-surface shadow-2xl">
         {/* 顶部细强调线（拖拽手柄暗示，内嵌无空洞） */}
@@ -134,8 +138,8 @@ export function DownloadDetailSheet({
 
         {/* 主体：左块网格 / 右源表 */}
         <div className="flex min-h-0 flex-1 flex-col gap-0 overflow-auto sm:flex-row sm:gap-0">
-          {/* 左：块完成位图（颜色 = 负责网卡） */}
-          <div className="border-b border-border-subtle p-4 sm:border-b-0 sm:border-r">
+          {/* 左：块完成位图（颜色 = 负责网卡）；sm 下固定宽度，避免挤压右栏 */}
+          <div className="w-full shrink-0 border-b border-border-subtle p-4 sm:w-[70%] sm:shrink-0 sm:border-b-0 sm:border-r">
             <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted">
               块完成位图（颜色 = 负责网卡）
             </div>
@@ -217,7 +221,7 @@ export function DownloadDetailSheet({
           </div>
 
           {/* 右：源 / 网卡表 + 全局一行小字 */}
-          <div className="p-4">
+          <div className="min-w-0 flex-1 p-4">
             <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted">
               源 / 网卡
             </div>

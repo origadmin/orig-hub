@@ -34,25 +34,34 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
   const meta = statusMeta[item.status] ?? statusMeta.idle
   const isActive = item.status === 'downloading'
 
-  /** 在资源管理器中显示文件（completed 任务可用） */
+  /** 用默认应用打开文件本身（completed 任务可用） */
   const handleReveal = async () => {
-    if (!item.dest_path) return
+    if (!item.dest_path) {
+      setError('文件尚未就绪：路径缺失，无法打开')
+      return
+    }
     try {
-      const { revealItemInDir } = await import('@tauri-apps/plugin-opener')
-      await revealItemInDir(item.dest_path)
+      // shell:allow-open（与 daemon sidecar 同套授权，已验证可用）——直接打开文件本体，无需解析路径
+      const { open } = await import('@tauri-apps/plugin-shell')
+      await open(item.dest_path)
     } catch (e) {
-      console.error('reveal failed', e)
+      console.error('open file failed', e)
       setError(`打开文件失败：${e instanceof Error ? e.message : String(e)}`)
     }
   }
 
-  /** 打开下载目录 */
+  /** 在资源管理器中打开文件所在目录（completed 任务可用） */
   const handleOpenDir = async () => {
-    if (!item.dest_path) return
+    if (!item.dest_path) {
+      setError('文件尚未就绪：路径缺失，无法打开目录')
+      return
+    }
     try {
-      const { openPath } = await import('@tauri-apps/plugin-opener')
-      const dir = item.dest_path.slice(0, Math.max(item.dest_path.lastIndexOf('/'), item.dest_path.lastIndexOf('\\')))
-      await openPath(dir || item.dest_path)
+      // revealItemInDir 直接吃完整文件路径、打开其所在文件夹并选中文件，
+      // 完全不需要手写的 slice/regex 去解析父目录（那正是上一版在分隔符/尾斜杠/空格目录下算错、导致 open 失败的根因）。
+      // 权限 allow-reveal-item-in-dir 已确认嵌进二进制且「打开文件」按钮一直用它、从未报坏。
+      const { revealItemInDir } = await import('@tauri-apps/plugin-opener')
+      await revealItemInDir(item.dest_path)
     } catch (e) {
       console.error('open dir failed', e)
       setError(`打开目录失败：${e instanceof Error ? e.message : String(e)}`)

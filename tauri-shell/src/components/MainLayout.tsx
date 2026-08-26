@@ -14,7 +14,7 @@ export function MainLayout() {
   const [view, setView] = useState<ViewId>('downloading')
   const [collapsed, setCollapsed] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
-  const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted } = useStore()
+  const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast } = useStore()
 
   useEffect(() => {
     init()
@@ -27,6 +27,13 @@ export function MainLayout() {
     const timer = setInterval(() => refresh().catch(() => {}), 5000)
     return () => clearInterval(timer)
   }, [init, refresh, setDaemon])
+
+  // 全局错误 toast：按钮/操作失败时的用户可见反馈（自动消失）
+  useEffect(() => {
+    if (!toast) return
+    const t = setTimeout(() => clearToast(), 4000)
+    return () => clearTimeout(t)
+  }, [toast, clearToast])
 
   const active = downloads.filter((d) => d.status === 'downloading' || d.status === 'queued')
   const paused = downloads.filter((d) => d.status === 'paused')
@@ -161,6 +168,13 @@ export function MainLayout() {
       </div>
 
       <AddDownloadDialog open={addOpen} onClose={() => setAddOpen(false)} />
+
+      {/* 全局错误 toast（按钮/操作失败可见反馈） */}
+      {toast && (
+        <div className="pointer-events-none fixed left-1/2 top-4 z-[100] -translate-x-1/2 rounded-lg border border-danger/40 bg-danger/15 px-4 py-2 text-sm text-danger shadow-lg backdrop-blur-sm">
+          {toast}
+        </div>
+      )}
     </div>
   )
 }

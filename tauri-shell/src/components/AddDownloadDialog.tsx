@@ -154,6 +154,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
               value={outputPath}
               onChange={setOutputPath}
               placeholder="留空使用默认下载目录"
+              onError={setError}
             />
           </div>
           <div>
