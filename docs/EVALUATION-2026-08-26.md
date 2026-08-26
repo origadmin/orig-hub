@@ -67,8 +67,8 @@
 ## 3. 文档现状
 
 - 子目录各有零散 `README.md`（`download-engine/README.md`、`tauri-shell/README.md`）。
-- 顶层 `STITCH_DESIGN_BRIEF.md`（设计简报）、`_docs/orig-hub/`（文档仓）。
-- **缺失**：根 `AGENTS.md`（orig-cms-ee 有，定义智能体/协作约定）、根 `README.md`、根 `.gitignore`、统一的 `docs/bugs/BUG-XXX.md` 缺陷追踪（orig-cms-ee 用此约定）。
+- 设计简报已归位 `docs/DESIGN_BRIEF.md`（原顶层 `STITCH_DESIGN_BRIEF.md`，含 `STITCH_` 门禁词，已按 EE 规范改名）；文档统一收敛至 `docs/`，`_docs/` 已废弃移除。
+- **已补**（2026-08-26）：根 `AGENTS.md`/`README.md`/`.gitignore` 已建立，统一 `docs/bugs/BUG-XXX.md` 缺陷追踪已落地（见 `docs/bugs/README.md`）。
 
 ---
 
