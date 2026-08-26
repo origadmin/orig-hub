@@ -33,6 +33,14 @@ export function MainLayout() {
   const completed = downloads.filter((d) => d.status === 'completed')
   const totalSpeed = active.reduce((sum, d) => sum + (d.speed || 0), 0)
 
+  // 全局聚合进度（BUG-004）：管理中任务（下载中/排队/已暂停）的累计字节占比。
+  const aggregate = downloads.filter(
+    (d) => d.status === 'downloading' || d.status === 'queued' || d.status === 'paused',
+  )
+  const aggDownloaded = aggregate.reduce((sum, d) => sum + (d.downloaded || 0), 0)
+  const aggTotal = aggregate.reduce((sum, d) => sum + (d.total_size || 0), 0)
+  const globalProgress = aggTotal > 0 ? Math.min(100, (aggDownloaded / aggTotal) * 100) : 0
+
   const visible =
     view === 'settings'
       ? downloads
@@ -125,6 +133,16 @@ export function MainLayout() {
               <DownloadList items={visible} />
             )}
           </main>
+
+          {/* 全局聚合进度条（BUG-004） */}
+          {aggregate.length > 0 && (
+            <div className="h-0.5 w-full bg-border-subtle" title={`全局进度 ${globalProgress.toFixed(1)}%`}>
+              <div
+                className="h-full bg-accent transition-all duration-300"
+                style={{ width: `${globalProgress}%` }}
+              />
+            </div>
+          )}
 
           {/* Status bar */}
           <footer className="flex h-8 shrink-0 items-center justify-between border-t border-border-subtle px-4 text-[11px] text-muted">

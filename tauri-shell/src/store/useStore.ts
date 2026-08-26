@@ -111,6 +111,7 @@ export const useStore = create<DownloadState>((set, get) => ({
                 ...(cur ?? {}),
                 id: item.id,
                 status: 'completed',
+                speed: 0,
                 hash_sha256: item.hash_sha256 ?? cur?.hash_sha256,
               } as DownloadStatus)
             } else if (evt.event === 'error') {
@@ -120,11 +121,12 @@ export const useStore = create<DownloadState>((set, get) => ({
                 ...(cur ?? {}),
                 id: item.id,
                 status: 'error',
+                speed: 0,
                 error: errItem.message ?? cur?.error,
               } as DownloadStatus)
             } else if (evt.event === 'paused') {
               const cur = map.get(item.id)
-              map.set(item.id, { ...(cur ?? {}), id: item.id, status: 'paused' } as DownloadStatus)
+              map.set(item.id, { ...(cur ?? {}), id: item.id, status: 'paused', speed: 0 } as DownloadStatus)
             } else if (evt.event === 'resumed') {
               const cur = map.get(item.id)
               map.set(item.id, { ...(cur ?? {}), id: item.id, status: 'downloading' } as DownloadStatus)
