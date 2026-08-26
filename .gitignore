@@ -1,0 +1,49 @@
+# ============ Rust（下载内核 + Tauri 壳） ============
+/target
+**/target
+**/*.rs.bk
+
+# ============ Node / 前端（Vite + React） ============
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+
+# ============ Tauri 构建产物 & sidecar 二进制 ============
+tauri-shell/src-tauri/target/
+tauri-shell/src-tauri/binaries/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# ============ 运行时产物 ============
+/bin/
+/data/
+*.orighub
+*.db
+proxy-test-file.bin
+coverage
+
+# ============ 日志 ============
+*.log
+logs/
+
+# ============ 工具元数据（不入库） ============
+.beads/
+.task/
+.code-review-graph/
+.team/
+.workbuddy/
+__pycache__/
+
+# ============ 编辑器 / OS ============
+.vscode/*
+.idea/
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
