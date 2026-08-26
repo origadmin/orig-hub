@@ -155,6 +155,8 @@ pub struct BlockMap {
     pub total: u64,
     pub block_size: u64,
     pub blocks: Vec<BlockState>,
+    /// 每块负责源下标（255 = 未分配）；与 `blocks` 同步增减，供前端按网卡着色。
+    pub block_source: Vec<u8>,
 }
 
 impl BlockMap {
@@ -165,6 +167,7 @@ impl BlockMap {
             total,
             block_size: bs,
             blocks: vec![BlockState::Pending; n.max(1)],
+            block_source: vec![255u8; n.max(1)],
         }
     }
 
@@ -226,6 +229,19 @@ impl BlockMap {
         if i < self.blocks.len() {
             self.blocks[i] = s;
         }
+    }
+
+    /// 记录某块当前负责源（下标；255 = 未分配）。重试会覆盖为新源。
+    pub fn set_source(&mut self, idx: u32, src: u8) {
+        let i = idx as usize;
+        if i < self.block_source.len() {
+            self.block_source[i] = src;
+        }
+    }
+
+    /// 读取某块负责源（255 = 未分配）。
+    pub fn source_of(&self, idx: u32) -> u8 {
+        self.block_source.get(idx as usize).copied().unwrap_or(255)
     }
 
     /// 由已有文件长度恢复完成位图（断点续传）。
@@ -356,6 +372,12 @@ pub struct Progress {
     pub blocks_done: u32,
     #[serde(default)]
     pub blocks_pending: u32,
+    /// 每块负责源下标（255 = 未分配）；与 `blocks` 同门控（>4096 时为空）。
+    #[serde(default)]
+    pub block_source: Vec<u8>,
+    /// 是否支持 Range（决定是否分块并发；前端据此判断是否渲染块网格）。
+    #[serde(default)]
+    pub supports_range: bool,
 }
 
 /// 运行期控制句柄：暂停标志 + 恢复通知 + 取消令牌。

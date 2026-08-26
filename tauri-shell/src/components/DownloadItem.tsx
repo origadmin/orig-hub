@@ -1,14 +1,15 @@
+import { useState } from 'react'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
 import { Progress } from './ui/progress'
 import {
-  cn,
   formatBytes,
   formatEta,
   formatSpeed,
 } from '../lib/utils'
 import type { DownloadStatus } from '../types'
 import { useStore } from '../store/useStore'
+import { DownloadDetailSheet } from './DownloadDetailSheet'
 
 // Tauri 环境可用时才加载 opener（浏览器 dev 环境降级为不显示）
 const isTauri = () =>
@@ -29,6 +30,7 @@ const statusMeta: Record<
 
 export function DownloadItem({ item }: { item: DownloadStatus }) {
   const { pause, resume, cancel, remove, setError } = useStore()
+  const [sheetOpen, setSheetOpen] = useState(false)
   const meta = statusMeta[item.status] ?? statusMeta.idle
   const isActive = item.status === 'downloading'
 
@@ -58,7 +60,11 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
   }
 
   return (
-    <div className="group rounded-lg border border-border-subtle bg-surface p-4 transition-all duration-200 hover:border-accent/40 hover:bg-surface/80">
+    <div
+      className="group cursor-pointer rounded-lg border border-border-subtle bg-surface p-4 transition-all duration-200 hover:border-accent/40 hover:bg-surface/80"
+      onClick={() => setSheetOpen(true)}
+      title="点击查看块进度详情"
+    >
       <div className="flex items-start justify-between gap-3">
         {/* 文件名 + URL */}
         <div className="min-w-0 flex-1">
@@ -73,8 +79,11 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
           </p>
         </div>
 
-        {/* 操作按钮（图标+文字，悬停显示） */}
-        <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+        {/* 操作按钮（图标+文字，悬停显示）；stopPropagation 避免触发详情 */}
+        <div
+          className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100"
+          onClick={(e) => e.stopPropagation()}
+        >
           {isActive && (
             <Button size="sm" variant="ghost" onClick={() => pause(item.id)} title="暂停">
               <svg className="mr-1 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -133,7 +142,7 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
         <Progress value={item.progress} animated={isActive} />
       </div>
 
-      {/* 元信息 */}
+      {/* 元信息（全中文） */}
       <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted">
         <span className="font-mono text-fg-mid">
           {formatBytes(item.downloaded)}
@@ -145,11 +154,14 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
           {isActive ? formatSpeed(item.speed) : '—'}
         </span>
         {isActive && item.eta > 0 && (
-          <span className="font-mono">ETA {formatEta(item.eta)}</span>
+          <span className="font-mono">剩余 {formatEta(item.eta)}</span>
         )}
         {item.connections > 0 && (
-          <span className={cn('font-mono')}>{item.connections} 连接</span>
+          <span className="font-mono">{item.connections} 连接</span>
         )}
+        {item.blocks_total ? (
+          <span className="font-mono">{item.blocks_done ?? 0}/{item.blocks_total} 块</span>
+        ) : null}
         {item.status === 'completed' && item.avg_speed > 0 && (
           <span className="font-mono">均速 {formatSpeed(item.avg_speed)}</span>
         )}
@@ -160,55 +172,10 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
         )}
       </div>
 
-      {/* 分块进度（BUG-002） */}
-      {item.blocks_total ? (
-        <div className="mt-2">
-          {item.blocks && item.blocks.length > 0 ? (
-            <div
-              className="flex flex-wrap gap-0.5"
-              title={`${item.blocks_done}/${item.blocks_total} 块完成 · ${item.blocks_pending} 待下载`}
-            >
-              {item.blocks.map((b, i) => (
-                <span
-                  key={i}
-                  className={cn(
-                    'h-1.5 w-1.5 rounded-[1px]',
-                    b === 2
-                      ? 'bg-success'
-                      : b === 1
-                        ? 'bg-accent/60'
-                        : b === 3
-                          ? 'bg-danger'
-                          : 'bg-border-subtle',
-                  )}
-                />
-              ))}
-            </div>
-          ) : (
-            <div className="font-mono text-xs text-muted">
-              {item.blocks_done}/{item.blocks_total} 块完成
-              {item.blocks_pending ? ` · ${item.blocks_pending} 待下载` : ''}
-            </div>
-          )}
-        </div>
-      ) : null}
+      {/* 块进度 / 连接详情 → 移至底部详情 Sheet（整行点击打开） */}
 
-      {/* 连接明细（BUG-002） */}
-      {isActive && item.connections_detail && item.connections_detail.length > 0 && (
-        <div className="mt-1 flex flex-wrap gap-1">
-          {item.connections_detail.map((c) => (
-            <span
-              key={c.id}
-              className={cn(
-                'rounded px-1 py-0.5 font-mono text-[10px]',
-                c.state === 'error' ? 'bg-danger/10 text-danger' : 'bg-accent/10 text-accent',
-              )}
-              title={`${c.iface} · ${formatSpeed(c.speed)}`}
-            >
-              {c.iface}
-            </span>
-          ))}
-        </div>
+      {sheetOpen && (
+        <DownloadDetailSheet item={item} onClose={() => setSheetOpen(false)} />
       )}
     </div>
   )

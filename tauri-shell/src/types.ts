@@ -36,6 +36,10 @@ export interface DownloadStatus {
   blocks_done?: number
   /** 待下载块数 */
   blocks_pending?: number
+  /** 每块负责源下标（255 = 未分配）；与 blocks 同门控，前端按网卡着色用 */
+  block_source?: number[]
+  /** 是否支持 Range（决定是否分块并发；前端据此判断是否渲染块网格） */
+  supports_range?: boolean
 }
 
 /** 单连接（源）实时状态（BUG-002） */
