@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 //! surge-daemon —— orig-hub 下载内核的 Rust sidecar（HTTP REST + SSE）。
 //!
 //! 对齐 orig-hub `internal/core/api.go` 的真实契约，复刻 Go 守护进程行为；
@@ -41,11 +43,13 @@ async fn main() {
                 "http://localhost:1420".parse().unwrap(),
                 "http://127.0.0.1:1420".parse().unwrap(),
                 "tauri://localhost".parse().unwrap(),
+                "http://tauri.localhost".parse().unwrap(),
                 "https://tauri.localhost".parse().unwrap(),
             ])
             .allow_methods([
                 axum::http::Method::GET,
                 axum::http::Method::POST,
+                axum::http::Method::PUT,
                 axum::http::Method::DELETE,
                 axum::http::Method::OPTIONS,
             ])

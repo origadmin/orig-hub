@@ -86,6 +86,8 @@ pub struct Config {
     pub port: u16,
     /// 自动分类配置（R3）。
     pub classify: ClassifyConfig,
+    /// HTTP 下载代理配置（默认直连）。
+    pub proxy: libsurge::protocol::ProxyConfig,
 }
 
 impl Default for Config {
@@ -96,6 +98,7 @@ impl Default for Config {
             token: None,
             port: 9876,
             classify: ClassifyConfig::default(),
+            proxy: libsurge::protocol::ProxyConfig::default(),
         }
     }
 }
@@ -167,6 +170,11 @@ impl TomlParser {
 impl Config {
     /// 加载配置：环境变量优先，其次 `download-engine.toml`。
     pub fn load() -> Self {
+        Self::load_from("download-engine.toml")
+    }
+
+    /// 从指定路径加载（测试可注入）。
+    pub fn load_from(path: &str) -> Self {
         let mut cfg = Config::default();
 
         if let Ok(d) = std::env::var("SURGE_DOWNLOAD_DIR") {
@@ -190,7 +198,7 @@ impl Config {
             }
         }
 
-        if let Ok(txt) = std::fs::read_to_string("download-engine.toml") {
+        if let Ok(txt) = std::fs::read_to_string(path) {
             let parser = TomlParser::parse(&txt);
 
             // 顶层键值
@@ -221,8 +229,126 @@ impl Config {
                     }
                 }
             }
+
+            // [proxy] 段（HTTP 下载代理；BT/DHT 代理未来独立段，同结构）
+            if let Some(sec) = parser.section("proxy") {
+                if let Some(v) = sec.get("mode") {
+                    cfg.proxy.mode = match v.as_str() {
+                        "system" => libsurge::protocol::ProxyMode::System,
+                        "custom" => libsurge::protocol::ProxyMode::Custom,
+                        _ => libsurge::protocol::ProxyMode::Direct,
+                    };
+                }
+                if let Some(v) = sec.get("url") {
+                    if !v.is_empty() {
+                        cfg.proxy.url = Some(v.clone());
+                    }
+                }
+            }
         }
         cfg
+    }
+
+    /// 将自动分类规则持久化到 `download-engine.toml`（保留既有键值；仅重写 [classify] 段）。
+    /// 返回写出的完整文本。
+    pub fn save_classify_map(&self, map: &HashMap<String, String>) -> std::io::Result<String> {
+        self.save_classify_map_to("download-engine.toml", map)
+    }
+
+    /// 同 [`Config::save_classify_map`]，但可指定目标路径（测试注入）。
+    pub fn save_classify_map_to(
+        &self,
+        path: &str,
+        map: &HashMap<String, String>,
+    ) -> std::io::Result<String> {
+        let existing = std::fs::read_to_string(path).unwrap_or_default();
+        let mut out = String::new();
+        let mut in_classify = false;
+        let mut classify_started = false;
+        for raw in existing.lines() {
+            let line = raw.trim_end();
+            let trimmed = line.trim();
+            if in_classify {
+                // 仍在旧 [classify] 段内（含 [[classify.map]] 数组段）：整段跳过，末尾重写
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    if trimmed == "[classify]" || trimmed == "[[classify.map]]" {
+                        continue;
+                    }
+                    in_classify = false; // 进入其它新段
+                } else {
+                    continue;
+                }
+            }
+            if trimmed == "[classify]" || trimmed == "[[classify.map]]" {
+                in_classify = true;
+                classify_started = true;
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        // 追加 [classify] 段（旧段已整段跳过；无旧段时补一个空行分隔）
+        if !classify_started {
+            if !out.trim().is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+        }
+        out.push_str("[classify]\n");
+        out.push_str(&format!("enabled = {}\n", if self.classify.enabled { "true" } else { "false" }));
+        for (ext, cat) in map {
+            out.push_str(&format!("[[classify.map]]\next = \"{ext}\"\ncategory = \"{cat}\"\n"));
+        }
+        std::fs::write(path, &out)?;
+        Ok(out)
+    }
+
+    /// 将代理配置持久化到 `download-engine.toml` 的 `[proxy]` 段（保留其它段）。
+    /// 返回写出的完整文本。
+    pub fn save_proxy(&self, path: &str) -> std::io::Result<String> {
+        let existing = std::fs::read_to_string(path).unwrap_or_default();
+        let mut out = String::new();
+        let mut in_proxy = false;
+        let mut proxy_started = false;
+        for raw in existing.lines() {
+            let line = raw.trim_end();
+            let trimmed = line.trim();
+            if in_proxy {
+                // 仍在旧 [proxy] 段内：整段跳过，末尾重写
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    if trimmed == "[proxy]" {
+                        continue;
+                    }
+                    in_proxy = false;
+                } else {
+                    continue;
+                }
+            }
+            if trimmed == "[proxy]" {
+                in_proxy = true;
+                proxy_started = true;
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        if !proxy_started {
+            if !out.trim().is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+        }
+        let mode_str = match self.proxy.mode {
+            libsurge::protocol::ProxyMode::Direct => "direct",
+            libsurge::protocol::ProxyMode::System => "system",
+            libsurge::protocol::ProxyMode::Custom => "custom",
+        };
+        out.push_str("[proxy]\n");
+        out.push_str(&format!("mode = \"{mode_str}\"\n"));
+        match &self.proxy.url {
+            Some(u) => out.push_str(&format!("url = \"{u}\"\n")),
+            None => out.push_str("url = \"\"\n"),
+        }
+        std::fs::write(path, &out)?;
+        Ok(out)
     }
 }
 
@@ -338,5 +464,42 @@ mod tests {
         let p = resolve_output_classified(None, &cfg, "a.pdf", true);
         assert_eq!(p.file_name().unwrap().to_str().unwrap(), "a.pdf");
         assert_eq!(parent_name(&p).unwrap(), "Papers");
+    }
+
+    #[test]
+    fn save_classify_roundtrip() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("surge-daemon-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("download-engine.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"download_dir = \"D:/dl\"\nport = 9999\n\n[classify]\nenabled = true\n[[classify.map]]\next = \"mkv\"\ncategory = \"Films\"\n").unwrap();
+        drop(f);
+
+        let cfg = Config::load_from(path.to_str().unwrap());
+        assert!(cfg.classify.enabled);
+        assert_eq!(cfg.classify.map.get("mkv").map(|s| s.as_str()), Some("Films"));
+
+        // 保存新规则（保留顶层键值）
+        let mut map = cfg.classify.map.clone();
+        map.insert("mp4".to_string(), "Films".to_string());
+        cfg.save_classify_map_to(path.to_str().unwrap(), &map).unwrap();
+
+        let txt = std::fs::read_to_string(&path).unwrap();
+        assert!(txt.contains("download_dir = \"D:/dl\""), "top-level key preserved");
+        assert!(txt.contains("port = 9999"), "top-level key preserved");
+        assert!(txt.contains("ext = \"mkv\""));
+        assert!(txt.contains("ext = \"mp4\""));
+        // 只允许一个 [classify] 段与一行 enabled（旧段被整体重写而非追加）
+        assert_eq!(txt.matches("[classify]").count(), 1);
+        assert_eq!(txt.matches("enabled = true").count(), 1);
+
+        // 重新加载验证 roundtrip
+        let cfg2 = Config::load_from(path.to_str().unwrap());
+        assert_eq!(cfg2.classify.map.get("mp4").map(|s| s.as_str()), Some("Films"));
+        assert!(cfg2.classify.enabled);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
