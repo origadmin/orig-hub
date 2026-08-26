@@ -70,7 +70,7 @@ interface CategoryRow {
  * - 多网卡 Tab：参与列表 + 公式权重展示（主 2 份 / 附属 1 份）
  */
 export function SettingsPanel() {
-  const { settings, updateSettings, daemon } = useStore()
+  const { settings, updateSettings, daemon, setError } = useStore()
   const [activeTab, setActiveTab] = useState<SettingsTab>('downloads')
   const [maxConnections, setMaxConnections] = useState(settings.maxConnections)
   const [dir, setDir] = useState(settings.downloadDirectory)
@@ -323,7 +323,7 @@ export function SettingsPanel() {
                     <p className="text-[11px] text-muted">文件保存位置</p>
                   </div>
                   <div className="mt-2">
-                    <DirectoryPicker value={dir} onChange={setDir} placeholder="~/Downloads" />
+                    <DirectoryPicker value={dir} onChange={setDir} placeholder="~/Downloads" onError={setError} />
                   </div>
                   <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
                     留空使用系统默认下载目录；可从历史记录快速选取。

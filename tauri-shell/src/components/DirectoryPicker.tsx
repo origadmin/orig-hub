@@ -11,6 +11,8 @@ interface Props {
   /** 是否展示历史下拉（设置页默认开，新建对话框也开） */
   showHistory?: boolean
   disabled?: boolean
+  /** 选择失败时的回调（用于全局 toast 提示，避免“点击无反应”） */
+  onError?: (msg: string) => void
 }
 
 /**
@@ -24,9 +26,11 @@ export function DirectoryPicker({
   placeholder,
   showHistory = true,
   disabled,
+  onError,
 }: Props) {
   const [recent, setRecent] = useState<string[]>([])
   const [openList, setOpenList] = useState(false)
+  const [localErr, setLocalErr] = useState<string | null>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -45,14 +49,17 @@ export function DirectoryPicker({
   }, [])
 
   const pick = async () => {
+    setLocalErr(null)
     try {
       const dir = await open({ directory: true, multiple: false })
       if (typeof dir === 'string' && dir) {
         onChange(dir)
         setRecent(addRecentDir(dir))
       }
-    } catch {
-      /* 非 Tauri 环境（浏览器预览）忽略 */
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setLocalErr(`选择目录失败：${msg}`)
+      onError?.(`选择目录失败：${msg}`)
     }
   }
 
@@ -108,6 +115,12 @@ export function DirectoryPicker({
           浏览…
         </Button>
       </div>
+
+      {localErr && (
+        <p className="mt-1 text-[11px] text-danger" title={localErr}>
+          {localErr}
+        </p>
+      )}
 
       {showHistory && openList && recent.length > 0 && (
         <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-56 overflow-y-auto rounded-md border border-border-subtle bg-surface shadow-xl">
