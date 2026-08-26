@@ -117,6 +117,7 @@ async fn list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
             &prog,
             now,
             dt.error.lock().await.clone(),
+            dt.category.clone(),
         );
         out.push(status);
     }
@@ -191,8 +192,12 @@ async fn add(
     // - 请求显式指定 output_path → 尊重用户选择，不分类
     // - classify=true 或（classify=None 且配置开启）→ 按扩展名归档子目录
     // - 否则 → 默认下载目录根（回归）
+    let category: Option<String>;
     let (mut output, mut cfg) = {
         let cfg_guard = st.config.read().unwrap();
+        // 始终按设置 classify_rules 推导分类名（不依赖 enabled：enabled 仅控制是否落子目录，
+        // 这里无论是否落子目录都给任务打分类标签，供前端「全部文件」按分类筛选）。
+        category = Some(cfg_guard.classify.classify(&filename));
         let classify_on = req.classify.unwrap_or(cfg_guard.classify.enabled);
         let output = if classify_on {
             resolve_output_classified(
@@ -312,6 +317,7 @@ async fn add(
         output: output.clone(),
         added_at,
         max_concurrency: cfg.max_concurrency,
+        category: category.clone(),
         error: tokio::sync::Mutex::new(None),
     };
 
@@ -365,6 +371,7 @@ async fn get_one(
         &prog,
         now,
         dt.error.lock().await.clone(),
+        dt.category.clone(),
     );
     Ok(axum::Json(status))
 }

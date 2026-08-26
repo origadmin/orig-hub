@@ -40,6 +40,8 @@ export interface DownloadStatus {
   block_source?: number[]
   /** 是否支持 Range（决定是否分块并发；前端据此判断是否渲染块网格） */
   supports_range?: boolean
+  /** 自动分类名（后端按设置 classify_rules 推导；前端「全部文件」按此筛选） */
+  category?: string
 }
 
 /** 单连接（源）实时状态（BUG-002） */

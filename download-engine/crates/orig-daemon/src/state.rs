@@ -19,6 +19,8 @@ pub struct DownloadTask {
     pub output: PathBuf,
     pub added_at: i64,
     pub max_concurrency: u32,
+    /// 自动分类名（按设置 classify_rules 推导）；供状态接口随任务透传。
+    pub category: Option<String>,
     /// 运行期错误（完成后若有错则写入，供状态接口暴露）。
     pub error: Mutex<Option<String>>,
 }

@@ -3,6 +3,7 @@ import type { AppSettings, DaemonStatus, DownloadStatus } from '../types'
 import {
   addDownload as apiAddDownload,
   downloadAction as apiDownloadAction,
+  getConfig,
   listDownloads,
   listInterfaces,
   removeDownload as apiRemoveDownload,
@@ -70,6 +71,11 @@ interface DownloadState {
   error: string | null
   /** 全局瞬时提示（toast）：按钮/操作失败时的用户可见反馈，避免“点击无反应” */
   toast: string | null
+  /** 自动分类清单（daemon classify_rules 的去重分类名，如 Videos/Music/...）；供侧边栏「全部文件」下钻 */
+  categories: string[]
+  /** 当前选中的分类筛选（null = 不过滤）；与 view 配合用于「全部文件」下钻 */
+  categoryFilter: string | null
+  setCategoryFilter: (c: string | null) => void
 
   init: () => Promise<void>
   refresh: () => Promise<void>
@@ -96,6 +102,8 @@ export const useStore = create<DownloadState>((set, get) => ({
   loading: false,
   error: null,
   toast: null,
+  categories: [],
+  categoryFilter: null,
 
   init: async () => {
     // 0. system 主题实时跟随系统配色
@@ -149,6 +157,14 @@ export const useStore = create<DownloadState>((set, get) => ({
     )
     // 2. 拉取当前列表
     await get().refresh()
+    // 3. 拉取分类清单（供侧边栏「全部文件」下钻；按设置 classify_rules 推导）
+    try {
+      const cfg = await getConfig()
+      const cats = Array.from(new Set(Object.values(cfg.classify_rules))).sort()
+      set({ categories: cats })
+    } catch {
+      // 配置不可达时静默：菜单暂不列出分类
+    }
   },
 
   refresh: async () => {
@@ -256,4 +272,5 @@ export const useStore = create<DownloadState>((set, get) => ({
 
   setError: (e) => set({ error: e, toast: e }),
   clearToast: () => set({ toast: null }),
+  setCategoryFilter: (c) => set({ categoryFilter: c }),
 }))
