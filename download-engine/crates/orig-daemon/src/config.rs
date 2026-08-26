@@ -87,7 +87,7 @@ pub struct Config {
     /// 自动分类配置（R3）。
     pub classify: ClassifyConfig,
     /// HTTP 下载代理配置（默认直连）。
-    pub proxy: libsurge::protocol::ProxyConfig,
+    pub proxy: orig_core::protocol::ProxyConfig,
 }
 
 impl Default for Config {
@@ -98,7 +98,7 @@ impl Default for Config {
             token: None,
             port: 9876,
             classify: ClassifyConfig::default(),
-            proxy: libsurge::protocol::ProxyConfig::default(),
+            proxy: orig_core::protocol::ProxyConfig::default(),
         }
     }
 }
@@ -234,9 +234,9 @@ impl Config {
             if let Some(sec) = parser.section("proxy") {
                 if let Some(v) = sec.get("mode") {
                     cfg.proxy.mode = match v.as_str() {
-                        "system" => libsurge::protocol::ProxyMode::System,
-                        "custom" => libsurge::protocol::ProxyMode::Custom,
-                        _ => libsurge::protocol::ProxyMode::Direct,
+                        "system" => orig_core::protocol::ProxyMode::System,
+                        "custom" => orig_core::protocol::ProxyMode::Custom,
+                        _ => orig_core::protocol::ProxyMode::Direct,
                     };
                 }
                 if let Some(v) = sec.get("url") {
@@ -337,9 +337,9 @@ impl Config {
             }
         }
         let mode_str = match self.proxy.mode {
-            libsurge::protocol::ProxyMode::Direct => "direct",
-            libsurge::protocol::ProxyMode::System => "system",
-            libsurge::protocol::ProxyMode::Custom => "custom",
+            orig_core::protocol::ProxyMode::Direct => "direct",
+            orig_core::protocol::ProxyMode::System => "system",
+            orig_core::protocol::ProxyMode::Custom => "custom",
         };
         out.push_str("[proxy]\n");
         out.push_str(&format!("mode = \"{mode_str}\"\n"));
@@ -470,7 +470,7 @@ mod tests {
     fn save_classify_roundtrip() {
         use std::io::Write;
 
-        let dir = std::env::temp_dir().join(format!("surge-daemon-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("orig-daemon-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("download-engine.toml");
         let mut f = std::fs::File::create(&path).unwrap();

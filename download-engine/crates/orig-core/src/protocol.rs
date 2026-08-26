@@ -44,7 +44,7 @@ impl CapabilitySet {
     pub const DHT: u32 = 1 << 5;
     /// BT 多 peer 并行。
     pub const MULTI_NODE: u32 = 1 << 6;
-    /// BT 做种 / 长效保活（Surge 产品特性）。
+    /// BT 做种 / 长效保活（Orig 产品特性）。
     pub const PINNING: u32 = 1 << 7;
     /// 仅支持顺序整文件流（如部分 FTP，无 REST/Range）。只能作 fallback 整文件源。
     pub const STREAM_ONLY: u32 = 1 << 8;
@@ -124,7 +124,7 @@ pub struct DownloadConfig {
     /// 镜像源 URL（HTTP 协议用；BT 协议忽略）。
     pub mirrors: Vec<String>,
     /// 多网卡分流配置（可选）：缺省 = 单主网卡（旧版行为）。
-    pub interfaces: Option<surge_net::InterfaceSpec>,
+    pub interfaces: Option<orig_net::InterfaceSpec>,
     /// 服务器是否支持 Range（来自 probe；影响 Source 能力声明与引擎调度策略）。
     /// 为 None 时，BoundSource 默认假设支持 Range（保守行为，probe 已保证可用性）。
     pub supports_range: Option<bool>,

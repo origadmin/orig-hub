@@ -28,7 +28,7 @@ import threading
 import time
 import urllib.request
 
-DAEMON = "target/debug/surge-daemon.exe"
+DAEMON = "target/debug/orig-daemon.exe"
 PORT = 9877
 SIZE_MB = 8  # 8MB 足够产生多个 1MB 块（多网卡并发）
 

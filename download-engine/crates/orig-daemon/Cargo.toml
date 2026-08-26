@@ -1,17 +1,17 @@
 [package]
-name = "surge-daemon"
+name = "orig-daemon"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "surge-daemon"
+name = "orig-daemon"
 path = "src/main.rs"
 
 [dependencies]
-libsurge = { path = "../libsurge" }
-surge-net = { path = "../surge-net" }
-surge-protocol-virtual = { path = "../surge-protocol-virtual" }
-surge-protocol-http = { path = "../surge-protocol-http" }
+orig-core = { path = "../orig-core" }
+orig-net = { path = "../orig-net" }
+orig-protocol-virtual = { path = "../orig-protocol-virtual" }
+orig-protocol-http = { path = "../orig-protocol-http" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

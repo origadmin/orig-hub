@@ -1,7 +1,7 @@
 //! REST 层使用的 `DownloadStatus` 结构：字段名/json tag 严格对齐 orig-hub
 //! `internal/engine/types/models.go` 的 `DownloadStatus`，便于 Go 端无缝消费。
 
-use libsurge::protocol::{ConnInfo, DownloadStatus as CoreStatus, Progress};
+use orig_core::protocol::{ConnInfo, DownloadStatus as CoreStatus, Progress};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
