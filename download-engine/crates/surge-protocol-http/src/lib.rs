@@ -346,6 +346,96 @@ impl Source for BoundSource {
     }
 }
 
+// ---- Content-Disposition / 文件名嗅探辅助函数（模块级自由函数，BUG-001）----
+
+/// 从 Content-Disposition 头解析文件名（RFC 5987 的 `filename*` 优先于 `filename`）。
+fn parse_content_disposition(value: &str) -> Option<String> {
+    let mut star: Option<String> = None;
+    let mut plain: Option<String> = None;
+    for part in value.split(';') {
+        let part = part.trim();
+        if let Some(rest) = part.strip_prefix("filename*=") {
+            // filename*=charset'lang'value（value 为 percent-encoded）
+            if let Some(idx) = rest.find('\'') {
+                let encoded = &rest[idx + 1..];
+                if let Some(last) = encoded.rfind('\'') {
+                    star = percent_decode(&encoded[last + 1..]);
+                }
+            }
+        } else if let Some(rest) = part.strip_prefix("filename=") {
+            plain = Some(rest.trim().trim_matches('"').to_string());
+        }
+    }
+    star.or(plain)
+}
+
+/// 最小化 percent-decode（仅解码 %XX；非 ASCII 直接保留）。
+fn percent_decode(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8 as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    Some(out)
+}
+
+/// Content-Type → 期望扩展名（无明确映射返回 None）。
+fn ext_for_content_type(ct: &str) -> Option<&'static str> {
+    Some(match ct {
+        "application/zip" | "application/x-zip-compressed" | "application/x-zip" => "zip",
+        "application/gzip" | "application/x-gzip" => "gz",
+        "application/x-tar" => "tar",
+        "application/x-7z-compressed" => "7z",
+        "application/pdf" => "pdf",
+        "application/json" | "text/json" => "json",
+        "application/msword" => "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "audio/mpeg" => "mp3",
+        "audio/mp4" => "m4a",
+        "text/plain" => "txt",
+        "text/csv" => "csv",
+        "application/octet-stream" => return None,
+        _ => return None,
+    })
+}
+
+/// 综合计算落盘文件名：Content-Disposition > URL 路径末段；
+/// 名无扩展名且 Content-Type 暗示明确扩展时补齐（BUG-001）。
+fn resolve_filename(url_path: &str, cd: Option<&str>, content_type: &str) -> Option<String> {
+    let raw = cd.or_else(|| {
+        url_path
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty() && !s.contains('?'))
+    })?;
+    // 去除可能的查询串残留（理论上 path 已不含 query，防御性处理）
+    let name = raw.split('?').next().unwrap_or(raw).to_string();
+    let has_ext = name.contains('.') && !name.ends_with('.');
+    if !has_ext {
+        if let Some(ext) = ext_for_content_type(content_type) {
+            return Some(format!("{name}.{ext}"));
+        }
+    }
+    Some(name)
+}
+
 #[async_trait]
 impl Protocol for HttpProtocol {
     fn name(&self) -> &'static str {
@@ -519,12 +609,15 @@ impl Protocol for HttpProtocol {
             )));
         }
 
-        let filename = url
-            .path
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+        // 文件名嗅探（BUG-001）：优先 Content-Disposition，其次 URL 路径末段；
+        // 并依据 Content-Type 补齐缺失的扩展名（如服务端返回 download.php 但实为 zip）。
+        let cd_raw = range_resp
+            .headers()
+            .get(reqwest::header::CONTENT_DISPOSITION)
+            .or_else(|| head_resp.headers().get(reqwest::header::CONTENT_DISPOSITION))
+            .and_then(|v| v.to_str().ok());
+        let cd = cd_raw.and_then(parse_content_disposition);
+        let filename = resolve_filename(&url.path, cd.as_deref(), &content_type);
 
         Ok(Metadata {
             total_size,

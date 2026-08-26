@@ -307,6 +307,29 @@ pub trait Protocol: Send + Sync {
     ) -> Result<Vec<Box<dyn Source>>>;
 }
 
+/// 单连接（worker）实时状态，供前端「连接明细」展示。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnInfo {
+    pub id: u32,
+    /// idle / downloading / error
+    pub state: String,
+    /// 当前正在下载的块索引（idle/error 时为 null）。
+    #[serde(default)]
+    pub block: Option<u32>,
+    /// 该连接瞬时速度 bytes/s。
+    pub speed: f64,
+    /// 绑定网卡名（多网卡分流）。
+    pub iface: String,
+    /// 使用的源下标（主源=0，镜像/附属网卡依次类推）。
+    pub source_index: usize,
+}
+
+/// 块状态编码（用于 `Progress.blocks` 的紧凑表示）。
+pub const BLOCK_PENDING: u8 = 0;
+pub const BLOCK_ASSIGNED: u8 = 1;
+pub const BLOCK_DONE: u8 = 2;
+pub const BLOCK_FAILED: u8 = 3;
+
 /// 进度快照（引擎内部，REST 层会再映射为 orig-hub 的 DownloadStatus 字段）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Progress {
@@ -320,6 +343,19 @@ pub struct Progress {
     /// 完成时的最终 sha256（续传/校验用）；进行中/失败时 None。
     #[serde(default)]
     pub hash_sha256: Option<String>,
+    /// 每个并发连接的实时状态（数量 = max_concurrency）。
+    #[serde(default)]
+    pub connections_detail: Vec<ConnInfo>,
+    /// 每块的完成状态编码（0/1/2/3）；块过多（>4096）时为空，改用下方计数。
+    #[serde(default)]
+    pub blocks: Vec<u8>,
+    /// 块计数（始终有效）。
+    #[serde(default)]
+    pub blocks_total: u32,
+    #[serde(default)]
+    pub blocks_done: u32,
+    #[serde(default)]
+    pub blocks_pending: u32,
 }
 
 /// 运行期控制句柄：暂停标志 + 恢复通知 + 取消令牌。

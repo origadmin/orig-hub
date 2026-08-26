@@ -26,6 +26,32 @@ export interface DownloadStatus {
   avg_speed: number
   /** SSE Completed 事件附加 */
   hash_sha256?: string
+  /** 每连接明细（BUG-002）：每个源一条 */
+  connections_detail?: ConnInfo[]
+  /** 分块位图（每块状态 0/1/2/3），块过多时为空改用计数 */
+  blocks?: number[]
+  /** 块总数 */
+  blocks_total?: number
+  /** 已完成块数 */
+  blocks_done?: number
+  /** 待下载块数 */
+  blocks_pending?: number
+}
+
+/** 单连接（源）实时状态（BUG-002） */
+export interface ConnInfo {
+  /** 连接序号 */
+  id: number
+  /** idle / downloading / error */
+  state: string
+  /** 当前下载块索引（idle/error 为 null） */
+  block: number | null
+  /** 瞬时速度 bytes/s */
+  speed: number
+  /** 绑定网卡名 */
+  iface: string
+  /** 源下标（主源=0） */
+  source_index: number
 }
 
 export interface NetworkInterface {
