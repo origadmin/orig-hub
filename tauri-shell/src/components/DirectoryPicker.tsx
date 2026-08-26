@@ -82,7 +82,7 @@ export function DirectoryPicker({
             onClick={() => setOpenList((v) => !v)}
             disabled={disabled}
             title="历史目录"
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border-subtle bg-surface-2 text-muted transition-colors hover:bg-surface-2/80 hover:text-zinc-100 disabled:opacity-50"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border-subtle bg-surface-2 text-muted transition-colors hover:bg-surface-2/80 hover:text-fg-strong disabled:opacity-50"
           >
             <svg
               width="14"
@@ -121,7 +121,7 @@ export function DirectoryPicker({
               onClick={() => chooseHistory(d)}
               title={d}
             >
-              <span className="truncate font-mono text-zinc-300">{d}</span>
+              <span className="truncate font-mono text-fg-mid">{d}</span>
               <button
                 className="shrink-0 text-muted opacity-0 transition-opacity hover:text-danger group-hover:opacity-100"
                 onClick={(e) => removeOne(e, d)}

@@ -82,7 +82,7 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between">
-          <h2 className="text-base font-semibold text-zinc-100">选择网卡</h2>
+          <h2 className="text-base font-semibold text-fg-strong">选择网卡</h2>
           <Badge variant="secondary">参与加速</Badge>
         </div>
 
@@ -90,7 +90,7 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
         <div className="mt-4 rounded-md bg-surface-2/60 px-3 py-2.5">
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2">
-              <span className="text-xs font-medium text-zinc-200">主网卡</span>
+              <span className="text-xs font-medium text-fg-mid">主网卡</span>
               <Badge variant="default" className="text-[9px]">默认</Badge>
             </div>
             <select
@@ -100,7 +100,7 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
                 setPrimary(name)
                 setChecked((c) => ({ ...c, [name]: true }))
               }}
-              className="max-w-[60%] flex-1 truncate rounded-md border border-border-subtle bg-surface px-2 py-1.5 text-xs text-zinc-100 focus:outline-none focus:ring-2 focus:ring-accent/50"
+              className="max-w-[60%] flex-1 truncate rounded-md border border-border-subtle bg-surface px-2 py-1.5 text-xs text-fg-strong focus:outline-none focus:ring-2 focus:ring-accent/50"
             >
               <option value="">自动识别（默认路由网卡）</option>
               {connIfaces.map((nic) => (
@@ -142,7 +142,7 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
                       nic.connected ? 'bg-success' : 'bg-muted'
                     }`}
                   />
-                  <span className="min-w-0 flex-1 truncate text-xs font-medium text-zinc-200">
+                  <span className="min-w-0 flex-1 truncate text-xs font-medium text-fg-mid">
                     {nic.name}
                   </span>
                   <span className="shrink-0 font-mono text-[10px] text-muted">

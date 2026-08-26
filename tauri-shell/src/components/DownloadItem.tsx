@@ -10,6 +10,10 @@ import {
 import type { DownloadStatus } from '../types'
 import { useStore } from '../store/useStore'
 
+// Tauri 环境可用时才加载 opener（浏览器 dev 环境降级为不显示）
+const isTauri = () =>
+  typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+
 const statusMeta: Record<
   string,
   { label: string; variant: 'success' | 'warning' | 'danger' | 'default' | 'secondary' }
@@ -28,13 +32,36 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
   const meta = statusMeta[item.status] ?? statusMeta.idle
   const isActive = item.status === 'downloading'
 
+  /** 在资源管理器中显示文件（completed 任务可用） */
+  const handleReveal = async () => {
+    if (!item.dest_path) return
+    try {
+      const { revealItemInDir } = await import('@tauri-apps/plugin-opener')
+      await revealItemInDir(item.dest_path)
+    } catch (e) {
+      console.error('reveal failed', e)
+    }
+  }
+
+  /** 打开下载目录 */
+  const handleOpenDir = async () => {
+    if (!item.dest_path) return
+    try {
+      const { openPath } = await import('@tauri-apps/plugin-opener')
+      const dir = item.dest_path.slice(0, Math.max(item.dest_path.lastIndexOf('/'), item.dest_path.lastIndexOf('\\')))
+      await openPath(dir || item.dest_path)
+    } catch (e) {
+      console.error('open dir failed', e)
+    }
+  }
+
   return (
     <div className="group rounded-lg border border-border-subtle bg-surface p-4 transition-all duration-200 hover:border-accent/40 hover:bg-surface/80">
       <div className="flex items-start justify-between gap-3">
         {/* 文件名 + URL */}
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <p className="truncate text-sm font-medium text-zinc-100">
+            <p className="truncate text-sm font-medium text-fg-strong">
               {item.filename || '未知文件'}
             </p>
             <Badge variant={meta.variant}>{meta.label}</Badge>
@@ -62,9 +89,21 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
             </Button>
           )}
           {(item.status === 'completed' || item.status === 'error' || item.status === 'cancelled') && (
-            <Button size="sm" variant="ghost" onClick={() => remove(item.id)} title="删除">
-              删除
-            </Button>
+            <>
+              {item.status === 'completed' && isTauri() && item.dest_path && (
+                <>
+                  <Button size="sm" variant="ghost" onClick={handleReveal} title="在资源管理器中显示文件">
+                    打开文件
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={handleOpenDir} title="打开下载目录">
+                    打开目录
+                  </Button>
+                </>
+              )}
+              <Button size="sm" variant="ghost" onClick={() => remove(item.id)} title="删除">
+                删除
+              </Button>
+            </>
           )}
         </div>
       </div>
@@ -76,7 +115,7 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
 
       {/* 元信息 */}
       <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted">
-        <span className="font-mono text-zinc-300">
+        <span className="font-mono text-fg-mid">
           {formatBytes(item.downloaded)}
           {item.total_size > 0 && (
             <> / {formatBytes(item.total_size)}</>

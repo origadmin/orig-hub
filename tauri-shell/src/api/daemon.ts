@@ -63,8 +63,7 @@ export function removeDownload(id: string): Promise<void> {
   })
 }
 
-/** GET /api/interfaces — 网卡列表（{primary, secondaries}，均已含 enabled/weight） */
-export async function listInterfaces(): Promise<{
+/** GET /api/interfaces — 网卡列表（{primary, secondaries}，均已含 enabled/weight） */export async function listInterfaces(): Promise<{
   primary: NetworkInterface
   secondaries: NetworkInterface[]
 }> {
@@ -78,6 +77,53 @@ export async function listInterfaces(): Promise<{
     }
   }
   return raw as { primary: NetworkInterface; secondaries: NetworkInterface[] }
+}
+
+/** daemon 配置（GET /api/config） */
+export interface DaemonConfig {
+  download_dir: string | null
+  max_connections: number
+  classify_enabled: boolean
+  /** 扩展名（小写，无点）→ 分类目录名（已合并内置默认 + 用户自定义） */
+  classify_rules: Record<string, string>
+  /** 代理配置：mode=direct|system|custom；url 仅 custom 模式有值 */
+  proxy: {
+    mode: 'direct' | 'system' | 'custom'
+    url: string | null
+  }
+}
+
+/** 代理配置（HTTP 下载） */
+export interface ProxyConfig {
+  mode: 'direct' | 'system' | 'custom'
+  url?: string | null
+}
+
+/** GET /api/config — 读取 daemon 配置 */
+export function getConfig(): Promise<DaemonConfig> {
+  return request<DaemonConfig>('/api/config')
+}
+
+/** PUT /api/config/proxy — 保存代理配置（运行时生效 + 持久化） */
+export function saveProxyConfig(req: ProxyConfig): Promise<{
+  ok: boolean
+  proxy: { mode: string; url: string | null }
+}> {
+  return request('/api/config/proxy', {
+    method: 'PUT',
+    body: JSON.stringify(req),
+  })
+}
+
+/** PUT /api/config/classify — 保存自动分类规则（运行时生效 + 持久化） */
+export function saveClassifyConfig(req: {
+  enabled: boolean
+  rules: Record<string, string>
+}): Promise<{ ok: boolean; classify_enabled: boolean; classify_rules: Record<string, string> }> {
+  return request('/api/config/classify', {
+    method: 'PUT',
+    body: JSON.stringify(req),
+  })
 }
 
 /** GET /health */

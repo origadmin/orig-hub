@@ -42,7 +42,7 @@ export function DownloadList({ items, loading, error, onRetry }: Props) {
             <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
           </svg>
         </div>
-        <h3 className="mt-4 text-sm font-medium text-zinc-200">暂无下载任务</h3>
+        <h3 className="mt-4 text-sm font-medium text-fg-mid">暂无下载任务</h3>
         <p className="mt-1 text-xs text-muted">点击右上角「新建下载」添加任务</p>
       </div>
     )

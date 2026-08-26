@@ -64,6 +64,10 @@ export interface AddDownloadRequest {
   max_connections?: number
   /** 自动分类（R3）：true=强制开启 / false=强制关闭 / 缺省=daemon 配置 */
   classify?: boolean
+  /** 覆盖下载：目标文件已存在时先删除再重新下载 */
+  overwrite?: boolean
+  /** 本次下载代理：缺省用 daemon 配置；{mode:'direct'} 强制直连；{mode:'custom',url} 指定 */
+  proxy?: { mode: 'direct' | 'system' | 'custom'; url?: string | null }
 }
 
 export interface DaemonStatus {
@@ -86,4 +90,6 @@ export interface AppSettings {
   enabledInterfaces: Record<string, number>
   /** 自动分类下载（R3）：默认值，可在新建下载时覆盖 */
   autoClassify: boolean
+  /** 自动分类规则（R3 优化）：扩展名 → 分类目录名；为空时使用 daemon 内置默认 */
+  classifyRules: Record<string, string>
 }
