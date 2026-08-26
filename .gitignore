@@ -24,7 +24,7 @@ tauri-shell/src-tauri/binaries/
 *.orighub
 *.db
 proxy-test-file.bin
-coverage
+coverage/
 
 # ============ 日志 ============
 *.log
