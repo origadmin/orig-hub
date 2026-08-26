@@ -1,7 +1,7 @@
 //! REST 层使用的 `DownloadStatus` 结构：字段名/json tag 严格对齐 orig-hub
 //! `internal/engine/types/models.go` 的 `DownloadStatus`，便于 Go 端无缝消费。
 
-use libsurge::protocol::{DownloadStatus as CoreStatus, Progress};
+use libsurge::protocol::{ConnInfo, DownloadStatus as CoreStatus, Progress};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -20,6 +20,18 @@ pub struct DownloadStatus {
     pub error: Option<String>,
     pub eta: i64,
     pub connections: u32,
+    /// 每个连接（源）的实时明细（BUG-002）。
+    #[serde(default)]
+    pub connections_detail: Vec<ConnInfo>,
+    /// 分块位图（每块状态 0/1/2/3）；块过多时为空，改用下方计数（BUG-002）。
+    #[serde(default)]
+    pub blocks: Vec<u8>,
+    #[serde(default)]
+    pub blocks_total: u32,
+    #[serde(default)]
+    pub blocks_done: u32,
+    #[serde(default)]
+    pub blocks_pending: u32,
     pub added_at: i64,
     pub time_taken: i64,
     pub avg_speed: f64,
@@ -81,6 +93,11 @@ impl DownloadStatus {
             error,
             eta: prog.eta_sec,
             connections,
+            connections_detail: prog.connections_detail.clone(),
+            blocks: prog.blocks.clone(),
+            blocks_total: prog.blocks_total,
+            blocks_done: prog.blocks_done,
+            blocks_pending: prog.blocks_pending,
             added_at,
             time_taken,
             avg_speed,

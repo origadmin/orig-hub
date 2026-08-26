@@ -171,10 +171,12 @@ async fn add(
     };
 
     let id = Uuid::new_v4().to_string();
+    // 文件名解析优先级（BUG-001）：用户显式指定 → 嗅探(Content-Disposition) → URL 路径末段 → <id>.bin
     let filename = req
         .filename
         .clone()
         .filter(|s| !s.is_empty())
+        .or_else(|| meta.filename.clone().filter(|s| !s.is_empty()))
         .or_else(|| {
             parsed
                 .path

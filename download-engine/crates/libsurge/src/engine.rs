@@ -205,6 +205,13 @@ impl SpeedTracker {
         self.ema.store(next as u64, Ordering::Relaxed);
         self.ema.load(Ordering::Relaxed)
     }
+
+    /// 只读读取当前 EMA 速度（不推进采样状态）。
+    /// 供多消费者（list/get_one 轮询、progress() 读取）安全调用，
+    /// 避免「多调用方各自 sample 抢增量」导致速度被低估（BUG-003）。
+    fn current_ema(&self) -> u64 {
+        self.ema.load(Ordering::Relaxed)
+    }
 }
 
 /// 一次下载任务：块映射 + 源集合 + 输出文件 + 控制句柄。
@@ -279,7 +286,6 @@ impl Task {
             self.downloaded.load(Ordering::SeqCst)
         };
         self.downloaded.store(downloaded, Ordering::SeqCst);
-        let speed = self.speed.sample(downloaded);
         let (status, eta) = if self.control.cancel.is_cancelled() {
             (DownloadStatus::Cancelled, -1i64)
         } else if self.control.paused.load(Ordering::SeqCst) {
@@ -289,6 +295,63 @@ impl Task {
         } else {
             (DownloadStatus::Downloading, -1i64)
         };
+        // 速度：仅活跃态反映实时 EMA；非活跃态（完成/暂停/取消/错误）强制归零，
+        // 避免残留旧速度（BUG-003）。采样由唯一生产者（worker）推进，此处只读。
+        let speed = if matches!(
+            status,
+            DownloadStatus::Downloading | DownloadStatus::Queued | DownloadStatus::Idle
+        ) {
+            self.speed.current_ema()
+        } else {
+            0
+        };
+
+        // 连接明细 + 分块位图（BUG-002）：
+        // - connections_detail：每个源一条，反映健康度/瞬时速度/绑定网卡。
+        // - blocks：每块状态编码（0/1/2/3），块数 >4096 时留空改由计数表达。
+        let mut connections_detail: Vec<ConnInfo> = Vec::with_capacity(self.sources.len());
+        for i in 0..self.sources.len() {
+            let h = self.selector.health(i);
+            let c_speed = h.avg_speed.load(Ordering::Relaxed) as f64;
+            let disabled = h.disabled.load(Ordering::Relaxed);
+            connections_detail.push(ConnInfo {
+                id: i as u32,
+                state: if disabled {
+                    "error".to_string()
+                } else {
+                    "downloading".to_string()
+                },
+                block: None,
+                speed: c_speed,
+                iface: self.sources[i].iface_name().to_string(),
+                source_index: i,
+            });
+        }
+        let blocks_total = bm.blocks.len() as u32;
+        let blocks_done = bm
+            .blocks
+            .iter()
+            .filter(|s| **s == BlockState::Done)
+            .count() as u32;
+        let blocks_pending = bm
+            .blocks
+            .iter()
+            .filter(|s| **s == BlockState::Pending)
+            .count() as u32;
+        let blocks: Vec<u8> = if bm.blocks.len() <= 4096 {
+            bm.blocks
+                .iter()
+                .map(|s| match s {
+                    BlockState::Pending => BLOCK_PENDING,
+                    BlockState::Assigned => BLOCK_ASSIGNED,
+                    BlockState::Done => BLOCK_DONE,
+                    BlockState::Failed => BLOCK_FAILED,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Progress {
             id: self.id.clone(),
             status,
@@ -298,6 +361,11 @@ impl Task {
             eta_sec: eta,
             protocol: self.protocol_name.clone(),
             hash_sha256: self.final_hash.read().unwrap().clone(),
+            connections_detail,
+            blocks,
+            blocks_total,
+            blocks_done,
+            blocks_pending,
         }
     }
 
@@ -352,7 +420,7 @@ impl Task {
     }
 
     /// 单个 worker：循环认领 pending 块并填充，直到无剩余或出错/取消。
-    async fn worker(&self, token: CancellationToken) -> Result<()> {
+    async fn worker(self: &Arc<Self>, token: CancellationToken) -> Result<()> {
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -378,32 +446,22 @@ impl Task {
             };
             let block = self.block_at(idx).await;
 
-            // 单块顺序下载（不支持 Range 的源）：轮询文件大小估算已下载字节，
-            // 以便 SSE/轮询能反映实时进度（progress() 现在直接读文件 size）。
+            // 非 Range 模式：单块顺序下载，单独拉起轮询 ticker 实时上报进度。
+            // 复用 Task 的 SpeedTracker（唯一生产者采样），避免与 worker 各自采样抢增量（BUG-003）。
             let progress_ticker = if !self.supports_range {
                 let ev = self.events.clone();
-                let id = self.id.clone();
                 let downloaded = self.downloaded.clone();
                 let total = self.block_map.read().await.total;
                 let output = self.output.clone();
-                let mut speed_track = SpeedTracker::new();
+                let self_arc = Arc::clone(self);
                 Some(tokio::spawn(async move {
                     let mut iv = tokio::time::interval(Duration::from_millis(500));
                     loop {
                         iv.tick().await;
                         let len = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
                         downloaded.store(len, Ordering::SeqCst);
-                        let speed = speed_track.sample(len);
-                        let p = Progress {
-                            id: id.clone(),
-                            status: DownloadStatus::Downloading,
-                            downloaded: len,
-                            total,
-                            speed,
-                            eta_sec: -1,
-                            protocol: String::new(),
-                            hash_sha256: None,
-                        };
+                        self_arc.speed.sample(len);
+                        let p = self_arc.progress().await;
                         if ev.send(SseEvent::Progress(p)).is_err() {
                             break;
                         }
@@ -433,6 +491,11 @@ impl Task {
                                 .set_state(idx, BlockState::Done);
                             let done = self.block_map.read().await.done_bytes();
                             self.downloaded.store(done, Ordering::SeqCst);
+                            // 唯一速度采样点（Range 模式）：每块完成后推进 EMA。
+                            // 非 Range 模式由 progress_ticker 单独采样，这里不重复采样（BUG-003）。
+                            if self.supports_range {
+                                self.speed.sample(done);
+                            }
                             self.events
                                 .send(SseEvent::Progress(self.progress().await))
                                 .ok();

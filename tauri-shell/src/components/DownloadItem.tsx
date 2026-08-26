@@ -159,6 +159,57 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
           </span>
         )}
       </div>
+
+      {/* 分块进度（BUG-002） */}
+      {item.blocks_total ? (
+        <div className="mt-2">
+          {item.blocks && item.blocks.length > 0 ? (
+            <div
+              className="flex flex-wrap gap-0.5"
+              title={`${item.blocks_done}/${item.blocks_total} 块完成 · ${item.blocks_pending} 待下载`}
+            >
+              {item.blocks.map((b, i) => (
+                <span
+                  key={i}
+                  className={cn(
+                    'h-1.5 w-1.5 rounded-[1px]',
+                    b === 2
+                      ? 'bg-success'
+                      : b === 1
+                        ? 'bg-accent/60'
+                        : b === 3
+                          ? 'bg-danger'
+                          : 'bg-border-subtle',
+                  )}
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="font-mono text-xs text-muted">
+              {item.blocks_done}/{item.blocks_total} 块完成
+              {item.blocks_pending ? ` · ${item.blocks_pending} 待下载` : ''}
+            </div>
+          )}
+        </div>
+      ) : null}
+
+      {/* 连接明细（BUG-002） */}
+      {isActive && item.connections_detail && item.connections_detail.length > 0 && (
+        <div className="mt-1 flex flex-wrap gap-1">
+          {item.connections_detail.map((c) => (
+            <span
+              key={c.id}
+              className={cn(
+                'rounded px-1 py-0.5 font-mono text-[10px]',
+                c.state === 'error' ? 'bg-danger/10 text-danger' : 'bg-accent/10 text-accent',
+              )}
+              title={`${c.iface} · ${formatSpeed(c.speed)}`}
+            >
+              {c.iface}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
