@@ -3,7 +3,7 @@
 
 use std::sync::Mutex;
 
-use orig_tg::login::{Client, ClientError, LoginPhase, SessionView};
+use orig_tg::login::{Channel, Client, ClientError, LoginPhase, MediaItem, SessionView};
 
 /// 内存占位客户端：固定验证码 00000 即授权（仅供接口契约自洽，非真实登录）。
 pub struct DummyClient {
@@ -45,5 +45,14 @@ impl Client for DummyClient {
             phone: None,
             user_id: None,
         }
+    }
+
+    async fn dialogs(&self) -> Result<Vec<Channel>, ClientError> {
+        // 占位客户端无真实订阅数据，返回空列表。
+        Ok(Vec::new())
+    }
+
+    async fn messages(&self, _chat_id: i64, _limit: u32) -> Result<Vec<MediaItem>, ClientError> {
+        Ok(Vec::new())
     }
 }

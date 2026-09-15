@@ -13,13 +13,14 @@
 
 use std::path::PathBuf;
 
-use grammers_client::types::{LoginToken, PasswordToken};
+use grammers_client::types::{LoginToken, Media, PasswordToken};
 use grammers_client::{Client as TgClient, Config as GConfig, SignInError};
+use grammers_client::grammers_tl_types as tl;
 use grammers_session::Session;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
-use crate::login::{Client, ClientError, LoginPhase, SessionView};
+use crate::login::{Channel, Client, ClientError, LoginPhase, MediaItem, SessionView};
 
 /// 登录中间态（在多次 HTTP 请求之间保留 Telegram 返回的 token）。
 struct Pending {
@@ -158,5 +159,77 @@ impl Client for GrammersClient {
             phone: p.phone.clone(),
             user_id: p.user_id,
         }
+    }
+
+    async fn dialogs(&self) -> Result<Vec<Channel>, ClientError> {
+        let mut iter = self.inner.iter_dialogs();
+        let mut out = Vec::new();
+        while let Some(dialog) = iter
+            .next()
+            .await
+            .map_err(|e| ClientError::Other(e.to_string()))?
+        {
+            let chat = dialog.chat();
+            out.push(Channel {
+                id: chat.id(),
+                title: chat.name().to_string(),
+                username: chat.username().map(str::to_string),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn messages(&self, chat_id: i64, limit: u32) -> Result<Vec<MediaItem>, ClientError> {
+        // 先通过订阅枚举解析目标会话的 PackedChat（含 access_hash），再拉取媒体历史。
+        let mut dialogs = self.inner.iter_dialogs();
+        let mut peer = None;
+        while let Some(dialog) = dialogs
+            .next()
+            .await
+            .map_err(|e| ClientError::Other(e.to_string()))?
+        {
+            let chat = dialog.chat();
+            if chat.id() == chat_id {
+                peer = Some(chat.pack());
+                break;
+            }
+        }
+        let peer = peer.ok_or_else(|| {
+            ClientError::Other("chat not found in subscribed dialogs".into())
+        })?;
+
+        let mut msgs = self.inner.iter_messages(peer).limit(limit.max(1) as usize);
+        let mut out = Vec::new();
+        while let Some(m) = msgs
+            .next()
+            .await
+            .map_err(|e| ClientError::Other(e.to_string()))?
+        {
+            let caption = {
+                let text = m.text();
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text.to_string())
+                }
+            };
+            let (mime_type, size) = match m.media() {
+                Some(Media::Document(doc)) => match doc.raw.document.as_ref() {
+                    Some(tl::enums::Document::Document(d)) => {
+                        (Some(d.mime_type.clone()), Some(d.size))
+                    }
+                    _ => (Some("application/octet-stream".into()), None),
+                },
+                Some(Media::Photo(_)) => (Some("image/jpeg".into()), None),
+                _ => (None, None),
+            };
+            out.push(MediaItem {
+                id: m.id() as i64,
+                caption,
+                mime_type,
+                size,
+            });
+        }
+        Ok(out)
     }
 }

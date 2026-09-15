@@ -38,6 +38,27 @@ pub struct SessionView {
     pub user_id: Option<i64>,
 }
 
+/// 订阅频道/会话的轻量元数据（枚举 + 频道本地索引的公共 DTO）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Channel {
+    pub id: i64,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+}
+
+/// 频道内一条媒体消息的摘要（历史拉取公共 DTO）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaItem {
+    pub id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(rename = "size", skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+}
+
 /// 客户端抽象：路由层只依赖此 trait，具体实现可替换。
 #[async_trait::async_trait]
 pub trait Client: Send + Sync {
@@ -49,6 +70,10 @@ pub trait Client: Send + Sync {
     async fn submit_password(&self, phone: &str, password: &str) -> Result<LoginPhase, ClientError>;
     /// 返回当前已登录会话快照（未登录返回 Anonymous）。
     async fn view(&self) -> SessionView;
+    /// 枚举用户订阅的会话（频道/群组/私聊），含频道元数据。
+    async fn dialogs(&self) -> Result<Vec<Channel>, ClientError>;
+    /// 拉取指定会话最近的媒体历史（从新到旧），最多 `limit` 条。
+    async fn messages(&self, chat_id: i64, limit: u32) -> Result<Vec<MediaItem>, ClientError>;
 }
 
 /// 登录流程错误。
@@ -97,6 +122,12 @@ mod tests {
                 phone: None,
                 user_id: None,
             }
+        }
+        async fn dialogs(&self) -> Result<Vec<Channel>, ClientError> {
+            Ok(Vec::new())
+        }
+        async fn messages(&self, _chat_id: i64, _limit: u32) -> Result<Vec<MediaItem>, ClientError> {
+            Ok(Vec::new())
         }
     }
 

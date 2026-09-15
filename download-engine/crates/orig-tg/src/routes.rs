@@ -7,12 +7,12 @@
 //!        body: {"phone":"+86..."}
 //!   POST /api/tg/code                -> 提交验证码/2FA 密码
 //!        body: {"code":...} / {"password":...}
-//!   GET  /api/tg/dialogs             -> [Channel] 订阅频道枚举（占位，未登录返回 401）
-//!   GET  /api/tg/messages?chat=...   -> [MediaItem] 频道历史拉取（占位，未登录返回 401）
+//!   GET  /api/tg/dialogs             -> [Channel] 订阅频道枚举（未登录返回 401）
+//!   GET  /api/tg/messages/:chat_id?limit=100 -> [MediaItem] 频道媒体历史（未登录返回 401）
 
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -23,26 +23,6 @@ use serde_json::json;
 use crate::login::{Client, ClientError, LoginPhase};
 use crate::state::AppState;
 
-/// 骨架阶段频道/媒体 DTO（占位，供接口契约对齐）。
-#[derive(Debug, serde::Serialize)]
-pub struct Channel {
-    pub id: i64,
-    pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize)]
-pub struct MediaItem {
-    pub id: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub caption: Option<String>,
-    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
-    pub mime_type: Option<String>,
-    #[serde(rename = "size", skip_serializing_if = "Option::is_none")]
-    pub size: Option<i64>,
-}
-
 pub fn router(state: Arc<AppState>) -> axum::Router {
     Router::new()
         .route("/health", get(health))
@@ -50,7 +30,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/api/tg/start", axum::routing::post(start))
         .route("/api/tg/code", axum::routing::post(code))
         .route("/api/tg/dialogs", get(dialogs))
-        .route("/api/tg/messages", get(messages))
+        .route("/api/tg/messages/:chat_id", get(messages))
         .with_state(state)
 }
 
@@ -117,23 +97,28 @@ async fn code(
 
 async fn dialogs(State(st): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     ensure_authorized(&*st.client).await?;
-    // 骨架阶段：接口契约占位，返回空列表；接入 grammers 后实现真实枚举。
-    Ok(Json(Vec::<Channel>::new()))
+    let dialogs = st.client.dialogs().await?;
+    Ok(Json(dialogs))
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct MsgQuery {
-    chat: i64,
+    #[serde(default = "default_limit")]
+    limit: u32,
+}
+
+fn default_limit() -> u32 {
+    100
 }
 
 async fn messages(
     State(st): State<Arc<AppState>>,
-    Query(_q): Query<MsgQuery>,
+    Path(chat_id): Path<i64>,
+    Query(q): Query<MsgQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_authorized(&*st.client).await?;
-    // 骨架阶段：接口契约占位，返回空列表；接入 grammers 后实现真实历史拉取。
-    Ok(Json(Vec::<MediaItem>::new()))
+    let items = st.client.messages(chat_id, q.limit).await?;
+    Ok(Json(items))
 }
 
 /// 骨架阶段的登录态守卫：仅内存占位客户端已授权时放行。
