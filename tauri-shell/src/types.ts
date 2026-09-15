@@ -110,12 +110,16 @@ export interface DaemonStatus {
 
 export type ThemeValue = 'dark' | 'light' | 'system'
 
+export type LanguageValue = 'zh-CN' | 'en-US'
+
 export interface AppSettings {
   maxConnections: number
   downloadDirectory: string
   autoStart: boolean
   notifications: boolean
   theme: ThemeValue
+  /** 界面显示语言（文件翻译模式 i18n）；缺省按浏览器环境推断 */
+  language: LanguageValue
   /** 指定主网卡（网卡名，可选；缺省自动识别） */
   primaryInterface?: string
   /** 全局启用的附属网卡名单（网卡名 → 权重份数，默认 1）；主网卡始终参与不在此列 */

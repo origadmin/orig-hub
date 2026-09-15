@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { AppSettings, DaemonStatus, DownloadStatus } from '../types'
+import type { AppSettings, DaemonStatus, DownloadStatus, LanguageValue } from '../types'
 import {
   addDownload as apiAddDownload,
   downloadAction as apiDownloadAction,
@@ -13,6 +13,12 @@ import type { AddDownloadRequest } from '../types'
 
 const SETTINGS_KEY = 'orig-hub:settings'
 
+/** 按浏览器环境推断默认语言（i18n 缺省值） */
+function defaultLanguage(): LanguageValue {
+  if (typeof navigator === 'undefined') return 'zh-CN'
+  return navigator.language?.toLowerCase().startsWith('zh') ? 'zh-CN' : 'en-US'
+}
+
 /** 读取持久化设置（localStorage）；不存在时返回默认值 */
 function loadSettings(): AppSettings {
   const defaults: AppSettings = {
@@ -21,6 +27,7 @@ function loadSettings(): AppSettings {
     autoStart: true,
     notifications: true,
     theme: 'dark',
+    language: defaultLanguage(),
     primaryInterface: undefined,
     enabledInterfaces: {},
     autoClassify: false,
