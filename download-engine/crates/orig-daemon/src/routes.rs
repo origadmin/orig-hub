@@ -602,16 +602,27 @@ async fn verify_proxy(
     target: &str,
 ) -> Result<reqwest::StatusCode, String> {
     let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .connect_timeout(std::time::Duration::from_secs(6));
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(8))
+        // 纯连通性探测：仅关心代理能否把流量送达目标，不校验证书/吊销，
+        // 否则 schannel 的吊销检查会误判可用代理为不可达。
+        .danger_accept_invalid_certs(true)
+        .use_rustls_tls();
     builder = match proxy.mode {
         orig_core::protocol::ProxyMode::Direct => builder.no_proxy(),
         orig_core::protocol::ProxyMode::System => builder,
         orig_core::protocol::ProxyMode::Custom => match &proxy.url {
-            Some(u) => match reqwest::Proxy::all(u) {
-                Ok(p) => builder.proxy(p),
-                Err(e) => return Err(format!("invalid proxy url {u:?}: {e}")),
-            },
+            Some(u) => {
+                // socks5h = 远端 DNS（经代理解析域名）；socks5 本地解析会拿到被污染的 IP，
+                // 导致真实可达代理被判不可达（curl --socks5-hostname 同理）。
+                let probe_url = u
+                    .replace("socks5://", "socks5h://")
+                    .replace("socks://", "socks5h://");
+                match reqwest::Proxy::all(&probe_url) {
+                    Ok(p) => builder.proxy(p),
+                    Err(e) => return Err(format!("invalid proxy url {u:?}: {e}")),
+                }
+            }
             None => builder.no_proxy(),
         },
     };

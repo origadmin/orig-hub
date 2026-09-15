@@ -25,5 +25,5 @@ futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 thiserror = "1"
-reqwest = { version = "0.12", features = ["stream", "http2", "socks"] }
+reqwest = { version = "0.12", features = ["stream", "http2", "socks", "rustls-tls"] }
 if-addrs = "0.13"
