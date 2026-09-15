@@ -1,9 +1,9 @@
 # Orig Hub — Telegram 频道内容汇总整理（设计草案）
 
-> **版本**: v0.1.3（accepted）
+> **版本**: v0.1.4（accepted）
 > **日期**: 2026-09-15
 > **基线 Commit**: 256e5a1
-> **最后验证 Commit**: 86bea39（orig-tg 枚举/拉取增量实现）
+> **最后验证 Commit**: 14b3a45（orig-tg 下载 + 网页调试界面 + 二进制发布）
 > **代码映射**: `download-engine/crates/orig-tg/`（新增独立服务）、`orig-daemon/`、`tauri-shell/src/`
 > **状态**: accepted — 已评审确认，进入分支开发
 
@@ -13,10 +13,10 @@
 |---|---|
 | 问题 | Telegram 频道大量高频发布，内容重复、分散在多频道；TG 搜索差、视频直链播放卡顿 |
 | 根因 | 现有引擎是纯 HTTP 下载器，无 Telegram 源；Bot API 有 20MB/history 硬限制；TG 流式播放不稳 |
-| 方案 | 以**用户账号 + MTProto（Rust grammers）**为拉取层；**orig-tg 作为独立服务**，经 HTTP 与主 daemon 交互；核心是**多频道内容汇总 + 手动择优 + 去重 + 系列聚类**，叠加**本地频道索引**与**点播即下载本地播放** |
-| 改动范围 | 新增独立服务 `orig-tg`（binary/sidecar）；daemon 增 TG 源路由 + 频道目录索引 + 任务/系列/元数据持久化；shell 增订阅、汇总视图、本地搜索、本地播放 |
+| 方案 | 以**用户账号 + MTProto（Rust grammers）**为拉取层；**orig-tg 作为独立可分发二进制**（仿 orig-daemon 的独立进程 + REST/SSE），内置 **`GET /` 独立网页调试界面**（浏览器打开即可登录/枚举/拉史/下载），经 HTTP 与主 daemon 交互；核心是**多频道内容汇总 + 手动择优 + 去重 + 系列聚类**，叠加**本地频道索引**与**点播即下载本地播放** |
+| 改动范围 | 新增独立服务二进制 `orig-tg`；daemon 增 TG 源路由 + 频道目录索引 + 任务/系列/元数据持久化；shell 增订阅、汇总视图、本地搜索、本地播放 |
 | 不改 | 现有 HTTP/BT 下载链路、HTTP 传输内核、转码（Phase 2 再做，本期仅原格式归档） |
-| 关键验证 | 登录→枚举订阅→拉历史/增量→手动择优→去重→系列归并→本地搜索→点播本地化播放 |
+| 关键验证 | 登录→枚举订阅→拉历史/增量→手动择优→去重→系列归并→本地搜索→点播本地化播放；`cargo build --release` 产出可分发的 orig-tg.exe，GET / 调试页全流程 |
 | 核心洞察 | "不允许下载"真相是 Bot API 限制；用户账号 + MTProto 可读全量历史且无大小限制。**播放不稳问题用"下载后本地播"根治**。守住**个人订阅归档**边界，不做反滥用规避 |
 
 ---
@@ -92,6 +92,30 @@ orig-tg-service (独立 daemon / sidecar, 新增) ─── 数据面：Telegram
 - 图片：落盘后本地查看，不走 TG 缩略图/流。
 - 结果：观看/查看稳定，与网络质量解耦；后续可演进为"先下头部 + 边下边播"。
 
+### 4.3 交付形态（下载工具二进制 + 网页调试界面）
+- `orig-tg` 是**独立可分发二进制**（`download-engine/crates/orig-tg` → `target/(debug|release)/orig-tg.exe`），不依赖主 daemon 即可独立运行、独立分发，职责=Telegram 频道内容下载工具。
+- **内置独立网页调试界面**：`GET /`（与 `/debug`)返回内联单页（无外部资源），浏览器打开 `http://127.0.0.1:9877` 即可完成 登录→枚举订阅→拉史→下载 全流程调试，无需额外前端部署。
+- REST 契约（独立于 orig-daemon 的 9876，本服务监听 9877）：
+
+  | 方法 | 路径 | 说明 |
+  |---|---|---|
+  | GET | `/` , `/debug` | 内嵌网页调试界面 |
+  | GET | `/health` | `{"status":"ok"}` |
+  | GET | `/api/tg/session` | 登录阶段快照 |
+  | POST | `/api/tg/start` | 发送验证码 `{"phone"}` |
+  | POST | `/api/tg/code` | 提交验证码 / 2FA 密码 `{"code"}` / `{"password"}` |
+  | GET | `/api/tg/dialogs` | 订阅频道枚举（需已授权） |
+  | GET | `/api/tg/messages/:chat_id?limit=` | 媒体历史（需已授权） |
+  | POST | `/api/tg/download/:chat_id/:message_id` | `{"dir"?}` → 下载落盘（需已授权） |
+
+- 命名：沿用 `orig-` 统一族前缀（与 orig-core/daemon/protocol-* 一致），不引入其它前缀体系。
+- 环境变量：`ORIG_TG_PORT` / `ORIG_TG_API_ID` / `ORIG_TG_API_HASH` / `ORIG_TG_SESSION` / `ORIG_TG_DOWNLOAD_DIR`；未配置 api_id/hash 时回退内存 DummyClient（含固定测试验证码 `00000`），便于契约自测。
+
+### 4.4 下载能力
+- `POST /api/tg/download/:chat_id/:message_id` 经 MTProto 解析消息 → 取媒体 → 下载到落地目录（请求 `dir` 优先，否则配置 `download_dir`，否则平台默认 `~/Downloads`）。
+- 文件名：文档优先用其声明文件名；照片用 `photo-{chat}_{msg}.jpg`；无文件名时按 MIME 推断扩展名（jpg/png/mp4/mkv/mp3/pdf 等）。
+- 下载即原作者原格式落盘；转码（ffmpeg 统一）保留到 Phase 2。
+
 ## 5. 系列识别策略（分层，不指望单一规则）
 
 | 层级 | 手段 | 覆盖 | 说明 |
@@ -107,7 +131,7 @@ orig-tg-service (独立 daemon / sidecar, 新增) ─── 数据面：Telegram
 
 | 文件/模块 | 变更类型 | 说明 |
 |---|---|---|
-| `download-engine/crates/orig-tg/` | 新增 | 独立 Telegram 拉取服务（登录/枚举/拉取/元数据采集/下载） |
+| `download-engine/crates/orig-tg/` | 新增 | 独立 Telegram 下载工具二进制（登录/枚举/拉史/下载）+ 内嵌网页调试界面 |
 | `download-engine/crates/orig-daemon/` | 修改 | TG 源路由、频道目录索引（SQLite+FTS5）、系列聚合、合并接口 |
 | `download-engine/Cargo.toml` | 修改 | workspace 添加成员 + grammers 依赖 |
 | `tauri-shell/src/` | 修改 | 频道订阅管理、多频道汇总视图、本地搜索、本地播放（点播即下载） |
@@ -127,8 +151,9 @@ orig-tg-service (独立 daemon / sidecar, 新增) ─── 数据面：Telegram
 
 ## 8. 验证计划
 
-- [ ] `cargo build --release`（引擎 + orig-tg 独立服务）通过
+- [ ] `cargo build --release`（引擎 + orig-tg 独立服务）通过；产出可分发的 `orig-tg.exe`
 - [ ] 本地 mock：登录 → 枚举频道 → 拉历史 → 手动择优 → 去重 → 系列归并（单测）
+- [ ] **网页调试界面**：`GET /` 返回单页，浏览器全流程调试（登录/枚举/拉史/下载）可用
 - [ ] 频道目录索引：元数据采集入库 + FTS5 本地搜索命中（单测）
 - [ ] 播放本地化：无文件点播 → 自动下载 → 本地续播（单测 + 截图）
 - [ ] 真实账号最小链路验证 + 截图（接受用）
@@ -149,3 +174,4 @@ orig-tg-service (独立 daemon / sidecar, 新增) ─── 数据面：Telegram
 | v0.1.1 | 2026-09-15 | 补充需求：orig-tg 采用**独立服务**形态（控制面/数据面分离）；新增**频道目录本地索引/搜索**；新增**点播即下载本地播放**解决 TG 播放不稳 |
 | v0.1.2 | 2026-09-15 | 文档状态置为 accepted，进入分支开发（基线 256e5a1） |
 | v0.1.3 | 2026-09-15 | 记录 orig-tg 分支开发进度：scaffold(9aac588) + grammers 登录(a4ffbac) + 枚举/拉取(86bea39)，最后验证 Commit 更新 |
+| v0.1.4 | 2026-09-15 | 明确交付形态：orig-tg 为**独立可分发二进制**（仿 orig-daemon），内置 **GET / 独立网页调试界面**；新增 **下载能力**（POST /api/tg/download，MTProto 落盘到 ~/Downloads）+ 完整 REST 契约 + 环境变量规范 |
