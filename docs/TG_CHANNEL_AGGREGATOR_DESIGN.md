@@ -1,10 +1,10 @@
 # Orig Hub — Telegram 频道内容汇总整理（设计草案）
 
-> **版本**: v0.1.1（draft）
+> **版本**: v0.1.2（accepted）
 > **日期**: 2026-09-15
-> **基线 Commit**: TBD（确认后回填）
+> **基线 Commit**: 256e5a1
 > **代码映射**: `download-engine/crates/orig-tg/`（新增独立服务）、`orig-daemon/`、`tauri-shell/src/`
-> **状态**: draft — 待用户评审确认
+> **状态**: accepted — 已评审确认，进入分支开发
 
 ## 快速概览（TL;DR）
 
