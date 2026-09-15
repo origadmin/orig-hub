@@ -23,6 +23,9 @@ pub struct Config {
     pub session_path: PathBuf,
     /// Telegram 媒体落地根目录（下载完成后交给 orig-core 归档）。
     pub download_dir: PathBuf,
+    /// MTProto 出口socks5代理 URL（如 "socks5://127.0.0.1:7897"）；为空走直连。
+    /// 国内网络直连 Telegram 常不可达，设置后取码/登录/下载均经该代理。
+    pub proxy: Option<String>,
 }
 
 impl Default for Config {
@@ -34,6 +37,7 @@ impl Default for Config {
             api_hash: None,
             session_path: PathBuf::from("./tg.session"),
             download_dir: default_download_dir(),
+            proxy: None,
         }
     }
 }
@@ -79,6 +83,11 @@ impl Config {
                 cfg.download_dir = PathBuf::from(v);
             }
         }
+        if let Ok(v) = std::env::var("ORIG_TG_PROXY") {
+            if !v.is_empty() {
+                cfg.proxy = Some(v);
+            }
+        }
         cfg
     }
 }
@@ -99,13 +108,16 @@ mod tests {
         unsafe {
             std::env::set_var("ORIG_TG_API_ID", "123456");
             std::env::set_var("ORIG_TG_PORT", "9999");
+            std::env::set_var("ORIG_TG_PROXY", "socks5://127.0.0.1:7897");
         }
         let cfg = Config::load();
         assert_eq!(cfg.api_id, Some(123456));
         assert_eq!(cfg.port, 9999);
+        assert_eq!(cfg.proxy.as_deref(), Some("socks5://127.0.0.1:7897"));
         unsafe {
             std::env::remove_var("ORIG_TG_API_ID");
             std::env::remove_var("ORIG_TG_PORT");
+            std::env::remove_var("ORIG_TG_PROXY");
         }
     }
 }

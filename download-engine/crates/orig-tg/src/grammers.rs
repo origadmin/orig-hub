@@ -50,11 +50,18 @@ impl GrammersClient {
 
         let session = Session::load_file_or_create(&cfg.session_path)
             .map_err(|e| ClientError::Network(e.to_string()))?;
+        let params = match &cfg.proxy {
+            Some(url) => grammers_client::InitParams {
+                proxy_url: Some(url.clone()),
+                ..Default::default()
+            },
+            None => Default::default(),
+        };
         let inner = TgClient::connect(GConfig {
             session,
             api_id,
             api_hash,
-            params: Default::default(),
+            params,
         })
         .await
         .map_err(|e| ClientError::Network(e.to_string()))?;
