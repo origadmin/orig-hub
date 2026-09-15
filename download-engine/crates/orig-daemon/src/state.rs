@@ -7,6 +7,7 @@ use std::sync::{Arc, RwLock};
 use orig_core::engine::Task;
 use orig_core::protocol::SseEvent;
 use orig_core::registry::Registry;
+use tokio::process::Child;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::config::Config;
@@ -32,6 +33,8 @@ pub struct AppState {
     pub events: broadcast::Sender<SseEvent>,
     /// daemon 配置（RwLock：设置页可运行时更新自动分类规则）。
     pub config: RwLock<Config>,
+    /// orig-tg 子进程句柄（TG 可选插件）。None = 未启动 / 已退出。
+    pub tg_child: Mutex<Option<Child>>,
 }
 
 impl AppState {
@@ -41,6 +44,71 @@ impl AppState {
             tasks: Mutex::new(HashMap::new()),
             events,
             config: RwLock::new(config),
+            tg_child: Mutex::new(None),
         }
     }
+
+    /// orig-tg 是否存活（句柄存在且未退出）；已退出自动清理句柄。
+    pub async fn tg_is_running(&self) -> bool {
+        let mut g = self.tg_child.lock().await;
+        match g.as_mut() {
+            Some(c) => {
+                if c.try_wait().ok().flatten().is_some() {
+                    *g = None;
+                    false
+                } else {
+                    true
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// 拉起 orig-tg 子进程（幂等）：注入主配置代理（custom 模式才传 `ORIG_TG_PROXY`）；
+    /// 未 custom 则直连（不设该 env）。返回是否处于运行态。
+    pub async fn tg_start(&self) -> std::io::Result<bool> {
+        if self.tg_is_running().await {
+            return Ok(true);
+        }
+        let cfg = self.config.read().unwrap().clone();
+        let proxy_url = match cfg.proxy.mode {
+            orig_core::protocol::ProxyMode::Custom => cfg.proxy.url.clone(),
+            _ => None,
+        };
+        let mut cmd = tokio::process::Command::new(tg_binary_path());
+        // 端口固定 9877，与 daemon 9876 分离；api_id/api_hash 等 ORIG_TG_* env 随父进程继承。
+        cmd.env("PORT", "9877");
+        cmd.kill_on_drop(true);
+        if let Some(url) = proxy_url {
+            cmd.env("ORIG_TG_PROXY", url);
+        }
+        let child = cmd.spawn()?;
+        *self.tg_child.lock().await = Some(child);
+        Ok(true)
+    }
+
+    /// 终止 orig-tg 子进程并清空句柄（幂等）。
+    pub async fn tg_stop(&self) {
+        let mut g = self.tg_child.lock().await;
+        if let Some(c) = g.as_mut() {
+            let _ = c.kill().await;
+        }
+        *g = None;
+    }
+}
+
+/// 定位 orig-tg 可执行文件：`ORIG_TG_PATH` 优先，其次当前 exe 同目录，最后回退裸名。
+pub fn tg_binary_path() -> PathBuf {
+    if let Ok(p) = std::env::var("ORIG_TG_PATH") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let name = if cfg!(windows) { "orig-tg.exe" } else { "orig-tg" };
+            return dir.join(name);
+        }
+    }
+    PathBuf::from("orig-tg")
 }

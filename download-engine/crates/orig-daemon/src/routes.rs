@@ -441,6 +441,7 @@ async fn events(
 
 /// GET /api/config — 当前 daemon 配置（供设置页初始化）。
 async fn get_config(State(st): State<Arc<AppState>>) -> axum::Json<serde_json::Value> {
+    let tg_running = st.tg_is_running().await;
     let cfg = st.config.read().unwrap();
     let map = cfg.classify.merged_map();
     let mut sorted: Vec<(String, String)> = map.into_iter().collect();
@@ -462,6 +463,8 @@ async fn get_config(State(st): State<Arc<AppState>>) -> axum::Json<serde_json::V
             },
             "url": cfg.proxy.url,
         },
+        "tg_enabled": cfg.tg_enabled,
+        "tg_running": tg_running,
     }))
 }
 
@@ -553,6 +556,47 @@ async fn put_config_proxy(
     })))
 }
 
+/// PUT /api/config/tg — 启停 TG 可选插件（运行时生效 + 持久化到 download-engine.toml）。
+/// body: {"enabled": bool}
+/// enabled=true 拉起 orig-tg 子进程（注入主配置代理）；false 终止子进程。
+#[derive(Deserialize)]
+pub struct TgUpdateReq {
+    pub enabled: bool,
+}
+
+async fn put_config_tg(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<TgUpdateReq>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let running = if req.enabled {
+        {
+            let mut cfg = st.config.write().unwrap();
+            cfg.tg_enabled = true;
+            cfg.save_tg("download-engine.toml").map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("persist tg config: {e}"))
+            })?;
+        }
+        st.tg_start().await.map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("start orig-tg: {e}"))
+        })?
+    } else {
+        {
+            let mut cfg = st.config.write().unwrap();
+            cfg.tg_enabled = false;
+            cfg.save_tg("download-engine.toml").map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("persist tg config: {e}"))
+            })?;
+        }
+        st.tg_stop().await;
+        false
+    };
+    Ok(axum::Json(serde_json::json!({
+        "ok": true,
+        "tg_enabled": req.enabled,
+        "tg_running": running,
+    })))
+}
+
 /// 枚举本机网卡（供 UI 多网卡配置页展示）。
 ///
 /// 返回**全部适配器**（含断开/无 IP 的物理网卡，附 `connected` 标记）；
@@ -622,6 +666,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/api/config", get(get_config))
         .route("/api/config/classify", axum::routing::put(put_config_classify))
         .route("/api/config/proxy", axum::routing::put(put_config_proxy))
+        .route("/api/config/tg", axum::routing::put(put_config_tg))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

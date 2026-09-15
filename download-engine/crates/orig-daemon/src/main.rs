@@ -34,6 +34,14 @@ async fn main() {
     let (events_tx, _rx) = tokio::sync::broadcast::channel(1024);
     let state = Arc::new(AppState::new(registry, events_tx, config.clone()));
 
+    // TG 可选插件：启动时按配置拉起 orig-tg 子进程（注入主配置代理）。
+    if config.tg_enabled {
+        match state.tg_start().await {
+            Ok(_) => eprintln!("orig-tg plugin started"),
+            Err(e) => eprintln!("failed to start orig-tg plugin: {e}"),
+        }
+    }
+
     let app: Router = routes::router(state).layer(
         // CORS：允许 Tauri WebView（dev vite 5180 / 生产 tauri://localhost）跨域访问
         tower_http::cors::CorsLayer::new()
