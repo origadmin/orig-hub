@@ -31,6 +31,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/api/tg/session", get(session))
         .route("/api/tg/start", axum::routing::post(start))
         .route("/api/tg/code", axum::routing::post(code))
+        .route("/api/tg/logs", get(logs))
+        .route("/api/tg/diag", get(diag))
         .route("/api/tg/dialogs", get(dialogs))
         .route("/api/tg/messages/:chat_id", get(messages))
         .route("/api/tg/download/:chat_id/:message_id", axum::routing::post(download))
@@ -51,6 +53,35 @@ async fn session(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     Json(view)
 }
 
+/// GET /api/tg/logs?lines=N — 最近 N 条诊断日志（新→旧）。
+#[derive(Deserialize)]
+struct LogsQuery {
+    #[serde(default = "default_logs_lines")]
+    lines: usize,
+}
+
+fn default_logs_lines() -> usize {
+    50
+}
+
+async fn logs(State(st): State<Arc<AppState>>, Query(q): Query<LogsQuery>) -> impl IntoResponse {
+    Json(st.logs.recent(q.lines))
+}
+
+/// GET /api/tg/diag — 运行诊断快照（端口/客户端真实度/代理/会话阶段/是否有 API 凭证）。
+async fn diag(State(st): State<Arc<AppState>>) -> impl IntoResponse {
+    let view = st.client.view().await;
+    Json(json!({
+        "health": "ok",
+        "port": st.config.port,
+        "api_mode": st.api_mode,
+        "api_configured": st.config.api_id.is_some() && st.config.api_hash.is_some(),
+        "proxy": st.config.proxy,
+        "session_phase": view.phase,
+        "log_lines": st.logs.len(),
+    }))
+}
+
 #[derive(Deserialize)]
 struct StartReq {
     phone: String,
@@ -60,7 +91,15 @@ async fn start(
     State(st): State<Arc<AppState>>,
     Json(req): Json<StartReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let phase = st.client.start(&req.phone).await?;
+    st.push_log(format!("/start phone={}", req.phone));
+    let phase = match st.client.start(&req.phone).await {
+        Ok(ph) => ph,
+        Err(e) => {
+            st.push_log(format!("/start FAILED phone={}: {e}", req.phone));
+            return Err(e.into());
+        }
+    };
+    st.push_log(format!("/start ok phone={} -> {phase:?}", req.phone));
     Ok(Json(json!({"phase": phase, "phone": req.phone})))
 }
 
@@ -81,7 +120,16 @@ async fn code(
     let view = st.client.view().await;
     let phase = match view.phase {
         LoginPhase::PasswordRequired => match req.password.as_deref() {
-            Some(p) => st.client.submit_password(&req.phone, p).await?,
+            Some(p) => {
+                st.push_log("/code submit 2fa password");
+                match st.client.submit_password(&req.phone, p).await {
+                    Ok(ph) => ph,
+                    Err(e) => {
+                        st.push_log(format!("/code 2fa FAILED: {e}"));
+                        return Err(e.into());
+                    }
+                }
+            }
             None => {
                 return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
@@ -90,13 +138,23 @@ async fn code(
             }
         },
         LoginPhase::CodeRequired => match req.code.as_deref() {
-            Some(c) => st.client.submit_code(&req.phone, c).await?,
+            Some(c) => {
+                st.push_log("/code submit code");
+                match st.client.submit_code(&req.phone, c).await {
+                    Ok(ph) => ph,
+                    Err(e) => {
+                        st.push_log(format!("/code FAILED code: {e}"));
+                        return Err(e.into());
+                    }
+                }
+            }
             None => {
                 return Err(ApiError::new(StatusCode::BAD_REQUEST, "code required"))
             }
         },
         LoginPhase::Anonymous | LoginPhase::Authorized => LoginPhase::Authorized,
     };
+    st.push_log(format!("/code ok -> {phase:?}"));
     if phase == LoginPhase::PasswordRequired {
         return Ok(Json(json!({"phase": phase, "next": "submit password"})));
     }

@@ -14,16 +14,17 @@ use orig_tg::state::AppState;
 mod dummy;
 
 /// 选择底层 MTProto 客户端：配置了 api_id/api_hash 用真实 grammers，否则退回内存占位。
-async fn build_client(config: &Config) -> Arc<dyn Client> {
+/// 返回 `(客户端, api_mode)`；api_mode=`real`|`dummy` 供 `/api/tg/diag` 展示。
+async fn build_client(config: &Config) -> (Arc<dyn Client>, &'static str) {
     if config.api_id.is_some() && config.api_hash.is_some() {
         match GrammersClient::connect(config).await {
-            Ok(c) => return Arc::new(c),
+            Ok(c) => return (Arc::new(c), "real"),
             Err(e) => eprintln!("[warn] grammers connect failed ({e}); falling back to dummy client"),
         }
     } else {
         eprintln!("[warn] ORIG_TG_API_ID/ORIG_TG_API_HASH not set; using in-memory dummy client");
     }
-    Arc::new(dummy::DummyClient::default())
+    (Arc::new(dummy::DummyClient::default()), "dummy")
 }
 
 #[tokio::main]
@@ -31,9 +32,13 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let config = Config::load();
-    let client = build_client(&config).await;
+    let (client, api_mode) = build_client(&config).await;
 
-    let state = Arc::new(AppState::new(client, config.clone()));
+    let state = Arc::new(AppState::new(client, config.clone(), api_mode));
+    state.push_log(format!(
+        "orig-tg start api_mode={api_mode} proxy={:?}",
+        config.proxy
+    ));
 
     let app = routes::router(state).layer(
         tower_http::cors::CorsLayer::new()
