@@ -38,6 +38,8 @@ export function AccountsPanel() {
   const [step, setStep] = useState<LoginStep>('idle')
   const [countryCode, setCountryCode] = useState('+86')
   const [phone, setPhone] = useState(tg.phone ?? '')
+  /** start 时使用的 E.164 完整号码；code/password 阶段必须原样回传后端 */
+  const [e164Phone, setE164Phone] = useState('')
   const [code, setCode] = useState('')
   const [busy, setBusy] = useState(false)
   const [phase, setPhase] = useState<TgSession['phase']>()
@@ -64,13 +66,14 @@ export function AccountsPanel() {
     }
   }
 
-  /** 第一步：请求发送验证码（手机号经区号规范化为 E.164） */
+  /** 第一步：请求发送验证码（手机号经区号规范化为 E.164）。缓存 e164 供后续阶段原样回传。 */
   const handleRequestCode = async () => {
     const e164 = normalizeE164(countryCode, phone)
     if (!e164) return
     setBusy(true)
     try {
       await startTgLogin(e164)
+      setE164Phone(e164)
       const s = await getTgSession()
       setPhase(s?.phase)
       setStep('code')
@@ -81,21 +84,22 @@ export function AccountsPanel() {
     }
   }
 
-  /** 第二步：提交验证码 / 两步验证密码 */
+  /** 第二步：提交验证码 / 两步验证密码。必须带上 start 时的完整 e164 phone。 */
   const handleSubmitCode = async () => {
-    if (!code.trim()) return
+    if (!code.trim() || !e164Phone) return
     setBusy(true)
     try {
-      const s = await submitTgCode(code.trim())
+      const s = await submitTgCode(e164Phone, code.trim())
       if (s?.phase === 'PasswordRequired') {
         // 需要两步验证密码：复用验证码输入框，提示清空后输入密码
         setCode('')
         setPhase('PasswordRequired')
         return
       }
-      setTgAccount({ bound: true, phone: phone.trim() })
+      setTgAccount({ bound: true, phone: e164Phone })
       setStep('idle')
       setCode('')
+      setE164Phone('')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -106,6 +110,7 @@ export function AccountsPanel() {
   const cancel = () => {
     setStep('idle')
     setCode('')
+    setE164Phone('')
     setPhase(undefined)
   }
 

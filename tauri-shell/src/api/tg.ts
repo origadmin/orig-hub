@@ -31,7 +31,7 @@ export function getTgSession(): Promise<TgSession> {
   return request('/api/tg/session')
 }
 
-/** POST /api/tg/start — 发送验证码到指定手机号 */
+/** POST /api/tg/start — 发送验证码到指定手机号（E.164，如 +8613912345678） */
 export function startTgLogin(phone: string): Promise<void> {
   return request('/api/tg/start', {
     method: 'POST',
@@ -39,11 +39,20 @@ export function startTgLogin(phone: string): Promise<void> {
   })
 }
 
-/** POST /api/tg/code — 提交验证码或 2FA 密码（orig-tg 复用同一端点） */
-export function submitTgCode(codeOrPassword: string): Promise<TgSession> {
+/** POST /api/tg/code — 提交验证码或 2FA 密码（orig-tg 复用同一端点）
+ *  phone 必须与 start 时使用的 E.164 完全一致；step 字段区分 code 阶段。 */
+export function submitTgCode(phone: string, codeOrPassword: string): Promise<TgSession> {
   return request('/api/tg/code', {
     method: 'POST',
-    body: JSON.stringify({ code: codeOrPassword }),
+    body: JSON.stringify({ phone, code: codeOrPassword }),
+  })
+}
+
+/** POST /api/tg/password — 两步验证密码阶段（需传入之前 start 用的 phone） */
+export function submitTgPassword(phone: string, password: string): Promise<TgSession> {
+  return request('/api/tg/code', {
+    method: 'POST',
+    body: JSON.stringify({ phone, password }),
   })
 }
 
