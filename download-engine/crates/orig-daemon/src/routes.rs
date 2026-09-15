@@ -556,6 +556,70 @@ async fn put_config_proxy(
     })))
 }
 
+/// POST /api/proxy/verify — 验证代理连通性（HTTP(S)/SOCKS5 均可）。
+/// 通过给定代理对 `api.telegram.org` 发起 TLS 连接，返回是否可达与耗时。
+/// body: {"mode": "direct"|"system"|"custom", "url": "http://..."|"socks5://..."}
+#[derive(Deserialize)]
+pub struct ProxyVerifyReq {
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+async fn post_proxy_verify(
+    Json(req): Json<ProxyVerifyReq>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let mode = match req.mode.as_str() {
+        "system" => orig_core::protocol::ProxyMode::System,
+        "custom" => orig_core::protocol::ProxyMode::Custom,
+        _ => orig_core::protocol::ProxyMode::Direct,
+    };
+    let proxy = orig_core::protocol::ProxyConfig {
+        mode,
+        url: req.url.filter(|u| !u.is_empty()),
+    };
+
+    let target = "https://api.telegram.org";
+    let started = std::time::Instant::now();
+    let result = verify_proxy(&proxy, target).await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(status) => Ok(axum::Json(serde_json::json!({
+            "ok": true,
+            "latency_ms": latency_ms,
+            "status": status.as_u16(),
+            "target": target,
+        }))),
+        Err(e) => Err((StatusCode::BAD_GATEWAY, format!("proxy unreachable: {e}"))),
+    }
+}
+
+/// 通过指定代理对 `target` 发起一次 HTTPS 探测请求，返回响应状态码。
+async fn verify_proxy(
+    proxy: &orig_core::protocol::ProxyConfig,
+    target: &str,
+) -> Result<reqwest::StatusCode, String> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .connect_timeout(std::time::Duration::from_secs(6));
+    builder = match proxy.mode {
+        orig_core::protocol::ProxyMode::Direct => builder.no_proxy(),
+        orig_core::protocol::ProxyMode::System => builder,
+        orig_core::protocol::ProxyMode::Custom => match &proxy.url {
+            Some(u) => match reqwest::Proxy::all(u) {
+                Ok(p) => builder.proxy(p),
+                Err(e) => return Err(format!("invalid proxy url {u:?}: {e}")),
+            },
+            None => builder.no_proxy(),
+        },
+    };
+    let client = builder.build().map_err(|e| e.to_string())?;
+    let resp = client.get(target).send().await.map_err(|e| e.to_string())?;
+    Ok(resp.status())
+}
+
 /// PUT /api/config/tg — 启停 TG 可选插件（运行时生效 + 持久化到 download-engine.toml）。
 /// body: {"enabled": bool}
 /// enabled=true 拉起 orig-tg 子进程（注入主配置代理）；false 终止子进程。
@@ -666,6 +730,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/api/config", get(get_config))
         .route("/api/config/classify", axum::routing::put(put_config_classify))
         .route("/api/config/proxy", axum::routing::put(put_config_proxy))
+        .route("/api/proxy/verify", axum::routing::post(post_proxy_verify))
         .route("/api/config/tg", axum::routing::put(put_config_tg))
         .layer(middleware::from_fn_with_state(
             state.clone(),

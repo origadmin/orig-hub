@@ -1487,6 +1487,7 @@ dependencies = [
  "orig-net",
  "orig-protocol-http",
  "orig-protocol-virtual",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

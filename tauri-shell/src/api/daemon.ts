@@ -119,6 +119,17 @@ export function saveProxyConfig(req: ProxyConfig): Promise<{
   })
 }
 
+/** POST /api/proxy/verify — 验证代理连通性（对 api.telegram.org 探测），返回耗时与状态 */
+export function verifyProxy(req: {
+  mode: string
+  url?: string | null
+}): Promise<{ ok: boolean; latency_ms: number; status: number; target: string }> {
+  return request('/api/proxy/verify', {
+    method: 'POST',
+    body: JSON.stringify(req),
+  })
+}
+
 /** PUT /api/config/classify — 保存自动分类规则（运行时生效 + 持久化） */
 export function saveClassifyConfig(req: {
   enabled: boolean

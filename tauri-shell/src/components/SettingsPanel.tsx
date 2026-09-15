@@ -7,7 +7,7 @@ import { Input } from './ui/input'
 import { DirectoryPicker } from './DirectoryPicker'
 import { InterfacePickerDialog, type InterfaceSelection } from './InterfacePickerDialog'
 import { AccountsPanel } from './AccountsPanel'
-import { getConfig, listInterfaces, saveClassifyConfig, saveProxyConfig } from '../api/daemon'
+import { getConfig, listInterfaces, saveClassifyConfig, saveProxyConfig, verifyProxy } from '../api/daemon'
 import { useStore } from '../store/useStore'
 import { useTranslation } from '../i18n'
 import { cn } from '../lib/utils'
@@ -108,6 +108,7 @@ export function SettingsPanel() {
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyBusy, setProxyBusy] = useState(false)
   const [proxyErr, setProxyErr] = useState<string | null>(null)
+  const [proxyVerifying, setProxyVerifying] = useState(false)
 
   // 主题选择（直接即时生效，无需点保存）
   const themeOptions: { value: 'dark' | 'light' | 'system'; labelKey: string }[] = [
@@ -220,6 +221,28 @@ export function SettingsPanel() {
       setProxyErr(e instanceof Error ? e.message : String(e))
     } finally {
       setProxyBusy(false)
+    }
+  }
+
+  /** 验证代理连通性（对 api.telegram.org 探测），不保存配置 */
+  const verifyCurrentProxy = async () => {
+    setProxyVerifying(true)
+    setProxyErr(null)
+    try {
+      const url = proxyUrl.trim()
+      const res = await verifyProxy({
+        mode: proxyMode,
+        ...(proxyMode === 'custom' && url ? { url } : { url: null }),
+      })
+      setProxyErr(
+        res.ok
+          ? `${t('proxy.verifyOk')}（${res.status}，${res.latency_ms}ms）`
+          : t('proxy.verifyFail'),
+      )
+    } catch (e) {
+      setProxyErr(`${t('proxy.verifyFail')}：${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setProxyVerifying(false)
     }
   }
 
@@ -622,8 +645,16 @@ export function SettingsPanel() {
                   </p>
                 </div>
 
-                {/* 测试代理连通性 */}
-                <div className="flex items-center gap-3">
+                {/* 测试代理连通性 / 保存 */}
+                <div className="flex flex-wrap items-center gap-3">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={proxyVerifying || proxyMode === 'direct'}
+                    onClick={verifyCurrentProxy}
+                  >
+                    {proxyVerifying ? t('settings.saving') : t('proxy.verify')}
+                  </Button>
                   <Button
                     variant="secondary"
                     size="sm"
@@ -632,9 +663,8 @@ export function SettingsPanel() {
                       setProxyBusy(true)
                       setProxyErr(null)
                       try {
-                        // 先保存使运行时生效，再探测
                         await persistProxy()
-                        setProxyErr('已保存，新下载将使用该代理')
+                        setProxyErr(t('proxy.savedApplied'))
                       } catch {
                         /* persistProxy 内部已设置错误 */
                       } finally {
@@ -648,7 +678,7 @@ export function SettingsPanel() {
                     <p
                       className={cn(
                         'text-[11px]',
-                        proxyErr.includes('失败') || proxyErr.includes('requires')
+                        proxyErr.includes(t('proxy.verifyFail')) || proxyErr.includes('requires')
                           ? 'text-danger'
                           : 'text-success',
                       )}

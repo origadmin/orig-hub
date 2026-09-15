@@ -1,4 +1,4 @@
-import type { TgChannel, TgMediaItem, TgSession } from '../types'
+import type { TgChannel, TgDiag, TgMediaItem, TgSession } from '../types'
 
 /** orig-tg 默认端口（与 Rust 侧 orig-tg 监听端口一致，独立于 daemon 的 9876） */
 export const TG_PORT = 9877
@@ -45,6 +45,16 @@ export function submitTgCode(codeOrPassword: string): Promise<TgSession> {
     method: 'POST',
     body: JSON.stringify({ code: codeOrPassword }),
   })
+}
+
+/** GET /api/tg/diag — 运行诊断快照（端口/客户端真实度/代理/会话阶段/api 凭证） */
+export function tgDiag(): Promise<TgDiag> {
+  return request('/api/tg/diag')
+}
+
+/** GET /api/tg/logs?lines=N — 最近 N 条诊断日志（新→旧） */
+export function tgLogs(lines = 50): Promise<string[]> {
+  return request(`/api/tg/logs?lines=${lines}`)
 }
 
 /** GET /api/tg/dialogs — 订阅频道枚举（需已授权） */

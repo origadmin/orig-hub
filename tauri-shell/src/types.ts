@@ -135,6 +135,17 @@ export interface TgMediaItem {
   size?: number
 }
 
+/** orig-tg 运行诊断快照（GET /api/tg/diag） */
+export interface TgDiag {
+  health: string
+  port: number
+  api_mode: 'real' | 'dummy'
+  api_configured: boolean
+  proxy: string | null
+  session_phase: string
+  log_lines: number
+}
+
 /** 账号绑定状态（持久化到 localStorage） */
 export interface TgAccount {
   phone: string | null
