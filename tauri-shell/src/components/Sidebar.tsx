@@ -15,8 +15,8 @@ interface Props {
   collapsed: boolean
   onToggle: () => void
   counts: { active: number; completed: number; total: number }
-  /** Telegram 已绑定 → 显示「TG」Tab */
-  tgEnabled: boolean
+  /** Telegram 已绑定/已登录 → 显示「TG」Tab（由登录绑定态驱动，非插件开关） */
+  tgBound: boolean
 }
 
 const NAV_ITEMS: { id: ViewId; labelKey: string; icon: JSX.Element }[] = [
@@ -80,7 +80,7 @@ export function Sidebar({
   collapsed,
   onToggle,
   counts,
-  tgEnabled,
+  tgBound,
 }: Props) {
   const { t } = useTranslation()
   const [catOpen, setCatOpen] = useState(false)
@@ -224,7 +224,7 @@ export function Sidebar({
           )}
         </div>
 
-        {NAV_ITEMS.filter((item) => item.id !== 'tg' || tgEnabled).map((item) => {
+        {NAV_ITEMS.filter((item) => item.id !== 'tg' || tgBound).map((item) => {
           const active = view === item.id
           const count =
             item.id === 'downloading'

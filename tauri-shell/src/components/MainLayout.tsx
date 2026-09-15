@@ -17,7 +17,7 @@ export function MainLayout() {
   const [collapsed, setCollapsed] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
   const { t } = useTranslation()
-  const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, tgEnabled } = useStore()
+  const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, accounts } = useStore()
 
   useEffect(() => {
     init()
@@ -31,10 +31,10 @@ export function MainLayout() {
     return () => clearInterval(timer)
   }, [init, refresh, setDaemon])
 
-  // TG 插件关闭时，若当前停留在 TG 视图则退回下载视图
+  // TG 未绑定时，若当前停留在 TG 视图则退回下载视图（由登录绑定态驱动，非插件开关）
   useEffect(() => {
-    if (!tgEnabled && view === 'tg') setView('downloading')
-  }, [tgEnabled, view])
+    if (!accounts.tg.bound && view === 'tg') setView('downloading')
+  }, [accounts.tg.bound, view])
 
   // 全局错误 toast：按钮/操作失败时的用户可见反馈（自动消失）
   useEffect(() => {
@@ -95,7 +95,7 @@ export function MainLayout() {
           collapsed={collapsed}
           onToggle={() => setCollapsed((c) => !c)}
           counts={{ active: active.length, completed: completed.length, total: downloads.length }}
-          tgEnabled={tgEnabled}
+          tgBound={accounts.tg.bound}
         />
 
         <div className="flex min-w-0 flex-1 flex-col">

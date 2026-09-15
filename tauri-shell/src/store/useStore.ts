@@ -354,10 +354,17 @@ export const useStore = create<DownloadState>((set, get) => ({
     }),
 
   refreshTgSession: async () => {
-    const session = await getTgSession()
+    // 以后端 /session 的 phase 为唯一权威（不轮询，仅在启动/登录完成/进入 TG 界面时调用）。
+    // 未登录或服务不可达一律视为未绑定，杜绝本地 bound 残留导致的“已绑定却未登录”。
+    let session
+    try {
+      session = await getTgSession()
+    } catch {
+      // 服务不可达（orig-tg 未运行）时无法确认登录，视为未绑定
+      if (get().accounts.tg.bound) get().setTgAccount({ bound: false, phone: null })
+      return
+    }
     const tg = get().accounts.tg
-    // 双向校准：Authorized → 置为已绑定；其余明确 phase（未登录/验证码中）→ 清除失效的“已绑定”态。
-    // 否则 localStorage 残留 bound=true 而会话已失效时，前端仍显示“已登录”，与真实 dialogs 401 不符。
     if (!session?.phase) return
     const bound = session.phase === 'Authorized'
     if (tg.bound !== bound || (bound && tg.phone !== (session.phone ?? tg.phone))) {
