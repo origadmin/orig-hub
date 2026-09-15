@@ -14,6 +14,7 @@ import {
   listDownloads,
   listInterfaces,
   removeDownload as apiRemoveDownload,
+  saveTgConfig,
   subscribeEvents,
 } from '../api/daemon'
 import { getTgSession } from '../api/tg'
@@ -105,6 +106,13 @@ interface DownloadState {
   categoryFilter: string | null
   setCategoryFilter: (c: string | null) => void
 
+  /** TG 可选插件开关（daemon [tg] enabled）；false 时侧边栏隐藏 TG 模块 */
+  tgEnabled: boolean
+  /** orig-tg 子服务是否实际在运行（daemon 探活） */
+  tgRunning: boolean
+  /** 启停 TG 插件：写 daemon（运行时生效+持久化），同步 tgEnabled/tgRunning */
+  setTgEnabled: (enabled: boolean) => Promise<boolean>
+
   /** 账号绑定中心状态（当前仅 Telegram，后续可扩展其他账号） */
   accounts: AccountsState
   loadAccounts: () => void
@@ -140,6 +148,8 @@ export const useStore = create<DownloadState>((set, get) => ({
   toast: null,
   categories: [],
   categoryFilter: null,
+  tgEnabled: false,
+  tgRunning: false,
   accounts: loadAccounts(),
 
   init: async () => {
@@ -194,11 +204,15 @@ export const useStore = create<DownloadState>((set, get) => ({
     )
     // 2. 拉取当前列表
     await get().refresh()
-    // 3. 拉取分类清单（供侧边栏「全部文件」下钻；按设置 classify_rules 推导）
+    // 3. 拉取分类清单 + TG 插件开关状态（供侧边栏「全部文件」下钻与 TG 模块显隐）
     try {
       const cfg = await getConfig()
       const cats = Array.from(new Set(Object.values(cfg.classify_rules))).sort()
-      set({ categories: cats })
+      set({
+        categories: cats,
+        tgEnabled: cfg.tg_enabled,
+        tgRunning: cfg.tg_running,
+      })
     } catch {
       // 配置不可达时静默：菜单暂不列出分类
     }
@@ -313,6 +327,18 @@ export const useStore = create<DownloadState>((set, get) => ({
   setError: (e) => set({ error: e, toast: e }),
   clearToast: () => set({ toast: null }),
   setCategoryFilter: (c) => set({ categoryFilter: c }),
+
+  /** 启停 TG 插件：写 daemon（拉起/终止 orig-tg 子服务），成功同步开关与运行态 */
+  setTgEnabled: async (enabled) => {
+    try {
+      const res = await saveTgConfig({ enabled })
+      set({ tgEnabled: res.tg_enabled, tgRunning: res.tg_running })
+      return true
+    } catch (e) {
+      set({ toast: e instanceof Error ? e.message : String(e) })
+      return false
+    }
+  },
 
   loadAccounts: () => set({ accounts: loadAccounts() }),
 

@@ -141,6 +141,12 @@
   "accounts.cancel": "取消",
   "accounts.note": "账号数据仅保存在本机。Telegram 使用独立的 orig-tg 服务，须由 Tauri 拉起后可用。",
 
+  "tg.toggle": "TG 插件",
+  "tg.toggleHint": "启用后随 daemon 启动 orig-tg 服务并注入主配置代理；关闭即终止并隐藏 TG 模块",
+  "tg.running": "运行中",
+  "tg.starting": "启动中",
+  "tg.stopped": "已停止",
+
   "tg.heading": "TG 频道",
   "tg.sub": "订阅频道与媒体内容",
   "tg.loadingChannels": "加载频道中…",

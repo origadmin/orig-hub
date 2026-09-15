@@ -17,8 +17,7 @@ export function MainLayout() {
   const [collapsed, setCollapsed] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
   const { t } = useTranslation()
-  const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, accounts } = useStore()
-  const tgEnabled = accounts.tg.bound
+  const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, tgEnabled } = useStore()
 
   useEffect(() => {
     init()
@@ -31,6 +30,11 @@ export function MainLayout() {
     const timer = setInterval(() => refresh().catch(() => {}), 5000)
     return () => clearInterval(timer)
   }, [init, refresh, setDaemon])
+
+  // TG 插件关闭时，若当前停留在 TG 视图则退回下载视图
+  useEffect(() => {
+    if (!tgEnabled && view === 'tg') setView('downloading')
+  }, [tgEnabled, view])
 
   // 全局错误 toast：按钮/操作失败时的用户可见反馈（自动消失）
   useEffect(() => {

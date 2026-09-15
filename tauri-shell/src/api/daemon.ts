@@ -91,6 +91,10 @@ export interface DaemonConfig {
     mode: 'direct' | 'system' | 'custom'
     url: string | null
   }
+  /** TG 可选插件开关（daemon [tg] enabled）；false 时前端隐藏 TG 模块 */
+  tg_enabled: boolean
+  /** orig-tg 子服务是否实际在运行（daemon 探活） */
+  tg_running: boolean
 }
 
 /** 代理配置（HTTP 下载） */
@@ -121,6 +125,16 @@ export function saveClassifyConfig(req: {
   rules: Record<string, string>
 }): Promise<{ ok: boolean; classify_enabled: boolean; classify_rules: Record<string, string> }> {
   return request('/api/config/classify', {
+    method: 'PUT',
+    body: JSON.stringify(req),
+  })
+}
+
+/** PUT /api/config/tg — 启停 TG 可选插件（运行时生效 + 持久化；同时拉起/终止 orig-tg 子服务） */
+export function saveTgConfig(req: {
+  enabled: boolean
+}): Promise<{ ok: boolean; tg_enabled: boolean; tg_running: boolean }> {
+  return request('/api/config/tg', {
     method: 'PUT',
     body: JSON.stringify(req),
   })

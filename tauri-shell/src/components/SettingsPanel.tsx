@@ -79,7 +79,8 @@ interface CategoryRow {
  */
 export function SettingsPanel() {
   const { t, language, setLanguage, supported } = useTranslation()
-  const { settings, updateSettings, daemon, setError } = useStore()
+  const { settings, updateSettings, daemon, setError, tgEnabled, tgRunning, setTgEnabled } =
+    useStore()
   const [activeTab, setActiveTab] = useState<SettingsTab>('downloads')
   const [maxConnections, setMaxConnections] = useState(settings.maxConnections)
   const [dir, setDir] = useState(settings.downloadDirectory)
@@ -767,7 +768,44 @@ export function SettingsPanel() {
             </div>
           )}
 
-          {activeTab === 'accounts' && <AccountsPanel />}
+          {activeTab === 'accounts' && (
+            <div className="mx-auto max-w-2xl space-y-6">
+              <div>
+                <h3 className="text-lg font-semibold text-fg-strong">{t('accounts.heading')}</h3>
+                <p className="mt-0.5 text-xs text-muted">{t('accounts.sub')}</p>
+              </div>
+
+              {/* TG 可选插件：daemon 拉起/终止 orig-tg 子服务；关闭时隐藏 TG 模块 */}
+              <div className="flex items-center justify-between gap-4 rounded-xl border border-border-subtle bg-surface p-5">
+                <div className="min-w-0">
+                  <p className="text-[13px] font-medium text-fg-strong">{t('tg.toggle')}</p>
+                  <p className="mt-0.5 text-[11px] text-muted">{t('tg.toggleHint')}</p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <span
+                    className={cn(
+                      'text-[11px]',
+                      tgRunning ? 'text-success' : 'text-muted',
+                    )}
+                  >
+                    {tgEnabled
+                      ? tgRunning
+                        ? t('tg.running')
+                        : t('tg.starting')
+                      : t('tg.stopped')}
+                  </span>
+                  <Switch
+                    checked={tgEnabled}
+                    onChange={(v) => {
+                      setTgEnabled(v)
+                    }}
+                  />
+                </div>
+              </div>
+
+              <AccountsPanel />
+            </div>
+          )}
 
           {activeTab === 'about' && (
             <div className="mx-auto max-w-2xl space-y-6">

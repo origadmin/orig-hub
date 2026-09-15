@@ -140,6 +140,13 @@
   "accounts.confirm": "Confirm",
   "accounts.cancel": "Cancel",
   "accounts.note": "Account data is stored locally only. Telegram uses a standalone orig-tg service that must be launched by Tauri.",
+
+  "tg.toggle": "TG Plugin",
+  "tg.toggleHint": "When enabled, daemon launches orig-tg with the main proxy injected; disabling stops it and hides the TG module",
+  "tg.running": "Running",
+  "tg.starting": "Starting",
+  "tg.stopped": "Stopped",
+
   "tg.heading": "TG Channels",
   "tg.sub": "Subscribed channels & media",
   "tg.loadingChannels": "Loading channels…",
