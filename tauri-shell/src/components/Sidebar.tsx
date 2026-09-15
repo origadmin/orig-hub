@@ -2,7 +2,7 @@ import { useState, type JSX } from 'react'
 import { cn } from '../lib/utils'
 import { useTranslation } from '../i18n'
 
-export type ViewId = 'all' | 'downloading' | 'completed' | 'settings'
+export type ViewId = 'all' | 'downloading' | 'completed' | 'tg' | 'settings'
 
 interface Props {
   view: ViewId
@@ -15,6 +15,8 @@ interface Props {
   collapsed: boolean
   onToggle: () => void
   counts: { active: number; completed: number; total: number }
+  /** Telegram 已绑定 → 显示「TG」Tab */
+  tgEnabled: boolean
 }
 
 const NAV_ITEMS: { id: ViewId; labelKey: string; icon: JSX.Element }[] = [
@@ -33,6 +35,15 @@ const NAV_ITEMS: { id: ViewId; labelKey: string; icon: JSX.Element }[] = [
     icon: (
       <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+      </svg>
+    ),
+  },
+  {
+    id: 'tg',
+    labelKey: 'nav.tg',
+    icon: (
+      <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 11.25L5.343 19.5c.52-3.64 9.344-7.798 14.865-10.2 1.14.86 2.94 2.22 3.855 3.468-.27 2.22-4.44 12.72-6.225 16.662l-6.163-1.08M7.5 11.25l9.33-6.53c.9-.63 2.13-.18 2.362.586l.9 2.944M7.5 11.25l4.89 4.11" />
       </svg>
     ),
   },
@@ -69,6 +80,7 @@ export function Sidebar({
   collapsed,
   onToggle,
   counts,
+  tgEnabled,
 }: Props) {
   const { t } = useTranslation()
   const [catOpen, setCatOpen] = useState(false)
@@ -212,7 +224,7 @@ export function Sidebar({
           )}
         </div>
 
-        {NAV_ITEMS.map((item) => {
+        {NAV_ITEMS.filter((item) => item.id !== 'tg' || tgEnabled).map((item) => {
           const active = view === item.id
           const count =
             item.id === 'downloading'

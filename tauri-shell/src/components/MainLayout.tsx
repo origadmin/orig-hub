@@ -3,6 +3,7 @@ import { Sidebar, type ViewId } from './Sidebar'
 import { DownloadList } from './DownloadList'
 import { AddDownloadDialog } from './AddDownloadDialog'
 import { SettingsPanel } from './SettingsPanel'
+import { TgPanel } from './TgPanel'
 import { TitleBar } from './TitleBar'
 import { Button } from './ui/button'
 import { useStore } from '../store/useStore'
@@ -16,7 +17,8 @@ export function MainLayout() {
   const [collapsed, setCollapsed] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
   const { t } = useTranslation()
-  const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter } = useStore()
+  const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, accounts } = useStore()
+  const tgEnabled = accounts.tg.bound
 
   useEffect(() => {
     init()
@@ -71,6 +73,8 @@ export function MainLayout() {
     : baseVisible
 
   const busy = active.length > 0
+  /** 下载相关视图才显示下载工具栏按钮（TG/设置视图隐藏） */
+  const isDownloadView = view === 'all' || view === 'downloading' || view === 'completed'
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background">
@@ -87,17 +91,19 @@ export function MainLayout() {
           collapsed={collapsed}
           onToggle={() => setCollapsed((c) => !c)}
           counts={{ active: active.length, completed: completed.length, total: downloads.length }}
+          tgEnabled={tgEnabled}
         />
 
         <div className="flex min-w-0 flex-1 flex-col">
           {/* 顶部工具栏：只放操作按钮；标题交给侧边栏，避免重复 */}
           <header className="flex h-12 shrink-0 items-center justify-end gap-3 border-b border-border-subtle bg-surface/60 px-4">
-            {busy && (
+            {isDownloadView && busy && (
               <span className="mr-auto hidden font-mono text-xs text-accent sm:inline">
                 {formatSpeed(totalSpeed)}
               </span>
             )}
 
+            {isDownloadView && (
             <div className="flex shrink-0 items-center gap-2">
               <Button size="sm" onClick={() => setAddOpen(true)}>
                 <svg className="mr-1 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -141,17 +147,21 @@ export function MainLayout() {
                 </Button>
               )}
             </div>
+            )}
           </header>
 
           {/* Content：设置页自带内滚动（标题置顶占满），其余视图用外层滚动 */}
           <main
             className={cn(
               'flex-1 overflow-hidden',
-              view !== 'settings' && 'overflow-y-auto p-4',
+              view === 'tg' && 'flex',
+              view !== 'settings' && view !== 'tg' && 'overflow-y-auto p-4',
             )}
           >
             {view === 'settings' ? (
               <SettingsPanel />
+            ) : view === 'tg' ? (
+              <TgPanel />
             ) : (
               <DownloadList items={visible} />
             )}

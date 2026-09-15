@@ -112,6 +112,40 @@ export type ThemeValue = 'dark' | 'light' | 'system'
 
 export type LanguageValue = 'zh-CN' | 'en-US'
 
+/** orig-tg 会话快照（GET /api/tg/session） */
+export interface TgSession {
+  /** Anonymous | CodeRequired | PasswordRequired | Authorized */
+  phase: string
+  phone?: string
+  user_id?: number
+}
+
+/** 频道/订阅会话摘要（GET /api/tg/dialogs） */
+export interface TgChannel {
+  id: number
+  title: string
+  username?: string
+}
+
+/** 频道媒体消息摘要（GET /api/tg/messages/:chat_id） */
+export interface TgMediaItem {
+  id: number
+  caption?: string
+  mimeType?: string
+  size?: number
+}
+
+/** 账号绑定状态（持久化到 localStorage） */
+export interface TgAccount {
+  phone: string | null
+  bound: boolean
+}
+
+/** 全局账号绑定中心（当前仅 Telegram，后续可扩展其他账号） */
+export interface AccountsState {
+  tg: TgAccount
+}
+
 export interface AppSettings {
   maxConnections: number
   downloadDirectory: string

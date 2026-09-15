@@ -1,5 +1,12 @@
 import { create } from 'zustand'
-import type { AppSettings, DaemonStatus, DownloadStatus, LanguageValue } from '../types'
+import type {
+  AccountsState,
+  AppSettings,
+  DaemonStatus,
+  DownloadStatus,
+  LanguageValue,
+  TgAccount,
+} from '../types'
 import {
   addDownload as apiAddDownload,
   downloadAction as apiDownloadAction,
@@ -9,14 +16,28 @@ import {
   removeDownload as apiRemoveDownload,
   subscribeEvents,
 } from '../api/daemon'
+import { getTgSession } from '../api/tg'
 import type { AddDownloadRequest } from '../types'
 
 const SETTINGS_KEY = 'orig-hub:settings'
+const ACCOUNTS_KEY = 'orig-hub:accounts'
 
 /** 按浏览器环境推断默认语言（i18n 缺省值） */
 function defaultLanguage(): LanguageValue {
   if (typeof navigator === 'undefined') return 'zh-CN'
   return navigator.language?.toLowerCase().startsWith('zh') ? 'zh-CN' : 'en-US'
+}
+
+/** 读取持久化设置（localStorage）；不存在时返回默认值 */
+function loadAccounts(): AccountsState {
+  const defaults: AccountsState = { tg: { phone: null, bound: false } }
+  try {
+    const raw = localStorage.getItem(ACCOUNTS_KEY)
+    if (!raw) return defaults
+    return { ...defaults, ...(JSON.parse(raw) as Partial<AccountsState>) }
+  } catch {
+    return defaults
+  }
 }
 
 /** 读取持久化设置（localStorage）；不存在时返回默认值 */
@@ -84,6 +105,14 @@ interface DownloadState {
   categoryFilter: string | null
   setCategoryFilter: (c: string | null) => void
 
+  /** 账号绑定中心状态（当前仅 Telegram，后续可扩展其他账号） */
+  accounts: AccountsState
+  loadAccounts: () => void
+  /** 更新某个账户的绑定态（持久化到 localStorage） */
+  setTgAccount: (patch: Partial<TgAccount>) => void
+  /** 校准 TG 绑定态：向 orig-tg 查询会话 phase==='Authorized'（失败静默） */
+  refreshTgSession: () => Promise<void>
+
   init: () => Promise<void>
   refresh: () => Promise<void>
   setDaemon: (d: DaemonStatus) => void
@@ -111,6 +140,7 @@ export const useStore = create<DownloadState>((set, get) => ({
   toast: null,
   categories: [],
   categoryFilter: null,
+  accounts: loadAccounts(),
 
   init: async () => {
     // 0. system 主题实时跟随系统配色
@@ -172,6 +202,9 @@ export const useStore = create<DownloadState>((set, get) => ({
     } catch {
       // 配置不可达时静默：菜单暂不列出分类
     }
+    // 4. 校准账号绑定态（orig-tg 会话）
+    get().loadAccounts()
+    await get().refreshTgSession().catch(() => {})
   },
 
   refresh: async () => {
@@ -280,4 +313,24 @@ export const useStore = create<DownloadState>((set, get) => ({
   setError: (e) => set({ error: e, toast: e }),
   clearToast: () => set({ toast: null }),
   setCategoryFilter: (c) => set({ categoryFilter: c }),
+
+  loadAccounts: () => set({ accounts: loadAccounts() }),
+
+  setTgAccount: (patch) =>
+    set((s) => {
+      const accounts = { ...s.accounts, tg: { ...s.accounts.tg, ...patch } }
+      try {
+        localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(accounts))
+      } catch {
+        // 忽略持久化失败（隐私模式等）
+      }
+      return { accounts }
+    }),
+
+  refreshTgSession: async () => {
+    const session = await getTgSession()
+    if (session?.phase === 'Authorized') {
+      get().setTgAccount({ bound: true, phone: session.phone ?? get().accounts.tg.phone })
+    }
+  },
 }))

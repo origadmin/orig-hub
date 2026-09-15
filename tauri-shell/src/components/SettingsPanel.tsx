@@ -6,18 +6,20 @@ import { Switch } from './ui/switch'
 import { Input } from './ui/input'
 import { DirectoryPicker } from './DirectoryPicker'
 import { InterfacePickerDialog, type InterfaceSelection } from './InterfacePickerDialog'
+import { AccountsPanel } from './AccountsPanel'
 import { getConfig, listInterfaces, saveClassifyConfig, saveProxyConfig } from '../api/daemon'
 import { useStore } from '../store/useStore'
 import { useTranslation } from '../i18n'
 import { cn } from '../lib/utils'
 
-type SettingsTab = 'general' | 'downloads' | 'network' | 'proxy' | 'about'
+type SettingsTab = 'general' | 'downloads' | 'network' | 'proxy' | 'accounts' | 'about'
 
 const TABS: { id: SettingsTab; labelKey: string; descKey: string }[] = [
   { id: 'general', labelKey: 'tab.general', descKey: 'tab.general.desc' },
   { id: 'downloads', labelKey: 'tab.downloads', descKey: 'tab.downloads.desc' },
   { id: 'network', labelKey: 'tab.network', descKey: 'tab.network.desc' },
   { id: 'proxy', labelKey: 'tab.proxy', descKey: 'tab.proxy.desc' },
+  { id: 'accounts', labelKey: 'tab.accounts', descKey: 'tab.accounts.desc' },
   { id: 'about', labelKey: 'tab.about', descKey: 'tab.about.desc' },
 ]
 
@@ -764,6 +766,8 @@ export function SettingsPanel() {
               </div>
             </div>
           )}
+
+          {activeTab === 'accounts' && <AccountsPanel />}
 
           {activeTab === 'about' && (
             <div className="mx-auto max-w-2xl space-y-6">
