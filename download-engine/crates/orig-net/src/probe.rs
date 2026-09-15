@@ -143,8 +143,12 @@ fn fallback_primary(list: &mut [NetInterface]) {
 /// ```
 #[cfg(windows)]
 fn default_route_iface_ip() -> Option<Ipv4Addr> {
+    use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW：daemon 为 GUI 子系统（无控制台），spawn 控制台程序 route.exe
+    // 若不隐藏会每次新建一个 Terminal 窗口弹个不停。
     let out = std::process::Command::new("route")
         .arg("print")
+        .creation_flags(0x0800_0000)
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);

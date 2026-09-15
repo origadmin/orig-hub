@@ -150,9 +150,11 @@ fn ensure_daemon(app: tauri::AppHandle, state: tauri::State<'_, DaemonState>) ->
 fn port_owner_is_daemon() -> bool {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         use std::process::Command;
         let pid = Command::new("netstat")
             .args(["-ano", "-p", "tcp"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW：避免 GUI 主进程 spawn 控制台命令弹 Terminal 窗
             .output()
             .ok()
             .and_then(|o| {
@@ -168,6 +170,7 @@ fn port_owner_is_daemon() -> bool {
         };
         let out = Command::new("wmic")
             .args(["process", "where", &format!("ProcessId={pid}"), "get", "ExecutablePath"])
+            .creation_flags(0x0800_0000)
             .output()
             .ok();
         if let Some(o) = out {
@@ -209,9 +212,11 @@ fn port_owner_is_daemon() -> bool {
 fn kill_port_owner(port: u16) {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         use std::process::Command;
         let out = Command::new("netstat")
             .args(["-ano", "-p", "tcp"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .output();
         if let Ok(out) = out {
             // 中文 Windows 的 netstat 输出含 GBK 字节，用 lossy 转换避免整段丢弃
@@ -230,6 +235,7 @@ fn kill_port_owner(port: u16) {
                 for pid in pids {
                     let _ = Command::new("taskkill")
                         .args(["/PID", &pid.to_string(), "/F"])
+                        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
                         .output();
                 }
         }

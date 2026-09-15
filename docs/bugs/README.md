@@ -40,3 +40,5 @@
 | BUG-008 | 自动分类「新增分类行」布局错乱（Input w-full 冲突） | fixed | shell |
 | BUG-009 | 自动分类编辑器内置分类名未翻译 | fixed | shell |
 | BUG-010 | 前端 BUILTIN_CLASSIFY 与 daemon 规范分类键不一致 | fixed | shell |
+| BUG-011 | 运行中反复弹出 Terminal 小窗（spawn 控制台命令未隐藏窗口） | fixed | engine+shell |
+| BUG-012 | 无法拉取应用（TG 频道列表失败）且显示已登录但会话失效 | fixed | engine |
