@@ -6,6 +6,7 @@ members = [
     "crates/orig-protocol-virtual",
     "crates/orig-protocol-http",
     "crates/orig-daemon",
+    "crates/orig-tg",
 ]
 
 [workspace.package]
