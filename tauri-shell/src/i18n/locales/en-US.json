@@ -174,5 +174,21 @@
   "tg.selectChannel": "Select a channel on the left to view media",
   "tg.loadingMessages": "Loading media…",
   "tg.noMessages": "No media in this channel",
-  "tg.download": "Download"
+  "tg.download": "Download",
+  "tg.filterAll": "All",
+  "tg.ungrouped": "Ungrouped",
+  "tg.searchPlaceholder": "Search by title or username",
+  "tg.monitor": "Monitor",
+  "tg.monitoring": "Monitoring",
+  "tg.unmonitor": "Unmonitor",
+  "tg.notMonitored": "This channel is not monitored yet; add it to auto-archive new content",
+  "tg.addMonitor": "Add monitor",
+  "tg.sync": "Sync now",
+  "tg.syncing": "Syncing…",
+  "tg.storedHeading": "Stored media",
+  "tg.downloaded": "Downloaded",
+  "tg.play": "Play",
+  "tg.loadingMonitor": "Loading monitor…",
+  "tg.noStored": "No stored media yet; click “Sync now” to pull new content",
+  "tg.monitoredCount": "{n} monitoring"
 }

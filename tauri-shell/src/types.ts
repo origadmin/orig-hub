@@ -125,6 +125,15 @@ export interface TgChannel {
   id: number
   title: string
   username?: string
+  /** 频道归属的 TG 分组标题；未归组则为 undefined */
+  folder?: string
+}
+
+/** TG 自定义分组摘要（GET /api/tg/folders） */
+export interface TgFolder {
+  id: number
+  title: string
+  channelIds: number[]
 }
 
 /** 频道媒体消息摘要（GET /api/tg/messages/:chat_id） */
@@ -133,6 +142,25 @@ export interface TgMediaItem {
   caption?: string
   mimeType?: string
   size?: number
+}
+
+/** 被监控频道（GET/POST/DELETE /api/tg/monitor/channels） */
+export interface TgMonitoredChannel {
+  channelId: number
+  title: string
+  username?: string
+  addedAt: number
+}
+
+/** 已入库媒体消息（GET /api/tg/monitor/messages） */
+export interface TgStoredMessage {
+  channelId: number
+  messageId: number
+  caption?: string
+  mimeType?: string
+  size?: number
+  downloaded: boolean
+  createdAt: number
 }
 
 /** orig-tg 运行诊断快照（GET /api/tg/diag） */

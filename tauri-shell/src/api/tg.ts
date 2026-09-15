@@ -1,4 +1,12 @@
-import type { TgChannel, TgDiag, TgMediaItem, TgSession } from '../types'
+import type {
+  TgChannel,
+  TgDiag,
+  TgFolder,
+  TgMediaItem,
+  TgMonitoredChannel,
+  TgSession,
+  TgStoredMessage,
+} from '../types'
 
 /** orig-tg 默认端口（与 Rust 侧 orig-tg 监听端口一致，独立于 daemon 的 9876） */
 export const TG_PORT = 9877
@@ -69,6 +77,51 @@ export function tgLogs(lines = 50): Promise<string[]> {
 /** GET /api/tg/dialogs — 订阅频道枚举（需已授权） */
 export function listTgDialogs(): Promise<TgChannel[]> {
   return request('/api/tg/dialogs')
+}
+
+/** GET /api/tg/folders — 用户自定义分组（需已授权） */
+export function listTgFolders(): Promise<TgFolder[]> {
+  return request('/api/tg/folders')
+}
+
+/** GET /api/tg/monitor/channels — 被监控频道列表 */
+export function listTgMonitoredChannels(): Promise<TgMonitoredChannel[]> {
+  return request('/api/tg/monitor/channels')
+}
+
+/** POST /api/tg/monitor/channels — 添加频道到监控（幂等） */
+export function addTgMonitoredChannel(ch: {
+  channelId: number
+  title: string
+  username?: string
+}): Promise<{ ok: boolean }> {
+  return request('/api/tg/monitor/channels', {
+    method: 'POST',
+    body: JSON.stringify(ch),
+  })
+}
+
+/** DELETE /api/tg/monitor/channels/:id — 移除监控频道（保留已入库消息） */
+export function removeTgMonitoredChannel(channelId: number | string): Promise<{ ok: boolean }> {
+  return request(
+    `/api/tg/monitor/channels/${encodeURIComponent(String(channelId))}`,
+    { method: 'DELETE' },
+  )
+}
+
+/** GET /api/tg/monitor/messages?channelId=..&limit=.. — 某频道已入库媒体（新→旧） */
+export function listTgMonitorMessages(
+  channelId: number | string,
+  limit = 100,
+): Promise<TgStoredMessage[]> {
+  return request(
+    `/api/tg/monitor/messages?channelId=${encodeURIComponent(String(channelId))}&limit=${limit}`,
+  )
+}
+
+/** POST /api/tg/monitor/sync — 手动触发一轮增量同步 */
+export function syncTgMonitor(): Promise<{ added: number }> {
+  return request('/api/tg/monitor/sync', { method: 'POST' })
 }
 
 /** GET /api/tg/messages/:chat_id?limit= — 媒体历史（需已授权） */

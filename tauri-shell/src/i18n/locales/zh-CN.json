@@ -174,5 +174,21 @@
   "tg.selectChannel": "从左侧选择频道查看媒体",
   "tg.loadingMessages": "加载媒体中…",
   "tg.noMessages": "该频道暂无媒体",
-  "tg.download": "下载"
+  "tg.download": "下载",
+  "tg.filterAll": "全部",
+  "tg.ungrouped": "未分组",
+  "tg.searchPlaceholder": "搜索频道标题或用户名",
+  "tg.monitor": "监控",
+  "tg.monitoring": "监控中",
+  "tg.unmonitor": "取消监控",
+  "tg.notMonitored": "此频道尚未监控，添加后新内容将自动入库",
+  "tg.addMonitor": "添加监控",
+  "tg.sync": "立即同步",
+  "tg.syncing": "同步中…",
+  "tg.storedHeading": "已入库媒体",
+  "tg.downloaded": "已下载",
+  "tg.play": "播放",
+  "tg.loadingMonitor": "加载监控中…",
+  "tg.noStored": "暂无已入库媒体，点击「立即同步」拉取新内容",
+  "tg.monitoredCount": "{n} 个监控中"
 }
