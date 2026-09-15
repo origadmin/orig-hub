@@ -3,6 +3,7 @@
 //! 独立于 orig-daemon（9876），监听独立端口（默认 9877），经 HTTP 供主 daemon 调度。
 
 pub mod config;
+pub mod grammers;
 pub mod login;
 pub mod routes;
 pub mod state;

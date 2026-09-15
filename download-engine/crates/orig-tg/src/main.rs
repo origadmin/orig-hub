@@ -5,18 +5,33 @@
 use std::sync::Arc;
 
 use orig_tg::config::Config;
+use orig_tg::grammers::GrammersClient;
+use orig_tg::login::Client;
 use orig_tg::routes;
 use orig_tg::state::AppState;
 
-// 骨架阶段：内存客户端（Dummy）。接入 grammers 后由 grammers 客户端替换。
+// 骨架阶段：内存客户端（Dummy）。未配置 Telegram api_id/hash 时用于契约自洽。
 mod dummy;
+
+/// 选择底层 MTProto 客户端：配置了 api_id/api_hash 用真实 grammers，否则退回内存占位。
+async fn build_client(config: &Config) -> Arc<dyn Client> {
+    if config.api_id.is_some() && config.api_hash.is_some() {
+        match GrammersClient::connect(config).await {
+            Ok(c) => return Arc::new(c),
+            Err(e) => eprintln!("[warn] grammers connect failed ({e}); falling back to dummy client"),
+        }
+    } else {
+        eprintln!("[warn] ORIG_TG_API_ID/ORIG_TG_API_HASH not set; using in-memory dummy client");
+    }
+    Arc::new(dummy::DummyClient::default())
+}
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
     let config = Config::load();
-    let client = Arc::new(dummy::DummyClient::default());
+    let client = build_client(&config).await;
 
     let state = Arc::new(AppState::new(client, config.clone()));
 
