@@ -88,6 +88,8 @@ pub struct Config {
     pub classify: ClassifyConfig,
     /// HTTP 下载代理配置（默认直连）。
     pub proxy: orig_core::protocol::ProxyConfig,
+    /// TG 可选插件：true 时 daemon 拉起 orig-tg 子服务（注入主配置代理），false 时终止并隐藏模块。
+    pub tg_enabled: bool,
 }
 
 impl Default for Config {
@@ -99,6 +101,7 @@ impl Default for Config {
             port: 9876,
             classify: ClassifyConfig::default(),
             proxy: orig_core::protocol::ProxyConfig::default(),
+            tg_enabled: false,
         }
     }
 }
@@ -245,6 +248,13 @@ impl Config {
                     }
                 }
             }
+
+            // [tg] 段（TG 可选插件开关）
+            if let Some(sec) = parser.section("tg") {
+                if let Some(v) = sec.get("enabled") {
+                    cfg.tg_enabled = v == "true" || v == "1";
+                }
+            }
         }
         cfg
     }
@@ -347,6 +357,45 @@ impl Config {
             Some(u) => out.push_str(&format!("url = \"{u}\"\n")),
             None => out.push_str("url = \"\"\n"),
         }
+        std::fs::write(path, &out)?;
+        Ok(out)
+    }
+
+    /// 将 TG 插件开关持久化到 `download-engine.toml` 的 `[tg]` 段（保留其它段）。
+    /// 返回写出的完整文本。
+    pub fn save_tg(&self, path: &str) -> std::io::Result<String> {
+        let existing = std::fs::read_to_string(path).unwrap_or_default();
+        let mut out = String::new();
+        let mut in_tg = false;
+        let mut tg_started = false;
+        for raw in existing.lines() {
+            let line = raw.trim_end();
+            let trimmed = line.trim();
+            if in_tg {
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    if trimmed == "[tg]" {
+                        continue;
+                    }
+                    in_tg = false;
+                } else {
+                    continue;
+                }
+            }
+            if trimmed == "[tg]" {
+                in_tg = true;
+                tg_started = true;
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        if !tg_started {
+            if !out.trim().is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+        }
+        out.push_str("[tg]\n");
+        out.push_str(&format!("enabled = {}\n", if self.tg_enabled { "true" } else { "false" }));
         std::fs::write(path, &out)?;
         Ok(out)
     }
