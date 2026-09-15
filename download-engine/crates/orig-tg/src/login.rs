@@ -59,6 +59,20 @@ pub struct MediaItem {
     pub size: Option<i64>,
 }
 
+/// 一次媒体下载的落盘结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadOutcome {
+    /// 消息 id。
+    #[serde(rename = "messageId")]
+    pub message_id: i64,
+    /// 最终落盘路径（绝对路径）。
+    #[serde(rename = "path")]
+    pub path: String,
+    /// 实际写盘字节数。
+    #[serde(rename = "bytes")]
+    pub bytes: u64,
+}
+
 /// 客户端抽象：路由层只依赖此 trait，具体实现可替换。
 #[async_trait::async_trait]
 pub trait Client: Send + Sync {
@@ -74,6 +88,8 @@ pub trait Client: Send + Sync {
     async fn dialogs(&self) -> Result<Vec<Channel>, ClientError>;
     /// 拉取指定会话最近的媒体历史（从新到旧），最多 `limit` 条。
     async fn messages(&self, chat_id: i64, limit: u32) -> Result<Vec<MediaItem>, ClientError>;
+    /// 将指定会话中某条媒体消息下载到 `dir`，返回落盘结果。
+    async fn download(&self, chat_id: i64, message_id: i64, dir: &str) -> Result<DownloadOutcome, ClientError>;
 }
 
 /// 登录流程错误。
@@ -85,6 +101,8 @@ pub enum ClientError {
     InvalidCode,
     #[error("wrong 2FA password")]
     InvalidPassword,
+    #[error("media not found")]
+    MediaNotFound,
     #[error("phone required")]
     MissingPhone,
     #[error("network: {0}")]
@@ -128,6 +146,9 @@ mod tests {
         }
         async fn messages(&self, _chat_id: i64, _limit: u32) -> Result<Vec<MediaItem>, ClientError> {
             Ok(Vec::new())
+        }
+        async fn download(&self, _chat_id: i64, _message_id: i64, _dir: &str) -> Result<DownloadOutcome, ClientError> {
+            Err(ClientError::MediaNotFound)
         }
     }
 

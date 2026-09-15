@@ -20,7 +20,9 @@ use grammers_session::Session;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
-use crate::login::{Channel, Client, ClientError, LoginPhase, MediaItem, SessionView};
+use crate::login::{
+    Channel, Client, ClientError, DownloadOutcome, LoginPhase, MediaItem, SessionView,
+};
 
 /// 登录中间态（在多次 HTTP 请求之间保留 Telegram 返回的 token）。
 struct Pending {
@@ -231,5 +233,88 @@ impl Client for GrammersClient {
             });
         }
         Ok(out)
+    }
+
+    async fn download(&self, chat_id: i64, message_id: i64, dir: &str) -> Result<DownloadOutcome, ClientError> {
+        // 通过订阅枚举解析目标会话（拿到 access_hash 等上下文）。
+        let mut dialogs = self.inner.iter_dialogs();
+        let mut peer = None;
+        while let Some(dialog) = dialogs
+            .next()
+            .await
+            .map_err(|e| ClientError::Other(e.to_string()))?
+        {
+            let chat = dialog.chat();
+            if chat.id() == chat_id {
+                peer = Some(chat.pack());
+                break;
+            }
+        }
+        let peer = peer.ok_or(ClientError::MediaNotFound)?;
+
+        let found = self
+            .inner
+            .get_messages_by_id(peer, &[message_id as i32])
+            .await
+            .map_err(|e| ClientError::Other(e.to_string()))?
+            .into_iter()
+            .find_map(|m| m);
+        let message = found.ok_or(ClientError::MediaNotFound)?;
+
+        let media = message.media().ok_or(ClientError::MediaNotFound)?;
+        let filename = match &media {
+            Media::Photo(_) => format!("photo-{}_{}.jpg", chat_id, message_id),
+            Media::Document(doc) => {
+                let name = doc.name().trim().to_string();
+                if !name.is_empty() {
+                    name
+                } else {
+                    let mime = doc.mime_type().unwrap_or("bin");
+                    let ext = extension_for_mime(mime).unwrap_or("bin");
+                    format!("doc-{}_{}.{}", chat_id, message_id, ext)
+                }
+            }
+            _ => return Err(ClientError::MediaNotFound),
+        };
+
+        let dir = PathBuf::from(dir);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| ClientError::Other(format!("create dir: {e}")))?;
+        let path = dir.join(&filename);
+
+        let ok = message
+            .download_media(&path)
+            .await
+            .map_err(|e| ClientError::Other(format!("download: {e}")))?;
+        if !ok {
+            return Err(ClientError::MediaNotFound);
+        }
+        let bytes = std::fs::metadata(&path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        Ok(DownloadOutcome {
+            message_id,
+            path: path.to_string_lossy().into_owned(),
+            bytes,
+        })
+    }
+}
+
+/// 由 MIME 推断文件扩展名（仅覆盖媒体常见类型，回退 None）。
+fn extension_for_mime(mime: &str) -> Option<&'static str> {
+    let base = mime.split(';').next().unwrap_or(mime).trim();
+    match base {
+        "image/jpeg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "image/bmp" => Some("bmp"),
+        "video/mp4" => Some("mp4"),
+        "video/x-matroska" | "video/webm" => Some("mkv"),
+        "audio/mpeg" => Some("mp3"),
+        "audio/ogg" => Some("ogg"),
+        "application/pdf" => Some("pdf"),
+        "text/plain" => Some("txt"),
+        _ => None,
     }
 }
