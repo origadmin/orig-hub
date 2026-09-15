@@ -167,11 +167,14 @@ impl Client for GrammersClient {
 
     async fn dialogs(&self) -> Result<Vec<Channel>, ClientError> {
         // 先读分组，建立 频道id -> 分组标题 映射（一个频道可属多组，取首个命中）。
+        // 分组读取失败（如代理连接抖动被断）不阻塞频道枚举：仅降级为「未分组」。
         let mut folder_of: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
-        for folder in self.folders().await? {
-            let title = folder.title.clone();
-            for id in folder.channel_ids {
-                folder_of.entry(id).or_insert_with(|| title.clone());
+        if let Ok(folders) = self.folders().await {
+            for folder in folders {
+                let title = folder.title.clone();
+                for id in folder.channel_ids {
+                    folder_of.entry(id).or_insert_with(|| title.clone());
+                }
             }
         }
 
