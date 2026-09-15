@@ -355,8 +355,17 @@ export const useStore = create<DownloadState>((set, get) => ({
 
   refreshTgSession: async () => {
     const session = await getTgSession()
-    if (session?.phase === 'Authorized') {
-      get().setTgAccount({ bound: true, phone: session.phone ?? get().accounts.tg.phone })
+    const tg = get().accounts.tg
+    // 双向校准：Authorized → 置为已绑定；其余明确 phase（未登录/验证码中）→ 清除失效的“已绑定”态。
+    // 否则 localStorage 残留 bound=true 而会话已失效时，前端仍显示“已登录”，与真实 dialogs 401 不符。
+    if (!session?.phase) return
+    const bound = session.phase === 'Authorized'
+    if (tg.bound !== bound || (bound && tg.phone !== (session.phone ?? tg.phone))) {
+      get().setTgAccount(
+        bound
+          ? { bound: true, phone: session.phone ?? tg.phone }
+          : { bound: false, phone: null },
+      )
     }
   },
 }))
