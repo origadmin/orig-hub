@@ -35,3 +35,8 @@
 | BUG-003 | 速度统计失准（完成仍显示/进行中不准） | fixed | engine+shell |
 | BUG-004 | 无全局进度状态，状态栏仅计数无实时速度 | fixed | shell |
 | BUG-005 | 「打开文件/打开目录」按钮无效 + 纯文字样式不一致 | closed | shell |
+| BUG-006 | 侧边栏「全部文件」展开/收起交互行为不纯 | fixed | shell |
+| BUG-007 | 内置分类标签不支持多语言设置 | fixed | shell |
+| BUG-008 | 自动分类「新增分类行」布局错乱（Input w-full 冲突） | fixed | shell |
+| BUG-009 | 自动分类编辑器内置分类名未翻译 | fixed | shell |
+| BUG-010 | 前端 BUILTIN_CLASSIFY 与 daemon 规范分类键不一致 | fixed | shell |
