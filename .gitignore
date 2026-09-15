@@ -25,6 +25,9 @@ tauri-shell/src-tauri/binaries/
 *.db
 proxy-test-file.bin
 coverage/
+verify_shots/
+docs/preview/
+download-engine/acceptance-evidence.txt
 
 # ============ 日志 ============
 *.log
