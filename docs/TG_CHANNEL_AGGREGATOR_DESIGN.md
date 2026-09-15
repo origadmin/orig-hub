@@ -1,8 +1,9 @@
 # Orig Hub — Telegram 频道内容汇总整理（设计草案）
 
-> **版本**: v0.1.2（accepted）
+> **版本**: v0.1.3（accepted）
 > **日期**: 2026-09-15
 > **基线 Commit**: 256e5a1
+> **最后验证 Commit**: 86bea39（orig-tg 枚举/拉取增量实现）
 > **代码映射**: `download-engine/crates/orig-tg/`（新增独立服务）、`orig-daemon/`、`tauri-shell/src/`
 > **状态**: accepted — 已评审确认，进入分支开发
 
@@ -146,3 +147,5 @@ orig-tg-service (独立 daemon / sidecar, 新增) ─── 数据面：Telegram
 |---|---|---|
 | v0.1.0 | 2026-09-15 | 初版。确立"多频道汇总整理"为核心，MTProto userbot（grammers）路径，系列分层识别，转码 Phase 2 |
 | v0.1.1 | 2026-09-15 | 补充需求：orig-tg 采用**独立服务**形态（控制面/数据面分离）；新增**频道目录本地索引/搜索**；新增**点播即下载本地播放**解决 TG 播放不稳 |
+| v0.1.2 | 2026-09-15 | 文档状态置为 accepted，进入分支开发（基线 256e5a1） |
+| v0.1.3 | 2026-09-15 | 记录 orig-tg 分支开发进度：scaffold(9aac588) + grammers 登录(a4ffbac) + 枚举/拉取(86bea39)，最后验证 Commit 更新 |
