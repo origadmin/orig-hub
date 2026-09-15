@@ -76,11 +76,22 @@ impl AppState {
             _ => None,
         };
         let mut cmd = tokio::process::Command::new(tg_binary_path());
-        // 端口固定 9877，与 daemon 9876 分离；api_id/api_hash 等 ORIG_TG_* env 随父进程继承。
+        // 端口固定 9877，与 daemon 9876 分离。api_id/api_hash 从 `[tg]` 段显式注入，
+        // 不依赖父进程环境继承，保证 Tauri/开机重启后 real 模式仍生效。
         cmd.env("PORT", "9877");
         cmd.kill_on_drop(true);
         if let Some(url) = proxy_url {
             cmd.env("ORIG_TG_PROXY", url);
+        }
+        if let Some(id) = &cfg.tg_api_id {
+            if !id.is_empty() {
+                cmd.env("ORIG_TG_API_ID", id);
+            }
+        }
+        if let Some(h) = &cfg.tg_api_hash {
+            if !h.is_empty() {
+                cmd.env("ORIG_TG_API_HASH", h);
+            }
         }
         let child = cmd.spawn()?;
         *self.tg_child.lock().await = Some(child);

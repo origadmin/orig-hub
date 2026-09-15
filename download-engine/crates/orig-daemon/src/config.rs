@@ -90,6 +90,10 @@ pub struct Config {
     pub proxy: orig_core::protocol::ProxyConfig,
     /// TG 可选插件：true 时 daemon 拉起 orig-tg 子服务（注入主配置代理），false 时终止并隐藏模块。
     pub tg_enabled: bool,
+    /// TG MTProto 应用凭证 api_id（`[tg]` 段；orig-tg real 模式，非空才注入）。
+    pub tg_api_id: Option<String>,
+    /// TG MTProto 应用凭证 api_hash（`[tg]` 段）。
+    pub tg_api_hash: Option<String>,
 }
 
 impl Default for Config {
@@ -102,6 +106,8 @@ impl Default for Config {
             classify: ClassifyConfig::default(),
             proxy: orig_core::protocol::ProxyConfig::default(),
             tg_enabled: false,
+            tg_api_id: None,
+            tg_api_hash: None,
         }
     }
 }
@@ -249,10 +255,20 @@ impl Config {
                 }
             }
 
-            // [tg] 段（TG 可选插件开关）
+            // [tg] 段（TG 可选插件开关 + MTProto 应用凭证）
             if let Some(sec) = parser.section("tg") {
                 if let Some(v) = sec.get("enabled") {
                     cfg.tg_enabled = v == "true" || v == "1";
+                }
+                if let Some(v) = sec.get("api_id") {
+                    if !v.is_empty() {
+                        cfg.tg_api_id = Some(v.clone());
+                    }
+                }
+                if let Some(v) = sec.get("api_hash") {
+                    if !v.is_empty() {
+                        cfg.tg_api_hash = Some(v.clone());
+                    }
                 }
             }
         }
@@ -396,6 +412,16 @@ impl Config {
         }
         out.push_str("[tg]\n");
         out.push_str(&format!("enabled = {}\n", if self.tg_enabled { "true" } else { "false" }));
+        if let Some(id) = &self.tg_api_id {
+            if !id.is_empty() {
+                out.push_str(&format!("api_id = \"{id}\"\n"));
+            }
+        }
+        if let Some(h) = &self.tg_api_hash {
+            if !h.is_empty() {
+                out.push_str(&format!("api_hash = \"{h}\"\n"));
+            }
+        }
         std::fs::write(path, &out)?;
         Ok(out)
     }
