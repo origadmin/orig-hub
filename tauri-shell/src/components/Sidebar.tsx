@@ -1,5 +1,6 @@
 import { useState, type JSX } from 'react'
 import { cn } from '../lib/utils'
+import { useTranslation } from '../i18n'
 
 export type ViewId = 'all' | 'downloading' | 'completed' | 'settings'
 
@@ -16,10 +17,10 @@ interface Props {
   counts: { active: number; completed: number; total: number }
 }
 
-const NAV_ITEMS: { id: ViewId; label: string; icon: JSX.Element }[] = [
+const NAV_ITEMS: { id: ViewId; labelKey: string; icon: JSX.Element }[] = [
   {
     id: 'downloading',
-    label: '下载中',
+    labelKey: 'nav.downloading',
     icon: (
       <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
@@ -28,7 +29,7 @@ const NAV_ITEMS: { id: ViewId; label: string; icon: JSX.Element }[] = [
   },
   {
     id: 'completed',
-    label: '已完成',
+    labelKey: 'nav.completed',
     icon: (
       <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -37,7 +38,7 @@ const NAV_ITEMS: { id: ViewId; label: string; icon: JSX.Element }[] = [
   },
   {
     id: 'settings',
-    label: '设置',
+    labelKey: 'nav.settings',
     icon: (
       <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.28z" />
@@ -69,8 +70,20 @@ export function Sidebar({
   onToggle,
   counts,
 }: Props) {
+  const { t } = useTranslation()
   const [catOpen, setCatOpen] = useState(false)
   const allActive = view === 'all' && categoryFilter === null
+
+  /** 点击「全部文件」文字/图标：仅切到全部视图（方案1：不碰子菜单展开态，纯导航动作） */
+  const handleSelectAll = () => {
+    onCategoryChange(null)
+    onViewChange('all')
+  }
+  /** 点击 chevron：仅翻转子菜单展开/收起，不改变当前视图与筛选 */
+  const handleToggle = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    setCatOpen((o) => !o)
+  }
 
   return (
     <aside
@@ -96,8 +109,8 @@ export function Sidebar({
           <button
             onClick={onToggle}
             className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid"
-            title="折叠侧边栏"
-            aria-label="折叠侧边栏"
+            title={t('sidebar.collapse')}
+            aria-label={t('sidebar.collapse')}
           >
             <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" />
@@ -111,8 +124,8 @@ export function Sidebar({
         <button
           onClick={onToggle}
           className="mx-auto mb-1 flex h-6 w-6 items-center justify-center rounded-md text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid"
-          title="展开侧边栏"
-          aria-label="展开侧边栏"
+          title={t('sidebar.expand')}
+          aria-label={t('sidebar.expand')}
         >
           <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
@@ -122,38 +135,55 @@ export function Sidebar({
 
       {/* 导航 */}
       <nav className="flex-1 space-y-1 px-2">
-        {/* 全部文件（可展开分类下钻） */}
+        {/* 全部文件：chevron 与文字/图标为两个独立点击动作 */}
         <div>
-          <button
-            onClick={() => {
-              onCategoryChange(null)
-              onViewChange('all')
-              setCatOpen((o) => !o)
-            }}
-            title="全部文件"
-            className={cn(
-              'flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-sm transition-all duration-200',
-              collapsed && 'justify-center px-0',
-              allActive
-                ? 'bg-accent/15 text-accent'
-                : 'text-fg-soft hover:bg-surface-2 hover:text-fg-mid',
-            )}
-          >
-            <span className="shrink-0">{FolderIcon}</span>
-            {!collapsed && (
-              <>
-                <span className="flex-1 text-left">全部文件</span>
+          {collapsed ? (
+            <button
+              onClick={handleSelectAll}
+              title={t('nav.all')}
+              aria-label={t('nav.all')}
+              className={cn(
+                'flex h-9 w-full items-center justify-center rounded-md text-sm transition-all duration-200',
+                allActive
+                  ? 'bg-accent/15 text-accent'
+                  : 'text-fg-soft hover:bg-surface-2 hover:text-fg-mid',
+              )}
+            >
+              {FolderIcon}
+            </button>
+          ) : (
+            <div className="flex w-full items-center gap-1.5 rounded-md px-2.5 py-2 text-sm">
+              <button
+                onClick={handleSelectAll}
+                title={t('nav.all')}
+                className={cn(
+                  'flex min-w-0 flex-1 items-center gap-2.5 rounded-md px-1 py-1 text-left transition-all duration-200',
+                  allActive
+                    ? 'bg-accent/15 text-accent'
+                    : 'text-fg-soft hover:bg-surface-2 hover:text-fg-mid',
+                )}
+              >
+                <span className="shrink-0">{FolderIcon}</span>
+                <span className="flex-1 truncate text-left">{t('nav.all')}</span>
                 {counts.total > 0 && (
                   <span className="rounded-full bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-fg-soft">
                     {counts.total}
                   </span>
                 )}
-                <span className={cn('shrink-0 text-muted transition-transform duration-200', catOpen && 'rotate-90')}>
+              </button>
+              <button
+                onClick={handleToggle}
+                title={t('sidebar.toggleCategories')}
+                aria-label={t('sidebar.toggleCategories')}
+                data-testid="category-chevron"
+                className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid"
+              >
+                <span className={cn('transition-transform duration-200', catOpen && 'rotate-90')}>
                   {ChevronIcon}
                 </span>
-              </>
-            )}
-          </button>
+              </button>
+            </div>
+          )}
 
           {catOpen && !collapsed && categories.length > 0 && (
             <div className="mt-0.5 space-y-0.5">
@@ -174,7 +204,7 @@ export function Sidebar({
                         : 'text-fg-soft hover:bg-surface-2 hover:text-fg-mid',
                     )}
                   >
-                    <span className="flex-1 truncate text-left">{cat}</span>
+                    <span className="flex-1 truncate text-left">{t(`category.${cat}`, undefined, cat)}</span>
                   </button>
                 )
               })}
@@ -194,7 +224,7 @@ export function Sidebar({
             <button
               key={item.id}
               onClick={() => onViewChange(item.id)}
-              title={item.label}
+              title={t(item.labelKey)}
               className={cn(
                 'flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-sm transition-all duration-200',
                 collapsed && 'justify-center px-0',
@@ -206,7 +236,7 @@ export function Sidebar({
               <span className="shrink-0">{item.icon}</span>
               {!collapsed && (
                 <>
-                  <span className="flex-1 text-left">{item.label}</span>
+                  <span className="flex-1 text-left">{t(item.labelKey)}</span>
                   {count > 0 && (
                     <span className="rounded-full bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-fg-soft">
                       {count}
@@ -223,7 +253,7 @@ export function Sidebar({
       <div className={cn('border-t border-border-subtle p-3', collapsed && 'p-2')}>
         <div className={cn('flex items-center gap-2', collapsed && 'justify-center')}>
           <span className="h-2 w-2 shrink-0 rounded-full bg-success" />
-          {!collapsed && <span className="text-[11px] text-muted">daemon 运行中</span>}
+          {!collapsed && <span className="text-[11px] text-muted">{t('status.daemonRunning')}</span>}
         </div>
       </div>
     </aside>
