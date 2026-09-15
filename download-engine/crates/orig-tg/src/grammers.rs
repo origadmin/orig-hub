@@ -8,20 +8,23 @@
 //!       → 需两步验证                           → PasswordRequired（缓存 PasswordToken）
 //!     → submit_password → check_password(pt, pwd) → Authorized
 //!
-//! 会话（等同密码凭证）通过 `Config.session_path` 落盘持久化（`grammers_session::Session`）。
+//! 会话（等同密码凭证）通过 `Config.session_path` 落盘持久化（grammers 0.10 的
+//! `SqliteSession`，基于 libsql 自动持久化，无需手动 save_to_file）。
 //! 本实现依赖在 `my.telegram.org` 申请的 api_id/api_hash；未配置时由 main 回退到 DummyClient。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use grammers_client::types::{LoginToken, Media, PasswordToken};
-use grammers_client::{Client as TgClient, Config as GConfig, SignInError};
-use grammers_client::grammers_tl_types as tl;
-use grammers_session::Session;
+use grammers_client::client::{LoginToken, PasswordToken};
+use grammers_client::media::Media;
+use grammers_client::sender::ConnectionParams;
+use grammers_client::session::storages::SqliteSession;
+use grammers_client::{Client as TgClient, SenderPool, SignInError, tl};
 use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::login::{
-    Channel, Client, ClientError, DownloadOutcome, LoginPhase, MediaItem, SessionView,
+    Channel, Client, ClientError, DownloadOutcome, Folder, LoginPhase, MediaItem, SessionView,
 };
 
 /// 登录中间态（在多次 HTTP 请求之间保留 Telegram 返回的 token）。
@@ -36,7 +39,8 @@ struct Pending {
 /// 包装 grammers 客户端的真实实现。
 pub struct GrammersClient {
     inner: TgClient,
-    session_path: PathBuf,
+    /// 发起登录码请求时需要 api_hash（grammers 0.10 的 `request_login_code(phone, api_hash)`）。
+    api_hash: String,
     pending: Mutex<Pending>,
 }
 
@@ -48,23 +52,22 @@ impl GrammersClient {
             _ => return Err(ClientError::NotInitialized),
         };
 
-        let session = Session::load_file_or_create(&cfg.session_path)
+        // grammers 0.10：会话改为 SqliteSession（libsql），自动持久化登录态。
+        let session = SqliteSession::open(&cfg.session_path)
+            .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
         let params = match &cfg.proxy {
-            Some(url) => grammers_client::InitParams {
+            Some(url) => ConnectionParams {
                 proxy_url: Some(url.clone()),
                 ..Default::default()
             },
             None => Default::default(),
         };
-        let inner = TgClient::connect(GConfig {
-            session,
-            api_id,
-            api_hash,
-            params,
-        })
-        .await
-        .map_err(|e| ClientError::Network(e.to_string()))?;
+        // 0.10 连接模型：SenderPool + 后台 runner + Client::new(handle)。
+        let pool = SenderPool::with_configuration(Arc::new(session), api_id, params);
+        let inner = TgClient::new(pool.handle);
+        // 驱动 sender pool 的后台任务（到各 DC 的连接按需建立）。
+        let _runner = tokio::spawn(pool.runner.run());
 
         // 已登录则直接进入 Authorized 并记录 user_id；否则为 Anonymous。
         let mut pending = Pending {
@@ -74,28 +77,22 @@ impl GrammersClient {
             login_token: None,
             password_token: None,
         };
-        if inner.is_authorized().await.map_err(|e| ClientError::Other(e.to_string()))? {
+        if inner
+            .is_authorized()
+            .await
+            .map_err(|e| ClientError::Other(e.to_string()))?
+        {
             pending.phase = LoginPhase::Authorized;
-            pending.user_id = inner.session().get_user().map(|u| u.id);
+            if let Ok(user) = inner.get_me().await {
+                pending.user_id = user.id().bot_api_dialog_id();
+            }
         }
-        // 持久化连接建立的 auth key（Anonymous 阶段也需保存 key，后续登录续用）。
-        inner
-            .session()
-            .save_to_file(&cfg.session_path)
-            .map_err(|e| ClientError::Other(e.to_string()))?;
 
         Ok(Self {
             inner,
-            session_path: cfg.session_path.clone(),
+            api_hash,
             pending: Mutex::new(pending),
         })
-    }
-
-    /// 登录成功后把会话（含 auth key + user）写入本地会话文件。
-    fn persist_session(&self) {
-        if let Err(e) = self.inner.session().save_to_file(&self.session_path) {
-            tracing::warn!("failed to persist tg session: {e}");
-        }
     }
 }
 
@@ -108,7 +105,7 @@ impl Client for GrammersClient {
         }
         let token = self
             .inner
-            .request_login_code(phone)
+            .request_login_code(phone, &self.api_hash)
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
         p.phone = Some(phone.to_string());
@@ -126,8 +123,7 @@ impl Client for GrammersClient {
         match self.inner.sign_in(token, code).await {
             Ok(user) => {
                 p.phase = LoginPhase::Authorized;
-                p.user_id = Some(user.id());
-                self.persist_session();
+                p.user_id = user.id().bot_api_dialog_id();
                 Ok(LoginPhase::Authorized)
             }
             Err(SignInError::PasswordRequired(password_token)) => {
@@ -136,7 +132,7 @@ impl Client for GrammersClient {
                 Ok(LoginPhase::PasswordRequired)
             }
             Err(SignInError::InvalidCode) => Err(ClientError::InvalidCode),
-            Err(SignInError::SignUpRequired { .. }) => {
+            Err(SignInError::SignUpRequired) => {
                 Err(ClientError::Other("sign up required in official client first".into()))
             }
             Err(e) => Err(ClientError::Other(e.to_string())),
@@ -152,11 +148,10 @@ impl Client for GrammersClient {
         match self.inner.check_password(password_token, password.as_bytes()).await {
             Ok(user) => {
                 p.phase = LoginPhase::Authorized;
-                p.user_id = Some(user.id());
-                self.persist_session();
+                p.user_id = user.id().bot_api_dialog_id();
                 Ok(LoginPhase::Authorized)
             }
-            Err(SignInError::InvalidPassword) => Err(ClientError::InvalidPassword),
+            Err(SignInError::InvalidPassword(_)) => Err(ClientError::InvalidPassword),
             Err(e) => Err(ClientError::Other(e.to_string())),
         }
     }
@@ -171,6 +166,15 @@ impl Client for GrammersClient {
     }
 
     async fn dialogs(&self) -> Result<Vec<Channel>, ClientError> {
+        // 先读分组，建立 频道id -> 分组标题 映射（一个频道可属多组，取首个命中）。
+        let mut folder_of: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
+        for folder in self.folders().await? {
+            let title = folder.title.clone();
+            for id in folder.channel_ids {
+                folder_of.entry(id).or_insert_with(|| title.clone());
+            }
+        }
+
         let mut iter = self.inner.iter_dialogs();
         let mut out = Vec::new();
         while let Some(dialog) = iter
@@ -178,18 +182,58 @@ impl Client for GrammersClient {
             .await
             .map_err(|e| ClientError::Other(e.to_string()))?
         {
-            let chat = dialog.chat();
+            let peer = dialog.peer();
+            let id = peer.id().bot_api_dialog_id().unwrap_or(0);
             out.push(Channel {
-                id: chat.id(),
-                title: chat.name().to_string(),
-                username: chat.username().map(str::to_string),
+                id,
+                title: peer.name().unwrap_or_default().to_string(),
+                username: peer.username().map(str::to_string),
+                folder: folder_of.get(&id).cloned(),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn folders(&self) -> Result<Vec<Folder>, ClientError> {
+        // 走原始 TL 调用拉取自定义分组（grammers 高层未暴露 DialogFilter）。
+        let result = self
+            .inner
+            .invoke(&tl::functions::messages::GetDialogFilters {})
+            .await
+            .map_err(|e| ClientError::Other(e.to_string()))?;
+        let filters = match result {
+            tl::enums::messages::DialogFilters::Filters(f) => f.filters,
+        };
+
+        let mut out = Vec::new();
+        for f in filters {
+            let tl::enums::DialogFilter::Filter(filter) = f else { continue };
+            let title = match filter.title {
+                tl::enums::TextWithEntities::Entities(t) => t.text,
+            };
+            let mut ids = Vec::new();
+            for peer in filter.include_peers {
+                let id = match peer {
+                    tl::enums::InputPeer::Channel(p) => Some(p.channel_id),
+                    tl::enums::InputPeer::Chat(p) => Some(p.chat_id),
+                    tl::enums::InputPeer::User(p) => Some(p.user_id),
+                    _ => None,
+                };
+                if let Some(id) = id {
+                    ids.push(id);
+                }
+            }
+            out.push(Folder {
+                id: filter.id,
+                title,
+                channel_ids: ids,
             });
         }
         Ok(out)
     }
 
     async fn messages(&self, chat_id: i64, limit: u32) -> Result<Vec<MediaItem>, ClientError> {
-        // 先通过订阅枚举解析目标会话的 PackedChat（含 access_hash），再拉取媒体历史。
+        // 先通过订阅枚举解析目标会话的 PeerRef（含 access_hash），再拉取媒体历史。
         let mut dialogs = self.inner.iter_dialogs();
         let mut peer = None;
         while let Some(dialog) = dialogs
@@ -197,9 +241,8 @@ impl Client for GrammersClient {
             .await
             .map_err(|e| ClientError::Other(e.to_string()))?
         {
-            let chat = dialog.chat();
-            if chat.id() == chat_id {
-                peer = Some(chat.pack());
+            if dialog.peer().id().bot_api_dialog_id() == Some(chat_id) {
+                peer = Some(dialog.peer_ref());
                 break;
             }
         }
@@ -223,12 +266,10 @@ impl Client for GrammersClient {
                 }
             };
             let (mime_type, size) = match m.media() {
-                Some(Media::Document(doc)) => match doc.raw.document.as_ref() {
-                    Some(tl::enums::Document::Document(d)) => {
-                        (Some(d.mime_type.clone()), Some(d.size))
-                    }
-                    _ => (Some("application/octet-stream".into()), None),
-                },
+                Some(Media::Document(doc)) => (
+                    doc.mime_type().map(str::to_string),
+                    doc.size().map(|s| s as i64),
+                ),
                 Some(Media::Photo(_)) => (Some("image/jpeg".into()), None),
                 _ => (None, None),
             };
@@ -251,9 +292,8 @@ impl Client for GrammersClient {
             .await
             .map_err(|e| ClientError::Other(e.to_string()))?
         {
-            let chat = dialog.chat();
-            if chat.id() == chat_id {
-                peer = Some(chat.pack());
+            if dialog.peer().id().bot_api_dialog_id() == Some(chat_id) {
+                peer = Some(dialog.peer_ref());
                 break;
             }
         }
@@ -272,7 +312,7 @@ impl Client for GrammersClient {
         let filename = match &media {
             Media::Photo(_) => format!("photo-{}_{}.jpg", chat_id, message_id),
             Media::Document(doc) => {
-                let name = doc.name().trim().to_string();
+                let name = doc.name().unwrap_or_default().trim().to_string();
                 if !name.is_empty() {
                     name
                 } else {

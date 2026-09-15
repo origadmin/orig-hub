@@ -21,6 +21,10 @@ pub struct Config {
     pub api_hash: Option<String>,
     /// MTProto 会话文件路径（持登录态；等同密码，须安全存储）。
     pub session_path: PathBuf,
+    /// 监控存储 SQLite 数据库文件路径（频道/消息/游标）。
+    pub db_path: PathBuf,
+    /// 后台监控轮询间隔（秒，最小 10s）。定时增量拉取被监控频道的新媒体入库。
+    pub monitor_interval_secs: u64,
     /// Telegram 媒体落地根目录（下载完成后交给 orig-core 归档）。
     pub download_dir: PathBuf,
     /// MTProto 出口socks5代理 URL（如 "socks5://127.0.0.1:7897"）；为空走直连。
@@ -36,6 +40,8 @@ impl Default for Config {
             api_id: None,
             api_hash: None,
             session_path: PathBuf::from("./tg.session"),
+            db_path: PathBuf::from("./tg_store.db"),
+            monitor_interval_secs: 30,
             download_dir: default_download_dir(),
             proxy: None,
         }
@@ -76,6 +82,16 @@ impl Config {
         if let Ok(v) = std::env::var("ORIG_TG_SESSION") {
             if !v.is_empty() {
                 cfg.session_path = PathBuf::from(v);
+            }
+        }
+        if let Ok(v) = std::env::var("ORIG_TG_DB") {
+            if !v.is_empty() {
+                cfg.db_path = PathBuf::from(v);
+            }
+        }
+        if let Ok(v) = std::env::var("ORIG_TG_MONITOR_INTERVAL") {
+            if let Ok(n) = v.parse() {
+                cfg.monitor_interval_secs = n;
             }
         }
         if let Ok(v) = std::env::var("ORIG_TG_DOWNLOAD_DIR") {

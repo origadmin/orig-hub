@@ -21,6 +21,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::login::{Client, ClientError, LoginPhase};
+use crate::monitor;
 use crate::state::AppState;
 
 pub fn router(state: Arc<AppState>) -> axum::Router {
@@ -34,8 +35,19 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/api/tg/logs", get(logs))
         .route("/api/tg/diag", get(diag))
         .route("/api/tg/dialogs", get(dialogs))
+        .route("/api/tg/folders", get(folders))
         .route("/api/tg/messages/:chat_id", get(messages))
         .route("/api/tg/download/:chat_id/:message_id", axum::routing::post(download))
+        .route(
+            "/api/tg/monitor/channels",
+            get(list_monitor_channels).post(add_monitor_channel),
+        )
+        .route(
+            "/api/tg/monitor/channels/:id",
+            axum::routing::delete(remove_monitor_channel),
+        )
+        .route("/api/tg/monitor/messages", get(monitor_messages))
+        .route("/api/tg/monitor/sync", axum::routing::post(monitor_sync))
         .with_state(state)
 }
 
@@ -167,6 +179,12 @@ async fn dialogs(State(st): State<Arc<AppState>>) -> Result<impl IntoResponse, A
     Ok(Json(dialogs))
 }
 
+async fn folders(State(st): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    ensure_authorized(&*st.client).await?;
+    let folders = st.client.folders().await?;
+    Ok(Json(folders))
+}
+
 #[derive(Deserialize)]
 struct MsgQuery {
     #[serde(default = "default_limit")]
@@ -205,6 +223,84 @@ async fn download(
         .unwrap_or_else(|| st.config.download_dir.to_string_lossy().into_owned());
     let outcome = st.client.download(chat_id, message_id, &dir).await?;
     Ok(Json(outcome))
+}
+
+// ---- 频道监控（本地库增删查 + 手动触发同步） ----
+
+/// GET /api/tg/monitor/channels — 列出被监控频道。
+async fn list_monitor_channels(
+    State(st): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let chs = st
+        .store
+        .list_channels()
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(chs))
+}
+
+#[derive(Deserialize)]
+struct AddMonitorReq {
+    #[serde(rename = "channelId")]
+    channel_id: i64,
+    title: String,
+    #[serde(default)]
+    username: Option<String>,
+}
+
+/// POST /api/tg/monitor/channels — 添加频道到监控（幂等）。
+async fn add_monitor_channel(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<AddMonitorReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.store
+        .add_channel(req.channel_id, &req.title, req.username.as_deref())
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    st.push_log(format!("/monitor add channel {} {}", req.channel_id, req.title));
+    Ok(Json(json!({"ok": true})))
+}
+
+/// DELETE /api/tg/monitor/channels/:id — 移除监控频道（保留已入库消息）。
+async fn remove_monitor_channel(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.store
+        .remove_channel(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    st.push_log(format!("/monitor remove channel {id}"));
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct MonitorMsgQuery {
+    #[serde(rename = "channelId")]
+    channel_id: i64,
+    #[serde(default = "default_limit")]
+    limit: u32,
+}
+
+/// GET /api/tg/monitor/messages?channelId=..&limit=.. — 列出某频道已入库媒体（新→旧）。
+async fn monitor_messages(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<MonitorMsgQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let msgs = st
+        .store
+        .list_messages(q.channel_id, q.limit)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(msgs))
+}
+
+/// POST /api/tg/monitor/sync — 手动触发一轮增量同步（调试/即时入库）。
+async fn monitor_sync(State(st): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    match monitor::sync_once(&st).await {
+        Ok(added) => Ok(Json(json!({"added": added}))),
+        Err(e) => Err(ApiError::new(StatusCode::BAD_GATEWAY, &e)),
+    }
 }
 
 /// 骨架阶段的登录态守卫：仅内存占位客户端已授权时放行。

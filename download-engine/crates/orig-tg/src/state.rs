@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::login::Client;
+use crate::store::Store;
 
 /// 内存环形日志缓冲（诊断用，不持久化）。容量上限防内存增长。
 pub struct RingLog {
@@ -53,16 +54,19 @@ pub struct AppState {
     pub config: Config,
     /// 诊断环形日志（`/api/tg/logs` 读取）。
     pub logs: RingLog,
+    /// 监控存储（频道/消息/游标）。
+    pub store: Store,
     /// 客户端真实度：`real`=grammers，`dummy`=内存占位（api_id/hash 未配置）。
     pub api_mode: &'static str,
 }
 
 impl AppState {
-    pub fn new(client: Arc<dyn Client>, config: Config, api_mode: &'static str) -> Self {
+    pub fn new(client: Arc<dyn Client>, config: Config, api_mode: &'static str, store: Store) -> Self {
         Self {
             client,
             config,
             logs: RingLog::new(200),
+            store,
             api_mode,
         }
     }

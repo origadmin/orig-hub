@@ -34,7 +34,18 @@ async fn main() {
     let config = Config::load();
     let (client, api_mode) = build_client(&config).await;
 
-    let state = Arc::new(AppState::new(client, config.clone(), api_mode));
+    // 打开监控存储；失败则不阻塞启动（仅监控/入库不可用）。
+    let store = match orig_tg::store::Store::open(&config.db_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[warn] open store {} failed ({e}); monitor unavailable", config.db_path.display());
+            orig_tg::store::Store::open(":memory:").await.expect("in-memory store")
+        }
+    };
+
+    let state = Arc::new(AppState::new(client, config.clone(), api_mode, store));
+    // 启动后台监控：周期增量拉取被监控频道的新媒体入库。
+    orig_tg::monitor::spawn(state.clone());
     state.push_log(format!(
         "orig-tg start api_mode={api_mode} proxy={:?}",
         config.proxy

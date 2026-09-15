@@ -27,8 +27,16 @@ tower-http = { version = "0.6", features = ["cors"] }
 thiserror.workspace = true
 
 # MTProto 用户客户端（个人订阅归档拉取层）
-grammers-client = { version = "0.7", features = ["proxy"] }
-grammers-session = "0.7"
-grammers-mtproto = "0.7"
-grammers-tl-types = "0.7"
-grammers-crypto = "0.7"
+grammers-client = { version = "0.10", features = ["proxy"] }
+grammers-session = "0.10"
+grammers-mtproto = "0.10"
+grammers-tl-types = "0.10"
+grammers-crypto = "0.10"
+
+# 固定 glass_pumpkin 到 2.0.0-rc0（grammers-crypto 0.10 的声明要求；rc1 改了 safe_prime::check 返回 Result 且换 num-bigint 0.5，不兼容）
+glass_pumpkin = "=2.0.0-rc0"
+
+# 监控频道/消息/游标的本地 SQLite 存储。
+# 采用与 grammers-session 相同的 libsql 本地后端（`core` feature），
+# 避免与 bundled sqlite3 的 LNK2005 多重定义链接冲突。
+libsql = { version = "0.9.30", features = ["core"], default-features = false }

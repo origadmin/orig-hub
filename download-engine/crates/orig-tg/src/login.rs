@@ -45,6 +45,18 @@ pub struct Channel {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// 频道归属的分组标题（按 TG 自定义分组划分；未归组则为 None）。
+    #[serde(rename = "folder", skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+}
+
+/// TG 自定义分组（DialogFilter）的公共 DTO，用于前端分组筛选。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Folder {
+    pub id: i32,
+    pub title: String,
+    #[serde(rename = "channelIds", skip_serializing_if = "Vec::is_empty")]
+    pub channel_ids: Vec<i64>,
 }
 
 /// 频道内一条媒体消息的摘要（历史拉取公共 DTO）。
@@ -86,6 +98,8 @@ pub trait Client: Send + Sync {
     async fn view(&self) -> SessionView;
     /// 枚举用户订阅的会话（频道/群组/私聊），含频道元数据。
     async fn dialogs(&self) -> Result<Vec<Channel>, ClientError>;
+    /// 枚举用户自定义分组（DialogFilter），含每组归属的频道 id。
+    async fn folders(&self) -> Result<Vec<Folder>, ClientError>;
     /// 拉取指定会话最近的媒体历史（从新到旧），最多 `limit` 条。
     async fn messages(&self, chat_id: i64, limit: u32) -> Result<Vec<MediaItem>, ClientError>;
     /// 将指定会话中某条媒体消息下载到 `dir`，返回落盘结果。
@@ -142,6 +156,9 @@ mod tests {
             }
         }
         async fn dialogs(&self) -> Result<Vec<Channel>, ClientError> {
+            Ok(Vec::new())
+        }
+        async fn folders(&self) -> Result<Vec<Folder>, ClientError> {
             Ok(Vec::new())
         }
         async fn messages(&self, _chat_id: i64, _limit: u32) -> Result<Vec<MediaItem>, ClientError> {
