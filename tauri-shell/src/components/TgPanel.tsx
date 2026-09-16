@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { Switch } from './ui/switch'
+import { MediaViewer } from './MediaViewer'
 import { useTranslation } from '../i18n'
 import { cn } from '../lib/utils'
 import {
@@ -184,19 +185,10 @@ export function TgPanel() {
   )
   /** 整组缓存取消请求：逐条间隙检查，命中即停止后续条目（当前条由服务端完成） */
   const cancelReqsRef = useRef<Set<string>>(new Set())
-  /** 原图/组内浏览遮罩：unit 为相册组（单条自成一组），index 为当前浏览位置 */
+  /** 原图/组内浏览：unit 为相册组（单条自成一组），index 为当前浏览位置；
+   *  渲染交给右侧第三栏通用播放器 MediaViewer（内容流保留不被替换） */
   const [lightbox, setLightbox] = useState<{ unit: FeedItem[]; index: number } | null>(null)
 
-  /** 倍速状态：lightbox 自持；视频重挂载后经 onLoadedMetadata 回填 */
-  const [lbRate, setLbRate] = useState(1)
-  const lbVideoRef = useRef<HTMLVideoElement | null>(null)
-  /** 本地+在线双降级仍失败（如 .mov 浏览器不可解码）→ 遮罩内显示可读提示而非黑屏 */
-  const [lbFailed, setLbFailed] = useState(false)
-  useEffect(() => {
-    if (lbVideoRef.current) lbVideoRef.current.playbackRate = lbRate
-  }, [lbRate, lightbox])
-  // 切换浏览对象时复位解码失败提示
-  useEffect(() => setLbFailed(false), [lightbox])
   /** APP 首启配置（api_id/api_hash 由壳持久化，未配置时显示配置卡） */
   const [needConfig, setNeedConfig] = useState(false)
   const [cfgId, setCfgId] = useState('')
@@ -774,108 +766,9 @@ export function TgPanel() {
 
       </aside>
 
-      {/* ===== 第二列：播放器（内嵌视图）/ 分组列表 / 聊天式媒体流 ===== */}
+      {/* ===== 第二列：分组模式=组内频道列表 / 内容模式=聊天式媒体流（最新在底部） ===== */}
       <section className="flex min-w-0 flex-1 flex-col bg-surface/20">
-        {lightbox ? (
-          (() => {
-            const cur = lightbox.unit[lightbox.index]
-            const many = lightbox.unit.length > 1
-            const local = downloadedPaths.get(cur.key)
-            return (
-              <>
-                {/* 返回行：← 返回列表 + 频道名 + n/N */}
-                <div className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-4 py-2.5">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 shrink-0 px-2 text-[11px]"
-                    onClick={() => setLightbox(null)}
-                  >
-                    ← {t('tg.backToFeed')}
-                  </Button>
-                  <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-fg-strong">
-                    {selectedChannel?.title}
-                  </span>
-                  {many && (
-                    <span className="shrink-0 text-[11px] text-muted">
-                      {lightbox.index + 1}/{lightbox.unit.length}
-                    </span>
-                  )}
-                </div>
-                {/* 媒体区：黑底居中；‹› 组内切换收进面板两侧，不再出框 */}
-                <div className="relative flex min-h-0 flex-1 items-center justify-center bg-black p-4">
-                  {(cur.type === 'video' || cur.type === 'audio') && (
-                    <PlaybackSpeed rate={lbRate} onRate={setLbRate} />
-                  )}
-                  {many && lightbox.index > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => setLightbox((s) => (s ? { ...s, index: s.index - 1 } : s))}
-                      className="absolute left-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-lg text-white hover:bg-white/20"
-                    >
-                      ‹
-                    </button>
-                  )}
-                  {cur.type === 'video' || cur.type === 'audio' ? (
-                    <video
-                      key={cur.key}
-                      ref={lbVideoRef}
-                      src={
-                        local
-                          ? tgLocalFileUrl(cur.chatId, cur.messageId)
-                          : tgFileUrl(cur.chatId, cur.messageId)
-                      }
-                      controls
-                      autoPlay
-                      preload="auto"
-                      onLoadedMetadata={(e) => {
-                        e.currentTarget.playbackRate = lbRate
-                      }}
-                      className="max-h-full max-w-full rounded-lg bg-black"
-                      onError={(e) => {
-                        const v = e.currentTarget
-                        if (local && !v.dataset.fallback) {
-                          v.dataset.fallback = '1'
-                          v.src = tgFileUrl(cur.chatId, cur.messageId)
-                        } else {
-                          // 本地+在线双失败（如 .mov 容器浏览器不可解码）→ 露出可读提示
-                          setLbFailed(true)
-                        }
-                      }}
-                    />
-                  ) : (
-                    <img
-                      key={cur.key}
-                      src={tgFileUrl(cur.chatId, cur.messageId)}
-                      alt={cur.caption || ''}
-                      className="max-h-full max-w-full rounded-lg object-contain"
-                      onError={() => setLbFailed(true)}
-                    />
-                  )}
-                  {many && lightbox.index < lightbox.unit.length - 1 && (
-                    <button
-                      type="button"
-                      onClick={() => setLightbox((s) => (s ? { ...s, index: s.index + 1 } : s))}
-                      className="absolute right-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-lg text-white hover:bg-white/20"
-                    >
-                      ›
-                    </button>
-                  )}
-                  {lbFailed && (
-                    <p className="absolute bottom-4 left-1/2 z-10 -translate-x-1/2 rounded-md border border-white/20 bg-white/10 px-3 py-1.5 text-center text-xs text-white/85">
-                      {t('tg.decodeFail')}
-                    </p>
-                  )}
-                </div>
-                {cur.caption && (
-                  <p className="max-h-24 shrink-0 overflow-y-auto bg-black px-4 py-2 text-center text-xs text-white/80">
-                    {cur.caption}
-                  </p>
-                )}
-              </>
-            )
-          })()
-        ) : !detail && groupMode !== null && activeGroup ? (
+        {!detail && groupMode !== null && activeGroup ? (
           <>
             {/* 分组模式：组内频道列表（仅添加/取消监控，不浏览内容） */}
             <header className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-3 py-2.5">
@@ -1035,6 +928,29 @@ export function TgPanel() {
           </div>
         )}
       </section>
+
+      {/* 第三栏：通用播放器（MediaViewer，模块无关）——内容流保留，播放器在右侧独立一栏 */}
+      {lightbox && (
+        <MediaViewer
+          className="w-[45%] min-w-[320px] max-w-[760px] shrink-0 border-l border-border-subtle/60"
+          title={selectedChannel?.title}
+          items={lightbox.unit.map((u) => {
+            const local = downloadedPaths.get(u.key)
+            return {
+              key: u.key,
+              chatId: u.chatId,
+              messageId: u.messageId,
+              kind: u.type,
+              caption: u.caption,
+              src: local ? tgLocalFileUrl(u.chatId, u.messageId) : tgFileUrl(u.chatId, u.messageId),
+              fallbackSrc: local ? tgFileUrl(u.chatId, u.messageId) : undefined,
+            }
+          })}
+          index={lightbox.index}
+          onIndex={(i) => setLightbox((s) => (s ? { ...s, index: i } : s))}
+          onClose={() => setLightbox(null)}
+        />
+      )}
 
 
 

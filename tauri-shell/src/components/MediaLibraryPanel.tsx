@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
+import { MediaViewer } from './MediaViewer'
 import { useTranslation } from '../i18n'
-import { cn } from '../lib/utils'
 import {
   tgHealth,
   listTgStored,
@@ -48,13 +48,8 @@ export function MediaLibraryPanel() {
   const [loading, setLoading] = useState(false)
   const [search, setSearch] = useState('')
   const [hasMore, setHasMore] = useState(false)
-  /** 播放遮罩：items 为相册组（单条自成一组），index 为当前播放位置 */
+  /** 右侧播放器（MediaViewer）：items 为相册组（单条自成一组），index 为当前播放位置 */
   const [playing, setPlaying] = useState<{ items: TgStoredItem[]; index: number } | null>(null)
-  /** 倍速（视频重挂载后经 onLoadedMetadata 回填） */
-  const [rate, setRate] = useState(1)
-  const videoRef = useRef<HTMLVideoElement | null>(null)
-  /** 本地+在线双降级仍失败（如 .mov 浏览器不可解码）→ 遮罩内显示可读提示而非黑屏 */
-  const [playFailed, setPlayFailed] = useState(false)
   /** 整组缓存进度（键 g-频道-组，值 已完成/总数）与取消请求 */
   const [albumProgress, setAlbumProgress] = useState<Map<string, { done: number; total: number }>>(
     new Map(),
@@ -67,21 +62,13 @@ export function MediaLibraryPanel() {
   const [dlDir, setDlDir] = useState('')
   const [dlDirSaving, setDlDirSaving] = useState(false)
 
-  useEffect(() => {
-    if (videoRef.current) videoRef.current.playbackRate = rate
-  }, [rate, playing])
-  // 切换播放对象时复位解码失败提示
-  useEffect(() => setPlayFailed(false), [playing])
-
-  // 播放遮罩键盘导航：←/→ 组内切换，Esc 关闭
+  // 播放器键盘导航：←/→ 组内切换，Esc 返回列表
   useEffect(() => {
     if (!playing) return
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'ArrowLeft') {
-        setPlayFailed(false)
         setPlaying((s) => (s && s.index > 0 ? { ...s, index: s.index - 1 } : s))
       } else if (e.key === 'ArrowRight') {
-        setPlayFailed(false)
         setPlaying((s) => (s && s.index < s.items.length - 1 ? { ...s, index: s.index + 1 } : s))
       } else if (e.key === 'Escape') {
         setPlaying(null)
@@ -433,107 +420,31 @@ export function MediaLibraryPanel() {
       {/* 右栏：播放器内嵌视图（带返回行，不再全屏遮罩覆盖窗口） */}
       <div className="flex min-w-0 flex-1 flex-col">
         {playing ? (
-          (() => {
-            const cur = playing.items[playing.index]
-            const many = playing.items.length > 1
-            const typ = cur.type ?? guessMediaType(cur.mimeType, cur.filePath)
-            return (
-              <>
-                {/* 返回行：← 返回列表 + 标题 + n/N */}
-                <div className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-3 py-2.5">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 shrink-0 px-2 text-[11px]"
-                    onClick={() => setPlaying(null)}
-                  >
-                    ← {t('tg.backToFeed')}
-                  </Button>
-                  <span className="min-w-0 flex-1 truncate text-[12px] text-muted">
-                    {cur.caption?.trim() || `#${cur.messageId}`}
-                    {cur.channelTitle ? ` · ${cur.channelTitle}` : ''}
-                  </span>
-                  {many && (
-                    <span className="shrink-0 text-[11px] text-muted">
-                      {playing.index + 1}/{playing.items.length}
-                    </span>
-                  )}
-                </div>
-                {/* 媒体区：黑底居中；‹› 组内切换收进面板两侧，不再出框 */}
-                <div className="relative flex min-h-0 flex-1 items-center justify-center bg-black p-4">
-                  {typ !== 'photo' && <PlaybackSpeed rate={rate} onRate={setRate} />}
-                  {many && playing.index > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => setPlaying((s) => (s ? { ...s, index: s.index - 1 } : s))}
-                      className="absolute left-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-lg text-white hover:bg-white/20"
-                    >
-                      ‹
-                    </button>
-                  )}
-                  {typ === 'photo' ? (
-                    <img
-                      key={cur.messageId}
-                      src={tgLocalFileUrl(cur.channelId, cur.messageId)}
-                      alt={cur.caption || ''}
-                      className="max-h-full max-w-full rounded-lg object-contain"
-                      onError={(e) => {
-                        // 本地缺失 → 降级在线流仅一次；在线也失败时终止，避免 onError 无限重试
-                        const img = e.currentTarget
-                        if (!img.dataset.fallback) {
-                          img.dataset.fallback = '1'
-                          img.src = tgFileUrl(cur.channelId, cur.messageId)
-                        } else {
-                          setPlayFailed(true)
-                        }
-                      }}
-                    />
-                  ) : (
-                    <video
-                      key={cur.messageId}
-                      ref={videoRef}
-                      src={tgLocalFileUrl(cur.channelId, cur.messageId)}
-                      controls
-                      autoPlay
-                      preload="auto"
-                      onLoadedMetadata={(e) => {
-                        e.currentTarget.playbackRate = rate
-                      }}
-                      className="max-h-full max-w-full rounded-lg bg-black"
-                      onError={(e) => {
-                        const v = e.currentTarget
-                        if (!v.dataset.fallback) {
-                          v.dataset.fallback = '1'
-                          v.src = tgFileUrl(cur.channelId, cur.messageId)
-                        } else {
-                          setPlayFailed(true)
-                        }
-                      }}
-                    />
-                  )}
-                  {many && playing.index < playing.items.length - 1 && (
-                    <button
-                      type="button"
-                      onClick={() => setPlaying((s) => (s ? { ...s, index: s.index + 1 } : s))}
-                      className="absolute right-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-lg text-white hover:bg-white/20"
-                    >
-                      ›
-                    </button>
-                  )}
-                  {playFailed && (
-                    <p className="absolute bottom-4 left-1/2 z-10 -translate-x-1/2 rounded-md border border-white/20 bg-white/10 px-3 py-1.5 text-center text-xs text-white/85">
-                      {t('tg.decodeFail')}
-                    </p>
-                  )}
-                </div>
-                {cur.caption?.trim() && (
-                  <p className="max-h-24 shrink-0 overflow-y-auto bg-black px-4 py-2 text-center text-xs text-white/80">
-                    {cur.caption}
-                  </p>
-                )}
-              </>
-            )
-          })()
+          <MediaViewer
+            className="min-w-0 flex-1"
+            items={playing.items.map((x) => {
+              const tp = x.type ?? guessMediaType(x.mimeType, x.filePath)
+              return {
+                key: x.messageId,
+                chatId: x.channelId,
+                messageId: x.messageId,
+                kind: tp,
+                caption: x.caption,
+                src: tgLocalFileUrl(x.channelId, x.messageId),
+                fallbackSrc: tgFileUrl(x.channelId, x.messageId),
+              }
+            })}
+            index={playing.index}
+            onIndex={(i) => setPlaying((s) => (s ? { ...s, index: i } : s))}
+            onClose={() => setPlaying(null)}
+            title={
+              (playing.items[playing.index]?.caption?.trim() ||
+                `#${playing.items[playing.index]?.messageId}`) +
+              (playing.items[playing.index]?.channelTitle
+                ? ` · ${playing.items[playing.index].channelTitle}`
+                : '')
+            }
+          />
         ) : (
           <div className="flex min-h-0 flex-1 items-center justify-center p-6">
             <p className="max-w-xs text-center text-sm leading-relaxed text-muted">
@@ -575,45 +486,6 @@ export function MediaLibraryPanel() {
               </Button>
             </div>
           </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-/** 倍速控制（悬浮在视频容器右上角；与 TgPanel 内同名组件同构） */
-function PlaybackSpeed({ rate, onRate }: { rate: number; onRate: (r: number) => void }) {
-  const [open, setOpen] = useState(false)
-  const speeds = [0.5, 0.75, 1, 1.25, 1.5, 2]
-  return (
-    <div className="absolute right-2 top-2 z-10" onClick={(e) => e.stopPropagation()}>
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className={cn(
-          'rounded-md bg-black/55 px-2 py-1 text-[10px] font-medium text-white backdrop-blur-sm hover:bg-black/70',
-        )}
-      >
-        {rate}x
-      </button>
-      {open && (
-        <div className="absolute right-0 top-8 flex flex-col overflow-hidden rounded-md border border-white/20 bg-black/85">
-          {speeds.map((s) => (
-            <button
-              key={s}
-              type="button"
-              onClick={() => {
-                onRate(s)
-                setOpen(false)
-              }}
-              className={cn(
-                'px-3 py-1.5 text-left text-[11px] text-white/80 hover:bg-white/10',
-                s === rate && 'text-accent',
-              )}
-            >
-              {s}x
-            </button>
-          ))}
         </div>
       )}
     </div>
