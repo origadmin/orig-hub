@@ -105,7 +105,7 @@ impl Default for Config {
             port: 9876,
             classify: ClassifyConfig::default(),
             proxy: orig_core::protocol::ProxyConfig::default(),
-            tg_enabled: false,
+            tg_enabled: true,
             tg_api_id: None,
             tg_api_hash: None,
         }

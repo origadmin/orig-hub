@@ -80,6 +80,14 @@ impl AppState {
         // 不依赖父进程环境继承，保证 Tauri/开机重启后 real 模式仍生效。
         cmd.env("PORT", "9877");
         cmd.kill_on_drop(true);
+        // 会话与监控库必须落到稳定数据目录，免得 orig-tg 用 CWD 相对的默认路径，
+        // 每次启动 CWD 变化就新生成会话 → 反复登录。目录在注入前先确保存在。
+        let data_dir = tg_data_dir();
+        if let Err(e) = std::fs::create_dir_all(&data_dir) {
+            return Err(e);
+        }
+        cmd.env("ORIG_TG_SESSION", data_dir.join("tg/session.session"));
+        cmd.env("ORIG_TG_DB", data_dir.join("tg/store.db"));
         if let Some(url) = proxy_url {
             cmd.env("ORIG_TG_PROXY", url);
         }
@@ -108,6 +116,39 @@ impl AppState {
     }
 }
 
+/// 定位稳定数据目录：Windows 用 `%LocalAppData%\OrigHub`，否则 `$XDG_DATA_HOME` 或
+/// `~/.local/share/orighub`。TG 会话/监控库统一落到该目录，与启动 CWD 无关。
+pub fn tg_data_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("ORIG_TG_DATA") {
+        if !d.is_empty() {
+            return PathBuf::from(d);
+        }
+    }
+    if cfg!(windows) {
+        if let Ok(app) = std::env::var("LOCALAPPDATA") {
+            if !app.is_empty() {
+                return PathBuf::from(app).join("OrigHub");
+            }
+        }
+    } else if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("orighub");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".local/share/orighub");
+        }
+    }
+    if let Ok(prof) = std::env::var("USERPROFILE") {
+        if !prof.is_empty() {
+            return PathBuf::from(prof).join(".local/share/orighub");
+        }
+    }
+    // 兜底：相对路径也能用，但上游 daemon 侧一般已有稳定目录。
+    PathBuf::from(".orighub")
+}
+
 /// 定位 orig-tg 可执行文件：`ORIG_TG_PATH` 优先，其次当前 exe 同目录，最后回退裸名。
 pub fn tg_binary_path() -> PathBuf {
     if let Ok(p) = std::env::var("ORIG_TG_PATH") {
@@ -122,4 +163,29 @@ pub fn tg_binary_path() -> PathBuf {
         }
     }
     PathBuf::from("orig-tg")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tg_data_dir_is_absolute_and_creatable() {
+        // 注入可控的稳定目录，避免读写真实用户目录。
+        let probe = std::env::temp_dir().join(format!("orighub-test-{}", std::process::id()));
+        std::env::set_var("ORIG_TG_DATA", &probe);
+
+        let dir = tg_data_dir();
+        // 校验返回绝对路径且命中所注入的目录。
+        assert!(dir.is_absolute(), "tg_data_dir() must be absolute");
+
+        // 父目录可创建。
+        let child = dir.join("tg/session.session");
+        let parent = child.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        assert!(parent.is_dir(), "parent dir must be creatable");
+
+        let _ = std::fs::remove_dir_all(&probe);
+        std::env::remove_var("ORIG_TG_DATA");
+    }
 }

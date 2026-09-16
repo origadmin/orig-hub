@@ -51,6 +51,18 @@ async fn main() {
         config.proxy
     ));
 
+    // 持久化会话恢复后通常已处于 Authorized：延迟 2s 触发首次后台全量会话扫描，
+    // 提前填充 dialog_cache 与 PeerRef 缓存，前端首开面板即读本地缓存、媒体请求秒解析。
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if st.client.view().await.phase == orig_tg::login::LoginPhase::Authorized {
+                routes::spawn_dialog_scan(st);
+            }
+        });
+    }
+
     let app = routes::router(state).layer(
         tower_http::cors::CorsLayer::new()
             .allow_origin([
@@ -59,7 +71,12 @@ async fn main() {
                 "tauri://localhost".parse().unwrap(),
                 "http://tauri.localhost".parse().unwrap(),
             ])
-            .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::OPTIONS])
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::DELETE,
+                axum::http::Method::OPTIONS,
+            ])
             .allow_headers([
                 axum::http::header::HeaderName::from_static("content-type"),
                 axum::http::header::HeaderName::from_static("authorization"),

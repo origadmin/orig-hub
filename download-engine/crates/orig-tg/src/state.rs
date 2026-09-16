@@ -1,6 +1,7 @@
 //! orig-tg 服务共享状态。
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -58,6 +59,8 @@ pub struct AppState {
     pub store: Store,
     /// 客户端真实度：`real`=grammers，`dummy`=内存占位（api_id/hash 未配置）。
     pub api_mode: &'static str,
+    /// 会话缓存是否正在后台全量扫描（GET dialogs 据此返回 `scanning`，前端轮询）。
+    pub dialog_scanning: AtomicBool,
 }
 
 impl AppState {
@@ -68,10 +71,16 @@ impl AppState {
             logs: RingLog::new(200),
             store,
             api_mode,
+            dialog_scanning: AtomicBool::new(false),
         }
     }
 
     pub fn push_log(&self, line: impl AsRef<str>) {
         self.logs.push(line);
+    }
+
+    /// 读取后台扫描状态（Relaxed：仅作进度提示，无并发数据依赖）。
+    pub fn is_scanning(&self) -> bool {
+        self.dialog_scanning.load(Ordering::Relaxed)
     }
 }

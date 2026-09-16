@@ -3,7 +3,7 @@
 
 use std::sync::Mutex;
 
-use orig_tg::login::{Channel, Client, ClientError, DownloadOutcome, Folder, LoginPhase, MediaItem, SessionView};
+use orig_tg::login::{Channel, Client, ClientError, DownloadOutcome, Folder, LoginPhase, MediaItem, MediaRange, MediaStream, SessionView, Thumbnail};
 
 /// 内存占位客户端：固定验证码 00000 即授权（仅供接口契约自洽，非真实登录）。
 pub struct DummyClient {
@@ -57,11 +57,36 @@ impl Client for DummyClient {
         Ok(Vec::new())
     }
 
-    async fn messages(&self, _chat_id: i64, _limit: u32) -> Result<Vec<MediaItem>, ClientError> {
+    async fn messages(
+        &self,
+        _chat_id: i64,
+        _limit: u32,
+        _before_id: Option<i64>,
+    ) -> Result<Vec<MediaItem>, ClientError> {
         Ok(Vec::new())
+    }
+
+    async fn thumb(
+        &self,
+        _chat_id: i64,
+        _message_id: i64,
+    ) -> Result<Option<Thumbnail>, ClientError> {
+        Ok(None)
+    }
+
+    async fn media(&self, _chat_id: i64, _message_id: i64, _range: Option<MediaRange>) -> Result<MediaStream, ClientError> {
+        Err(ClientError::MediaNotFound)
     }
 
     async fn download(&self, _chat_id: i64, _message_id: i64, _dir: &str) -> Result<DownloadOutcome, ClientError> {
         Err(ClientError::MediaNotFound)
+    }
+
+    async fn message_meta(
+        &self,
+        _chat_id: i64,
+        _message_id: i64,
+    ) -> Result<Option<MediaItem>, ClientError> {
+        Ok(None)
     }
 }
