@@ -237,3 +237,16 @@ export interface AppSettings {
   /** 自动分类规则（R3 优化）：扩展名 → 分类目录名；为空时使用 daemon 内置默认 */
   classifyRules: Record<string, string>
 }
+
+/** 全局播放器条目（模块无关）：调用方把媒体归一化后交给 MediaViewer 渲染 */
+export interface ViewerItem {
+  key: string | number
+  chatId: number
+  messageId: number
+  kind: 'photo' | 'video' | 'audio' | 'file'
+  caption?: string | null
+  /** 首选媒体地址（已缓存走本地流，未缓存走在线流） */
+  src: string
+  /** 降级地址（首选失败时回退一次，如本地缺失回退在线流） */
+  fallbackSrc?: string
+}

@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
-import { MediaViewer } from './MediaViewer'
 import { useTranslation } from '../i18n'
 import {
   tgHealth,
@@ -25,7 +24,7 @@ import { fmtDuration, fmtSize, fmtTime, guessMediaType } from '../lib/tgmedia'
  */
 export function MediaLibraryPanel() {
   const { t } = useTranslation()
-  const { setError } = useStore()
+  const { setError, openViewer } = useStore()
 
   // ---- 服务探活：APP 模式由 Tauri 壳托管拉起 ----
   const [alive, setAlive] = useState(false)
@@ -48,8 +47,6 @@ export function MediaLibraryPanel() {
   const [loading, setLoading] = useState(false)
   const [search, setSearch] = useState('')
   const [hasMore, setHasMore] = useState(false)
-  /** 右侧播放器（MediaViewer）：items 为相册组（单条自成一组），index 为当前播放位置 */
-  const [playing, setPlaying] = useState<{ items: TgStoredItem[]; index: number } | null>(null)
   /** 整组缓存进度（键 g-频道-组，值 已完成/总数）与取消请求 */
   const [albumProgress, setAlbumProgress] = useState<Map<string, { done: number; total: number }>>(
     new Map(),
@@ -62,21 +59,7 @@ export function MediaLibraryPanel() {
   const [dlDir, setDlDir] = useState('')
   const [dlDirSaving, setDlDirSaving] = useState(false)
 
-  // 播放器键盘导航：←/→ 组内切换，Esc 返回列表
-  useEffect(() => {
-    if (!playing) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'ArrowLeft') {
-        setPlaying((s) => (s && s.index > 0 ? { ...s, index: s.index - 1 } : s))
-      } else if (e.key === 'ArrowRight') {
-        setPlaying((s) => (s && s.index < s.items.length - 1 ? { ...s, index: s.index + 1 } : s))
-      } else if (e.key === 'Escape') {
-        setPlaying(null)
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [playing])
+  // 播放器键盘导航（←/→/Esc）由 MediaViewer 组件自持，此处不再监听
 
   /** 聚合行：同频道同 groupId 聚合为相册行（组内按消息 id 升序），其余单条成行 */
   const rows = useMemo<{ key: string; items: TgStoredItem[] }[]>(() => {
@@ -97,6 +80,24 @@ export function MediaLibraryPanel() {
       return { key: k, items: group }
     })
   }, [items])
+
+  /** 归一化聚合行 → 全局播放器条目（本地流优先 + 在线降级；判型带扩展名兜底） */
+  const toViewerItems = (group: TgStoredItem[]) =>
+    group.map((x) => ({
+      key: x.messageId,
+      chatId: x.channelId,
+      messageId: x.messageId,
+      kind: x.type ?? guessMediaType(x.mimeType, x.filePath),
+      caption: x.caption,
+      src: tgLocalFileUrl(x.channelId, x.messageId),
+      fallbackSrc: tgFileUrl(x.channelId, x.messageId),
+    }))
+  /** 播放器返回行标题：当前行 caption（无则 #id）· 频道名 */
+  const viewerTitle = (group: TgStoredItem[]) => {
+    const it = group[0]
+    const cap = group.find((x) => x.caption?.trim())?.caption
+    return (cap?.trim() || `#${it.messageId}`) + (it.channelTitle ? ` · ${it.channelTitle}` : '')
+  }
 
   // 进入视图 / 搜索词变化（300ms 防抖）时重查第一页
   const fetchPage = useCallback(
@@ -305,7 +306,9 @@ export function MediaLibraryPanel() {
                 {/* 缩略图（视频/照片）；音频/文件用图标；单击打开播放遮罩 */}
                 <button
                   type="button"
-                  onClick={() => setPlaying({ items: group, index: 0 })}
+                  onClick={() =>
+                    openViewer({ title: viewerTitle(group), index: 0, items: toViewerItems(group) })
+                  }
                   className="relative h-12 w-20 shrink-0 overflow-hidden rounded-md bg-surface-2"
                 >
                   {thumbTyp === 'photo' || thumbTyp === 'video' ? (
@@ -368,7 +371,9 @@ export function MediaLibraryPanel() {
                         variant="outline"
                         size="sm"
                         className="h-6 px-2 text-[10px]"
-                        onClick={() => setPlaying({ items: group, index: 0 })}
+                        onClick={() =>
+                    openViewer({ title: viewerTitle(group), index: 0, items: toViewerItems(group) })
+                  }
                       >
                         {isGroup || typ === 'video' || typ === 'audio'
                           ? t('tg.play')
@@ -417,41 +422,13 @@ export function MediaLibraryPanel() {
       </div>
       </div>
 
-      {/* 右栏：播放器内嵌视图（带返回行，不再全屏遮罩覆盖窗口） */}
+      {/* 右栏：提示区（播放交给全局播放器页，播放时整窗独占） */}
       <div className="flex min-w-0 flex-1 flex-col">
-        {playing ? (
-          <MediaViewer
-            className="min-w-0 flex-1"
-            items={playing.items.map((x) => {
-              const tp = x.type ?? guessMediaType(x.mimeType, x.filePath)
-              return {
-                key: x.messageId,
-                chatId: x.channelId,
-                messageId: x.messageId,
-                kind: tp,
-                caption: x.caption,
-                src: tgLocalFileUrl(x.channelId, x.messageId),
-                fallbackSrc: tgFileUrl(x.channelId, x.messageId),
-              }
-            })}
-            index={playing.index}
-            onIndex={(i) => setPlaying((s) => (s ? { ...s, index: i } : s))}
-            onClose={() => setPlaying(null)}
-            title={
-              (playing.items[playing.index]?.caption?.trim() ||
-                `#${playing.items[playing.index]?.messageId}`) +
-              (playing.items[playing.index]?.channelTitle
-                ? ` · ${playing.items[playing.index].channelTitle}`
-                : '')
-            }
-          />
-        ) : (
-          <div className="flex min-h-0 flex-1 items-center justify-center p-6">
-            <p className="max-w-xs text-center text-sm leading-relaxed text-muted">
-              {t('tg.selectToPlay')}
-            </p>
-          </div>
-        )}
+        <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+          <p className="max-w-xs text-center text-sm leading-relaxed text-muted">
+            {t('tg.selectToPlay')}
+          </p>
+        </div>
       </div>
 
       {/* 下载目录弹窗：查看/修改缓存落地目录（持久化，立即生效） */}

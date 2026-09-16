@@ -2,22 +2,10 @@ import { useEffect, useRef, useState } from 'react'
 import { Button } from './ui/button'
 import { useTranslation } from '../i18n'
 import { cn } from '../lib/utils'
-
-/** 播放器条目（调用方归一化：媒体库 TgStoredItem / TG feed FeedItem 均可映射进来） */
-export interface ViewerItem {
-  key: string | number
-  chatId: number
-  messageId: number
-  kind: 'photo' | 'video' | 'audio' | 'file'
-  caption?: string | null
-  /** 首选媒体地址（已缓存走本地流，未缓存走在线流） */
-  src: string
-  /** 降级地址（首选失败时回退一次，如本地缺失回退在线流） */
-  fallbackSrc?: string
-}
+import type { ViewerItem } from '../types'
 
 /**
- * 通用媒体播放器栏（模块无关，TG / 媒体库共用）：右侧内嵌视图，非全屏遮罩。
+ * 全局媒体播放器页（模块无关，不带任何模块信息）：打开时独占内容区整页。
  * 返回行（← 返回 + 标题 + n/N）+ 黑底媒体区（‹ › 收在面板内侧，不会出框）+ caption 底部行。
  */
 export function MediaViewer(props: {
@@ -43,6 +31,21 @@ export function MediaViewer(props: {
   useEffect(() => {
     if (videoRef.current) videoRef.current.playbackRate = rate
   }, [rate, cur?.key])
+
+  // 键盘导航：←/→ 组内切换，Esc 返回（组件自持，任何挂载处行为一致）
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'ArrowLeft') {
+        if (index > 0) onIndex(index - 1)
+      } else if (e.key === 'ArrowRight') {
+        if (index < items.length - 1) onIndex(index + 1)
+      } else if (e.key === 'Escape') {
+        onClose()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [index, items.length, onIndex, onClose])
 
   return (
     <div className={cn('flex min-h-0 flex-col bg-surface/20', className)}>

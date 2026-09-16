@@ -5,6 +5,7 @@ import { AddDownloadDialog } from './AddDownloadDialog'
 import { SettingsPanel } from './SettingsPanel'
 import { TgPanel } from './TgPanel'
 import { MediaLibraryPanel } from './MediaLibraryPanel'
+import { MediaViewer } from './MediaViewer'
 import { ErrorBoundary } from './ui/ErrorBoundary'
 import { TitleBar } from './TitleBar'
 import { Button } from './ui/button'
@@ -19,7 +20,7 @@ export function MainLayout() {
   const [collapsed, setCollapsed] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
   const { t } = useTranslation()
-  const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, accounts } = useStore()
+  const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, accounts, viewer, setViewerIndex, closeViewer } = useStore()
 
   useEffect(() => {
     init()
@@ -90,7 +91,20 @@ export function MainLayout() {
       {/* 自定义标题栏（与系统样式一致） */}
       <TitleBar title="Orig Hub" />
 
-      <div className="flex min-h-0 flex-1">
+      <div className="relative flex min-h-0 flex-1">
+        {/* 全局播放器页：打开时独占整个内容区（连侧边导航在内无任何模块信息），返回后回到原视图 */}
+        {viewer && (
+          <div className="absolute inset-0 z-40 flex bg-background">
+            <MediaViewer
+              className="min-w-0 flex-1"
+              items={viewer.items}
+              index={viewer.index}
+              onIndex={setViewerIndex}
+              onClose={closeViewer}
+              title={viewer.title}
+            />
+          </div>
+        )}
         <Sidebar
           view={view}
           onViewChange={handleView}

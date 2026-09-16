@@ -3,7 +3,6 @@ import type { ReactNode } from 'react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { Switch } from './ui/switch'
-import { MediaViewer } from './MediaViewer'
 import { useTranslation } from '../i18n'
 import { cn } from '../lib/utils'
 import {
@@ -157,7 +156,7 @@ function groupAlbums(feed: FeedItem[]): FeedItem[][] {
  */
 export function TgPanel() {
   const { t } = useTranslation()
-  const { setError } = useStore()
+  const { setError, openViewer } = useStore()
   const [alive, setAlive] = useState(false)
   const [channels, setChannels] = useState<TgChannel[]>([])
   const [scanning, setScanning] = useState(false)
@@ -185,10 +184,6 @@ export function TgPanel() {
   )
   /** 整组缓存取消请求：逐条间隙检查，命中即停止后续条目（当前条由服务端完成） */
   const cancelReqsRef = useRef<Set<string>>(new Set())
-  /** 原图/组内浏览：unit 为相册组（单条自成一组），index 为当前浏览位置；
-   *  渲染交给右侧第三栏通用播放器 MediaViewer（内容流保留不被替换） */
-  const [lightbox, setLightbox] = useState<{ unit: FeedItem[]; index: number } | null>(null)
-
   /** APP 首启配置（api_id/api_hash 由壳持久化，未配置时显示配置卡） */
   const [needConfig, setNeedConfig] = useState(false)
   const [cfgId, setCfgId] = useState('')
@@ -490,21 +485,20 @@ export function TgPanel() {
   // ---- 内容流相册聚合：相邻同 groupId 的消息合并为一个相册气泡（v0.4.2） ----
   const albumUnits = useMemo(() => groupAlbums(feed), [feed])
 
-  // lightbox 键盘导航：←/→ 组内切换，Esc 关闭（v0.4.2 相册浏览）
-  useEffect(() => {
-    if (!lightbox) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'ArrowLeft') {
-        setLightbox((s) => (s && s.index > 0 ? { ...s, index: s.index - 1 } : s))
-      } else if (e.key === 'ArrowRight') {
-        setLightbox((s) => (s && s.index < s.unit.length - 1 ? { ...s, index: s.index + 1 } : s))
-      } else if (e.key === 'Escape') {
-        setLightbox(null)
+  /** 归一化 feed 条目 → 全局播放器条目（已缓存走本地流并带在线降级，未缓存直连在线流） */
+  const toViewerItems = (unit: FeedItem[]) =>
+    unit.map((u) => {
+      const local = downloadedPaths.get(u.key)
+      return {
+        key: u.key,
+        chatId: u.chatId,
+        messageId: u.messageId,
+        kind: u.type,
+        caption: u.caption,
+        src: local ? tgLocalFileUrl(u.chatId, u.messageId) : tgFileUrl(u.chatId, u.messageId),
+        fallbackSrc: local ? tgFileUrl(u.chatId, u.messageId) : undefined,
       }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [lightbox])
+    })
 
   // ---- 监控增删（本地乐观更新 + 后端持久化） ----
   const refreshMonitored = useCallback(async () => {
@@ -899,7 +893,13 @@ export function TgPanel() {
                         downloadedPath={downloadedPaths.get(unit[0].key)}
                         onDownload={() => void doDownload(unit[0])}
                         onOpenDownloaded={() => void openDownloaded(unit[0])}
-                        onPreview={() => setLightbox({ unit, index: 0 })}
+                        onPreview={() =>
+                          openViewer({
+                            title: selectedChannel?.title,
+                            index: 0,
+                            items: toViewerItems(unit),
+                          })
+                        }
                       />
                     ) : (
                       <AlbumBubble
@@ -911,7 +911,13 @@ export function TgPanel() {
                         progress={albumProgress.get(`a-${unit[0].chatId}-${unit[0].groupId}`)}
                         onDownload={() => void downloadAlbum(unit)}
                         onCancel={() => cancelAlbum(`a-${unit[0].chatId}-${unit[0].groupId}`)}
-                        onPreview={(index) => setLightbox({ unit, index })}
+                        onPreview={(index) =>
+                          openViewer({
+                            title: selectedChannel?.title,
+                            index,
+                            items: toViewerItems(unit),
+                          })
+                        }
                       />
                     ),
                   )
@@ -929,28 +935,6 @@ export function TgPanel() {
         )}
       </section>
 
-      {/* 第三栏：通用播放器（MediaViewer，模块无关）——内容流保留，播放器在右侧独立一栏 */}
-      {lightbox && (
-        <MediaViewer
-          className="w-[45%] min-w-[320px] max-w-[760px] shrink-0 border-l border-border-subtle/60"
-          title={selectedChannel?.title}
-          items={lightbox.unit.map((u) => {
-            const local = downloadedPaths.get(u.key)
-            return {
-              key: u.key,
-              chatId: u.chatId,
-              messageId: u.messageId,
-              kind: u.type,
-              caption: u.caption,
-              src: local ? tgLocalFileUrl(u.chatId, u.messageId) : tgFileUrl(u.chatId, u.messageId),
-              fallbackSrc: local ? tgFileUrl(u.chatId, u.messageId) : undefined,
-            }
-          })}
-          index={lightbox.index}
-          onIndex={(i) => setLightbox((s) => (s ? { ...s, index: i } : s))}
-          onClose={() => setLightbox(null)}
-        />
-      )}
 
 
 

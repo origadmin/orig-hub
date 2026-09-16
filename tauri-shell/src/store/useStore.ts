@@ -18,7 +18,7 @@ import {
   subscribeEvents,
 } from '../api/daemon'
 import { getTgSession } from '../api/tg'
-import type { AddDownloadRequest } from '../types'
+import type { AddDownloadRequest, ViewerItem } from '../types'
 
 const SETTINGS_KEY = 'orig-hub:settings'
 const ACCOUNTS_KEY = 'orig-hub:accounts'
@@ -100,6 +100,11 @@ interface DownloadState {
   error: string | null
   /** 全局瞬时提示（toast）：按钮/操作失败时的用户可见反馈，避免“点击无反应” */
   toast: string | null
+  /** 全局媒体播放器（模块无关）：打开时整个内容区切换为播放器页（不带任何模块信息），TG/媒体库共用 */
+  viewer: { items: ViewerItem[]; index: number; title?: string } | null
+  openViewer: (v: { items: ViewerItem[]; index: number; title?: string }) => void
+  setViewerIndex: (i: number) => void
+  closeViewer: () => void
   /** 自动分类清单（daemon classify_rules 的去重分类名，如 Videos/Music/...）；供侧边栏「全部文件」下钻 */
   categories: string[]
   /** 当前选中的分类筛选（null = 不过滤）；与 view 配合用于「全部文件」下钻 */
@@ -326,6 +331,12 @@ export const useStore = create<DownloadState>((set, get) => ({
 
   setError: (e) => set({ error: e, toast: e }),
   clearToast: () => set({ toast: null }),
+
+  viewer: null,
+  openViewer: (v) => set({ viewer: v }),
+  setViewerIndex: (i) =>
+    set((s) => (s.viewer ? { viewer: { ...s.viewer, index: i } } : s)),
+  closeViewer: () => set({ viewer: null }),
   setCategoryFilter: (c) => set({ categoryFilter: c }),
 
   /** 启停 TG 插件：写 daemon（拉起/终止 orig-tg 子服务），成功同步开关与运行态 */
