@@ -41,4 +41,6 @@
 | BUG-009 | 自动分类编辑器内置分类名未翻译 | fixed | shell |
 | BUG-010 | 前端 BUILTIN_CLASSIFY 与 daemon 规范分类键不一致 | fixed | shell |
 | BUG-011 | 运行中反复弹出 Terminal 小窗（spawn 控制台命令未隐藏窗口） | fixed | engine+shell |
-| BUG-012 | 无法拉取应用（TG 频道列表失败）且显示已登录但会话失效 | fixed | engine |
+| BUG-012 | 无法拉取应用（TG 频道列表失败）且显示已登录但实际会话失效 | fixed | engine |
+| BUG-013 | 分组（TG 频道列表）加载极慢，单次全量拉取导致前端拿不到分组 | open | engine+shell |
+| BUG-014 | 入库媒体看不到图片/视频，无法选择下载/浏览 | open | engine+shell |
