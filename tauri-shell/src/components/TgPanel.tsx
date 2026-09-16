@@ -13,20 +13,17 @@ import {
   removeTgMonitoredChannel,
   listTgMonitorMessages,
   listTgMessages,
-  listTgStored,
-  clearTgStored,
   listTgDownloaded,
-  getTgConfig,
-  setTgDownloadDir,
   syncTgMonitor,
   downloadTgMessage,
   tgFileUrl,
   tgLocalFileUrl,
   tgThumbUrl,
 } from '../api/tg'
-import type { TgChannel, TgMediaItem, TgMonitoredChannel, TgStoredItem, TgStoredMessage } from '../types'
+import type { TgChannel, TgMediaItem, TgMonitoredChannel, TgStoredMessage } from '../types'
 import { ensureTg, tgSaveConfig } from '../api/tauri'
 import { useStore } from '../store/useStore'
+import { fmtDuration, fmtSize, fmtTime, guessMediaType, type MediaType } from '../lib/tgmedia'
 
 /** 未分组的内部键（避免与真实分组标题冲突） */
 const UNGROUPED = '__ungrouped__'
@@ -34,8 +31,6 @@ const UNGROUPED = '__ungrouped__'
 const ALL_KEY = '__all__'
 /** 右栏媒体历史每页条数 */
 const PAGE_SIZE = 30
-
-type MediaType = 'photo' | 'video' | 'audio' | 'file'
 
 /** 右栏统一消息视图模型（监控本地消息与在线消息共同映射） */
 interface FeedItem {
@@ -61,14 +56,6 @@ interface MiddleChannel {
   title: string
   username?: string
   folder?: string
-}
-
-function guessMediaType(mime?: string): MediaType {
-  const m = (mime || '').toLowerCase()
-  if (m.startsWith('image/')) return 'photo'
-  if (m.startsWith('video/')) return 'video'
-  if (m.startsWith('audio/')) return 'audio'
-  return 'file'
 }
 
 /**
@@ -134,36 +121,6 @@ function fromLive(chatId: number, m: TgMediaItem): FeedItem {
   }
 }
 
-function fmtSize(bytes?: number): string {
-  if (!bytes || bytes <= 0) return '—'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  let v = bytes
-  let i = 0
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024
-    i++
-  }
-  return `${v.toFixed(v >= 100 ? 0 : 1)} ${units[i]}`
-}
-
-function fmtTime(sec?: number): string {
-  if (!sec) return ''
-  const d = new Date(sec * 1000)
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`
-}
-
-/** 秒 → h:mm:ss / m:ss（视频时长徽标用） */
-function fmtDuration(sec?: number): string {
-  if (!sec || sec <= 0) return ''
-  const s = Math.round(sec)
-  const h = Math.floor(s / 3600)
-  const m = Math.floor((s % 3600) / 60)
-  const r = s % 60
-  const p = (n: number) => String(n).padStart(2, '0')
-  return h > 0 ? `${h}:${p(m)}:${p(r)}` : `${m}:${p(r)}`
-}
-
 /**
  * 相册聚合（v0.4.2）：把相邻且同 (chatId, groupId) 的消息合并为一个相册单元。
  * feed 为旧→新顺序；无 groupId 的消息（历史旧行/单条媒体）各自成单元。
@@ -221,7 +178,7 @@ export function TgPanel() {
   const [syncing, setSyncing] = useState(false)
   const [downloading, setDownloading] = useState<Set<number>>(new Set())
   const [downloadedPaths, setDownloadedPaths] = useState<Map<string, string>>(new Map())
-  /** 相册整组缓存进度（键：a-内容流组 / g-缓存库组，值：已完成/总数，v0.4.2） */
+  /** 相册整组缓存进度（键：a-内容流组，值：已完成/总数，v0.4.2；缓存库组进度归 MediaLibraryPanel） */
   const [albumProgress, setAlbumProgress] = useState<Map<string, { done: number; total: number }>>(
     new Map(),
   )
@@ -230,38 +187,16 @@ export function TgPanel() {
   /** 原图/组内浏览遮罩：unit 为相册组（单条自成一组），index 为当前浏览位置 */
   const [lightbox, setLightbox] = useState<{ unit: FeedItem[]; index: number } | null>(null)
 
-  // ---- 缓存库（跨频道聚合视图，v0.4.1） ----
-  const [cachedMode, setCachedMode] = useState(false)
-  const [cachedItems, setCachedItems] = useState<TgStoredItem[]>([])
-  const [cachedLoading, setCachedLoading] = useState(false)
-  const [cachedSearch, setCachedSearch] = useState('')
-  const [cachedHasMore, setCachedHasMore] = useState(false)
-  /** 缓存库内播放遮罩：items 为相册组（单条自成一组），index 为当前播放位置 */
-  const [cachedPlaying, setCachedPlaying] = useState<{
-    items: TgStoredItem[]
-    index: number
-  } | null>(null)
-  /** 倍速状态：lightbox 与缓存库播放遮罩各自维护（VideoBlock 内部自持）；视频重挂载后经 onLoadedMetadata 回填 */
+  /** 倍速状态：lightbox 自持；视频重挂载后经 onLoadedMetadata 回填 */
   const [lbRate, setLbRate] = useState(1)
   const lbVideoRef = useRef<HTMLVideoElement | null>(null)
-  const [cpRate, setCpRate] = useState(1)
-  const cpVideoRef = useRef<HTMLVideoElement | null>(null)
   /** 本地+在线双降级仍失败（如 .mov 浏览器不可解码）→ 遮罩内显示可读提示而非黑屏 */
   const [lbFailed, setLbFailed] = useState(false)
-  const [cpFailed, setCpFailed] = useState(false)
   useEffect(() => {
     if (lbVideoRef.current) lbVideoRef.current.playbackRate = lbRate
   }, [lbRate, lightbox])
-  useEffect(() => {
-    if (cpVideoRef.current) cpVideoRef.current.playbackRate = cpRate
-  }, [cpRate, cachedPlaying])
   // 切换浏览对象时复位解码失败提示
   useEffect(() => setLbFailed(false), [lightbox])
-  useEffect(() => setCpFailed(false), [cachedPlaying])
-  /** 缓存下载目录弹窗 */
-  const [dirOpen, setDirOpen] = useState(false)
-  const [dlDir, setDlDir] = useState('')
-  const [dlDirSaving, setDlDirSaving] = useState(false)
   /** APP 首启配置（api_id/api_hash 由壳持久化，未配置时显示配置卡） */
   const [needConfig, setNeedConfig] = useState(false)
   const [cfgId, setCfgId] = useState('')
@@ -579,26 +514,6 @@ export function TgPanel() {
     return () => window.removeEventListener('keydown', onKey)
   }, [lightbox])
 
-  // 缓存库播放遮罩键盘导航：←/→ 组内切换，Esc 关闭（v0.4.4 补齐，与 lightbox 同构）
-  useEffect(() => {
-    if (!cachedPlaying) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'ArrowLeft') {
-        setCpFailed(false)
-        setCachedPlaying((s) => (s && s.index > 0 ? { ...s, index: s.index - 1 } : s))
-      } else if (e.key === 'ArrowRight') {
-        setCpFailed(false)
-        setCachedPlaying((s) =>
-          s && s.index < s.items.length - 1 ? { ...s, index: s.index + 1 } : s,
-        )
-      } else if (e.key === 'Escape') {
-        setCachedPlaying(null)
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [cachedPlaying])
-
   // ---- 监控增删（本地乐观更新 + 后端持久化） ----
   const refreshMonitored = useCallback(async () => {
     try {
@@ -672,20 +587,6 @@ export function TgPanel() {
     }
   }
 
-  /** 缓存库行：点击缓存成功后刷新该行状态（重查聚合视图，保持口径一致）；返回是否成功 */
-  const downloadStored = async (it: TgStoredItem): Promise<boolean> => {
-    const path = await downloadCore(it.channelId, it.messageId, () => {
-      setCachedItems((prev) =>
-        prev.map((p) =>
-          p.channelId === it.channelId && p.messageId === it.messageId
-            ? { ...p, downloaded: true, filePath: p.filePath ?? 'cached' }
-            : p,
-        ),
-      )
-    })
-    return path !== undefined
-  }
-
   /** 相册整组缓存（v0.4.2）：按组内顺序逐条缓存，进度「缓存中 n/N」；单条失败即中止（错误已提示） */
   const downloadAlbum = async (items: FeedItem[]) => {
     const key = `a-${items[0].chatId}-${items[0].groupId}`
@@ -710,56 +611,9 @@ export function TgPanel() {
     }
   }
 
-  /** 缓存库相册行整组缓存（v0.4.2）：只补未缓存项，进度 n 按组内总数计 */
-  const downloadStoredGroup = async (items: TgStoredItem[]) => {
-    const key = `g-${items[0].channelId}-${items[0].groupId}`
-    let done = items.filter((x) => x.downloaded).length
-    setAlbumProgress((m) => new Map(m).set(key, { done, total: items.length }))
-    try {
-      for (const it of items) {
-        if (cancelReqsRef.current.has(key)) break
-        if (it.downloaded) continue
-        const ok = await downloadStored(it)
-        if (ok) done += 1
-        setAlbumProgress((m) => new Map(m).set(key, { done, total: items.length }))
-        if (!ok) break
-      }
-    } finally {
-      cancelReqsRef.current.delete(key)
-      setAlbumProgress((m) => {
-        const next = new Map(m)
-        next.delete(key)
-        return next
-      })
-    }
-  }
-
   /** 取消整组缓存：置取消标记，循环在下一条间隙停止（当前条由服务端自然完成） */
   const cancelAlbum = (key: string) => {
     cancelReqsRef.current.add(key)
-  }
-
-  /** 清除缓存（缓存库行）：逐条删落盘文件并复位状态，随后重查聚合视图刷新列表。
-   *  同时清内容流状态（s-/l- 两种 key 形式都清），保证缓存库与内容流一致。 */
-  const clearStoredRows = async (items: TgStoredItem[]) => {
-    const done = items.filter((x) => x.downloaded)
-    if (done.length === 0) return
-    try {
-      for (const it of done) {
-        await clearTgStored(it.channelId, it.messageId)
-      }
-      setDownloadedPaths((prev) => {
-        const m = new Map(prev)
-        for (const it of done) {
-          m.delete(`s-${it.channelId}-${it.messageId}`)
-          m.delete(`l-${it.channelId}-${it.messageId}`)
-        }
-        return m
-      })
-      await fetchCached()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
   }
 
   /** 用系统默认播放器打开已下载文件（Tauri 壳内；浏览器调试环境静默失败） */
@@ -773,90 +627,6 @@ export function TgPanel() {
       console.error('openPath failed', e)
     }
   }
-
-  /** 缓存库聚合行（v0.4.2）：同频道同 groupId 聚合为相册行（组内按消息 id 升序），其余单条成行 */
-  const cachedRows = useMemo<{ key: string; items: TgStoredItem[] }[]>(() => {
-    const map = new Map<string, TgStoredItem[]>()
-    const order: string[] = []
-    for (const it of cachedItems) {
-      const k =
-        it.groupId != null
-          ? `g-${it.channelId}-${it.groupId}`
-          : `s-${it.channelId}-${it.messageId}`
-      if (!map.has(k)) {
-        map.set(k, [])
-        order.push(k)
-      }
-      map.get(k)!.push(it)
-    }
-    return order.map((k) => {
-      const items = map.get(k)!
-      if (items.length > 1) items.sort((a, b) => a.messageId - b.messageId)
-      return { key: k, items }
-    })
-  }, [cachedItems])
-
-  // ---- 缓存库：进入视图 / 搜索词变化（300ms 防抖）时重查第一页 ----
-  const fetchCached = useCallback(
-    async (opts?: { beforeId?: number }) => {
-      setCachedLoading(true)
-      try {
-        const page = await listTgStored({
-          q: cachedSearch.trim() || undefined,
-          downloaded: true,
-          limit: 50,
-          beforeId: opts?.beforeId,
-        })
-        setCachedItems((prev) => (opts?.beforeId ? [...prev, ...page.items] : page.items))
-        setCachedHasMore(page.hasMore)
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e))
-      } finally {
-        setCachedLoading(false)
-      }
-    },
-    [cachedSearch, setError],
-  )
-
-  useEffect(() => {
-    if (!cachedMode) return
-    const h = setTimeout(() => void fetchCached(), cachedItems.length ? 300 : 0)
-    return () => clearTimeout(h)
-    // cachedSearch 变化重查；cachedMode 进入时立即查。cachedItems.length 仅作防抖判断不触发。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cachedMode, cachedSearch, fetchCached])
-
-  /** 缓存库加载更早一页（滚到顶部触发） */
-  const loadCachedOlder = useCallback(() => {
-    if (cachedLoading || !cachedHasMore || cachedItems.length === 0) return
-    const oldest = cachedItems[cachedItems.length - 1]
-    void fetchCached({ beforeId: oldest.messageId })
-  }, [cachedLoading, cachedHasMore, cachedItems, fetchCached])
-
-  /** 打开下载目录弹窗：拉当前生效目录 */
-  const openDirDialog = useCallback(async () => {
-    try {
-      const cfg = await getTgConfig()
-      setDlDir(cfg.downloadDir)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-    setDirOpen(true)
-  }, [setError])
-
-  /** 保存下载目录（后端校验可创建并持久化，立即生效） */
-  const saveDownloadDir = useCallback(async () => {
-    setDlDirSaving(true)
-    try {
-      const cfg = await setTgDownloadDir(dlDir.trim())
-      setDlDir(cfg.downloadDir)
-      setDirOpen(false)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setDlDirSaving(false)
-    }
-  }, [dlDir, setError])
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-1 overflow-hidden">
@@ -1002,212 +772,11 @@ export function TgPanel() {
           })}
         </div>
 
-        {/* 缓存库入口：沉底固定（跨频道聚合视图，不随列表滚动） */}
-        <div className="shrink-0 border-t border-border-subtle/60 p-1.5">
-          <button
-            onClick={() => setCachedMode(true)}
-            className={cn(
-              'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12.5px] transition-colors',
-              cachedMode
-                ? 'bg-accent/10 font-medium text-fg-strong'
-                : 'text-fg-mid hover:bg-surface-2/70',
-            )}
-          >
-            <span className="text-[13px]">⬇</span>
-            <span className="min-w-0 flex-1 truncate">{t('tg.cachedLib')}</span>
-          </button>
-        </div>
       </aside>
 
-      {/* ===== 第二列：缓存库 / 分组模式=组内频道列表 / 内容模式=聊天式媒体流（最新在底部） ===== */}
+      {/* ===== 第二列：分组模式=组内频道列表 / 内容模式=聊天式媒体流（最新在底部） ===== */}
       <section className="flex min-w-0 flex-1 flex-col bg-surface/20">
-        {cachedMode ? (
-          <>
-            {/* 缓存库模式：跨频道聚合列表（标题/频道/时长/大小/日期 + 缓存状态），支持检索 */}
-            <header className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-3 py-2.5">
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-7 shrink-0 px-2 text-[11px]"
-                onClick={() => setCachedMode(false)}
-              >
-                ← {t('tg.backToFeed')}
-              </Button>
-              <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold text-fg-strong">
-                ⬇ {t('tg.cachedLib')}
-              </h3>
-              <Button
-                variant="ghost"
-                size="sm"
-                className="h-7 shrink-0 px-2 text-[11px]"
-                onClick={() => void openDirDialog()}
-              >
-                ⌂ {t('tg.downloadDir')}
-              </Button>
-            </header>
-            <div className="border-b border-border-subtle/60 px-3 pb-2 pt-2">
-              <Input
-                value={cachedSearch}
-                onChange={(e) => setCachedSearch(e.target.value)}
-                placeholder={t('tg.searchMedia')}
-                className="h-8 text-xs"
-              />
-            </div>
-            <div
-              className="min-h-0 flex-1 overflow-y-auto p-1.5"
-              onScroll={(e) => {
-                const el = e.currentTarget
-                if (el.scrollTop + el.clientHeight >= el.scrollHeight - 40) loadCachedOlder()
-              }}
-            >
-              {cachedLoading && cachedItems.length === 0 ? (
-                <p className="px-2 py-6 text-center text-xs text-muted">{t('tg.historyLoading')}</p>
-              ) : cachedItems.length === 0 ? (
-                <p className="px-2 py-6 text-center text-xs text-muted">{t('tg.emptyCached')}</p>
-              ) : (
-                cachedRows.map((row) => {
-                  const items = row.items
-                  const it = items[0]
-                  const isGroup = items.length > 1
-                  const prog = isGroup
-                    ? albumProgress.get(`g-${it.channelId}-${it.groupId}`)
-                    : undefined
-                  const isBusy = isGroup ? Boolean(prog) : downloading.has(it.messageId)
-                  const typ = it.type ?? guessMediaType(it.mimeType)
-                  const thumbMsg =
-                    items.find((x) => {
-                      const tp = x.type ?? guessMediaType(x.mimeType)
-                      return tp === 'video' || tp === 'photo'
-                    }) ?? it
-                  const thumbTyp = thumbMsg.type ?? guessMediaType(thumbMsg.mimeType)
-                  const dur = fmtDuration(thumbMsg.duration)
-                  const doneCount = items.filter((x) => x.downloaded).length
-                  const allDone = doneCount === items.length
-                  const caption = items.find((x) => x.caption?.trim())?.caption
-                  return (
-                    <div
-                      key={row.key}
-                      className="flex items-center gap-2 rounded-md px-2 py-2 hover:bg-surface-2/70"
-                    >
-                      {/* 缩略图（视频/照片）；音频/文件用图标；单击打开播放遮罩
-                          （单条/相册组均可：本地流播放，照片看大图） */}
-                      <button
-                        type="button"
-                        onClick={() => setCachedPlaying({ items, index: 0 })}
-                        className="relative h-12 w-20 shrink-0 overflow-hidden rounded-md bg-surface-2"
-                      >
-                        {thumbTyp === 'photo' || thumbTyp === 'video' ? (
-                          <img
-                            src={tgThumbUrl(thumbMsg.channelId, thumbMsg.messageId)}
-                            alt=""
-                            loading="lazy"
-                            onError={(e) => {
-                              e.currentTarget.style.display = 'none'
-                            }}
-                            className="h-full w-full object-cover"
-                          />
-                        ) : (
-                          <span className="flex h-full w-full items-center justify-center text-base">
-                            {thumbTyp === 'audio' ? '🎵' : '📄'}
-                          </span>
-                        )}
-                        {dur && (
-                          <span className="absolute bottom-0.5 right-0.5 rounded bg-black/70 px-1 text-[9px] text-white">
-                            {dur}
-                          </span>
-                        )}
-                      </button>
-                      {/* 标题 + 元信息（相册行带「相册 · N 项」角标） */}
-                      <div className="min-w-0 flex-1">
-                        <p className="flex items-center gap-1.5 text-[12.5px] font-medium text-fg-strong">
-                          <span className="min-w-0 truncate">{caption || `#${it.messageId}`}</span>
-                          {isGroup && (
-                            <Chip tone="accent">{t('tg.albumN', { n: items.length })}</Chip>
-                          )}
-                        </p>
-                        <p className="truncate text-[10px] text-muted">
-                          {it.channelTitle ?? `#${it.channelId}`} ·{' '}
-                          {fmtSize(items.reduce((s, x) => s + (x.size ?? 0), 0))} ·{' '}
-                          {fmtTime(it.date ?? it.createdAt)}
-                        </p>
-                      </div>
-                      {/* 状态即按钮（v0.4.3）：⬇缓存 → 缓存中(文字+取消) → ▶播放/▶查看/▶继续(n/N)；
-                          清除为固定次级项。全部 outline h-6 同构，无徽标混排。 */}
-                      <div className="flex shrink-0 items-center gap-1.5">
-                        {isBusy ? (
-                          <>
-                            <span className="text-[10px] text-muted">
-                              {t('tg.cachingProgress', {
-                                n: prog?.done ?? 0,
-                                total: prog?.total ?? items.length,
-                              })}
-                            </span>
-                            {isGroup && (
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                className="h-6 px-2 text-[10px]"
-                                onClick={() => cancelAlbum(`g-${it.channelId}-${it.groupId}`)}
-                              >
-                                {t('tg.cancel')}
-                              </Button>
-                            )}
-                          </>
-                        ) : allDone ? (
-                          <>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              className="h-6 px-2 text-[10px]"
-                              onClick={() => setCachedPlaying({ items, index: 0 })}
-                            >
-                              {isGroup || typ === 'video' || typ === 'audio'
-                                ? t('tg.play')
-                                : t('tg.view')}
-                            </Button>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              className="h-6 px-2 text-[10px]"
-                              onClick={() => void clearStoredRows(items)}
-                            >
-                              {t('tg.clearRow')}
-                            </Button>
-                          </>
-                        ) : (
-                          <>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              className="h-6 px-2 text-[10px]"
-                              onClick={() =>
-                                isGroup ? void downloadStoredGroup(items) : void downloadStored(it)
-                              }
-                            >
-                              {doneCount > 0
-                                ? `${t('tg.continue')} ${doneCount}/${items.length}`
-                                : t('tg.download')}
-                            </Button>
-                            {doneCount > 0 && (
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                className="h-6 px-2 text-[10px]"
-                                onClick={() => void clearStoredRows(items)}
-                              >
-                                {t('tg.clearRow')}
-                              </Button>
-                            )}
-                          </>
-                        )}
-                      </div>
-                    </div>
-                  )
-                })
-              )}
-            </div>
-          </>
-        ) : !detail && groupMode !== null && activeGroup ? (
+        {!detail && groupMode !== null && activeGroup ? (
           <>
             {/* 分组模式：组内频道列表（仅添加/取消监控，不浏览内容） */}
             <header className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-3 py-2.5">
@@ -1368,40 +937,6 @@ export function TgPanel() {
         )}
       </section>
 
-      {/* 下载目录弹窗：查看/修改缓存落地目录（持久化，立即生效） */}
-      {dirOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6"
-          onClick={() => setDirOpen(false)}
-        >
-          <div
-            className="w-full max-w-md rounded-lg border border-border-subtle bg-surface p-4 shadow-lg"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h4 className="text-[13px] font-semibold text-fg-strong">⌂ {t('tg.downloadDir')}</h4>
-            <p className="mt-1 text-[11px] text-muted">{t('tg.downloadDirTip')}</p>
-            <Input
-              value={dlDir}
-              onChange={(e) => setDlDir(e.target.value)}
-              className="mt-3 h-8 text-xs"
-              spellCheck={false}
-            />
-            <div className="mt-4 flex justify-end gap-2">
-              <Button variant="outline" size="sm" className="h-8 px-3 text-xs" onClick={() => setDirOpen(false)}>
-                {t('tg.cancel')}
-              </Button>
-              <Button
-                size="sm"
-                className="h-8 px-3 text-xs"
-                disabled={dlDirSaving || !dlDir.trim()}
-                onClick={() => void saveDownloadDir()}
-              >
-                {t('tg.save')}
-              </Button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* 原图/相册组内浏览遮罩（v0.4.2）：多元素时 ‹ › 切换 + n/N 计数，←/→ 键盘导航；
           v0.4.4 固定 ✕ 关闭按钮（全屏遮罩必须始终有可见退出，不能只靠点背景） */}
@@ -1502,107 +1037,6 @@ export function TgPanel() {
         </div>
       )}
 
-      {/* 缓存库本地播放遮罩：优先本地文件流，失败降级在线流；相册组内 ‹ › 切换（v0.4.2）；
-          v0.4.4 固定 ✕ 关闭按钮 + Esc 键，解码失败露出可读提示 */}
-      {cachedPlaying && (
-        <div
-          className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/90 p-6"
-          onClick={() => setCachedPlaying(null)}
-        >
-          <button
-            type="button"
-            aria-label={t('tg.close')}
-            onClick={() => setCachedPlaying(null)}
-            className="absolute right-4 top-4 z-10 flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-xl text-white hover:bg-white/20"
-          >
-            ✕
-          </button>
-          {(() => {
-            const cur = cachedPlaying.items[cachedPlaying.index]
-            const many = cachedPlaying.items.length > 1
-            const typ = cur.type ?? guessMediaType(cur.mimeType)
-            return (
-              <div className="flex flex-col items-center" onClick={(e) => e.stopPropagation()}>
-                <div className="relative flex items-center justify-center">
-                  {typ !== 'photo' && <PlaybackSpeed rate={cpRate} onRate={setCpRate} />}
-                  {many && cachedPlaying.index > 0 && (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setCachedPlaying((s) => (s ? { ...s, index: s.index - 1 } : s))
-                      }
-                      className="absolute -left-14 flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-xl text-white hover:bg-white/20"
-                    >
-                      ‹
-                    </button>
-                  )}
-                  {typ === 'photo' ? (
-                    <img
-                      key={cur.messageId}
-                      src={tgLocalFileUrl(cur.channelId, cur.messageId)}
-                      alt={cur.caption || ''}
-                      className="max-h-[78vh] max-w-[80vw] rounded-lg object-contain"
-                      onError={(e) => {
-                        // 本地缺失 → 降级在线流仅一次；在线也失败时终止，避免 onError 无限重试
-                        const img = e.currentTarget
-                        if (!img.dataset.fallback) {
-                          img.dataset.fallback = '1'
-                          img.src = tgFileUrl(cur.channelId, cur.messageId)
-                        } else {
-                          setCpFailed(true)
-                        }
-                      }}
-                    />
-                  ) : (
-                    <video
-                      key={cur.messageId}
-                      ref={cpVideoRef}
-                      src={tgLocalFileUrl(cur.channelId, cur.messageId)}
-                      controls
-                      autoPlay
-                      preload="auto"
-                      onLoadedMetadata={(e) => {
-                        e.currentTarget.playbackRate = cpRate
-                      }}
-                      className="max-h-[82vh] max-w-[92vw] rounded-lg bg-black"
-                      onError={(e) => {
-                        const v = e.currentTarget
-                        if (!v.dataset.fallback) {
-                          v.dataset.fallback = '1'
-                          v.src = tgFileUrl(cur.channelId, cur.messageId)
-                        } else {
-                          setCpFailed(true)
-                        }
-                      }}
-                    />
-                  )}
-                  {many && cachedPlaying.index < cachedPlaying.items.length - 1 && (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setCachedPlaying((s) => (s ? { ...s, index: s.index + 1 } : s))
-                      }
-                      className="absolute -right-14 flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-xl text-white hover:bg-white/20"
-                    >
-                      ›
-                    </button>
-                  )}
-                </div>
-                {cpFailed && (
-                  <p className="mt-3 rounded-md border border-white/20 bg-white/10 px-3 py-1.5 text-center text-xs text-white/85">
-                    {t('tg.decodeFail')}
-                  </p>
-                )}
-                <p className="mt-3 max-w-2xl truncate text-center text-xs text-white/80">
-                  {cur.caption?.trim() || `#${cur.messageId}`}
-                  {cur.channelTitle ? ` · ${cur.channelTitle}` : ''}
-                  {many ? ` · ${cachedPlaying.index + 1}/${cachedPlaying.items.length}` : ''}
-                </p>
-              </div>
-            )
-          })()}
-        </div>
-      )}
         </>
       )}
     </div>
@@ -1758,15 +1192,17 @@ function AlbumBubble(props: {
   return (
     <div className="flex flex-col">
       <div className="max-w-[88%] rounded-2xl rounded-tl-md border border-border-subtle bg-surface p-2.5 shadow-sm">
-        {/* 角标行：相册标识 + 缓存状态 + 时间（角标与操作按钮同构 outline 风格，v0.4.4） */}
-        <div className="mb-1.5 flex items-center gap-2">
-          <Chip tone="accent">{t('tg.albumN', { n: items.length })}</Chip>
+        {/* 状态行：相册计数 + 缓存进度（纯文本弱化，文字归文字、按钮归按钮） */}
+        <div className="mb-1.5 flex items-center gap-2 text-[10px]">
+          <span className="font-medium text-accent">{t('tg.albumN', { n: items.length })}</span>
           {allDone ? (
-            <Chip tone="success">{t('tg.downloaded')}</Chip>
+            <span className="text-success">{t('tg.downloaded')}</span>
           ) : downloadedCount > 0 ? (
-            <Chip>{t('tg.albumPartial', { n: downloadedCount, total: items.length })}</Chip>
+            <span className="text-muted">
+              {t('tg.albumPartial', { n: downloadedCount, total: items.length })}
+            </span>
           ) : null}
-          <span className="ml-auto text-[10px] text-muted">{fmtTime(items[0].date)}</span>
+          <span className="ml-auto text-muted">{fmtTime(items[0].date)}</span>
         </div>
 
         {/* 组内 2 列网格：点击任一格进入组内浏览 */}

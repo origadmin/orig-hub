@@ -8,6 +8,7 @@ import { DirectoryPicker } from './DirectoryPicker'
 import { InterfacePickerDialog, type InterfaceSelection } from './InterfacePickerDialog'
 import { AccountsPanel } from './AccountsPanel'
 import { getConfig, listInterfaces, saveClassifyConfig, saveProxyConfig, verifyProxy } from '../api/daemon'
+import { clearTgCache } from '../api/tg'
 import { useStore } from '../store/useStore'
 import { useTranslation } from '../i18n'
 import { cn } from '../lib/utils'
@@ -102,6 +103,10 @@ export function SettingsPanel() {
   // 分类规则保存状态
   const [classifyBusy, setClassifyBusy] = useState(false)
   const [classifyErr, setClassifyErr] = useState<string | null>(null)
+  // 清理 TG 缓存状态
+  const [clearBusy, setClearBusy] = useState(false)
+  const [clearMsg, setClearMsg] = useState<string | null>(null)
+  const [clearOk, setClearOk] = useState(false)
 
   // 代理配置编辑态
   const [proxyMode, setProxyMode] = useState<'direct' | 'system' | 'custom'>('direct')
@@ -203,6 +208,23 @@ export function SettingsPanel() {
       setClassifyErr(e instanceof Error ? e.message : String(e))
     } finally {
       setClassifyBusy(false)
+    }
+  }
+
+  /** 清理 TG 缓存（缩略图/临时媒体）：二次确认 + 结果提示 */
+  const handleClearCache = async () => {
+    if (!window.confirm(t('tg.clearCacheConfirm'))) return
+    setClearBusy(true)
+    setClearMsg(null)
+    try {
+      await clearTgCache()
+      setClearOk(true)
+      setClearMsg(t('tg.clearCacheDone'))
+    } catch (e) {
+      setClearOk(false)
+      setClearMsg(`${t('tg.clearCacheFail')}${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setClearBusy(false)
     }
   }
 
@@ -772,6 +794,64 @@ export function SettingsPanel() {
 
                 <div className="h-px bg-border-subtle/60" />
 
+                {/* TG 模块：启停开关 + 状态 + 清理缓存（属「通用」，不归「账号」） */}
+                <div>
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="min-w-0">
+                      <p className="text-[13px] font-medium text-fg-strong">{t('tg.toggle')}</p>
+                      <p className="mt-0.5 text-[11px] text-muted">{t('tg.toggleHint')}</p>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      <span
+                        className={cn(
+                          'text-[11px]',
+                          tgRunning ? 'text-success' : 'text-muted',
+                        )}
+                      >
+                        {tgEnabled
+                          ? tgRunning
+                            ? t('tg.running')
+                            : t('tg.starting')
+                          : t('tg.stopped')}
+                      </span>
+                      <Switch
+                        checked={tgEnabled}
+                        onChange={(v) => {
+                          setTgEnabled(v)
+                        }}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="mt-3 flex items-center justify-between gap-4 rounded-lg bg-surface-2/40 px-3 py-2.5">
+                    <div className="min-w-0">
+                      <p className="text-[13px] font-medium text-fg-strong">{t('tg.clearCache')}</p>
+                      <p className="mt-0.5 text-[11px] text-muted">{t('tg.clearCacheHint')}</p>
+                    </div>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      className="shrink-0"
+                      disabled={clearBusy}
+                      onClick={handleClearCache}
+                    >
+                      {clearBusy ? t('settings.saving') : t('tg.clearCache')}
+                    </Button>
+                  </div>
+                  {clearMsg && (
+                    <p
+                      className={cn(
+                        'mt-1.5 text-[11px]',
+                        clearOk ? 'text-success' : 'text-danger',
+                      )}
+                    >
+                      {clearMsg}
+                    </p>
+                  )}
+                </div>
+
+                <div className="h-px bg-border-subtle/60" />
+
                 {/* 启动行为 */}
                 <div className="flex items-center justify-between gap-4">
                   <div className="min-w-0">
@@ -799,42 +879,7 @@ export function SettingsPanel() {
           )}
 
           {activeTab === 'accounts' && (
-            <div className="mx-auto max-w-2xl space-y-6">
-              <div>
-                <h3 className="text-lg font-semibold text-fg-strong">{t('accounts.heading')}</h3>
-                <p className="mt-0.5 text-xs text-muted">{t('accounts.sub')}</p>
-              </div>
-
-              {/* TG 可选插件：daemon 拉起/终止 orig-tg 子服务；关闭时隐藏 TG 模块 */}
-              <div className="flex items-center justify-between gap-4 rounded-xl border border-border-subtle bg-surface p-5">
-                <div className="min-w-0">
-                  <p className="text-[13px] font-medium text-fg-strong">{t('tg.toggle')}</p>
-                  <p className="mt-0.5 text-[11px] text-muted">{t('tg.toggleHint')}</p>
-                </div>
-                <div className="flex shrink-0 items-center gap-2">
-                  <span
-                    className={cn(
-                      'text-[11px]',
-                      tgRunning ? 'text-success' : 'text-muted',
-                    )}
-                  >
-                    {tgEnabled
-                      ? tgRunning
-                        ? t('tg.running')
-                        : t('tg.starting')
-                      : t('tg.stopped')}
-                  </span>
-                  <Switch
-                    checked={tgEnabled}
-                    onChange={(v) => {
-                      setTgEnabled(v)
-                    }}
-                  />
-                </div>
-              </div>
-
-              <AccountsPanel />
-            </div>
+            <AccountsPanel />
           )}
 
           {activeTab === 'about' && (

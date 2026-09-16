@@ -3,8 +3,10 @@ import type {
   TgDiag,
   TgFolder,
   TgMediaItem,
+  TgMessagePage,
   TgMonitoredChannel,
   TgSession,
+  TgStoredItem,
   TgStoredMessage,
 } from '../types'
 
@@ -74,9 +76,39 @@ export function tgLogs(lines = 50): Promise<string[]> {
   return request(`/api/tg/logs?lines=${lines}`)
 }
 
-/** GET /api/tg/dialogs — 订阅频道枚举（需已授权） */
-export function listTgDialogs(): Promise<TgChannel[]> {
-  return request('/api/tg/dialogs')
+/** 分页枚举结果（GET /api/tg/dialogs，v0.4.0 缓存优先 + 后台扫描） */
+export interface TgDialogsPage {
+  items: TgChannel[]
+  total: number
+  hasMore: boolean
+  /** 后台是否正在全量扫描会话缓存（true 时前端可轮询） */
+  scanning?: boolean
+}
+
+/** GET /api/tg/dialogs?limit=&offset=&refresh= — 订阅频道（缓存优先，需已授权）。
+ * v0.4.0：永远先读本地缓存分页；缓存空/refresh 时后台全量扫描，扫描中 scanning=true。
+ * 兼容旧版平铺数组返回。 */
+export async function listTgDialogs(opts?: {
+  limit?: number
+  offset?: number
+  refresh?: boolean
+}): Promise<TgDialogsPage> {
+  const q = new URLSearchParams()
+  q.set('limit', String(opts?.limit ?? 200))
+  if (opts?.offset) q.set('offset', String(opts.offset))
+  if (opts?.refresh) q.set('refresh', '1')
+  const res = await request<unknown>(`/api/tg/dialogs?${q}`)
+  if (Array.isArray(res)) {
+    // 兼容旧返回（平铺数组）
+    return { items: res as TgChannel[], total: res.length, hasMore: false, scanning: false }
+  }
+  const page = res as Partial<TgDialogsPage>
+  return {
+    items: Array.isArray(page.items) ? page.items : [],
+    total: Number(page.total) || 0,
+    hasMore: Boolean(page.hasMore),
+    scanning: Boolean(page.scanning),
+  }
 }
 
 /** GET /api/tg/folders — 用户自定义分组（需已授权） */
@@ -109,14 +141,28 @@ export function removeTgMonitoredChannel(channelId: number | string): Promise<{ 
   )
 }
 
-/** GET /api/tg/monitor/messages?channelId=..&limit=.. — 某频道已入库媒体（新→旧） */
-export function listTgMonitorMessages(
+/** GET /api/tg/monitor/messages?channelId=..&limit=..&beforeId=..
+ *  本地真列表（新→旧）：本地不足一页时后端向 TG 回补并入库；网络失败降级只回本地。
+ *  beforeId 为历史游标（exclusive）：只取 messageId < beforeId 的一页。兼容旧平铺数组。 */
+export async function listTgMonitorMessages(
   channelId: number | string,
-  limit = 100,
-): Promise<TgStoredMessage[]> {
-  return request(
-    `/api/tg/monitor/messages?channelId=${encodeURIComponent(String(channelId))}&limit=${limit}`,
-  )
+  opts?: { limit?: number; beforeId?: number },
+): Promise<TgMessagePage<TgStoredMessage>> {
+  const limit = opts?.limit ?? 30
+  const q = new URLSearchParams({
+    channelId: String(channelId),
+    limit: String(limit),
+  })
+  if (opts?.beforeId !== undefined) q.set('beforeId', String(opts.beforeId))
+  const res = await request<unknown>(`/api/tg/monitor/messages?${q}`)
+  if (Array.isArray(res)) {
+    return { items: res as TgStoredMessage[], hasMore: res.length >= limit }
+  }
+  const page = res as Partial<TgMessagePage<TgStoredMessage>>
+  return {
+    items: Array.isArray(page.items) ? page.items : [],
+    hasMore: Boolean(page.hasMore),
+  }
 }
 
 /** POST /api/tg/monitor/sync — 手动触发一轮增量同步 */
@@ -124,9 +170,26 @@ export function syncTgMonitor(): Promise<{ added: number }> {
   return request('/api/tg/monitor/sync', { method: 'POST' })
 }
 
-/** GET /api/tg/messages/:chat_id?limit= — 媒体历史（需已授权） */
-export function listTgMessages(chatId: number | string, limit = 100): Promise<TgMediaItem[]> {
-  return request(`/api/tg/messages/${encodeURIComponent(String(chatId))}?limit=${limit}`)
+/** GET /api/tg/messages/:chat_id?limit=&beforeId= — 在线媒体历史（新→旧，需已授权）。
+ *  v0.4.0：后端只返回媒体消息并支持 beforeId 历史游标翻页。兼容旧平铺数组。 */
+export async function listTgMessages(
+  chatId: number | string,
+  opts?: { limit?: number; beforeId?: number },
+): Promise<TgMessagePage<TgMediaItem>> {
+  const limit = opts?.limit ?? 30
+  const q = new URLSearchParams({ limit: String(limit) })
+  if (opts?.beforeId !== undefined) q.set('beforeId', String(opts.beforeId))
+  const res = await request<unknown>(
+    `/api/tg/messages/${encodeURIComponent(String(chatId))}?${q}`,
+  )
+  if (Array.isArray(res)) {
+    return { items: res as TgMediaItem[], hasMore: res.length >= limit }
+  }
+  const page = res as Partial<TgMessagePage<TgMediaItem>>
+  return {
+    items: Array.isArray(page.items) ? page.items : [],
+    hasMore: Boolean(page.hasMore),
+  }
 }
 
 /** POST /api/tg/download/:chat_id/:message_id — 下载媒体到本地（需已授权） */
@@ -139,4 +202,82 @@ export function downloadTgMessage(
     method: 'POST',
     body: JSON.stringify(dir ? { dir } : {}),
   })
+}
+
+/** GET /api/tg/file/{chat}/{msg} — 媒体在线流（照片→JPEG；视频→Range）。
+ * 供 <img>/<video> 直接引用实现点看/点放，不预下载、不过度缓存。 */
+export function tgFileUrl(chatId: number | string, messageId: number | string): string {
+  return `${TG_BASE}/api/tg/file/${encodeURIComponent(String(chatId))}/${encodeURIComponent(String(messageId))}`
+}
+
+/** GET /api/tg/thumb/{chat}/{msg} — 轻量缩略图（<=480px JPEG，列表海报专用）。
+ *  后端优先返回 TL 内嵌 Cached 缩略图（秒回）；无缩略图时该 URL 返回 404。 */
+export function tgThumbUrl(chatId: number | string, messageId: number | string): string {
+  return `${TG_BASE}/api/tg/thumb/${encodeURIComponent(String(chatId))}/${encodeURIComponent(String(messageId))}`
+}
+
+/** GET /api/tg/config — 运行时配置（缓存下载目录等） */
+export async function getTgConfig(): Promise<{ downloadDir: string }> {
+  return request<{ downloadDir: string }>('/api/tg/config')
+}
+
+/** PUT /api/tg/config — 更新缓存下载目录（持久化到 app_setting，立即生效） */
+export async function setTgDownloadDir(downloadDir: string): Promise<{ downloadDir: string }> {
+  return request<{ downloadDir: string }>('/api/tg/config', {
+    method: 'PUT',
+    body: JSON.stringify({ downloadDir }),
+  })
+}
+
+/** GET /api/tg/local/{chat}/{msg} — 已缓存文件的本地流（支持 Range，不回源 TG）。
+ *  供 <video> 直接引用；未缓存/文件缺失时返回 404，前端降级在线流。 */
+export function tgLocalFileUrl(chatId: number | string, messageId: number | string): string {
+  return `${TG_BASE}/api/tg/local/${encodeURIComponent(String(chatId))}/${encodeURIComponent(String(messageId))}`
+}
+
+/** GET /api/tg/stored?q=&type=&downloaded=1&beforeId=&limit= — 缓存库跨频道聚合视图（新→旧） */
+export async function listTgStored(
+  opts?: { q?: string; mediaType?: string; downloaded?: boolean; limit?: number; beforeId?: number },
+): Promise<TgMessagePage<TgStoredItem>> {
+  const limit = opts?.limit ?? 50
+  const q = new URLSearchParams({ limit: String(limit) })
+  if (opts?.q) q.set('q', opts.q)
+  if (opts?.mediaType) q.set('type', opts.mediaType)
+  if (opts?.downloaded) q.set('downloaded', '1')
+  if (opts?.beforeId !== undefined) q.set('beforeId', String(opts.beforeId))
+  const res = await request<unknown>(`/api/tg/stored?${q}`)
+  const page = res as Partial<TgMessagePage<TgStoredItem>>
+  return {
+    items: Array.isArray(page.items) ? page.items : [],
+    hasMore: Boolean(page.hasMore),
+  }
+}
+
+/** POST /api/tg/cache/clear — 清理 TG 缓存（缩略图/临时媒体）。
+ * 若后端尚未实现该端点将返回 4xx，前端据此兜底提示。 */
+export async function clearTgCache(): Promise<{ ok: boolean }> {
+  return request('/api/tg/cache/clear', { method: 'POST' })
+}
+
+/** DELETE /api/tg/stored/{chat}/{msg} — 清除单条消息的本地缓存
+ * （删落盘文件副本 + 复位 downloaded；库内记录保留，可重新缓存） */
+export async function clearTgStored(
+  chatId: number | string,
+  messageId: number | string,
+): Promise<{ ok: boolean; removed: boolean }> {
+  return request(
+    `/api/tg/stored/${encodeURIComponent(String(chatId))}/${encodeURIComponent(String(messageId))}`,
+    { method: 'DELETE' },
+  )
+}
+
+/** GET /api/tg/downloaded/{chat} — 该频道已缓存清单：{messageId: filePath}。
+ *  DB 为唯一真相源，feed/缓存库加载时合并，保证刷新后缓存状态准确。 */
+export async function listTgDownloaded(
+  chatId: number | string,
+): Promise<Record<string, string>> {
+  const res = await request<{ downloaded?: Record<string, string> }>(
+    `/api/tg/downloaded/${encodeURIComponent(String(chatId))}`,
+  )
+  return res.downloaded ?? {}
 }

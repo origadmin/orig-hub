@@ -2,7 +2,7 @@ import { useState, type JSX } from 'react'
 import { cn } from '../lib/utils'
 import { useTranslation } from '../i18n'
 
-export type ViewId = 'all' | 'downloading' | 'completed' | 'tg' | 'settings'
+export type ViewId = 'all' | 'downloading' | 'completed' | 'media' | 'tg' | 'settings'
 
 interface Props {
   view: ViewId
@@ -35,6 +35,15 @@ const NAV_ITEMS: { id: ViewId; labelKey: string; icon: JSX.Element }[] = [
     icon: (
       <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+      </svg>
+    ),
+  },
+  {
+    id: 'media',
+    labelKey: 'nav.media',
+    icon: (
+      <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v12a1.5 1.5 0 001.5 1.5zm10.5-11.25h.008v.008h-.008V8.25zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" />
       </svg>
     ),
   },

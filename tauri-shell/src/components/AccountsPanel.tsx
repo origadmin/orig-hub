@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Button } from './ui/button'
 import { Badge } from './ui/badge'
 import { Input } from './ui/input'
@@ -31,8 +31,14 @@ function normalizeE164(countryCode: string, national: string): string {
  */
 export function AccountsPanel() {
   const { t } = useTranslation()
-  const { accounts, setTgAccount, setError } = useStore()
+  const { accounts, setTgAccount, setError, refreshTgSession } = useStore()
   const tg = accounts.tg
+
+  // 挂载时校准一次登录态：后端会话已 Authorized（含持久化加载的会话）则自动恢复为「已绑定」。
+  // refreshTgSession 幂等——只在绑定态或 phase 变化时才写 store；后端不可达时保持现状并静默。
+  useEffect(() => {
+    refreshTgSession().catch(() => {})
+  }, [refreshTgSession])
 
   // 登录流程本地状态
   const [step, setStep] = useState<LoginStep>('idle')

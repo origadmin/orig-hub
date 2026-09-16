@@ -142,6 +142,18 @@ export interface TgMediaItem {
   caption?: string
   mimeType?: string
   size?: number
+  /** 媒体类型（v0.4.0：后端只返回媒体消息，photo/video/audio/file） */
+  type?: 'photo' | 'video' | 'audio' | 'file'
+  /** 原始文件名 */
+  fileName?: string
+  /** 消息在 TG 上的原始发布时间（Unix 秒） */
+  date?: number
+  /** 媒体时长（秒；视频/音频才有，v0.4.1） */
+  duration?: number
+  /** TG 相册分组 ID（grouped_id；同组消息构成一个相册，v0.4.2） */
+  groupId?: number
+  /** 是否含媒体附件 */
+  hasMedia?: boolean
 }
 
 /** 被监控频道（GET/POST/DELETE /api/tg/monitor/channels） */
@@ -161,6 +173,29 @@ export interface TgStoredMessage {
   size?: number
   downloaded: boolean
   createdAt: number
+  /** 媒体类型（v0.4.0 新列；历史旧行可能缺失，用 mimeType 兜底判型） */
+  type?: 'photo' | 'video' | 'audio' | 'file'
+  /** TG 原始发布时间（Unix 秒；历史旧行可能缺失，回退 createdAt） */
+  date?: number
+  /** 媒体时长（秒；视频/音频才有，v0.4.1） */
+  duration?: number
+  /** 已缓存文件绝对路径（downloaded 时有值，v0.4.1） */
+  filePath?: string
+  /** TG 相册分组 ID（grouped_id；同组消息构成一个相册，v0.4.2） */
+  groupId?: number
+}
+
+/** 缓存库聚合行（GET /api/tg/stored）：媒体消息 + 所属频道标题 */
+export interface TgStoredItem extends TgStoredMessage {
+  /** 所属频道标题（频道取消监控后为 undefined） */
+  channelTitle?: string
+}
+
+/** 媒体历史分页响应（messages / monitor/messages 统一） */
+export interface TgMessagePage<T> {
+  items: T[]
+  /** 是否还可能有更早的历史页 */
+  hasMore: boolean
 }
 
 /** orig-tg 运行诊断快照（GET /api/tg/diag） */

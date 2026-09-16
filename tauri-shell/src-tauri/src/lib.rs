@@ -267,6 +267,235 @@ fn stop_daemon(state: tauri::State<'_, DaemonState>) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// orig-tg sidecar（Telegram REST 服务，9877）：与 daemon 同模式由外壳托管。
+// 凭证存 appDataDir/tg/config.json（APP 内配置一次，无需手动环境变量）；
+// session/store/下载目录固定在 appDataDir/tg/ 下。
+// ---------------------------------------------------------------------------
+
+/// 侧边进程名（与 tauri.conf.json externalBin 对应）。
+const TG_BIN: &str = "orig-tg";
+/// orig-tg 默认监听端口。
+const TG_PORT: u16 = 9877;
+
+struct TgState {
+    /// 由本外壳拉起的 orig-tg 子进程句柄（复用已运行实例时为 None）。
+    child: Mutex<Option<CommandChild>>,
+}
+
+/// 检查 orig-tg 是否真正可用：TCP 连上且 GET /health 返回 200。
+fn tg_alive() -> bool {
+    let Ok(mut stream) = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{TG_PORT}").parse().unwrap(),
+        Duration::from_millis(300),
+    ) else {
+        return false;
+    };
+    stream.set_read_timeout(Some(Duration::from_millis(800))).ok();
+    stream.set_write_timeout(Some(Duration::from_millis(800))).ok();
+    let req = format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{TG_PORT}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    let n = match stream.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    if n == 0 {
+        return false;
+    }
+    let head = String::from_utf8_lossy(&buf[..n]);
+    head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+}
+
+/// 检查 9877 上的服务是否为「真实客户端」模式。
+/// 未配置凭证时手动/残留启动的 orig-tg 会回退成 dummy 假客户端（假登录、假验证码），
+/// 端口活着但 api_mode 不是 real 的实例一律视为无效，需要杀掉重拉。
+fn tg_service_real() -> bool {
+    let Ok(mut stream) = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{TG_PORT}").parse().unwrap(),
+        Duration::from_millis(300),
+    ) else {
+        return false;
+    };
+    stream.set_read_timeout(Some(Duration::from_millis(1500))).ok();
+    stream.set_write_timeout(Some(Duration::from_millis(800))).ok();
+    let req = format!("GET /api/tg/diag HTTP/1.1\r\nHost: 127.0.0.1:{TG_PORT}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf);
+    text.contains("\"api_mode\":\"real\"") || text.contains("\"api_mode\": \"real\"")
+}
+
+/// orig-tg 启动配置（APP 数据目录内，UI 配置一次）。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TgLaunchConfig {
+    api_id: String,
+    api_hash: String,
+    #[serde(default = "default_tg_proxy")]
+    proxy: String,
+}
+
+fn default_tg_proxy() -> String {
+    "socks5://127.0.0.1:7897".into()
+}
+
+fn tg_config_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("tg")
+        .join("config.json"))
+}
+
+/// 读取配置；文件不存在返回 None（= 未配置，前端出配置表单）。
+fn read_tg_config(app: &tauri::AppHandle) -> Result<Option<TgLaunchConfig>, String> {
+    let path = tg_config_path(app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map(Some).map_err(|e| e.to_string())
+}
+
+fn write_tg_config(app: &tauri::AppHandle, cfg: &TgLaunchConfig) -> Result<(), String> {
+    let path = tg_config_path(app)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let text = serde_json::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| e.to_string())
+}
+
+/// 拉起 orig-tg sidecar（凭证/路径全部注入 env），阻塞直到 health 就绪。
+fn spawn_tg(app: &tauri::AppHandle) -> Result<CommandChild, String> {
+    let cfg = read_tg_config(app)?.ok_or("not-configured")?;
+    if cfg.api_id.trim().is_empty() || cfg.api_hash.trim().is_empty() {
+        return Err("not-configured".into());
+    }
+    let data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("tg");
+    std::fs::create_dir_all(&data).map_err(|e| e.to_string())?;
+    let dl_dir = data.join("downloads");
+    std::fs::create_dir_all(&dl_dir).map_err(|e| e.to_string())?;
+
+    let sidecar = app
+        .shell()
+        .sidecar(TG_BIN)
+        .map_err(|e| format!("sidecar resolve failed: {e}"))?;
+    let (mut rx, child) = sidecar
+        .env("ORIG_TG_API_ID", cfg.api_id.trim())
+        .env("ORIG_TG_API_HASH", cfg.api_hash.trim())
+        .env(
+            "ORIG_TG_SESSION",
+            data.join("session.session").to_string_lossy().to_string(),
+        )
+        .env(
+            "ORIG_TG_DB",
+            data.join("store.db").to_string_lossy().to_string(),
+        )
+        .env(
+            "ORIG_TG_DOWNLOAD_DIR",
+            dl_dir.to_string_lossy().to_string(),
+        )
+        .env("ORIG_TG_PROXY", cfg.proxy.trim())
+        .spawn()
+        .map_err(|e| format!("sidecar spawn failed: {e}"))?;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        // 必须是 real 模式才算就绪：凭证非法时 orig-tg 会回退 dummy（假客户端），
+        // 若只等 health 会假成功，用户将在假客户端上走登录。
+        if tg_alive() && tg_service_real() {
+            return Ok(child);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = rx.try_recv();
+    }
+    Err("orig-tg did not become ready (real mode) within 8s".into())
+}
+
+/// 前端查询：orig-tg 是否存活 + 端口 + 是否本壳托管。
+#[tauri::command]
+fn tg_status(state: tauri::State<'_, TgState>) -> serde_json::Value {
+    serde_json::json!({
+        "alive": tg_alive(),
+        "port": TG_PORT,
+        "managed": state.child.lock().unwrap().is_some(),
+    })
+}
+
+/// 前端命令：保存配置并（重）启动 orig-tg。
+#[tauri::command]
+fn tg_save_config(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, TgState>,
+    api_id: String,
+    api_hash: String,
+    proxy: String,
+) -> Result<serde_json::Value, String> {
+    if api_id.trim().is_empty() || api_hash.trim().is_empty() {
+        return Err("api_id / api_hash is empty".into());
+    }
+    write_tg_config(
+        &app,
+        &TgLaunchConfig {
+            api_id: api_id.trim().into(),
+            api_hash: api_hash.trim().into(),
+            proxy: if proxy.trim().is_empty() { default_tg_proxy() } else { proxy.trim().into() },
+        },
+    )?;
+    // 先停掉由本壳托管的实例与端口残留，再以新配置拉起。
+    if let Some(child) = state.child.lock().unwrap().take() {
+        let _ = child.kill();
+    }
+    kill_port_owner(TG_PORT);
+    std::thread::sleep(Duration::from_millis(300));
+    let child = spawn_tg(&app)?;
+    *state.child.lock().unwrap() = Some(child);
+    Ok(serde_json::json!({ "started": true, "port": TG_PORT }))
+}
+
+/// 前端命令：确保 orig-tg 运行（幂等）。未配置返回 Err("not-configured")。
+#[tauri::command]
+fn ensure_tg(app: tauri::AppHandle, state: tauri::State<'_, TgState>) -> Result<serde_json::Value, String> {
+    if tg_alive() {
+        if tg_service_real() {
+            return Ok(serde_json::json!({ "started": false, "reason": "already-running" }));
+        }
+        // 端口活着但不是真实客户端模式（未配置回退的 dummy 残留等）→ 杀掉重拉，
+        // 避免 APP 在假客户端上走登录（假验证码，永远收不到）。
+        eprintln!("[ensure_tg] alive but not real mode, killing stale and respawning");
+        kill_port_owner(TG_PORT);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if TcpStream::connect_timeout(
+                &format!("127.0.0.1:{TG_PORT}").parse().unwrap(),
+                Duration::from_millis(200),
+            )
+            .is_err()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    } else {
+        // 端口残留（health 都不通的旧进程等）一律清掉，由壳统一托管。
+        kill_port_owner(TG_PORT);
+    }
+    let child = spawn_tg(&app)?;
+    *state.child.lock().unwrap() = Some(child);
+    Ok(serde_json::json!({ "started": true, "port": TG_PORT }))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -284,6 +513,9 @@ pub fn run() {
             }),
         )
         .manage(DaemonState {
+            child: Mutex::new(None),
+        })
+        .manage(TgState {
             child: Mutex::new(None),
         })
         .setup(|app| {
@@ -312,7 +544,14 @@ pub fn run() {
             let _ = _tray;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![daemon_status, ensure_daemon, stop_daemon])
+        .invoke_handler(tauri::generate_handler![
+            daemon_status,
+            ensure_daemon,
+            stop_daemon,
+            tg_status,
+            tg_save_config,
+            ensure_tg
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

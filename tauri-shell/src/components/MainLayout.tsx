@@ -4,6 +4,8 @@ import { DownloadList } from './DownloadList'
 import { AddDownloadDialog } from './AddDownloadDialog'
 import { SettingsPanel } from './SettingsPanel'
 import { TgPanel } from './TgPanel'
+import { MediaLibraryPanel } from './MediaLibraryPanel'
+import { ErrorBoundary } from './ui/ErrorBoundary'
 import { TitleBar } from './TitleBar'
 import { Button } from './ui/button'
 import { useStore } from '../store/useStore'
@@ -26,8 +28,11 @@ export function MainLayout() {
       .then(() => daemonStatus())
       .then(setDaemon)
       .catch(() => {})
-    // 定期刷新兜底（SSE 断线时）
-    const timer = setInterval(() => refresh().catch(() => {}), 5000)
+    // 定期刷新兜底：仅在 SSE 断线（connected=false）时真正拉取，避免健康连接下每 5s 空轮询
+    const timer = setInterval(() => {
+      if (useStore.getState().connected) return
+      refresh().catch(() => {})
+    }, 5000)
     return () => clearInterval(timer)
   }, [init, refresh, setDaemon])
 
@@ -158,14 +163,20 @@ export function MainLayout() {
           <main
             className={cn(
               'flex-1 overflow-hidden',
-              view === 'tg' && 'flex',
-              view !== 'settings' && view !== 'tg' && 'overflow-y-auto p-4',
+              (view === 'tg' || view === 'media') && 'flex',
+              view !== 'settings' && view !== 'tg' && view !== 'media' && 'overflow-y-auto p-4',
             )}
           >
             {view === 'settings' ? (
               <SettingsPanel />
             ) : view === 'tg' ? (
-              <TgPanel />
+              <ErrorBoundary>
+                <TgPanel />
+              </ErrorBoundary>
+            ) : view === 'media' ? (
+              <ErrorBoundary>
+                <MediaLibraryPanel />
+              </ErrorBoundary>
             ) : (
               <DownloadList items={visible} />
             )}
