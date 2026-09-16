@@ -227,6 +227,7 @@
   "tg.searchMedia": "搜索标题 / 频道",
   "tg.emptyCached": "暂无缓存记录，监控内容自动入库后可在此缓存",
   "tg.serviceOffline": "TG 服务未连接，启动 APP 或登录后可查看媒体库",
+  "tg.selectToPlay": "从左侧选择内容播放",
   "tg.downloadDir": "下载目录",
   "tg.downloadDirTip": "缓存文件落地位置，保存后立即生效（仅影响之后的新缓存）",
   "tg.cancel": "取消",

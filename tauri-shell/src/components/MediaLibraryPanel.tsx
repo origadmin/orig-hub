@@ -252,7 +252,9 @@ export function MediaLibraryPanel() {
   }, [dlDir, setError])
 
   return (
-    <div className="flex h-full min-h-0 flex-1 flex-col bg-surface/20">
+    <div className="flex h-full min-h-0 flex-1 bg-surface/20">
+      {/* 左栏：标题 + 搜索 + 列表 */}
+      <div className="flex w-[42%] min-w-[340px] max-w-[560px] shrink-0 flex-col border-r border-border-subtle/60">
       {/* 标题行：媒体库 + 下载目录 */}
       <header className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-3 py-2.5">
         <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold text-fg-strong">
@@ -426,6 +428,120 @@ export function MediaLibraryPanel() {
           })
         )}
       </div>
+      </div>
+
+      {/* 右栏：播放器内嵌视图（带返回行，不再全屏遮罩覆盖窗口） */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        {playing ? (
+          (() => {
+            const cur = playing.items[playing.index]
+            const many = playing.items.length > 1
+            const typ = cur.type ?? guessMediaType(cur.mimeType, cur.filePath)
+            return (
+              <>
+                {/* 返回行：← 返回列表 + 标题 + n/N */}
+                <div className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-3 py-2.5">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 shrink-0 px-2 text-[11px]"
+                    onClick={() => setPlaying(null)}
+                  >
+                    ← {t('tg.backToFeed')}
+                  </Button>
+                  <span className="min-w-0 flex-1 truncate text-[12px] text-muted">
+                    {cur.caption?.trim() || `#${cur.messageId}`}
+                    {cur.channelTitle ? ` · ${cur.channelTitle}` : ''}
+                  </span>
+                  {many && (
+                    <span className="shrink-0 text-[11px] text-muted">
+                      {playing.index + 1}/{playing.items.length}
+                    </span>
+                  )}
+                </div>
+                {/* 媒体区：黑底居中；‹› 组内切换收进面板两侧，不再出框 */}
+                <div className="relative flex min-h-0 flex-1 items-center justify-center bg-black p-4">
+                  {typ !== 'photo' && <PlaybackSpeed rate={rate} onRate={setRate} />}
+                  {many && playing.index > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setPlaying((s) => (s ? { ...s, index: s.index - 1 } : s))}
+                      className="absolute left-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-lg text-white hover:bg-white/20"
+                    >
+                      ‹
+                    </button>
+                  )}
+                  {typ === 'photo' ? (
+                    <img
+                      key={cur.messageId}
+                      src={tgLocalFileUrl(cur.channelId, cur.messageId)}
+                      alt={cur.caption || ''}
+                      className="max-h-full max-w-full rounded-lg object-contain"
+                      onError={(e) => {
+                        // 本地缺失 → 降级在线流仅一次；在线也失败时终止，避免 onError 无限重试
+                        const img = e.currentTarget
+                        if (!img.dataset.fallback) {
+                          img.dataset.fallback = '1'
+                          img.src = tgFileUrl(cur.channelId, cur.messageId)
+                        } else {
+                          setPlayFailed(true)
+                        }
+                      }}
+                    />
+                  ) : (
+                    <video
+                      key={cur.messageId}
+                      ref={videoRef}
+                      src={tgLocalFileUrl(cur.channelId, cur.messageId)}
+                      controls
+                      autoPlay
+                      preload="auto"
+                      onLoadedMetadata={(e) => {
+                        e.currentTarget.playbackRate = rate
+                      }}
+                      className="max-h-full max-w-full rounded-lg bg-black"
+                      onError={(e) => {
+                        const v = e.currentTarget
+                        if (!v.dataset.fallback) {
+                          v.dataset.fallback = '1'
+                          v.src = tgFileUrl(cur.channelId, cur.messageId)
+                        } else {
+                          setPlayFailed(true)
+                        }
+                      }}
+                    />
+                  )}
+                  {many && playing.index < playing.items.length - 1 && (
+                    <button
+                      type="button"
+                      onClick={() => setPlaying((s) => (s ? { ...s, index: s.index + 1 } : s))}
+                      className="absolute right-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-lg text-white hover:bg-white/20"
+                    >
+                      ›
+                    </button>
+                  )}
+                  {playFailed && (
+                    <p className="absolute bottom-4 left-1/2 z-10 -translate-x-1/2 rounded-md border border-white/20 bg-white/10 px-3 py-1.5 text-center text-xs text-white/85">
+                      {t('tg.decodeFail')}
+                    </p>
+                  )}
+                </div>
+                {cur.caption?.trim() && (
+                  <p className="max-h-24 shrink-0 overflow-y-auto bg-black px-4 py-2 text-center text-xs text-white/80">
+                    {cur.caption}
+                  </p>
+                )}
+              </>
+            )
+          })()
+        ) : (
+          <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+            <p className="max-w-xs text-center text-sm leading-relaxed text-muted">
+              {t('tg.selectToPlay')}
+            </p>
+          </div>
+        )}
+      </div>
 
       {/* 下载目录弹窗：查看/修改缓存落地目录（持久化，立即生效） */}
       {dirOpen && (
@@ -459,103 +575,6 @@ export function MediaLibraryPanel() {
               </Button>
             </div>
           </div>
-        </div>
-      )}
-
-      {/* 播放遮罩：本地流优先、在线流降级一次；固定 ✕（全屏遮罩必须始终有可见退出） */}
-      {playing && (
-        <div
-          className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/90 p-6"
-          onClick={() => setPlaying(null)}
-        >
-          <button
-            type="button"
-            aria-label={t('tg.close')}
-            onClick={() => setPlaying(null)}
-            className="absolute right-4 top-4 z-10 flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-xl text-white hover:bg-white/20"
-          >
-            ✕
-          </button>
-          {(() => {
-            const cur = playing.items[playing.index]
-            const many = playing.items.length > 1
-            const typ = cur.type ?? guessMediaType(cur.mimeType, cur.filePath)
-            return (
-              <div className="flex flex-col items-center" onClick={(e) => e.stopPropagation()}>
-                <div className="relative flex items-center justify-center">
-                  {typ !== 'photo' && <PlaybackSpeed rate={rate} onRate={setRate} />}
-                  {many && playing.index > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => setPlaying((s) => (s ? { ...s, index: s.index - 1 } : s))}
-                      className="absolute -left-14 flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-xl text-white hover:bg-white/20"
-                    >
-                      ‹
-                    </button>
-                  )}
-                  {typ === 'photo' ? (
-                    <img
-                      key={cur.messageId}
-                      src={tgLocalFileUrl(cur.channelId, cur.messageId)}
-                      alt={cur.caption || ''}
-                      className="max-h-[78vh] max-w-[80vw] rounded-lg object-contain"
-                      onError={(e) => {
-                        // 本地缺失 → 降级在线流仅一次；在线也失败时终止，避免 onError 无限重试
-                        const img = e.currentTarget
-                        if (!img.dataset.fallback) {
-                          img.dataset.fallback = '1'
-                          img.src = tgFileUrl(cur.channelId, cur.messageId)
-                        } else {
-                          setPlayFailed(true)
-                        }
-                      }}
-                    />
-                  ) : (
-                    <video
-                      key={cur.messageId}
-                      ref={videoRef}
-                      src={tgLocalFileUrl(cur.channelId, cur.messageId)}
-                      controls
-                      autoPlay
-                      preload="auto"
-                      onLoadedMetadata={(e) => {
-                        e.currentTarget.playbackRate = rate
-                      }}
-                      className="max-h-[82vh] max-w-[92vw] rounded-lg bg-black"
-                      onError={(e) => {
-                        const v = e.currentTarget
-                        if (!v.dataset.fallback) {
-                          v.dataset.fallback = '1'
-                          v.src = tgFileUrl(cur.channelId, cur.messageId)
-                        } else {
-                          setPlayFailed(true)
-                        }
-                      }}
-                    />
-                  )}
-                  {many && playing.index < playing.items.length - 1 && (
-                    <button
-                      type="button"
-                      onClick={() => setPlaying((s) => (s ? { ...s, index: s.index + 1 } : s))}
-                      className="absolute -right-14 flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-xl text-white hover:bg-white/20"
-                    >
-                      ›
-                    </button>
-                  )}
-                </div>
-                {playFailed && (
-                  <p className="mt-3 rounded-md border border-white/20 bg-white/10 px-3 py-1.5 text-center text-xs text-white/85">
-                    {t('tg.decodeFail')}
-                  </p>
-                )}
-                <p className="mt-3 max-w-2xl truncate text-center text-xs text-white/80">
-                  {cur.caption?.trim() || `#${cur.messageId}`}
-                  {cur.channelTitle ? ` · ${cur.channelTitle}` : ''}
-                  {many ? ` · ${playing.index + 1}/${playing.items.length}` : ''}
-                </p>
-              </div>
-            )
-          })()}
         </div>
       )}
     </div>

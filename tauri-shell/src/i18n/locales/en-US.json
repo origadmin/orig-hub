@@ -227,6 +227,7 @@
   "tg.searchMedia": "Search title / channel",
   "tg.emptyCached": "No cached items yet. Monitored content is indexed automatically for caching.",
   "tg.serviceOffline": "TG service is offline. Start the APP or sign in to browse the media library.",
+  "tg.selectToPlay": "Select an item on the left to play",
   "tg.downloadDir": "Download folder",
   "tg.downloadDirTip": "Where cached files are saved. Applies immediately (new caches only).",
   "tg.cancel": "Cancel",

@@ -774,9 +774,108 @@ export function TgPanel() {
 
       </aside>
 
-      {/* ===== 第二列：分组模式=组内频道列表 / 内容模式=聊天式媒体流（最新在底部） ===== */}
+      {/* ===== 第二列：播放器（内嵌视图）/ 分组列表 / 聊天式媒体流 ===== */}
       <section className="flex min-w-0 flex-1 flex-col bg-surface/20">
-        {!detail && groupMode !== null && activeGroup ? (
+        {lightbox ? (
+          (() => {
+            const cur = lightbox.unit[lightbox.index]
+            const many = lightbox.unit.length > 1
+            const local = downloadedPaths.get(cur.key)
+            return (
+              <>
+                {/* 返回行：← 返回列表 + 频道名 + n/N */}
+                <div className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-4 py-2.5">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 shrink-0 px-2 text-[11px]"
+                    onClick={() => setLightbox(null)}
+                  >
+                    ← {t('tg.backToFeed')}
+                  </Button>
+                  <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-fg-strong">
+                    {selectedChannel?.title}
+                  </span>
+                  {many && (
+                    <span className="shrink-0 text-[11px] text-muted">
+                      {lightbox.index + 1}/{lightbox.unit.length}
+                    </span>
+                  )}
+                </div>
+                {/* 媒体区：黑底居中；‹› 组内切换收进面板两侧，不再出框 */}
+                <div className="relative flex min-h-0 flex-1 items-center justify-center bg-black p-4">
+                  {(cur.type === 'video' || cur.type === 'audio') && (
+                    <PlaybackSpeed rate={lbRate} onRate={setLbRate} />
+                  )}
+                  {many && lightbox.index > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setLightbox((s) => (s ? { ...s, index: s.index - 1 } : s))}
+                      className="absolute left-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-lg text-white hover:bg-white/20"
+                    >
+                      ‹
+                    </button>
+                  )}
+                  {cur.type === 'video' || cur.type === 'audio' ? (
+                    <video
+                      key={cur.key}
+                      ref={lbVideoRef}
+                      src={
+                        local
+                          ? tgLocalFileUrl(cur.chatId, cur.messageId)
+                          : tgFileUrl(cur.chatId, cur.messageId)
+                      }
+                      controls
+                      autoPlay
+                      preload="auto"
+                      onLoadedMetadata={(e) => {
+                        e.currentTarget.playbackRate = lbRate
+                      }}
+                      className="max-h-full max-w-full rounded-lg bg-black"
+                      onError={(e) => {
+                        const v = e.currentTarget
+                        if (local && !v.dataset.fallback) {
+                          v.dataset.fallback = '1'
+                          v.src = tgFileUrl(cur.chatId, cur.messageId)
+                        } else {
+                          // 本地+在线双失败（如 .mov 容器浏览器不可解码）→ 露出可读提示
+                          setLbFailed(true)
+                        }
+                      }}
+                    />
+                  ) : (
+                    <img
+                      key={cur.key}
+                      src={tgFileUrl(cur.chatId, cur.messageId)}
+                      alt={cur.caption || ''}
+                      className="max-h-full max-w-full rounded-lg object-contain"
+                      onError={() => setLbFailed(true)}
+                    />
+                  )}
+                  {many && lightbox.index < lightbox.unit.length - 1 && (
+                    <button
+                      type="button"
+                      onClick={() => setLightbox((s) => (s ? { ...s, index: s.index + 1 } : s))}
+                      className="absolute right-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-lg text-white hover:bg-white/20"
+                    >
+                      ›
+                    </button>
+                  )}
+                  {lbFailed && (
+                    <p className="absolute bottom-4 left-1/2 z-10 -translate-x-1/2 rounded-md border border-white/20 bg-white/10 px-3 py-1.5 text-center text-xs text-white/85">
+                      {t('tg.decodeFail')}
+                    </p>
+                  )}
+                </div>
+                {cur.caption && (
+                  <p className="max-h-24 shrink-0 overflow-y-auto bg-black px-4 py-2 text-center text-xs text-white/80">
+                    {cur.caption}
+                  </p>
+                )}
+              </>
+            )
+          })()
+        ) : !detail && groupMode !== null && activeGroup ? (
           <>
             {/* 分组模式：组内频道列表（仅添加/取消监控，不浏览内容） */}
             <header className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-3 py-2.5">
@@ -938,104 +1037,6 @@ export function TgPanel() {
       </section>
 
 
-      {/* 原图/相册组内浏览遮罩（v0.4.2）：多元素时 ‹ › 切换 + n/N 计数，←/→ 键盘导航；
-          v0.4.4 固定 ✕ 关闭按钮（全屏遮罩必须始终有可见退出，不能只靠点背景） */}
-      {lightbox && (
-        <div
-          className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/85 p-6"
-          onClick={() => setLightbox(null)}
-        >
-          <button
-            type="button"
-            aria-label={t('tg.close')}
-            onClick={() => setLightbox(null)}
-            className="absolute right-4 top-4 z-10 flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-xl text-white hover:bg-white/20"
-          >
-            ✕
-          </button>
-          {(() => {
-            const cur = lightbox.unit[lightbox.index]
-            const many = lightbox.unit.length > 1
-            const local = downloadedPaths.get(cur.key)
-            return (
-              <div className="flex flex-col items-center" onClick={(e) => e.stopPropagation()}>
-                <div className="relative flex items-center justify-center">
-                  {(cur.type === 'video' || cur.type === 'audio') && (
-                    <PlaybackSpeed rate={lbRate} onRate={setLbRate} />
-                  )}
-                  {many && lightbox.index > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => setLightbox((s) => (s ? { ...s, index: s.index - 1 } : s))}
-                      className="absolute -left-14 flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-xl text-white hover:bg-white/20"
-                    >
-                      ‹
-                    </button>
-                  )}
-                  {cur.type === 'video' || cur.type === 'audio' ? (
-                    <video
-                      key={cur.key}
-                      ref={lbVideoRef}
-                      src={
-                        local
-                          ? tgLocalFileUrl(cur.chatId, cur.messageId)
-                          : tgFileUrl(cur.chatId, cur.messageId)
-                      }
-                      controls
-                      autoPlay
-                      preload="auto"
-                      onLoadedMetadata={(e) => {
-                        e.currentTarget.playbackRate = lbRate
-                      }}
-                      className="max-h-[78vh] max-w-[80vw] rounded-lg bg-black"
-                      onError={(e) => {
-                        const v = e.currentTarget
-                        if (local && !v.dataset.fallback) {
-                          v.dataset.fallback = '1'
-                          v.src = tgFileUrl(cur.chatId, cur.messageId)
-                        } else {
-                          // 本地+在线双失败（如 .mov 容器浏览器不可解码）→ 露出可读提示
-                          setLbFailed(true)
-                        }
-                      }}
-                    />
-                  ) : (
-                    <img
-                      key={cur.key}
-                      src={tgFileUrl(cur.chatId, cur.messageId)}
-                      alt={cur.caption || ''}
-                      className="max-h-[78vh] max-w-[80vw] rounded-lg object-contain"
-                      onError={() => setLbFailed(true)}
-                    />
-                  )}
-                  {many && lightbox.index < lightbox.unit.length - 1 && (
-                    <button
-                      type="button"
-                      onClick={() => setLightbox((s) => (s ? { ...s, index: s.index + 1 } : s))}
-                      className="absolute -right-14 flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-xl text-white hover:bg-white/20"
-                    >
-                      ›
-                    </button>
-                  )}
-                </div>
-                {lbFailed && (
-                  <p className="mt-3 rounded-md border border-white/20 bg-white/10 px-3 py-1.5 text-center text-xs text-white/85">
-                    {t('tg.decodeFail')}
-                  </p>
-                )}
-                {cur.caption && (
-                  <p className="mt-3 max-w-2xl text-center text-xs text-white/80">{cur.caption}</p>
-                )}
-                {many && (
-                  <p className="mt-1 text-[11px] text-white/60">
-                    {lightbox.index + 1} / {lightbox.unit.length}
-                  </p>
-                )}
-              </div>
-            )
-          })()}
-        </div>
-      )}
 
         </>
       )}
