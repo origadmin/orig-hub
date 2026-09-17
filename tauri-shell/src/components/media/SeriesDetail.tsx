@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { Film, Image as ImageIcon, Music, Pencil, Play } from 'lucide-react'
 import { Button } from '../ui/button'
 import type { MediaEpisode, MediaSeries, MediaSeriesDetail, MediaTag } from '../../api/media'
 import { mediaItemUrl } from '../../api/media'
@@ -154,9 +155,9 @@ export function SeriesDetail(props: {
                       setDescDraft(detail.description ?? '')
                       setEditingDesc(true)
                     }}
-                    className="absolute right-0 top-0 rounded px-1.5 py-0.5 text-[10.5px] text-muted hover:bg-surface-2 hover:text-fg-mid"
+                    className="absolute right-0 top-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] text-muted hover:bg-surface-2 hover:text-fg-mid"
                   >
-                    ✎ 编辑
+                    <Pencil className="h-3 w-3" /> 编辑
                   </button>
                 </div>
               )}
@@ -259,7 +260,7 @@ export function SeriesDetail(props: {
                           type="button"
                           onClick={() => onPlay(idx)}
                           className="relative h-11 w-20 shrink-0 overflow-hidden rounded bg-surface-2"
-                          title="查看 / 播放"
+                          title={ep.kind === 'photo' ? '浏览图片' : '播放'}
                         >
                           {ep.poster ? (
                             <img
@@ -276,12 +277,21 @@ export function SeriesDetail(props: {
                               className="h-full w-full object-cover"
                             />
                           ) : (
-                            <span className="flex h-full w-full items-center justify-center text-base text-muted">
-                              {ep.kind === 'audio' ? '🎵' : '🎬'}
+                            <span className="flex h-full w-full items-center justify-center text-muted">
+                              {ep.kind === 'audio' ? (
+                                <Music className="h-4 w-4" />
+                              ) : (
+                                <Film className="h-4 w-4" />
+                              )}
                             </span>
                           )}
-                          <span className="absolute inset-0 flex items-center justify-center bg-black/40 text-xs text-white opacity-0 transition-opacity hover:opacity-100">
-                            ▶
+                          {/* 动作标识按类型区分：图片是「浏览」，不是「播放」 */}
+                          <span className="absolute inset-0 flex items-center justify-center bg-black/40 text-white opacity-0 transition-opacity hover:opacity-100">
+                            {ep.kind === 'photo' ? (
+                              <ImageIcon className="h-4 w-4" />
+                            ) : (
+                              <Play className="h-4 w-4 fill-white" />
+                            )}
                           </span>
                         </button>
                         <div className="min-w-0 flex-1">
@@ -295,15 +305,17 @@ export function SeriesDetail(props: {
                                 setEditingEp(ep.id)
                                 setEpDraft(ep.description ?? '')
                               }}
-                              className="shrink-0 rounded px-1 text-[10.5px] text-muted hover:bg-surface-2 hover:text-fg-mid"
+                              className="shrink-0 rounded px-1 text-muted hover:bg-surface-2 hover:text-fg-mid"
                               title="编辑本集介绍"
                             >
-                              ✎
+                              <Pencil className="h-3 w-3" />
                             </button>
                           </div>
+                          {/* 副行按类型给语义：图片没有时长概念，显示「--:--」会被误当可播内容 */}
                           <p className="text-[10px] text-muted">
-                            {ep.duration ? `${fmtDuration(ep.duration)} · ` : ''}
-                            {ep.kind ?? ''}
+                            {ep.kind === 'photo'
+                              ? '图片'
+                              : fmtDuration(ep.duration ?? undefined) || '--:--'}
                           </p>
                         </div>
                         <Button
@@ -410,8 +422,12 @@ export function SeriesCard(props: {
         {cover ? (
           <img src={cover} alt={series.title} className="h-full w-full object-cover" />
         ) : (
-          <span className="flex h-full w-full items-center justify-center text-3xl text-muted">
-            {series.kind === 'album' ? '🖼' : '🎬'}
+          <span className="flex h-full w-full items-center justify-center text-muted">
+            {series.kind === 'album' ? (
+              <ImageIcon className="h-7 w-7" />
+            ) : (
+              <Film className="h-7 w-7" />
+            )}
           </span>
         )}
         <span className="absolute inset-0 flex items-center justify-center bg-black/45 opacity-0 transition-opacity group-hover:opacity-100">

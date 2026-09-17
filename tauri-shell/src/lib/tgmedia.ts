@@ -49,3 +49,14 @@ export function fmtDuration(sec?: number): string {
   const p = (n: number) => String(n).padStart(2, '0')
   return h > 0 ? `${h}:${p(m)}:${p(r)}` : `${m}:${p(r)}`
 }
+
+/**
+ * 是否为 TG 落盘原始文件名（如 `photo--1004418016251_2000`）。
+ *
+ * 这类字符串来自下载器的命名规则，**不是标题** —— 直接展示会让界面充满乱码般的噪音，
+ * 而且同一实体在侧栏（可读占位「图片 1」）与底部 caption（原始文件名）会变成两个名字。
+ * 无真实标题时应回退到可读占位。
+ */
+export function isRawFileName(s?: string | null): boolean {
+  return !!s && /^[a-z]+--\d+_\d+/i.test(s.trim())
+}

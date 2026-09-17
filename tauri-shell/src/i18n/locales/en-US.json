@@ -306,5 +306,13 @@
   "player.episodesEmpty": "No episodes in this series",
   "player.episodesFailed": "Failed to load episodes",
   "player.notInPlaylist": "Not in playlist",
-  "player.photoEp": "Image {n}"
+  "player.photoEp": "Image {n}",
+  "player.browse": "Photo viewer",
+  "player.photoPos": "Photo {n} of {total}",
+  "player.episodePos": "Episode {n} of {total}",
+  "player.photoLabel": "Photo",
+  "player.prevPhoto": "Previous photo",
+  "player.nextPhoto": "Next photo",
+  "player.unsupported": "This type cannot be previewed in the app",
+  "player.mixedCount": "{v} videos · {p} photos"
 }

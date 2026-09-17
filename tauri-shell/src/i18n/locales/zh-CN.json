@@ -306,5 +306,13 @@
   "player.episodesEmpty": "该剧集暂无分集",
   "player.episodesFailed": "分集加载失败",
   "player.notInPlaylist": "不在播放列表",
-  "player.photoEp": "图片 {n}"
+  "player.photoEp": "图片 {n}",
+  "player.browse": "图片浏览",
+  "player.photoPos": "第 {n} / {total} 张",
+  "player.episodePos": "第 {n} 集 · 共 {total} 集",
+  "player.photoLabel": "图片",
+  "player.prevPhoto": "上一张",
+  "player.nextPhoto": "下一张",
+  "player.unsupported": "此类型不支持在应用内预览",
+  "player.mixedCount": "视频 {v} · 图片 {p}"
 }

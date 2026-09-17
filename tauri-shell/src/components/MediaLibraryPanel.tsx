@@ -33,7 +33,7 @@ import { ImportDialog } from './media/ImportDialog'
 import { BulkTagDialog, TagManagerDialog } from './media/TagManagerDialog'
 import { AddToSeriesDialog, CreateSeriesDialog } from './media/SeriesDialog'
 import { ItemEditDialog } from './media/ItemEditDialog'
-import { fmtSize } from '../lib/tgmedia'
+import { fmtSize, isRawFileName } from '../lib/tgmedia'
 import type { ViewerItem } from '../types'
 
 type Tab = 'all' | MediaKind
@@ -186,8 +186,13 @@ export function MediaLibraryPanel() {
       id: e.itemId,
       source: 'local',
       ref: String(e.itemId),
-      title: e.title || e.itemTitle || `#${e.itemId}`,
-      kind: (e.kind ?? 'video') as MediaKind,
+      // 原始文件名（photo--123_456）不是标题：留空交给展示层给可读占位。
+      // 否则侧栏说「图片 1」而底部 caption 说「photo--1004418016251_2000」——同一实体两个名字。
+      title: e.title || (isRawFileName(e.itemTitle) ? '' : e.itemTitle) || '',
+      // **不**兜底成 'video'：后端对每条内容必下发 kind，兜底成视频会把图片静默当视频播
+      // （正是「加入剧集后图片全被当视频」的成因之一）。未知类型归入 'file'，
+      // 由播放器显示「不支持预览」——让异常可见，而不是伪装成可播内容。
+      kind: (e.kind ?? 'file') as MediaKind,
       poster: e.poster,
       duration: e.duration,
       addedAt: 0,
@@ -197,11 +202,16 @@ export function MediaLibraryPanel() {
     }))
 
   /**
-   * 播放一组条目。
+   * 打开一组条目。
    *
-   * 关键：若选中项属于某个剧集，播放组必须扩成**整部剧集**。
-   * 播放器右侧分集列表的点击是在「当前播放组」内按 itemId 定位的，
-   * 播放组若只含一条，那些点击会全部落空（表现为「点了没反应」）。
+   * 关键：若选中项属于某个剧集，传入的列表必须扩成**整部剧集**。
+   * 播放器右侧分集列表的点击是在这份列表内按 itemId 定位的，
+   * 若只含一条，那些点击会全部落空（表现为「点了没反应」）。
+   *
+   * 注意这里传的是**全量**（图片 + 视频都含）：
+   * 「播放序列只含同类内容」由 `MediaViewer` 按 kind 派生分组实现 ——
+   * 点视频 → 组内只有视频（连着播）；点图片 → 组内只有图片（连着翻）。
+   * **不要在这一层过滤**，否则侧栏会缺项，用户也无法从图片切回视频。
    */
   const playItems = async (list: MediaItem[], index: number, title?: string) => {
     if (list.length === 0) return
