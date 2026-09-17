@@ -75,6 +75,33 @@ export interface MediaEpisode {
   duration?: number | null
   kind?: MediaKind | null
   description?: string | null
+  /**
+   * 合并溯源：来源剧集标题快照。源剧集在合并时已被删除，故由后端存快照下发。
+   * null = 这条不是合并搬过来的。
+   */
+  originSeriesTitle?: string | null
+  /** 合并溯源：并入目标前的原始集号（重编后仍可分辨「这条原来是第几集」） */
+  originEpisodeNo?: number | null
+  /** 条目来源（'local' / 'tg'）——「同一内容多源导入」时用于分辨 */
+  source?: string | null
+  /** 条目来源标识（本地路径 / TG ref）—— 分辨重复项的唯一可靠依据，别用标题 */
+  ref?: string | null
+}
+
+/** 合并时被跳过的分集（同一条目已在目标同季） */
+export interface MergeSkipped {
+  itemId: number
+  title?: string | null
+  season: number
+  episodeNo: number
+}
+
+/** 剧集合并结果 */
+export interface MergeResult {
+  /** 实际搬移的分集数 */
+  added: number
+  skippedCount: number
+  skipped: MergeSkipped[]
 }
 
 export interface MediaSeriesDetail extends MediaSeries {
@@ -253,6 +280,20 @@ export async function appendEpisodes(
   return request(`/api/media/series/${seriesId}/episodes/append`, {
     method: 'POST',
     body: JSON.stringify({ itemIds, season }),
+  })
+}
+
+/**
+ * 合并剧集：把 `sourceId` 的全部分集搬入 `seriesId` 末尾（各季续编集号）并**删除源剧集**。
+ *
+ * 后端刻意不做内容级去重：文件名相同而内容不同、同一内容多源导入、`1-2` 与 `1,2` 并存、
+ * 每批都带的预告 —— 一律原样保留。只有「同一条目已在目标同季」才跳过，
+ * 且跳过明细在 `skipped` 里回传，调用方**必须**呈现给用户。
+ */
+export async function mergeSeries(seriesId: number, sourceId: number): Promise<MergeResult> {
+  return request(`/api/media/series/${seriesId}/merge`, {
+    method: 'POST',
+    body: JSON.stringify({ sourceId }),
   })
 }
 

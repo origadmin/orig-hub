@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Film, Image as ImageIcon, Music, Pencil, Play } from 'lucide-react'
+import { Film, GitMerge, Image as ImageIcon, Music, Pencil, Play, Tag, Trash2 } from 'lucide-react'
 import { Button } from '../ui/button'
 import type { MediaEpisode, MediaSeries, MediaSeriesDetail, MediaTag } from '../../api/media'
 import { mediaItemUrl } from '../../api/media'
@@ -22,12 +22,23 @@ export function SeriesDetail(props: {
   onPlay: (index: number) => void
   onRemoveEpisode: (ep: MediaEpisode) => void
   onDeleteSeries: () => void
+  /** 打开「合并到…」对话框（把另一个剧集整体并入当前剧集） */
+  onMerge: () => void
   onBack: () => void
   onChanged: () => void
   onError: (msg: string) => void
 }) {
-  const { detail, tags, onPlay, onRemoveEpisode, onDeleteSeries, onBack, onChanged, onError } =
-    props
+  const {
+    detail,
+    tags,
+    onPlay,
+    onRemoveEpisode,
+    onDeleteSeries,
+    onMerge,
+    onBack,
+    onChanged,
+    onError,
+  } = props
   const [editingTags, setEditingTags] = useState(false)
   const [selected, setSelected] = useState<number[]>(detail.tags.map((t) => t.id))
   const [busy, setBusy] = useState(false)
@@ -100,8 +111,12 @@ export function SeriesDetail(props: {
           {cover ? (
             <img src={cover} alt={detail.title} className="h-full w-full object-cover" />
           ) : (
-            <span className="flex h-full w-full items-center justify-center text-3xl text-muted">
-              {detail.kind === 'album' ? '🖼' : '🎬'}
+            <span className="flex h-full w-full items-center justify-center text-muted">
+              {detail.kind === 'album' ? (
+                <ImageIcon className="h-8 w-8" />
+              ) : (
+                <Film className="h-8 w-8" />
+              )}
             </span>
           )}
         </div>
@@ -189,7 +204,18 @@ export function SeriesDetail(props: {
                 setEditingTags((v) => !v)
               }}
             >
-              🏷 标签
+              <Tag className="h-3.5 w-3.5" />
+              标签
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              onClick={onMerge}
+              title="把另一个剧集的内容并入本剧集（源剧集会被删除）"
+            >
+              <GitMerge className="h-3.5 w-3.5" />
+              合并到…
             </Button>
             <Button
               variant="outline"
@@ -316,6 +342,28 @@ export function SeriesDetail(props: {
                             {ep.kind === 'photo'
                               ? '图片'
                               : fmtDuration(ep.duration ?? undefined) || '--:--'}
+                            {/* 合并溯源：重编集号后必须让用户知道「这条原来是哪部剧的第几集」，
+                                否则「搬来的 1-2」与目标原有的 1、2 会分不清谁是谁 */}
+                            {(ep.originSeriesTitle || ep.originEpisodeNo != null) && (
+                              <span className="text-accent/80">
+                                {' · '}
+                                {ep.originSeriesTitle
+                                  ? `合并自《${ep.originSeriesTitle}》`
+                                  : '合并自其他剧集'}
+                                {ep.originEpisodeNo != null ? ` 原 E${ep.originEpisodeNo}` : ''}
+                              </span>
+                            )}
+                            {/* 文件来源：「同一内容多源导入」时，这是判断该删哪条的唯一依据
+                                （标题与文件名都不可靠，见 BUG-037） */}
+                            {ep.ref && (
+                              <span
+                                className="text-muted/70"
+                                title={`${ep.source === 'tg' ? 'TG' : '本地'} · ${ep.ref}`}
+                              >
+                                {' · '}
+                                {ep.source === 'tg' ? 'TG' : '本地'}
+                              </span>
+                            )}
                           </p>
                         </div>
                         <Button
@@ -466,10 +514,10 @@ export function SeriesCard(props: {
       <button
         type="button"
         onClick={onDelete}
-        className="absolute bottom-1 right-1 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white opacity-0 transition-opacity hover:bg-black/80 group-hover:opacity-100"
+        className="absolute bottom-1 right-1 flex items-center rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white opacity-0 transition-opacity hover:bg-black/80 group-hover:opacity-100"
         title="删除剧集"
       >
-        🗑
+        <Trash2 className="h-3 w-3" />
       </button>
     </div>
   )

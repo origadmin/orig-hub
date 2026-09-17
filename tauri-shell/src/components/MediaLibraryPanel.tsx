@@ -31,7 +31,7 @@ import { MediaCard } from './media/MediaCard'
 import { SeriesCard, SeriesDetail } from './media/SeriesDetail'
 import { ImportDialog } from './media/ImportDialog'
 import { BulkTagDialog, TagManagerDialog } from './media/TagManagerDialog'
-import { AddToSeriesDialog, CreateSeriesDialog } from './media/SeriesDialog'
+import { AddToSeriesDialog, CreateSeriesDialog, MergeSeriesDialog } from './media/SeriesDialog'
 import { ItemEditDialog } from './media/ItemEditDialog'
 import { fmtSize, isRawFileName } from '../lib/tgmedia'
 import type { ViewerItem } from '../types'
@@ -95,6 +95,8 @@ export function MediaLibraryPanel() {
   const [bulkTagOpen, setBulkTagOpen] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
   const [addToOpen, setAddToOpen] = useState(false)
+  /** 「合并到…」对话框（把另一个剧集并入当前打开的剧集） */
+  const [mergeOpen, setMergeOpen] = useState(false)
   const [editing, setEditing] = useState<MediaItem | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<{ kind: 'items' | 'series'; id?: number } | null>(
     null,
@@ -562,6 +564,7 @@ export function MediaLibraryPanel() {
               }
             }}
             onDeleteSeries={() => setConfirmDelete({ kind: 'series', id: detail.id })}
+            onMerge={() => setMergeOpen(true)}
             onBack={() => {
               setView('series')
               setDetail(null)
@@ -682,6 +685,26 @@ export function MediaLibraryPanel() {
           onDone={async () => {
             clearSelection()
             await refreshAll()
+          }}
+          onError={(m) => setError(m)}
+        />
+      ) : null}
+
+      {mergeOpen && detail ? (
+        <MergeSeriesDialog
+          target={{ id: detail.id, title: detail.title, episodeCount: detail.episodeCount }}
+          series={series}
+          onClose={() => setMergeOpen(false)}
+          onDone={async (res, sourceTitle) => {
+            await refreshAll()
+            if (activeSeriesId) await openSeries(activeSeriesId)
+            // 跳过明细必须说出来：合并里唯一「少搬了东西」的地方，
+            // 静默会让用户以为全搬完了（与「已导入 N 项」同一反馈位）。
+            setError(
+              res.skippedCount > 0
+                ? `已把《${sourceTitle}》的 ${res.added} 集并入，${res.skippedCount} 集因已在剧中而跳过`
+                : `已把《${sourceTitle}》的 ${res.added} 集并入`,
+            )
           }}
           onError={(m) => setError(m)}
         />

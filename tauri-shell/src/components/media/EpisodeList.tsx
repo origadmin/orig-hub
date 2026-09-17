@@ -205,6 +205,16 @@ export function EpisodeList({
                       </>
                     )}
                     {!enabled && ` · ${t('player.notInPlaylist')}`}
+                    {/* 合并溯源：集号重编过，必须让人知道「这条原来属于哪部剧、是第几集」——
+                        否则合并后与目标原有的同号分集分不清谁是谁 */}
+                    {(ep.originSeriesTitle || ep.originEpisodeNo != null) && (
+                      <span className="block text-[10px] text-accent/75">
+                        {ep.originSeriesTitle
+                          ? `合并自《${ep.originSeriesTitle}》`
+                          : '合并自其他剧集'}
+                        {ep.originEpisodeNo != null ? ` 原 E${ep.originEpisodeNo}` : ''}
+                      </span>
+                    )}
                   </span>
                 </span>
 
