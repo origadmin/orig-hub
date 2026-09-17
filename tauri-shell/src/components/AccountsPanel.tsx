@@ -31,8 +31,18 @@ function normalizeE164(countryCode: string, national: string): string {
  */
 export function AccountsPanel() {
   const { t } = useTranslation()
-  const { accounts, setTgAccount, setError, refreshTgSession } = useStore()
+  const { accounts, setTgAccount, setError, refreshTgSession, tgAvailability, tgEnabled } = useStore()
   const tg = accounts.tg
+  /**
+   * TG 依赖是否处于故障态（不可用/不可达）。
+   *
+   * 故障时必须**明确告知原因**并挡住登录动作：否则用户点「登录 → 发送验证码」只会
+   * 拿到一个失败，然后把「连不上 Telegram」误判成自己的账号问题（BUG-023 的现场）。
+   */
+  const tgBroken = tgAvailability !== null && tgAvailability.status !== 'ok'
+
+  /** 入口级门控（与 MainLayout/Sidebar 同一判定）：开关关或探测到不可用 → 不渲染 TG 绑定卡。 */
+  const tgFeatureReady = tgEnabled && (tgAvailability === null || tgAvailability.status === 'ok')
 
   // 挂载时校准一次登录态：后端会话已 Authorized（含持久化加载的会话）则自动恢复为「已绑定」。
   // refreshTgSession 幂等——只在绑定态或 phase 变化时才写 store；后端不可达时保持现状并静默。
@@ -127,7 +137,9 @@ export function AccountsPanel() {
         <p className="mt-0.5 text-xs text-muted">{t('accounts.sub')}</p>
       </div>
 
-      {/* Telegram 账号 */}
+      {/* Telegram 账号 —— 入口级门控：开关关或探测不可用时整体不渲染（用户裁定：
+          功能不存在就不该显示绑定入口；面板级故障卡仅是 TgPanel 内的保底回退） */}
+      {tgFeatureReady && (
       <div className="space-y-5 rounded-xl border border-border-subtle bg-surface p-5">
         <div className="flex items-center justify-between gap-4">
           <div className="flex min-w-0 items-center gap-3">
@@ -150,6 +162,28 @@ export function AccountsPanel() {
 
         <div className="h-px bg-border-subtle/60" />
 
+        {/* TG 依赖故障横幅：把「连不上 Telegram」与「未登录」分开显示。
+            此前二者在界面上无从区分，故障被读成登录丢失。 */}
+        {tgBroken && tgAvailability && (
+          <div className="rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger">
+            <p className="font-medium">
+              {tgAvailability.status === 'unreachable'
+                ? t('accounts.tgUnreachable')
+                : t('accounts.tgUnavailable')}
+            </p>
+            <p className="mt-0.5 opacity-90">
+              {tgAvailability.status === 'unreachable'
+                ? t('accounts.tgUnreachableHint')
+                : t('accounts.tgUnavailableHint')}
+            </p>
+            {tgAvailability.status === 'unavailable' && tgAvailability.reason && (
+              <p className="mt-1 break-all font-mono text-[10px] opacity-80">
+                {tgAvailability.reason}
+              </p>
+            )}
+          </div>
+        )}
+
         {tg.bound ? (
           <div className="flex justify-end">
             <Button variant="ghost" size="sm" onClick={() => setTgAccount({ bound: false, phone: null })}>
@@ -158,7 +192,8 @@ export function AccountsPanel() {
           </div>
         ) : step === 'idle' ? (
           <div className="flex justify-end">
-            <Button size="sm" onClick={() => setStep('phone')}>
+            {/* 故障时禁止进入登录流程：发码必然失败，让用户走到一半再报错是误导。 */}
+            <Button size="sm" disabled={tgBroken} onClick={() => setStep('phone')}>
               {t('accounts.login')}
             </Button>
           </div>
@@ -235,6 +270,7 @@ export function AccountsPanel() {
           </div>
         )}
       </div>
+      )}
 
       {/* 连接诊断面板 */}
       <div className="rounded-xl border border-border-subtle bg-surface p-5">
@@ -291,9 +327,28 @@ export function AccountsPanel() {
                 <div className="flex items-center gap-1.5">
                   <dt className="text-muted">{t('accounts.diagMode')}</dt>
                   <dd className="text-fg-strong">
-                    {diag.api_mode === 'real' ? t('accounts.diagModeReal') : t('accounts.diagModeDummy')}
+                    {diag.available ? t('accounts.diagModeReady') : t('accounts.diagModeUnavailable')}
                   </dd>
                 </div>
+                {!diag.available && diag.unavailable_reason && (
+                  <div className="col-span-2 flex items-start gap-1.5">
+                    <dt className="shrink-0 text-muted">{t('accounts.diagUnavailableReason')}</dt>
+                    <dd className="break-all font-mono text-[10px] text-danger">
+                      {diag.unavailable_reason}
+                    </dd>
+                  </div>
+                )}
+                {/* 合成数据必须自报家门：仅 `--features mock` 构建可能为 true。 */}
+                {diag.mock && (
+                  <div className="col-span-2 flex items-center gap-1.5">
+                    <dt className="text-muted">{t('accounts.diagMock')}</dt>
+                    <dd>
+                      <span className="inline-flex items-center rounded-full bg-danger/15 px-2 py-0.5 text-[10px] font-medium text-danger">
+                        mock
+                      </span>
+                    </dd>
+                  </div>
+                )}
                 <div className="flex items-center gap-1.5">
                   <dt className="text-muted">{t('accounts.diagProxy')}</dt>
                   <dd className="text-fg-strong">{diag.proxy ?? t('accounts.diagProxyDirect')}</dd>

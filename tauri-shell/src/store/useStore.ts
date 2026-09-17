@@ -6,6 +6,7 @@ import type {
   DownloadStatus,
   LanguageValue,
   TgAccount,
+  TgAvailability,
 } from '../types'
 import {
   addDownload as apiAddDownload,
@@ -120,6 +121,13 @@ interface DownloadState {
 
   /** 账号绑定中心状态（当前仅 Telegram，后续可扩展其他账号） */
   accounts: AccountsState
+  /**
+   * TG 可用性探测结果（null = 尚未探测）。
+   *
+   * 与 `accounts.tg.bound` 正交：`bound` 说的是「有没有登录会话」，
+   * 这里说的是「依赖本身能不能用」。区分二者才能不把连接故障显示成「登录丢了」。
+   */
+  tgAvailability: TgAvailability | null
   loadAccounts: () => void
   /** 更新某个账户的绑定态（持久化到 localStorage） */
   setTgAccount: (patch: Partial<TgAccount>) => void
@@ -156,6 +164,7 @@ export const useStore = create<DownloadState>((set, get) => ({
   tgEnabled: false,
   tgRunning: false,
   accounts: loadAccounts(),
+  tgAvailability: null,
 
   init: async () => {
     // 0. system 主题实时跟随系统配色
@@ -365,16 +374,30 @@ export const useStore = create<DownloadState>((set, get) => ({
     }),
 
   refreshTgSession: async () => {
-    // 以后端 /session 的 phase 为唯一权威（不轮询，仅在启动/登录完成/进入 TG 界面时调用）。
-    // 未登录或服务不可达一律视为未绑定，杜绝本地 bound 残留导致的“已绑定却未登录”。
+    // 以 /session 的 phase 为唯一权威（不轮询，仅在启动/登录完成/进入 TG 界面时调用）。
+    //
+    // 「不可用/不可达」与「未登录」必须分开（BUG-023）：
+    //   旧逻辑把「连不上 orig-tg」直接当成「未绑定」，于是依赖故障在界面上表现成
+    //   「登录丢了」，用户会去重登，而真因是服务连不上。现在分成三态，故障**可见**：
+    //     - ok：可用，按 phase 推导 bound
+    //     - unavailable：orig-tg 活着但连不上 Telegram（后端给出原因），保留上次 bound
+    //     - unreachable：连 orig-tg 进程都够不到，保留上次 bound
+    //   后两种都**不清空**登录态——因为「不知道」不等于「没登录」。
     let session
     try {
       session = await getTgSession()
-    } catch {
-      // 服务不可达（orig-tg 未运行）时无法确认登录，视为未绑定
-      if (get().accounts.tg.bound) get().setTgAccount({ bound: false, phone: null })
+    } catch (e) {
+      set({ tgAvailability: { status: 'unreachable' } })
+      get().setError(e instanceof Error ? e.message : String(e))
       return
     }
+    if (session?.available === false) {
+      set({
+        tgAvailability: { status: 'unavailable', reason: session.reason ?? null },
+      })
+      return
+    }
+    set({ tgAvailability: { status: 'ok' } })
     const tg = get().accounts.tg
     if (!session?.phase) return
     const bound = session.phase === 'Authorized'

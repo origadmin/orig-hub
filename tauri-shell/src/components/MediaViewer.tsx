@@ -150,18 +150,20 @@ function PlaybackSpeed({ rate, onRate }: { rate: number; onRate: (r: number) => 
   const [open, setOpen] = useState(false)
   const speeds = [0.5, 0.75, 1, 1.25, 1.5, 2]
   return (
-    <div className="absolute right-2 top-2 z-10" onClick={(e) => e.stopPropagation()}>
+    <div className="absolute right-3 top-3 z-10" onClick={(e) => e.stopPropagation()}>
+      {/* 入口按钮必须够大够显眼：此前 27×23 的贴边小字，用户根本找不到（BUG-033）。
+          最小可点击目标 24×24，这里取 32×32 并加描边提高与黑底的对比度。 */}
       <button
         type="button"
+        aria-label={`playback speed ${rate}x`}
+        title={`${rate}x`}
         onClick={() => setOpen((v) => !v)}
-        className={cn(
-          'rounded-md bg-black/55 px-2 py-1 text-[10px] font-medium text-white backdrop-blur-sm hover:bg-black/70',
-        )}
+        className="flex h-8 min-w-[2.5rem] items-center justify-center rounded-md bg-black/70 px-2 text-[11px] font-semibold text-white ring-1 ring-white/30 backdrop-blur-sm hover:bg-black/85"
       >
         {rate}x
       </button>
       {open && (
-        <div className="absolute right-0 top-8 flex flex-col overflow-hidden rounded-md border border-white/20 bg-black/85">
+        <div className="absolute right-0 top-9 flex flex-col overflow-hidden rounded-md border border-white/20 bg-black/85">
           {speeds.map((s) => (
             <button
               key={s}
@@ -171,7 +173,7 @@ function PlaybackSpeed({ rate, onRate }: { rate: number; onRate: (r: number) => 
                 setOpen(false)
               }}
               className={cn(
-                'px-3 py-1.5 text-left text-[11px] text-white/80 hover:bg-white/10',
+                'min-h-[32px] min-w-[64px] px-3 text-left text-[11px] text-white/80 hover:bg-white/10',
                 s === rate && 'text-accent',
               )}
             >

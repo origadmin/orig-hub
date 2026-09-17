@@ -309,9 +309,11 @@ fn tg_alive() -> bool {
     head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
 }
 
-/// 检查 9877 上的服务是否为「真实客户端」模式。
-/// 未配置凭证时手动/残留启动的 orig-tg 会回退成 dummy 假客户端（假登录、假验证码），
-/// 端口活着但 api_mode 不是 real 的实例一律视为无效，需要杀掉重拉。
+/// 检查 9877 上的服务是否为「可用且非合成」的实例。
+///
+/// 契约（orig-tg `/api/tg/diag`）：`available` + `mode` + `mock`。
+/// 端口活着但 `available=false`（无凭证 / MTProto 连不上）或 `mock=true` 的实例一律视为无效，
+/// 需要杀掉重拉 —— 否则用户会在一个「假装可用」的客户端上走登录，验证码永远收不到。
 fn tg_service_real() -> bool {
     let Ok(mut stream) = TcpStream::connect_timeout(
         &format!("127.0.0.1:{TG_PORT}").parse().unwrap(),
@@ -328,7 +330,11 @@ fn tg_service_real() -> bool {
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf);
     let text = String::from_utf8_lossy(&buf);
-    text.contains("\"api_mode\":\"real\"") || text.contains("\"api_mode\": \"real\"")
+    // BUG-023 后语义：`api_mode:"real"` 字符串已不存在，改用可用性契约判定。
+    // mock=true 也判为无效 —— 合成实例绝不能被桌面壳当成可服务实例接受。
+    let available = text.contains("\"available\":true") || text.contains("\"available\": true");
+    let mock = text.contains("\"mock\":true") || text.contains("\"mock\": true");
+    available && !mock
 }
 
 /// orig-tg 启动配置（APP 数据目录内，UI 配置一次）。
@@ -412,15 +418,16 @@ fn spawn_tg(app: &tauri::AppHandle) -> Result<CommandChild, String> {
 
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     while std::time::Instant::now() < deadline {
-        // 必须是 real 模式才算就绪：凭证非法时 orig-tg 会回退 dummy（假客户端），
-        // 若只等 health 会假成功，用户将在假客户端上走登录。
+        // 必须是「可用且非合成」才算就绪：凭证非法/网络不通时 orig-tg 会以
+        // unavailable 态运行（诚实报 503），若只等 health 会假成功，
+        // 用户将在不可用实例上走登录，验证码永远收不到。
         if tg_alive() && tg_service_real() {
             return Ok(child);
         }
         std::thread::sleep(Duration::from_millis(100));
         let _ = rx.try_recv();
     }
-    Err("orig-tg did not become ready (real mode) within 8s".into())
+    Err("orig-tg did not become ready (available, non-mock) within 8s".into())
 }
 
 /// 前端查询：orig-tg 是否存活 + 端口 + 是否本壳托管。
@@ -471,9 +478,9 @@ fn ensure_tg(app: tauri::AppHandle, state: tauri::State<'_, TgState>) -> Result<
         if tg_service_real() {
             return Ok(serde_json::json!({ "started": false, "reason": "already-running" }));
         }
-        // 端口活着但不是真实客户端模式（未配置回退的 dummy 残留等）→ 杀掉重拉，
-        // 避免 APP 在假客户端上走登录（假验证码，永远收不到）。
-        eprintln!("[ensure_tg] alive but not real mode, killing stale and respawning");
+        // 端口活着但不可用/为合成实例（无凭证、连不上 TG 的残留等）→ 杀掉重拉，
+        // 避免 APP 在不可用实例上走登录（验证码永远收不到）。
+        eprintln!("[ensure_tg] alive but unavailable/mock, killing stale and respawning");
         kill_port_owner(TG_PORT);
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while std::time::Instant::now() < deadline {

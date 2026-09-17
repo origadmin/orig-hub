@@ -1,4 +1,5 @@
 import type {
+  TgCacheTask,
   TgChannel,
   TgDiag,
   TgFolder,
@@ -280,4 +281,54 @@ export async function listTgDownloaded(
     `/api/tg/downloaded/${encodeURIComponent(String(chatId))}`,
   )
   return res.downloaded ?? {}
+}
+
+// ---- 缓存任务（服务端任务态）----
+//
+// 缓存由后端 worker 执行并落库，前端不再自己跑「逐条循环」：那个循环活在浏览器内存里，
+// 刷新/切页即消失（「缓存状态完全丢失」的根因）。这里只负责入队 + 读状态。
+
+/** GET /api/tg/cache/tasks — 返回**当前唯一**任务（后端单飞：running → 最老 queued →
+ *  最近一条已结束；无任务时 null）。挂载时调用即恢复进度，1s 轮询也走这里。 */
+export async function getCacheTask(): Promise<TgCacheTask | null> {
+  const res = await request<{ task?: TgCacheTask | null }>('/api/tg/cache/tasks')
+  return res.task ?? null
+}
+
+/**
+ * POST /api/tg/cache/tasks — 入队缓存任务。
+ * 幂等：同 key 已有活跃任务时后端复用该任务，不重复下载。
+ * 传 `groupId` 表示整组（相册）缓存；缺省为单条。
+ */
+export async function enqueueCacheTask(opts: {
+  chatId: number
+  messageIds: number[]
+  groupId?: number
+}): Promise<TgCacheTask> {
+  return request<TgCacheTask>('/api/tg/cache/tasks', {
+    method: 'POST',
+    body: JSON.stringify({
+      chatId: opts.chatId,
+      messageIds: opts.messageIds,
+      groupId: opts.groupId,
+    }),
+  })
+}
+
+/** DELETE /api/tg/cache/tasks/{id} — 取消任务（worker 在下一条目间隙退出）。 */
+export async function cancelCacheTask(id: number): Promise<{ ok: boolean }> {
+  return request(`/api/tg/cache/tasks/${encodeURIComponent(String(id))}`, { method: 'DELETE' })
+}
+
+/** GET /api/tg/cache/tasks/all — 全量任务 + 各状态计数（缓存管理面板用，低频拉取）。 */
+export async function listAllCacheTasks(): Promise<{
+  tasks: TgCacheTask[]
+  counts: Record<string, number>
+}> {
+  return request('/api/tg/cache/tasks/all')
+}
+
+/** DELETE /api/tg/cache/finished — 清除全部终态任务记录（活跃任务不受影响）。 */
+export async function clearFinishedCacheTasks(): Promise<{ ok: boolean; removed: number }> {
+  return request('/api/tg/cache/finished', { method: 'DELETE' })
 }

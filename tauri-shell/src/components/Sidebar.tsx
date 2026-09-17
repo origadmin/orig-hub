@@ -15,9 +15,20 @@ interface Props {
   collapsed: boolean
   onToggle: () => void
   counts: { active: number; completed: number; total: number }
-  /** Telegram 已绑定/已登录 → 显示「TG」Tab（由登录绑定态驱动，非插件开关） */
+  /** Telegram 已绑定/已登录（由登录绑定态驱动） */
   tgBound: boolean
+  /** TG 功能就绪（常规开关开 + 可用性探测 ok）；false 时 TG 导航整体隐藏（入口级门控） */
+  tgReady: boolean
 }
+
+/**
+ * 隐藏下载模块（可逆开关）。
+ *
+ * 依据：用户裁定「下载不需要，因为不使用这个下载逻辑」——主流程是 TG 抓取 → 缓存入库 →
+ * 媒体库管理/播放，不经过 orig-daemon 的下载任务队列。置 false 即可恢复全部下载入口。
+ */
+const DOWNLOAD_MODULE_HIDDEN = true
+const HIDDEN_VIEWS: ViewId[] = ['downloading', 'completed']
 
 const NAV_ITEMS: { id: ViewId; labelKey: string; icon: JSX.Element }[] = [
   {
@@ -51,8 +62,8 @@ const NAV_ITEMS: { id: ViewId; labelKey: string; icon: JSX.Element }[] = [
     id: 'tg',
     labelKey: 'nav.tg',
     icon: (
-      <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-        <path strokeLinecap="round" strokeLinejoin="round" d="M7.5 11.25L5.343 19.5c.52-3.64 9.344-7.798 14.865-10.2 1.14.86 2.94 2.22 3.855 3.468-.27 2.22-4.44 12.72-6.225 16.662l-6.163-1.08M7.5 11.25l9.33-6.53c.9-.63 2.13-.18 2.362.586l.9 2.944M7.5 11.25l4.89 4.11" />
+      <svg className="h-4.5 w-4.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z" />
       </svg>
     ),
   },
@@ -90,6 +101,7 @@ export function Sidebar({
   onToggle,
   counts,
   tgBound,
+  tgReady,
 }: Props) {
   const { t } = useTranslation()
   const [catOpen, setCatOpen] = useState(false)
@@ -233,7 +245,11 @@ export function Sidebar({
           )}
         </div>
 
-        {NAV_ITEMS.filter((item) => item.id !== 'tg' || tgBound).map((item) => {
+        {NAV_ITEMS.filter(
+          (item) =>
+            (!DOWNLOAD_MODULE_HIDDEN || !HIDDEN_VIEWS.includes(item.id)) &&
+            (item.id !== 'tg' || (tgBound && tgReady)),
+        ).map((item) => {
           const active = view === item.id
           const count =
             item.id === 'downloading'

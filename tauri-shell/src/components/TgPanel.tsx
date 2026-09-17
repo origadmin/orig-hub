@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
@@ -15,13 +15,22 @@ import {
   listTgMessages,
   listTgDownloaded,
   syncTgMonitor,
-  downloadTgMessage,
   tgFileUrl,
   tgLocalFileUrl,
   tgThumbUrl,
+  getCacheTask,
+  enqueueCacheTask,
+  cancelCacheTask,
 } from '../api/tg'
-import type { TgChannel, TgMediaItem, TgMonitoredChannel, TgStoredMessage } from '../types'
+import type {
+  TgCacheTask,
+  TgChannel,
+  TgMediaItem,
+  TgMonitoredChannel,
+  TgStoredMessage,
+} from '../types'
 import { ensureTg, tgSaveConfig } from '../api/tauri'
+import { CacheManagerDialog } from './CacheManagerDialog'
 import { useStore } from '../store/useStore'
 import { fmtDuration, fmtSize, fmtTime, guessMediaType, type MediaType } from '../lib/tgmedia'
 
@@ -31,6 +40,23 @@ const UNGROUPED = '__ungrouped__'
 const ALL_KEY = '__all__'
 /** 右栏媒体历史每页条数 */
 const PAGE_SIZE = 30
+
+/**
+ * 稳定事件回调（useEvent 模式）：**引用恒定、行为永远取最新闭包**。
+ *
+ * 流畅度的前提——子组件 `memo` 生效要求 props 引用稳定；用内联箭头
+ * `onDownload={() => do(item)}` 每次渲染都是新引用，memo 形同虚设，
+ * 于是每秒一次的进度轮询会把整列消息气泡全部重渲染（卡顿根源）。
+ * 子组件改为回传自己的数据（如 `onDownload(item)`），父级用本钩子
+ * 提供恒定引用、点击时再取最新状态，杜绝陈旧闭包。
+ */
+function useEvent<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
+  const ref = useRef(fn)
+  useLayoutEffect(() => {
+    ref.current = fn
+  })
+  return useCallback((...args: A) => ref.current(...args), [])
+}
 
 /** 右栏统一消息视图模型（监控本地消息与在线消息共同映射） */
 interface FeedItem {
@@ -156,7 +182,14 @@ function groupAlbums(feed: FeedItem[]): FeedItem[][] {
  */
 export function TgPanel() {
   const { t } = useTranslation()
-  const { setError, openViewer } = useStore()
+  const { setError, openViewer, tgAvailability } = useStore()
+  /**
+   * TG 依赖故障（不可用/不可达）：直接以「不可用 + 原因」取代面板内容。
+   *
+   * 面板里的每一次拉取都依赖 TG 连接，故障时展示一个空列表会让人以为「频道没了」；
+   * 明确说出原因，才能把「连不上 Telegram」与「没有内容」区分开（BUG-023）。
+   */
+  const tgBroken = tgAvailability !== null && tgAvailability.status !== 'ok'
   const [alive, setAlive] = useState(false)
   const [channels, setChannels] = useState<TgChannel[]>([])
   const [scanning, setScanning] = useState(false)
@@ -176,14 +209,20 @@ export function TgPanel() {
   const [hasMore, setHasMore] = useState(false)
 
   const [syncing, setSyncing] = useState(false)
-  const [downloading, setDownloading] = useState<Set<number>>(new Set())
   const [downloadedPaths, setDownloadedPaths] = useState<Map<string, string>>(new Map())
-  /** 相册整组缓存进度（键：a-内容流组，值：已完成/总数，v0.4.2；缓存库组进度归 MediaLibraryPanel） */
-  const [albumProgress, setAlbumProgress] = useState<Map<string, { done: number; total: number }>>(
-    new Map(),
-  )
-  /** 整组缓存取消请求：逐条间隙检查，命中即停止后续条目（当前条由服务端完成） */
-  const cancelReqsRef = useRef<Set<string>>(new Set())
+  /**
+   * 缓存任务（服务端任务态）：缓存由 orig-tg 的后台 worker 执行并落库，前端只读状态。
+   *
+   * 此前进度存在组件内存（`downloading` Set / `albumProgress` Map），且整组缓存由浏览器
+   * 逐条循环驱动——两者都活在页面里，刷新/切页即整体消失（「缓存状态完全丢失」的根因）。
+   * 现在任务的入队、进度、取消、失败原因全在服务端，刷新后重新拉取即可恢复。
+   */
+  /** 当前唯一缓存任务（后端单飞：任意时刻至多一个在呈现；设计裁定「task 只返回一个结果」） */
+  const [cacheTask, setCacheTask] = useState<TgCacheTask | null>(null)
+  /** 缓存管理面板开关（BUG-029：缓存任务的可观测面——数量/进度/状态） */
+  const [cacheManagerOpen, setCacheManagerOpen] = useState(false)
+  /** 已提示过的失败任务：避免轮询把同一个错误反复弹给用户 */
+  const reportedFailuresRef = useRef<Set<number>>(new Set())
   /** APP 首启配置（api_id/api_hash 由壳持久化，未配置时显示配置卡） */
   const [needConfig, setNeedConfig] = useState(false)
   const [cfgId, setCfgId] = useState('')
@@ -265,12 +304,15 @@ export function TgPanel() {
 
   useEffect(() => {
     if (!alive) return
+    // 依赖不可用时不做任何拉取：这些请求必然 503，只会刷无谓的错误提示，
+    // 而面板已用「不可用 + 原因」把情况说清楚了（BUG-023：避免故障被读成一堆零散报错）。
+    if (tgBroken) return
     // 首屏强制触发一次后台扫描：修复旧缓存中 folder 为 NULL 的历史数据。
     fetchDialogs(true)
     listTgMonitoredChannels()
       .then(setMonitoredList)
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-  }, [alive, fetchDialogs, setError])
+  }, [alive, tgBroken, fetchDialogs, setError])
 
   // 扫描中轮询（2.5s），直到后端扫描结束。
   useEffect(() => {
@@ -382,7 +424,136 @@ export function TgPanel() {
     [],
   )
 
-  // ---- 右栏：首屏/切频道/监控状态变化时重新加载首页（最新在底） ----
+  // ---- 缓存任务：读服务端状态（刷新/切页后由此恢复，不再依赖页面内存） ----
+
+  /** 活跃任务（queued/running）；`interrupted` 属已结束（进程崩溃遗留），不参与轮询。 */
+  const activeTask =
+    cacheTask && (cacheTask.status === 'queued' || cacheTask.status === 'running')
+      ? cacheTask
+      : null
+
+  /**
+   * 正在写盘的消息号集合（驱动「缓存中」转圈）。
+   * 整组任务同一时刻只有 `currentId` 在写盘，故只把它算作进行中——否则整组会一起转圈。
+   */
+  const downloading = useMemo(() => {
+    const s = new Set<number>()
+    if (activeTask) {
+      if (activeTask.groupId === undefined || activeTask.groupId === null)
+        activeTask.messageIds.forEach((id) => s.add(id))
+      else if (activeTask.currentId !== undefined) s.add(activeTask.currentId)
+    }
+    return s
+  }, [activeTask])
+
+  /** 整组缓存进度（键与渲染处一致：`a-{chatId}-{groupId}`；单飞下至多一项） */
+  const albumProgress = useMemo(() => {
+    const m = new Map<string, { done: number; total: number }>()
+    if (activeTask && activeTask.groupId !== undefined && activeTask.groupId !== null) {
+      m.set(`a-${activeTask.chatId}-${activeTask.groupId}`, {
+        done: activeTask.done,
+        total: activeTask.total,
+      })
+    }
+    return m
+  }, [activeTask])
+
+  /**
+   * 轮询签名：id/status/done/currentId/error 任一变化才算「状态真的变了」。
+   * 快照返回新对象但内容没变（下载一条要几秒，1s 轮询绝大多数是空转）时
+   * **直接跳过 setState**——零重渲染。这是流畅度规则「等值短路」的落点。
+   */
+  const cacheTasksSigRef = useRef('')
+  const refreshCacheTasks = useCallback(async () => {
+    try {
+      const task = await getCacheTask()
+      const sig = task
+        ? `${task.id}:${task.status}:${task.done}:${task.currentId ?? ''}:${task.error ?? ''}`
+        : ''
+      if (sig === cacheTasksSigRef.current) return
+      cacheTasksSigRef.current = sig
+      setCacheTask(task)
+    } catch {
+      // 任务查询失败不影响浏览；下次轮询/操作会重试
+    }
+  }, [])
+
+  /** 挂载即拉一次：刷新/切页后由此恢复「缓存中 n/N」与已完成标记（本 BUG 的正解）。 */
+  useEffect(() => {
+    if (tgBroken) return
+    void refreshCacheTasks()
+  }, [tgBroken, refreshCacheTasks])
+
+  /** 有活跃任务时才轮询（无任务零开销）：5s 一次、固定节拍（BUG-030：1s 过频致卡顿）。
+   *  依赖只用布尔 `hasActive`——任务进度变化不会重建 interval，节拍恒定不抖动。
+   *  缓存管理面板打开时主轮询暂停：面板自轮 tasks/all（5s），避免双源重复请求。 */
+  const hasActiveTask = activeTask !== null
+  useEffect(() => {
+    if (tgBroken || !hasActiveTask || cacheManagerOpen) return
+    const timer = setInterval(() => void refreshCacheTasks(), 5000)
+    return () => clearInterval(timer)
+  }, [tgBroken, hasActiveTask, cacheManagerOpen, refreshCacheTasks])
+
+  /** feed 最新值（供不依赖 feed 身份的进度刷新读取） */
+  const feedRef = useRef<FeedItem[]>([])
+  useEffect(() => {
+    feedRef.current = feed
+  }, [feed])
+
+  /** 任务终态触发一次「已缓存」快照刷新（▶ 及时出现）。
+   *  设计裁定：进度变化**绝不**派发重请求——1s 恰好 1 个 cache/tasks 轮询，
+   *  全量 downloaded 清单只在任务收尾时拉一次。多任务排队时逐个触发。 */
+  const prevTaskRef = useRef<{ id: number; status: string } | null>(null)
+  useEffect(() => {
+    const prev = prevTaskRef.current
+    prevTaskRef.current = cacheTask ? { id: cacheTask.id, status: cacheTask.status } : null
+    const src = feedSourceRef.current
+    if (!src || !cacheTask) return
+    const wasActive = prev && (prev.status === 'queued' || prev.status === 'running')
+    const isTerminal =
+      cacheTask.status === 'done' ||
+      cacheTask.status === 'failed' ||
+      cacheTask.status === 'cancelled' ||
+      cacheTask.status === 'interrupted'
+    // 同一任务从活跃 → 终态：收尾刷一次；新任务开始（id 变化）不刷。
+    if (!(wasActive && isTerminal && prev.id === cacheTask.id)) return
+    let cancelled = false
+    void (async () => {
+      try {
+        const dl = await listTgDownloaded(src.chatId)
+        if (cancelled) return
+        setDownloadedPaths((m) => {
+          const next = new Map(m)
+          for (const it of feedRef.current) {
+            const p = dl[String(it.messageId)]
+            if (p) next.set(it.key, p)
+            else next.delete(it.key)
+          }
+          return next
+        })
+      } catch {
+        // 快照失败不阻塞浏览
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [cacheTask])
+
+  /** 任务失败必须显式告知（此前失败只留在前端 catch 里，刷新后连痕迹都没有）。 */
+  useEffect(() => {
+    if (!cacheTask || cacheTask.status !== 'failed') return
+    if (reportedFailuresRef.current.has(cacheTask.id)) return
+    reportedFailuresRef.current.add(cacheTask.id)
+    const raw = cacheTask.error ?? ''
+    setError(
+      /os error 5|拒绝访问|access denied/i.test(raw)
+        ? t('tg.protectedMedia')
+        : raw || t('tg.cacheFailed'),
+    )
+  }, [cacheTask, setError, t])
+
+
   // v0.4.3：分组内订阅频道可直接点进内容页（在线流浏览）；监控频道仍走本地真列表。
   useEffect(() => {
     if (selectedId === null) {
@@ -547,59 +718,51 @@ export function TgPanel() {
     }
   }
 
+  /**
+   * 单条缓存：入队服务端任务后立即返回。
+   *
+   * 不再 `await` 整个下载——那会把任务寿命绑在这次 fetch 上，刷新即断。
+   * 进度由 `cacheTasks` 轮询呈现。
+   */
   const doDownload = async (item: FeedItem) => {
-    const path = await downloadCore(item.chatId, item.messageId)
-    if (path) setDownloadedPaths((prev) => new Map(prev).set(item.key, path))
-  }
-
-  /** 下载（缓存）核心：置缓存中状态 → 调后端 → 错误映射；成功后 onDone 回调 */
-  const downloadCore = async (chatId: number, messageId: number, onDone?: () => void) => {
-    setDownloading((s) => new Set(s).add(messageId))
     try {
-      const { path } = await downloadTgMessage(chatId, messageId)
-      onDone?.()
-      return path
+      await enqueueCacheTask({ chatId: item.chatId, messageIds: [item.messageId] })
+      await refreshCacheTasks()
     } catch (e) {
-      const raw = e instanceof Error ? e.message : String(e)
-      // 受保护内容/系统拒绝（Windows os error 5）→ 友好提示，不刷原始错误
-      setError(/os error 5|拒绝访问|access denied/i.test(raw) ? t('tg.protectedMedia') : raw)
-      return undefined
-    } finally {
-      setDownloading((s) => {
-        const next = new Set(s)
-        next.delete(messageId)
-        return next
-      })
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
-  /** 相册整组缓存（v0.4.2）：按组内顺序逐条缓存，进度「缓存中 n/N」；单条失败即中止（错误已提示） */
+  /**
+   * 相册整组缓存：整批交给服务端 worker（顺序 / 进度 / 失败中止 / 取消都在后端）。
+   *
+   * 此前后端循环在浏览器内存里跑，切页即消失；现在刷新页面任务照跑，回来即可见进度。
+   * 已缓存条目由 worker 幂等跳过 → 与「继续」按钮的语义一致（续跑剩余，不重下）。
+   */
   const downloadAlbum = async (items: FeedItem[]) => {
-    const key = `a-${items[0].chatId}-${items[0].groupId}`
-    setAlbumProgress((m) => new Map(m).set(key, { done: 0, total: items.length }))
+    if (items.length === 0) return
     try {
-      for (let i = 0; i < items.length; i++) {
-        if (cancelReqsRef.current.has(key)) break
-        const it = items[i]
-        const path = await downloadCore(it.chatId, it.messageId)
-        if (!path) break
-        setDownloadedPaths((prev) => new Map(prev).set(it.key, path))
-        setFeed((prev) => prev.map((f) => (f.key === it.key ? { ...f, downloaded: true } : f)))
-        setAlbumProgress((m) => new Map(m).set(key, { done: i + 1, total: items.length }))
-      }
-    } finally {
-      cancelReqsRef.current.delete(key)
-      setAlbumProgress((m) => {
-        const next = new Map(m)
-        next.delete(key)
-        return next
+      await enqueueCacheTask({
+        chatId: items[0].chatId,
+        messageIds: items.map((it) => it.messageId),
+        groupId: items[0].groupId,
       })
+      await refreshCacheTasks()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
-  /** 取消整组缓存：置取消标记，循环在下一条间隙停止（当前条由服务端自然完成） */
-  const cancelAlbum = (key: string) => {
-    cancelReqsRef.current.add(key)
+  /** 取消整组缓存：取消服务端任务（worker 在下一条目间隙退出）。 */
+  const cancelAlbum = async (key: string) => {
+    // 单飞模型：当前任务就是该组时才可取消（其它组在排队，无进度可取消）。
+    if (!activeTask || `a-${activeTask.chatId}-${activeTask.groupId}` !== key) return
+    try {
+      await cancelCacheTask(activeTask.id)
+      await refreshCacheTasks()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
   }
 
   /** 用系统默认播放器打开已下载文件（Tauri 壳内；浏览器调试环境静默失败） */
@@ -614,9 +777,57 @@ export function TgPanel() {
     }
   }
 
+  /**
+   * 稳定回调（useEvent）：子气泡全部 memo 化后，回调引用必须恒定。
+   * 子组件回传自己的数据（item / items / index），这里点击时再取最新闭包，
+   * 既保住 memo 的浅比较，又不产生陈旧闭包。
+   */
+  const onBubbleDownload = useEvent((item: FeedItem) => void doDownload(item))
+  const onBubbleOpen = useEvent((item: FeedItem) => void openDownloaded(item))
+  const onBubblePreview = useEvent((item: FeedItem) =>
+    openViewer({
+      title: selectedChannel?.title,
+      index: 0,
+      items: toViewerItems([item]),
+    }),
+  )
+  const onAlbumDownload = useEvent((items: FeedItem[]) => void downloadAlbum(items))
+  const onAlbumCancel = useEvent((items: FeedItem[]) =>
+    void cancelAlbum(`a-${items[0].chatId}-${items[0].groupId}`),
+  )
+  const onAlbumPreview = useEvent((index: number, items: FeedItem[]) =>
+    openViewer({
+      title: selectedChannel?.title,
+      index,
+      items: toViewerItems(items),
+    }),
+  )
+
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-1 overflow-hidden">
-      {needConfig && !alive ? (
+      {tgBroken && tgAvailability ? (
+        /* 依赖故障：说明「为什么用不了」，而不是给一个空列表 */
+        <div className="flex flex-1 items-center justify-center p-6">
+          <div className="w-full max-w-md rounded-lg border border-danger/30 bg-danger/10 p-5">
+            <h3 className="text-[14px] font-semibold text-danger">
+              {tgAvailability.status === 'unreachable'
+                ? t('accounts.tgUnreachable')
+                : t('accounts.tgUnavailable')}
+            </h3>
+            <p className="mt-1 text-[11px] leading-relaxed text-danger/90">
+              {/* 面板内不自带「连接诊断」，故用面板专属文案（不指向账号页才有的区块） */}
+              {tgAvailability.status === 'unreachable'
+                ? t('tg.unreachableHint')
+                : t('tg.unavailableHint')}
+            </p>
+            {tgAvailability.status === 'unavailable' && tgAvailability.reason && (
+              <p className="mt-3 break-all rounded-md bg-surface/60 px-2 py-1.5 font-mono text-[10px] text-danger">
+                {tgAvailability.reason}
+              </p>
+            )}
+          </div>
+        </div>
+      ) : needConfig && !alive ? (
         /* APP 首启：Telegram 凭证配置（保存后由 Tauri 壳持久化并拉起服务） */
         <div className="flex flex-1 items-center justify-center p-6">
           <div className="w-full max-w-md rounded-lg border border-border-subtle bg-surface p-5">
@@ -849,6 +1060,28 @@ export function TgPanel() {
                   </p>
                 )}
               </div>
+              <button
+                type="button"
+                onClick={() => setCacheManagerOpen(true)}
+                title={t('tg.cacheManager')}
+                className="flex h-7 shrink-0 items-center gap-1 rounded px-2 text-[11px] text-fg-muted hover:bg-surface-2 hover:text-fg-strong"
+              >
+                <svg
+                  className="h-3.5 w-3.5"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  strokeWidth={1.5}
+                  aria-hidden="true"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M20 7.5 12 12 4 7.5m8 4.5v9M4 7.5C4 5.015 7.582 3 12 3s8 2.015 8 4.5M4 7.5v9C4 18.985 7.582 21 12 21s8-2.015 8-4.5v-9"
+                  />
+                </svg>
+                {t('tg.cacheManager')}
+              </button>
               {selectedMonitored ? (
                 <Chip tone="success">{t('tg.monitoring')}</Chip>
               ) : (
@@ -891,15 +1124,9 @@ export function TgPanel() {
                         item={unit[0]}
                         downloading={downloading.has(unit[0].messageId)}
                         downloadedPath={downloadedPaths.get(unit[0].key)}
-                        onDownload={() => void doDownload(unit[0])}
-                        onOpenDownloaded={() => void openDownloaded(unit[0])}
-                        onPreview={() =>
-                          openViewer({
-                            title: selectedChannel?.title,
-                            index: 0,
-                            items: toViewerItems(unit),
-                          })
-                        }
+                        onDownload={onBubbleDownload}
+                        onOpenDownloaded={onBubbleOpen}
+                        onPreview={onBubblePreview}
                       />
                     ) : (
                       <AlbumBubble
@@ -909,15 +1136,9 @@ export function TgPanel() {
                           unit.filter((x) => x.downloaded || downloadedPaths.has(x.key)).length
                         }
                         progress={albumProgress.get(`a-${unit[0].chatId}-${unit[0].groupId}`)}
-                        onDownload={() => void downloadAlbum(unit)}
-                        onCancel={() => cancelAlbum(`a-${unit[0].chatId}-${unit[0].groupId}`)}
-                        onPreview={(index) =>
-                          openViewer({
-                            title: selectedChannel?.title,
-                            index,
-                            items: toViewerItems(unit),
-                          })
-                        }
+                        onDownload={onAlbumDownload}
+                        onCancel={onAlbumCancel}
+                        onPreview={onAlbumPreview}
                       />
                     ),
                   )
@@ -940,6 +1161,9 @@ export function TgPanel() {
 
         </>
       )}
+      {cacheManagerOpen ? (
+        <CacheManagerDialog channels={channels} onClose={() => setCacheManagerOpen(false)} />
+      ) : null}
     </div>
   )
 }
@@ -957,26 +1181,31 @@ function mergeFeed(older: FeedItem[], current: FeedItem[]): FeedItem[] {
 }
 
 /** 单条媒体消息气泡（频道风格，全部靠左） */
-function MessageBubble(props: {
+/**
+ * 单条消息气泡。**memo 化 + 数据回传式回调**（流畅度规则）：
+ * 回调携带自己的数据（`onDownload(item)`），父级用 useEvent 提供恒定引用，
+ * 这样轮询引发的父级重渲染在浅比较时被整体跳过，不再拖累整列气泡。
+ */
+const MessageBubble = memo(function MessageBubble(props: {
   item: FeedItem
   downloading: boolean
   downloadedPath?: string
-  onDownload: () => void
-  onOpenDownloaded: () => void
-  onPreview: () => void
+  onDownload: (item: FeedItem) => void
+  onOpenDownloaded: (item: FeedItem) => void
+  onPreview: (item: FeedItem) => void
 }) {
   const { item: m, downloading, downloadedPath, onDownload, onOpenDownloaded, onPreview } = props
   const { t } = useTranslation()
   return (
     <div className="flex flex-col">
       <div className="max-w-[88%] rounded-2xl rounded-tl-md border border-border-subtle bg-surface p-2.5 shadow-sm">
-        {m.type === 'photo' && <PhotoBlock item={m} onPreview={onPreview} />}
+        {m.type === 'photo' && <PhotoBlock item={m} onPreview={() => onPreview(m)} />}
         {m.type === 'video' && (
           <VideoBlock
             item={m}
             downloaded={Boolean(m.downloaded || downloadedPath)}
             downloading={downloading}
-            onDownload={onDownload}
+            onDownload={() => onDownload(m)}
           />
         )}
 
@@ -1003,7 +1232,7 @@ function MessageBubble(props: {
           <span className="ml-auto text-[10px] text-muted">{fmtTime(m.date)}</span>
           {/* 视频的缓存/播放操作在海报上（点击视频=开始缓存），meta 行不重复放按钮 */}
           {m.type === 'video' ? null : downloadedPath ? (
-            <Button variant="secondary" size="sm" className="h-6 px-2 text-[10px]" onClick={onOpenDownloaded}>
+            <Button variant="secondary" size="sm" className="h-6 px-2 text-[10px]" onClick={() => onOpenDownloaded(m)}>
               {t('tg.play')}
             </Button>
           ) : (
@@ -1012,7 +1241,7 @@ function MessageBubble(props: {
               size="sm"
               className="h-6 px-2 text-[10px]"
               disabled={downloading}
-              onClick={onDownload}
+              onClick={() => onDownload(m)}
             >
               {downloading ? '…' : t('tg.download')}
             </Button>
@@ -1021,7 +1250,7 @@ function MessageBubble(props: {
       </div>
     </div>
   )
-}
+})
 
 /** 可选播放速率（倍速菜单项） */
 const PLAYBACK_SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2]
@@ -1036,13 +1265,16 @@ function PlaybackSpeed(props: { rate: number; onRate: (r: number) => void }) {
   const [open, setOpen] = useState(false)
   return (
     <div
-      className="absolute right-2 top-2 z-10 flex flex-col items-end"
+      className="absolute right-3 top-3 z-10 flex flex-col items-end"
       onClick={(e) => e.stopPropagation()}
     >
+      {/* 入口按钮必须够大够显眼（BUG-033）：此前 22×18 的贴边小字用户找不到。
+          最小可点击目标 24×24，这里取 32 高并加描边提高与黑底的对比度。 */}
       <button
         type="button"
+        aria-label={`playback speed ${rate}x`}
         onClick={() => setOpen((v) => !v)}
-        className="rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white/90 hover:bg-black/80"
+        className="flex h-8 min-w-[2.5rem] items-center justify-center rounded-md bg-black/70 px-2 text-[11px] font-semibold text-white ring-1 ring-white/30 backdrop-blur-sm hover:bg-black/85"
       >
         {rate === 1 ? t('tg.speed') : `${rate}x`}
       </button>
@@ -1056,7 +1288,7 @@ function PlaybackSpeed(props: { rate: number; onRate: (r: number) => void }) {
                 onRate(s)
                 setOpen(false)
               }}
-              className={`min-w-[52px] px-3 py-1 text-center hover:bg-white/20 ${
+              className={`min-h-[32px] min-w-[64px] px-3 text-center hover:bg-white/20 ${
                 s === rate ? 'font-semibold text-accent' : ''
               }`}
             >
@@ -1073,17 +1305,21 @@ function PlaybackSpeed(props: { rate: number; onRate: (r: number) => void }) {
  * 相册气泡（v0.4.2）：相邻同 grouped_id 的消息聚合为单个气泡。
  * 组内 2 列缩略图网格 + 「相册 · N 项」角标；点击任一格从该格进入组内浏览
  * （lightbox 左右切换）。整组一键缓存，进行中显示「缓存中 n/N」。
+ *
+ * memo + 自定义比较：`progress` 对象每次进度重建都是新引用，但多数相册的
+ * done/total 并没变——按**值**比较，只有真正在推进的那一组才重渲染。
+ * 回调为 useEvent 恒定引用，不参与比较。
  */
-function AlbumBubble(props: {
+const AlbumBubble = memo(function AlbumBubble(props: {
   items: FeedItem[]
   /** 组内已缓存条数（含本次会话下载成功的） */
   downloadedCount: number
   /** 整组缓存进行中的进度 */
   progress?: { done: number; total: number }
-  onDownload: () => void
+  onDownload: (items: FeedItem[]) => void
   /** 取消整组缓存（进行中时操作行显示「取消」） */
-  onCancel?: () => void
-  onPreview: (index: number) => void
+  onCancel?: (items: FeedItem[]) => void
+  onPreview: (index: number, items: FeedItem[]) => void
 }) {
   const { items, downloadedCount, progress, onDownload, onCancel, onPreview } = props
   const { t } = useTranslation()
@@ -1115,7 +1351,7 @@ function AlbumBubble(props: {
               <button
                 key={it.key}
                 type="button"
-                onClick={() => onPreview(i)}
+                onClick={() => onPreview(i, items)}
                 className="relative block aspect-square w-full overflow-hidden rounded-lg bg-surface-2"
               >
                 {typ === 'photo' || typ === 'video' ? (
@@ -1167,7 +1403,7 @@ function AlbumBubble(props: {
                   variant="outline"
                   size="sm"
                   className="h-6 px-2 text-[10px]"
-                  onClick={onCancel}
+                  onClick={() => onCancel(items)}
                 >
                   {t('tg.cancel')}
                 </Button>
@@ -1178,7 +1414,7 @@ function AlbumBubble(props: {
               variant="outline"
               size="sm"
               className="ml-auto h-6 px-2 text-[10px]"
-              onClick={onDownload}
+              onClick={() => onDownload(items)}
             >
               {downloadedCount > 0
                 ? `${t('tg.continue')} ${downloadedCount}/${items.length}`
@@ -1189,7 +1425,12 @@ function AlbumBubble(props: {
       </div>
     </div>
   )
-}
+}, (a, b) =>
+  a.items === b.items &&
+  a.downloadedCount === b.downloadedCount &&
+  a.progress?.done === b.progress?.done &&
+  a.progress?.total === b.progress?.total,
+)
 
 /** 图片块：列表用轻量缩略图（自然比例不裁切），点击弹遮罩看原图 */
 function PhotoBlock({ item, onPreview }: { item: FeedItem; onPreview: () => void }) {

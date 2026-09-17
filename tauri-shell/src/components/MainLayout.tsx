@@ -16,11 +16,18 @@ import { ensureDaemon, daemonStatus } from '../api/tauri'
 import { cn } from '../lib/utils'
 
 export function MainLayout() {
-  const [view, setView] = useState<ViewId>('downloading')
+  // 默认落地媒体库（下载模块已按用户裁定隐藏，见 Sidebar 的 DOWNLOAD_MODULE_HIDDEN）
+  const [view, setView] = useState<ViewId>('media')
   const [collapsed, setCollapsed] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
   const { t } = useTranslation()
-  const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, accounts, viewer, setViewerIndex, closeViewer } = useStore()
+  const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, accounts, viewer, setViewerIndex, closeViewer, tgEnabled, tgAvailability, refreshTgSession } = useStore()
+
+  /** TG 入口级门控（用户裁定：常规 TG 开关控制整个 TG 内容）：
+   *  开关关 OR 探测到不可用/不可达 → 侧栏 TG 导航与账号页 TG 绑定整体隐藏；
+   *  面板级故障卡只作保底回退。`tgAvailability === null` 为探测未返回的瞬态，
+   *  按 ready 处理避免首帧闪烁（探测毫秒级，init() 挂载即触发）。 */
+  const tgFeatureReady = tgEnabled && (tgAvailability === null || tgAvailability.status === 'ok')
 
   useEffect(() => {
     init()
@@ -37,10 +44,41 @@ export function MainLayout() {
     return () => clearInterval(timer)
   }, [init, refresh, setDaemon])
 
-  // TG 未绑定时，若当前停留在 TG 视图则退回下载视图（由登录绑定态驱动，非插件开关）
+  // TG 未绑定时，若当前停留在 TG 视图则退回媒体库（由登录绑定态驱动，非插件开关）
   useEffect(() => {
-    if (!accounts.tg.bound && view === 'tg') setView('downloading')
+    if (!accounts.tg.bound && view === 'tg') setView('media')
   }, [accounts.tg.bound, view])
+
+  // 功能被摘除时（开关关 / 探测到不可用）把用户从 TG 视图送回媒体库，
+  // 避免停留在已被门控隐藏的面板上。探测未返回（null）不算不可用。
+  useEffect(() => {
+    if (view !== 'tg') return
+    const unavailable = tgAvailability !== null && tgAvailability.status !== 'ok'
+    if (!tgEnabled || unavailable) setView('media')
+  }, [tgEnabled, tgAvailability, view])
+
+  // TG 开关变化时重探测可用性：开启侧 daemon 拉起 orig-tg 需要时间，最多重试 5 次；
+  // 关闭侧探一次即可（必为不可达，TG 入口随之摘除）。
+  useEffect(() => {
+    if (!tgEnabled) {
+      void refreshTgSession()
+      return
+    }
+    let attempts = 0
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const probe = () => {
+      void refreshTgSession().then(() => {
+        const st = useStore.getState().tgAvailability
+        if ((st === null || st.status !== 'ok') && ++attempts < 5) {
+          timer = setTimeout(probe, 1500)
+        }
+      })
+    }
+    probe()
+    return () => {
+      if (timer) clearTimeout(timer)
+    }
+  }, [tgEnabled, refreshTgSession])
 
   // 全局错误 toast：按钮/操作失败时的用户可见反馈（自动消失）
   useEffect(() => {
@@ -115,6 +153,7 @@ export function MainLayout() {
           onToggle={() => setCollapsed((c) => !c)}
           counts={{ active: active.length, completed: completed.length, total: downloads.length }}
           tgBound={accounts.tg.bound}
+          tgReady={tgFeatureReady}
         />
 
         <div className="flex min-w-0 flex-1 flex-col">

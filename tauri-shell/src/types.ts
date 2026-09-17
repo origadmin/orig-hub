@@ -116,9 +116,30 @@ export type LanguageValue = 'zh-CN' | 'en-US'
 export interface TgSession {
   /** Anonymous | CodeRequired | PasswordRequired | Authorized */
   phase: string
-  phone?: string
-  user_id?: number
+  phone?: string | null
+  user_id?: number | null
+  /**
+   * TG 依赖是否可用。`false` 表示 orig-tg 连不上 Telegram（凭证缺失或 MTProto 失败），
+   * 此时 `reason` 给出原因 —— 注意这**不是**「未登录」，二者必须分开显示。
+   */
+  available?: boolean
+  /** 不可用原因（`available === false` 时非空）。 */
+  reason?: string | null
 }
+
+/**
+ * TG 可用性三态（前端内部模型）。
+ *
+ * - `ok`：依赖可用，登录态由 `phase` 推导
+ * - `unavailable`：orig-tg 活着，但它连不上 Telegram（后端给出 `reason`）
+ * - `unreachable`：连 orig-tg 进程都够不到
+ *
+ * 后两态都**不**清空绑定态：不知道 ≠ 没登录（BUG-023 的界面根因）。
+ */
+export type TgAvailability =
+  | { status: 'ok' }
+  | { status: 'unavailable'; reason: string | null }
+  | { status: 'unreachable' }
 
 /** 频道/订阅会话摘要（GET /api/tg/dialogs） */
 export interface TgChannel {
@@ -198,11 +219,43 @@ export interface TgMessagePage<T> {
   hasMore: boolean
 }
 
+/**
+ * 服务端缓存任务（GET /api/tg/cache/tasks）。
+ *
+ * 状态归属服务端：刷新/切页/关标签页都不会再丢进度，前端只做读视图。
+ * `status` 中 `interrupted` = 进程崩溃遗留（已无 worker），前端按「未完成、可继续」处理。
+ */
+export interface TgCacheTask {
+  id: number
+  chatId: number
+  /** 相册分组 id（单条缓存时缺省） */
+  groupId?: number
+  /** 去重键：g:{chat}:{group} / m:{chat}:{msg} */
+  itemKey: string
+  messageIds: number[]
+  total: number
+  done: number
+  status: 'queued' | 'running' | 'done' | 'cancelled' | 'failed' | 'interrupted'
+  /** 正在缓存的消息号 */
+  currentId?: number
+  /** 失败原因（status=failed 时有值） */
+  error?: string
+  createdAt: number
+  updatedAt: number
+}
+
 /** orig-tg 运行诊断快照（GET /api/tg/diag） */
 export interface TgDiag {
   health: string
   port: number
-  api_mode: 'real' | 'dummy'
+  /** TG 是否可用（凭证齐备且 MTProto 已连接）。 */
+  available: boolean
+  /** 可用性标签：`ready` | `unavailable`。 */
+  mode: string
+  /** 不可用原因（`available === false` 时非空）。 */
+  unavailable_reason: string | null
+  /** 是否运行在测试 mock 客户端之上（生产构建恒为 false）。 */
+  mock: boolean
   api_configured: boolean
   proxy: string | null
   session_phase: string

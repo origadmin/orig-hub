@@ -1,32 +1,59 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { useTranslation } from '../i18n'
-import {
-  tgHealth,
-  listTgStored,
-  clearTgStored,
-  downloadTgMessage,
-  getTgConfig,
-  setTgDownloadDir,
-  tgFileUrl,
-  tgLocalFileUrl,
-  tgThumbUrl,
-} from '../api/tg'
-import { ensureTg } from '../api/tauri'
 import { useStore } from '../store/useStore'
-import type { TgStoredItem } from '../types'
-import { fmtDuration, fmtSize, fmtTime, guessMediaType } from '../lib/tgmedia'
+import { tgHealth } from '../api/tg'
+import { ensureTg } from '../api/tauri'
+import {
+  deleteMediaItem,
+  deleteEpisode,
+  deleteSeries,
+  getLibraryStats,
+  getSeries,
+  listMediaItems,
+  listSeries,
+  listTags,
+  mediaItemUrl,
+  patchMediaItem,
+  patchSeries,
+  setItemTags,
+} from '../api/media'
+import type {
+  LibraryStats,
+  MediaItem,
+  MediaKind,
+  MediaSeries,
+  MediaSeriesDetail,
+  MediaTag,
+} from '../api/media'
+import { MediaCard } from './media/MediaCard'
+import { SeriesCard, SeriesDetail } from './media/SeriesDetail'
+import { ImportDialog } from './media/ImportDialog'
+import { BulkTagDialog, TagManagerDialog } from './media/TagManagerDialog'
+import { AddToSeriesDialog, CreateSeriesDialog } from './media/SeriesDialog'
+import { ItemEditDialog } from './media/ItemEditDialog'
+import { fmtSize } from '../lib/tgmedia'
+import type { ViewerItem } from '../types'
+
+type Tab = 'all' | MediaKind
+type View = 'items' | 'series' | 'seriesDetail'
+
+const PAGE = 120
 
 /**
- * 媒体库（v0.5.0 独立视图）：跨频道聚合的已缓存媒体（原 TgPanel「缓存库」整块迁出）。
- * 检索 + 相册聚合行 + 播放遮罩（本地流优先、在线流降级）+ 下载目录设置。
+ * 媒体资料库（v0.6.0）：**用户可管理的**内容目录，替代原先只读的 TG 缓存列表。
+ *
+ * 结构（对齐主流媒体站）：
+ *   左栏 分类/剧集/标签导航 → 主区 海报墙（内容）或 剧集墙/剧集详情
+ * 能力：本地目录导入、剧集（季/集）编排、标签交叉归类、图片（图集）管理、多选批量操作。
+ * 播放统一交给全局播放器页（openViewer），不在本面板内嵌。
  */
 export function MediaLibraryPanel() {
   const { t } = useTranslation()
   const { setError, openViewer } = useStore()
 
-  // ---- 服务探活：APP 模式由 Tauri 壳托管拉起 ----
+  // ---- 服务探活（媒体资料库与 TG 同进程；APP 模式由壳托管拉起）----
   const [alive, setAlive] = useState(false)
   useEffect(() => {
     const isTauri = '__TAURI_INTERNALS__' in window
@@ -43,428 +70,641 @@ export function MediaLibraryPanel() {
       })
   }, [])
 
-  const [items, setItems] = useState<TgStoredItem[]>([])
+  // ---- 数据 ----
+  const [stats, setStats] = useState<LibraryStats | null>(null)
+  const [items, setItems] = useState<MediaItem[]>([])
+  const [total, setTotal] = useState(0)
+  const [series, setSeries] = useState<MediaSeries[]>([])
+  const [tags, setTags] = useState<MediaTag[]>([])
+  const [detail, setDetail] = useState<MediaSeriesDetail | null>(null)
   const [loading, setLoading] = useState(false)
+
+  // ---- 视图状态 ----
+  const [tab, setTab] = useState<Tab>('all')
+  const [view, setView] = useState<View>('items')
+  const [activeSeriesId, setActiveSeriesId] = useState<number | null>(null)
+  const [activeTagId, setActiveTagId] = useState<number | null>(null)
   const [search, setSearch] = useState('')
-  const [hasMore, setHasMore] = useState(false)
-  /** 整组缓存进度（键 g-频道-组，值 已完成/总数）与取消请求 */
-  const [albumProgress, setAlbumProgress] = useState<Map<string, { done: number; total: number }>>(
-    new Map(),
+  const [sort, setSort] = useState<'recent' | 'oldest' | 'title' | 'duration' | 'size'>('recent')
+  const [unassignedOnly, setUnassignedOnly] = useState(false)
+  const [selected, setSelected] = useState<Set<number>>(new Set())
+
+  // ---- 弹窗 ----
+  const [importOpen, setImportOpen] = useState(false)
+  const [tagMgrOpen, setTagMgrOpen] = useState(false)
+  const [bulkTagOpen, setBulkTagOpen] = useState(false)
+  const [createOpen, setCreateOpen] = useState(false)
+  const [addToOpen, setAddToOpen] = useState(false)
+  const [editing, setEditing] = useState<MediaItem | null>(null)
+  const [confirmDelete, setConfirmDelete] = useState<{ kind: 'items' | 'series'; id?: number } | null>(
+    null,
   )
-  const cancelReqsRef = useRef<Set<string>>(new Set())
-  /** 缓存中单条（供行内「缓存中」态判断） */
-  const [downloading, setDownloading] = useState<Set<number>>(new Set())
-  /** 下载目录弹窗 */
-  const [dirOpen, setDirOpen] = useState(false)
-  const [dlDir, setDlDir] = useState('')
-  const [dlDirSaving, setDlDirSaving] = useState(false)
 
-  // 播放器键盘导航（←/→/Esc）由 MediaViewer 组件自持，此处不再监听
-
-  /** 聚合行：同频道同 groupId 聚合为相册行（组内按消息 id 升序），其余单条成行 */
-  const rows = useMemo<{ key: string; items: TgStoredItem[] }[]>(() => {
-    const map = new Map<string, TgStoredItem[]>()
-    const order: string[] = []
-    for (const it of items) {
-      const k =
-        it.groupId != null ? `g-${it.channelId}-${it.groupId}` : `s-${it.channelId}-${it.messageId}`
-      if (!map.has(k)) {
-        map.set(k, [])
-        order.push(k)
-      }
-      map.get(k)!.push(it)
+  // ---------- 加载 ----------
+  const loadMeta = useCallback(async () => {
+    try {
+      const [s, tg, sr] = await Promise.all([getLibraryStats(), listTags(), listSeries()])
+      setStats(s)
+      setTags(tg)
+      setSeries(sr)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
     }
-    return order.map((k) => {
-      const group = map.get(k)!
-      if (group.length > 1) group.sort((a, b) => a.messageId - b.messageId)
-      return { key: k, items: group }
-    })
-  }, [items])
+  }, [setError])
 
-  /** 归一化聚合行 → 全局播放器条目（本地流优先 + 在线降级；判型带扩展名兜底） */
-  const toViewerItems = (group: TgStoredItem[]) =>
-    group.map((x) => ({
-      key: x.messageId,
-      chatId: x.channelId,
-      messageId: x.messageId,
-      kind: x.type ?? guessMediaType(x.mimeType, x.filePath),
-      caption: x.caption,
-      src: tgLocalFileUrl(x.channelId, x.messageId),
-      fallbackSrc: tgFileUrl(x.channelId, x.messageId),
-    }))
-  /** 播放器返回行标题：当前行 caption（无则 #id）· 频道名 */
-  const viewerTitle = (group: TgStoredItem[]) => {
-    const it = group[0]
-    const cap = group.find((x) => x.caption?.trim())?.caption
-    return (cap?.trim() || `#${it.messageId}`) + (it.channelTitle ? ` · ${it.channelTitle}` : '')
-  }
+  const loadItems = useCallback(async () => {
+    setLoading(true)
+    try {
+      const r = await listMediaItems({
+        kind: tab === 'all' ? '' : tab,
+        q: search.trim() || undefined,
+        tagId: activeTagId ?? undefined,
+        unassigned: unassignedOnly,
+        sort,
+        limit: PAGE,
+        offset: 0,
+      })
+      setItems(r.items)
+      setTotal(r.total)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [tab, search, activeTagId, unassignedOnly, sort, setError])
 
-  // 进入视图 / 搜索词变化（300ms 防抖）时重查第一页
-  const fetchPage = useCallback(
-    async (opts?: { beforeId?: number }) => {
-      setLoading(true)
-      try {
-        const page = await listTgStored({
-          q: search.trim() || undefined,
-          downloaded: true,
-          limit: 50,
-          beforeId: opts?.beforeId,
-        })
-        setItems((prev) => (opts?.beforeId ? [...prev, ...page.items] : page.items))
-        setHasMore(page.hasMore)
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e))
-      } finally {
-        setLoading(false)
-      }
-    },
-    [search, setError],
-  )
+  const loadSeries = useCallback(async () => {
+    try {
+      setSeries(await listSeries())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }, [setError])
 
   useEffect(() => {
     if (!alive) return
-    const h = setTimeout(() => void fetchPage(), items.length ? 300 : 0)
+    void loadMeta()
+  }, [alive, loadMeta])
+
+  useEffect(() => {
+    if (!alive || view !== 'items') return
+    const h = setTimeout(() => void loadItems(), 250)
     return () => clearTimeout(h)
-    // items.length 仅作防抖判断不触发。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [alive, search, fetchPage])
+  }, [alive, view, loadItems])
 
-  /** 加载更早一页（滚动到底部触发） */
-  const loadOlder = useCallback(() => {
-    if (loading || !hasMore || items.length === 0) return
-    const oldest = items[items.length - 1]
-    void fetchPage({ beforeId: oldest.messageId })
-  }, [loading, hasMore, items, fetchPage])
+  const openSeries = useCallback(
+    async (id: number) => {
+      try {
+        const d = await getSeries(id)
+        setDetail(d)
+        setActiveSeriesId(id)
+        setView('seriesDetail')
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e))
+      }
+    },
+    [setError],
+  )
 
-  /** 下载（缓存）核心：置缓存中状态 → 调后端 → 错误映射 */
-  const downloadCore = async (channelId: number, messageId: number, onDone?: () => void) => {
-    setDownloading((s) => new Set(s).add(messageId))
-    try {
-      const { path } = await downloadTgMessage(channelId, messageId)
-      onDone?.()
-      return path
-    } catch (e) {
-      const raw = e instanceof Error ? e.message : String(e)
-      // 受保护内容/系统拒绝（Windows os error 5）→ 友好提示，不刷原始错误
-      setError(/os error 5|拒绝访问|access denied/i.test(raw) ? t('tg.protectedMedia') : raw)
-      return undefined
-    } finally {
-      setDownloading((s) => {
-        const next = new Set(s)
-        next.delete(messageId)
-        return next
-      })
-    }
+  // ---------- 播放（交给全局播放器页）----------
+  const toViewerItems = (list: { id: number; kind: MediaKind; title: string }[]): ViewerItem[] =>
+    list.map((i) => ({
+      key: `media-${i.id}`,
+      chatId: 0,
+      messageId: i.id,
+      kind: i.kind,
+      caption: i.title,
+      src: mediaItemUrl(i.id),
+    }))
+
+  const playItems = (list: MediaItem[], index: number, title?: string) => {
+    if (list.length === 0) return
+    openViewer({ items: toViewerItems(list), index, title })
   }
 
-  /** 单条缓存：成功后就地刷新该行状态 */
-  const downloadOne = async (it: TgStoredItem): Promise<boolean> => {
-    const path = await downloadCore(it.channelId, it.messageId, () => {
+  const playEpisode = (index: number) => {
+    if (!detail) return
+    // 分集 → 内容条目：用第一集的封面/标题组装播放组
+    const eps = detail.episodes
+    const list: MediaItem[] = eps.map((e) => ({
+      id: e.itemId,
+      source: 'local',
+      ref: String(e.itemId),
+      title: e.title || e.itemTitle || `#${e.itemId}`,
+      kind: (e.kind ?? 'video') as MediaKind,
+      poster: e.poster,
+      duration: e.duration,
+      addedAt: 0,
+      tags: [],
+      seriesId: detail.id,
+      seriesTitle: detail.title,
+    }))
+    playItems(list, Math.max(0, index), detail.title)
+  }
+
+  // ---------- 选择 ----------
+  const toggleSelect = (id: number, _shiftKey: boolean) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+  const clearSelection = () => setSelected(new Set())
+
+  const visibleIds = useMemo(() => items.map((i) => i.id), [items])
+
+  // ---------- 操作 ----------
+  const onPosterReady = useCallback(
+    (patch: { id: number; poster: string; duration?: number }) => {
+      // 静默回写：失败不影响展示（内存里已有封面）
+      void patchMediaItem(patch.id, {
+        poster: patch.poster,
+        duration: patch.duration,
+      }).catch(() => undefined)
       setItems((prev) =>
-        prev.map((p) =>
-          p.channelId === it.channelId && p.messageId === it.messageId
-            ? { ...p, downloaded: true, filePath: p.filePath ?? 'cached' }
-            : p,
+        prev.map((i) =>
+          i.id === patch.id
+            ? { ...i, poster: patch.poster, duration: patch.duration ?? i.duration }
+            : i,
         ),
       )
-    })
-    return path !== undefined
+    },
+    [],
+  )
+
+  const refreshAll = async () => {
+    await loadMeta()
+    if (view === 'items') await loadItems()
+    else if (view === 'series') await loadSeries()
+    else if (view === 'seriesDetail' && activeSeriesId) await openSeries(activeSeriesId)
   }
 
-  /** 相册行整组缓存：只补未缓存项，进度 n 按组内总数计 */
-  const downloadGroup = async (group: TgStoredItem[]) => {
-    const key = `g-${group[0].channelId}-${group[0].groupId}`
-    let done = group.filter((x) => x.downloaded).length
-    setAlbumProgress((m) => new Map(m).set(key, { done, total: group.length }))
+  const doDeleteSelected = async () => {
+    const ids = [...selected]
+    if (ids.length === 0) return
     try {
-      for (const it of group) {
-        if (cancelReqsRef.current.has(key)) break
-        if (it.downloaded) continue
-        const ok = await downloadOne(it)
-        if (ok) done += 1
-        setAlbumProgress((m) => new Map(m).set(key, { done, total: group.length }))
-        if (!ok) break
-      }
-    } finally {
-      cancelReqsRef.current.delete(key)
-      setAlbumProgress((m) => {
-        const next = new Map(m)
-        next.delete(key)
-        return next
-      })
-    }
-  }
-
-  /** 取消整组缓存：置取消标记，循环在下一条间隙停止 */
-  const cancelAlbum = (key: string) => {
-    cancelReqsRef.current.add(key)
-  }
-
-  /** 清除缓存行：逐条删落盘文件并复位状态，随后重查聚合视图刷新列表 */
-  const clearRows = async (group: TgStoredItem[]) => {
-    const done = group.filter((x) => x.downloaded)
-    if (done.length === 0) return
-    try {
-      for (const it of done) {
-        await clearTgStored(it.channelId, it.messageId)
-      }
-      await fetchPage()
+      for (const id of ids) await deleteMediaItem(id)
+      clearSelection()
+      await refreshAll()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
   }
 
-  /** 打开下载目录弹窗：拉当前生效目录 */
-  const openDirDialog = useCallback(async () => {
+  const doDeleteSeries = async (id: number) => {
     try {
-      const cfg = await getTgConfig()
-      setDlDir(cfg.downloadDir)
+      await deleteSeries(id)
+      setView('series')
+      setDetail(null)
+      setActiveSeriesId(null)
+      await refreshAll()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
-    setDirOpen(true)
-  }, [setError])
+  }
 
-  /** 保存下载目录（后端校验可创建并持久化，立即生效） */
-  const saveDownloadDir = useCallback(async () => {
-    setDlDirSaving(true)
-    try {
-      const cfg = await setTgDownloadDir(dlDir.trim())
-      setDlDir(cfg.downloadDir)
-      setDirOpen(false)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setDlDirSaving(false)
-    }
-  }, [dlDir, setError])
+  const switchTab = (next: Tab) => {
+    setTab(next)
+    setView('items')
+    setDetail(null)
+    clearSelection()
+  }
+
+  // ---------- 渲染 ----------
+  const railBtn = (active: boolean) =>
+    [
+      'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] transition-colors',
+      active
+        ? 'bg-accent/10 font-medium text-accent'
+        : 'text-fg-strong hover:bg-surface-2/70',
+    ].join(' ')
+
+  const emptyState = (
+    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-10">
+      <p className="text-sm text-muted">{loading ? t('media.loading') : t('media.empty')}</p>
+      {!loading && total === 0 ? (
+        <>
+          <p className="max-w-sm text-center text-[11px] leading-relaxed text-muted">
+            {t('media.emptyHint')}
+          </p>
+          <Button size="sm" className="h-8 px-3 text-xs" onClick={() => setImportOpen(true)}>
+            {t('media.importDir')}
+          </Button>
+        </>
+      ) : null}
+    </div>
+  )
 
   return (
     <div className="flex h-full min-h-0 flex-1 bg-surface/20">
-      {/* 左栏：标题 + 搜索 + 列表 */}
-      <div className="flex w-[42%] min-w-[340px] max-w-[560px] shrink-0 flex-col border-r border-border-subtle/60">
-      {/* 标题行：媒体库 + 下载目录 */}
-      <header className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-3 py-2.5">
-        <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold text-fg-strong">
-          ⬇ {t('tg.cachedLib')}
-        </h3>
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-7 shrink-0 px-2 text-[11px]"
-          onClick={() => void openDirDialog()}
-        >
-          ⌂ {t('tg.downloadDir')}
-        </Button>
-      </header>
-      <div className="border-b border-border-subtle/60 px-3 pb-2 pt-2">
-        <Input
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder={t('tg.searchMedia')}
-          className="h-8 text-xs"
-        />
-      </div>
-      <div
-        className="min-h-0 flex-1 overflow-y-auto p-1.5"
-        onScroll={(e) => {
-          const el = e.currentTarget
-          if (el.scrollTop + el.clientHeight >= el.scrollHeight - 40) loadOlder()
-        }}
-      >
-        {!alive ? (
-          <p className="px-2 py-6 text-center text-xs text-muted">{t('tg.serviceOffline')}</p>
-        ) : loading && items.length === 0 ? (
-          <p className="px-2 py-6 text-center text-xs text-muted">{t('tg.historyLoading')}</p>
-        ) : items.length === 0 ? (
-          <p className="px-2 py-6 text-center text-xs text-muted">{t('tg.emptyCached')}</p>
-        ) : (
-          rows.map((row) => {
-            const group = row.items
-            const it = group[0]
-            const isGroup = group.length > 1
-            const prog = isGroup
-              ? albumProgress.get(`g-${it.channelId}-${it.groupId}`)
-              : undefined
-            const isBusy = isGroup ? Boolean(prog) : downloading.has(it.messageId)
-            const typ = it.type ?? guessMediaType(it.mimeType, it.filePath)
-            const thumbMsg =
-              group.find((x) => {
-                const tp = x.type ?? guessMediaType(x.mimeType, x.filePath)
-                return tp === 'video' || tp === 'photo'
-              }) ?? it
-            const thumbTyp = thumbMsg.type ?? guessMediaType(thumbMsg.mimeType, thumbMsg.filePath)
-            const dur = fmtDuration(thumbMsg.duration)
-            const doneCount = group.filter((x) => x.downloaded).length
-            const allDone = doneCount === group.length
-            const caption = group.find((x) => x.caption?.trim())?.caption
-            return (
-              <div
-                key={row.key}
-                className="flex items-center gap-2 rounded-md px-2 py-2 hover:bg-surface-2/70"
-              >
-                {/* 缩略图（视频/照片）；音频/文件用图标；单击打开播放遮罩 */}
-                <button
-                  type="button"
-                  onClick={() =>
-                    openViewer({ title: viewerTitle(group), index: 0, items: toViewerItems(group) })
-                  }
-                  className="relative h-12 w-20 shrink-0 overflow-hidden rounded-md bg-surface-2"
+      {/* ───────── 左栏导航 ───────── */}
+      <aside className="flex w-52 shrink-0 flex-col border-r border-border-subtle/60">
+        <div className="shrink-0 border-b border-border-subtle/60 px-3 py-2.5">
+          <h3 className="truncate text-[13px] font-semibold text-fg-strong">🎬 {t('media.title')}</h3>
+          {stats ? (
+            <p className="mt-0.5 truncate text-[10px] text-muted">
+              {stats.items} 项 · {fmtSize(stats.totalSize)}
+            </p>
+          ) : null}
+        </div>
+
+        <nav className="min-h-0 flex-1 overflow-y-auto p-2">
+          <p className="px-2 pb-1 pt-1 text-[10px] font-medium uppercase tracking-wide text-muted">
+            {t('media.sectionContent')}
+          </p>
+          {(
+            [
+              ['all', t('media.all'), stats?.items ?? 0],
+              ['video', t('media.videos'), stats?.videos ?? 0],
+              ['photo', t('media.photos'), stats?.photos ?? 0],
+              ['audio', t('media.audios'), stats?.audios ?? 0],
+            ] as [Tab, string, number][]
+          ).map(([key, label, count]) => (
+            <button
+              key={key}
+              type="button"
+              className={railBtn(view === 'items' && tab === key && activeTagId === null)}
+              onClick={() => {
+                setActiveTagId(null)
+                switchTab(key)
+              }}
+            >
+              <span className="min-w-0 flex-1 truncate">{label}</span>
+              <span className="shrink-0 text-[10px] text-muted">{count}</span>
+            </button>
+          ))}
+
+          <p className="px-2 pb-1 pt-3 text-[10px] font-medium uppercase tracking-wide text-muted">
+            {t('media.series')}
+          </p>
+          <button
+            type="button"
+            className={railBtn(view === 'series')}
+            onClick={() => {
+              setView('series')
+              setDetail(null)
+              setActiveTagId(null)
+              clearSelection()
+              void loadSeries()
+            }}
+          >
+            <span className="min-w-0 flex-1 truncate">{t('media.allSeries')}</span>
+            <span className="shrink-0 text-[10px] text-muted">{series.length}</span>
+          </button>
+
+          <p className="px-2 pb-1 pt-3 text-[10px] font-medium uppercase tracking-wide text-muted">
+            {t('media.tags')}
+          </p>
+          <div className="flex flex-wrap gap-1 px-1">
+            {tags.length === 0 ? (
+              <p className="px-1 text-[10px] text-muted">—</p>
+            ) : (
+              tags.map((tag) => {
+                const on = activeTagId === tag.id
+                return (
+                  <button
+                    key={tag.id}
+                    type="button"
+                    onClick={() => {
+                      setActiveTagId(on ? null : tag.id)
+                      setView('items')
+                      setDetail(null)
+                      clearSelection()
+                    }}
+                    className={[
+                      'rounded-full border px-2 py-0.5 text-[10.5px] transition-colors',
+                      on ? 'text-white' : 'text-fg-strong hover:bg-surface-2',
+                    ].join(' ')}
+                    style={
+                      on
+                        ? { background: tag.color ?? '#64748b', borderColor: tag.color ?? '#64748b' }
+                        : { borderColor: `${tag.color ?? '#64748b'}55` }
+                    }
+                  >
+                    {tag.name}
+                    <span className="ml-1 opacity-70">{tag.itemCount ?? 0}</span>
+                  </button>
+                )
+              })
+            )}
+          </div>
+        </nav>
+      </aside>
+
+      {/* ───────── 主区 ───────── */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        {/* 工具条 */}
+        <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border-subtle/60 px-3 py-2">
+          <div className="w-44 min-w-0">
+            <Input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder={t('media.search')}
+              className="h-7 text-xs"
+            />
+          </div>
+          <select
+            value={sort}
+            onChange={(e) => setSort(e.target.value as typeof sort)}
+            className="h-7 rounded-md border border-border-subtle bg-surface px-2 text-[11px] text-fg-strong"
+          >
+            <option value="recent">{t('media.sortRecent')}</option>
+            <option value="oldest">{t('media.sortOldest')}</option>
+            <option value="title">{t('media.sortTitle')}</option>
+            <option value="duration">{t('media.sortDuration')}</option>
+            <option value="size">{t('media.sortSize')}</option>
+          </select>
+          {view === 'items' ? (
+            <label className="flex items-center gap-1 text-[11px] text-muted">
+              <input
+                type="checkbox"
+                checked={unassignedOnly}
+                onChange={(e) => setUnassignedOnly(e.target.checked)}
+                className="h-3 w-3"
+              />
+              {t('media.unassignedOnly')}
+            </label>
+          ) : null}
+
+          <div className="ml-auto flex items-center gap-1.5">
+            {selected.size > 0 ? (
+              <>
+                <span className="mr-1 text-[11px] text-muted">
+                  {t('media.selected', { n: selected.size })}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  onClick={() => setAddToOpen(true)}
                 >
-                  {thumbTyp === 'photo' || thumbTyp === 'video' ? (
-                    <img
-                      src={tgThumbUrl(thumbMsg.channelId, thumbMsg.messageId)}
-                      alt=""
-                      loading="lazy"
-                      onError={(e) => {
-                        e.currentTarget.style.display = 'none'
-                      }}
-                      className="h-full w-full object-cover"
-                    />
-                  ) : (
-                    <span className="flex h-full w-full items-center justify-center text-base">
-                      {thumbTyp === 'audio' ? '🎵' : '📄'}
-                    </span>
-                  )}
-                  {dur && (
-                    <span className="absolute bottom-0.5 right-0.5 rounded bg-black/70 px-1 text-[9px] text-white">
-                      {dur}
-                    </span>
-                  )}
-                </button>
-                {/* 标题 + 元信息：相册计数并入元信息行（纯文本，与按钮视觉分离） */}
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-[12.5px] font-medium text-fg-strong">
-                    {caption || `#${it.messageId}`}
-                  </p>
-                  <p className="truncate text-[10px] text-muted">
-                    {isGroup && `${t('tg.albumN', { n: group.length })} · `}
-                    {it.channelTitle ?? `#${it.channelId}`} ·{' '}
-                    {fmtSize(group.reduce((s, x) => s + (x.size ?? 0), 0))} ·{' '}
-                    {fmtTime(it.date ?? it.createdAt)}
-                  </p>
-                </div>
-                {/* 状态即按钮：⬇缓存 → 缓存中(文字+取消) → ▶播放/▶查看/▶继续(n/N)；清除为固定次级项 */}
-                <div className="flex shrink-0 items-center gap-1.5">
-                  {isBusy ? (
-                    <>
-                      <span className="text-[10px] text-muted">
-                        {t('tg.cachingProgress', {
-                          n: prog?.done ?? 0,
-                          total: prog?.total ?? group.length,
-                        })}
-                      </span>
-                      {isGroup && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="h-6 px-2 text-[10px]"
-                          onClick={() => cancelAlbum(`g-${it.channelId}-${it.groupId}`)}
-                        >
-                          {t('tg.cancel')}
-                        </Button>
-                      )}
-                    </>
-                  ) : allDone ? (
-                    <>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="h-6 px-2 text-[10px]"
-                        onClick={() =>
-                    openViewer({ title: viewerTitle(group), index: 0, items: toViewerItems(group) })
-                  }
-                      >
-                        {isGroup || typ === 'video' || typ === 'audio'
-                          ? t('tg.play')
-                          : t('tg.view')}
-                      </Button>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="h-6 px-2 text-[10px]"
-                        onClick={() => void clearRows(group)}
-                      >
-                        {t('tg.clearRow')}
-                      </Button>
-                    </>
-                  ) : (
-                    <>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="h-6 px-2 text-[10px]"
-                        onClick={() =>
-                          isGroup ? void downloadGroup(group) : void downloadOne(it)
-                        }
-                      >
-                        {doneCount > 0
-                          ? `${t('tg.continue')} ${doneCount}/${group.length}`
-                          : t('tg.download')}
-                      </Button>
-                      {doneCount > 0 && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="h-6 px-2 text-[10px]"
-                          onClick={() => void clearRows(group)}
-                        >
-                          {t('tg.clearRow')}
-                        </Button>
-                      )}
-                    </>
-                  )}
-                </div>
+                  {t('media.addToSeries')}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  onClick={() => setBulkTagOpen(true)}
+                >
+                  {t('media.bulkTag')}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 px-2 text-[11px] text-destructive"
+                  onClick={() => setConfirmDelete({ kind: 'items' })}
+                >
+                  {t('media.remove')}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  onClick={clearSelection}
+                >
+                  {t('media.clearSel')}
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  onClick={() => {
+                    setSelected(new Set(visibleIds))
+                  }}
+                >
+                  {t('media.selectAll')}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  onClick={() => setImportOpen(true)}
+                >
+                  ⬇ {t('media.importDir')}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  onClick={() => setCreateOpen(true)}
+                >
+                  ＋ {t('media.newSeries')}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  onClick={() => setTagMgrOpen(true)}
+                >
+                  🏷 {t('media.manageTags')}
+                </Button>
+              </>
+            )}
+          </div>
+        </header>
+
+        {/* 内容区 */}
+        {!alive ? (
+          <div className="flex min-h-0 flex-1 items-center justify-center p-10">
+            <p className="text-sm text-muted">{t('media.offline')}</p>
+          </div>
+        ) : view === 'seriesDetail' && detail ? (
+          <SeriesDetail
+            detail={detail}
+            tags={tags}
+            onPlay={playEpisode}
+            onRemoveEpisode={async (ep) => {
+              try {
+                await deleteEpisode(ep.id)
+                if (activeSeriesId) await openSeries(activeSeriesId)
+                await loadMeta()
+              } catch (e) {
+                setError(e instanceof Error ? e.message : String(e))
+              }
+            }}
+            onDeleteSeries={() => setConfirmDelete({ kind: 'series', id: detail.id })}
+            onBack={() => {
+              setView('series')
+              setDetail(null)
+              setActiveSeriesId(null)
+              void loadSeries()
+            }}
+            onChanged={() => void refreshAll()}
+            onError={(m) => setError(m)}
+          />
+        ) : view === 'series' ? (
+          <div className="min-h-0 flex-1 overflow-y-auto p-3">
+            {series.length === 0 ? (
+              <div className="flex flex-col items-center justify-center gap-3 py-20">
+                <p className="text-sm text-muted">{t('media.noSeries')}</p>
+                <Button size="sm" className="h-8 px-3 text-xs" onClick={() => setCreateOpen(true)}>
+                  ＋ {t('media.newSeries')}
+                </Button>
               </div>
-            )
-          })
+            ) : (
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(160px,1fr))] gap-3">
+                {series.map((s) => (
+                  <SeriesCard
+                    key={s.id}
+                    series={s}
+                    tags={tags}
+                    onOpen={() => void openSeries(s.id)}
+                    onDelete={() => setConfirmDelete({ kind: 'series', id: s.id })}
+                    onCoverReady={(id, poster) => {
+                      void patchSeries(id, { poster }).catch(() => undefined)
+                      setSeries((prev) =>
+                        prev.map((x) => (x.id === id ? { ...x, poster } : x)),
+                      )
+                    }}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        ) : items.length === 0 && !loading ? (
+          emptyState
+        ) : (
+          <>
+            <div className="min-h-0 flex-1 overflow-y-auto p-3">
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-3">
+                {items.map((item, idx) => (
+                  <MediaCard
+                    key={item.id}
+                    item={item}
+                    selected={selected.has(item.id)}
+                    onSelectToggle={toggleSelect}
+                    onOpen={() => playItems(items, idx, item.title)}
+                    onEdit={setEditing}
+                    onPosterReady={onPosterReady}
+                  />
+                ))}
+              </div>
+              {total > items.length ? (
+                <p className="py-3 text-center text-[11px] text-muted">
+                  {t('media.showing', { n: items.length, total })}
+                </p>
+              ) : null}
+            </div>
+          </>
         )}
       </div>
-      </div>
 
-      {/* 右栏：提示区（播放交给全局播放器页，播放时整窗独占） */}
-      <div className="flex min-w-0 flex-1 flex-col">
-        <div className="flex min-h-0 flex-1 items-center justify-center p-6">
-          <p className="max-w-xs text-center text-sm leading-relaxed text-muted">
-            {t('tg.selectToPlay')}
-          </p>
-        </div>
-      </div>
+      {/* ───────── 弹窗 ───────── */}
+      {importOpen ? (
+        <ImportDialog
+          onClose={() => setImportOpen(false)}
+          onImported={async (n) => {
+            clearSelection()
+            await refreshAll()
+            setError(`已导入 ${n} 项`)
+          }}
+          onError={(m) => setError(m)}
+        />
+      ) : null}
 
-      {/* 下载目录弹窗：查看/修改缓存落地目录（持久化，立即生效） */}
-      {dirOpen && (
+      {tagMgrOpen ? (
+        <TagManagerDialog
+          tags={tags}
+          onClose={() => setTagMgrOpen(false)}
+          onChanged={() => void loadMeta()}
+          onError={(m) => setError(m)}
+        />
+      ) : null}
+
+      {bulkTagOpen ? (
+        <BulkTagDialog
+          count={selected.size}
+          tags={tags}
+          onClose={() => setBulkTagOpen(false)}
+          onApply={async (tagIds) => {
+            for (const id of selected) await setItemTags(id, tagIds)
+            clearSelection()
+            await refreshAll()
+          }}
+        />
+      ) : null}
+
+      {createOpen ? (
+        <CreateSeriesDialog
+          onClose={() => setCreateOpen(false)}
+          onCreated={async (id) => {
+            await refreshAll()
+            void openSeries(id)
+          }}
+          onError={(m) => setError(m)}
+        />
+      ) : null}
+
+      {addToOpen ? (
+        <AddToSeriesDialog
+          itemIds={[...selected]}
+          series={series}
+          onClose={() => setAddToOpen(false)}
+          onDone={async () => {
+            clearSelection()
+            await refreshAll()
+          }}
+          onError={(m) => setError(m)}
+        />
+      ) : null}
+
+      {editing ? (
+        <ItemEditDialog
+          item={editing}
+          tags={tags}
+          onClose={() => setEditing(null)}
+          onSaved={() => void refreshAll()}
+          onError={(m) => setError(m)}
+        />
+      ) : null}
+
+      {confirmDelete ? (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6"
-          onClick={() => setDirOpen(false)}
+          onClick={() => setConfirmDelete(null)}
         >
           <div
-            className="w-full max-w-md rounded-lg border border-border-subtle bg-surface p-4 shadow-lg"
+            className="w-full max-w-sm rounded-lg border border-border-subtle bg-surface p-4 shadow-lg"
             onClick={(e) => e.stopPropagation()}
           >
-            <h4 className="text-[13px] font-semibold text-fg-strong">⌂ {t('tg.downloadDir')}</h4>
-            <p className="mt-1 text-[11px] text-muted">{t('tg.downloadDirTip')}</p>
-            <Input
-              value={dlDir}
-              onChange={(e) => setDlDir(e.target.value)}
-              className="mt-3 h-8 text-xs"
-              spellCheck={false}
-            />
+            <h4 className="text-[13px] font-semibold text-fg-strong">
+              {confirmDelete.kind === 'items' ? t('media.confirmRemoveItems') : t('media.confirmDeleteSeries')}
+            </h4>
+            <p className="mt-1.5 text-[11.5px] leading-relaxed text-muted">
+              {confirmDelete.kind === 'items'
+                ? t('media.confirmRemoveItemsHint')
+                : t('media.confirmDeleteSeriesHint')}
+            </p>
             <div className="mt-4 flex justify-end gap-2">
-              <Button variant="outline" size="sm" className="h-8 px-3 text-xs" onClick={() => setDirOpen(false)}>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 px-3 text-xs"
+                onClick={() => setConfirmDelete(null)}
+              >
                 {t('tg.cancel')}
               </Button>
               <Button
                 size="sm"
                 className="h-8 px-3 text-xs"
-                disabled={dlDirSaving || !dlDir.trim()}
-                onClick={() => void saveDownloadDir()}
+                onClick={async () => {
+                  const k = confirmDelete
+                  setConfirmDelete(null)
+                  if (k.kind === 'items') await doDeleteSelected()
+                  else if (k.id !== undefined) await doDeleteSeries(k.id)
+                }}
               >
-                {t('tg.save')}
+                {t('media.confirm')}
               </Button>
             </div>
           </div>
         </div>
-      )}
+      ) : null}
     </div>
   )
 }

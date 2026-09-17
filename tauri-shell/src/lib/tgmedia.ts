@@ -20,7 +20,7 @@ export function guessMediaType(mime?: string, filePath?: string): MediaType {
   return 'file'
 }
 
-export function fmtSize(bytes?: number): string {
+export function fmtSize(bytes?: number | null): string {
   if (!bytes || bytes <= 0) return '—'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   let v = bytes
