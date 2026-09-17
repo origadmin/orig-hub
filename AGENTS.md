@@ -90,3 +90,24 @@
   `DELIVERY_FALLBACK_BPS`），可用 `ORIG_TG_DELIVERY_BPS` 覆盖以便 A/B，无需重编。
   判断标准：**倍速下的冗余倍数应在个位数**（当前 3–4x）。新增任何投递端点必须同样过背压，
   并纳入 `diag_rate_storm.cjs` 回归。
+- **判「播放卡顿」必须量真实上屏帧，禁止用代理指标（BUG-034）**：
+  - **禁用** `timeupdate` 判停顿（约 4Hz，几百 ms 的卡顿直接漏检）；**禁用** `rAF` 判帧率
+    （它测的是合成帧——video 画面冻住时照样 60fps，等于没测）。
+  - 必须用 `video.requestVideoFrameCallback`（真实上屏帧：墙钟间隔 + `mediaTime` 步长）
+    配合 `video.getVideoPlaybackQuality()`（`droppedVideoFrames`）。
+  - **先量合成器时钟**（空载 rAF 频率）：若「需求 fps = 源fps × 倍率」> 刷新率，瓶颈在
+    **呈现层**而非解码——两者修法完全不同，不分清就会修错地方。
+  - **`readyState` 满格 ≠ 能播**：视频轨编码不可解时它同样是 4（实测 `videoWidth=0`、
+    `duration` 正常、**`onError` 从不触发**）。判断「能不能播」必须另看 `videoWidth`。
+  - `navigator.mediaCapabilities` 的 `supported/smooth/powerEfficient` 是**声明式**的，
+    偏乐观，不能替代实测。
+  - 凡做 GPU 对照实验，必须把 WebGL `UNMASKED_RENDERER` 记进证据，否则「换独显无改善」
+    可能只是根本没换成功。
+  - **Playwright 自带 Chromium 不含 HEVC/AAC 等专有编解码器**，其对编码相关问题的表现
+    ≠ WebView2；涉编码的判断必须用 `BROWSER=msedge`（与 WebView2 同引擎）。
+  - 工具：`diag_playback_smooth.cjs`（上屏帧账）、`probe_mp4_codec.py`（轨道/codec 探测）、
+    `probe_decode_caps.cjs`（解码能力 + GPU）、`diag_seek_latency.cjs`（跳转回填）。
+- **解码异常不许静默（BUG-034）**：`<video>` 的两类失败都不触发 `onError`——
+  视频轨不可解（黑屏但控制条在走）与解码吞吐不足（仅丢帧）。凡是喂 `<video>` 的路径，
+  必须经 `tauri-shell/src/lib/decodeHealth.ts` 的 `useDecodeHealth` 探测并向用户提示，
+  文案要给出可行动信息（如「调低播放速度会更流畅」），不得只报错误码或什么都不说。
