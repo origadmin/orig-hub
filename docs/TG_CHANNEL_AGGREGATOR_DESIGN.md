@@ -109,7 +109,11 @@ orig-tg-service (独立 daemon / sidecar, 新增) ─── 数据面：Telegram
   | POST | `/api/tg/download/:chat_id/:message_id` | `{"dir"?}` → 下载落盘（需已授权） |
 
 - 命名：沿用 `orig-` 统一族前缀（与 orig-core/daemon/protocol-* 一致），不引入其它前缀体系。
-- 环境变量：`ORIG_TG_PORT` / `ORIG_TG_API_ID` / `ORIG_TG_API_HASH` / `ORIG_TG_SESSION` / `ORIG_TG_DOWNLOAD_DIR`；未配置 api_id/hash 时回退内存 DummyClient（含固定测试验证码 `00000`），便于契约自测。
+- 环境变量：`ORIG_TG_PORT` / `ORIG_TG_API_ID` / `ORIG_TG_API_HASH` / `ORIG_TG_SESSION` / `ORIG_TG_DOWNLOAD_DIR`。
+  未配置 api_id/hash 或 MTProto 连接失败时**不再回退合成客户端**（BUG-023 结构性修复）：
+  服务以不可用态运行，TG 端点诚实返回 503 + 原因（`/api/tg/diag` 下发 `available`/`unavailable_reason`）。
+  合成客户端只存在于带 `mock` feature 的测试构建，且必须显式 `ORIG_TG_MOCK=1` + 显式 `ORIG_TG_DB`，
+  绝不允许出现在生产 sidecar 上。
 
 ### 4.4 下载能力
 - `POST /api/tg/download/:chat_id/:message_id` 经 MTProto 解析消息 → 取媒体 → 下载到落地目录（请求 `dir` 优先，否则配置 `download_dir`，否则平台默认 `~/Downloads`）。
