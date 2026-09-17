@@ -7,7 +7,7 @@
 //!
 //! 表结构见 `migrate()`。所有写入均通过 `Store`（同一 SQLite 连接）完成。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -117,6 +117,27 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
         (),
     )
     .await?;
+    // 旧库兼容：media_episode 补**合并溯源**列（BUG-037）。
+    //
+    // 为什么存标题快照而不是来源剧集 id：合并会把源剧集**删除**，id 立刻悬空，
+    // 前端就再也显示不出「这条原来是哪部剧的」。原始集号同理 —— 合并要重编集号
+    // （位置必须在该季唯一有序），若不留下原号，用户就分不清搬过来的 `1-2` 与
+    // 本地原有的 `1,2` 谁是谁。
+    for (col, ty) in [("origin_series_title", "TEXT"), ("origin_episode_no", "INTEGER")] {
+        let probe = conn
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('media_episode') WHERE name = '{col}'"
+            ))
+            .await?;
+        let exists = probe.query(()).await?.next().await?.is_some();
+        if !exists {
+            conn.execute(
+                &format!("ALTER TABLE media_episode ADD COLUMN {col} {ty}"),
+                (),
+            )
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -202,6 +223,16 @@ pub struct EpisodeView {
     pub kind: Option<String>,
     /// 单集介绍（问题3：每集介绍）。
     pub description: Option<String>,
+    /// 合并溯源：来源剧集标题快照（源剧集已删除，故存快照而非 id）。None = 不是合并来的。
+    pub origin_series_title: Option<String>,
+    /// 合并溯源：并入目标前的原始集号。None = 不是合并来的。
+    pub origin_episode_no: Option<i64>,
+    /// 条目来源（local / tg）。同一内容从多个源进来时，用户靠它与 ref 分辨哪个该删。
+    pub source: Option<String>,
+    /// 条目来源标识（本地路径 / TG ref）。与 `source` 配对，是分辨「同名不同内容」
+    /// 与「同内容多源」的唯一依据 —— 标题与文件名都不可靠。
+    #[serde(rename = "ref")]
+    pub ref_key: Option<String>,
 }
 
 /// 剧集详情 = 元数据 + 分集列表。
@@ -211,6 +242,31 @@ pub struct SeriesDetail {
     #[serde(flatten)]
     pub series: SeriesView,
     pub episodes: Vec<EpisodeView>,
+}
+
+/// 合并时被跳过的分集明细。
+///
+/// **必须回传**：跳过是合并里唯一「少搬了东西」的地方，静默吞掉会让用户以为
+/// 全搬完了。带上条目标题，用户才能判断「跳掉的这条我是不是真的不需要」。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeSkipped {
+    pub item_id: i64,
+    /// 条目标题（缺失时回退到分集标题）。
+    pub title: Option<String>,
+    pub season: i64,
+    /// 该条目在**源剧集**里的原始集号。
+    pub episode_no: i64,
+}
+
+/// 剧集合并结果。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeReport {
+    /// 实际搬移的分集数。
+    pub added: i64,
+    /// 因「同季已有同一条目」而跳过的分集（同一份数据记录，非内容判定）。
+    pub skipped: Vec<MergeSkipped>,
 }
 
 /// 列表查询条件。
@@ -656,7 +712,8 @@ impl Store {
             .conn
             .prepare(
                 "SELECT e.id, e.item_id, e.season, e.episode_no, e.title,
-                        i.title, i.poster, i.duration, i.kind, e.description
+                        i.title, i.poster, i.duration, i.kind, e.description,
+                        e.origin_series_title, e.origin_episode_no, i.source, i.ref
                    FROM media_episode e
                    LEFT JOIN media_item i ON i.id = e.item_id
                   WHERE e.series_id = ?1
@@ -677,6 +734,10 @@ impl Store {
                 duration: r.get(7)?,
                 kind: r.get(8)?,
                 description: r.get(9)?,
+                origin_series_title: r.get(10)?,
+                origin_episode_no: r.get(11)?,
+                source: r.get(12)?,
+                ref_key: r.get(13)?,
             });
         }
         Ok(Some(SeriesDetail { series, episodes }))
@@ -742,6 +803,198 @@ impl Store {
     }
 
     /// 删除剧集（分集与标签关联一并清理；**内容条目本身保留**，仅解除归属）。
+    /// 剧集是否存在（合并前的存在性校验，避免「合并不存在的源」被当成成功）。
+    pub async fn series_exists(&self, id: i64) -> libsql::Result<bool> {
+        let stmt = self
+            .conn
+            .prepare("SELECT 1 FROM media_series WHERE id = ?1")
+            .await?;
+        let mut rows = stmt.query(params![id]).await?;
+        Ok(rows.next().await?.is_some())
+    }
+
+    /// 合并剧集（BUG-037）：把 `source_id` 的**全部分集**搬到 `target_id` 末尾，再删除源剧集。
+    ///
+    /// ## 语义边界（刻意划死的）
+    ///
+    /// **只搬移与重编位置，不做任何内容判定。** 唯一允许的跳过依据是
+    /// `item_id` 在目标**同季**已存在 —— 那是「同一条数据库记录」，属事实而非启发式。
+    /// 以下情况**一律保留、绝不合并**，因为它们都可能是合法的独立观看项：
+    ///
+    /// - 文件名/标题相同但内容不同（分散保存时的常见情况）；
+    /// - 同一内容从多个源进来（tg 缓存 + 本地导入 → 两条 item 记录）；
+    /// - `1-2` 与 `1, 2` 并存（前者是并成单文件的版本，**重叠 ≠ 重复**）；
+    /// - 每批都附带的预告。
+    ///
+    /// ## 集号
+    ///
+    /// 集号是**位置**而非身份：目标各季从现有 `MAX(episode_no)` 续编，源剧集的原始集号
+    /// 写入 `origin_episode_no`、来源剧集标题写入 `origin_series_title`（快照，因为源剧集
+    /// 会被删除）。这样重编后用户仍能分辨哪条是从哪儿并过来的。
+    ///
+    /// 全流程在 `BEGIN IMMEDIATE` 内；任何一步失败即 `ROLLBACK`，不留半成品。
+    pub async fn merge_series(
+        &self,
+        target_id: i64,
+        source_id: i64,
+    ) -> libsql::Result<MergeReport> {
+        // ── 读源分集（带条目标题：跳过明细要能让人认出是哪一条）──
+        let stmt = self
+            .conn
+            .prepare(
+                "SELECT e.item_id, e.season, e.episode_no, e.title, i.title
+                   FROM media_episode e
+                   LEFT JOIN media_item i ON i.id = e.item_id
+                  WHERE e.series_id = ?1
+                  ORDER BY e.season ASC, e.episode_no ASC, e.id ASC",
+            )
+            .await?;
+        let mut rows = stmt.query(params![source_id]).await?;
+        let mut src: Vec<(i64, i64, i64, Option<String>, Option<String>)> = Vec::new();
+        while let Some(r) = rows.next().await? {
+            src.push((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?));
+        }
+        drop(rows);
+
+        // 源剧集标题快照（源稍后会被删，必须在事务里先取走）。
+        let source_title: Option<String> = {
+            let stmt = self
+                .conn
+                .prepare("SELECT title FROM media_series WHERE id = ?1")
+                .await?;
+            let mut rows = stmt.query(params![source_id]).await?;
+            match rows.next().await? {
+                Some(r) => Some(r.get(0)?),
+                None => None,
+            }
+        };
+
+        let mut report = MergeReport::default();
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+
+        let outcome: libsql::Result<()> = async {
+            // 目标各季续编起点。
+            let stmt = self
+                .conn
+                .prepare(
+                    "SELECT season, COALESCE(MAX(episode_no), 0) FROM media_episode
+                      WHERE series_id = ?1 GROUP BY season",
+                )
+                .await?;
+            let mut rows = stmt.query(params![target_id]).await?;
+            let mut next: HashMap<i64, i64> = HashMap::new();
+            while let Some(r) = rows.next().await? {
+                next.insert(r.get(0)?, r.get(1)?);
+            }
+            drop(rows);
+
+            // 目标各季已有条目（去重**只**按 item_id）。
+            let stmt = self
+                .conn
+                .prepare("SELECT season, item_id FROM media_episode WHERE series_id = ?1")
+                .await?;
+            let mut rows = stmt.query(params![target_id]).await?;
+            let mut have: HashMap<i64, HashSet<i64>> = HashMap::new();
+            while let Some(r) = rows.next().await? {
+                have.entry(r.get(0)?).or_default().insert(r.get(1)?);
+            }
+            drop(rows);
+
+            for (item_id, season, episode_no, ep_title, item_title) in &src {
+                if have.get(season).is_some_and(|s| s.contains(item_id)) {
+                    report.skipped.push(MergeSkipped {
+                        item_id: *item_id,
+                        title: item_title.clone().or_else(|| ep_title.clone()),
+                        season: *season,
+                        episode_no: *episode_no,
+                    });
+                    continue;
+                }
+                let slot = next.entry(*season).or_insert(0);
+                *slot += 1;
+                // 刻意用纯 INSERT 而非 `add_episode`（后者带 ON CONFLICT DO UPDATE）：
+                // 集号若算错，宁可撞唯一约束让整个事务回滚，也**绝不能静默覆盖**目标已有分集。
+                self.conn
+                    .execute(
+                        "INSERT INTO media_episode
+                           (series_id, item_id, season, episode_no, title,
+                            origin_series_title, origin_episode_no)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            target_id,
+                            *item_id,
+                            *season,
+                            *slot,
+                            ep_title.clone(),
+                            source_title.clone(),
+                            *episode_no
+                        ],
+                    )
+                    .await?;
+                report.added += 1;
+                have.entry(*season).or_default().insert(*item_id);
+            }
+
+            // 标签并集（目标原有标签一律保留）。
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO media_series_tag (series_id, tag_id)
+                     SELECT ?1, tag_id FROM media_series_tag WHERE series_id = ?2",
+                    params![target_id, source_id],
+                )
+                .await?;
+
+            // 元数据**仅在目标缺失时继承**：不覆盖用户已设的介绍/年份/封面。
+            self.conn
+                .execute(
+                    "UPDATE media_series SET
+                       description = COALESCE(description, (SELECT description FROM media_series WHERE id = ?2)),
+                       year        = COALESCE(year,        (SELECT year        FROM media_series WHERE id = ?2)),
+                       poster      = COALESCE(poster,      (SELECT poster      FROM media_series WHERE id = ?2))
+                     WHERE id = ?1",
+                    params![target_id, source_id],
+                )
+                .await?;
+
+            // 删源（分集已搬走、标签已并走）。
+            self.conn
+                .execute(
+                    "DELETE FROM media_episode WHERE series_id = ?1",
+                    params![source_id],
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "DELETE FROM media_series_tag WHERE series_id = ?1",
+                    params![source_id],
+                )
+                .await?;
+            self.conn
+                .execute("DELETE FROM media_series WHERE id = ?1", params![source_id])
+                .await?;
+
+            self.conn
+                .execute(
+                    "UPDATE media_series SET updated_at = ?1 WHERE id = ?2",
+                    params![now_secs(), target_id],
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
+
+        match outcome {
+            Ok(()) => {
+                self.conn.execute("COMMIT", ()).await?;
+                Ok(report)
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
     pub async fn delete_series(&self, id: i64) -> libsql::Result<()> {
         self.conn
             .execute("DELETE FROM media_episode WHERE series_id = ?1", params![id])

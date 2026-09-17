@@ -108,6 +108,10 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             axum::routing::post(append_media_episodes),
         )
         .route(
+            "/api/media/series/:id/merge",
+            axum::routing::post(merge_media_series),
+        )
+        .route(
             "/api/media/episodes/:id",
             axum::routing::patch(patch_media_episode).delete(delete_media_episode),
         )
@@ -2116,6 +2120,65 @@ async fn append_media_episodes(
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     Ok(Json(json!({"added": n})))
+}
+
+/// 合并请求体：把 `sourceId` 的**全部分集**并入路径上的剧集。
+#[derive(Deserialize)]
+struct MergeSeriesReq {
+    #[serde(rename = "sourceId")]
+    source_id: i64,
+}
+
+/// `POST /api/media/series/:id/merge` — 合并剧集（BUG-037）。
+///
+/// 把 `sourceId` 的分集整体搬入 `:id` 的末尾（各季续编集号）并**删除源剧集**，
+/// 全程单事务。刻意的语义边界：**不做任何内容级去重** —— 文件名相同而内容不同、
+/// 同一内容多源导入、`1-2` 与 `1,2` 并存、每批都带的预告，一律原样保留；
+/// 只有「同一条目（item_id）已在目标同季」才跳过，且跳过明细随响应回传，
+/// 不让「少搬了东西」被静默掩盖。
+async fn merge_media_series(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<MergeSeriesReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    if body.source_id == id {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "sourceId 不能与目标剧集相同",
+        ));
+    }
+    let target_ok = st
+        .store
+        .series_exists(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if !target_ok {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "target series not found"));
+    }
+    let source_ok = st
+        .store
+        .series_exists(body.source_id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if !source_ok {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "source series not found"));
+    }
+    let rep = st
+        .store
+        .merge_series(id, body.source_id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    st.push_log(&format!(
+        "/api/media/series/{id}/merge: 并入 {} 集，跳过 {} 集（源 {} 已删除）",
+        rep.added,
+        rep.skipped.len(),
+        body.source_id
+    ));
+    Ok(Json(json!({
+        "added": rep.added,
+        "skippedCount": rep.skipped.len(),
+        "skipped": rep.skipped,
+    })))
 }
 
 #[derive(Deserialize)]
