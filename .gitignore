@@ -1,6 +1,8 @@
 # ============ Rust（下载内核 + Tauri 壳） ============
 /target
 **/target
+# mock 构建用的独立 target 目录（CARGO_TARGET_DIR=target-mock）；`**/target` 匹配不到它
+**/target-mock/
 **/*.rs.bk
 
 # ============ Node / 前端（Vite + React） ============
