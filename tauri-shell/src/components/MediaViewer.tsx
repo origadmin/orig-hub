@@ -1,13 +1,22 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Button } from './ui/button'
 import { useTranslation } from '../i18n'
 import { cn } from '../lib/utils'
-import { decodeStateKey, useDecodeHealth } from '../lib/decodeHealth'
+import { VideoPlayer } from './media/VideoPlayer'
+import { EpisodeList } from './media/EpisodeList'
+import { useSeriesDetail } from '../hooks/useSeriesDetail'
 import type { ViewerItem } from '../types'
 
 /**
  * 全局媒体播放器页（模块无关，不带任何模块信息）：打开时独占内容区整页。
- * 返回行（← 返回 + 标题 + n/N）+ 黑底媒体区（‹ › 收在面板内侧，不会出框）+ caption 底部行。
+ * 返回行（← 返回 + 标题 + n/N）+ 媒体区（‹ › 收在面板内侧，不会出框）+ caption 底部行。
+ *
+ * 视频交给 `media/VideoPlayer`（自绘控件，含快捷键/倍速/画中画/自动连播）；
+ * 当播放项带 `seriesId` 时，右侧挂分集列表 —— 点某集即在播放组内定位。
+ *
+ * 键盘（**与播放器内部快捷键刻意分工，互不重叠**）：
+ *   ←/→ 组内切换上一个/下一个，Esc 返回
+ *   播放器内部：Space/K 播放暂停、J/L 快退快进 10s、↑/↓ 音量、M 静音、F 全屏、P 画中画
  */
 export function MediaViewer(props: {
   items: ViewerItem[]
@@ -23,17 +32,20 @@ export function MediaViewer(props: {
   const cur = items[index]
   const many = items.length > 1
 
-  /** 倍速（视频重挂载后经 onLoadedMetadata 回填） */
-  const [rate, setRate] = useState(1)
-  const videoRef = useRef<HTMLVideoElement | null>(null)
-  /** 首选+降级均失败（如 .mov 容器浏览器不可解码）→ 露出可读提示而非黑屏 */
-  const [failed, setFailed] = useState(false)
-  useEffect(() => setFailed(false), [cur?.key])
-  /** 视频轨解不出来 / 解码吃力 —— 两种 onError 抓不到的静默失败（BUG-034） */
-  const decode = useDecodeHealth(videoRef, cur?.key)
-  useEffect(() => {
-    if (videoRef.current) videoRef.current.playbackRate = rate
-  }, [rate, cur?.key])
+  /** 图片降级失败（视频的失败由 VideoPlayer 内部处理） */
+  const [imgFailed, setImgFailed] = useState(false)
+  useEffect(() => setImgFailed(false), [cur?.key])
+
+  const seriesId = cur?.seriesId ?? null
+  /**
+   * 有剧集归属就显示侧栏 —— **刻意不按媒体类型过滤**。
+   * 剧集可能是混合内容（实测某剧集 = 3 个视频 + 7 张图片）。若只对视频显示，
+   * 用户点到图片那一集时侧栏会突然消失，此后再也无法切回视频集 ——
+   * 这正是「点了没反应 / 列表没了」的成因。
+   */
+  const showEpisodes = Boolean(seriesId)
+  /** 分集数据（单一来源）：侧栏列表与「即将播放 第 N 集」标注共用同一份 */
+  const { detail, loading, error } = useSeriesDetail(seriesId)
 
   // 键盘导航：←/→ 组内切换，Esc 返回（组件自持，任何挂载处行为一致）
   useEffect(() => {
@@ -49,6 +61,25 @@ export function MediaViewer(props: {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [index, items.length, onIndex, onClose])
+
+  // 分集列表点击：在播放组内按 itemId 定位（媒体库里 messageId 即 MediaItem.id）
+  const selectEpisode = (itemId: number) => {
+    const idx = items.findIndex((it) => it.messageId === itemId)
+    if (idx >= 0 && idx !== index) onIndex(idx)
+  }
+  const isSelectable = (itemId: number) => items.some((it) => it.messageId === itemId)
+
+  const next = index < items.length - 1 ? items[index + 1] : null
+  const nextUp = next
+    ? {
+        title: next.caption?.trim() || `#${next.messageId}`,
+        poster: next.poster,
+        episodeNo:
+          next.episodeNo ?? detail?.episodes.find((e) => e.itemId === next.messageId)?.episodeNo ?? null,
+      }
+    : null
+
+  if (!cur) return null
 
   return (
     <div className={cn('flex min-h-0 flex-col bg-surface/20', className)}>
@@ -71,124 +102,85 @@ export function MediaViewer(props: {
           </span>
         )}
       </div>
-      {/* 媒体区：黑底居中；‹ › 组内切换收进面板两侧，不再出框 */}
-      <div className="relative flex min-h-0 flex-1 items-center justify-center bg-black p-4">
-        {(cur.kind === 'video' || cur.kind === 'audio') && (
-          <PlaybackSpeed rate={rate} onRate={setRate} />
-        )}
-        {many && index > 0 && (
-          <button
-            type="button"
-            onClick={() => onIndex(index - 1)}
-            className="absolute left-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-lg text-white hover:bg-white/20"
-          >
-            ‹
-          </button>
-        )}
-        {cur.kind === 'photo' ? (
-          <img
-            key={String(cur.key)}
-            src={cur.src}
-            alt={cur.caption || ''}
-            className="max-h-full max-w-full rounded-lg object-contain"
-            onError={(e) => {
-              const img = e.currentTarget
-              if (cur.fallbackSrc && !img.dataset.fallback) {
-                img.dataset.fallback = '1'
-                img.src = cur.fallbackSrc
-              } else {
-                setFailed(true)
-              }
-            }}
+
+      {/* 主体：媒体区 + 分集侧栏 */}
+      <div className="flex min-h-0 flex-1">
+        {/* 媒体区：黑底居中；‹ › 组内切换收在面板两侧，不再出框 */}
+        <div className="relative flex min-h-0 min-w-0 flex-1 items-center justify-center bg-black">
+          {many && index > 0 && (
+            <button
+              type="button"
+              aria-label={t('player.prevItem')}
+              onClick={() => onIndex(index - 1)}
+              className="absolute left-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-lg text-white hover:bg-white/20"
+            >
+              ‹
+            </button>
+          )}
+
+          {cur.kind === 'photo' ? (
+            <img
+              key={String(cur.key)}
+              src={cur.src}
+              alt={cur.caption || ''}
+              className="max-h-full max-w-full rounded-lg object-contain"
+              onError={(e) => {
+                const img = e.currentTarget
+                if (cur.fallbackSrc && !img.dataset.fallback) {
+                  img.dataset.fallback = '1'
+                  img.src = cur.fallbackSrc
+                } else {
+                  setImgFailed(true)
+                }
+              }}
+            />
+          ) : (
+            <VideoPlayer
+              key={String(cur.key)}
+              src={cur.src}
+              fallbackSrc={cur.fallbackSrc}
+              poster={cur.poster}
+              autoPlay
+              nextUp={nextUp}
+              onPlayNext={() => onIndex(index + 1)}
+            />
+          )}
+
+          {many && index < items.length - 1 && (
+            <button
+              type="button"
+              aria-label={t('player.nextItem')}
+              onClick={() => onIndex(index + 1)}
+              className="absolute right-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-lg text-white hover:bg-white/20"
+            >
+              ›
+            </button>
+          )}
+
+          {imgFailed && (
+            <p className="absolute bottom-4 left-1/2 z-10 -translate-x-1/2 rounded-md border border-white/20 bg-white/10 px-3 py-1.5 text-center text-xs text-white/85">
+              {t('tg.decodeFail')}
+            </p>
+          )}
+        </div>
+
+        {showEpisodes && seriesId && (
+          <EpisodeList
+            title={detail?.title ?? ''}
+            episodes={detail?.episodes ?? []}
+            loading={loading}
+            error={error}
+            currentItemId={cur.messageId}
+            onSelect={selectEpisode}
+            isSelectable={isSelectable}
           />
-        ) : (
-          <video
-            key={String(cur.key)}
-            ref={videoRef}
-            src={cur.src}
-            controls
-            autoPlay
-            preload="auto"
-            onLoadedMetadata={(e) => {
-              e.currentTarget.playbackRate = rate
-            }}
-            className="max-h-full max-w-full rounded-lg bg-black"
-            onError={(e) => {
-              const v = e.currentTarget
-              if (cur.fallbackSrc && !v.dataset.fallback) {
-                v.dataset.fallback = '1'
-                v.src = cur.fallbackSrc
-              } else {
-                setFailed(true)
-              }
-            }}
-          />
-        )}
-        {many && index < items.length - 1 && (
-          <button
-            type="button"
-            onClick={() => onIndex(index + 1)}
-            className="absolute right-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-lg text-white hover:bg-white/20"
-          >
-            ›
-          </button>
-        )}
-        {failed && (
-          <p className="absolute bottom-4 left-1/2 z-10 -translate-x-1/2 rounded-md border border-white/20 bg-white/10 px-3 py-1.5 text-center text-xs text-white/85">
-            {t('tg.decodeFail')}
-          </p>
-        )}
-        {!failed && decode !== 'ok' && (
-          <p className="absolute bottom-4 left-1/2 z-10 max-w-[80%] -translate-x-1/2 rounded-md border border-white/20 bg-white/10 px-3 py-1.5 text-center text-xs text-white/85">
-            {t(decodeStateKey(decode) ?? 'tg.decodeFail')}
-          </p>
         )}
       </div>
+
       {cur.caption?.trim() && (
-        <p className="max-h-24 shrink-0 overflow-y-auto bg-black px-4 py-2 text-center text-xs text-white/80">
+        <p className="max-h-24 shrink-0 overflow-y-auto border-t border-border-subtle/60 bg-black px-4 py-2 text-center text-xs text-white/80">
           {cur.caption}
         </p>
-      )}
-    </div>
-  )
-}
-
-/** 倍速控制（悬浮媒体区右上角） */
-function PlaybackSpeed({ rate, onRate }: { rate: number; onRate: (r: number) => void }) {
-  const [open, setOpen] = useState(false)
-  const speeds = [0.5, 0.75, 1, 1.25, 1.5, 2]
-  return (
-    <div className="absolute right-3 top-3 z-10" onClick={(e) => e.stopPropagation()}>
-      {/* 入口按钮必须够大够显眼：此前 27×23 的贴边小字，用户根本找不到（BUG-033）。
-          最小可点击目标 24×24，这里取 32×32 并加描边提高与黑底的对比度。 */}
-      <button
-        type="button"
-        aria-label={`playback speed ${rate}x`}
-        title={`${rate}x`}
-        onClick={() => setOpen((v) => !v)}
-        className="flex h-8 min-w-[2.5rem] items-center justify-center rounded-md bg-black/70 px-2 text-[11px] font-semibold text-white ring-1 ring-white/30 backdrop-blur-sm hover:bg-black/85"
-      >
-        {rate}x
-      </button>
-      {open && (
-        <div className="absolute right-0 top-9 flex flex-col overflow-hidden rounded-md border border-white/20 bg-black/85">
-          {speeds.map((s) => (
-            <button
-              key={s}
-              type="button"
-              onClick={() => {
-                onRate(s)
-                setOpen(false)
-              }}
-              className={cn(
-                'min-h-[32px] min-w-[64px] px-3 text-left text-[11px] text-white/80 hover:bg-white/10',
-                s === rate && 'text-accent',
-              )}
-            >
-              {s}x
-            </button>
-          ))}
-        </div>
       )}
     </div>
   )

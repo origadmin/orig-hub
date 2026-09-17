@@ -302,4 +302,13 @@ export interface ViewerItem {
   src: string
   /** 降级地址（首选失败时回退一次，如本地缺失回退在线流） */
   fallbackSrc?: string
+  /**
+   * 所属剧集 id（媒体库场景）。有值时播放器展示分集列表，
+   * 并支持「自动播下一集」。模块无关：TG 消息流不填即可。
+   */
+  seriesId?: number | null
+  /** 封面（视频海报 / 图片缩略）：自动播下一集浮层与续播用 */
+  poster?: string | null
+  /** 本条在所属剧集中的集号（1 起）：用于「第 N 集」标注 */
+  episodeNo?: number | null
 }

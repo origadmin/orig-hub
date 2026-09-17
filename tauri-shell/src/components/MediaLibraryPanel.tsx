@@ -167,7 +167,8 @@ export function MediaLibraryPanel() {
   )
 
   // ---------- 播放（交给全局播放器页）----------
-  const toViewerItems = (list: { id: number; kind: MediaKind; title: string }[]): ViewerItem[] =>
+  /** 内容条目 → 播放项；带 seriesId 的条目会让播放器挂出分集列表 */
+  const toViewerItems = (list: MediaItem[]): ViewerItem[] =>
     list.map((i) => ({
       key: `media-${i.id}`,
       chatId: 0,
@@ -175,18 +176,13 @@ export function MediaLibraryPanel() {
       kind: i.kind,
       caption: i.title,
       src: mediaItemUrl(i.id),
+      poster: i.poster ?? null,
+      seriesId: i.seriesId ?? null,
     }))
 
-  const playItems = (list: MediaItem[], index: number, title?: string) => {
-    if (list.length === 0) return
-    openViewer({ items: toViewerItems(list), index, title })
-  }
-
-  const playEpisode = (index: number) => {
-    if (!detail) return
-    // 分集 → 内容条目：用第一集的封面/标题组装播放组
-    const eps = detail.episodes
-    const list: MediaItem[] = eps.map((e) => ({
+  /** 分集 → 内容条目：剧集详情页入口与网格入口共用同一映射 */
+  const episodesToItems = (d: MediaSeriesDetail): MediaItem[] =>
+    d.episodes.map((e) => ({
       id: e.itemId,
       source: 'local',
       ref: String(e.itemId),
@@ -196,10 +192,38 @@ export function MediaLibraryPanel() {
       duration: e.duration,
       addedAt: 0,
       tags: [],
-      seriesId: detail.id,
-      seriesTitle: detail.title,
+      seriesId: d.id,
+      seriesTitle: d.title,
     }))
-    playItems(list, Math.max(0, index), detail.title)
+
+  /**
+   * 播放一组条目。
+   *
+   * 关键：若选中项属于某个剧集，播放组必须扩成**整部剧集**。
+   * 播放器右侧分集列表的点击是在「当前播放组」内按 itemId 定位的，
+   * 播放组若只含一条，那些点击会全部落空（表现为「点了没反应」）。
+   */
+  const playItems = async (list: MediaItem[], index: number, title?: string) => {
+    if (list.length === 0) return
+    const picked = list[index]
+    const sid = picked?.seriesId
+    if (sid) {
+      try {
+        const d = await getSeries(sid)
+        const all = episodesToItems(d)
+        const start = Math.max(0, all.findIndex((x) => x.id === picked.id))
+        openViewer({ items: toViewerItems(all), index: start, title: d.title })
+        return
+      } catch {
+        // 拉剧集失败不阻断播放：退回原列表
+      }
+    }
+    openViewer({ items: toViewerItems(list), index, title })
+  }
+
+  const playEpisode = (index: number) => {
+    if (!detail) return
+    void playItems(episodesToItems(detail), Math.max(0, index), detail.title)
   }
 
   // ---------- 选择 ----------
@@ -578,7 +602,7 @@ export function MediaLibraryPanel() {
                     item={item}
                     selected={selected.has(item.id)}
                     onSelectToggle={toggleSelect}
-                    onOpen={() => playItems(items, idx, item.title)}
+                    onOpen={() => void playItems(items, idx, item.title)}
                     onEdit={setEditing}
                     onPosterReady={onPosterReady}
                   />
