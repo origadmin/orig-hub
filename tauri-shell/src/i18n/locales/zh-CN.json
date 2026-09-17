@@ -229,6 +229,8 @@
   "tg.cancel": "取消",
   "tg.close": "关闭",
   "tg.decodeFail": "浏览器无法解码该格式（如 .mov/QuickTime），请在 APP 内用系统播放器打开",
+  "tg.decodeUnsupported": "该视频的视频轨无法解码（如 HEVC/H.265 且本机缺少解码支持），当前只能听到声音",
+  "tg.decodeStrained": "解码吃力：画面在丢帧，调低播放速度会明显更流畅",
   "tg.save": "保存",
   "tg.setup": "Telegram 服务配置",
   "tg.setupTip": "首次使用需配置一次 API 凭证：在 my.telegram.org → API development tools 中创建应用后，将 api_id 与 api_hash 填入下方。配置由应用保存，之后自动启动，无需重复输入。",

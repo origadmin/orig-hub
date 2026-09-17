@@ -5,6 +5,7 @@ import { Input } from './ui/input'
 import { Switch } from './ui/switch'
 import { useTranslation } from '../i18n'
 import { cn } from '../lib/utils'
+import { decodeStateKey, useDecodeHealth } from '../lib/decodeHealth'
 import {
   tgHealth,
   listTgDialogs,
@@ -1489,6 +1490,8 @@ function VideoBlock(props: {
   useEffect(() => {
     if (videoRef.current) videoRef.current.playbackRate = rate
   }, [rate, playing])
+  /** 视频轨解不出来 / 解码吃力 —— 两种 onError 抓不到的静默失败（BUG-034） */
+  const decode = useDecodeHealth(videoRef, `${playing}-${item.messageId}`)
 
   if (playing !== 'off') {
     return (
@@ -1514,6 +1517,12 @@ function VideoBlock(props: {
           className="max-h-[70vh] w-full rounded-lg bg-black"
         />
         <PlaybackSpeed rate={rate} onRate={setRate} />
+        {/* 解码异常提示：视频轨解不出来 / 丢帧严重时不再静默（BUG-034） */}
+        {decode !== 'ok' && (
+          <p className="absolute bottom-2 left-1/2 z-10 max-w-[80%] -translate-x-1/2 rounded-md border border-white/20 bg-white/10 px-3 py-1.5 text-center text-xs text-white/85">
+            {t(decodeStateKey(decode) ?? 'tg.decodeFail')}
+          </p>
+        )}
       </div>
     )
   }

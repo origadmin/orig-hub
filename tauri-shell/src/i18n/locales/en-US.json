@@ -229,6 +229,8 @@
   "tg.cancel": "Cancel",
   "tg.close": "Close",
   "tg.decodeFail": "This format (e.g. .mov/QuickTime) cannot be decoded by the browser. Open it with the system player inside the APP",
+  "tg.decodeUnsupported": "This video's video track cannot be decoded (e.g. HEVC/H.265 with no local decode support), so only the audio plays",
+  "tg.decodeStrained": "Decoding is struggling: frames are being dropped. A lower playback speed will be noticeably smoother",
   "tg.save": "Save",
   "tg.setup": "Telegram Service Setup",
   "tg.setupTip": "One-time setup: create an app at my.telegram.org → API development tools, then enter the api_id and api_hash below. The app stores the config and starts the service automatically afterwards.",

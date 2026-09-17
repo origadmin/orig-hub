@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Button } from './ui/button'
 import { useTranslation } from '../i18n'
 import { cn } from '../lib/utils'
+import { decodeStateKey, useDecodeHealth } from '../lib/decodeHealth'
 import type { ViewerItem } from '../types'
 
 /**
@@ -28,6 +29,8 @@ export function MediaViewer(props: {
   /** 首选+降级均失败（如 .mov 容器浏览器不可解码）→ 露出可读提示而非黑屏 */
   const [failed, setFailed] = useState(false)
   useEffect(() => setFailed(false), [cur?.key])
+  /** 视频轨解不出来 / 解码吃力 —— 两种 onError 抓不到的静默失败（BUG-034） */
+  const decode = useDecodeHealth(videoRef, cur?.key)
   useEffect(() => {
     if (videoRef.current) videoRef.current.playbackRate = rate
   }, [rate, cur?.key])
@@ -133,6 +136,11 @@ export function MediaViewer(props: {
         {failed && (
           <p className="absolute bottom-4 left-1/2 z-10 -translate-x-1/2 rounded-md border border-white/20 bg-white/10 px-3 py-1.5 text-center text-xs text-white/85">
             {t('tg.decodeFail')}
+          </p>
+        )}
+        {!failed && decode !== 'ok' && (
+          <p className="absolute bottom-4 left-1/2 z-10 max-w-[80%] -translate-x-1/2 rounded-md border border-white/20 bg-white/10 px-3 py-1.5 text-center text-xs text-white/85">
+            {t(decodeStateKey(decode) ?? 'tg.decodeFail')}
           </p>
         )}
       </div>
