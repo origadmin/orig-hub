@@ -195,6 +195,12 @@ pub trait Client: Send + Sync {
 pub enum ClientError {
     #[error("client not initialized (missing api_id/api_hash)")]
     NotInitialized,
+    /// TG 整体不可用（凭证缺失 / MTProto 连接失败）。
+    ///
+    /// 这是**显式错误态**：绝不允许用「返回合成数据的假客户端」替代（BUG-023）。
+    /// 映射为 503 + 原因，使故障可见；调用方据此区分「依赖不可用」与「未登录」。
+    #[error("telegram unavailable: {0}")]
+    Unavailable(String),
     #[error("invalid code")]
     InvalidCode,
     #[error("wrong 2FA password")]

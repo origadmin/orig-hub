@@ -12,6 +12,17 @@ path = "src/main.rs"
 name = "orig_tg"
 path = "src/lib.rs"
 
+[features]
+# 测试用 mock 客户端（合成频道/消息/缩略图/下载）。
+#
+# **默认关闭**：生产二进制（sidecar 构建不带任何特性）因此物理上不含合成数据实现，
+# 也就不可能存在「连不上 TG → 退回 mock 继续对外服务」这种静默降级（BUG-023）。
+#
+# 启用后仍需两个显式条件才会被选中：
+#   1. `ORIG_TG_MOCK=1`
+#   2. 显式 `ORIG_TG_DB`（强制隔离库，防止合成频道/消息污染真实 tg_store.db）
+mock = []
+
 [dependencies]
 orig-core = { path = "../orig-core" }
 async-trait.workspace = true

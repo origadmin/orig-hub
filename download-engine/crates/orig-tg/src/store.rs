@@ -85,8 +85,71 @@ pub struct StoredQuery {
 
 /// libsql 本地 SQLite 存储。
 pub struct Store {
-    conn: Connection,
+    /// `pub(crate)` 供 `media` 模块复用同一连接（资料库与 TG 流水同库）。
+    pub(crate) conn: Connection,
 }
+
+/// 缓存任务（`cache_task` 行）——服务端持有的下载任务状态。
+///
+/// 结构性要点：任务生命周期**不绑定 HTTP 请求**。此前缓存是「浏览器发一条同步
+/// 下载请求、进度只存在前端 React state」，刷新/切页即丢（任务连同状态一起消失）。
+/// 现在任务落库、由后台 worker 跑，前端只做**读视图**，刷新后重新读取即可恢复。
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheTask {
+    pub id: i64,
+    #[serde(rename = "chatId")]
+    pub chat_id: i64,
+    /// 相册分组 id（单条缓存为 NULL）。
+    #[serde(rename = "groupId", skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<i64>,
+    /// 去重键：`g:{chat}:{group}`（整组）或 `m:{chat}:{msg}`（单条）。
+    #[serde(rename = "itemKey")]
+    pub item_key: String,
+    /// 任务覆盖的消息号（按缓存顺序）。
+    #[serde(rename = "messageIds")]
+    pub message_ids: Vec<i64>,
+    pub total: i64,
+    pub done: i64,
+    /// `queued` | `running` | `done` | `cancelled` | `failed` | `interrupted`。
+    pub status: String,
+    /// 正在缓存的消息号（无则 None）。
+    #[serde(rename = "currentId", skip_serializing_if = "Option::is_none")]
+    pub current_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: i64,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: i64,
+}
+
+/// 任务是否处于「活跃」态（活跃态由 `cache_task_active_uniq` 保证同 key 唯一）。
+pub const CACHE_TASK_ACTIVE_STATES: &str = "('queued', 'running')";
+
+/// 按 `list_cache_tasks`/`get_cache_task` 的 SELECT 列顺序映射一行。
+/// 列顺序：id, chat_id, group_id, item_key, items, total, done, status,
+///         current_id, error, created_at, updated_at
+fn cache_task_from_row(r: &Row) -> libsql::Result<CacheTask> {
+    let items: String = r.get(4)?;
+    Ok(CacheTask {
+        id: r.get(0)?,
+        chat_id: r.get(1)?,
+        group_id: r.get(2)?,
+        item_key: r.get(3)?,
+        message_ids: serde_json::from_str(&items).unwrap_or_default(),
+        total: r.get(5)?,
+        done: r.get(6)?,
+        status: r.get(7)?,
+        current_id: r.get(8)?,
+        error: r.get(9)?,
+        created_at: r.get(10)?,
+        updated_at: r.get(11)?,
+    })
+}
+
+/// `cache_task` 的 SELECT 列清单（与 `cache_task_from_row` 严格同序）。
+const CACHE_TASK_COLS: &str = "id, chat_id, group_id, item_key, items, total, done, \
+                               status, current_id, error, created_at, updated_at";
 
 fn now() -> i64 {
     SystemTime::now()
@@ -210,16 +273,35 @@ impl Store {
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS cache_task (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id    INTEGER NOT NULL,
+                group_id   INTEGER,
+                item_key   TEXT    NOT NULL,
+                items      TEXT    NOT NULL,
+                total      INTEGER NOT NULL,
+                done       INTEGER NOT NULL DEFAULT 0,
+                status     TEXT    NOT NULL,
+                current_id INTEGER,
+                dir        TEXT,
+                error      TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS cache_task_active_uniq
+                ON cache_task(item_key) WHERE status IN ('queued', 'running');
             "#,
         )
         .await?;
         // 旧库（v0.3.x）的 media_message 缺 media_type/msg_date：幂等补列，不删数据。
         migrate_media_message(&conn).await?;
+        // 媒体资料库（内容/剧集/标签）：与 TG 流水同库、职责分离。
+        crate::media::migrate(&conn).await?;
         Ok(Self { conn })
     }
 
     /// 查询首个结果行；无结果返回 `None`。
-    async fn row_opt(&self, sql: &str, p: impl IntoParams) -> libsql::Result<Option<Row>> {
+    pub(crate) async fn row_opt(&self, sql: &str, p: impl IntoParams) -> libsql::Result<Option<Row>> {
         let mut stmt = self.conn.prepare(sql).await?;
         match stmt.query_row(p).await {
             Ok(row) => Ok(Some(row)),
@@ -469,7 +551,284 @@ impl Store {
         Ok(out)
     }
 
+    // ---- 缓存任务（服务端任务态：刷新/切页/关浏览器都不再丢） ----
+
+    /// 入队一个缓存任务；同 key 已有活跃任务时**复用既有任务**（幂等，不重复下载）。
+    ///
+    /// 返回 `(任务, 是否本次新建)`：只有新建时才允许起 worker，复用时 worker 已在跑。
+    /// 返回 `None` 仅出现在极端并发下（撞唯一索引后既读不到活跃行），调用方按内部错误处理。
+    pub async fn enqueue_cache_task(
+        &self,
+        chat_id: i64,
+        group_id: Option<i64>,
+        item_key: &str,
+        message_ids: &[i64],
+        dir: &str,
+    ) -> libsql::Result<Option<(CacheTask, bool)>> {
+        // 先读活跃任务：命中即复用（正常路径，避免无谓的写入冲突）。
+        if let Some(t) = self.active_cache_task(item_key).await? {
+            return Ok(Some((t, false)));
+        }
+        let items = serde_json::to_string(message_ids).unwrap_or_else(|_| "[]".to_string());
+        let ts = now();
+        // `cache_task_active_uniq`（partial unique）兜底并发：撞索引说明别人已插成功，回读即可。
+        let inserted = self
+            .conn
+            .execute(
+                "INSERT INTO cache_task \
+                   (chat_id, group_id, item_key, items, total, done, status, dir, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 'queued', ?6, ?7, ?7)",
+                params![
+                    chat_id,
+                    group_id,
+                    item_key,
+                    items,
+                    message_ids.len() as i64,
+                    dir,
+                    ts
+                ],
+            )
+            .await;
+        match inserted {
+            Ok(_) => {
+                let id = self.conn.last_insert_rowid();
+                Ok(self.get_cache_task(id).await?.map(|t| (t, true)))
+            }
+            Err(_) => Ok(self.active_cache_task(item_key).await?.map(|t| (t, false))),
+        }
+    }
+
+    /// 读同 key 的活跃任务（`queued`/`running`）。
+    pub async fn active_cache_task(&self, item_key: &str) -> libsql::Result<Option<CacheTask>> {
+        self.row_opt(
+            &format!(
+                "SELECT {CACHE_TASK_COLS} FROM cache_task \
+                 WHERE item_key = ?1 AND status IN {CACHE_TASK_ACTIVE_STATES}"
+            ),
+            params![item_key],
+        )
+        .await?
+        .map(|r| cache_task_from_row(&r))
+        .transpose()
+    }
+
+    /// 读单个任务。
+    pub async fn get_cache_task(&self, id: i64) -> libsql::Result<Option<CacheTask>> {
+        self.row_opt(
+            &format!("SELECT {CACHE_TASK_COLS} FROM cache_task WHERE id = ?1"),
+            params![id],
+        )
+        .await?
+        .map(|r| cache_task_from_row(&r))
+        .transpose()
+    }
+
+    /// 列出任务：活跃优先，其余新→旧（前端据此恢复「缓存中 n/N」）。
+    pub async fn list_cache_tasks(&self, limit: u32) -> libsql::Result<Vec<CacheTask>> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {CACHE_TASK_COLS} FROM cache_task \
+                     ORDER BY CASE WHEN status IN {CACHE_TASK_ACTIVE_STATES} THEN 0 ELSE 1 END, id DESC \
+                     LIMIT ?1"
+                ),
+                params![limit as i64],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(cache_task_from_row(&r)?);
+        }
+        Ok(out)
+    }
+
+    /// 各状态任务计数（缓存管理面板统计行）。
+    /// 返回 `(status, n)`；未出现的状态由调用方按 0 补齐。
+    pub async fn count_cache_tasks(&self) -> libsql::Result<Vec<(String, i64)>> {
+        let mut rows = self
+            .conn
+            .query("SELECT status, COUNT(*) FROM cache_task GROUP BY status", ())
+            .await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push((r.get(0)?, r.get(1)?));
+        }
+        Ok(out)
+    }
+
+    /// 清除终态任务记录（缓存管理面板「清除记录」）。
+    /// 活跃任务（queued/running）绝不清除。返回删除行数。
+    pub async fn clear_finished_cache_tasks(&self) -> libsql::Result<u64> {
+        let n = self
+            .conn
+            .execute(
+                &format!(
+                    "DELETE FROM cache_task WHERE status NOT IN {CACHE_TASK_ACTIVE_STATES}"
+                ),
+                (),
+            )
+            .await?;
+        Ok(n)
+    }
+
+    /// `queued` → `running`（worker 起跑时置位）。
+    pub async fn mark_cache_task_running(&self, id: i64) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE cache_task SET status = 'running', updated_at = ?2 \
+                 WHERE id = ?1 AND status = 'queued'",
+                params![id, now()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// 更新进度（已完成条数 + 正在处理的条目）。
+    pub async fn update_cache_task_progress(
+        &self,
+        id: i64,
+        done: i64,
+        current_id: Option<i64>,
+    ) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE cache_task SET done = ?2, current_id = ?3, updated_at = ?4 WHERE id = ?1",
+                params![id, done, current_id, now()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// 置终态；**仅在活跃态时生效**——已被取消的任务不会被 worker 事后改写成 done。
+    pub async fn finish_cache_task(
+        &self,
+        id: i64,
+        status: &str,
+        error: Option<&str>,
+    ) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE cache_task SET status = ?2, error = ?3, current_id = NULL, updated_at = ?4 \
+                     WHERE id = ?1 AND status IN {CACHE_TASK_ACTIVE_STATES}"
+                ),
+                params![id, status, error, now()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// 请求取消：置终态 `cancelled`，worker 在下一条目间隙自行退出。
+    /// 返回是否命中活跃任务（false = 任务已结束，无需取消）。
+    pub async fn cancel_cache_task(&self, id: i64) -> libsql::Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                &format!(
+                    "UPDATE cache_task SET status = 'cancelled', current_id = NULL, updated_at = ?2 \
+                     WHERE id = ?1 AND status IN {CACHE_TASK_ACTIVE_STATES}"
+                ),
+                params![id, now()],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// 任务是否仍活跃（worker 在每条目间隙检查，实现可取消）。
+    pub async fn is_cache_task_active(&self, id: i64) -> libsql::Result<bool> {
+        let Some(r) = self
+            .row_opt("SELECT status FROM cache_task WHERE id = ?1", params![id])
+            .await?
+        else {
+            return Ok(false);
+        };
+        let s: String = r.get(0)?;
+        Ok(s == "queued" || s == "running")
+    }
+
+    /// 是否有 worker 正在跑（单飞判定：新入队任务若已有 worker，则留在队列等接续）。
+    pub async fn has_running_cache_task(&self) -> libsql::Result<bool> {
+        let Some(r) = self
+            .row_opt("SELECT 1 FROM cache_task WHERE status = 'running' LIMIT 1", ())
+            .await?
+        else {
+            return Ok(false);
+        };
+        let _: i64 = r.get(0)?;
+        Ok(true)
+    }
+
+    /// 最老的排队任务（worker 跑完当前任务后按 FIFO 接续）。
+    pub async fn next_queued_task(&self) -> libsql::Result<Option<CacheTask>> {
+        self.row_opt(
+            &format!(
+                "SELECT {CACHE_TASK_COLS} FROM cache_task \
+                 WHERE status = 'queued' ORDER BY id ASC LIMIT 1"
+            ),
+            (),
+        )
+        .await?
+        .map(|r| cache_task_from_row(&r))
+        .transpose()
+    }
+
+    /// 当前应呈现给前端的**唯一**任务（设计裁定：无论多少缓存在排队，task 只返回一个结果）：
+    /// running 优先 → 最老 queued → 最近一条已结束任务（供前端收尾展示/错误提示）。
+    pub async fn current_cache_task(&self) -> libsql::Result<Option<CacheTask>> {
+        // 1) running（理论上至多一个）
+        if let Some(t) = self
+            .row_opt(
+                &format!(
+                    "SELECT {CACHE_TASK_COLS} FROM cache_task \
+                     WHERE status = 'running' ORDER BY id ASC LIMIT 1"
+                ),
+                (),
+            )
+            .await?
+            .map(|r| cache_task_from_row(&r))
+            .transpose()?
+        {
+            return Ok(Some(t));
+        }
+        // 2) 最老 queued
+        if let Some(t) = self.next_queued_task().await? {
+            return Ok(Some(t));
+        }
+        // 3) 最近一条已结束（done/failed/cancelled/interrupted）
+        self.row_opt(
+            &format!(
+                "SELECT {CACHE_TASK_COLS} FROM cache_task \
+                 WHERE status NOT IN {CACHE_TASK_ACTIVE_STATES} \
+                 ORDER BY updated_at DESC, id DESC LIMIT 1"
+            ),
+            (),
+        )
+        .await?
+        .map(|r| cache_task_from_row(&r))
+        .transpose()
+    }
+
+    /// 启动时清理僵尸任务：进程被杀/崩溃时残留的 queued/running 永远等不到 worker，
+    /// 必须显式降级为 `interrupted`，否则前端会显示一个永不推进的「缓存中」（假状态）。
+    /// 返回被标记的条数。
+    pub async fn mark_stale_cache_tasks(&self) -> libsql::Result<usize> {
+        let n = self
+            .conn
+            .execute(
+                &format!(
+                    "UPDATE cache_task SET status = 'interrupted', current_id = NULL, updated_at = ?1 \
+                     WHERE status IN {CACHE_TASK_ACTIVE_STATES}"
+                ),
+                params![now()],
+            )
+            .await?;
+        Ok(n as usize)
+    }
+
+
     /// 清除单条消息的本地缓存：删除落盘文件（存在才删，缺失忽略）并复位 downloaded/file_path。
+    ///
     /// 返回是否确有缓存被清除（无缓存时 false，幂等）。仅删缓存副本，不动库中消息记录本身。
     pub async fn clear_downloaded(&self, channel_id: i64, message_id: i64) -> libsql::Result<bool> {
         let row = self
@@ -812,5 +1171,75 @@ mod tests {
         // 清缓存仅清 dialog_cache。
         s.clear_dialog_cache().await.unwrap();
         assert_eq!(s.count_dialogs().await.unwrap(), 0);
+    }
+
+    /// 缓存任务状态机：入队 → 复用 → 进度 → 终态 → 取消 → 僵尸降级。
+    #[tokio::test]
+    async fn cache_task_lifecycle() {
+        let s = store("cache_task").await;
+
+        // 入队：新建（created=true），初始 queued、done=0。
+        let (t1, created) = s
+            .enqueue_cache_task(7, Some(900), "g:7:900", &[11, 12, 13], "D:/dl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(created);
+        assert_eq!(t1.total, 3);
+        assert_eq!(t1.done, 0);
+        assert_eq!(t1.status, "queued");
+        assert_eq!(t1.message_ids, vec![11, 12, 13], "消息号须原样保留顺序");
+
+        // 复用：同 key 再入队返回同一任务（幂等，不产生第二条）。
+        let (t2, created2) = s
+            .enqueue_cache_task(7, Some(900), "g:7:900", &[11, 12, 13], "D:/dl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!created2, "活跃任务必须复用而非新建");
+        assert_eq!(t2.id, t1.id);
+        assert_eq!(s.list_cache_tasks(50).await.unwrap().len(), 1);
+
+        // running + 进度。
+        s.mark_cache_task_running(t1.id).await.unwrap();
+        s.update_cache_task_progress(t1.id, 1, Some(12)).await.unwrap();
+        let t = s.get_cache_task(t1.id).await.unwrap().unwrap();
+        assert_eq!(t.status, "running");
+        assert_eq!(t.done, 1);
+        assert_eq!(t.current_id, Some(12));
+
+        // 取消：置终态；worker 事后不能把它改写成 done（finish 仅对活跃态生效）。
+        assert!(s.cancel_cache_task(t1.id).await.unwrap());
+        s.finish_cache_task(t1.id, "done", None).await.unwrap();
+        let t = s.get_cache_task(t1.id).await.unwrap().unwrap();
+        assert_eq!(t.status, "cancelled", "取消后不得被 worker 覆盖为 done");
+        assert!(!s.is_cache_task_active(t1.id).await.unwrap());
+        // 已结束的任务再取消 → 未命中。
+        assert!(!s.cancel_cache_task(t1.id).await.unwrap());
+
+        // 终态后同 key 可再次入队（partial unique 只约束活跃态）。
+        let (t3, created3) = s
+            .enqueue_cache_task(7, Some(900), "g:7:900", &[11, 12, 13], "D:/dl")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(created3, "终态任务的 key 应可重新入队");
+        assert_ne!(t3.id, t1.id);
+
+        // 僵尸降级：重启后残留的活跃任务不得继续表现为活跃（否则前端永远显示「缓存中」）。
+        s.mark_cache_task_running(t3.id).await.unwrap();
+        assert_eq!(s.mark_stale_cache_tasks().await.unwrap(), 1);
+        let t = s.get_cache_task(t3.id).await.unwrap().unwrap();
+        assert_eq!(t.status, "interrupted");
+        assert_eq!(t.current_id, None);
+
+        // 列表：活跃优先，其余新→旧。
+        let (a, _) = s
+            .enqueue_cache_task(8, None, "m:8:21", &[21], "D:/dl")
+            .await
+            .unwrap()
+            .unwrap();
+        let list = s.list_cache_tasks(50).await.unwrap();
+        assert_eq!(list[0].id, a.id, "活跃任务必须排在最前");
     }
 }
