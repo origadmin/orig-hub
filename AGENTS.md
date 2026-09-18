@@ -72,6 +72,8 @@
 | 验证/验收脚本（本地跑、不交付） | `verify_shots/<topic>/` | ❌ gitignore |
 | 一次性处理脚本 / dump / 草稿 | 系统临时目录 或 `.scratch/` | ❌ gitignore |
 | AI 报告 / 评估 / 交付摘要 / 说明 | **不入库**；确需保留的正式文档 → `docs/` 且正式命名 | ❌ |
+| 本机便利/包装脚本（`cargo build && …`、`.bat`/`.cmd`、带 `pause` 的交互脚本） | **不入库**；确需交付 → 写进 `scripts/`（须跨平台）或舱内 `verify/` | ❌ |
+| 含本机绝对路径的脚本 | **不入库**（换机即坏） | ❌ |
 
 ### 6.3 AI 工具目录（ZERO TOLERANCE）
 
@@ -82,6 +84,17 @@
 - **禁止写裸目录名**（`analysis/` 这类）：Git 会在**任意层级**匹配，会把源码/文档黑洞掉（文件在磁盘上却对 `git ls-files` 隐形，改了等于没改）。构建产物/运行目录一律**根锚定**：写 `/bin/` 不写 `bin`。
 - 改 `.gitignore` 后必须自查：`git check-ignore -v <path>`。
 - 审计仓库完整性时 `git ls-files` **不可信**，须同时跑 `find` 与 `git status --ignored` 对账。
+
+### 6.5 脚本可移植性铁律（2026-09-18 补，`run_test.bat` 事故）
+
+- **禁止入库本机绝对路径**：`D:\...`、`C:\Users\<user>`、`/c/Users/...` 不得出现在入库脚本中（换机即坏）。
+  路径一律用相对路径 / `$(dirname "$0")` / `%~dp0` / `git rev-parse --show-toplevel`。
+- **禁止入库本机便利脚本**：`cargo build && python verify/...` 这类包装器、`.bat`/`.cmd`、带 `pause`
+  的交互脚本，属**本地便利**而非交付物 → 交付就写进 `scripts/`（须跨平台）或舱内 `verify/`，否则留本地不入库。
+  **同一职能已有脚本时不得再造第二份**（如 `download-engine/verify/run_verify.sh` 已覆盖 build+verify）。
+- **入库脚本必须 UTF-8/ASCII**：非 UTF-8（含 NUL）会让文本门禁与搜索失效，内容无法核验。
+- **按原则判定，不按扩展名枚举**：判「该不该入库」看**产物性质 + 可移植性**，不看扩展名/文件名前缀清单
+  —— `run_test.bat` 事故的根因正是"只按扩展名（漏 `.bat`）与名字前缀（`probe_*`/`tmp_*`）去找"。
 
 ## 7. 提交前污染防线（自动门禁）
 
