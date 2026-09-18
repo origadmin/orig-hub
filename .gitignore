@@ -41,6 +41,55 @@ logs/
 .workbuddy/
 __pycache__/
 
+# ============ AI/Agent 工具目录（ZERO TOLERANCE，绝不入库） ============
+# 对齐 EE：AI 工具运行态/配置一律本地化，提交即规范事故（AGENTS.md §6.3）
+.claude/
+.trae/
+.agents/
+.agent/
+.cursor/
+.coder/
+.augment/
+.sourcegraph/
+.continue/
+.aider/
+.aider*
+.kiro/
+.cody/
+.codex/
+.codeium/
+.windsurfrules
+.cursorignore
+.cursorrules
+CLAUDE.md
+skills-lock.json
+.github/copilot/
+
+# ============ 仓库根唯一临时出口（AGENTS.md §6.1） ============
+# 临时/处理/草稿产物只许落这里；根目录与工作目录严禁落临时文件
+/.scratch/
+
+# ============ 构建/临时残留 ============
+# mock 构建目标、git 操作临时对象目录、通用临时文件
+**/target-mock/
+.git-tmp-obj/
+*.tmp
+*.bak
+*.orig
+
+# ============ AI 生成的报告/摘要（不入库，AGENTS.md §6.2） ============
+REPORT.md
+FINDINGS.md
+TRIAGE.md
+RCA.md
+FIX.md
+AC.md
+IMPL.md
+SCOPE.md
+SPEC.md
+analysis*.js
+analyze*.js
+
 # ============ 编辑器 / OS ============
 **/.vscode/
 **/.idea/

@@ -1,0 +1,12 @@
+#!/bin/sh
+# orig-hub commit-msg hook (tracked copy; install via scripts/install-hooks.sh)
+# EE rule (inherited): commit messages must NEVER contain Chinese.
+# Makes the "Chinese commit" error state unrepresentable: CJK in subject/body -> reject.
+# AGENTS.md: --no-verify to skip hooks is forbidden unless explicitly authorized.
+msg_file="$1"
+if grep -qP '[\x{4e00}-\x{9fff}]' "$msg_file" 2>/dev/null; then
+  echo "commit-msg: rejected - commit message contains Chinese (EE rule: English only)" >&2
+  echo "  example: feat(engine): add series merge API (reorder only, no content check)" >&2
+  exit 1
+fi
+exit 0
