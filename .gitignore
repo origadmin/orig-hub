@@ -42,11 +42,20 @@ logs/
 __pycache__/
 
 # ============ 编辑器 / OS ============
-.vscode/*
-.idea/
+**/.vscode/
+**/.idea/
 .DS_Store
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+
+# ============ Cargo 本地环境配置（不入库） ============
+# 含本机网络镜像源(rsproxy 等)或代理，属本地环境，换机/CI 不应继承
+**/.cargo/config.toml
+**/.cargo/config
+
+# ============ 本地验证脚本（非交付代码） ============
+# e2e/verify 类脚本按用途归类为本地验证，不入库（对齐 EE 的 probe_*.mjs 规则）
+tauri-shell/verify-e2e.mjs
