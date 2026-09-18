@@ -15,9 +15,11 @@
 
 格式：`<type>(<scope>): <subject>`
 
+- **语言（强制）：提交信息（subject 与 body）一律英文，禁止中文。** 这是继承自 EE（orig-cms-ee）的核心规约，优先级高于本文件的格式示例——历史已出现 24/78 中文提交，根因即此规约从未写入本地约定且无门禁拦截。
 - type：`feat` / `fix` / `refactor` / `docs` / `chore` / `test` / `style`
 - scope：`engine`（内核）/ `shell`（Tauri 壳+前端）/ `docs` / `build`
-- 示例：`feat(engine): 支持 Content-Disposition 文件名嗅探`
+- 示例：`feat(engine): support Content-Disposition filename sniffing`
+- 门禁：`.git/hooks/commit-msg` 会拒绝任何含中文的提交信息；AGENTS.md 已规定禁止 `--no-verify` 跳过（除非显式授权）。
 
 要求：
 
