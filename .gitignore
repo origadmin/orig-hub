@@ -35,12 +35,38 @@ download-engine/acceptance-evidence.txt
 *.log
 logs/
 
+# ============ AI/Agent 工具目录（本地专属，绝不入库 · 零容忍） ============
+# 整块照抄 orig-cms-ee 根 .gitignore（其 AI/Agent 工具清单）。
+# orig-hub 此前缺此整块，导致 .trae 被误提交；现对齐 EE，禁止任何 AI 临时/配置目录入库。
+.claude/
+.trae/
+.workbuddy/
+.agents/
+.agent/
+.cursor/
+.coder/
+.augment/
+.sourcegraph/
+.continue/
+.aider/
+.aider*
+.kiro/
+.cody/
+.codex/
+.codeium/
+.windsurfrules
+.cursorignore
+.cursorrules
+CLAUDE.md
+.aider.conf*
+skills-lock.json
+.github/copilot/
+
 # ============ 工具元数据（不入库） ============
 .beads/
 .task/
 .code-review-graph/
 .team/
-.workbuddy/
 __pycache__/
 
 # ============ 编辑器 / OS ============
