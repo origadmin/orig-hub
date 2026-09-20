@@ -1019,7 +1019,48 @@ export function TgPanel({ onOpenAccounts }: { onOpenAccounts?: () => void } = {}
   )
 
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-1 overflow-hidden">
+    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+      {/*
+        顶部工具条：**常驻**的「缓存管理」入口（补偿可达性）。
+        「传输中」导航移除后，缓存任务的入口只剩频道详情页头部那一处，
+        必须先点进某个频道才看得到 —— 全局入口就此消失。
+        这里把它放回面板顶部，与是否选中频道无关。
+
+        未授权/不可用（`unavailable`）时**照样显示**：缓存任务与缓存字节是**本地数据**
+        （实测 `/api/tg/cache/tasks` 与 `/api/cache/stats` 在未授权时仍 200），
+        TG 连不上时恰恰更需要查看与清理；真连不上服务（`unreachable`）才隐藏。
+      */}
+      {tgServiceUp && (
+        <div
+          className="flex shrink-0 items-center justify-end border-b border-border-subtle/60 px-3 py-1.5"
+          data-testid="tg-toolbar"
+        >
+          <button
+            type="button"
+            onClick={() => setCacheManagerOpen(true)}
+            title={t('tg.cacheManagerHint')}
+            className="flex h-7 shrink-0 items-center gap-1 rounded px-2 text-[11px] text-fg-muted hover:bg-surface-2 hover:text-fg-strong"
+            data-testid="tg-cache-manager-entry"
+          >
+            <svg
+              className="h-3.5 w-3.5"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              strokeWidth={1.5}
+              aria-hidden="true"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M20 7.5 12 12 4 7.5m8 4.5v9M4 7.5C4 5.015 7.582 3 12 3s8 2.015 8 4.5M4 7.5v9C4 18.985 7.582 21 12 21s8-2.015 8-4.5v-9"
+              />
+            </svg>
+            {t('tg.cacheManager')}
+          </button>
+        </div>
+      )}
+      <div className="flex min-h-0 flex-1">
       {tgDebugOffline && tgAvailability ? (
         /* 调试期离线：预期态，中性呈现，不报警 */
         <div className="flex flex-1 items-center justify-center p-6">
@@ -1550,6 +1591,7 @@ export function TgPanel({ onOpenAccounts }: { onOpenAccounts?: () => void } = {}
 
         </>
       )}
+      </div>
       {cacheManagerOpen ? (
         <CacheManagerDialog channels={channels} onClose={() => setCacheManagerOpen(false)} />
       ) : null}

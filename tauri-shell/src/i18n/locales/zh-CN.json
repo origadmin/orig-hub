@@ -189,6 +189,7 @@
   "tg.monitoring": "监控中",
   "tg.newContent": "有 {n} 条新内容 · 点击刷新",
   "tg.cacheManager": "缓存管理",
+  "tg.cacheManagerHint": "查看与管理已缓存的媒体（与当前选中的频道无关）",
   "tg.cacheRefresh": "刷新",
   "tg.cacheClear": "清除记录",
   "tg.cacheClearConfirmAll": "确定清除全部 {n} 条记录？其中的进行中任务会被取消。仅删除记录，不删除已缓存文件。",

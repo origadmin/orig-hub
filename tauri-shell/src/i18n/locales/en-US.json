@@ -189,6 +189,7 @@
   "tg.monitoring": "Monitoring",
   "tg.newContent": "{n} new items · tap to refresh",
   "tg.cacheManager": "Cache Manager",
+  "tg.cacheManagerHint": "View and manage cached media (independent of the selected channel)",
   "tg.cacheRefresh": "Refresh",
   "tg.cacheClear": "Clear records",
   "tg.cacheClearConfirmAll": "Clear all {n} records? Tasks in progress will be cancelled. Records only — cached files are kept.",
