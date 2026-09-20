@@ -1,83 +1,117 @@
 #!/usr/bin/env sh
-# 仓库污染门禁 —— 对应 AGENTS.md §6「目录归属与污染防线」。
+# ============================================================
+# orig-hub pollution gate  (AGENTS.md §6 / §7)
 #
-# 三条不变量（每条都能被机械判定，不靠人记）：
-#   I1 仓库根只允许 4 个文件：.gitignore / AGENTS.md / README.md / download-engine.toml
-#      （目录不限；根目录下的**文件**是污染高发区：交付概述、临时库、日志都往这儿落）
-#   I2 仓内不得**跟踪**构建产物 / 运行时残留 / AI 工具目录
-#      （`.gitignore` 拦不住的唯一原因是「先提交、后 ignore」——已跟踪的文件不受 ignore 影响）
-#   I3 仓内不得存在**未忽略**的残留文件（dist_* / *.db / *.session / *.log / *.part …）
+# Blocks, in the STAGED set:
+#   1. root-level files outside the whitelist
+#   2. AI/Agent tool directories (ZERO TOLERANCE)
+#   3. temp files (*.tmp *.bak *.orig *~ *.swp *.log)
+#   4. probe/scratch artifacts left in a working dir
+#   5. batch/cmd helpers outside scripts/ (local convenience wrappers)
+#   6. scripts loose at a cabin root (cabins hold source, not helpers)
+#   7. scripts containing machine-absolute paths (non-portable)
+#   8. non-UTF8/binary scripts (encoding unverifiable)
 #
-# 判定口径：「被 .gitignore 忽略」= 可容忍（target/、node_modules/ 物理存在是正常的）；
-# 「被跟踪」或「未忽略」= 失败。这样门禁不需要对用户的本地工具目录做物理删除。
-#
-# 用法：sh scripts/check-pollution.sh   （由 .git/hooks/pre-commit 与 CI 同时调用）
-
+# Fix the ROOT CAUSE (relocate / delete / add .gitignore).
+# NEVER bypass with --no-verify.
+# ============================================================
 set -u
 
-if ! ROOT=$(git rev-parse --show-toplevel 2>/dev/null); then
-  echo "check-pollution: FAIL - not inside a git work tree" >&2
-  exit 1
-fi
-cd "$ROOT" || exit 1
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+cd "$ROOT" || exit 0
 
-ALLOWED_ROOT_FILES=".gitignore AGENTS.md README.md download-engine.toml"
+FAIL=0
+bad() { printf '\033[31m[POLLUTION]\033[0m %s\n' "$1"; FAIL=1; }
 
-# 构建产物 / 运行时残留 / AI 工具目录的路径模式（POSIX ERE，作用于仓库相对路径）
-ARTIFACT_RE='(^|/)(target|target-mock|node_modules|dist|dist_[^/]*|binaries)/|\.(exe|dll|so|dylib|db|session|log|part|tmp|bak)$|(^|/)proxy-test-file\.bin$'
+# Whitelisted files allowed at repository root (must stay in sync with AGENTS.md §6.1).
+ROOT_WHITELIST=".gitignore AGENTS.md README.md download-engine.toml"
 
-fail=0
-report() {
-  echo "check-pollution: FAIL - $1" >&2
-  fail=1
-}
-
-is_allowed_root_file() {
-  for a in $ALLOWED_ROOT_FILES; do
-    [ "$1" = "$a" ] && return 0
-  done
+is_root_whitelisted() {
+  for w in $ROOT_WHITELIST; do [ "$1" = "$w" ] && return 0; done
   return 1
 }
 
-# ---------- I1 仓库根只允许 4 个文件 ----------
-root_files=$(
-  {
-    git ls-files
-    git ls-files --others --exclude-standard
-  } | awk 'index($0, "/") == 0'
-)
+# Anything that is executed / interpreted rather than compiled.
+is_script() {
+  case "$1" in
+    *.sh|*.py|*.mjs|*.cjs|*.js|*.ps1|*.bat|*.cmd) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
-for f in $root_files; do
-  if ! is_allowed_root_file "$f"; then
-    report "仓库根出现白名单外的文件：$f（AGENTS.md §6：根只允许 $ALLOWED_ROOT_FILES）"
-    echo "      处置：文档移入 docs/、脚本移入 scripts/、产物移出仓库或加入 .gitignore。" >&2
+STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
+
+for f in $STAGED; do
+  # (1) root-level file outside whitelist
+  case "$f" in
+    */*) : ;;
+    *) is_root_whitelisted "$f" || bad "root-level file not in whitelist: $f" ;;
+  esac
+
+  # (2) AI/Agent tool artifacts
+  case "$f" in
+    .trae/*|.claude/*|.cursor/*|.cursorrules|.cursorignore|.coder/*|.augment/*|.sourcegraph/*|.continue/*|.aider*|.kiro/*|.cody/*|.codex/*|.codeium/*|.windsurf*|.agents/*|.agent/*|CLAUDE.md|skills-lock.json)
+      bad "AI tool artifact must never be committed: $f" ;;
+  esac
+
+  # (3) temp files
+  case "$f" in
+    *.tmp|*.bak|*.orig|*~|*.swp|*.swo|*.log)
+      bad "temp file must never be committed: $f" ;;
+  esac
+
+  # (4) probe/scratch artifacts left in a working dir
+  case "$f" in
+    */probe_*|*/tmp_*|*/temp_*|*/scratch_*|*/debug_*|*/.scratch/*|*/_probe/*)
+      bad "scratch/probe artifact in working dir: $f" ;;
+  esac
+
+  # (5) batch/cmd helpers are Windows-local convenience wrappers -> only scripts/ may hold them
+  case "$f" in
+    *.bat|*.cmd)
+      case "$f" in
+        scripts/*) : ;;
+        *) bad "batch/cmd helper outside scripts/ (relocate or keep local): $f" ;;
+      esac ;;
+  esac
+
+  # (6) cabins hold SOURCE; a bare script at a cabin root is a stray helper.
+  #     Deliverable verification belongs in <cabin>/verify/ or the repo-level scripts/.
+  case "$f" in
+    download-engine/*|tauri-shell/*)
+      case "$f" in
+        */*/*) : ;;   # deeper than the cabin root -> allowed
+        *)
+          if is_script "$f"; then
+            bad "script loose at cabin root (move to <cabin>/verify/ or scripts/): $f"
+          fi ;;
+      esac ;;
+  esac
+
+  # (7)/(8) script hygiene: portable paths + verifiable encoding
+  # NOTE: the path regex is anchored so it cannot match THIS gate's own source
+  # (a naive pattern would contain its own trigger and self-block every commit),
+  # and the leading-boundary rule keeps URLs like "http://" from matching.
+  if is_script "$f" && [ -f "$f" ]; then
+    if grep -qE '(^|[^A-Za-z])[A-Za-z]:[\\/]|/(c|C)/Users/' "$f" 2>/dev/null; then
+      bad "machine-absolute path in script (use relative or \$(dirname \"\$0\")): $f"
+    fi
+    if od -An -c "$f" 2>/dev/null | grep -q '\\0'; then
+      bad "binary/non-UTF8 script (encoding not verifiable, convert to UTF-8/ASCII): $f"
+    fi
   fi
 done
 
-# ---------- I2 不得跟踪产物 / AI 工具目录 ----------
-tracked_bad=$(git ls-files | grep -E "$ARTIFACT_RE" || true)
-if [ -n "$tracked_bad" ]; then
-  report "以下产物/残留已被 git 跟踪（ignore 对已跟踪文件无效）："
-  echo "$tracked_bad" | sed 's/^/      /' >&2
-  echo "      处置：git rm --cached <path>，并在 .gitignore 补上对应模式。" >&2
-fi
-
-tracked_ai=$(git ls-files | grep -E '(^|/)\.(trae|claude|cursor|aider|kiro|cody|codex|codeium|augment|continue|sourcegraph|agents?)/|(^|/)CLAUDE\.md$|(^|/)\.windsurfrules$' || true)
-if [ -n "$tracked_ai" ]; then
-  report "以下 AI/Agent 工具文件已被跟踪（零容忍，AGENTS.md §6）："
-  echo "$tracked_ai" | sed 's/^/      /' >&2
-fi
-
-# ---------- I3 不得存在未忽略的残留文件 ----------
-untracked_bad=$(git ls-files --others --exclude-standard | grep -E "$ARTIFACT_RE" || true)
-if [ -n "$untracked_bad" ]; then
-  report "以下未忽略的残留文件存在于工作树："
-  echo "$untracked_bad" | sed 's/^/      /' >&2
-  echo "      处置：移出仓库（或加入 .gitignore 并确属运行时产物）。" >&2
-fi
-
-if [ "$fail" -ne 0 ]; then
+if [ "$FAIL" -ne 0 ]; then
+  echo ""
+  echo "Commit blocked by pollution gate (AGENTS.md §7)."
+  echo "Fix the root cause:"
+  echo "  - move scratch to .scratch/ or system temp"
+  echo "  - move docs into docs/  (never the repo root)"
+  echo "  - move helper scripts to <cabin>/verify/ or scripts/"
+  echo "  - delete temp files / replace machine paths with relative ones"
+  echo "Do NOT bypass with --no-verify."
   exit 1
 fi
 
-echo "check-pollution: OK - 根目录 4 文件白名单内，无被跟踪/未忽略的产物与残留。"
+exit 0

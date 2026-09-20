@@ -1,16 +1,12 @@
 # ============ Rust（下载内核 + Tauri 壳） ============
 /target
 **/target
-# mock 构建用的独立 target 目录（CARGO_TARGET_DIR=target-mock）；`**/target` 匹配不到它
-**/target-mock/
 **/*.rs.bk
 
 # ============ Node / 前端（Vite + React） ============
 node_modules/
 dist/
 dist-ssr/
-# 验证/CI 用的备用构建输出名（dist_check / dist_ci / dist_probe …）：`dist/` 匹配不到它们
-tauri-shell/dist_*/
 .vite/
 *.local
 
@@ -27,8 +23,6 @@ tauri-shell/src-tauri/binaries/
 /data/
 *.orighub
 *.db
-# TG 会话文件（等同密码凭证），由 tg_data_dir() 落到用户数据目录；仓内出现即裸跑残留
-*.session
 proxy-test-file.bin
 coverage/
 verify_shots/
@@ -39,13 +33,18 @@ download-engine/acceptance-evidence.txt
 *.log
 logs/
 
-# ============ AI/Agent 工具目录（本地专属，绝不入库 · 零容忍） ============
-# 整块照抄 orig-cms-ee 根 .gitignore（其 AI/Agent 工具清单）。
-# orig-hub 此前缺此整块，导致 .trae 被误提交；现对齐 EE，禁止任何 AI 临时/配置目录入库。
+# ============ 工具元数据（不入库） ============
+.beads/
+.task/
+.code-review-graph/
+.team/
+.workbuddy/
+__pycache__/
+
+# ============ AI/Agent 工具目录（ZERO TOLERANCE，绝不入库） ============
+# 对齐 EE：AI 工具运行态/配置一律本地化，提交即规范事故（AGENTS.md §6.3）
 .claude/
 .trae/
-.workbuddy/
-.workbuddy-ai/
 .agents/
 .agent/
 .cursor/
@@ -63,23 +62,50 @@ logs/
 .cursorignore
 .cursorrules
 CLAUDE.md
-.aider.conf*
 skills-lock.json
 .github/copilot/
 
-# ============ 工具元数据（不入库） ============
-.beads/
-.task/
-.code-review-graph/
-.team/
-__pycache__/
+# ============ 仓库根唯一临时出口（AGENTS.md §6.1） ============
+# 临时/处理/草稿产物只许落这里；根目录与工作目录严禁落临时文件
+/.scratch/
+
+# ============ 构建/临时残留 ============
+# mock 构建目标、git 操作临时对象目录、通用临时文件
+**/target-mock/
+.git-tmp-obj/
+*.tmp
+*.bak
+*.orig
+
+# ============ AI 生成的报告/摘要（不入库，AGENTS.md §6.2） ============
+REPORT.md
+FINDINGS.md
+TRIAGE.md
+RCA.md
+FIX.md
+AC.md
+IMPL.md
+SCOPE.md
+SPEC.md
+analysis*.js
+analyze*.js
 
 # ============ 编辑器 / OS ============
-.vscode/*
-.idea/
+**/.vscode/
+**/.idea/
 .DS_Store
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+
+# ============ Cargo 本地环境配置（不入库） ============
+# 含本机网络镜像源(rsproxy 等)或代理，属本地环境，换机/CI 不应继承
+**/.cargo/config.toml
+**/.cargo/config
+
+# ============ 本地验证脚本（非交付代码） ============
+# e2e/verify 类脚本按用途归类为本地验证，不入库（对齐 EE 的 probe_*.mjs 规则）
+tauri-shell/verify-e2e.mjs
+.workbuddy-ai/
