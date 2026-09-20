@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "verify:ui": "node verify/verify_ui_render.cjs",
     "sidecars": "bash ../scripts/sync-sidecars.sh",
     "tauri:dev": "bash ../scripts/sync-sidecars.sh && tauri dev",
     "tauri:build": "bash ../scripts/sync-sidecars.sh && tauri build"

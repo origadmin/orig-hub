@@ -23,7 +23,23 @@
  * 因为「BUG 登记的验收证据必须换台机器也能复核」；截图/JSON 这类产物仍留在 ignored 的
  * `verify_shots/`，否则仓库会被像素级证据撑爆。
  */
-const { chromium } = require('playwright')
+// BUG-086: playwright is intentionally NOT a dependency of tauri-shell (its browser
+// download is impossible in offline/constrained environments). Degrade gracefully
+// instead of crashing with a bare MODULE_NOT_FOUND. See verify/README.md.
+let chromium
+try {
+  ;({ chromium } = require('playwright'))
+} catch (err) {
+  const missingPlaywright =
+    err && err.code === 'MODULE_NOT_FOUND' && String(err.message || '').includes('playwright')
+  if (missingPlaywright) {
+    console.error('[verify] 未安装 playwright，本脚本无法执行：需要真实浏览器截图，非网络不可。')
+    console.error('[verify] 安装方式：cd tauri-shell && npm i -D playwright && npx playwright install chromium')
+    console.error('[verify] 零依赖的真实渲染验收请改用：npm run verify:ui')
+    process.exit(2)
+  }
+  throw err
+}
 const path = require('path')
 const fs = require('fs')
 

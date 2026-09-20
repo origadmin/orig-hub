@@ -115,6 +115,7 @@
 | BUG-083 | 顶部下载工具栏仅 `isDownloadView` 下渲染，媒体库/TG 下整行空白（`<header>` 常驻定高，**布局不跳动，无需额外占位**）。评估：媒体库/TG **不显示**下载按钮（按钮语义指向 daemon 队列，而媒体库条目与 TG 缓存任务都不是其对象，常显会误导）。建议把该栏改为「上下文栏」：低改本放视图标题+全局态，中成本把内容区工具条上行合并。待拍板：工具条上行还是留在内容区 | fixed | shell |
 | BUG-084 | 提交信息混入 CR（CRLF）：同内容提交哈希不同（`206ee70` vs `645d2c7` 同 tree 仅差结尾行尾）、后代哈希全变，78 条里 76 条 message 含 CR。修：门禁加 CR 检测——`check-commit-msgs.py` 按字节取 `%B` + 生效点基线（历史欠账只告警、新增阻断）+ `--self-test`，`commit-msg` 钩子用字面 CR + `grep -U`；AGENTS.md §2/§7 同步。存量 76 条待重写，见待拍板 | fixed | build |
 | BUG-085 | BUG-077 的 `/api/activity` 轮询打到 TG 全量端点 `/api/tg/cache/tasks/all`，该端点**每次两次 SQLite**（`list_cache_tasks` + `count_cache_tasks`，`orig-tg/src/routes.rs:986-1005`），其中 `counts` daemon 侧**根本不消费**（`activity.rs:157-161`）。根因是 TG 缺「内存快照版全量端点」——内存端点契约只返回一条（单飞），而 `is_in_transit` 需含 failed/interrupted 的全量。已在 `activity.rs:305` 留 §5 豁免注释。待拍板：(a) TG 新增内存全量端点（建议）/ (b) `?counts=0` 止血 / (c) 维持 | open | engine |
+| BUG-086 | UI 验收通道自身不可执行 —— `tauri-shell/verify/` 6 个 `shot_*.cjs` 均 `require('playwright')` 而 `package.json` 未声明该依赖（`node_modules/playwright*` 不存在），任何机器首跑即 `MODULE_NOT_FOUND` 崩溃，产出「验证失败」假象；次生为 `node_modules` 残缺缺 `@babel/core`（`@vitejs/plugin-react` 依赖）致白屏而 dev server 仍返 200。修：6 脚本改 try/catch 优雅降级（exit 2 + 中文提示，不删改业务逻辑）+ 新增零依赖 CDP 驱动 `verify/lib/cdp.cjs`（Node 内置 WebSocket）+ 真实渲染验收 `verify_ui_render.cjs`（20/20 PASS）+ `npm run verify:ui` + `verify/README.md` | fixed | shell |
 
 ## 历史欠账
 
