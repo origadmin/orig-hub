@@ -16,6 +16,7 @@ import { useEvent } from '../hooks/useEvent'
 import { useTranslation } from '../i18n'
 import { formatSpeed } from '../lib/utils'
 import { ensureDaemon, daemonStatus } from '../api/tauri'
+import { health } from '../api/daemon'
 import { cn } from '../lib/utils'
 
 export function MainLayout() {
@@ -26,7 +27,7 @@ export function MainLayout() {
   const { t } = useTranslation()
   /** 连接态：与上下文栏、侧栏底部同源（BUG-087，唯一来源 `store/connState.ts`） */
   const connState = useConnState()
-  const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, accounts, viewer, setViewerIndex, closeViewer, tgEnabled, tgAvailability, refreshTgSession } = useStore()
+  const { downloads, init, setDaemon, setDaemonAlive, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, accounts, viewer, setViewerIndex, closeViewer, tgEnabled, tgAvailability, refreshTgSession } = useStore()
 
   /** TG 入口级门控（用户裁定：常规 TG 开关控制整个 TG 内容）：
    *  开关关 OR 探测到不可用/不可达 → 侧栏 TG 导航与账号页 TG 绑定整体隐藏；
@@ -36,18 +37,31 @@ export function MainLayout() {
 
   useEffect(() => {
     init()
-    // 确保 daemon 运行（先拉起，再查状态）
+    /*
+     * 确保 daemon 运行（先拉起，再查状态）。
+     *
+     * `ensureDaemon` / `daemonStatus` 都是 **Tauri Rust 命令**：纯浏览器开发模式
+     * （直接开 dev server、无桌面宿主）下 `invoke` 不存在 → Promise reject。
+     * 旧写法 `.catch(() => {})` 把失败咽掉 → `daemon` 恒 null → 连接态恒 offline，
+     * 而此时 `/api/downloads` 等请求明明一直在成功（BUG-090：指示器说谎）。
+     * 故 Tauri 路径不可用时退到**一次** HTTP 健康探测播种 alive —— 启动期一次性请求，
+     * 不是轮询；此后的存活完全由既有请求的成功/失败反推（见 store.refresh / SSE onOpen）。
+     */
     ensureDaemon()
       .then(() => daemonStatus())
       .then(setDaemon)
-      .catch(() => {})
+      .catch(() => {
+        health()
+          .then(() => setDaemonAlive(true))
+          .catch(() => setDaemonAlive(false))
+      })
     // 定期刷新兜底：仅在 SSE 断线（connected=false）时真正拉取，避免健康连接下每 5s 空轮询
     const timer = setInterval(() => {
       if (useStore.getState().connected) return
       refresh().catch(() => {})
     }, 5000)
     return () => clearInterval(timer)
-  }, [init, refresh, setDaemon])
+  }, [init, refresh, setDaemon, setDaemonAlive])
 
   // TG 未绑定时，若当前停留在 TG 视图则退回全部下载（由登录绑定态驱动，非插件开关）
   useEffect(() => {

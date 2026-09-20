@@ -9,6 +9,7 @@ import type {
   TgAvailability,
 } from '../types'
 import {
+  DAEMON_PORT,
   addDownload as apiAddDownload,
   downloadAction as apiDownloadAction,
   getConfig,
@@ -23,6 +24,18 @@ import type { AddDownloadRequest, ViewerItem } from '../types'
 
 const SETTINGS_KEY = 'orig-hub:settings'
 const ACCOUNTS_KEY = 'orig-hub:accounts'
+
+/**
+ * 由「通信结果」反推的 daemon 状态（BUG-090）。
+ *
+ * 只改 `alive` 一个字段：Tauri 路径给的 `managed` / `port` 是宿主的真实信息，
+ * 不能被一次 HTTP 成功改写掉（`managed` 决定停止按钮等托管语义）。
+ * `daemon` 为 null（从未拿到过宿主信息，如浏览器开发模式）时按「非托管」播种。
+ */
+function daemonWithAlive(cur: DaemonStatus | null, alive: boolean): DaemonStatus {
+  if (cur) return cur.alive === alive ? cur : { ...cur, alive }
+  return { alive, port: DAEMON_PORT, managed: false }
+}
 
 /** 按浏览器环境推断默认语言（i18n 缺省值） */
 function defaultLanguage(): LanguageValue {
@@ -144,6 +157,15 @@ interface DownloadState {
   init: () => Promise<void>
   refresh: () => Promise<void>
   setDaemon: (d: DaemonStatus) => void
+  /**
+   * 用**已有请求的结果**推导 daemon 存活（BUG-090）：不新发任何探活请求。
+   *
+   * Tauri 命令（`daemon_status`）只在桌面宿主里存在；浏览器开发模式下它 reject，
+   * 于是 `daemon` 恒为 null → 连接态恒 offline，而此时 daemon 明明活着
+   * （`/api/downloads` 等请求一直在成功）。故存活改由真实通信结果反推：
+   * SSE 连上 / 列表拉取成功 → alive；拉取失败 → 不 alive。
+   */
+  setDaemonAlive: (alive: boolean) => void
   addDownload: (req: AddDownloadRequest) => Promise<void>
   pause: (id: string) => Promise<void>
   resume: (id: string) => Promise<void>
@@ -220,7 +242,11 @@ export const useStore = create<DownloadState>((set, get) => ({
           return { downloads: [...map.values()] }
         })
       },
-      () => set({ connected: true }),
+      // SSE 连上 = 与 daemon 的通信真的通了 → alive 反推为 true（BUG-090，零新增请求）
+      () => {
+        set({ connected: true })
+        get().setDaemonAlive(true)
+      },
       () => set({ connected: false }),
     )
     // 2. 拉取当前列表
@@ -246,8 +272,12 @@ export const useStore = create<DownloadState>((set, get) => ({
     set({ loading: true })
     try {
       const downloads = await listDownloads()
+      // 列表拉取成功 = daemon 可达（BUG-090：复用既有请求的成功信号，不新发探活）
+      get().setDaemonAlive(true)
       set({ downloads, loading: false, error: null })
     } catch (e) {
+      // 拉取失败 = 这会儿真连不上（5s 兜底轮询会再试，恢复后自动翻回 alive）
+      get().setDaemonAlive(false)
       set({
         loading: false,
         error: e instanceof Error ? e.message : String(e),
@@ -256,6 +286,9 @@ export const useStore = create<DownloadState>((set, get) => ({
   },
 
   setDaemon: (d) => set({ daemon: d }),
+
+  setDaemonAlive: (alive) =>
+    set({ daemon: daemonWithAlive(get().daemon, alive) }),
 
   addDownload: async (req) => {
     await apiAddDownload(req)

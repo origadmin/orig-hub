@@ -119,6 +119,7 @@
 | BUG-087 | 连接态指示三处各写各的 —— 上下文栏读 store，底部状态栏硬编码「daemon 已连接」+恒绿点（`MainLayout.tsx:283-284`）、侧栏底部硬编码「daemon 运行中」+恒绿点（`Sidebar.tsx:349-354`），同屏出现「一个说未连接、两个说已连接」。修：抽唯一规范来源 `store/connState.ts`（`resolveConnState` + `CONN_DOT` + `CONN_LABEL` + `useConnState`），三处同读并各带 `data-conn-state` | fixed | shell |
 | BUG-088 | 「传输中」面板把后端原始 HTTP 报文直渲染进正文（`ActivityPanel.tsx:236-240` 原样出 `failed` 字符串，实测正文显示「404 Not Found」），且错误态下仍按退避反复请求同一必然失败的端点。修：失败只存分类 `failKind`（4xx/5xx→`unavailable`）绝不直出报文 + 中文降级文案 + 「重新加载」可行动出口 + 空态兜底 + `MAX_FAILS=4` 熔断停轮询；`activity.sourceDown` 的 `{reason}` 同源降级 | fixed | shell |
 | BUG-089 | 分类下钻时「全部文件」行不点亮 —— `Sidebar.tsx:150` 的 `allActive` 额外要求 `categoryFilter === null`，点「视频」后标题已是「全部文件 · 视频」而顶行无 `bg-accent/15`。修：`allActive = view === 'all'`，下钻时顶行保持面包屑态点亮 | fixed | shell |
+| BUG-090 | 浏览器开发模式下连接态恒 offline —— `ensureDaemon()`/`daemonStatus()` 是 Tauri Rust 命令，无宿主时 `invoke` reject 被 `.catch(() => {})` 静默吞掉，`daemon` 恒 null → 三处一致显示「daemon 未连接」，而 `/health`、`/api/downloads` 实测均 200（指示器说谎）。修：启动期一次性 `GET /health` 兜底播种 alive（失败不再吞）+ 新增 `setDaemonAlive`：SSE onOpen / 既有 `refresh()` 成功→alive，失败→不 alive，复用既有请求信号、零新增轮询 | fixed | shell |
 
 ## 历史欠账
 
