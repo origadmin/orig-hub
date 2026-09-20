@@ -1,12 +1,57 @@
 #!/bin/sh
 # orig-hub commit-msg hook (tracked copy; install via scripts/install-hooks.sh)
-# EE rule (inherited): commit messages must NEVER contain Chinese.
-# Makes the "Chinese commit" error state unrepresentable: CJK in subject/body -> reject.
+#
+# Three rules:
+#  1) EE rule (inherited): commit messages must NEVER contain Chinese.
+#     Makes the "Chinese commit" error state unrepresentable.
+#  2) BUG rule (BUG-067): `fix` commits must cite a registered bug id.
+#     Audit found 19 of 22 fix commits carried no id, so the register cannot
+#     answer "was this fixed" / "which bug did this fix".
+#  3) LF rule (BUG-084): commit messages must be LF-only, never CR.
+#     A commit hash = SHA1(tree + parents + author + committer + message).
+#     One CR inside the message changes the object bytes, hence the hash, hence
+#     every descendant hash. That is exactly how this repo forked from
+#     origin/main: root 206ee70 vs 645d2c7 had an identical tree, author and
+#     timestamp and differed only by a single trailing CR -- so 78 local
+#     commits could never merge with or push to the remote.
+#
 # AGENTS.md: --no-verify to skip hooks is forbidden unless explicitly authorized.
 msg_file="$1"
+
+# --- rule 1: English only (no CJK) ---
 if grep -qP '[\x{4e00}-\x{9fff}]' "$msg_file" 2>/dev/null; then
   echo "commit-msg: rejected - commit message contains Chinese (EE rule: English only)" >&2
   echo "  example: feat(engine): add series merge API (reorder only, no content check)" >&2
   exit 1
 fi
+
+# --- rule 3: LF only, no CR ---
+# NOTE: `grep -P '\r'` does NOT match CR under MSYS. Use a literal CR with -U.
+CR=$(printf '\r')
+if grep -qU "$CR" "$msg_file" 2>/dev/null; then
+  echo "commit-msg: rejected - commit message contains CR (BUG-084 rule: LF only)" >&2
+  echo "  why: a CR changes the commit object bytes, so the hash differs from the" >&2
+  echo "       same message written with LF; every descendant hash changes too and" >&2
+  echo "       the branch can never merge with the remote." >&2
+  echo "  fix: rewrite the message with LF endings" >&2
+  echo "       (git config core.autocrlf input; or write the message with \\n only)" >&2
+  exit 1
+fi
+
+# --- rule 2: fix commits must cite a bug id ---
+subject="$(head -n 1 "$msg_file")"
+case "$subject" in
+  fix:*|fix\(*|fix!*)
+    if ! grep -qE 'BUG-[0-9]{3}' "$msg_file"; then
+      echo "commit-msg: rejected - fix commit must cite a registered bug id (BUG-067 rule)" >&2
+      echo "  subject: $subject" >&2
+      echo "  add the id to the body, e.g.:" >&2
+      echo "    Refs: BUG-058" >&2
+      echo "  if this is a defect nobody registered yet, register it first:" >&2
+      echo "    docs/bugs/BUG-<next>.md + docs/bugs/README.md row" >&2
+      exit 1
+    fi
+    ;;
+esac
+
 exit 0
