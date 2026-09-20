@@ -55,12 +55,37 @@ fn daemon_alive() -> bool {
     head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
 }
 
+/// daemon 侧 TG 数据目录（BUG-094）。
+///
+/// daemon 的 `tg_data_dir()` 在未设 `ORIG_TG_DATA` 时回落 `%LOCALAPPDATA%\OrigHub`，
+/// 与桌面壳真实会话目录 `app_data_dir()/tg` 分裂 —— 冷启动必然读不到已授权会话。
+/// 这里把 `app_data_dir()` 注入给 daemon，让两边共用同一份会话与凭据。
+///
+/// **拼接口径（务必与 `orig-daemon::state::tg_data_dir()` 对齐）**：`tg_data_dir()`
+/// 内部还会再 `join("tg/session.session")`，所以这里注入的是**父目录**
+/// （`app_data_dir()`），**不是** `tg` 目录本身 —— 传成 `.../tg` 会拼出
+/// `.../tg/tg/session.session`，那就是第三份分裂的会话。
+fn daemon_tg_data_dir(app: &tauri::AppHandle) -> Option<String> {
+    let dir = app.path().app_data_dir().ok()?;
+    let s = dir.to_string_lossy().trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// 用 Tauri sidecar 拉起 daemon（阻塞直到端口就绪或超时）。
 fn spawn_daemon(app: &tauri::AppHandle) -> Result<CommandChild, String> {
     let sidecar = app
         .shell()
         .sidecar(DAEMON_BIN)
         .map_err(|e| format!("sidecar resolve failed: {e}"))?;
+    // BUG-094：把壳侧的 TG 数据目录（父目录）交给 daemon，避免它自猜目录。
+    let sidecar = match daemon_tg_data_dir(app) {
+        Some(dir) => sidecar.env("ORIG_TG_DATA", dir),
+        None => sidecar,
+    };
     let (mut rx, child) = sidecar
         .spawn()
         .map_err(|e| format!("sidecar spawn failed: {e}"))?;
@@ -471,9 +496,14 @@ fn tg_save_config(
     Ok(serde_json::json!({ "started": true, "port": TG_PORT }))
 }
 
-/// 前端命令：确保 orig-tg 运行（幂等）。未配置返回 Err("not-configured")。
-#[tauri::command]
-fn ensure_tg(app: tauri::AppHandle, state: tauri::State<'_, TgState>) -> Result<serde_json::Value, String> {
+/// 确保 orig-tg 运行（幂等）。未配置返回 Err("not-configured")。
+///
+/// 与 `#[tauri::command]` 外壳分离，好让 `setup` 阶段也能直接调用（BUG-094）。
+///
+/// **「已健康则跳过」的判断已具备**：`tg_alive() && tg_service_real()` 时直接返回
+/// `already-running`，不会 kill + respawn —— 因此在 `setup` 里调用是安全的，
+/// 不会顶掉一个已经 `Authorized` 的实例。
+fn ensure_tg_inner(app: &tauri::AppHandle, state: &TgState) -> Result<serde_json::Value, String> {
     if tg_alive() {
         if tg_service_real() {
             return Ok(serde_json::json!({ "started": false, "reason": "already-running" }));
@@ -498,9 +528,15 @@ fn ensure_tg(app: tauri::AppHandle, state: tauri::State<'_, TgState>) -> Result<
         // 端口残留（health 都不通的旧进程等）一律清掉，由壳统一托管。
         kill_port_owner(TG_PORT);
     }
-    let child = spawn_tg(&app)?;
+    let child = spawn_tg(app)?;
     *state.child.lock().unwrap() = Some(child);
     Ok(serde_json::json!({ "started": true, "port": TG_PORT }))
+}
+
+/// 前端命令：确保 orig-tg 运行（幂等）。未配置返回 Err("not-configured")。
+#[tauri::command]
+fn ensure_tg(app: tauri::AppHandle, state: tauri::State<'_, TgState>) -> Result<serde_json::Value, String> {
+    ensure_tg_inner(&app, &state)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -549,6 +585,25 @@ pub fn run() {
                 })
                 .build(app)?;
             let _ = _tray;
+
+            // BUG-094 保命阀：壳启动时就把「正确实例」拉起来。
+            //
+            // 不这么做的话，唯一正确路径 `spawn_tg` 只在 `ensure_tg` / `tg_save_config`
+            // 里被调到，而前端 `ensureTg()` 又挂在「`tgHealth()` 失败」上 —— daemon 拉起的
+            // 无凭据实例 `/health` 恒 200，于是前端永不触发、TG 面板（nav-tg 已被过滤）
+            // 也进不去，用户彻底无法自救。这里在 setup 阶段主动补一次。
+            //
+            // 放后台线程：`spawn_tg` 最长阻塞 8s 等就绪，不能在 setup 里同步阻塞出窗。
+            // `ensure_tg_inner` 自带「已健康则跳过」，不会 kill 掉正常在跑的实例；
+            // 未配置（config.json 缺失）时返回 Err，这里只记一行日志、不影响启动。
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let state = handle.state::<TgState>();
+                match ensure_tg_inner(&handle, &state) {
+                    Ok(v) => eprintln!("[setup] ensure_tg: {v}"),
+                    Err(e) => eprintln!("[setup] ensure_tg skipped: {e}"),
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
