@@ -3,10 +3,14 @@ import { useStore } from '../store/useStore'
 import {
   selectActiveCount,
   selectActiveSpeedLabel,
-  selectConnected,
-  selectDaemonAlive,
   selectHasActiveSpeed,
 } from '../store/selectors'
+import {
+  CONN_DOT,
+  CONN_LABEL,
+  useConnState,
+  type ConnState,
+} from '../store/connState'
 import { useTranslation } from '../i18n'
 import { cn } from '../lib/utils'
 
@@ -15,36 +19,10 @@ import { cn } from '../lib/utils'
  *
  * 高频值**不走 props**：`SpeedChip` / `ActiveCount` 各自订阅标量切片，
  * 一次 SSE progress 最多重渲染一个文本节点，上下文栏与内容面板完全不动。
+ *
+ * 连接态**不在此处判定**：`CONN_DOT` / `CONN_LABEL` / `useConnState` 全部来自
+ * `store/connState.ts`（BUG-087 规范来源），与底部状态栏、侧栏底部同源。
  */
-
-/** 连接态三态（设计待明确③ 取 B：降级态可见） */
-export type ConnState = 'live' | 'degraded' | 'offline'
-
-const CONN_DOT: Record<ConnState, string> = {
-  live: 'bg-success',
-  degraded: 'bg-warning',
-  offline: 'bg-muted',
-}
-
-const CONN_LABEL: Record<ConnState, string> = {
-  live: 'ctx.connected',
-  degraded: 'ctx.degraded',
-  offline: 'ctx.disconnected',
-}
-
-/**
- * 连接态判定（纯函数）：
- *   - daemon 都没起来 → offline（灰）；
- *   - daemon 在但 SSE 断了 → degraded（黄，仍在跑 5s 兜底轮询）；
- *   - 实时链路通 → live（绿）。
- */
-export function resolveConnState(
-  connected: boolean,
-  daemonAlive: boolean,
-): ConnState {
-  if (!daemonAlive) return 'offline'
-  return connected ? 'live' : 'degraded'
-}
 
 /** 聚合速度：无传输时不渲染（与原先 `busy && speed` 的表现一致） */
 export const SpeedChip = memo(function SpeedChip() {
@@ -88,9 +66,7 @@ export const ContextBarStatus = memo(function ContextBarStatus({
   showActiveCount = true,
 }: ContextBarStatusProps) {
   const { t } = useTranslation()
-  const connected = useStore(selectConnected)
-  const daemonAlive = useStore(selectDaemonAlive)
-  const state = resolveConnState(connected, daemonAlive)
+  const state: ConnState = useConnState()
   const label = t(CONN_LABEL[state])
 
   return (

@@ -116,6 +116,9 @@
 | BUG-084 | 提交信息混入 CR（CRLF）：同内容提交哈希不同（`206ee70` vs `645d2c7` 同 tree 仅差结尾行尾）、后代哈希全变，78 条里 76 条 message 含 CR。修：门禁加 CR 检测——`check-commit-msgs.py` 按字节取 `%B` + 生效点基线（历史欠账只告警、新增阻断）+ `--self-test`，`commit-msg` 钩子用字面 CR + `grep -U`；AGENTS.md §2/§7 同步。存量 76 条待重写，见待拍板 | fixed | build |
 | BUG-085 | BUG-077 的 `/api/activity` 轮询打到 TG 全量端点 `/api/tg/cache/tasks/all`，该端点**每次两次 SQLite**（`list_cache_tasks` + `count_cache_tasks`，`orig-tg/src/routes.rs:986-1005`），其中 `counts` daemon 侧**根本不消费**（`activity.rs:157-161`）。根因是 TG 缺「内存快照版全量端点」——内存端点契约只返回一条（单飞），而 `is_in_transit` 需含 failed/interrupted 的全量。已在 `activity.rs:305` 留 §5 豁免注释。待拍板：(a) TG 新增内存全量端点（建议）/ (b) `?counts=0` 止血 / (c) 维持 | open | engine |
 | BUG-086 | UI 验收通道自身不可执行 —— `tauri-shell/verify/` 6 个 `shot_*.cjs` 均 `require('playwright')` 而 `package.json` 未声明该依赖（`node_modules/playwright*` 不存在），任何机器首跑即 `MODULE_NOT_FOUND` 崩溃，产出「验证失败」假象；次生为 `node_modules` 残缺缺 `@babel/core`（`@vitejs/plugin-react` 依赖）致白屏而 dev server 仍返 200。修：6 脚本改 try/catch 优雅降级（exit 2 + 中文提示，不删改业务逻辑）+ 新增零依赖 CDP 驱动 `verify/lib/cdp.cjs`（Node 内置 WebSocket）+ 真实渲染验收 `verify_ui_render.cjs`（20/20 PASS）+ `npm run verify:ui` + `verify/README.md` | fixed | shell |
+| BUG-087 | 连接态指示三处各写各的 —— 上下文栏读 store，底部状态栏硬编码「daemon 已连接」+恒绿点（`MainLayout.tsx:283-284`）、侧栏底部硬编码「daemon 运行中」+恒绿点（`Sidebar.tsx:349-354`），同屏出现「一个说未连接、两个说已连接」。修：抽唯一规范来源 `store/connState.ts`（`resolveConnState` + `CONN_DOT` + `CONN_LABEL` + `useConnState`），三处同读并各带 `data-conn-state` | fixed | shell |
+| BUG-088 | 「传输中」面板把后端原始 HTTP 报文直渲染进正文（`ActivityPanel.tsx:236-240` 原样出 `failed` 字符串，实测正文显示「404 Not Found」），且错误态下仍按退避反复请求同一必然失败的端点。修：失败只存分类 `failKind`（4xx/5xx→`unavailable`）绝不直出报文 + 中文降级文案 + 「重新加载」可行动出口 + 空态兜底 + `MAX_FAILS=4` 熔断停轮询；`activity.sourceDown` 的 `{reason}` 同源降级 | fixed | shell |
+| BUG-089 | 分类下钻时「全部文件」行不点亮 —— `Sidebar.tsx:150` 的 `allActive` 额外要求 `categoryFilter === null`，点「视频」后标题已是「全部文件 · 视频」而顶行无 `bg-accent/15`。修：`allActive = view === 'all'`，下钻时顶行保持面包屑态点亮 | fixed | shell |
 
 ## 历史欠账
 

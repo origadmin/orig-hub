@@ -41,6 +41,47 @@ const POLL_MS = 5000
 const MAX_POLL_MS = 30000
 /** 「纯粹在等来源恢复」时的节奏：没有真活在跑，守恢复不需要 5s 粒度 */
 const RECOVERY_POLL_MS = 30000
+/**
+ * 连续失败上限：到顶即**停轮询**（AGENTS.md §5 失败退避）。
+ * 读端点若结构性缺失（如陈旧 daemon 二进制没有 `/api/activity`，恒 404），
+ * 继续按 5s→30s 退避重试只是反复刷同一个必然失败的请求；
+ * 停下后由「重新加载」按钮或 `hasWork` 变化（真有任务增删）重新唤醒。
+ */
+const MAX_FAILS = 4
+
+/**
+ * 后端错误 → 中文降级 key（BUG-088）。
+ *
+ * `fetchActivity` 失败时抛的是**原始 HTTP 报文**（形如 `404 Not Found: ...`），
+ * 直出给用户就是满屏英文错误码。这里只做「能不能认出」的分类，
+ * **绝不把报文内容带进 UI** —— 用户看到的永远是中文可行动文案。
+ */
+type FailKind = 'unavailable' | 'failed'
+
+const FAIL_LABEL: Record<FailKind, string> = {
+  unavailable: 'activity.loadUnavailable',
+  failed: 'activity.loadFailed',
+}
+
+function failKindOf(msg: string): FailKind {
+  // 4xx/5xx 状态码开头 = 端点侧问题（缺失 / 未就绪），不是用户能修的
+  return /^\s*[45]\d\d\b/.test(msg) ? 'unavailable' : 'failed'
+}
+
+/** 是否为后端原始 HTTP 报文（形如 `404 Not Found`、`503 ...`） */
+const isHttpStatusLine = (s: string) => /^\s*[45]\d\d\b/.test(s)
+
+/**
+ * 来源错误文案：同样**不许直出原始报文**（BUG-088）。
+ * 命中 HTTP 状态行 / 空值 → 中文兜底，其余（后端已有的可读原因）照原样显示。
+ */
+function sourceReasonText(
+  err: string | null | undefined,
+  tr: (k: string) => string,
+): string {
+  if (!err) return tr('activity.sourceUnknown')
+  return isHttpStatusLine(err) ? tr('activity.sourceUnavailable') : err
+}
 
 /** 动作 → i18n key。**刻意不含任何删除类动词** */
 const ACTION_LABEL: Record<ActivityAction, string> = {
@@ -87,7 +128,8 @@ function amountText(task: ActivityTaskView, tr: (k: string) => string): string {
 export function ActivityPanel() {
   const { t } = useTranslation()
   const [snap, setSnap] = useState<ActivitySnapshot | null>(null)
-  const [failed, setFailed] = useState<string | null>(null)
+  /** 失败态只存**分类**，不存后端报文（BUG-088：绝不把原始错误直出给用户） */
+  const [failKind, setFailKind] = useState<FailKind | null>(null)
   /**
    * **在途**下载条数（store 标量，SSE 驱动）：**只作「有没有活」的唤醒信号** ——
    * 只在增删任务时变化，进度更新不会变，因此不会变成「每次进度一条请求」。
@@ -108,6 +150,8 @@ export function ActivityPanel() {
   )
   const setError = useStore((s) => s.setError)
 
+  /** 熔断后手动重试的计数器：变化即重启轮询（deps 里带它） */
+  const [retryNonce, setRetryNonce] = useState(0)
   const backoff = useRef(0)
   const sigRef = useRef('')
 
@@ -121,10 +165,10 @@ export function ActivityPanel() {
         setSnap(next)
       }
       backoff.current = 0
-      setFailed(null)
+      setFailKind(null)
     } catch (e) {
-      backoff.current = Math.min(backoff.current + 1, 4)
-      setFailed(e instanceof Error ? e.message : String(e))
+      backoff.current = Math.min(backoff.current + 1, MAX_FAILS)
+      setFailKind(failKindOf(e instanceof Error ? e.message : String(e)))
     }
   })
 
@@ -158,6 +202,8 @@ export function ActivityPanel() {
     const tick = async () => {
       await load()
       if (stopped) return
+      // 熔断：连续失败到顶即停 —— 端点结构性缺失时不再反复刷必然失败的请求
+      if (backoff.current >= MAX_FAILS) return
       // 终态即停：没活了就不再排下一次（有活时由下方 deps 变化重新唤醒）
       if (!hasWorkRef.current) return
       const delay =
@@ -174,7 +220,13 @@ export function ActivityPanel() {
       stopped = true
       if (timer) clearTimeout(timer)
     }
-  }, [load, hasWork])
+  }, [load, hasWork, retryNonce])
+
+  /** 手动「重新加载」：熔断后给用户的可行动出口 —— 重置退避并重新起一轮 */
+  const reload = useEvent(() => {
+    backoff.current = 0
+    setRetryNonce((n) => n + 1)
+  })
 
   /** 控制分流：按 `control.side` 把动作指回各侧原路径 */
   const runAction = useEvent(
@@ -226,23 +278,33 @@ export function ActivityPanel() {
                     ? 'activity.kindCache'
                     : 'activity.kindDownload',
                 ),
-                reason: s.error ?? '',
+                reason: sourceReasonText(s.error, t),
               }),
             )
             .join('；')}
         </div>
       )}
 
-      {failed && (
-        <div className="mx-4 mb-2 shrink-0 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger">
-          {failed}
+      {/*
+        错误态（BUG-088）：**绝不渲染后端原始报文**（`404 Not Found` 之类），
+        只出中文分类文案 + 「重新加载」这个可行动出口。
+      */}
+      {failKind && (
+        <div
+          className="mx-4 mb-2 flex shrink-0 items-center gap-3 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-[11px] leading-4 text-warning"
+          data-testid="activity-load-failed"
+        >
+          <span className="flex-1">{t(FAIL_LABEL[failKind])}</span>
+          <Button variant="ghost" size="sm" onClick={reload}>
+            {t('activity.reload')}
+          </Button>
         </div>
       )}
 
       <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
         {tasks.length === 0 ? (
           <div className="flex h-32 items-center justify-center text-xs text-muted">
-            {t('activity.empty')}
+            {failKind ? t('activity.loadFailedEmpty') : t('activity.empty')}
           </div>
         ) : (
           <ul className="space-y-2">

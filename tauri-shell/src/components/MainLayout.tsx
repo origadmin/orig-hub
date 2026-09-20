@@ -11,6 +11,7 @@ import { ErrorBoundary } from './ui/ErrorBoundary'
 import { TitleBar } from './TitleBar'
 import { ContextBar } from './ContextBar'
 import { useStore } from '../store/useStore'
+import { CONN_DOT, CONN_LABEL, useConnState } from '../store/connState'
 import { useEvent } from '../hooks/useEvent'
 import { useTranslation } from '../i18n'
 import { formatSpeed } from '../lib/utils'
@@ -23,6 +24,8 @@ export function MainLayout() {
   const [collapsed, setCollapsed] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
   const { t } = useTranslation()
+  /** 连接态：与上下文栏、侧栏底部同源（BUG-087，唯一来源 `store/connState.ts`） */
+  const connState = useConnState()
   const { downloads, init, setDaemon, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, accounts, viewer, setViewerIndex, closeViewer, tgEnabled, tgAvailability, refreshTgSession } = useStore()
 
   /** TG 入口级门控（用户裁定：常规 TG 开关控制整个 TG 内容）：
@@ -279,9 +282,21 @@ export function MainLayout() {
                 failed: failed.length,
               })}
             </span>
-            <span className={cn('flex items-center gap-1.5')}>
-              <span className="h-1.5 w-1.5 rounded-full bg-success" />
-              {t('main.daemonConnected')}
+            {/*
+              连接态**不在此处判定**（BUG-087）：此前这里是硬编码「daemon 已连接」+ 恒绿点，
+              daemon 真断线时底部照绿，与上下文栏的「daemon 未连接」同屏打架。
+              现与上下文栏、侧栏底部同读 `useConnState()`，文案与配色一律取自
+              `store/connState.ts` 的 `CONN_LABEL` / `CONN_DOT`。
+            */}
+            <span
+              className={cn('flex items-center gap-1.5')}
+              data-testid="statusbar-conn"
+              data-conn-state={connState}
+            >
+              <span
+                className={cn('h-1.5 w-1.5 shrink-0 rounded-full', CONN_DOT[connState])}
+              />
+              {t(CONN_LABEL[connState])}
               {totalSpeed > 0 && (
                 <span className="font-mono text-accent">{formatSpeed(totalSpeed)}</span>
               )}

@@ -1,6 +1,7 @@
 import { useState, type JSX } from 'react'
 import { cn } from '../lib/utils'
 import { useTranslation } from '../i18n'
+import { CONN_DOT, CONN_LABEL, useConnState } from '../store/connState'
 
 /**
  * 导航视图枚举。
@@ -146,8 +147,17 @@ export function Sidebar({
   tgReady,
 }: Props) {
   const { t } = useTranslation()
+  /** 连接态：与上下文栏、底部状态栏同源（BUG-087，唯一来源 `store/connState.ts`） */
+  const connState = useConnState()
   const [catOpen, setCatOpen] = useState(false)
-  const allActive = view === 'all' && categoryFilter === null
+  /**
+   * 「全部文件」行是否点亮（BUG-089）：只看当前是否**全部文件视图**。
+   *
+   * 旧判据额外要求 `categoryFilter === null`，于是分类下钻（标题已变「全部文件 · 视频」、
+   * 子项高亮）时顶行反而熄灭 —— 用户失去「我在哪」的指示。下钻本质上仍处在全部文件里，
+   * 顶行保持点亮（面包屑态），子项另行高亮当前分类。
+   */
+  const allActive = view === 'all'
 
   /** 点击「全部文件」文字/图标：仅切到全部视图（方案1：不碰子菜单展开态，纯导航动作） */
   const handleSelectAll = () => {
@@ -347,9 +357,22 @@ export function Sidebar({
 
       {/* 底部状态 */}
       <div className={cn('border-t border-border-subtle p-3', collapsed && 'p-2')}>
-        <div className={cn('flex items-center gap-2', collapsed && 'justify-center')}>
-          <span className="h-2 w-2 shrink-0 rounded-full bg-success" />
-          {!collapsed && <span className="text-[11px] text-muted">{t('status.daemonRunning')}</span>}
+        {/*
+          连接态**不在此处判定**（BUG-087）：此前是硬编码「daemon 运行中」+ 恒绿点，
+          daemon 真断线时侧栏照绿，与上下文栏 / 底部状态栏同屏打架。
+          现三者同读 `useConnState()`，文案与配色取自 `store/connState.ts`。
+        */}
+        <div
+          className={cn('flex items-center gap-2', collapsed && 'justify-center')}
+          data-testid="sidebar-conn"
+          data-conn-state={connState}
+        >
+          <span
+            className={cn('h-2 w-2 shrink-0 rounded-full', CONN_DOT[connState])}
+          />
+          {!collapsed && (
+            <span className="text-[11px] text-muted">{t(CONN_LABEL[connState])}</span>
+          )}
         </div>
       </div>
     </aside>
