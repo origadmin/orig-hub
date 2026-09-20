@@ -17,8 +17,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, Query, State, Json};
 use axum::http::{StatusCode, header::AUTHORIZATION};
@@ -693,12 +693,82 @@ async fn put_config_tg(
     })))
 }
 
-/// 枚举本机网卡（供 UI 多网卡配置页展示）。
+/// `/api/interfaces` 结果缓存（BUG-092）。
+///
+/// `orig_net::list_all_adapters()` 走 Windows `GetAdaptersAddresses`，实测单次约 1s；
+/// 而该端点由「新建下载弹窗一打开」触发 → 弹窗开合肉眼可见卡顿。网卡清单极少变化，
+/// 故按 TTL 缓存。TTL 到期后由**命中的那次请求**重算一次 —— 不预刷新、不建后台任务，
+/// 不把它变成高频刷新端点（AGENTS.md §5）。
+const INTERFACES_TTL: Duration = Duration::from_secs(30);
+
+static INTERFACES_CACHE: OnceLock<RwLock<Option<(Instant, serde_json::Value)>>> = OnceLock::new();
+
+fn interfaces_cache_slot() -> &'static RwLock<Option<(Instant, serde_json::Value)>> {
+    INTERFACES_CACHE.get_or_init(|| RwLock::new(None))
+}
+
+/// 读缓存：命中且未过期则返回值，否则 None。
+fn interfaces_cache_get() -> Option<serde_json::Value> {
+    let slot = INTERFACES_CACHE.get()?;
+    let guard = slot.read().ok()?;
+    let (at, value) = guard.as_ref()?;
+    if at.elapsed() < INTERFACES_TTL {
+        Some(value.clone())
+    } else {
+        None
+    }
+}
+
+fn interfaces_cache_put(value: serde_json::Value) {
+    let slot = interfaces_cache_slot();
+    if let Ok(mut g) = slot.write() {
+        *g = Some((Instant::now(), value));
+    }
+}
+
+/// 手动失效：配置变更 / 网卡增删后调用，下一次请求立即重算。
+/// （`GET /api/interfaces?refresh=1` 走的就是这条路径。）
+pub fn invalidate_interfaces_cache() {
+    let slot = interfaces_cache_slot();
+    if let Ok(mut g) = slot.write() {
+        *g = None;
+    }
+}
+
+#[derive(Deserialize)]
+struct InterfacesQuery {
+    /// 传任意值（除 `0`/`false`）即强制跳过缓存重算一次 —— 手动失效的 HTTP 出口。
+    refresh: Option<String>,
+}
+
+impl InterfacesQuery {
+    fn wants_refresh(&self) -> bool {
+        !matches!(self.refresh.as_deref(), None | Some("0") | Some("false"))
+    }
+}
+
+/// GET /api/interfaces — 枚举本机网卡（供 UI 多网卡配置页展示）。
 ///
 /// 返回**全部适配器**（含断开/无 IP 的物理网卡，附 `connected` 标记）；
 /// 主网卡 always enabled；虚拟网卡（Hyper-V/WSL/隧道等）标记 is_virtual 由前端折叠。
 /// 前端据此渲染：主网卡（固定）+ 可用附属网卡（可选开关）+ 未连接网卡（禁用）。
-async fn list_interfaces() -> axum::Json<serde_json::Value> {
+async fn list_interfaces(Query(q): Query<InterfacesQuery>) -> axum::Json<serde_json::Value> {
+    if q.wants_refresh() {
+        invalidate_interfaces_cache();
+    } else if let Some(hit) = interfaces_cache_get() {
+        return axum::Json(hit);
+    }
+    // 枚举网卡是同步阻塞调用（Windows GetAdaptersAddresses，实测 ~1s），
+    // 丢到阻塞池执行，避免占住 async worker 线程拖慢其它端点。
+    let value = tokio::task::spawn_blocking(compute_interfaces)
+        .await
+        .unwrap_or_else(|_| compute_interfaces());
+    interfaces_cache_put(value.clone());
+    axum::Json(value)
+}
+
+/// 计算网卡清单（**未缓存**，约 1s；只应由 `list_interfaces` 在缓存未命中时调用）。
+fn compute_interfaces() -> serde_json::Value {
     // 全部适配器（Windows: GetAdaptersAddresses；其它平台退化为 up 网卡）
     let all = orig_net::list_all_adapters().unwrap_or_default();
     // 默认池（主网卡）用于判断 enabled
@@ -735,7 +805,7 @@ async fn list_interfaces() -> axum::Json<serde_json::Value> {
             secondaries.push(entry);
         }
     }
-    axum::Json(serde_json::json!({
+    serde_json::json!({
         "primary": primary_out.unwrap_or_else(|| serde_json::json!({
             "name": pool.primary.name,
             "ip": pool.primary.ip.to_string(),
@@ -746,8 +816,9 @@ async fn list_interfaces() -> axum::Json<serde_json::Value> {
             "weight": pool.primary.weight,
         })),
         "secondaries": secondaries,
-    }))
+    })
 }
+
 /// 构造路由树（含鉴权中间件）。
 pub fn router(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()

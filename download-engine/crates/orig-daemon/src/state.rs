@@ -17,6 +17,30 @@ use crate::config::Config;
 /// 两处必须同源，否则「启在 9877、拉 9876」这类分叉又会重新长出来。
 pub const TG_PORT: u16 = 9877;
 
+/// 端口探测超时。无人监听时 connect 立即 ECONNREFUSED，这里的超时只是兜底
+/// （防火墙静默丢包等极端情况不该挂住 `/api/config`）。
+const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// 探测 127.0.0.1:{port} 是否已有监听者。
+///
+/// 为什么需要它（BUG-091）：orig-tg 可能由**别的发起方**拉起 —— 上一轮 daemon 遗留、
+/// 手动启动、开机自启 —— 此时本进程手里没有它的 `Child` 句柄，只查句柄会得出
+/// 「没在跑」，于是再 spawn 一个：要么 9877 bind 失败，要么跑出双进程。
+/// 端口连得上就说明已有一个实例在服务，判为「已在运行」。
+pub async fn tg_port_has_listener(port: u16) -> bool {
+    // 目标是本机回环，`TcpStream::connect` 不走系统代理（不像 reqwest 会继承 HTTP_PROXY）。
+    match tokio::time::timeout(
+        PORT_PROBE_TIMEOUT,
+        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    {
+        Ok(Ok(_stream)) => true,
+        // 连不上（ECONNREFUSED）或超时 —— 都当作没有监听者。
+        Ok(Err(_)) | Err(_) => false,
+    }
+}
+
 /// 构造出向 HTTP 客户端（聚合层读 orig-tg 用）。
 ///
 /// 两点必须如此：
@@ -72,8 +96,8 @@ impl AppState {
         }
     }
 
-    /// orig-tg 是否存活（句柄存在且未退出）；已退出自动清理句柄。
-    pub async fn tg_is_running(&self) -> bool {
+    /// **本进程自己拉起**的 orig-tg 是否存活（句柄存在且未退出）；已退出自动清理句柄。
+    async fn tg_managed_alive(&self) -> bool {
         let mut g = self.tg_child.lock().await;
         match g.as_mut() {
             Some(c) => {
@@ -88,10 +112,30 @@ impl AppState {
         }
     }
 
+    /// orig-tg 是否存活：**先**看本进程托管的子进程句柄（主路径），**再**探端口
+    /// —— 后者覆盖「由别的发起方拉起、本进程没有句柄」的情形（BUG-091）。
+    ///
+    /// 两条路径的语义差别要清楚：托管路径是「我拉的孩子还在」，端口路径是
+    /// 「这个端口上已经有人在服务」。后者为真时我们拿不到它的句柄，也就不能 kill
+    /// （`tg_stop` 对外部实例无能为力，这是既有行为，不在本次修复范围）。
+    pub async fn tg_is_running_on(&self, port: u16) -> bool {
+        if self.tg_managed_alive().await {
+            return true;
+        }
+        tg_port_has_listener(port).await
+    }
+
+    /// orig-tg 是否存活（固定 `TG_PORT`）。
+    pub async fn tg_is_running(&self) -> bool {
+        self.tg_is_running_on(TG_PORT).await
+    }
+
     /// 拉起 orig-tg 子进程（幂等）：注入主配置代理（custom 模式才传 `ORIG_TG_PROXY`）；
     /// 未 custom 则直连（不设该 env）。返回是否处于运行态。
-    pub async fn tg_start(&self) -> std::io::Result<bool> {
-        if self.tg_is_running().await {
+    ///
+    /// 端口已被占用（不论是不是本进程拉起的）时**不 spawn**，直接返回 true。
+    pub async fn tg_start_on(&self, port: u16) -> std::io::Result<bool> {
+        if self.tg_is_running_on(port).await {
             return Ok(true);
         }
         let cfg = self.config.read().unwrap().clone();
@@ -100,9 +144,10 @@ impl AppState {
             _ => None,
         };
         let mut cmd = tokio::process::Command::new(tg_binary_path());
-        // 端口固定 9877（`TG_PORT`），与 daemon 9876 分离。api_id/api_hash 从 `[tg]` 段
-        // 显式注入，不依赖父进程环境继承，保证 Tauri/开机重启后 real 模式仍生效。
-        cmd.env("PORT", TG_PORT.to_string());
+        // 端口由入参决定（生产恒为 `TG_PORT`=9877，与 daemon 9876 分离）。
+        // api_id/api_hash 从 `[tg]` 段显式注入，不依赖父进程环境继承，
+        // 保证 Tauri/开机重启后 real 模式仍生效。
+        cmd.env("PORT", port.to_string());
         cmd.kill_on_drop(true);
         // 会话与监控库必须落到稳定数据目录，免得 orig-tg 用 CWD 相对的默认路径，
         // 每次启动 CWD 变化就新生成会话 → 反复登录。目录在注入前先确保存在。
@@ -130,7 +175,15 @@ impl AppState {
         Ok(true)
     }
 
+    /// 拉起 orig-tg 子进程（固定 `TG_PORT`）。
+    pub async fn tg_start(&self) -> std::io::Result<bool> {
+        self.tg_start_on(TG_PORT).await
+    }
+
     /// 终止 orig-tg 子进程并清空句柄（幂等）。
+    ///
+    /// 只能终止**本进程托管的**那个（`tg_child`）；对端口探测发现的外部实例无能为力，
+    /// 调用方（`PUT /api/config/tg`）据此回 `tg_running=false` 时需注意这一前提。
     pub async fn tg_stop(&self) {
         let mut g = self.tg_child.lock().await;
         if let Some(c) = g.as_mut() {
@@ -193,6 +246,18 @@ pub fn tg_binary_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    /// 构造一份最小 AppState（无托管子进程、默认配置）。
+    fn test_state() -> AppState {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        AppState::new(Registry::new(), tx, Config::default())
+    }
+
+    /// 借内核分配一个**当前空闲**的端口号（bind 后立刻释放）。
+    async fn free_port() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    }
+
     #[test]
     fn tg_data_dir_is_absolute_and_creatable() {
         // 注入可控的稳定目录，避免读写真实用户目录。
@@ -211,5 +276,67 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&probe);
         std::env::remove_var("ORIG_TG_DATA");
+    }
+
+    #[tokio::test]
+    async fn port_probe_detects_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(
+            tg_port_has_listener(port).await,
+            "端口上有监听者时应探测为真"
+        );
+    }
+
+    #[tokio::test]
+    async fn port_probe_reports_false_when_idle() {
+        let port = free_port().await; // 已释放，无人监听
+        assert!(
+            !tg_port_has_listener(port).await,
+            "空闲端口不应被判为有监听者（否则会误判成 TG 已启动）"
+        );
+    }
+
+    /// BUG-091 的实测矛盾态：9877 确实在跑（外部/遗留实例），但本进程没有子进程句柄，
+    /// `/api/config` 于是回 `tg_running=false` —— 用户点「启动 TG」会 spawn 出第二个。
+    #[tokio::test]
+    async fn start_skips_spawn_when_port_occupied_without_child_handle() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let st = test_state();
+        assert!(
+            st.tg_child.lock().await.is_none(),
+            "前置条件：没有托管子进程句柄"
+        );
+
+        // 端口被占用 → 应判为「已在运行」……
+        assert!(
+            st.tg_is_running_on(port).await,
+            "端口有监听者时必须判为运行中（修前只查句柄 → false）"
+        );
+
+        // ……且不得 spawn 第二个进程。
+        assert_eq!(
+            st.tg_start_on(port).await.unwrap(),
+            true,
+            "端口已占用时 tg_start 应返回 true 而不报错"
+        );
+        assert!(
+            st.tg_child.lock().await.is_none(),
+            "端口已占用时绝不能再 spawn 子进程（双进程 / bind 失败的根因）"
+        );
+    }
+
+    /// 反向守卫：端口空闲 + 无句柄时才允许走 spawn 路径。
+    /// 这里不真 spawn（那样依赖 orig-tg 二进制是否存在），只断言探测为「未运行」。
+    #[tokio::test]
+    async fn not_running_when_idle_port_and_no_child() {
+        let port = free_port().await;
+        let st = test_state();
+        assert!(
+            !st.tg_is_running_on(port).await,
+            "端口空闲且无托管句柄时应判为未运行（放行 spawn）"
+        );
     }
 }
