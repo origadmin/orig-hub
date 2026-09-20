@@ -37,6 +37,7 @@ import { ensureTg, tgSaveConfig } from '../api/tauri'
 import { CacheManagerDialog } from './CacheManagerDialog'
 import { useStore } from '../store/useStore'
 import { classifyTgReason, logTgReason } from '../lib/tgReason'
+import { useTgRetry } from '../lib/tgRetry'
 import {
   ALBUM_MAX_TILES,
   albumGridClass,
@@ -229,6 +230,13 @@ export function TgPanel({ onOpenAccounts }: { onOpenAccounts?: () => void } = {}
   useEffect(() => {
     logTgReason(rawReason, 'tg-panel')
   }, [rawReason])
+
+  /**
+   * 「重试连接」出口（BUG-094）：orig-tg 只在启动时连一次，失败后不会自愈，
+   * 所以未授权/不可用时必须给用户一个显式重连入口 —— 否则就算他把代理修好了，
+   * 服务也永远停在不可用态（除了重启应用无路可走）。
+   */
+  const { busy: retrying, noteKey: retryNoteKey, retry: retryTg } = useTgRetry()
   const [alive, setAlive] = useState(false)
   const [channels, setChannels] = useState<TgChannel[]>([])
   const [scanning, setScanning] = useState(false)
@@ -1055,13 +1063,30 @@ export function TgPanel({ onOpenAccounts }: { onOpenAccounts?: () => void } = {}
                 {t(reasonKey)}
               </p>
             )}
-            <Button
-              size="sm"
-              className="mt-5 h-8 w-full text-xs"
-              onClick={() => onOpenAccounts?.()}
-            >
-              {t('tg.unboundAction')}
-            </Button>
+            <div className="mt-5 flex gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 flex-1 text-xs"
+                disabled={retrying}
+                onClick={() => void retryTg()}
+              >
+                {retrying ? t('tg.retrying') : t('tg.retry')}
+              </Button>
+              <Button
+                size="sm"
+                className="h-8 flex-1 text-xs"
+                onClick={() => onOpenAccounts?.()}
+              >
+                {t('tg.unboundAction')}
+              </Button>
+            </div>
+            {/* 失败必须可见（绝不静默吞掉，BUG-090 的教训） */}
+            {retryNoteKey && (
+              <p className="mt-2 rounded-md bg-background px-2 py-1.5 text-[11px] leading-relaxed text-fg-mid">
+                {t(retryNoteKey)}
+              </p>
+            )}
           </div>
         </div>
       ) : tgBroken && tgAvailability ? (

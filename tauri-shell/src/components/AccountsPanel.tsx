@@ -6,6 +6,7 @@ import { cn } from '../lib/utils'
 import { useStore } from '../store/useStore'
 import { useTranslation } from '../i18n'
 import { classifyTgReason, logTgReason } from '../lib/tgReason'
+import { useTgRetry } from '../lib/tgRetry'
 import { getTgSession, startTgLogin, submitTgCode, tgDiag, tgLogs } from '../api/tg'
 import type { TgDiag, TgSession } from '../types'
 
@@ -64,6 +65,12 @@ export function AccountsPanel() {
   useEffect(() => {
     refreshTgSession().catch(() => {})
   }, [refreshTgSession])
+
+  /**
+   * 「重试连接」出口（BUG-094）：与 TgPanel 引导区共用 `useTgRetry`，
+   * 同一份判定与同一套文案。故障态下登录被禁用，这里就是用户唯一的自救入口。
+   */
+  const { busy: retrying, noteKey: retryNoteKey, retry: retryTg } = useTgRetry()
 
   // 登录流程本地状态
   const [step, setStep] = useState<LoginStep>('idle')
@@ -212,6 +219,12 @@ export function AccountsPanel() {
                 {t(bannerReasonKey)}
               </p>
             )}
+            {/* 重连结果必须可见：绝不能静默吞掉（BUG-090） */}
+            {retryNoteKey && (
+              <p className="mt-1 text-[10px] leading-relaxed opacity-90">
+                {t(retryNoteKey)}
+              </p>
+            )}
           </div>
         )}
 
@@ -222,7 +235,22 @@ export function AccountsPanel() {
             </Button>
           </div>
         ) : step === 'idle' ? (
-          <div className="flex justify-end">
+          <div className="flex justify-end gap-2">
+            {/*
+              故障态才给重连入口：orig-tg 只在启动时连一次、失败不自愈，
+              用户修好代理后需要它把服务拉回可用（`ensure_tg` 的 kill + respawn）。
+              正常态（ok）下没有可重连的东西，不显示。
+            */}
+            {tgBroken && (
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={retrying}
+                onClick={() => void retryTg()}
+              >
+                {retrying ? t('tg.retrying') : t('tg.retry')}
+              </Button>
+            )}
             {/* 故障时禁止进入登录流程：发码必然失败，让用户走到一半再报错是误导。 */}
             <Button size="sm" disabled={tgBroken} onClick={() => setStep('phone')}>
               {t('accounts.login')}
