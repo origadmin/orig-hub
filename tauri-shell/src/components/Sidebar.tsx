@@ -10,8 +10,20 @@ import { useTranslation } from '../i18n'
  *   - paused      → paused
  *   - completed   → completed
  *   - failed      → error | cancelled
+ *
+ * `activity`（传输中）是**另一条轴**：跨来源（普通下载 + TG 缓存）的只读聚合视图
+ * （BUG-077 方案 (a)），不是上面四档里的任何一档，故单列。
  */
-export type ViewId = 'all' | 'downloading' | 'paused' | 'completed' | 'failed' | 'media' | 'tg' | 'settings'
+export type ViewId =
+  | 'all'
+  | 'downloading'
+  | 'activity'
+  | 'paused'
+  | 'completed'
+  | 'failed'
+  | 'media'
+  | 'tg'
+  | 'settings'
 
 interface Props {
   view: ViewId
@@ -37,6 +49,18 @@ const NAV_ITEMS: { id: ViewId; labelKey: string; icon: JSX.Element }[] = [
     icon: (
       <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+      </svg>
+    ),
+  },
+  {
+    // 「传输中」：跨来源聚合视图（下载 + TG 缓存），与上面四档不是同一条轴。
+    // 不带计数徽标 —— 它的条数要等 `/api/activity` 返回才知道，侧栏不为此订阅该端点
+    // （避免侧栏参与 5s 轮询，AGENTS.md §5）。
+    id: 'activity',
+    labelKey: 'nav.activity',
+    icon: (
+      <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M3 8h13m0 0l-3-3m3 3l-3 3M21 16H8m0 0l3-3m-3 3l3 3" />
       </svg>
     ),
   },

@@ -106,7 +106,7 @@
 | BUG-074 | 网页调试态 orig-tg 离线短路未真正生效（跑的是旧 sidecar 副本，diag 仍 `api_mode:dummy`）+ 离线在 UI 被渲染成红色错误（toast / 红框）。修：重建+同步四副本+`restart_tg.py` 离线重启（diag `mode:unavailable`）；`refreshTgSession` 后台探测失败不再弹红 toast；`TgPanel` 离线态渲染中性「调试模式」面板；状态端点返 200（数据端点仍 503，BUG-023 不矛盾）。验收 `verify_debug_offline.py` 7/7 | fixed | engine+shell |
 | BUG-075 | `/src/**.tsx?t=...` 直连 .tsx 请求 —— Vite dev server 按需转译 + HMR 缓存穿透（`vite.config.ts` port 5180），**非缺陷** | wontfix | shell |
 | BUG-076 | 剧集分集标题编辑另起一行 + 编辑态沿用 `truncate` 致长标题存错内容。修：标题输入移入**分集行内**同一槽位，改 `textarea`（`rows=2` + `[overflow-wrap:anywhere]`）自动换行、**编辑态零截断**；只读态保留 `truncate` 并补 `title` 悬浮全文 | fixed | shell |
-| BUG-077 | 缓存是否应与下载结合 —— 结论：**部分能，只统一视图不统一引擎/存储**。统一任务列表/进度 UI 可行且代价低（daemon 只读聚合 + 统一 `TaskView`）；落盘目录**已事实统一**但清理必须分开；**缓存复用下载引擎不可行**（MTProto chunk 对齐 + FloodWait/DC 迁移，且 orig-tg 已自建 K 路并行分片）。最小方案 = daemon 新增 `activity.rs` 只读聚合 + `GET /api/activity`，控制仍分流。强行统一会破坏清理/断点/产物所有权语义 | open | engine+shell |
+| BUG-077 | 缓存是否应与下载结合 —— 结论：**部分能，只统一视图不统一引擎/存储**。统一任务列表/进度 UI 可行且代价低（daemon 只读聚合 + 统一 `TaskView`）；落盘目录**已事实统一**但清理必须分开；**缓存复用下载引擎不可行**（MTProto chunk 对齐 + FloodWait/DC 迁移，且 orig-tg 已自建 K 路并行分片）。最小方案 = daemon 新增 `activity.rs` 只读聚合 + `GET /api/activity`，控制仍分流（**已实施**，见 BUG-077 修复节）。强行统一会破坏清理/断点/产物所有权语义 | fixed | engine+shell |
 | BUG-078 | 缓存任务「重试」新建一条任务 +「删除」确认框出现在面板顶部而非当前任务下。修：新增 `Store::retry_cache_task(id)`（只复位终态、复用同一 id）+ `POST /api/cache/tasks/:id/retry`；前端改调 `retryCacheTask`；`confirm` 升为 `{kind:'one'|'batch', id?}`，单条内联到该任务行 | fixed | engine+shell |
 | BUG-079 | 缓存字节：频道 chip `truncate` 截名致同名难辨 +「预计释放」显示全量而非选中量。修：新增 `tg.bytesSelected` 由**选中集合**求和即时反馈（`cache-bytes-selected-preview`）；chip 改 `whitespace-nowrap` 不截名 | fixed | shell |
 | BUG-080 | 缓存清理后媒体库条目仍在且外观如常，但 `file_path=NULL` → `/api/media/items/:id/raw` 返回 404，点了播不了且无提示。修：`EpisodeView.has_bytes`（`file_path IS NOT NULL`，**不新增列**）+ `hasMediaBytes()` 唯一判据入口；无字节时占位、不给播放按钮，TG 源给「重新缓存」、非 TG 标「文件已丢失」。**关键例外：TG 图片不落盘（BUG-049），`file_path` 空 ≠ 丢失，判据优先级必须把 `source=tg && kind=photo` 排在最前** | fixed | engine+shell |
@@ -114,6 +114,7 @@
 | BUG-082 | 左侧 Navi 缺「下载中/已完成」—— 被 `DOWNLOAD_MODULE_HIDDEN` 开关整体隐藏（`Sidebar.tsx:30`），且**无替代筛选入口**。评估（已推翻旧结论）：**APP 核心是下载工具**，缺的是**下载队列**状态筛选，与 TG 无关；三档不够，引擎七态中 `paused`/`error`/`cancelled` 无归宿，建议定档五档（全部/下载中/已暂停/已完成/失败·已取消）；状态与分类应改为正交下钻而非同级互斥。待拍板 3 项（①已定案五档） | fixed | shell |
 | BUG-083 | 顶部下载工具栏仅 `isDownloadView` 下渲染，媒体库/TG 下整行空白（`<header>` 常驻定高，**布局不跳动，无需额外占位**）。评估：媒体库/TG **不显示**下载按钮（按钮语义指向 daemon 队列，而媒体库条目与 TG 缓存任务都不是其对象，常显会误导）。建议把该栏改为「上下文栏」：低改本放视图标题+全局态，中成本把内容区工具条上行合并。待拍板：工具条上行还是留在内容区 | fixed | shell |
 | BUG-084 | 提交信息混入 CR（CRLF）：同内容提交哈希不同（`206ee70` vs `645d2c7` 同 tree 仅差结尾行尾）、后代哈希全变，78 条里 76 条 message 含 CR。修：门禁加 CR 检测——`check-commit-msgs.py` 按字节取 `%B` + 生效点基线（历史欠账只告警、新增阻断）+ `--self-test`，`commit-msg` 钩子用字面 CR + `grep -U`；AGENTS.md §2/§7 同步。存量 76 条待重写，见待拍板 | fixed | build |
+| BUG-085 | BUG-077 的 `/api/activity` 轮询打到 TG 全量端点 `/api/tg/cache/tasks/all`，该端点**每次两次 SQLite**（`list_cache_tasks` + `count_cache_tasks`，`orig-tg/src/routes.rs:986-1005`），其中 `counts` daemon 侧**根本不消费**（`activity.rs:157-161`）。根因是 TG 缺「内存快照版全量端点」——内存端点契约只返回一条（单飞），而 `is_in_transit` 需含 failed/interrupted 的全量。已在 `activity.rs:305` 留 §5 豁免注释。待拍板：(a) TG 新增内存全量端点（建议）/ (b) `?counts=0` 止血 / (c) 维持 | open | engine |
 
 ## 历史欠账
 

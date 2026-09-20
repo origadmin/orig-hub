@@ -53,6 +53,7 @@ export function resolveContextKind(view: ViewId): ContextKind {
 export const TITLE_KEY: Record<ViewId, string> = {
   all: 'nav.all',
   downloading: 'nav.downloading',
+  activity: 'nav.activity',
   paused: 'nav.paused',
   completed: 'nav.completed',
   failed: 'nav.failed',

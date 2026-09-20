@@ -5,6 +5,7 @@
 //! 对齐 orig-hub `internal/core/api.go` 的真实契约，复刻 Go 守护进程行为；
 //! 下载内核用 orig-core（BlockMap + Source 调度），HTTP 源走 reqwest。
 
+mod activity;
 mod config;
 mod routes;
 mod state;

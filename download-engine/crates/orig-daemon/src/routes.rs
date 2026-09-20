@@ -9,6 +9,7 @@
 //!   POST /api/downloads/:id?action=...  -> {"status":"paused"|"resumed"|"cancelled","id":"..."}
 //!   DELETE /api/downloads/:id           -> {"status":"deleted","id":"..."}
 //!   GET  /api/events                    -> SSE 实时进度（REST+SSE 设计；原 Go 端由 Wails 轮询，此处补充）
+//!   GET  /api/activity                  -> 传输中聚合视图（只读，见 `activity.rs`）
 //!
 //! 下载流程：parse_url → probe(取总大小) → create_sources(一组 Source) →
 //! 用 `BlockMap` + `Task` 调度（见 `orig_core::engine`）。
@@ -33,6 +34,7 @@ use uuid::Uuid;
 
 use orig_core::engine::Task;
 use orig_core::protocol::{DownloadConfig, ParsedUrl, SseEvent};
+use crate::activity::{self, ActivityQuery, ActivitySnapshot};
 use crate::config::{resolve_output, resolve_output_classified};
 use crate::state::{AppState, DownloadTask};
 use crate::status::DownloadStatus;
@@ -439,6 +441,25 @@ async fn events(
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
+/// GET /api/activity — 传输中**只读**聚合视图（BUG-077 方案 (a)）。
+///
+/// 把本进程内存里的普通下载任务，与 orig-tg（9877）的缓存任务合并成统一 `TaskView`。
+/// 语义与端点边界（改动前必读 `activity.rs` 顶部五条铁律）：
+/// - **只读**：不写任何一侧的存储；
+/// - **控制分流**：写操作仍走 `/api/downloads/:id` 与 `/api/cache/*`，这里只给
+///   `control`（归属侧 + 原生 id）与 `actions`（真实具备的动词）；
+/// - **不给统一删除**，对 TG 侧**不给暂停/继续**（无真续传，那会是假能力）；
+/// - **恒 200**：9877 不可达时降级为「该来源不可用」，普通下载任务照常返回。
+///
+/// 复用现有 `/api/events` 广播做刷新触发 —— **不新建 SSE 通道**（架构裁定）；
+/// 该通道只承载下载侧事件，TG 侧由前端按轮询周期一并拉回。
+async fn activity(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<ActivityQuery>,
+) -> axum::Json<ActivitySnapshot> {
+    axum::Json(activity::collect(&st, q.scope()).await)
+}
+
 /// GET /api/config — 当前 daemon 配置（供设置页初始化）。
 async fn get_config(State(st): State<Arc<AppState>>) -> axum::Json<serde_json::Value> {
     let tg_running = st.tg_is_running().await;
@@ -737,6 +758,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             get(get_one).post(action).delete(delete_one),
         )
         .route("/api/events", get(events))
+        .route("/api/activity", get(activity))
         .route("/api/interfaces", get(list_interfaces))
         .route("/api/config", get(get_config))
         .route("/api/config/classify", axum::routing::put(put_config_classify))
@@ -750,7 +772,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .with_state(state)
 }
 
-fn now_secs() -> i64 {
+/// 当前 Unix 秒（`pub(crate)`：`activity.rs` 的时间戳同源，避免两套时钟口径）。
+pub(crate) fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

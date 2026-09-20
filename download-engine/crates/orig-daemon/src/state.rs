@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use orig_core::engine::Task;
 use orig_core::protocol::SseEvent;
@@ -11,6 +12,26 @@ use tokio::process::Child;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::config::Config;
+
+/// orig-tg 监听端口。**唯一真源**：拉起子进程时注入、聚合层拉取时引用，
+/// 两处必须同源，否则「启在 9877、拉 9876」这类分叉又会重新长出来。
+pub const TG_PORT: u16 = 9877;
+
+/// 构造出向 HTTP 客户端（聚合层读 orig-tg 用）。
+///
+/// 两点必须如此：
+/// - `no_proxy()`：目标是本机 127.0.0.1。reqwest 默认继承系统/环境代理，
+///   一旦 `HTTP_PROXY` 生效，本机端口会被绕去远端代理而永远连不上 ——
+///   那会把「TG 侧不可用」变成**假故障**（正是 BUG-077 风险 4 的反面）。
+/// - 短超时：9877 挂掉时 `/api/activity` 必须快速降级，不能挂住调用方。
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(4))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
 
 /// 单个任务在 daemon 侧的元数据（引擎 Task 不含 url/filename/时间等展示字段）。
 pub struct DownloadTask {
@@ -35,6 +56,8 @@ pub struct AppState {
     pub config: RwLock<Config>,
     /// orig-tg 子进程句柄（TG 可选插件）。None = 未启动 / 已退出。
     pub tg_child: Mutex<Option<Child>>,
+    /// 出向 HTTP 客户端（`/api/activity` 聚合层拉 orig-tg 用；见 `build_http_client`）。
+    pub http: reqwest::Client,
 }
 
 impl AppState {
@@ -45,6 +68,7 @@ impl AppState {
             events,
             config: RwLock::new(config),
             tg_child: Mutex::new(None),
+            http: build_http_client(),
         }
     }
 
@@ -76,9 +100,9 @@ impl AppState {
             _ => None,
         };
         let mut cmd = tokio::process::Command::new(tg_binary_path());
-        // 端口固定 9877，与 daemon 9876 分离。api_id/api_hash 从 `[tg]` 段显式注入，
-        // 不依赖父进程环境继承，保证 Tauri/开机重启后 real 模式仍生效。
-        cmd.env("PORT", "9877");
+        // 端口固定 9877（`TG_PORT`），与 daemon 9876 分离。api_id/api_hash 从 `[tg]` 段
+        // 显式注入，不依赖父进程环境继承，保证 Tauri/开机重启后 real 模式仍生效。
+        cmd.env("PORT", TG_PORT.to_string());
         cmd.kill_on_drop(true);
         // 会话与监控库必须落到稳定数据目录，免得 orig-tg 用 CWD 相对的默认路径，
         // 每次启动 CWD 变化就新生成会话 → 反复登录。目录在注入前先确保存在。
