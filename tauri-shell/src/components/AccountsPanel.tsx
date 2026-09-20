@@ -5,6 +5,7 @@ import { Input } from './ui/input'
 import { cn } from '../lib/utils'
 import { useStore } from '../store/useStore'
 import { useTranslation } from '../i18n'
+import { classifyTgReason, logTgReason } from '../lib/tgReason'
 import { getTgSession, startTgLogin, submitTgCode, tgDiag, tgLogs } from '../api/tg'
 import type { TgDiag, TgSession } from '../types'
 
@@ -41,8 +42,22 @@ export function AccountsPanel() {
    */
   const tgBroken = tgAvailability !== null && tgAvailability.status !== 'ok'
 
-  /** 入口级门控（与 MainLayout/Sidebar 同一判定）：开关关或探测到不可用 → 不渲染 TG 绑定卡。 */
-  const tgFeatureReady = tgEnabled && (tgAvailability === null || tgAvailability.status === 'ok')
+  /**
+   * 入口级门控（与 `MainLayout.tsx` 的 `tgFeatureReady` **同一语义**，BUG-094）：
+   * 开关关 OR orig-tg 进程不可达（unreachable） → 不渲染 TG 绑定卡。
+   *
+   * `unavailable`（进程活着、连不上 Telegram）**必须继续显示绑定卡**：
+   * 那正是用户需要看到失败原因并重新配置（改代理 / 重登）的时刻，
+   * 把入口一起藏掉，TG 面板里的出口就成了一条死路。
+   */
+  const tgFeatureReady =
+    tgEnabled && (tgAvailability === null || tgAvailability.status !== 'unreachable')
+  /** 故障原因（分类降级后的 i18n 键，绝不直出后端原文 —— BUG-088） */
+  const bannerReasonKey = classifyTgReason(
+    tgAvailability !== null && tgAvailability.status === 'unavailable'
+      ? tgAvailability.reason
+      : null,
+  )
 
   // 挂载时校准一次登录态：后端会话已 Authorized（含持久化加载的会话）则自动恢复为「已绑定」。
   // refreshTgSession 幂等——只在绑定态或 phase 变化时才写 store；后端不可达时保持现状并静默。
@@ -64,6 +79,22 @@ export function AccountsPanel() {
   const [showDiag, setShowDiag] = useState(false)
   const [diag, setDiag] = useState<TgDiag | null>(null)
   const [diagLogs, setDiagLogs] = useState<string[]>([])
+  /*
+   * 原文只进日志（BUG-088）：界面上每一处 reason 都是 `classifyTgReason` 降级后的文案。
+   *
+   * 注意声明位置必须在 `diag` 之后 —— effect 的依赖数组在**渲染期**求值，
+   * 放到状态声明之前会踩 TDZ（`Cannot access 'diag' before initialization`，
+   * tsc 查不出，只有真跑起来才炸）。
+   */
+  useEffect(() => {
+    logTgReason(
+      tgAvailability !== null && tgAvailability.status === 'unavailable'
+        ? tgAvailability.reason
+        : null,
+      'accounts-banner',
+    )
+    logTgReason(diag?.unavailable_reason ?? null, 'accounts-diag')
+  }, [tgAvailability, diag])
   const [diagBusy, setDiagBusy] = useState(false)
   const [diagErr, setDiagErr] = useState('')
 
@@ -177,8 +208,8 @@ export function AccountsPanel() {
                 : t('accounts.tgUnavailableHint')}
             </p>
             {tgAvailability.status === 'unavailable' && tgAvailability.reason && (
-              <p className="mt-1 break-all font-mono text-[10px] opacity-80">
-                {tgAvailability.reason}
+              <p className="mt-1 text-[10px] leading-relaxed opacity-80">
+                {t(bannerReasonKey)}
               </p>
             )}
           </div>
@@ -333,8 +364,8 @@ export function AccountsPanel() {
                 {!diag.available && diag.unavailable_reason && (
                   <div className="col-span-2 flex items-start gap-1.5">
                     <dt className="shrink-0 text-muted">{t('accounts.diagUnavailableReason')}</dt>
-                    <dd className="break-all font-mono text-[10px] text-danger">
-                      {diag.unavailable_reason}
+                    <dd className="text-[10px] leading-relaxed text-danger">
+                      {t(classifyTgReason(diag.unavailable_reason))}
                     </dd>
                   </div>
                 )}

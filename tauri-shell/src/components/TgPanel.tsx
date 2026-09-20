@@ -36,6 +36,7 @@ import type {
 import { ensureTg, tgSaveConfig } from '../api/tauri'
 import { CacheManagerDialog } from './CacheManagerDialog'
 import { useStore } from '../store/useStore'
+import { classifyTgReason, logTgReason } from '../lib/tgReason'
 import {
   ALBUM_MAX_TILES,
   albumGridClass,
@@ -46,41 +47,6 @@ import {
   guessMediaType,
   type MediaType,
 } from '../lib/tgmedia'
-
-/**
- * 后端原因 → i18n 键的**分类降级**（BUG-088 通用规则）。
- *
- * `reason` 是后端原文，可能是 `MTProto connect failed: request error: read 0 bytes`
- * 这种传输层报文 —— 它既不是给用户看的，也不该直接进 DOM（术语、英文、无行动指引）。
- * 这里只做分类映射，原文一律只进日志（`logTgReason`）。
- * 匹配顺序即优先级：越具体的先试，兜底为 `tg.reasonUnknown`。
- *
- * @param reason 后端 `available === false` 时给出的原文（可能为空）
- * @returns i18n 键（调用方再 `t(key)` 取双语文案）
- */
-function classifyTgReason(reason: string | null | undefined): string {
-  const raw = (reason ?? '').trim()
-  if (!raw) return 'tg.reasonUnknown'
-  if (/flood|rate limit|too many|retry after|FLOOD_WAIT/i.test(raw)) return 'tg.reasonFlood'
-  if (/api_id|api_hash|api credential|not configured|missing api|credentials/i.test(raw))
-    return 'tg.reasonConfig'
-  if (/unauthoriz|auth key|session|credential|phone|password|login|code/i.test(raw))
-    return 'tg.reasonAuth'
-  if (
-    /mtproto|connect|network|proxy|socks|timeout|timed out|eof|refused|reset by peer|dns|read 0 bytes|unreachable|i\/o|transport/i.test(
-      raw,
-    )
-  )
-    return 'tg.reasonNetwork'
-  return 'tg.reasonUnknown'
-}
-
-/** 原文只进日志（不渲染）：保留排查所需信息，又不把报文抛到界面上。 */
-function logTgReason(reason: string | null | undefined): void {
-  const raw = (reason ?? '').trim()
-  if (!raw) return
-  console.debug('[tg] availability reason (raw, not rendered):', raw)
-}
 
 /** 未分组的内部键（避免与真实分组标题冲突） */
 const UNGROUPED = '__ungrouped__'
@@ -261,7 +227,7 @@ export function TgPanel({ onOpenAccounts }: { onOpenAccounts?: () => void } = {}
 
   // 原文只进日志：保留排查信息，又不把传输层报文抛给用户
   useEffect(() => {
-    logTgReason(rawReason)
+    logTgReason(rawReason, 'tg-panel')
   }, [rawReason])
   const [alive, setAlive] = useState(false)
   const [channels, setChannels] = useState<TgChannel[]>([])
@@ -1056,9 +1022,10 @@ export function TgPanel({ onOpenAccounts }: { onOpenAccounts?: () => void } = {}
             <p className="mt-1 text-[11px] leading-relaxed text-muted">
               {t('tg.debugOfflineHint')}
             </p>
+            {/* 原文不进 DOM（BUG-088）：与其余各处同走 `classifyTgReason` */}
             {tgAvailability.reason && (
-              <p className="mt-3 break-all rounded-md bg-background px-2 py-1.5 font-mono text-[10px] text-muted">
-                {tgAvailability.reason}
+              <p className="mt-3 rounded-md bg-background px-2 py-1.5 text-[10px] leading-relaxed text-muted">
+                {t(classifyTgReason(tgAvailability.reason))}
               </p>
             )}
           </div>

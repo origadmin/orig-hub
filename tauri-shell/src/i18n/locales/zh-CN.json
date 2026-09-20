@@ -311,6 +311,7 @@
   "tg.unboundTitle": "Telegram 未绑定",
   "tg.unboundHint": "当前没有可用的 Telegram 登录会话，频道内容暂时无法浏览。绑定账号后即可查看。",
   "tg.unboundAction": "前往「设置 → 账号」绑定",
+  "tg.reasonOfflineDebug": "当前为离线调试模式，orig-tg 未连接 Telegram。",
   "tg.reasonNetwork": "无法连接到 Telegram，请检查网络与代理设置后重试。",
   "tg.reasonAuth": "Telegram 登录凭证已失效，请重新绑定账号。",
   "tg.reasonFlood": "Telegram 限制了当前账号的请求频率，请稍后再试。",

@@ -311,6 +311,7 @@
   "tg.unboundTitle": "Telegram not bound",
   "tg.unboundHint": "There is no active Telegram session, so channel content cannot be shown yet. Bind the account to continue.",
   "tg.unboundAction": "Bind in Settings → Accounts",
+  "tg.reasonOfflineDebug": "Running in offline debug mode; orig-tg is not connected to Telegram.",
   "tg.reasonNetwork": "Cannot reach Telegram. Check your network and proxy settings, then retry.",
   "tg.reasonAuth": "The Telegram credentials are no longer valid. Please bind the account again.",
   "tg.reasonFlood": "Telegram is rate-limiting this account. Please try again later.",
