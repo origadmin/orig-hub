@@ -16,10 +16,11 @@
 格式：`<type>(<scope>): <subject>`
 
 - **语言（强制）：提交信息（subject 与 body）一律英文，禁止中文。** 这是继承自 EE（orig-cms-ee）的核心规约，优先级高于本文件的格式示例——历史已出现 24/78 中文提交，根因即此规约从未写入本地约定且无门禁拦截。
+- **行尾（强制）：提交信息必须 LF，禁止 CR（`\r`）。** git 按**字节**哈希提交对象，message 里的 CR 会原样进入字节内容；LF 才是通用行尾。本仓库根提交 `206ee70` 与 `645d2c7` 内容完全相同（同 tree `09b3465`、同作者同时刻），仅因结尾 CRLF/LF 之差而哈希不同，并让**所有后代哈希全变**（本分支 78 条里 76 条 message 含 CR，见 BUG-084）。
 - type：`feat` / `fix` / `refactor` / `docs` / `chore` / `test` / `style`
 - scope：`engine`（内核）/ `shell`（Tauri 壳+前端）/ `docs` / `build`
 - 示例：`feat(engine): support Content-Disposition filename sniffing`
-- 门禁：`.git/hooks/commit-msg` 会拒绝任何含中文的提交信息；AGENTS.md 已规定禁止 `--no-verify` 跳过（除非显式授权）。
+- 门禁：`.git/hooks/commit-msg` 会拒绝任何**含中文**或**含 CR** 的提交信息；AGENTS.md 已规定禁止 `--no-verify` 跳过（除非显式授权）。
 
 要求：
 
@@ -146,7 +147,7 @@
 | 门禁 | 脚本（单一真源） | 覆盖 | 本地钩子 | CI |
 |---|---|---|---|---|
 | 缺陷登记一致性 | `python scripts/check-bugs.py` | 编号连续 / 索引↔文件双向一致 / 字段枚举 / `fixed` 须有可核证据 | pre-commit（必需） | `registry` |
-| 提交信息 | `python scripts/check-commit-msgs.py` | 全英文（扫 `%B` 全文，只看 `%s` 会假阴性）；`fix` 必须引用 `BUG-<编号>` | commit-msg（必需） | `registry` |
+| 提交信息 | `python scripts/check-commit-msgs.py` | 全英文（扫 `%B` 全文，只看 `%s` 会假阴性）；`fix` 必须引用 `BUG-<编号>`；**CRLF 检测**：扫 `%B` 全文，出现 `CR` 即失败（必须 LF，`%B` 按字节取，`text=True` 会吃掉 `\r` 致假阴性）；历史欠账（生效点 `3e85681` 及其祖先）只告警不阻断 | commit-msg（必需） | `registry` |
 | 目录污染 | `sh scripts/check-pollution.sh` | 根 4 文件白名单（I1）/ 未跟踪的产物与 AI 目录（I2）/ 未忽略残留（I3） | pre-commit（必需） | `registry` |
 | sidecar 一致性 | `sh scripts/sync-sidecars.sh --check` | release 产物不旧于源码 + 四处副本逐字节一致 | — | `engine` |
 

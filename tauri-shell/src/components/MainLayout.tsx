@@ -8,8 +8,9 @@ import { MediaLibraryPanel } from './MediaLibraryPanel'
 import { MediaViewer } from './MediaViewer'
 import { ErrorBoundary } from './ui/ErrorBoundary'
 import { TitleBar } from './TitleBar'
-import { Button } from './ui/button'
+import { ContextBar } from './ContextBar'
 import { useStore } from '../store/useStore'
+import { useEvent } from '../hooks/useEvent'
 import { useTranslation } from '../i18n'
 import { formatSpeed } from '../lib/utils'
 import { ensureDaemon, daemonStatus } from '../api/tauri'
@@ -106,6 +107,16 @@ export function MainLayout() {
     setView(v)
   }
 
+  /**
+   * 上下文栏的四个操作回调：必须 `useEvent` 恒定引用。
+   * 原写法 `onClick={() => pauseAll()...}` 是内联箭头，每次渲染都是新引用，
+   * 会让 `ContextBar` / `ContextBarActions` 的 memo 形同虚设（AGENTS.md §5）。
+   */
+  const handleNewDownload = useEvent(() => setAddOpen(true))
+  const handlePauseAll = useEvent(() => void pauseAll().catch(() => {}))
+  const handleResumeAll = useEvent(() => void resumeAll().catch(() => {}))
+  const handleClearCompleted = useEvent(() => void clearCompleted().catch(() => {}))
+
   const baseVisible =
     view === 'settings'
       ? downloads
@@ -119,10 +130,6 @@ export function MainLayout() {
   const visible = categoryFilter
     ? baseVisible.filter((d) => d.category === categoryFilter)
     : baseVisible
-
-  const busy = active.length > 0
-  /** 下载相关视图才显示下载工具栏按钮（TG/设置视图隐藏） */
-  const isDownloadView = view === 'all' || view === 'downloading' || view === 'completed'
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background">
@@ -157,59 +164,22 @@ export function MainLayout() {
         />
 
         <div className="flex min-w-0 flex-1 flex-col">
-          {/* 顶部工具栏：只放操作按钮；标题交给侧边栏，避免重复 */}
-          <header className="flex h-12 shrink-0 items-center justify-end gap-3 border-b border-border-subtle bg-surface/60 px-4">
-            {isDownloadView && busy && (
-              <span className="mr-auto hidden font-mono text-xs text-accent sm:inline">
-                {formatSpeed(totalSpeed)}
-              </span>
-            )}
-
-            {isDownloadView && (
-            <div className="flex shrink-0 items-center gap-2">
-              <Button size="sm" onClick={() => setAddOpen(true)}>
-                <svg className="mr-1 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
-                </svg>
-                {t('main.newDownload')}
-              </Button>
-              <Button
-                size="sm"
-                variant="secondary"
-                onClick={() => pauseAll().catch(() => {})}
-                disabled={!busy}
-                title={t('main.pauseAllHint')}
-              >
-                <svg className="mr-1 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M8 5v14M16 5v14" />
-                </svg>
-                {t('main.pauseAll')}
-              </Button>
-              <Button
-                size="sm"
-                variant="secondary"
-                onClick={() => resumeAll().catch(() => {})}
-                disabled={paused.length === 0}
-                title={t('main.resumeAllHint')}
-              >
-                <svg className="mr-1 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M8 5.14v13.72a1 1 0 001.5.86l11-6.86a1 1 0 000-1.72l-11-6.86a1 1 0 00-1.5.86z" />
-                </svg>
-                {t('main.resumeAll')}
-              </Button>
-              {view === 'completed' && (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => clearCompleted().catch(() => {})}
-                  disabled={completed.length === 0}
-                  title={t('main.clearHint')}
-                >
-                  {t('main.clear')}
-                </Button>
-              )}
-            </div>
-            )}
+          {/*
+            顶部上下文栏（BUG-083）：高度恒为 h-12 shrink-0 且恒定渲染，
+            内容随视图切换（下载视图给操作、其余给标题 + 全局态），因此不需要占位。
+          */}
+          <header
+            className="flex h-12 shrink-0 items-center border-b border-border-subtle bg-surface/60 px-4"
+            data-testid="context-bar-header"
+          >
+            <ContextBar
+              view={view}
+              categoryFilter={categoryFilter}
+              onNewDownload={handleNewDownload}
+              onPauseAll={handlePauseAll}
+              onResumeAll={handleResumeAll}
+              onClearCompleted={handleClearCompleted}
+            />
           </header>
 
           {/* Content：设置页自带内滚动（标题置顶占满），其余视图用外层滚动 */}

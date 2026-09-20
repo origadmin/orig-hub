@@ -2,19 +2,27 @@
 """提交信息门禁 · 范围版（CI 用）。
 
 本地 `.git/hooks/commit-msg` 只能拦单条、且可以被 `--no-verify` 绕过；
-CI 是对**已落地提交**的最后一道闸，按范围复验 `AGENTS.md` §2 的两条硬规：
+CI 是对**已落地提交**的最后一道闸，按范围复验 `AGENTS.md` §2 的三条硬规：
 
   1. 提交信息一律**英文**（subject 与 body 都不得含 CJK）—— 与 EE 规约对齐；
-  2. `fix` 类提交必须引用 `BUG-<三位编号>`，让「修了什么」可追溯到登记册。
+  2. `fix` 类提交必须引用 `BUG-<三位编号>`，让「修了什么」可追溯到登记册；
+  3. 提交信息**必须 LF，禁止 CR**（扫 `%B` 全文，出现一个 `\\r` 即失败）。
 
 用法：
   python scripts/check-commit-msgs.py                 # 默认 origin/main..HEAD
   python scripts/check-commit-msgs.py BASE..HEAD      # 指定范围
   python scripts/check-commit-msgs.py --all           # 全历史（审计用，退出码仍非零表示有违规）
+  python scripts/check-commit-msgs.py --self-test     # 只跑 CR 检测自检（不读工作树状态）
 
 设计取舍：
 - 扫 **全文 `%B`**（subject + body + trailer），只看 `%s` 会假阴性（历史教训）；
+- `%B` 必须**按字节取**：`subprocess(text=True)` 会做通用换行转换，把 `\\r` 悄悄翻译成 `\\n`，
+  CR 检测会 100% 假阴性 —— 故 `git()` 取字节后自行 decode（BUG-084）；
 - `Merge` / `Revert` 提交跳过（机器生成，不代表作者措辞）；
+- CR 规则有**生效点** `CR_RULE_BASELINE`：该提交**及其祖先**属历史欠账，计数告警不阻断；
+  其**后代**一律阻断。与 `check-bugs.py` 的 RULE_FROM 同源理由：本分支 78 条提交里 76 条
+  message 含 CR，规则一落地就把 CI 恒判红 = 门禁沦为噪音；历史如实标注，新增零容忍。
+  基线对象被 prune（本仓库发生过）时**降级为只告警并明说**：既不静默放行，也不误伤历史。
 - 审计历史用 `--all` 时只统计不阻断（退出码 0），便于把它挂进报告而不让 CI 永远红。
 """
 
@@ -29,16 +37,28 @@ CJK = re.compile(r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\
 BUG_REF = re.compile(r"BUG-\d{3}")
 FIX_SUBJECT = re.compile(r"^fix(\(|!|:|\s)", re.IGNORECASE)
 
+# CR 规则的生效点（该提交本身及其祖先 = 历史欠账）。
+CR_RULE_BASELINE = "3e856816dd98188aa23bc0c0fa840ba7a42ebe0c"
 
-def git(*args: str) -> str:
-    return subprocess.run(
-        ["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace"
-    ).stdout
+# 报错必须可行动：说清「为什么不行」+「怎么改」，而不是只打一个错误码。
+CR_HINT = (
+    "  why: git 按**字节**哈希提交对象，message 里的 CR 会原样进入字节内容，LF 才是通用行尾。\n"
+    "       一个多余的 \\r 就让「内容完全相同」的两条提交得到不同哈希 —— 本仓库根提交\n"
+    "       206ee70 与 645d2c7 同 tree 09b3465、同作者同时刻，仅因结尾 CRLF/LF 而异，\n"
+    "       且所有后代哈希随之全变。\n"
+    "  fix: 提交信息只用 LF —— 关掉工具的 CRLF（`git config core.autocrlf input`），\n"
+    "       不要把 CRLF 文本粘贴进 `-m` / `-F`；已落地的历史提交只能靠重写清除。"
+)
 
 
-def commits_in_range(rng: str) -> list[tuple[str, str, str]]:
-    """返回 [(sha, subject, full_message)]。"""
-    out = git("log", "--format=%H%x1f%s%x1f%B%x1e", rng)
+def git(*args: str) -> bytes:
+    """取**字节**：`text=True` 的通用换行转换会把 `\\r` 吃掉，CR 检测必须绕过它。"""
+    return subprocess.run(["git", *args], capture_output=True).stdout
+
+
+def commits_in_range(*rng: str) -> list[tuple[str, str, str]]:
+    """返回 [(sha, subject, full_message)]；`full_message` 保留原始 CR。"""
+    out = git("log", "--format=%H%x1f%s%x1f%B%x1e", *rng).decode("utf-8", "replace")
     items: list[tuple[str, str, str]] = []
     for chunk in out.split("\x1e"):
         chunk = chunk.strip("\n")
@@ -52,7 +72,63 @@ def commits_in_range(rng: str) -> list[tuple[str, str, str]]:
     return items
 
 
+def cr_violation(short: str, subject: str, body: str) -> str | None:
+    """扫 `%B` 全文找 CR；命中则返回可行动的报错文本，未命中返回 None。"""
+    idx = body.find("\r")
+    if idx < 0:
+        return None
+    snippet = body[max(0, idx - 20) : idx + 20].replace("\r", "<CR>").replace("\n", "\\n")
+    return f"{short}: 提交信息含回车符 CR（\\r）→ …{snippet}…  （{subject}）\n" + CR_HINT
+
+
+def cr_grandfathered() -> set[str] | None:
+    """CR 规则的「历史欠账」集合（生效点及其祖先）。
+
+    返回 None = 基线不可解析（对象被 prune）：调用方须**降级为只告警并明说**，
+    不能据此把历史判成违规。
+    """
+    probe = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"{CR_RULE_BASELINE}^{{commit}}"],
+        capture_output=True,
+    )
+    if probe.returncode != 0:
+        return None
+    out = subprocess.run(
+        ["git", "rev-list", CR_RULE_BASELINE], capture_output=True, text=True
+    ).stdout
+    return set(out.split())
+
+
+def self_test() -> int:
+    """CR 检测自检：合成 LF / CRLF 两条 + 一条真实含 CR 的历史提交，不依赖工作树。"""
+    ok = True
+
+    if cr_violation("0000000", "chore: lf only", "chore: lf only\n") is not None:
+        print("self-test FAIL: 纯 LF 提交信息被误判为含 CR")
+        ok = False
+    if cr_violation("0000000", "chore: crlf", "chore: crlf\r\n") is None:
+        print("self-test FAIL: CRLF 提交信息未被检出")
+        ok = False
+
+    # 真实提交 206ee70：确认 %B 是**按字节**取的（若退回 text=True，这里会假阴性）。
+    real = commits_in_range("-n", "1", "206ee70")
+    if not real:
+        print("self-test SKIP: 206ee70 不在本仓库（对象被 prune），跳过真实提交核对")
+    elif cr_violation(real[0][0][:8], real[0][1], real[0][2]) is None:
+        print("self-test FAIL: 真实含 CR 提交 206ee70 未被检出（%B 可能被换行转换吞掉 CR）")
+        ok = False
+
+    if not ok:
+        print("check-commit-msgs: self-test FAIL")
+        return 1
+    print("check-commit-msgs: self-test OK - CR 检测（合成 LF/CRLF + 真实含 CR 提交 206ee70）")
+    return 0
+
+
 def main() -> int:
+    if "--self-test" in sys.argv:
+        return self_test()
+
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     audit = "--all" in sys.argv
 
@@ -75,7 +151,13 @@ def main() -> int:
         print(f"check-commit-msgs: 范围内无提交（{rng}），跳过。")
         return 0
 
+    baseline = cr_grandfathered()
+    if baseline is None:
+        print(f"check-commit-msgs: CR 基线 {CR_RULE_BASELINE[:8]} 不可解析（对象被 prune？）"
+              f"→ CR 检测降级为只告警，不阻断。")
+
     errors: list[str] = []
+    cr_debt: list[str] = []
     for sha, subject, body in commits:
         short = sha[:8]
         if re.match(r"^(Merge|Revert)\b", subject):
@@ -87,6 +169,17 @@ def main() -> int:
             errors.append(f"{short}: 提交信息含中文/全角字符 → …{snippet}…  （{subject}）")
         if FIX_SUBJECT.match(subject) and not BUG_REF.search(body):
             errors.append(f"{short}: `fix` 提交未引用 BUG-<编号> → {subject}")
+        # CR：历史欠账（生效点及祖先）只计数，其后代一律阻断
+        cr = cr_violation(short, subject, body)
+        if cr:
+            if baseline is None or sha in baseline:
+                cr_debt.append(cr)
+            else:
+                errors.append(cr)
+
+    if cr_debt:
+        print(f"check-commit-msgs: 历史欠账 {len(cr_debt)} 条提交信息含 CR"
+              f"（生效点 {CR_RULE_BASELINE[:8]} 及其祖先 → 如实标注、只告警；重写历史后清零）")
 
     if errors:
         print(f"check-commit-msgs: {len(errors)} 项违规 / 共 {len(commits)} 条提交（{rng}）")

@@ -1,0 +1,147 @@
+/**
+ * BUG-083 · 顶部上下文栏真实渲染验收。
+ *
+ * 对应用户裁定：「顶部那一栏改成随视图变化的上下文栏；不需要占位」。
+ * 断言三件事：
+ *   1) **不留白**：媒体库 / TG / 设置三视图的左槽都有视图标题、右槽都有连接态灯；
+ *   2) **不跳动**：切换视图时 header 的 top / height 完全一致（这是「不需要占位」的前提）；
+ *   3) **下载分支未死**：`DOWNLOAD_MODULE_HIDDEN=false` 时，三个下载视图仍渲染
+ *      新建 / 全部暂停 / 全部开始（「已完成」追加「清空」），且 disabled 态正确。
+ *
+ * 前置：vite dev（默认 http://127.0.0.1:5180）、orig-daemon 已起。
+ * 用法：NODE_PATH=<managed-node-workspace>/node_modules node tauri-shell/verify/shot_context_bar.cjs
+ * 产物：默认落 `verify_shots/round10/`（**证据产物不入库**，AGENTS.md §6），可用 ORIG_SHOT_OUT 覆盖。
+ */
+const { chromium } = require('playwright')
+const path = require('path')
+const fs = require('fs')
+
+const OUT =
+  process.env.ORIG_SHOT_OUT || path.resolve(__dirname, '..', '..', 'verify_shots', 'round10')
+const URL = process.env.APP_URL || 'http://127.0.0.1:5180'
+
+const checks = []
+function check(name, ok, detail) {
+  checks.push({ name, ok: !!ok, detail })
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  |  ' + detail : ''}`)
+}
+
+/** 读上下文栏的运行期事实：标题、连接态、header 几何、按钮清单。 */
+async function readBar(page) {
+  return page.evaluate(() => {
+    const header = document.querySelector('[data-testid="context-bar-header"]')
+    const title = document.querySelector('[data-testid="context-bar-title"]')
+    const conn = document.querySelector('[data-testid="context-conn"]')
+    const speed = document.querySelector('[data-testid="context-speed"]')
+    const active = document.querySelector('[data-testid="context-active"]')
+    const box = header ? header.getBoundingClientRect() : null
+    const buttons = Array.from(header ? header.querySelectorAll('button') : []).map((b) => ({
+      text: (b.textContent || '').trim(),
+      disabled: !!b.disabled,
+    }))
+    return {
+      hasHeader: !!header,
+      title: title ? (title.textContent || '').trim() : null,
+      connState: conn ? conn.getAttribute('data-conn-state') : null,
+      connText: conn ? (conn.textContent || '').trim() : null,
+      speed: speed ? (speed.textContent || '').trim() : null,
+      active: active ? (active.textContent || '').trim() : null,
+      top: box ? Math.round(box.top) : null,
+      height: box ? Math.round(box.height) : null,
+      buttons,
+    }
+  })
+}
+
+async function goto(page, testid) {
+  const nav = page.locator(`[data-testid="${testid}"]`)
+  if ((await nav.count()) === 0) return false
+  await nav.first().click()
+  await page.waitForTimeout(250)
+  return true
+}
+
+async function main() {
+  fs.mkdirSync(OUT, { recursive: true })
+  const browser = await chromium.launch()
+  const page = await browser.newPage({ viewport: { width: 1280, height: 800 } })
+  page.on('pageerror', (e) => console.log('PAGEERROR', e.message))
+  await page.goto(URL, { waitUntil: 'domcontentloaded' })
+  await page.waitForTimeout(1200)
+
+  /** 视图 → 期望标题（zh-CN 默认语言；与 `nav.*` 一致） */
+  const EXPECT = {
+    'nav-media': '媒体库',
+    'nav-tg': 'Telegram',
+    'nav-settings': '设置',
+    'nav-downloading': '下载中',
+    'nav-completed': '已完成',
+  }
+
+  const geo = []
+  for (const [testid, expect] of Object.entries(EXPECT)) {
+    const reached = await goto(page, testid)
+    if (!reached) {
+      // 下载视图被 DOWNLOAD_MODULE_HIDDEN 摘除：属预期，跳过而不判失败
+      console.log(`SKIP  ${testid}  |  导航不可达（DOWNLOAD_MODULE_HIDDEN=true），下载分支需置 false 后复跑`)
+      continue
+    }
+    const bar = await readBar(page)
+    const shot = path.join(OUT, `context_${testid.replace('nav-', '')}.png`)
+    await page.screenshot({ path: shot })
+
+    check(`${testid} 上下文栏存在`, bar.hasHeader, shot)
+    check(`${testid} 标题为「${expect}」`, bar.title === expect, `实际「${bar.title}」`)
+    if (testid === 'nav-media' || testid === 'nav-tg' || testid === 'nav-settings') {
+      check(`${testid} 右槽有连接态`, bar.connState !== null, `state=${bar.connState} text=${bar.connText}`)
+      check(`${testid} 右槽无下载按钮`, bar.buttons.length === 0, JSON.stringify(bar.buttons))
+    } else {
+      const texts = bar.buttons.map((b) => b.text)
+      check(`${testid} 有下载操作按钮`, texts.length >= 3, JSON.stringify(bar.buttons))
+      if (testid === 'nav-completed') {
+        check(`${testid} 有「清空」`, texts.some((x) => x.includes('清空')), JSON.stringify(texts))
+      }
+    }
+    geo.push({ testid, top: bar.top, height: bar.height })
+  }
+
+  // 高度一致性：header 恒定 h-12 → 切视图不跳动（「不需要占位」的前提）
+  const tops = new Set(geo.map((g) => g.top))
+  const heights = new Set(geo.map((g) => g.height))
+  check(
+    '切换视图 header 上沿不变',
+    tops.size <= 1,
+    JSON.stringify(geo.map((g) => `${g.testid}:top=${g.top}`)),
+  )
+  check(
+    '切换视图 header 高度不变',
+    heights.size <= 1,
+    JSON.stringify(geo.map((g) => `${g.testid}:h=${g.height}`)),
+  )
+
+  // 「全部文件」下钻：标题补一级面包屑
+  const allRow = page.locator('[data-testid="all-files-row"]')
+  if ((await allRow.count()) > 0) {
+    await allRow.first().click()
+    await page.waitForTimeout(250)
+    const bar = await readBar(page)
+    check('全部文件 标题', bar.title === '全部文件', `实际「${bar.title}」`)
+    await page.screenshot({ path: path.join(OUT, 'context_all.png') })
+  }
+
+  await browser.close()
+
+  const failed = checks.filter((c) => !c.ok)
+  const summary = { total: checks.length, failed: failed.length, checks }
+  fs.writeFileSync(
+    path.join(OUT, 'context_bar_result.json'),
+    JSON.stringify(summary, null, 2),
+  )
+  console.log(`\n${checks.length - failed.length}/${checks.length} passed  →  ${OUT}`)
+  process.exit(failed.length === 0 ? 0 : 1)
+}
+
+main().catch((e) => {
+  console.error('FATAL', e)
+  process.exit(2)
+})

@@ -5,6 +5,7 @@ import { Input } from './ui/input'
 import { Switch } from './ui/switch'
 import { useTranslation } from '../i18n'
 import { cn } from '../lib/utils'
+import { useEvent } from '../hooks/useEvent'
 import { decodeStateKey, useDecodeHealth } from '../lib/decodeHealth'
 import {
   tgHealth,
@@ -54,21 +55,14 @@ const ALL_KEY = '__all__'
 const PAGE_SIZE = 30
 
 /**
- * 稳定事件回调（useEvent 模式）：**引用恒定、行为永远取最新闭包**。
+ * 稳定事件回调（useEvent 模式）收敛到 `hooks/useEvent.ts` 的**唯一实现**，本文件改为导入。
  *
- * 流畅度的前提——子组件 `memo` 生效要求 props 引用稳定；用内联箭头
- * `onDownload={() => do(item)}` 每次渲染都是新引用，memo 形同虚设，
+ * 语义不变：引用恒定、行为永远取最新闭包 —— 子组件 `memo` 生效要求 props 引用稳定；
+ * 用内联箭头 `onDownload={() => do(item)}` 每次渲染都是新引用，memo 形同虚设，
  * 于是每秒一次的进度轮询会把整列消息气泡全部重渲染（卡顿根源）。
- * 子组件改为回传自己的数据（如 `onDownload(item)`），父级用本钩子
- * 提供恒定引用、点击时再取最新状态，杜绝陈旧闭包。
+ * 子组件回传自己的数据（如 `onDownload(item)`），父级用本钩子提供恒定引用，
+ * 点击时再取最新状态，杜绝陈旧闭包。
  */
-function useEvent<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
-  const ref = useRef(fn)
-  useLayoutEffect(() => {
-    ref.current = fn
-  })
-  return useCallback((...args: A) => ref.current(...args), [])
-}
 
 /** 右栏统一消息视图模型（监控本地消息与在线消息共同映射） */
 interface FeedItem {
