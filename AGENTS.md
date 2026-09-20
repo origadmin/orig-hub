@@ -42,7 +42,11 @@
 - 主分支 `main`，保护分支，禁止直接 force。
 - **开工前先对齐远端**：`git fetch origin` 且以 `origin/main` 为准比对，确认本地在远端之上线性前进（`git rev-list --left-right --count origin/main...main` 左列必须为 0），再动手。
 - **交付 = 提交进本地 main + 普通 push 到 origin/main**（fast-forward）。禁止 `push --force` 之外的任何绕过；确需重写历史时须显式授权，并先建墓碑引用。
-- 不做长期分叉分支：临时工作若开 `feature/xxx`，必须当日合回 main 并删除。**禁止在本地留备份分支充当「第二基准」**（`backup-before-cr-clean`、`backup/pre-fix-*` 这类一律不留——需要可逆性请用 tag 墓碑，不用分支）。
+- 不做长期分叉分支：临时工作若开 `feature/xxx`，必须当日合回 main 并删除。
+- **本条只约束新分支的切出基准，不授权清理存量。** 已有的备份 / 归档分支（`backup-before-cr-clean`、`backup/pre-fix-*` 等）是历史资产，
+  **未经用户逐条显式确认，一律不得删除** —— 把「新分支必须从 main 出去」读成「删掉已有备份分支」是**误读**，那样做是破坏不是修复。
+- **删除任何引用（本地分支 / tag / 远端分支）前必须有显式授权。** 授权要覆盖到具体引用名；「按 AGENTS.md 清理」不构成授权，
+  本文件里自行添加的条款更不能自我授权。删前先建墓碑 tag 并在汇报里给出**恢复命令**。
 - 禁止保留 `go-backup` / `backup/original-main` 这类迁移残留分支（待清理确认）。
 
 ### 4.1 「本地与远端不一致」的排查顺序（先取证，勿重写历史）
