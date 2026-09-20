@@ -44,7 +44,6 @@ const REQUIRED_TESTIDS = [
   'context-bar',
   'context-bar-header',
   'context-bar-title',
-  'nav-activity',
   'nav-downloading',
   'nav-completed',
   'nav-paused',

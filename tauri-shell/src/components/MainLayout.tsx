@@ -6,7 +6,6 @@ import { SettingsPanel } from './SettingsPanel'
 import { TgPanel } from './TgPanel'
 import { MediaLibraryPanel } from './MediaLibraryPanel'
 import { MediaViewer } from './MediaViewer'
-import { ActivityPanel } from './ActivityPanel'
 import { ErrorBoundary } from './ui/ErrorBoundary'
 import { TitleBar } from './TitleBar'
 import { ContextBar } from './ContextBar'
@@ -239,11 +238,10 @@ export function MainLayout() {
           <main
             className={cn(
               'flex-1 overflow-hidden',
-              (view === 'tg' || view === 'media' || view === 'activity') && 'flex',
+              (view === 'tg' || view === 'media') && 'flex',
               view !== 'settings' &&
                 view !== 'tg' &&
                 view !== 'media' &&
-                view !== 'activity' &&
                 'overflow-y-auto p-4',
             )}
           >
@@ -252,11 +250,6 @@ export function MainLayout() {
             ) : view === 'tg' ? (
               <ErrorBoundary>
                 <TgPanel />
-              </ErrorBoundary>
-            ) : view === 'activity' ? (
-              // 传输中：跨来源只读聚合（BUG-077 方案 (a)），自带内滚动
-              <ErrorBoundary>
-                <ActivityPanel />
               </ErrorBoundary>
             ) : view === 'media' ? (
               <ErrorBoundary>
