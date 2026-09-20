@@ -33,9 +33,14 @@ interface Props {
   collapsed: boolean
   onToggle: () => void
   counts: { downloading: number; paused: number; completed: number; failed: number; total: number }
-  /** Telegram 已绑定/已登录（由登录绑定态驱动） */
-  tgBound: boolean
-  /** TG 功能就绪（常规开关开 + 可用性探测 ok）；false 时 TG 导航整体隐藏（入口级门控） */
+  /**
+   * TG 功能就绪（常规开关开 + orig-tg 服务可达）；false 时 TG 导航整体隐藏（入口级门控）。
+   *
+   * 门控**只看服务，不看登录态**（BUG-094）：此前是 `tgBound && tgReady`，
+   * 于是「没登录」或「连不上 Telegram」都会让入口凭空消失 —— 用户既看不到 TG，
+   * 也看不到任何失败原因，更进不去重新配置（坏了就修不回来）。
+   * 现在只要服务在跑就显示入口，未绑定态由 TgPanel 内的引导区承载。
+   */
   tgReady: boolean
 }
 
@@ -127,7 +132,6 @@ export function Sidebar({
   collapsed,
   onToggle,
   counts,
-  tgBound,
   tgReady,
 }: Props) {
   const { t } = useTranslation()
@@ -297,7 +301,9 @@ export function Sidebar({
           )}
         </div>
 
-        {NAV_ITEMS.filter((item) => item.id !== 'tg' || (tgBound && tgReady)).map((item) => {
+        {/* TG 入口门控：服务可用即显示（BUG-094），不再要求已绑定 —— 未绑定是面板内的
+            一种可修复状态，不是「功能不存在」，隐藏入口等于切断修复路径。 */}
+        {NAV_ITEMS.filter((item) => item.id !== 'tg' || tgReady).map((item) => {
           const active = view === item.id
           const count =
             item.id === 'downloading'

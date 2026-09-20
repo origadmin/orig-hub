@@ -47,6 +47,41 @@ import {
   type MediaType,
 } from '../lib/tgmedia'
 
+/**
+ * 后端原因 → i18n 键的**分类降级**（BUG-088 通用规则）。
+ *
+ * `reason` 是后端原文，可能是 `MTProto connect failed: request error: read 0 bytes`
+ * 这种传输层报文 —— 它既不是给用户看的，也不该直接进 DOM（术语、英文、无行动指引）。
+ * 这里只做分类映射，原文一律只进日志（`logTgReason`）。
+ * 匹配顺序即优先级：越具体的先试，兜底为 `tg.reasonUnknown`。
+ *
+ * @param reason 后端 `available === false` 时给出的原文（可能为空）
+ * @returns i18n 键（调用方再 `t(key)` 取双语文案）
+ */
+function classifyTgReason(reason: string | null | undefined): string {
+  const raw = (reason ?? '').trim()
+  if (!raw) return 'tg.reasonUnknown'
+  if (/flood|rate limit|too many|retry after|FLOOD_WAIT/i.test(raw)) return 'tg.reasonFlood'
+  if (/api_id|api_hash|api credential|not configured|missing api|credentials/i.test(raw))
+    return 'tg.reasonConfig'
+  if (/unauthoriz|auth key|session|credential|phone|password|login|code/i.test(raw))
+    return 'tg.reasonAuth'
+  if (
+    /mtproto|connect|network|proxy|socks|timeout|timed out|eof|refused|reset by peer|dns|read 0 bytes|unreachable|i\/o|transport/i.test(
+      raw,
+    )
+  )
+    return 'tg.reasonNetwork'
+  return 'tg.reasonUnknown'
+}
+
+/** 原文只进日志（不渲染）：保留排查所需信息，又不把报文抛到界面上。 */
+function logTgReason(reason: string | null | undefined): void {
+  const raw = (reason ?? '').trim()
+  if (!raw) return
+  console.debug('[tg] availability reason (raw, not rendered):', raw)
+}
+
 /** 未分组的内部键（避免与真实分组标题冲突） */
 const UNGROUPED = '__ungrouped__'
 /** 「全部订阅」分组的内部键 */
@@ -186,9 +221,9 @@ function groupAlbums(feed: FeedItem[]): FeedItem[][] {
  * 第二栏：聊天式媒体流（最新在底部，滚到顶按 beforeId 加载更早历史）。
  * 关系链：分组 → 组内列表 → 添加 → 监控列表 → 显示。
  */
-export function TgPanel() {
+export function TgPanel({ onOpenAccounts }: { onOpenAccounts?: () => void } = {}) {
   const { t } = useTranslation()
-  const { setError, openViewer, tgAvailability } = useStore()
+  const { setError, openViewer, tgAvailability, accounts } = useStore()
   /**
    * TG 依赖故障（不可用/不可达）：直接以「不可用 + 原因」取代面板内容。
    *
@@ -202,6 +237,32 @@ export function TgPanel() {
   const tgDebugOffline =
     tgAvailability?.status === 'unavailable' &&
     /offline debug mode/.test(tgAvailability.reason ?? '')
+  /**
+   * orig-tg 服务是否在跑（进程可达）。
+   *
+   * `unavailable` 的语义是「进程活着、连不上 Telegram」—— 它仍算服务在跑，
+   * 而且正是最需要留在这里修（改代理 / 重新登录）的状态。
+   */
+  const tgServiceUp = tgAvailability === null || tgAvailability.status !== 'unreachable'
+  /**
+   * 未绑定态（BUG-094）：服务在跑，但没有可用登录会话。
+   * 此时渲染引导区而不是频道列表 —— 频道列表在没有会话时必然是空的，
+   * 空列表会把「没登录 / 连不上」伪装成「没有内容」。
+   */
+  const tgUnbound = tgServiceUp && !accounts.tg.bound
+  /** 后端原文（仅用于日志与分类），绝不直接渲染 */
+  const rawReason =
+    tgAvailability !== null && tgAvailability.status === 'unavailable'
+      ? tgAvailability.reason
+      : null
+  const showReason = Boolean(rawReason && rawReason.trim())
+  /** 分类降级后的 i18n 键（BUG-088） */
+  const reasonKey = classifyTgReason(rawReason)
+
+  // 原文只进日志：保留排查信息，又不把传输层报文抛给用户
+  useEffect(() => {
+    logTgReason(rawReason)
+  }, [rawReason])
   const [alive, setAlive] = useState(false)
   const [channels, setChannels] = useState<TgChannel[]>([])
   const [scanning, setScanning] = useState(false)
@@ -985,47 +1046,80 @@ export function TgPanel() {
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-1 overflow-hidden">
-      {tgBroken && tgAvailability ? (
-        tgDebugOffline ? (
-          /* 调试期离线：预期态，中性呈现，不报警 */
-          <div className="flex flex-1 items-center justify-center p-6">
-            <div className="w-full max-w-md rounded-lg border border-border-subtle bg-surface/60 p-5">
-              <h3 className="text-[14px] font-semibold text-foreground">
-                {t('tg.debugOfflineTitle')}
-              </h3>
-              <p className="mt-1 text-[11px] leading-relaxed text-muted">
-                {t('tg.debugOfflineHint')}
+      {tgDebugOffline && tgAvailability ? (
+        /* 调试期离线：预期态，中性呈现，不报警 */
+        <div className="flex flex-1 items-center justify-center p-6">
+          <div className="w-full max-w-md rounded-lg border border-border-subtle bg-surface/60 p-5">
+            <h3 className="text-[14px] font-semibold text-foreground">
+              {t('tg.debugOfflineTitle')}
+            </h3>
+            <p className="mt-1 text-[11px] leading-relaxed text-muted">
+              {t('tg.debugOfflineHint')}
+            </p>
+            {tgAvailability.reason && (
+              <p className="mt-3 break-all rounded-md bg-background px-2 py-1.5 font-mono text-[10px] text-muted">
+                {tgAvailability.reason}
               </p>
-              {tgAvailability.reason && (
-                <p className="mt-3 break-all rounded-md bg-background px-2 py-1.5 font-mono text-[10px] text-muted">
-                  {tgAvailability.reason}
-                </p>
-              )}
-            </div>
+            )}
           </div>
-        ) : (
-          /* 依赖故障：说明「为什么用不了」，而不是给一个空列表 */
-          <div className="flex flex-1 items-center justify-center p-6">
-            <div className="w-full max-w-md rounded-lg border border-danger/30 bg-danger/10 p-5">
-              <h3 className="text-[14px] font-semibold text-danger">
-                {tgAvailability.status === 'unreachable'
-                  ? t('accounts.tgUnreachable')
-                  : t('accounts.tgUnavailable')}
-              </h3>
-              <p className="mt-1 text-[11px] leading-relaxed text-danger/90">
-                {/* 面板内不自带「连接诊断」，故用面板专属文案（不指向账号页才有的区块） */}
-                {tgAvailability.status === 'unreachable'
-                  ? t('tg.unreachableHint')
-                  : t('tg.unavailableHint')}
+        </div>
+      ) : tgUnbound ? (
+        /*
+         * 未绑定引导区（BUG-094）：入口已按「服务可用即显示」放行，这里必须说清
+         * 「没登录 / 为什么连不上」并给出可行动出口 —— 否则点进来是一个空面板，
+         * 用户既不知道发生了什么，也没有任何路径把它修回来。
+         *
+         * 原因走 `classifyTgReason` 分类降级（BUG-088）：后端原文是传输层报文，
+         * 只进日志，界面上是中文可行动文案。
+         */
+        <div
+          className="flex flex-1 items-center justify-center p-6"
+          data-testid="tg-unbound-guide"
+        >
+          <div className="w-full max-w-md rounded-lg border border-border-subtle bg-surface/60 p-5">
+            <h3 className="text-[14px] font-semibold text-fg-strong">
+              {t('tg.unboundTitle')}
+            </h3>
+            <p className="mt-1 text-[11px] leading-relaxed text-muted">
+              {t('tg.unboundHint')}
+            </p>
+            {showReason && (
+              <p className="mt-3 rounded-md bg-background px-2 py-1.5 text-[11px] leading-relaxed text-fg-mid">
+                {t(reasonKey)}
               </p>
-              {tgAvailability.status === 'unavailable' && tgAvailability.reason && (
-                <p className="mt-3 break-all rounded-md bg-surface/60 px-2 py-1.5 font-mono text-[10px] text-danger">
-                  {tgAvailability.reason}
-                </p>
-              )}
-            </div>
+            )}
+            <Button
+              size="sm"
+              className="mt-5 h-8 w-full text-xs"
+              onClick={() => onOpenAccounts?.()}
+            >
+              {t('tg.unboundAction')}
+            </Button>
           </div>
-        )
+        </div>
+      ) : tgBroken && tgAvailability ? (
+        /* 依赖故障：说明「为什么用不了」，而不是给一个空列表 */
+        <div className="flex flex-1 items-center justify-center p-6">
+          <div className="w-full max-w-md rounded-lg border border-danger/30 bg-danger/10 p-5">
+            <h3 className="text-[14px] font-semibold text-danger">
+              {tgAvailability.status === 'unreachable'
+                ? t('accounts.tgUnreachable')
+                : t('accounts.tgUnavailable')}
+            </h3>
+            <p className="mt-1 text-[11px] leading-relaxed text-danger/90">
+              {/* 面板内不自带「连接诊断」，故用面板专属文案（不指向账号页才有的区块） */}
+              {tgAvailability.status === 'unreachable'
+                ? t('tg.unreachableHint')
+                : t('tg.unavailableHint')}
+            </p>
+            {/* 原文不进 DOM（BUG-088）：只渲染分类降级后的中文文案 */}
+            {showReason && (
+              <p className="mt-3 rounded-md bg-surface/60 px-2 py-1.5 text-[10px] leading-relaxed text-danger">
+                {t(reasonKey)}
+              </p>
+            )}
+          </div>
+        </div>
       ) : needConfig && !alive ? (
         /* APP 首启：Telegram 凭证配置（保存后由 Tauri 壳持久化并拉起服务） */
         <div className="flex flex-1 items-center justify-center p-6">

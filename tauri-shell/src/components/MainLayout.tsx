@@ -26,13 +26,19 @@ export function MainLayout() {
   const { t } = useTranslation()
   /** 连接态：与上下文栏、侧栏底部同源（BUG-087，唯一来源 `store/connState.ts`） */
   const connState = useConnState()
-  const { downloads, init, setDaemon, setDaemonAlive, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, accounts, viewer, setViewerIndex, closeViewer, tgEnabled, tgAvailability, refreshTgSession } = useStore()
+  const { downloads, init, setDaemon, setDaemonAlive, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, viewer, setViewerIndex, closeViewer, tgEnabled, tgAvailability, refreshTgSession } = useStore()
 
   /** TG 入口级门控（用户裁定：常规 TG 开关控制整个 TG 内容）：
-   *  开关关 OR 探测到不可用/不可达 → 侧栏 TG 导航与账号页 TG 绑定整体隐藏；
+   *  开关关 OR orig-tg 进程不可达 → 侧栏 TG 导航整体隐藏；
    *  面板级故障卡只作保底回退。`tgAvailability === null` 为探测未返回的瞬态，
-   *  按 ready 处理避免首帧闪烁（探测毫秒级，init() 挂载即触发）。 */
-  const tgFeatureReady = tgEnabled && (tgAvailability === null || tgAvailability.status === 'ok')
+   *  按 ready 处理避免首帧闪烁（探测毫秒级，init() 挂载即触发）。
+   *
+   *  **「服务可用」= orig-tg 进程可达**（BUG-094）：只有 `unreachable`（连进程都
+   *  够不到）才算服务不在；`unavailable`（进程活着、连不上 Telegram）恰恰是最需要
+   *  让用户进来修的场景（改代理 / 重新登录），把它判成「功能不存在」而隐藏入口，
+   *  就等于把唯一的修复入口一起藏掉。 */
+  const tgFeatureReady =
+    tgEnabled && (tgAvailability === null || tgAvailability.status !== 'unreachable')
 
   useEffect(() => {
     init()
@@ -62,17 +68,16 @@ export function MainLayout() {
     return () => clearInterval(timer)
   }, [init, refresh, setDaemon, setDaemonAlive])
 
-  // TG 未绑定时，若当前停留在 TG 视图则退回全部下载（由登录绑定态驱动，非插件开关）
-  useEffect(() => {
-    if (!accounts.tg.bound && view === 'tg') setView('all')
-  }, [accounts.tg.bound, view])
-
-  // 功能被摘除时（开关关 / 探测到不可用）把用户从 TG 视图送回全部下载，
+  // 服务被摘除时（开关关 / orig-tg 进程不可达）把用户从 TG 视图送回全部下载，
   // 避免停留在已被门控隐藏的面板上。探测未返回（null）不算不可用。
+  //
+  // 注意：**未绑定不再弹回**（BUG-094）。此前还有一段「未绑定 → 退回 all」，
+  // 它与「服务可用即显示」的新门控直接冲突：入口放行了，进来又被弹走，等于没改；
+  // 而 `unavailable`（连不上 Telegram）正是必须让用户留下来修的状态。
   useEffect(() => {
     if (view !== 'tg') return
-    const unavailable = tgAvailability !== null && tgAvailability.status !== 'ok'
-    if (!tgEnabled || unavailable) setView('all')
+    const serviceDown = tgAvailability !== null && tgAvailability.status === 'unreachable'
+    if (!tgEnabled || serviceDown) setView('all')
   }, [tgEnabled, tgAvailability, view])
 
   // TG 开关变化时重探测可用性：开启侧 daemon 拉起 orig-tg 需要时间，最多重试 5 次；
@@ -155,6 +160,11 @@ export function MainLayout() {
   const handlePauseAll = useEvent(() => void pauseAll().catch(() => {}))
   const handleResumeAll = useEvent(() => void resumeAll().catch(() => {}))
   const handleClearCompleted = useEvent(() => void clearCompleted().catch(() => {}))
+  /**
+   * TG 未绑定引导区的出口：跳到设置页（→ 账号 Tab）复用已有的绑定入口。
+   * 不在此处另起一套登录流程 —— 登录表单归 `AccountsPanel`，只有一份实现。
+   */
+  const handleGoAccounts = useEvent(() => handleView('settings'))
 
   /**
    * 档位过滤（BUG-082）：下载四档与 `download.status` 七态一一对应，
@@ -211,7 +221,6 @@ export function MainLayout() {
             failed: failed.length,
             total: downloads.length,
           }}
-          tgBound={accounts.tg.bound}
           tgReady={tgFeatureReady}
         />
 
@@ -249,7 +258,7 @@ export function MainLayout() {
               <SettingsPanel />
             ) : view === 'tg' ? (
               <ErrorBoundary>
-                <TgPanel />
+                <TgPanel onOpenAccounts={handleGoAccounts} />
               </ErrorBoundary>
             ) : view === 'media' ? (
               <ErrorBoundary>
