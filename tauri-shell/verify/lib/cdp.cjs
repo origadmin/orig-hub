@@ -684,11 +684,34 @@ async function launch(options = {}) {
     } catch (_err) {
       // Process already dead.
     }
+    // A failed launch used to leak the temp profile directory forever. Remove it
+    // here too: `force: true` keeps a locked/absent directory from throwing and
+    // masking the original launch error.
+    try {
+      fs.rmSync(userDataDir, { recursive: true, force: true })
+    } catch (_err) {
+      // Best effort: never let cleanup replace the real failure reason.
+    }
     throw err
   }
 
-  const conn = new CdpConnection(version.webSocketDebuggerUrl)
-  await conn.connect()
+  let conn
+  try {
+    conn = new CdpConnection(version.webSocketDebuggerUrl)
+    await conn.connect()
+  } catch (err) {
+    try {
+      proc.kill()
+    } catch (_err) {
+      // Process already dead.
+    }
+    try {
+      fs.rmSync(userDataDir, { recursive: true, force: true })
+    } catch (_err) {
+      // Best effort cleanup.
+    }
+    throw err
+  }
   return new Browser({ proc, conn, port, executable, userDataDir, version })
 }
 

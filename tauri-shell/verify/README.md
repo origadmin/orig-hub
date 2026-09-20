@@ -29,8 +29,14 @@
 
 > 端口说明：daemon 的 CORS 白名单按 origin 收口，**只有规范开发源 `http://127.0.0.1:5180`**
 > 能正常访问后端。用别的端口起 dev server（例如 5199）会因 CORS 预检失败而刷出
-> `Access to fetch ... blocked by CORS policy` —— 那是预期行为，不是前端缺陷。
-> 因此 `verify:ui` 默认且应当指向 5180。
+> `Access to fetch ... blocked by CORS policy` 及其伴随的 `net::ERR_FAILED`。
+>
+> 这类 **CORS 噪音不会让验收 FAIL**（UI 本身渲染是好的），但**也不会被静默吞掉**：
+> 会以 `--- WARNINGS ---` 逐条打印，并提示「daemon 按 origin 收口，请用 5180」。
+> 豁免范围**仅限**被 CORS 拦截的那个 host 上的请求失败 —— 应用自身 origin 或 CDN 上
+> 真实的资源加载失败照样 FAIL。
+>
+> 所以：`verify:ui` 默认且应当指向 5180；看到 CORS warning 就说明端口不对，后端数据没连上。
 
 ---
 
@@ -51,8 +57,17 @@ ORIG_VERIFY_OUT=<临时目录> npm run verify:ui        # 指定产物目录
   `C:/Program Files/Microsoft/Edge/Application/msedge.exe` → Chrome 路径 → 平台默认路径。
 - 调试端口**随机探测空闲端口**（不硬编码 9333，避免并行跑互相抢占），
   轮询 `/json/version` 直到就绪，超时报错退出（不静默挂起）；`close()` 必杀进程树（不留孤儿）。
-- 断言的是**JS 执行后**的 DOM，不是 HTTP 状态码。退出码：`0` 全通过 / `1` 有断言失败 /
-  `2` 环境问题（找不到浏览器、dev server 不可达）。
+- 断言的是**JS 执行后**的 DOM，不是 HTTP 状态码。
+- **退出码语义（两类失败严格分开，别搞混）**：
+  | 退出码 | 含义 | 典型文案 |
+  |---|---|---|
+  | `0` | 全部断言通过 | `RESULT: PASS` |
+  | `1` | **被测页面有问题** —— 断言失败 | `#root has 0 children (app did not mount / white screen)` |
+  | `2` | **环境/通道有问题** —— 浏览器找不到、dev server 不可达、导航失败 | `dev server unreachable` |
+- **白屏属于 `1`，不属于 `2`**：返回 200 但 `#root` 为空（React 未挂载）是本工具最核心的失败模式，
+  必须报成断言失败。若被归到 `2`（环境问题），排查方向会被彻底带偏。
+  导航阶段因此**不等待** `#root`，挂载情况由独立断言项判定。
+- 失败路径也会先打印已记录的 PASS/FAIL 清单，再退出 —— 不会只甩一个 stack。
 
 断言项（20 项）：`#root` 存在且有子节点、`body.innerText` 非空、
 无 `vite-error-overlay` / `Failed to resolve` / `Uncaught`、无未捕获异常、无 console error
@@ -108,6 +123,8 @@ node verify/shot_context_bar.cjs
 | 页面白屏 | `dev server 200` 但 `#root` 子节点为 0 | `npm install` 补 `@babel/core` |
 | `Failed to resolve import` | DOM 文本里出现该串 | 同上（依赖不完整，非源码缺陷） |
 | `net::ERR_CONNECTION_REFUSED` | dev server 没起 | `npm run dev` |
-| CORS 刷屏 | 端口不是 5180 | 回到 5180 |
+| CORS warning 刷屏 | 端口不是 5180 | 回到 5180（不 FAIL，但后端数据没连上，验收不充分） |
+| `RESULT: FAIL` 且含 `white screen` | 200 但 React 未挂载 | 查依赖是否装全（`@babel/core`）、控制台报错；**这是页面问题不是环境问题** |
+| `RESULT: UNREACHABLE (exit 2)` | 端口无监听 / 浏览器起不来 | `npm run dev`；或设 `EDGE_PATH` |
 | 找不到浏览器 | `CDP: no local Edge/Chrome found` | 设 `EDGE_PATH` 指向本机 Edge |
 | 浏览器起不来 | DevTools 超时 | 确认没有残留 `--remote-debugging-port` 实例占端口 |
