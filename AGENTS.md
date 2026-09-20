@@ -35,9 +35,31 @@
 
 ## 4. 分支模型
 
+> **铁律（用户 2026-09-21 裁定，优先级高于本节其余条款）：**
+> **远端 `origin/main` 是唯一源。所有开发与所有分支，必须、且只允许从远端 main 出去。**
+> 本地不另立基准、不长期持有分叉分支、不以本地分支作为交付依据。
+
 - 主分支 `main`，保护分支，禁止直接 force。
-- 临时工作用 `feature/xxx`，合并后删除。
+- **开工前先对齐远端**：`git fetch origin` 且以 `origin/main` 为准比对，确认本地在远端之上线性前进（`git rev-list --left-right --count origin/main...main` 左列必须为 0），再动手。
+- **交付 = 提交进本地 main + 普通 push 到 origin/main**（fast-forward）。禁止 `push --force` 之外的任何绕过；确需重写历史时须显式授权，并先建墓碑引用。
+- 不做长期分叉分支：临时工作若开 `feature/xxx`，必须当日合回 main 并删除。**禁止在本地留备份分支充当「第二基准」**（`backup-before-cr-clean`、`backup/pre-fix-*` 这类一律不留——需要可逆性请用 tag 墓碑，不用分支）。
 - 禁止保留 `go-backup` / `backup/original-main` 这类迁移残留分支（待清理确认）。
+
+### 4.1 「本地与远端不一致」的排查顺序（先取证，勿重写历史）
+
+现象为「main 脱离 remote / 项目归零」时，**先按此顺序取证，绝大多数是引用陈旧而非代码丢失**：
+
+1. `git ls-remote origin refs/heads/main` —— 远端**真实**值。
+2. `git rev-parse HEAD` —— 本地值。
+3. `git rev-parse origin/main` —— 本地**跟踪引用**（可能是幽灵旧值）。
+4. `git rev-list --left-right --count origin/main...main` —— 左右两列是否都为 0。
+5. `git rev-parse --abbrev-ref main@{upstream}` —— **upstream 是否配置**（未配置时 IDE 里会显示成「脱离」，但代码并未脱离）。
+
+修复手段（**均不触碰对象库、不丢代码**）：
+
+- 跟踪引用陈旧 → 直接改 `.git/packed-refs` 中对应行（本环境 `refs/remotes/**` 写入会被静默拦截，`git fetch` / `git update-ref` 可能退出码 0 却不生效，**改完必须回读校验**）。
+- upstream 缺失 → `git branch --set-upstream-to=origin/main main`。
+- 只有远端确实缺少本地提交时才 push；本地落后时才 pull/merge。**任何一步都不需要 force。**
 
 ## 5. 代码层约束
 
