@@ -185,21 +185,36 @@ export function Sidebar({
               {FolderIcon}
             </button>
           ) : (
-            <div className="flex w-full items-center gap-1.5 rounded-md px-2.5 py-2 text-sm">
+            /*
+             * 「全部文件」= **一个视觉单元、两个独立动作**。
+             *
+             * 容器承担 hover/选中底色与左右留白，metrics 与同列导航行完全一致
+             * （`px-2.5 py-2` + `gap-2.5`）—— 于是 folder 图标左缘、计数徽标右缘
+             * 与下方 媒体库/TG/设置 三行严格对齐（此前内层按钮额外 `px-1 py-1`，
+             * 图标被推到 14px 而兄弟行是 10px，这就是「留白不一致」）。
+             *
+             * 文字区只切视图、chevron 只翻转子菜单，两者状态**仍完全解耦**
+             * （曾因混入 setCatOpen 变成杂交体）；但底色只画在容器上，hover 靠 CSS
+             * `:hover` 冒泡覆盖整行 —— 不再是两块各自发亮的独立按钮（「脱离」）。
+             */
+            <div
+              data-testid="all-files-row"
+              className={cn(
+                'flex w-full items-center rounded-md px-2.5 py-2 text-sm transition-all duration-200',
+                allActive
+                  ? 'bg-accent/15 text-accent'
+                  : 'text-fg-soft hover:bg-surface-2 hover:text-fg-mid',
+              )}
+            >
               <button
                 onClick={handleSelectAll}
                 title={t('nav.all')}
-                className={cn(
-                  'flex min-w-0 flex-1 items-center gap-2.5 rounded-md px-1 py-1 text-left transition-all duration-200',
-                  allActive
-                    ? 'bg-accent/15 text-accent'
-                    : 'text-fg-soft hover:bg-surface-2 hover:text-fg-mid',
-                )}
+                className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
               >
                 <span className="shrink-0">{FolderIcon}</span>
                 <span className="flex-1 truncate text-left">{t('nav.all')}</span>
                 {counts.total > 0 && (
-                  <span className="rounded-full bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-fg-soft">
+                  <span className="shrink-0 rounded-full bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-fg-soft">
                     {counts.total}
                   </span>
                 )}
@@ -208,8 +223,9 @@ export function Sidebar({
                 onClick={handleToggle}
                 title={t('sidebar.toggleCategories')}
                 aria-label={t('sidebar.toggleCategories')}
+                aria-expanded={catOpen}
                 data-testid="category-chevron"
-                className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid"
+                className="ml-1.5 flex h-5 w-5 shrink-0 items-center justify-center rounded text-current opacity-60 transition-all duration-200 hover:opacity-100"
               >
                 <span className={cn('transition-transform duration-200', catOpen && 'rotate-90')}>
                   {ChevronIcon}
@@ -262,6 +278,7 @@ export function Sidebar({
               key={item.id}
               onClick={() => onViewChange(item.id)}
               title={t(item.labelKey)}
+              data-testid={`nav-${item.id}`}
               className={cn(
                 'flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-sm transition-all duration-200',
                 collapsed && 'justify-center px-0',

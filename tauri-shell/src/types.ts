@@ -298,6 +298,12 @@ export interface ViewerItem {
   messageId: number
   kind: 'photo' | 'video' | 'audio' | 'file'
   caption?: string | null
+  /**
+   * 介绍（媒体库条目用）。与 `caption` 的分工：`caption` 是 TG 消息流的原文，
+   * `description` 是媒体库条目的介绍字段。两者都有时优先显示 `description` ——
+   * 媒体库里的「标题」在返回行，正文必须在正文位，否则同一个标题会显示两遍。
+   */
+  description?: string | null
   /** 首选媒体地址（已缓存走本地流，未缓存走在线流） */
   src: string
   /** 降级地址（首选失败时回退一次，如本地缺失回退在线流） */

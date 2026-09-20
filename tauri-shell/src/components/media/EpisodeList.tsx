@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef } from 'react'
-import { Image as ImageIcon, ListVideo, Play } from 'lucide-react'
+import { Image as ImageIcon, ListVideo } from 'lucide-react'
 import type { MediaEpisode } from '../../api/media'
 import { cn } from '../../lib/utils'
-import { fmtDuration, isRawFileName } from '../../lib/tgmedia'
+import { fmtDuration } from '../../lib/tgmedia'
 import { useTranslation } from '../../i18n'
 import { sortEpisodes } from '../../hooks/useSeriesDetail'
 
@@ -21,6 +21,10 @@ import { sortEpisodes } from '../../hooks/useSeriesDetail'
  * 点击某集 → 回调 `onSelect(itemId)`，由调用方定位。
  * 若目标项不在当前列表内，通过 `isSelectable` 判定为**显式禁用**：
  * 点了没反应的控件比禁用态更让人困惑。
+ *
+ * 行尾**不挂任何播放图标**：当前集已由「强调色底 + 强调色标题 + 序号徽标反色」表达，
+ * 再挂一个 ▶ 只会让人以为那是「点这里播放本集」的按钮 —— 而当前集本来就在播，
+ * 点它什么也不会发生。看得见却按不动的控件是纯误导，故不表达。
  */
 export interface EpisodeListProps {
   /** 剧集标题 */
@@ -138,13 +142,11 @@ export function EpisodeList({
             const enabled = isSelectable ? isSelectable(ep.itemId) : true
             const isPhoto = ep.kind === 'photo'
             const seq = seqNo.get(ep.itemId)
+            // 标题直接取分集字段 —— 后端已把它收敛为「所指向条目的标题」，
+            // 这里不再有 `ep.title || ep.itemTitle` 的兜底链（两个名字的来源）。
             const label =
               ep.title ||
-              (isPhoto
-                ? t('player.photoEp', { n: seq?.pos ?? 1 })
-                : isRawFileName(ep.itemTitle)
-                  ? ''
-                  : ep.itemTitle) ||
+              (isPhoto ? t('player.photoEp', { n: seq?.pos ?? 1 }) : '') ||
               `#${ep.itemId}`
             return (
               <button
@@ -190,7 +192,7 @@ export function EpisodeList({
                       'block truncate text-[12px] leading-snug',
                       active ? 'font-medium text-accent' : 'text-fg-strong',
                     )}
-                    title={ep.title || ep.itemTitle || ''}
+                    title={ep.title || ''}
                   >
                     {label}
                   </span>
@@ -217,13 +219,6 @@ export function EpisodeList({
                     )}
                   </span>
                 </span>
-
-                {active &&
-                  (isPhoto ? (
-                    <ImageIcon className="mt-1 h-3.5 w-3.5 shrink-0 text-accent" />
-                  ) : (
-                    <Play className="mt-1 h-3.5 w-3.5 shrink-0 fill-accent text-accent" />
-                  ))}
               </button>
             )
           })}

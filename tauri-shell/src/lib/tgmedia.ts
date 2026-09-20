@@ -60,3 +60,80 @@ export function fmtDuration(sec?: number): string {
 export function isRawFileName(s?: string | null): boolean {
   return !!s && /^[a-z]+--\d+_\d+/i.test(s.trim())
 }
+
+/**
+ * 图片「完整显示、不裁切」的唯一判定点（铺满 vs 完整的分界）。
+ *
+ * - `photo` → `object-contain`：**图片是内容本身**，裁掉边缘就是丢内容（用户报的
+ *   「图片被截取」）。容器按固定几何排布，图片以留白换取完整。
+ * - 其他（视频抽帧 / 音频 / 文档）→ `object-cover`：封面只是**指代**，裁切不影响
+ *   信息量，且铺满更像海报墙。
+ *
+ * 单一函数而非各处散写三元：媒体类型判定是规则（type 是规则不是约定），
+ * 分散写必然出现「某个角落还在 cover」的漏网之鱼。
+ */
+export function coverFit(kind?: string | null): string {
+  return kind === 'photo' ? 'object-contain' : 'object-cover'
+}
+
+/** 相册宫格最多平铺的格子数（超出部分折进最后一格的 `+N`，与原图浏览页互补） */
+export const ALBUM_MAX_TILES = 9
+
+/**
+ * 相册宫格列数：按图片数量自适应（参照 TG 相册排版）。
+ *
+ * 1 → 单图（自然比例整幅）
+ * 2 → 2 列（并排）
+ * 3 → 3 列（一行）
+ * 4 → 2 列（2×2）
+ * 5/6 → 3 列（3+2 / 3+3，即 5、6 宫格）
+ * 7/8/9 → 3 列（3+3+1 / 3+3+2 / 3×3，即 7、8、9 宫格）
+ *
+ * 4 特意回到 2 列：3 列排 4 张会得到「3+1」的瘸腿行，而 2×2 是 4 图的自然形态。
+ */
+export function albumGridCols(n: number): 1 | 2 | 3 {
+  if (n <= 1) return 1
+  if (n === 2 || n === 4) return 2
+  return 3
+}
+
+/** 相册宫格列数 → Tailwind 类（避免动态类名被 JIT 扫不到） */
+export function albumGridClass(n: number): string {
+  const c = albumGridCols(n)
+  return c === 1 ? 'grid-cols-1' : c === 2 ? 'grid-cols-2' : 'grid-cols-3'
+}
+
+/** TG 来源标识 `chat:msg` → 频道号 + 消息号；格式不符返回 `null`（不猜、不兜底成 0）。 */
+export function parseTgRef(ref?: string | null): { chatId: number; messageId: number } | null {
+  if (!ref) return null
+  const i = ref.indexOf(':')
+  if (i <= 0 || i === ref.length - 1) return null
+  const chatId = Number(ref.slice(0, i))
+  const messageId = Number(ref.slice(i + 1))
+  if (!Number.isFinite(chatId) || !Number.isFinite(messageId)) return null
+  return { chatId, messageId }
+}
+
+/**
+ * 这条内容**当前有没有字节可播**（BUG-080）。
+ *
+ * 清缓存只删字节、留条目：条目仍在资料库与剧集里，外观却与正常内容一模一样，
+ * 点下去 `GET /api/media/items/:id/raw` 返回 404 —— 静默播不了。有没有字节是**事实态**，
+ * 必须由展示层如实呈现，而不是让一个长得能点的按钮去 404。
+ *
+ * 判据优先级：
+ *   1. TG 图片**不落盘**（BUG-049）：raw 端点现场代理 TG 缩略图字节，
+ *      `file_path` 为空也能显示 —— 那是「没有本地副本」，不是「丢失」；
+ *   2. 后端下发的 `hasBytes`（分集视图；条目视图改看 `filePath`）；
+ *   3. 有落盘路径即有字节。
+ */
+export function hasMediaBytes(item: {
+  kind?: string | null
+  source?: string | null
+  filePath?: string | null
+  hasBytes?: boolean | null
+}): boolean {
+  if (item.source === 'tg' && item.kind === 'photo') return true
+  if (item.hasBytes != null) return item.hasBytes
+  return Boolean(item.filePath)
+}

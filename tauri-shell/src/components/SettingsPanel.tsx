@@ -8,9 +8,11 @@ import { DirectoryPicker } from './DirectoryPicker'
 import { InterfacePickerDialog, type InterfaceSelection } from './InterfacePickerDialog'
 import { AccountsPanel } from './AccountsPanel'
 import { getConfig, listInterfaces, saveClassifyConfig, saveProxyConfig, verifyProxy } from '../api/daemon'
-import { clearTgCache } from '../api/tg'
+import { getCacheClearPreview, getCacheStats } from '../api/tg'
+import { CacheManagerDialog } from './CacheManagerDialog'
 import { useStore } from '../store/useStore'
 import { useTranslation } from '../i18n'
+import { fmtSize } from '../lib/tgmedia'
 import { cn } from '../lib/utils'
 
 type SettingsTab = 'general' | 'downloads' | 'network' | 'proxy' | 'accounts' | 'about'
@@ -103,10 +105,25 @@ export function SettingsPanel() {
   // 分类规则保存状态
   const [classifyBusy, setClassifyBusy] = useState(false)
   const [classifyErr, setClassifyErr] = useState<string | null>(null)
-  // 清理 TG 缓存状态
-  const [clearBusy, setClearBusy] = useState(false)
-  const [clearMsg, setClearMsg] = useState<string | null>(null)
-  const [clearOk, setClearOk] = useState(false)
+  // 缓存清理：只读占用读数 + 「有没有可清理的东西」判据 + 清理中心开关
+  const [cacheUsage, setCacheUsage] = useState<{ files: number; bytes: number } | null>(null)
+  /** 孤儿字节：`stats.bytes` 只统计**条目背书**的字节，孤儿不在其中。不写出来的话
+   *  「当前占用 850 MB」旁边其实还躺着 1.1 GB 可清理字节 —— 读数低估会让人错过清理。 */
+  const [orphanBytes, setOrphanBytes] = useState(0)
+  /** 可清理条目数（缓存条目 + 孤儿文件）。0 时入口禁用 —— 不让用户点开一个空面板 */
+  const [clearableCount, setClearableCount] = useState(0)
+  /**
+   * 判据是否已读回。**未就绪 ≠ 无可清**：两者都是「暂时点不了」，但含义相反 ——
+   * 未就绪时禁用等于在「正在读取占用…」旁边挂一个灰按钮，直接谎报「没什么可清」。
+   * 所以禁用只在**读完且确实为 0** 时生效（多余的一次点击由面板内的空态承接）。
+   */
+  const [cacheUsageLoaded, setCacheUsageLoaded] = useState(false)
+  const [cacheManagerOpen, setCacheManagerOpen] = useState(false)
+
+  // 缓存占用：进设置页读一次（不轮询 —— 它只在清理前后变化，轮询是白耗）
+  useEffect(() => {
+    void refreshCacheUsage()
+  }, [])
 
   // 代理配置编辑态
   const [proxyMode, setProxyMode] = useState<'direct' | 'system' | 'custom'>('direct')
@@ -211,20 +228,33 @@ export function SettingsPanel() {
     }
   }
 
-  /** 清理 TG 缓存（缩略图/临时媒体）：二次确认 + 结果提示 */
-  const handleClearCache = async () => {
-    if (!window.confirm(t('tg.clearCacheConfirm'))) return
-    setClearBusy(true)
-    setClearMsg(null)
+  /**
+   * 「清除缓存文件」现在是**入口**，不是动作（BUG-059）。
+   *
+   * 此前点一下就把下载目录内全部缓存字节清光：粒度只有「全清」一档，
+   * 于是最危险的档位被直接摆在一个按钮下面（要么不动、要么全动）。
+   * 现在点击打开清理中心（落在「缓存字节」页签），先给分档预览 ——
+   * 条目数与字节、孤儿文件、外部文件多少不参与 —— 由用户按档或多选后再执行。
+   *
+   * 清理能力只有一个家（缓存管理面板），设置页只是另一个门：两处入口两套实现
+   * 必然各自漂移，最终变成「同一个动作两个说法」。
+   */
+
+  /** 拉一次缓存占用 + 可清理量（进设置页时 + 清理后各一次，不轮询） */
+  const refreshCacheUsage = async () => {
     try {
-      await clearTgCache()
-      setClearOk(true)
-      setClearMsg(t('tg.clearCacheDone'))
-    } catch (e) {
-      setClearOk(false)
-      setClearMsg(`${t('tg.clearCacheFail')}${e instanceof Error ? e.message : String(e)}`)
+      const [st, pv] = await Promise.all([getCacheStats(), getCacheClearPreview()])
+      setCacheUsage({ files: st.files ?? 0, bytes: st.bytes ?? 0 })
+      setOrphanBytes(pv.orphan?.bytes ?? 0)
+      // 判据取「缓存条目 + 孤儿」而不是只看占用：只剩孤儿文件时占用可能显示很小，
+      // 但那确实是**可清理**的字节，禁用入口等于谎报「没什么可清」。
+      setClearableCount((pv.total?.count ?? 0) + (pv.orphan?.count ?? 0))
+    } catch {
+      setCacheUsage(null)
+      setOrphanBytes(0)
+      setClearableCount(0)
     } finally {
-      setClearBusy(false)
+      setCacheUsageLoaded(true)
     }
   }
 
@@ -344,6 +374,7 @@ export function SettingsPanel() {
             <button
               key={tab.id}
               onClick={() => setActiveTab(tab.id)}
+              data-testid={`settings-tab-${tab.id}`}
               className={cn(
                 'flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors',
                 activeTab === tab.id
@@ -825,29 +856,43 @@ export function SettingsPanel() {
 
                   <div className="mt-3 flex items-center justify-between gap-4 rounded-lg bg-surface-2/40 px-3 py-2.5">
                     <div className="min-w-0">
-                      <p className="text-[13px] font-medium text-fg-strong">{t('tg.clearCache')}</p>
-                      <p className="mt-0.5 text-[11px] text-muted">{t('tg.clearCacheHint')}</p>
+                      <p className="text-[13px] font-medium text-fg-strong">
+                        {t('tg.clearCacheFile')}
+                      </p>
+                      <p className="mt-0.5 text-[11px] text-muted">{t('tg.clearCacheFileHint')}</p>
+                      {/* 占用读数与按钮同屏：释放磁盘不可逆，盲操作不可接受 */}
+                      <p className="mt-0.5 text-[11px] text-muted" data-testid="clear-cache-usage">
+                        {cacheUsage
+                          ? t('tg.clearCacheUsage', {
+                              size: fmtSize(cacheUsage.bytes),
+                              n: cacheUsage.files,
+                            })
+                          : t('tg.clearCacheUsageUnknown')}
+                        {/* 孤儿字节单独如实报出：它是**可清理**的，但不计入 stats.bytes
+                            （stats 只算条目背书的字节）。漏了就是读数低估。 */}
+                        {orphanBytes > 0 ? (
+                          <span data-testid="clear-cache-orphan-hint">
+                            {' '}
+                            {t('tg.clearCacheUsageOrphan', { size: fmtSize(orphanBytes) })}
+                          </span>
+                        ) : null}
+                      </p>
                     </div>
                     <Button
                       variant="secondary"
                       size="sm"
                       className="shrink-0"
-                      disabled={clearBusy}
-                      onClick={handleClearCache}
+                      // 无可清理内容时禁用：点开一个空面板只会让人以为功能坏了。
+                      // 但**读回判据之前不禁用** —— 那时「正在读取占用…」与灰按钮同屏，
+                      // 等于谎报「没什么可清」（转瞬即逝，却正是用户第一眼看到的那一帧）。
+                      disabled={cacheUsageLoaded && clearableCount === 0}
+                      onClick={() => setCacheManagerOpen(true)}
+                      data-testid="clear-cache-files"
+                      title={t('tg.bytesOpenManager')}
                     >
-                      {clearBusy ? t('settings.saving') : t('tg.clearCache')}
+                      {t('tg.clearCacheFile')}
                     </Button>
                   </div>
-                  {clearMsg && (
-                    <p
-                      className={cn(
-                        'mt-1.5 text-[11px]',
-                        clearOk ? 'text-success' : 'text-danger',
-                      )}
-                    >
-                      {clearMsg}
-                    </p>
-                  )}
                 </div>
 
                 <div className="h-px bg-border-subtle/60" />
@@ -939,6 +984,19 @@ export function SettingsPanel() {
         selected={sel}
         onConfirm={(s) => setSel(s)}
       />
+
+      {/*
+       * 清理中心：设置页只是**入口**，落在「缓存字节」页签（BUG-059）。
+       * 清理能力只此一份实现 —— 设置页与缓存管理面板共享同一个面板，
+       * 两处各写一套必然漂移成「同一个动作两个说法」。
+       */}
+      {cacheManagerOpen ? (
+        <CacheManagerDialog
+          initialView="bytes"
+          onClose={() => setCacheManagerOpen(false)}
+          onTasksChanged={() => void refreshCacheUsage()}
+        />
+      ) : null}
     </div>
   )
 }

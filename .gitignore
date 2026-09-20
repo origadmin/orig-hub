@@ -9,6 +9,8 @@
 node_modules/
 dist/
 dist-ssr/
+# 验证/CI 用的备用构建输出名（dist_check / dist_ci / dist_probe …）：`dist/` 匹配不到它们
+tauri-shell/dist_*/
 .vite/
 *.local
 
@@ -25,6 +27,8 @@ tauri-shell/src-tauri/binaries/
 /data/
 *.orighub
 *.db
+# TG 会话文件（等同密码凭证），由 tg_data_dir() 落到用户数据目录；仓内出现即裸跑残留
+*.session
 proxy-test-file.bin
 coverage/
 verify_shots/
@@ -41,6 +45,7 @@ logs/
 .claude/
 .trae/
 .workbuddy/
+.workbuddy-ai/
 .agents/
 .agent/
 .cursor/

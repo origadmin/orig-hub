@@ -101,7 +101,14 @@ interface DownloadState {
   error: string | null
   /** 全局瞬时提示（toast）：按钮/操作失败时的用户可见反馈，避免“点击无反应” */
   toast: string | null
-  /** 全局媒体播放器（模块无关）：打开时整个内容区切换为播放器页（不带任何模块信息），TG/媒体库共用 */
+  /**
+   * 全局媒体播放器（模块无关）：打开时整个内容区切换为播放器页（不带任何模块信息），TG/媒体库共用。
+   *
+   * **播放页是只读的**：它只负责看，不提供任何编辑入口。曾经这里有个 `editable`
+   * 标志让播放页弹出条目的编辑框，结果是一排「看着能改」的控件落在「正在看片」的
+   * 上下文里 —— 改标题/介绍是**整理资料库**的动作，归媒体库（卡片、剧集分集面板），
+   * 那里才看得到归属、排序与影响面。
+   */
   viewer: { items: ViewerItem[]; index: number; title?: string } | null
   openViewer: (v: { items: ViewerItem[]; index: number; title?: string }) => void
   setViewerIndex: (i: number) => void
@@ -387,8 +394,10 @@ export const useStore = create<DownloadState>((set, get) => ({
     try {
       session = await getTgSession()
     } catch (e) {
+      // 后台可用性探测失败（orig-tg 未运行 / 离线调试）：仅记录状态，不弹红色错误 toast——
+      // 网页调试阶段 orig-tg 本就可能离线，弹「503 / fetch failed」会让调试环境变成错误环境。
+      // 状态仍可见（侧栏据此隐藏 TG），故障并未被掩盖。
       set({ tgAvailability: { status: 'unreachable' } })
-      get().setError(e instanceof Error ? e.message : String(e))
       return
     }
     if (session?.available === false) {

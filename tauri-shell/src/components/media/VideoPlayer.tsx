@@ -118,8 +118,9 @@ export function VideoPlayer({
   const [fatal, setFatal] = useState(false)
   const [fellBack, setFellBack] = useState(false)
 
-  /** 视频轨解不出来 / 解码吃力 —— 两类 onError 抓不到的静默失败（BUG-034） */
-  const decode = useDecodeHealth(videoRef)
+  /** 视频轨解不出来 / 解码吃力 —— 两类 onError 抓不到的静默失败（BUG-034）。
+   *  换源或改倍速都重设基线：倍速变化会改变所需解码吞吐，旧账不能算到新状态上（BUG-053）。 */
+  const decode = useDecodeHealth(videoRef, `${src}|${playbackRate}`)
 
   const effectiveVolume = isMuted ? 0 : volume
 

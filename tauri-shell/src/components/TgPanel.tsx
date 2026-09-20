@@ -13,6 +13,7 @@ import {
   addTgMonitoredChannel,
   removeTgMonitoredChannel,
   listTgMonitorMessages,
+  searchTgMonitorMessages,
   listTgMessages,
   listTgDownloaded,
   syncTgMonitor,
@@ -23,6 +24,7 @@ import {
   enqueueCacheTask,
   cancelCacheTask,
 } from '../api/tg'
+import { findMediaItemIdByRef, importMediaItems } from '../api/media'
 import type {
   TgCacheTask,
   TgChannel,
@@ -33,7 +35,16 @@ import type {
 import { ensureTg, tgSaveConfig } from '../api/tauri'
 import { CacheManagerDialog } from './CacheManagerDialog'
 import { useStore } from '../store/useStore'
-import { fmtDuration, fmtSize, fmtTime, guessMediaType, type MediaType } from '../lib/tgmedia'
+import {
+  ALBUM_MAX_TILES,
+  albumGridClass,
+  coverFit,
+  fmtDuration,
+  fmtSize,
+  fmtTime,
+  guessMediaType,
+  type MediaType,
+} from '../lib/tgmedia'
 
 /** 未分组的内部键（避免与真实分组标题冲突） */
 const UNGROUPED = '__ungrouped__'
@@ -191,6 +202,12 @@ export function TgPanel() {
    * 明确说出原因，才能把「连不上 Telegram」与「没有内容」区分开（BUG-023）。
    */
   const tgBroken = tgAvailability !== null && tgAvailability.status !== 'ok'
+  /** 调试期离线短路（orig-tg 以 ORIG_TG_OFFLINE=1 启动，跳过 MTProto 连接）：
+   *   预期态，不是故障。渲染成中性「调试模式」面板而非红色错误框，否则网页调试阶段
+   *   一打开 TG 就满屏红错，等于没有调试环境。 */
+  const tgDebugOffline =
+    tgAvailability?.status === 'unavailable' &&
+    /offline debug mode/.test(tgAvailability.reason ?? '')
   const [alive, setAlive] = useState(false)
   const [channels, setChannels] = useState<TgChannel[]>([])
   const [scanning, setScanning] = useState(false)
@@ -208,9 +225,30 @@ export function TgPanel() {
   const [feedLoading, setFeedLoading] = useState(false)
   const [loadingOlder, setLoadingOlder] = useState(false)
   const [hasMore, setHasMore] = useState(false)
+  /** 监控频道新内容：后台增量同步到的未展示条数（点击提示条才刷新，避免拽走滚动位置） */
+  const [pendingNew, setPendingNew] = useState(0)
+  /** 显式刷新信号：提示条点击时触发消息流重载 */
+  const [feedReloadTick, setFeedReloadTick] = useState(0)
+  /**
+   * 监控内容查找（唯一搜索框，在频道标题栏）：跨全部监控频道筛内容。
+   * 输入非空时第二列切换为结果视图（按频道分组）；清空即回到原视图。
+   */
+  const [globalSearchInput, setGlobalSearchInput] = useState('')
+  const [globalSearch, setGlobalSearch] = useState('')
+  const [globalHits, setGlobalHits] = useState<
+    (TgStoredMessage & { channelTitle?: string })[]
+  >([])
+  const [globalSearching, setGlobalSearching] = useState(false)
 
   const [syncing, setSyncing] = useState(false)
   const [downloadedPaths, setDownloadedPaths] = useState<Map<string, string>>(new Map())
+  /**
+   * 图片入库状态（BUG-049 规则：图片不缓存，最多加入媒体库）：
+   * 已入库图片的 ref 集合（`<chatId>:<messageId>`）。feed 变化时对未见过的图片
+   * 逐个 by-ref 查询；查过的记入 photoCheckedRef 不再重复请求。
+   */
+  const [photoLibRefs, setPhotoLibRefs] = useState<Set<string>>(new Set())
+  const photoCheckedRef = useRef<Set<string>>(new Set())
   /**
    * 缓存任务（服务端任务态）：缓存由 orig-tg 的后台 worker 执行并落库，前端只读状态。
    *
@@ -296,8 +334,10 @@ export function TgPanel() {
           return [...map.values()]
         })
         setScanning(scanning)
+        return merged.size
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e))
+        return 0
       }
     },
     [setError],
@@ -308,8 +348,15 @@ export function TgPanel() {
     // 依赖不可用时不做任何拉取：这些请求必然 503，只会刷无谓的错误提示，
     // 而面板已用「不可用 + 原因」把情况说清楚了（BUG-023：避免故障被读成一堆零散报错）。
     if (tgBroken) return
-    // 首屏强制触发一次后台扫描：修复旧缓存中 folder 为 NULL 的历史数据。
-    fetchDialogs(true)
+    // 订阅列表**缓存优先**：频道变化极少，每次进面板都全量扫描既慢又让人迷惑
+    // （「缓存还是实时同步？」）。缓存即所得；只有冷启动（缓存为空）才自动补一次
+    // 扫描，之后一律走「重新扫描订阅」手动刷新。真正的持续监控点是**内容**，
+    // 由监控频道的同步/消息流承担，与这份静态列表解耦。
+    void (async () => {
+      const cached = await fetchDialogs(false)
+      // 冷启动：缓存为空 → 自动补一次后台扫描（后端 total==0 时同样会自扫，双保险）
+      if (cached === 0) void fetchDialogs(true)
+    })()
     listTgMonitoredChannels()
       .then(setMonitoredList)
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
@@ -556,6 +603,69 @@ export function TgPanel() {
 
 
   // v0.4.3：分组内订阅频道可直接点进内容页（在线流浏览）；监控频道仍走本地真列表。
+  // （搜索词为全局状态，切频道时保留——结果视图跨频道，无需串台清理。）
+
+  // 全局监控查找：防抖 300ms → 跨全部监控频道查本地已同步消息
+  useEffect(() => {
+    const h = setTimeout(() => setGlobalSearch(globalSearchInput.trim()), 300)
+    return () => clearTimeout(h)
+  }, [globalSearchInput])
+  useEffect(() => {
+    if (!globalSearch) {
+      setGlobalHits([])
+      setGlobalSearching(false)
+      return
+    }
+    let cancelled = false
+    setGlobalSearching(true)
+    searchTgMonitorMessages(globalSearch)
+      .then((hits) => {
+        if (!cancelled) setGlobalHits(hits)
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
+      })
+      .finally(() => {
+        if (!cancelled) setGlobalSearching(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [globalSearch, setError])
+
+  /** 点全局命中 → 打开预览（已缓存走本地流，未缓存在线流），标题带频道名 */
+  const onGlobalHitPreview = useEvent((hit: TgStoredMessage & { channelTitle?: string }) => {
+    const item: FeedItem = {
+      key: `g-${hit.channelId}-${hit.messageId}`,
+      chatId: hit.channelId,
+      messageId: hit.messageId,
+      caption: hit.caption,
+      mimeType: hit.mimeType,
+      size: hit.size,
+      type: hit.type ?? guessMediaType(hit.mimeType),
+      date: hit.date ?? hit.createdAt,
+      duration: hit.duration,
+      groupId: hit.groupId,
+      downloaded: hit.downloaded,
+    }
+    openViewer({
+      title: hit.channelTitle,
+      index: 0,
+      items: toViewerItems([item]),
+    })
+  })
+
+  /** 命中按频道分组（保持时间倒序的频道首次出现顺序） */
+  const globalGroups = useMemo(() => {
+    const map = new Map<string, typeof globalHits>()
+    for (const h of globalHits) {
+      const k = h.channelTitle || `#${h.channelId}`
+      if (!map.has(k)) map.set(k, [])
+      map.get(k)!.push(h)
+    }
+    return [...map.entries()]
+  }, [globalHits])
+
   useEffect(() => {
     if (selectedId === null) {
       setFeed([])
@@ -570,11 +680,14 @@ export function TgPanel() {
     setFeedLoading(true)
     setFeed([])
     setHasMore(true)
+    setPendingNew(0)
     stickBottomRef.current = true
     void (async () => {
       try {
         if (monitored) {
-          const page = await listTgMonitorMessages(chatId, { limit: PAGE_SIZE })
+          const page = await listTgMonitorMessages(chatId, {
+            limit: PAGE_SIZE,
+          })
           if (cancelled) return
           setFeed(page.items.map(fromStored).reverse())
           setHasMore(page.hasMore)
@@ -595,8 +708,32 @@ export function TgPanel() {
     return () => {
       cancelled = true
     }
-    // monitoredSet 身份随监控列表变化，增删监控后自动重载
-  }, [selectedId, monitoredSet, setError, applyStoredSnapshot])
+    // monitoredSet 身份随监控列表变化，增删监控后自动重载；
+    // feedReloadTick 为提示条点击的显式刷新。
+  }, [selectedId, monitoredSet, feedReloadTick, setError, applyStoredSnapshot])
+
+  // 监控频道内容新鲜度：消息流本地满页即不回网，若没有任何主动同步动作，
+  // 停留在面板里永远看不到新内容（BUG-038）。这里补上「内容即监控点」的主动轮：
+  // 进入监控频道立即触发一轮全局增量同步，停留期间每 60s 一轮；
+  // 同步到新条目不粗暴重载（会拽走滚动位置），累计进「有新内容」提示条。
+  useEffect(() => {
+    if (selectedId === null || !monitoredSet.has(selectedId)) return
+    let cancelled = false
+    const run = async () => {
+      try {
+        const r = await syncTgMonitor()
+        if (!cancelled && r.added > 0) setPendingNew((n) => n + r.added)
+      } catch {
+        // 同步失败不打扰内容浏览（服务不可达时面板顶部已有整体提示）
+      }
+    }
+    void run()
+    const h = setInterval(run, 60_000)
+    return () => {
+      cancelled = true
+      clearInterval(h)
+    }
+  }, [selectedId, monitoredSet])
 
   // 滚到底 / prepend 锚定（在 DOM 更新后同步执行，避免闪烁）。
   useLayoutEffect(() => {
@@ -612,6 +749,31 @@ export function TgPanel() {
       prependAnchorRef.current = null
     }
   }, [feed, feedLoading])
+
+  // BUG-049：feed 里每张未见过的图片查一次「是否已入库」，驱动图片气泡的
+  // 「加入媒体库 / 已入库」状态（图片不缓存，这是图片唯一的落库路径标记）。
+  useEffect(() => {
+    const todos = feed
+      .filter((f) => f.type === 'photo')
+      .map((f) => `${f.chatId}:${f.messageId}`)
+      .filter((r) => !photoCheckedRef.current.has(r))
+    if (todos.length === 0) return
+    let alive = true
+    void (async () => {
+      for (const r of todos) {
+        photoCheckedRef.current.add(r)
+        try {
+          const id = await findMediaItemIdByRef('tg', r)
+          if (alive && id != null) setPhotoLibRefs((prev) => new Set(prev).add(r))
+        } catch {
+          /* 服务不可用：静默，按钮保持可点击 */
+        }
+      }
+    })()
+    return () => {
+      alive = false
+    }
+  }, [feed])
 
   /** 滚到顶部：按当前最旧消息 id 加载更早一页并 prepend */
   const loadOlder = useCallback(async () => {
@@ -779,11 +941,34 @@ export function TgPanel() {
   }
 
   /**
+   * 图片加入媒体库（BUG-049 规则：图片不缓存，最多入库为浏览条目）。
+   * 按 (source=tg, ref) 幂等；条目无本地文件，浏览字节由服务端现场代理缩略图。
+   */
+  const importPhoto = async (item: FeedItem) => {
+    const ref = `${item.chatId}:${item.messageId}`
+    try {
+      await importMediaItems([
+        {
+          source: 'tg',
+          ref,
+          kind: 'photo',
+          title: item.caption?.trim() || undefined,
+          size: item.size ?? undefined,
+        },
+      ])
+      setPhotoLibRefs((prev) => new Set(prev).add(ref))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  /**
    * 稳定回调（useEvent）：子气泡全部 memo 化后，回调引用必须恒定。
    * 子组件回传自己的数据（item / items / index），这里点击时再取最新闭包，
    * 既保住 memo 的浅比较，又不产生陈旧闭包。
    */
   const onBubbleDownload = useEvent((item: FeedItem) => void doDownload(item))
+  const onBubbleImportPhoto = useEvent((item: FeedItem) => void importPhoto(item))
   const onBubbleOpen = useEvent((item: FeedItem) => void openDownloaded(item))
   const onBubblePreview = useEvent((item: FeedItem) =>
     openViewer({
@@ -807,27 +992,46 @@ export function TgPanel() {
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-1 overflow-hidden">
       {tgBroken && tgAvailability ? (
-        /* 依赖故障：说明「为什么用不了」，而不是给一个空列表 */
-        <div className="flex flex-1 items-center justify-center p-6">
-          <div className="w-full max-w-md rounded-lg border border-danger/30 bg-danger/10 p-5">
-            <h3 className="text-[14px] font-semibold text-danger">
-              {tgAvailability.status === 'unreachable'
-                ? t('accounts.tgUnreachable')
-                : t('accounts.tgUnavailable')}
-            </h3>
-            <p className="mt-1 text-[11px] leading-relaxed text-danger/90">
-              {/* 面板内不自带「连接诊断」，故用面板专属文案（不指向账号页才有的区块） */}
-              {tgAvailability.status === 'unreachable'
-                ? t('tg.unreachableHint')
-                : t('tg.unavailableHint')}
-            </p>
-            {tgAvailability.status === 'unavailable' && tgAvailability.reason && (
-              <p className="mt-3 break-all rounded-md bg-surface/60 px-2 py-1.5 font-mono text-[10px] text-danger">
-                {tgAvailability.reason}
+        tgDebugOffline ? (
+          /* 调试期离线：预期态，中性呈现，不报警 */
+          <div className="flex flex-1 items-center justify-center p-6">
+            <div className="w-full max-w-md rounded-lg border border-border-subtle bg-surface/60 p-5">
+              <h3 className="text-[14px] font-semibold text-foreground">
+                {t('tg.debugOfflineTitle')}
+              </h3>
+              <p className="mt-1 text-[11px] leading-relaxed text-muted">
+                {t('tg.debugOfflineHint')}
               </p>
-            )}
+              {tgAvailability.reason && (
+                <p className="mt-3 break-all rounded-md bg-background px-2 py-1.5 font-mono text-[10px] text-muted">
+                  {tgAvailability.reason}
+                </p>
+              )}
+            </div>
           </div>
-        </div>
+        ) : (
+          /* 依赖故障：说明「为什么用不了」，而不是给一个空列表 */
+          <div className="flex flex-1 items-center justify-center p-6">
+            <div className="w-full max-w-md rounded-lg border border-danger/30 bg-danger/10 p-5">
+              <h3 className="text-[14px] font-semibold text-danger">
+                {tgAvailability.status === 'unreachable'
+                  ? t('accounts.tgUnreachable')
+                  : t('accounts.tgUnavailable')}
+              </h3>
+              <p className="mt-1 text-[11px] leading-relaxed text-danger/90">
+                {/* 面板内不自带「连接诊断」，故用面板专属文案（不指向账号页才有的区块） */}
+                {tgAvailability.status === 'unreachable'
+                  ? t('tg.unreachableHint')
+                  : t('tg.unavailableHint')}
+              </p>
+              {tgAvailability.status === 'unavailable' && tgAvailability.reason && (
+                <p className="mt-3 break-all rounded-md bg-surface/60 px-2 py-1.5 font-mono text-[10px] text-danger">
+                  {tgAvailability.reason}
+                </p>
+              )}
+            </div>
+          </div>
+        )
       ) : needConfig && !alive ? (
         /* APP 首启：Telegram 凭证配置（保存后由 Tauri 壳持久化并拉起服务） */
         <div className="flex flex-1 items-center justify-center p-6">
@@ -973,8 +1177,78 @@ export function TgPanel() {
       </aside>
 
       {/* ===== 第二列：分组模式=组内频道列表 / 内容模式=聊天式媒体流（最新在底部） ===== */}
-      <section className="flex min-w-0 flex-1 flex-col bg-surface/20">
-        {!detail && groupMode !== null && activeGroup ? (
+      <section className="relative flex min-w-0 flex-1 flex-col bg-surface/20">
+        {globalSearch ? (
+          <>
+            {/* 全局监控内容查找结果：跨全部监控频道，按频道分组（新→旧混排后归组）。
+                搜索框与频道标题栏是同一个输入（autoFocus 接管焦点，切视图不打断输入）。 */}
+            <header className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-4 py-2.5">
+              <input
+                autoFocus
+                type="search"
+                value={globalSearchInput}
+                onChange={(e) => setGlobalSearchInput(e.target.value)}
+                placeholder={t('tg.globalSearchPlaceholder')}
+                className="h-8 min-w-0 flex-1 rounded-md border border-border-subtle bg-surface-2/60 px-3 text-[12px] text-fg-strong outline-none placeholder:text-muted focus:border-accent/60"
+              />
+              <span className="shrink-0 text-[11px] tabular-nums text-muted">
+                {globalHits.length}
+              </span>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 shrink-0 px-2 text-[11px]"
+                onClick={() => setGlobalSearchInput('')}
+              >
+                {t('tg.globalSearchClear')}
+              </Button>
+            </header>
+            <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
+              {globalSearching ? (
+                <p className="px-2 py-6 text-center text-xs text-muted">{t('tg.searching')}</p>
+              ) : globalGroups.length === 0 ? (
+                <div className="px-4 py-6 text-center">
+                  <p className="text-xs text-muted">{t('tg.searchNoMatch')}</p>
+                  <p className="mt-1 text-[10px] text-muted/80">{t('tg.globalSearchScope')}</p>
+                </div>
+              ) : (
+                globalGroups.map(([title, hits]) => (
+                  <div key={title} className="mb-2">
+                    <p className="sticky top-0 z-10 truncate bg-surface/95 px-2 py-1 text-[10px] font-semibold text-muted backdrop-blur-sm">
+                      {title} · {hits.length}
+                    </p>
+                    {hits.map((hit) => {
+                      const typ = hit.type ?? guessMediaType(hit.mimeType)
+                      return (
+                        <button
+                          key={`${hit.channelId}-${hit.messageId}`}
+                          type="button"
+                          onClick={() => onGlobalHitPreview(hit)}
+                          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-surface-2/70"
+                        >
+                          <span className="w-10 shrink-0 text-center text-[9px] text-muted">
+                            {typ === 'photo' ? '图片' : typ === 'video' ? '视频' : typ === 'audio' ? '音频' : '文件'}
+                          </span>
+                          <span className="min-w-0 flex-1 truncate text-[12px] text-fg-mid">
+                            {hit.caption}
+                          </span>
+                          {hit.downloaded && (
+                            <span className="shrink-0 text-[9px] text-success">
+                              {t('tg.downloaded')}
+                            </span>
+                          )}
+                          <span className="shrink-0 text-[9px] tabular-nums text-muted">
+                            {fmtTime(hit.date ?? hit.createdAt)}
+                          </span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                ))
+              )}
+            </div>
+          </>
+        ) : !detail && groupMode !== null && activeGroup ? (
           <>
             {/* 分组模式：组内频道列表（仅添加/取消监控，不浏览内容） */}
             <header className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-3 py-2.5">
@@ -1061,6 +1335,14 @@ export function TgPanel() {
                   </p>
                 )}
               </div>
+              {/* 监控内容搜索：跨全部监控频道（顶部标题与按钮之间；输入非空 → 第二列切结果视图） */}
+              <input
+                type="search"
+                value={globalSearchInput}
+                onChange={(e) => setGlobalSearchInput(e.target.value)}
+                placeholder={t('tg.globalSearchPlaceholder')}
+                className="h-8 w-48 shrink-0 rounded-md border border-border-subtle bg-surface-2/60 px-3 text-[12px] text-fg-strong outline-none placeholder:text-muted focus:border-accent/60"
+              />
               <button
                 type="button"
                 onClick={() => setCacheManagerOpen(true)}
@@ -1097,6 +1379,8 @@ export function TgPanel() {
               )}
             </header>
 
+            {/* 监控内容搜索已上移到标题栏（跨全部监控频道）；单频道过滤是它的子集，不再单设一框 */}
+
             {/* 消息流（滚动容器） */}
             <div
               ref={scrollRef}
@@ -1125,7 +1409,9 @@ export function TgPanel() {
                         item={unit[0]}
                         downloading={downloading.has(unit[0].messageId)}
                         downloadedPath={downloadedPaths.get(unit[0].key)}
+                        photoInLibrary={photoLibRefs.has(`${unit[0].chatId}:${unit[0].messageId}`)}
                         onDownload={onBubbleDownload}
+                        onImportPhoto={onBubbleImportPhoto}
                         onOpenDownloaded={onBubbleOpen}
                         onPreview={onBubblePreview}
                       />
@@ -1137,6 +1423,13 @@ export function TgPanel() {
                           unit.filter((x) => x.downloaded || downloadedPaths.has(x.key)).length
                         }
                         progress={albumProgress.get(`a-${unit[0].chatId}-${unit[0].groupId}`)}
+                        groupHasVideo={unit.some((x) => x.type === 'video')}
+                        groupInLibrary={unit.every(
+                          (x) =>
+                            x.type !== 'photo' ||
+                            x.downloaded ||
+                            photoLibRefs.has(`${x.chatId}:${x.messageId}`),
+                        )}
                         onDownload={onAlbumDownload}
                         onCancel={onAlbumCancel}
                         onPreview={onAlbumPreview}
@@ -1147,6 +1440,21 @@ export function TgPanel() {
                 <div className="h-2 shrink-0" />
               </div>
             </div>
+            {/* 有新内容提示条：点击才刷新（重载会重置滚动位置，不自动执行） */}
+            {pendingNew > 0 && selectedMonitored ? (
+              <div className="pointer-events-none absolute bottom-3 left-0 right-0 flex justify-center">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPendingNew(0)
+                    setFeedReloadTick((v) => v + 1)
+                  }}
+                  className="pointer-events-auto rounded-full bg-accent px-3 py-1 text-[11px] font-medium text-white shadow-md transition-transform hover:scale-[1.03]"
+                >
+                  {t('tg.newContent').replace('{n}', String(pendingNew))}
+                </button>
+              </div>
+            ) : null}
           </>
         ) : (
           <div className="flex min-h-0 flex-1 items-center justify-center p-6">
@@ -1191,11 +1499,23 @@ const MessageBubble = memo(function MessageBubble(props: {
   item: FeedItem
   downloading: boolean
   downloadedPath?: string
+  /** BUG-049：图片已入库（图片不缓存，入库即终态） */
+  photoInLibrary: boolean
   onDownload: (item: FeedItem) => void
+  onImportPhoto: (item: FeedItem) => void
   onOpenDownloaded: (item: FeedItem) => void
   onPreview: (item: FeedItem) => void
 }) {
-  const { item: m, downloading, downloadedPath, onDownload, onOpenDownloaded, onPreview } = props
+  const {
+    item: m,
+    downloading,
+    downloadedPath,
+    photoInLibrary,
+    onDownload,
+    onImportPhoto,
+    onOpenDownloaded,
+    onPreview,
+  } = props
   const { t } = useTranslation()
   return (
     <div className="flex flex-col">
@@ -1231,11 +1551,23 @@ const MessageBubble = memo(function MessageBubble(props: {
           {m.size ? <span className="text-[10px] text-muted">{fmtSize(m.size)}</span> : null}
           {(m.downloaded || downloadedPath) && <Chip tone="success">{t('tg.downloaded')}</Chip>}
           <span className="ml-auto text-[10px] text-muted">{fmtTime(m.date)}</span>
-          {/* 视频的缓存/播放操作在海报上（点击视频=开始缓存），meta 行不重复放按钮 */}
-          {m.type === 'video' ? null : downloadedPath ? (
+          {/* 缓存/播放按钮：视频与图片同构（BUG-046）——此前视频只靠海报上的 ⬇ 图标，
+              图片却有显式「缓存」按钮，逻辑倒置。海报点击行为不变（已缓存=播放，
+              缓存中=在线播放，未缓存=开始缓存），按钮是明确的兜底入口。 */}
+          {/* 操作按钮（BUG-049 区分视频/图片）：视频=缓存/播放；图片=加入媒体库/已入库
+              （图片不缓存；历史已落盘的图片保留「播放」）；其余类型照旧缓存。 */}
+          {downloadedPath || m.downloaded ? (
             <Button variant="secondary" size="sm" className="h-6 px-2 text-[10px]" onClick={() => onOpenDownloaded(m)}>
               {t('tg.play')}
             </Button>
+          ) : m.type === 'photo' ? (
+            photoInLibrary ? (
+              <Chip tone="success">{t('tg.inLibrary')}</Chip>
+            ) : (
+              <Button variant="secondary" size="sm" className="h-6 px-2 text-[10px]" onClick={() => onImportPhoto(m)}>
+                {t('tg.addToLibrary')}
+              </Button>
+            )
           ) : (
             <Button
               variant="secondary"
@@ -1244,7 +1576,7 @@ const MessageBubble = memo(function MessageBubble(props: {
               disabled={downloading}
               onClick={() => onDownload(m)}
             >
-              {downloading ? '…' : t('tg.download')}
+              {downloading ? t('tg.caching') : t('tg.download')}
             </Button>
           )}
         </div>
@@ -1317,12 +1649,25 @@ const AlbumBubble = memo(function AlbumBubble(props: {
   downloadedCount: number
   /** 整组缓存进行中的进度 */
   progress?: { done: number; total: number }
+  /** BUG-049：组内是否有视频 —— 决定按钮语义（缓存 vs 加入媒体库） */
+  groupHasVideo: boolean
+  /** BUG-049：组内图片是否全部已入库（纯图组全入库后按钮收起） */
+  groupInLibrary: boolean
   onDownload: (items: FeedItem[]) => void
   /** 取消整组缓存（进行中时操作行显示「取消」） */
   onCancel?: (items: FeedItem[]) => void
   onPreview: (index: number, items: FeedItem[]) => void
 }) {
-  const { items, downloadedCount, progress, onDownload, onCancel, onPreview } = props
+  const {
+    items,
+    downloadedCount,
+    progress,
+    groupHasVideo,
+    groupInLibrary,
+    onDownload,
+    onCancel,
+    onPreview,
+  } = props
   const { t } = useTranslation()
   const allDone = downloadedCount >= items.length
   const caption = items.find((it) => it.caption?.trim())?.caption
@@ -1343,24 +1688,50 @@ const AlbumBubble = memo(function AlbumBubble(props: {
           <span className="ml-auto text-muted">{fmtTime(items[0].date)}</span>
         </div>
 
-        {/* 组内 2 列网格：点击任一格进入组内浏览 */}
-        <div className="grid grid-cols-2 gap-1.5">
-          {items.map((it, i) => {
+        {/*
+         * 组内宫格：列数**按数量自适应**（1→单图 / 2→2列 / 3→3列 / 4→2×2 /
+         * 5..9→3 列，即 5/6/7/8/9 宫格），图片一律 `object-contain`。
+         *
+         * 两处都改必然性、而非调数值：
+         *  - 旧版固定 `grid-cols-2` + `aspect-square` + `object-cover`：4 图以上永远
+         *    2 列（9 张图排成 5 行的长条），且 cover 把每张图**裁掉边缘** —— 用户报的
+         *    「图片被截取、没有九宫格」就是这个组合造成的。宫格形状是数量决定的函数，
+         *    不是写死的常量。
+         *  - 超过 9 张按平台惯例折进第 9 格的 `+N`，其余图片在全屏浏览页里连翻
+         *    （该页本来就遍历整组，不存在看不到的图）。
+         */}
+        <div
+          data-testid="album-grid"
+          className={cn('grid gap-1.5', albumGridClass(items.length))}
+        >
+          {items.slice(0, ALBUM_MAX_TILES).map((it, i) => {
             const typ = it.type ?? guessMediaType(it.mimeType)
             const dur = fmtDuration(it.duration)
+            const overflow = items.length - ALBUM_MAX_TILES
+            const isLastTile = i === ALBUM_MAX_TILES - 1 && overflow > 0
+            const single = items.length === 1
             return (
               <button
                 key={it.key}
                 type="button"
                 onClick={() => onPreview(i, items)}
-                className="relative block aspect-square w-full overflow-hidden rounded-lg bg-surface-2"
+                className={cn(
+                  'relative block w-full overflow-hidden rounded-lg bg-surface-2',
+                  // 单图给自然比例（整幅呈现）；多图用方形格保证网格整齐
+                  single ? '' : 'aspect-square',
+                  isLastTile && 'ring-1 ring-inset ring-white/10',
+                )}
               >
                 {typ === 'photo' || typ === 'video' ? (
                   <img
                     src={tgThumbUrl(it.chatId, it.messageId)}
                     alt={it.caption || ''}
                     loading="lazy"
-                    className="h-full w-full object-cover"
+                    className={cn(
+                      // 单图：自然比例、不放大（`w-auto` 而非 `w-full`，避免小图被拉糊）
+                      single ? 'mx-auto h-auto max-h-[60vh] w-auto max-w-full' : 'h-full w-full',
+                      coverFit(typ),
+                    )}
                   />
                 ) : (
                   <span className="flex h-full w-full items-center justify-center text-lg">
@@ -1377,6 +1748,11 @@ const AlbumBubble = memo(function AlbumBubble(props: {
                     <span className="flex h-8 w-8 items-center justify-center rounded-full bg-black/55 pl-0.5 text-xs text-white backdrop-blur-sm">
                       {it.downloaded ? '▶' : '⬇'}
                     </span>
+                  </span>
+                )}
+                {isLastTile && (
+                  <span className="absolute inset-0 flex items-center justify-center bg-black/60 text-sm font-semibold text-white">
+                    +{overflow}
                   </span>
                 )}
               </button>
@@ -1411,16 +1787,24 @@ const AlbumBubble = memo(function AlbumBubble(props: {
               )}
             </>
           ) : !allDone ? (
-            <Button
-              variant="outline"
-              size="sm"
-              className="ml-auto h-6 px-2 text-[10px]"
-              onClick={() => onDownload(items)}
-            >
-              {downloadedCount > 0
-                ? `${t('tg.continue')} ${downloadedCount}/${items.length}`
-                : t('tg.download')}
-            </Button>
+            /* BUG-049：按钮语义按组构成区分 —— 含视频=「缓存」（图片由 worker 顺带入库，
+               不落盘）；纯图组=「加入媒体库」，全入库后按钮收起改显「已入库」。 */
+            !groupHasVideo && groupInLibrary ? (
+              <span className="ml-auto text-[10px] text-success">{t('tg.inLibrary')}</span>
+            ) : (
+              <Button
+                variant="outline"
+                size="sm"
+                className="ml-auto h-6 px-2 text-[10px]"
+                onClick={() => onDownload(items)}
+              >
+                {!groupHasVideo
+                  ? t('tg.addToLibrary')
+                  : downloadedCount > 0
+                    ? `${t('tg.continue')} ${downloadedCount}/${items.length}`
+                    : t('tg.download')}
+              </Button>
+            )
           ) : null}
         </div>
       </div>
@@ -1430,7 +1814,9 @@ const AlbumBubble = memo(function AlbumBubble(props: {
   a.items === b.items &&
   a.downloadedCount === b.downloadedCount &&
   a.progress?.done === b.progress?.done &&
-  a.progress?.total === b.progress?.total,
+  a.progress?.total === b.progress?.total &&
+  a.groupHasVideo === b.groupHasVideo &&
+  a.groupInLibrary === b.groupInLibrary,
 )
 
 /** 图片块：列表用轻量缩略图（自然比例不裁切），点击弹遮罩看原图 */
@@ -1458,7 +1844,7 @@ function PhotoBlock({ item, onPreview }: { item: FeedItem; onPreview: () => void
         alt={item.caption || ''}
         loading="lazy"
         onError={() => setErr(true)}
-        className="mx-auto h-auto w-full max-h-[60vh] object-contain"
+        className="mx-auto h-auto max-h-[60vh] w-auto max-w-full object-contain"
       />
     </button>
   )
@@ -1490,8 +1876,9 @@ function VideoBlock(props: {
   useEffect(() => {
     if (videoRef.current) videoRef.current.playbackRate = rate
   }, [rate, playing])
-  /** 视频轨解不出来 / 解码吃力 —— 两种 onError 抓不到的静默失败（BUG-034） */
-  const decode = useDecodeHealth(videoRef, `${playing}-${item.messageId}`)
+  /** 视频轨解不出来 / 解码吃力 —— 两种 onError 抓不到的静默失败（BUG-034）。
+   *  倍速入 key：改速即重设基线，否则「调低速度」这个建议本身不会清掉提示（BUG-053）。 */
+  const decode = useDecodeHealth(videoRef, `${playing}-${item.messageId}-${rate}`)
 
   if (playing !== 'off') {
     return (

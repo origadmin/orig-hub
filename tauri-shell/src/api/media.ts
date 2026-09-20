@@ -28,6 +28,8 @@ export interface MediaItem {
   source: 'local' | 'tg' | string
   ref: string
   title: string
+  /** 介绍：与剧集 `description` 同源同切法（caption 首行之外的部分） */
+  description?: string | null
   kind: MediaKind
   filePath?: string | null
   /** 前端生成的封面 data-uri（视频抽帧 / 图片缩略） */
@@ -69,11 +71,18 @@ export interface MediaEpisode {
   itemId: number
   season: number
   episodeNo: number
+  /**
+   * 内容标题 —— **取自所指向的条目**。
+   *
+   * 分集只表示「内容在剧集里的位置」，标题与介绍归内容（条目）。
+   * 曾经还有一套 `itemTitle` / `itemDescription`：同一份文案两个字段、两个写入路径，
+   * 于是同一个视频在剧集页叫旧名、在媒体库里叫新名。现在只有一个名字。
+   */
   title?: string | null
-  itemTitle?: string | null
   poster?: string | null
   duration?: number | null
   kind?: MediaKind | null
+  /** 内容介绍 —— 同样取自所指向的条目。 */
   description?: string | null
   /**
    * 合并溯源：来源剧集标题快照。源剧集在合并时已被删除，故由后端存快照下发。
@@ -86,6 +95,22 @@ export interface MediaEpisode {
   source?: string | null
   /** 条目来源标识（本地路径 / TG ref）—— 分辨重复项的唯一可靠依据，别用标题 */
   ref?: string | null
+  /** 合集范围终点（BUG-039）：占用槽位 episodeNo..episodeNoEnd；缺省 = 单集 */
+  episodeNoEnd?: number | null
+  /** 同槽备用来源（BUG-039）：同一集的其他缓存来源；主条目不在其中 */
+  sources?: EpisodeSourceRef[]
+  /**
+   * 这一集当前有没有字节（BUG-080；后端 `file_path IS NOT NULL`）。
+   * 清缓存只删字节留条目，没有它前端无从分辨「点开能播」与「点了 404」。
+   */
+  hasBytes?: boolean | null
+}
+
+/** 剧集分集的备用来源引用 */
+export interface EpisodeSourceRef {
+  itemId: number
+  title?: string | null
+  kind?: MediaKind | null
 }
 
 /** 合并时被跳过的分集（同一条目已在目标同季） */
@@ -185,6 +210,13 @@ export async function getMediaItem(id: number): Promise<MediaItem> {
   return request<MediaItem>(`/api/media/items/${id}`)
 }
 
+/** 按 (source, ref) 查条目 id；不存在返回 null（BUG-049：图片「已入库」判定用） */
+export async function findMediaItemIdByRef(source: string, ref: string): Promise<number | null> {
+  const sp = new URLSearchParams({ source, ref })
+  const d = await request<{ id: number | null }>(`/api/media/items/by-ref?${sp}`)
+  return d.id
+}
+
 export async function getLibraryStats(): Promise<LibraryStats> {
   return request<LibraryStats>('/api/media/stats')
 }
@@ -206,7 +238,16 @@ export async function importMediaItems(items: ImportEntry[]): Promise<{ ids: num
 
 export async function patchMediaItem(
   id: number,
-  patch: { title?: string; poster?: string; duration?: number; width?: number; height?: number; kind?: MediaKind },
+  patch: {
+    title?: string
+    /** 介绍：`null` = 显式清空（后端 Option<Option<String>> 契约，与剧集一致） */
+    description?: string | null
+    poster?: string
+    duration?: number
+    width?: number
+    height?: number
+    kind?: MediaKind
+  },
 ): Promise<{ ok: boolean }> {
   return request(`/api/media/items/${id}`, { method: 'PATCH', body: JSON.stringify(patch) })
 }
@@ -225,8 +266,10 @@ export async function setItemTags(id: number, tagIds: number[]): Promise<{ ok: b
 
 // ────────────────── 剧集 ──────────────────
 
-export async function listSeries(): Promise<MediaSeries[]> {
-  const r = await request<{ items: MediaSeries[] }>('/api/media/series')
+/** 列出剧集。`tagId` 用于按标签筛剧集（TG 自动归档的 #标签 落在剧集上）。 */
+export async function listSeries(tagId?: number | null): Promise<MediaSeries[]> {
+  const qs = tagId == null ? '' : `?tagId=${tagId}`
+  const r = await request<{ items: MediaSeries[] }>(`/api/media/series${qs}`)
   return r.items ?? []
 }
 
@@ -245,7 +288,14 @@ export async function createSeries(body: {
 
 export async function patchSeries(
   id: number,
-  patch: { title?: string; description?: string; kind?: string; poster?: string; year?: number },
+  patch: {
+    title?: string
+    /** 介绍：`null` = 显式清空（后端 Option<Option<String>> 契约） */
+    description?: string | null
+    kind?: string
+    poster?: string
+    year?: number
+  },
 ): Promise<{ ok: boolean }> {
   return request(`/api/media/series/${id}`, { method: 'PATCH', body: JSON.stringify(patch) })
 }
@@ -263,7 +313,7 @@ export async function setSeriesTags(id: number, tagIds: number[]): Promise<{ ok:
 
 export async function addEpisode(
   seriesId: number,
-  body: { itemId: number; season?: number; episodeNo?: number; title?: string },
+  body: { itemId: number; season?: number; episodeNo?: number },
 ): Promise<{ id: number }> {
   return request(`/api/media/series/${seriesId}/episodes`, {
     method: 'POST',
@@ -297,13 +347,63 @@ export async function mergeSeries(seriesId: number, sourceId: number): Promise<M
   })
 }
 
+/**
+ * 改单集：标题 / 介绍 / **槽位**（季号与集号）。
+ *
+ * 集号允许任意值（2、3…不必从 1 连续）；若目标槽已被同剧另一条占用，后端会**对调**
+ * 两条的槽位（不会 409）—— 所以「把第 3 集改成第 2 集」的结果是两条互换位置。
+ */
 export async function patchEpisode(
   id: number,
-  patch: { title?: string; description?: string },
+  patch: {
+    title?: string
+    /** 介绍：`null` = 显式清空（与剧集介绍同一契约） */
+    description?: string | null
+    season?: number
+    episodeNo?: number
+    /** 合集范围终点：`null` = 改回单集 */
+    episodeNoEnd?: number | null
+  },
 ): Promise<{ ok: boolean }> {
   return request(`/api/media/episodes/${id}`, {
     method: 'PATCH',
     body: JSON.stringify(patch),
+  })
+}
+
+/** 挂条目为某集的备用来源（BUG-039：同一集多缓存来源；幂等） */
+export function attachEpisodeSource(episodeId: number, itemId: number): Promise<{ ok: boolean }> {
+  return request(`/api/media/episodes/${episodeId}/sources`, {
+    method: 'POST',
+    body: JSON.stringify({ itemId }),
+  })
+}
+
+/** 主备切换：itemId 必须已是该集备用源；原主条目降级为备用 */
+export function switchEpisodeSource(episodeId: number, itemId: number): Promise<{ ok: boolean }> {
+  return request(`/api/media/episodes/${episodeId}/sources/primary`, {
+    method: 'POST',
+    body: JSON.stringify({ itemId }),
+  })
+}
+
+/** 摘除备用源（内容保留在资料库） */
+export function detachEpisodeSource(episodeId: number, itemId: number): Promise<{ ok: boolean }> {
+  return request(`/api/media/episodes/${episodeId}/sources/${itemId}`, { method: 'DELETE' })
+}
+
+/**
+ * 剧集内换位：与同季相邻的一集交换槽位。
+ *
+ * `moved: false` = 已在边界（没有相邻分集）——**如实回报**，让界面提示而不是假装成功。
+ */
+export async function moveEpisode(
+  id: number,
+  dir: 'up' | 'down',
+): Promise<{ ok: boolean; moved: boolean }> {
+  return request(`/api/media/episodes/${id}/move`, {
+    method: 'POST',
+    body: JSON.stringify({ dir }),
   })
 }
 

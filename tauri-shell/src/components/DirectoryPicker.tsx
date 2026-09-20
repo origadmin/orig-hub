@@ -3,6 +3,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { getRecentDirs, addRecentDir, removeRecentDir } from '../lib/recentDirs'
+import { isTauri } from '../lib/env'
 
 interface Props {
   value: string
@@ -32,6 +33,8 @@ export function DirectoryPicker({
   const [openList, setOpenList] = useState(false)
   const [localErr, setLocalErr] = useState<string | null>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
+  // 网页调试模式（纯浏览器、无 Tauri 运行时）不支持系统原生目录对话框。
+  const inTauri = isTauri()
 
   useEffect(() => {
     setRecent(getRecentDirs())
@@ -49,6 +52,17 @@ export function DirectoryPicker({
   }, [])
 
   const pick = async () => {
+    // 网页调试模式（纯浏览器、无 Tauri 运行时）没有系统原生对话框：
+    // @tauri-apps/plugin-dialog 底层 invoke 为 undefined，直接调会抛
+    // "Cannot read properties of undefined (reading 'invoke')"。
+    // 软失败 + 提示，而不是让整个设置页炸成错误现场（BUG-072）。
+    // 手动输入与历史下拉在网页模式下仍可用，不影响调试。
+    if (!isTauri()) {
+      const msg = '目录选择需在桌面客户端中使用（网页调试模式不支持系统原生对话框，可直接输入路径或选历史）'
+      setLocalErr(msg)
+      onError?.(msg)
+      return
+    }
     setLocalErr(null)
     try {
       const dir = await open({ directory: true, multiple: false })
@@ -109,7 +123,8 @@ export function DirectoryPicker({
           type="button"
           variant="secondary"
           onClick={pick}
-          disabled={disabled}
+          disabled={disabled || !inTauri}
+          title={inTauri ? undefined : '网页调试模式不支持系统原生目录对话框（可直接输入路径或选历史）'}
           className="shrink-0"
         >
           浏览…

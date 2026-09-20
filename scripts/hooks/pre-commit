@@ -1,0 +1,41 @@
+#!/usr/bin/env sh
+# orig-hub pre-commit hook (tracked copy; install via scripts/install-hooks.sh)
+#
+# 门禁清单：
+#  1) 缺陷登记完整性 —— `scripts/check-bugs.py`（编号连续 / 索引双向一致 / 字段枚举 /
+#     fixed 必须有可核证据）。该脚本**入库**，缺失即为错误状态：直接失败并说清怎么修。
+#  2) 目录污染 —— `scripts/check-pollution.sh`（AGENTS.md §6：根 4 文件白名单 /
+#     未跟踪产物 / AI 工具目录）。
+#
+# 设计取舍：两个依赖**都已入库**，任一缺失即失败（不静默跳过）。
+# 历史教训：本钩子曾无条件 `exec sh scripts/check-pollution.sh`，而该脚本从未入库，
+# 钩子恒 exit 127 → **所有提交被锁死**且报错只指向不存在的文件；随后修成「缺了就跳过」，
+# 结果污染门禁长期空转（根目录因此积了两处残留）。缺依赖必须说真话，不能装没看见。
+ROOT="$(git rev-parse --show-toplevel)"
+rc=0
+
+BUGS="$ROOT/scripts/check-bugs.py"
+if [ -f "$BUGS" ]; then
+  if command -v python >/dev/null 2>&1; then
+    # `--quiet`：历史告警有上百条，全量输出会把真正的 ERROR 埋掉；总数仍在结论行里。
+    python "$BUGS" --quiet || rc=1
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 "$BUGS" --quiet || rc=1
+  else
+    echo "pre-commit: FAIL - python not found, cannot run the bug registry gate" >&2
+    rc=1
+  fi
+else
+  echo "pre-commit: FAIL - scripts/check-bugs.py missing (bug registry gate is required)" >&2
+  rc=1
+fi
+
+POLL="$ROOT/scripts/check-pollution.sh"
+if [ -f "$POLL" ]; then
+  sh "$POLL" || rc=1
+else
+  echo "pre-commit: FAIL - scripts/check-pollution.sh missing (pollution gate is required)" >&2
+  rc=1
+fi
+
+exit $rc

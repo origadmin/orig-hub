@@ -147,7 +147,7 @@ export function removeTgMonitoredChannel(channelId: number | string): Promise<{ 
  *  beforeId 为历史游标（exclusive）：只取 messageId < beforeId 的一页。兼容旧平铺数组。 */
 export async function listTgMonitorMessages(
   channelId: number | string,
-  opts?: { limit?: number; beforeId?: number },
+  opts?: { limit?: number; beforeId?: number; q?: string },
 ): Promise<TgMessagePage<TgStoredMessage>> {
   const limit = opts?.limit ?? 30
   const q = new URLSearchParams({
@@ -155,6 +155,7 @@ export async function listTgMonitorMessages(
     limit: String(limit),
   })
   if (opts?.beforeId !== undefined) q.set('beforeId', String(opts.beforeId))
+  if (opts?.q) q.set('q', opts.q)
   const res = await request<unknown>(`/api/tg/monitor/messages?${q}`)
   if (Array.isArray(res)) {
     return { items: res as TgStoredMessage[], hasMore: res.length >= limit }
@@ -169,6 +170,20 @@ export async function listTgMonitorMessages(
 /** POST /api/tg/monitor/sync — 手动触发一轮增量同步 */
 export function syncTgMonitor(): Promise<{ added: number }> {
   return request('/api/tg/monitor/sync', { method: 'POST' })
+}
+
+/** GET /api/tg/monitor/search?q=.. — 全局监控内容查找（跨全部监控频道，caption 子串）。
+ *  只查本地已同步消息；命中项带 channelTitle 供按频道分组展示。 */
+export async function searchTgMonitorMessages(
+  q: string,
+  limit = 60,
+): Promise<(TgStoredMessage & { channelTitle?: string })[]> {
+  const trimmed = q.trim()
+  if (!trimmed) return []
+  const res = await request<{ items?: (TgStoredMessage & { channelTitle?: string })[] }>(
+    `/api/tg/monitor/search?q=${encodeURIComponent(trimmed)}&limit=${limit}`,
+  )
+  return res.items ?? []
 }
 
 /** GET /api/tg/messages/:chat_id?limit=&beforeId= — 在线媒体历史（新→旧，需已授权）。
@@ -320,6 +335,52 @@ export async function cancelCacheTask(id: number): Promise<{ ok: boolean }> {
   return request(`/api/tg/cache/tasks/${encodeURIComponent(String(id))}`, { method: 'DELETE' })
 }
 
+/**
+ * POST /api/cache/tasks/:id/retry — **原任务重试**（BUG-078）：按 id 复位终态记录为
+ * `queued`，复用同一行，不再新建任务。与 `enqueueCacheTask`（对终态会 INSERT 新行）区分。
+ */
+export async function retryCacheTask(id: number): Promise<TgCacheTask> {
+  return request(`/api/cache/tasks/${encodeURIComponent(String(id))}/retry`, { method: 'POST' })
+}
+
+/**
+ * DELETE /api/cache/tasks/{id} — 删除**单条**任务记录（任何状态）。
+ * 与「取消」不同：终态记录也要能删掉，活跃任务则先置 cancelled 再删。
+ */
+export async function deleteCacheTask(id: number): Promise<{ ok: boolean }> {
+  return request(`/api/cache/tasks/${encodeURIComponent(String(id))}`, { method: 'DELETE' })
+}
+
+/**
+ * DELETE /api/cache/tasks?ids=1,2,3 — 删除**勾选的具体几条**任务记录。
+ *
+ * 与 `clearCacheTasks(scope)` 共用同一端点：scope 是「看得见的筛选」整档，
+ * ids 是用户勾出来的集合（点全选即等价全部）。选择本身才是诉求 ——
+ * 枚举档位永远追不上（清空失败 / 清空成功 / 清空中断…）。
+ * 空数组会被后端 422 拒绝（避免误发空选择反而清空列表）。
+ */
+export async function deleteCacheTasksByIds(
+  ids: number[],
+): Promise<{ ok: boolean; removed: number; selected: number }> {
+  if (ids.length === 0) {
+    throw new Error('没有勾选任何记录')
+  }
+  return request(`/api/cache/tasks?ids=${encodeURIComponent(ids.join(','))}`, { method: 'DELETE' })
+}
+
+/**
+ * DELETE /api/cache/tasks?scope=all|success|failed — 批量清除任务记录。
+ *
+ * 动词只有一个（清除），范围走参数：三档互斥且并集为全集，所以不需要「清空全部」
+ * 「清除记录」「清空失败」N 个函数。活跃任务只有 `all` 档会清（先取消再删）。
+ * 界面上的批量删除已改为「勾选 + 删除所选」（见 `deleteCacheTasksByIds`）。
+ */
+export async function clearCacheTasks(
+  scope: 'all' | 'success' | 'failed',
+): Promise<{ ok: boolean; removed: number; scope: string }> {
+  return request(`/api/cache/tasks?scope=${encodeURIComponent(scope)}`, { method: 'DELETE' })
+}
+
 /** GET /api/tg/cache/tasks/all — 全量任务 + 各状态计数（缓存管理面板用，低频拉取）。 */
 export async function listAllCacheTasks(): Promise<{
   tasks: TgCacheTask[]
@@ -328,7 +389,86 @@ export async function listAllCacheTasks(): Promise<{
   return request('/api/tg/cache/tasks/all')
 }
 
-/** DELETE /api/tg/cache/finished — 清除全部终态任务记录（活跃任务不受影响）。 */
-export async function clearFinishedCacheTasks(): Promise<{ ok: boolean; removed: number }> {
-  return request('/api/tg/cache/finished', { method: 'DELETE' })
+/**
+ * GET /api/cache/stats — 缓存磁盘占用（`files` / `bytes` / `external`）。
+ * 「清除缓存文件」是释放磁盘的动作，不知道占多少就是盲操作。
+ */
+export async function getCacheStats(): Promise<{
+  ok: boolean
+  files: number
+  bytes: number
+  external: number
+}> {
+  return request('/api/cache/stats')
+}
+
+/** 缓存清理**预览**（只读）：回答「按下确认会释放多少、涉及哪几条」（BUG-059）。 */
+export type CacheClearPreview = {
+  ok: boolean
+  downloadDir: string
+  olderThanDays: number
+  total: { count: number; bytes: number }
+  /** 孤儿：磁盘上有、库里没有任何条目指向 */
+  orphan: { count: number; bytes: number; truncated: boolean }
+  /** 外部文件（导入/扫描带进来的）：**永不参与清理**，只如实计数 */
+  external: { count: number; bytes: number; removable: boolean }
+  stale: { count: number; bytes: number }
+  /** 失败/取消/中断任务涉及过的消息所占字节 */
+  failed: { count: number; bytes: number }
+  byChat: Array<{ chatId: number; count: number; bytes: number }>
+  items: Array<{
+    id: number
+    title: string
+    chatId: number | null
+    bytes: number
+    ageDays: number
+    inside: boolean
+    failed: boolean
+  }>
+  itemsTruncated: boolean
+}
+
+/** GET /api/cache/clear/preview — 清理影响面（**不产生任何删除**）。 */
+export async function getCacheClearPreview(olderThanDays?: number): Promise<CacheClearPreview> {
+  const qs = olderThanDays ? `?olderThanDays=${olderThanDays}` : ''
+  return request(`/api/cache/clear/preview${qs}`)
+}
+
+/** 清理结果：如实回报，界面直接照读，不自行推算。 */
+export type CacheClearResult = {
+  ok: boolean
+  scope: string
+  removed: number
+  skipped: number
+  bytesFreed: number
+  /** 仅 `ids` 档：请求里选了几条 / 实际命中几条 */
+  selected?: number
+  hit?: number
+}
+
+/**
+ * POST /api/cache/clear — 清理**缓存字节**的唯一端点（条目与记录一律保留）。
+ *
+ * 三种互斥范围：`ids`（勾选的集合）/ `scope`（整档）/ 无参（= `scope=all`，向后兼容）。
+ * 旧签名 `clearCacheBytes()` 仍然可用 —— 无参即全清。
+ */
+export async function clearCacheBytes(
+  opts: { ids?: number[]; scope?: 'all' | 'orphan' | 'stale' | 'failed'; olderThanDays?: number } = {},
+): Promise<CacheClearResult> {
+  const parts: string[] = []
+  if (opts.ids && opts.ids.length > 0) parts.push(`ids=${encodeURIComponent(opts.ids.join(','))}`)
+  else if (opts.scope) parts.push(`scope=${encodeURIComponent(opts.scope)}`)
+  if (opts.olderThanDays) parts.push(`olderThanDays=${opts.olderThanDays}`)
+  const qs = parts.length > 0 ? `?${parts.join('&')}` : ''
+  return request(`/api/cache/clear${qs}`, { method: 'POST' })
+}
+
+/**
+ * DELETE /api/cache/items/:id — 清除**单个条目**已缓存的字节（记录保留，可重新缓存）。
+ *
+ * 语义与「删除条目」严格区分：清缓存后条目仍在库里（回「仅入库」浏览态），
+ * 删除条目则连记录一起没了。后端对「没有字节可清」返回 422，前端据此给如实提示。
+ */
+export async function clearCacheItem(id: number): Promise<{ ok: boolean; freed: number }> {
+  return request(`/api/cache/items/${id}`, { method: 'DELETE' })
 }

@@ -137,7 +137,10 @@ export function MediaViewer(props: {
   })()
 
   return (
-    <div className={cn('flex min-h-0 flex-col bg-surface/20', className)}>
+    <div
+      className={cn('flex min-h-0 flex-col bg-surface/20', className)}
+      data-testid="media-viewer"
+    >
       {/* 返回行：← 返回 + 标题 + 位置/总数 */}
       <div className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-3 py-2.5">
         <Button
@@ -241,10 +244,73 @@ export function MediaViewer(props: {
         )}
       </div>
 
-      {cur.caption?.trim() && (
-        <p className="max-h-24 shrink-0 overflow-y-auto border-t border-border-subtle/60 bg-black px-4 py-2 text-center text-xs text-white/80">
-          {cur.caption}
+      {/*
+       * 底部文案行：媒体库条目**优先显示介绍**。
+       *
+       * 条目的 `caption` 在媒体库场景被填成标题（返回行已经显示了一遍），
+       * 若这里再显示 caption，同一个标题会出现两次、而真正的正文无处可看 ——
+       * 这正是「视频内容错误」的观感来源。有 `description` 就显示它。
+       *
+       * `whitespace-pre-wrap` 与剧集详情（`SeriesDetail`）的正文渲染**必须一致**：
+       * 介绍是多段文本，折叠换行会把分段吃掉 —— 同一段正文在剧集页有分段、
+       * 在播放页变成一坨，就是「剧集对、视频错」的又一种形态。
+       */}
+      {(cur.description?.trim() || cur.caption?.trim()) && (
+        <p
+          className="max-h-24 shrink-0 overflow-y-auto whitespace-pre-wrap break-words border-t border-border-subtle/60 bg-black px-4 py-2 text-center text-xs text-white/80 [overflow-wrap:anywhere]"
+          data-testid="viewer-text"
+        >
+          {cur.description?.trim() || cur.caption}
         </p>
+      )}
+
+      {/*
+       * 图片轮播带（browse 模式且组内多图）。
+       *
+       * 为什么必须有：多图剧集（或一次加入的多张图）此前只能靠 ‹ › 一张张翻，
+       * 用户无法知道「这组一共几张、还剩哪些」——即「多张图加入后没有完整展示」。
+       * 缩略图带把**整组图片一次摆出来**：当前张高亮、点任意一张直接切过去，
+       * 位置与顺序一眼可见。
+       *
+       * 只对图片（browse）出现：视频/音频的顺序导航由分集侧栏承担，
+       * 再挂一条缩略带是重复的第二套控件。
+       *
+       * 缩略图用 `object-cover` 是**刻意**的：48px 的方格里它是「索引」而非内容，
+       * 内容由上方大图完整呈现（`object-contain`，绝不裁切）。
+       */}
+      {browse && group.length > 1 && (
+        <div className="flex shrink-0 gap-1.5 overflow-x-auto border-t border-border-subtle/60 bg-black px-3 py-2">
+          {group.map((it, i) => {
+            const on = String(it.key) === curKey
+            return (
+              <button
+                key={String(it.key)}
+                type="button"
+                onClick={() => goTo(it)}
+                aria-current={on ? 'true' : undefined}
+                aria-label={t('player.photoPos', { n: i + 1, total: group.length })}
+                title={it.caption?.trim() || `#${it.messageId}`}
+                data-testid="photo-strip-item"
+                className={cn(
+                  'relative h-12 w-12 shrink-0 overflow-hidden rounded border transition-all',
+                  on
+                    ? 'border-accent ring-1 ring-accent'
+                    : 'border-white/15 opacity-65 hover:opacity-100',
+                )}
+              >
+                <img
+                  src={it.poster ?? it.src}
+                  alt=""
+                  loading="lazy"
+                  className="h-full w-full object-cover"
+                />
+                <span className="absolute bottom-0 right-0 rounded-tl bg-black/70 px-1 text-[9px] tabular-nums text-white">
+                  {i + 1}
+                </span>
+              </button>
+            )
+          })}
+        </div>
       )}
     </div>
   )

@@ -15,6 +15,17 @@
 //!
 //! 测试 mock 被 `#[cfg(feature = "mock")]` 编译排除于生产构建之外，且需 `ORIG_TG_MOCK=1`
 //! 与显式 `ORIG_TG_DB` 才会被选中 —— 失败路径永不回退到它。
+//!
+//! ## 调试期离线短路（非 Release 网页调试）
+//!
+//! 只要本地媒体库（`/api/media/*`，与 TG 客户端无关）就能驱动整页 UI 联调，
+//! 此时去连 MTProto 只为换来一个 503 + 启动噪声。因此 **非 Release 构建默认跳过
+//! `GrammersClient::connect`**：服务以「本地媒体库可用、TG 端点诚实 503」启动，
+//! 不发起任何 Telegram 网络请求。Release 构建默认走真实连接。
+//!
+//! 显式开关覆盖默认值：
+//! - `ORIG_TG_OFFLINE=1`：强制离线（任意 profile，CI / 纯前端联调用）。
+//! - `ORIG_TG_ONLINE=1`：强制在线（debug 下想联调真实 TG 登录/授权时用）。
 
 use std::sync::Arc;
 
@@ -42,6 +53,17 @@ const EXIT_STORE_FAILED: i32 = 5;
 /// **不存在静默降级**：凭证齐全但连接失败时，不会换客户端假装正常，而是明确标记不可用
 /// 并携带原因；未配置凭证同样标记不可用（并提示先绑定账号）。
 async fn build_client(config: &Config) -> (Arc<dyn Client>, Availability, bool) {
+    // 调试期离线短路：见文件头注释。非 Release 默认不连 MTProto，仅本地媒体库可用。
+    if offline_short_circuit() {
+        let reason = "offline debug mode: MTProto connect skipped (set ORIG_TG_ONLINE=1 to force real TG)".to_string();
+        eprintln!("[info] {reason}; serving local media library, TG endpoints return 503");
+        return (
+            Arc::new(UnavailableClient::new(reason.clone())),
+            Availability::Unavailable(reason),
+            false,
+        );
+    }
+
     let configured = config.api_id.is_some() && config.api_hash.is_some();
 
     if configured {
@@ -84,6 +106,30 @@ fn mock_requested() -> bool {
     std::env::var("ORIG_TG_MOCK")
         .map(|v| v == "1")
         .unwrap_or(false)
+}
+
+/// 调试期离线短路判定。
+///
+/// - `ORIG_TG_OFFLINE=1` 强制离线（任意 profile，CI / 纯前端联调）。
+/// - `ORIG_TG_ONLINE=1` 强制在线（debug 下想联调真实 TG 登录/授权）。
+/// - 两者均未设时：**非 Release（`debug_assertions`）默认离线**，Release 默认在线。
+///
+/// 离线 = 跳过 `GrammersClient::connect`，不发起任何 Telegram 网络请求；
+/// 本地媒体库照常可用，TG 端点仍诚实返回 503（BUG-023 契约不变）。
+fn offline_short_circuit() -> bool {
+    if std::env::var("ORIG_TG_OFFLINE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if std::env::var("ORIG_TG_ONLINE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    cfg!(debug_assertions)
 }
 
 /// mock 模式强制要求显式 `ORIG_TG_DB`。

@@ -89,6 +89,41 @@ pub struct Store {
     pub(crate) conn: Connection,
 }
 
+/// 批量清除任务记录的**范围**——动词只有一个（清除），可变的是范围。
+///
+/// 三档互斥，且**并集恰好是全集**（`success` ∪ `failed` ∪ 活跃 = 全部记录），
+/// 因此不存在「要不要再加一档清空 X」的问题：任何新增诉求都先归到这三档之一。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskClearScope {
+    /// 全部记录（含活跃任务——先置 cancelled 停 worker 再删）。
+    All,
+    /// 仅成功记录（`done`）。
+    Success,
+    /// 仅失败类记录（`failed` / `cancelled` / `interrupted`）。
+    Failed,
+}
+
+impl TaskClearScope {
+    /// SQL 谓词（作用于 `cache_task.status`）。
+    pub fn predicate(self) -> &'static str {
+        match self {
+            Self::All => "1=1",
+            Self::Success => "status = 'done'",
+            Self::Failed => "status IN ('failed', 'cancelled', 'interrupted')",
+        }
+    }
+
+    /// 从 query 串解析；无法识别返回 `None`（调用方回 422，不静默当成「全部」）。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "all" | "" => Some(Self::All),
+            "success" | "done" | "succeeded" => Some(Self::Success),
+            "failed" | "failure" | "error" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
 /// 缓存任务（`cache_task` 行）——服务端持有的下载任务状态。
 ///
 /// 结构性要点：任务生命周期**不绑定 HTTP 请求**。此前缓存是「浏览器发一条同步
@@ -213,6 +248,15 @@ async fn migrate_media_message(conn: &Connection) -> libsql::Result<()> {
 /// 按 `list_messages`/`get_message` 的 SELECT 列顺序映射一行。
 /// 列顺序：channel_id, message_id, caption, mime_type, size, downloaded, created_at,
 ///         media_type, msg_date, duration, file_path, group_id
+/// 全局监控搜索命中：消息本体（拍平）+ 所属监控频道标题（前端按频道分组展示用）。
+#[derive(Debug, Clone, Serialize)]
+pub struct MonitoredMessageHit {
+    #[serde(flatten)]
+    pub message: StoredMessage,
+    #[serde(rename = "channelTitle")]
+    pub channel_title: Option<String>,
+}
+
 fn stored_message_from_row(r: &Row) -> libsql::Result<StoredMessage> {
     Ok(StoredMessage {
         channel_id: r.get(0)?,
@@ -461,6 +505,93 @@ impl Store {
         Ok(out)
     }
 
+    /// 监控内容查找：按 caption 子串筛**本地已同步**消息（新→旧，`before_id` 游标同 `list_messages`）。
+    ///
+    /// 只查本地——搜索是查询语义，不做网络回补（回补属浏览语义，把一次搜索放大成
+    /// 拉全量历史不可接受）；未同步到的历史段落不保证命中，与列表的降级语义一致。
+    /// caption 为 NULL（无文字媒体）不命中。`%`/`_` 按字面匹配（ESCAPE 转义）。
+    pub async fn search_messages(
+        &self,
+        channel_id: i64,
+        q: &str,
+        before_id: Option<i64>,
+        limit: u32,
+    ) -> libsql::Result<Vec<StoredMessage>> {
+        let pattern = format!(
+            "%{}%",
+            q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+        );
+        let (sql, args): (&str, Vec<libsql::Value>) = match before_id {
+            None => (
+                "SELECT channel_id, message_id, caption, mime_type, size, downloaded, created_at, media_type, msg_date, duration, file_path, group_id
+                 FROM media_message WHERE channel_id = ?1 AND caption LIKE ?2 ESCAPE '\\'
+                 ORDER BY message_id DESC LIMIT ?3",
+                vec![
+                    channel_id.into(),
+                    pattern.into(),
+                    (limit.max(1) as i64).into(),
+                ],
+            ),
+            Some(before) => (
+                "SELECT channel_id, message_id, caption, mime_type, size, downloaded, created_at, media_type, msg_date, duration, file_path, group_id
+                 FROM media_message WHERE channel_id = ?1 AND caption LIKE ?2 ESCAPE '\\' AND message_id < ?3
+                 ORDER BY message_id DESC LIMIT ?4",
+                vec![
+                    channel_id.into(),
+                    pattern.into(),
+                    before.into(),
+                    (limit.max(1) as i64).into(),
+                ],
+            ),
+        };
+        let stmt = self.conn.prepare(sql).await?;
+        let mut rows = stmt.query(args).await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(stored_message_from_row(&r)?);
+        }
+        Ok(out)
+    }
+
+    /// 监控内容**全局**查找：跨**全部监控频道**按 caption 子串筛本地已同步消息
+    /// （新→旧按消息时间）。与 `search_messages`（单频道）的差别只在两点——
+    /// 不带 channel_id 过滤、JOIN `monitored_channel` 带出频道标题供分组展示。
+    /// 同样只查本地：搜索是查询语义，不做网络回补。
+    pub async fn search_monitored_messages(
+        &self,
+        q: &str,
+        limit: u32,
+    ) -> libsql::Result<Vec<MonitoredMessageHit>> {
+        let pattern = format!(
+            "%{}%",
+            q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+        );
+        let stmt = self
+            .conn
+            .prepare(
+                "SELECT m.channel_id, m.message_id, m.caption, m.mime_type, m.size, m.downloaded,
+                        m.created_at, m.media_type, m.msg_date, m.duration, m.file_path, m.group_id,
+                        c.title
+                 FROM media_message m
+                 JOIN monitored_channel c ON c.channel_id = m.channel_id
+                 WHERE m.caption LIKE ?1 ESCAPE '\\'
+                 ORDER BY COALESCE(m.msg_date, m.created_at) DESC, m.message_id DESC
+                 LIMIT ?2",
+            )
+            .await?;
+        let mut rows = stmt
+            .query(params![pattern, limit.max(1) as i64])
+            .await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(MonitoredMessageHit {
+                message: stored_message_from_row(&r)?,
+                channel_title: r.get(12)?,
+            });
+        }
+        Ok(out)
+    }
+
     /// 取单条已入库消息。
     pub async fn get_message(
         &self,
@@ -598,6 +729,20 @@ impl Store {
         }
     }
 
+    /// **原任务重试**（BUG-078）：把终态记录复位为 `queued`，复用同一 id，由 worker 重跑。
+    /// 只动终态（failed/cancelled/interrupted）；running/queued 不复位（避免双跑同一条）。
+    /// 与 `enqueue_cache_task`（对终态会 `INSERT` 新行）区分——后者正是「重试却新建任务」的根因。
+    pub async fn retry_cache_task(&self, id: i64) -> libsql::Result<Option<CacheTask>> {
+        self.conn
+            .execute(
+                "UPDATE cache_task SET status='queued', done=0, error=NULL, updated_at=?1 \
+                 WHERE id=?2 AND status NOT IN ('running','queued')",
+                params![now(), id],
+            )
+            .await?;
+        self.get_cache_task(id).await
+    }
+
     /// 读同 key 的活跃任务（`queued`/`running`）。
     pub async fn active_cache_task(&self, item_key: &str) -> libsql::Result<Option<CacheTask>> {
         self.row_opt(
@@ -657,19 +802,87 @@ impl Store {
         Ok(out)
     }
 
-    /// 清除终态任务记录（缓存管理面板「清除记录」）。
-    /// 活跃任务（queued/running）绝不清除。返回删除行数。
-    pub async fn clear_finished_cache_tasks(&self) -> libsql::Result<u64> {
-        let n = self
-            .conn
+    /// 任务记录的**唯一批量清除入口**——范围由参数决定，不是靠堆按钮/堆端点。
+    ///
+    /// 三档范围（见 [`TaskClearScope`]）互斥且并集为全集：
+    /// `success` ∪ `failed` ∪ `{queued,running}` = 全部记录。
+    /// 只有 `all` 档会波及活跃任务（先置 `cancelled` 让 worker 在下一条目间隙退出），
+    /// 另两档**永不误伤正在跑的任务**。返回删除行数。
+    ///
+    /// 此前的错误形态（BUG-051）：为「清除终态」和「清空全部」各写一个端点，
+    /// 于是「清空失败」「清空成功」就会顺理成章地再加两个——动词被当成枚举对象，
+    /// 面板必然无限叠加。正解是**动词只有一个**，范围是可组合的参数。
+    pub async fn clear_cache_tasks(&self, scope: TaskClearScope) -> libsql::Result<u64> {
+        let pred = scope.predicate();
+        self.conn
             .execute(
                 &format!(
-                    "DELETE FROM cache_task WHERE status NOT IN {CACHE_TASK_ACTIVE_STATES}"
+                    "UPDATE cache_task SET status = 'cancelled', current_id = NULL, updated_at = ?1 \
+                     WHERE ({pred}) AND status IN {CACHE_TASK_ACTIVE_STATES}"
                 ),
-                (),
+                params![now()],
             )
             .await?;
+        let n = self
+            .conn
+            .execute(&format!("DELETE FROM cache_task WHERE {pred}"), ())
+            .await?;
         Ok(n)
+    }
+
+    /// 删除**指定 id 集合**的任务记录 —— 缓存管理面板「删除所选」。
+    ///
+    /// 与 `delete_cache_task` 同一套纪律：活跃任务先置 `cancelled`（让 worker 在
+    /// 下一条目间隙退出），再删行 —— 直接删行会让 worker 拿着不存在的 id 继续写进度。
+    ///
+    /// 为什么按 id 而不是再加一档 scope：范围（全部/成功/失败）是**看得见的筛选**，
+    /// 而用户要的是「我勾了这几条」。选择本身才是诉求，枚举档位永远追不上
+    /// （清空失败 / 清空成功 / 清空中断…）。点全选即等价于「全部」。
+    pub async fn delete_cache_tasks_by_ids(&self, ids: &[i64]) -> libsql::Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        // 变长 IN 列表无法用绑定参数表达；id 全是 i64，拼接无注入面。
+        let list = ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE cache_task SET status = 'cancelled', current_id = NULL, updated_at = ?1 \
+                     WHERE id IN ({list}) AND status IN {CACHE_TASK_ACTIVE_STATES}"
+                ),
+                params![now()],
+            )
+            .await?;
+        let n = self
+            .conn
+            .execute(&format!("DELETE FROM cache_task WHERE id IN ({list})"), ())
+            .await?;
+        Ok(n)
+    }
+
+    /// 删除**单条**任务记录（任何状态）——缓存管理面板「删除」。
+    ///
+    /// 活跃任务先置 `cancelled`（让 worker 在下一条目间隙退出），再删行；
+    /// 直接删行会让 worker 拿着不存在的 id 继续写进度。返回是否命中该 id。
+    pub async fn delete_cache_task(&self, id: i64) -> libsql::Result<bool> {
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE cache_task SET status = 'cancelled', current_id = NULL, updated_at = ?2 \
+                     WHERE id = ?1 AND status IN {CACHE_TASK_ACTIVE_STATES}"
+                ),
+                params![id, now()],
+            )
+            .await?;
+        let n = self
+            .conn
+            .execute("DELETE FROM cache_task WHERE id = ?1", params![id])
+            .await?;
+        Ok(n > 0)
     }
 
     /// `queued` → `running`（worker 起跑时置位）。
@@ -1241,5 +1454,105 @@ mod tests {
             .unwrap();
         let list = s.list_cache_tasks(50).await.unwrap();
         assert_eq!(list[0].id, a.id, "活跃任务必须排在最前");
+    }
+
+    /// 回归（BUG-051 缓存管理）：终态记录**必须能删**，活跃任务也能删（先取消再删行），
+    /// 「清空全部」必须连活跃任务一起清。
+    #[tokio::test]
+    async fn cache_task_delete_single_and_clear_all() {
+        async fn mk_task(s: &Store, key: &str, msg: i64) -> CacheTask {
+            s.enqueue_cache_task(9, None, key, &[msg], "D:/dl")
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+        }
+
+        let s = store("cache_delete").await;
+
+        let (t1, _) = s
+            .enqueue_cache_task(9, None, "m:9:31", &[31], "D:/dl")
+            .await
+            .unwrap()
+            .unwrap();
+        let (t2, _) = s
+            .enqueue_cache_task(9, None, "m:9:32", &[32], "D:/dl")
+            .await
+            .unwrap()
+            .unwrap();
+        // t1 置终态，t2 保持 queued（活跃）。
+        s.finish_cache_task(t1.id, "done", None).await.unwrap();
+
+        // 单删：终态记录可删（此前只能取消活跃任务，终态直接 404 → 永远删不掉）。
+        assert!(s.delete_cache_task(t1.id).await.unwrap());
+        assert!(s.get_cache_task(t1.id).await.unwrap().is_none());
+        assert!(!s.delete_cache_task(t1.id).await.unwrap(), "重复删除未命中");
+
+        // 活跃任务也能删：先置 cancelled 再删行，worker 不会继续写进度。
+        assert!(s.delete_cache_task(t2.id).await.unwrap());
+        assert!(s.get_cache_task(t2.id).await.unwrap().is_none());
+
+        // —— 批量清除：动词只有一个，范围三档互斥且并集为全集 ——
+        let ran = mk_task(&s, "m:9:33", 33).await;
+        let ok = mk_task(&s, "m:9:34", 34).await;
+        let bad = mk_task(&s, "m:9:35", 35).await;
+        s.finish_cache_task(ok.id, "done", None).await.unwrap();
+        s.finish_cache_task(bad.id, "failed", Some("boom"))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.count_cache_tasks().await.unwrap().iter().map(|(_, n)| n).sum::<i64>(),
+            3
+        );
+
+        // success 档：只删成功，**活跃任务不受伤**（这是「清除记录」与「清空全部」的分界线）。
+        assert_eq!(s.clear_cache_tasks(TaskClearScope::Success).await.unwrap(), 1);
+        assert!(s.get_cache_task(ok.id).await.unwrap().is_none());
+        assert!(s.get_cache_task(ran.id).await.unwrap().is_some(), "活跃任务必须存活");
+        assert!(s.get_cache_task(bad.id).await.unwrap().is_some());
+
+        // failed 档：只删失败类，活跃任务同样不受伤。
+        assert_eq!(s.clear_cache_tasks(TaskClearScope::Failed).await.unwrap(), 1);
+        assert!(s.get_cache_task(bad.id).await.unwrap().is_none());
+        assert!(s.get_cache_task(ran.id).await.unwrap().is_some());
+
+        // all 档：连活跃任务一起清（先置 cancelled 停 worker，再删行）。
+        assert_eq!(s.clear_cache_tasks(TaskClearScope::All).await.unwrap(), 1);
+        assert!(s.get_cache_task(ran.id).await.unwrap().is_none());
+        assert!(s.list_cache_tasks(50).await.unwrap().is_empty());
+    }
+
+    /// 三档范围必须互斥且穷尽——否则任何新需求都会变成「再加一档」。
+    #[test]
+    fn clear_scope_partitions_all_statuses() {
+        let all = ["queued", "running", "done", "failed", "cancelled", "interrupted"];
+        let in_scope = |scope: TaskClearScope, s: &str| match scope {
+            TaskClearScope::All => true,
+            TaskClearScope::Success => s == "done",
+            TaskClearScope::Failed => matches!(s, "failed" | "cancelled" | "interrupted"),
+        };
+        for s in all {
+            assert!(in_scope(TaskClearScope::All, s), "{s} 必须落在 all 档");
+            let hits = [TaskClearScope::Success, TaskClearScope::Failed]
+                .iter()
+                .filter(|sc| in_scope(**sc, s))
+                .count();
+            assert!(hits <= 1, "{s} 不能同时属于两档（互斥）");
+        }
+        let mut total = 0u64;
+        for s in all {
+            if s == "done" {
+                total += 1
+            } else if ["failed", "cancelled", "interrupted"].contains(&s) {
+                total += 1
+            }
+        }
+        // 6 个状态中，终态 4 个（done + failed/cancelled/interrupted），由 success/failed 两档覆盖；
+        // 活跃 2 个（queued/running）只有 all 档会动 —— 这就是「还有第 4 档吗」的答案。
+        assert_eq!(total, 4, "success ∪ failed 覆盖全部终态");
+        assert_eq!(TaskClearScope::parse("nonsense"), None, "未知范围必须报错，不能当全部");
+        assert_eq!(TaskClearScope::parse("all"), Some(TaskClearScope::All));
+        assert_eq!(TaskClearScope::parse("success"), Some(TaskClearScope::Success));
+        assert_eq!(TaskClearScope::parse("failed"), Some(TaskClearScope::Failed));
     }
 }

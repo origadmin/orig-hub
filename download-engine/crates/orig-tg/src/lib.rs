@@ -17,6 +17,7 @@
 pub mod config;
 pub mod grammers;
 pub mod login;
+pub mod cache;
 /// 极简容量+TTL LRU（媒体元数据/缩略图缓存，BUG-028）。
 pub mod lru;
 pub mod media;

@@ -62,11 +62,13 @@ export function CreateSeriesDialog(props: {
             className="h-8 text-xs"
             autoFocus
           />
-          <Input
+          {/* 介绍天然是多行内容：单行 Input 会把长介绍截成一行（用户实测反馈） */}
+          <textarea
             value={description}
             onChange={(e) => setDescription(e.target.value)}
-            placeholder="简介（可选）"
-            className="h-8 text-xs"
+            placeholder="简介（可选，支持换行）"
+            rows={2}
+            className="w-full resize-none rounded-md border border-border-subtle bg-surface px-2.5 py-1.5 text-xs text-fg-strong placeholder:text-muted"
           />
           <Input
             value={year}
@@ -289,6 +291,13 @@ export function MergeSeriesDialog(props: {
               内容按原有顺序接到目标各季末尾并重新编号；已在目标里的同一条目不会重复加入。
               文件名相同但内容不同的条目、同一内容的不同来源，都会原样保留 ——
               本功能不做内容合并判断。
+            </p>
+            <p className="text-[10px] leading-relaxed text-muted">
+              集号规则：目标各季从
+              <span className="font-medium text-fg-mid">现有最大集号往后</span>
+              续编（不会覆盖已有编号）；并入的每一集保留「合并自《源剧集》· 原 E&lt;n&gt;」
+              溯源标注，之后可在详情里改号或上下移动。两个剧集的标签会合并去重，
+              不会丢也不会重复。
             </p>
             {confirming && source && (
               <p className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-[11px] leading-relaxed text-destructive">
