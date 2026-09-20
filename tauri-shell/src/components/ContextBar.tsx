@@ -40,7 +40,11 @@ export interface ContextBarProps {
 
 /** 视图 → 形态（唯一真源，禁止在 JSX 里散写三元） */
 export function resolveContextKind(view: ViewId): ContextKind {
-  return view === 'all' || view === 'downloading' || view === 'completed'
+  return view === 'all' ||
+    view === 'downloading' ||
+    view === 'paused' ||
+    view === 'completed' ||
+    view === 'failed'
     ? 'download'
     : 'status'
 }
@@ -49,7 +53,9 @@ export function resolveContextKind(view: ViewId): ContextKind {
 export const TITLE_KEY: Record<ViewId, string> = {
   all: 'nav.all',
   downloading: 'nav.downloading',
+  paused: 'nav.paused',
   completed: 'nav.completed',
+  failed: 'nav.failed',
   media: 'nav.media',
   tg: 'nav.tg',
   settings: 'nav.settings',
@@ -95,6 +101,10 @@ export const ContextBar = memo(function ContextBar({
   const { t } = useTranslation()
   const kind = resolveContextKind(view)
 
+  /** 终态两档（已完成 / 失败·已取消）都显示「清空」：
+   *  store 的 clearCompleted 已覆盖 completed | error | cancelled 三种状态，语义正好对齐。 */
+  const showClear = view === 'completed' || view === 'failed'
+
   return (
     <div
       className="flex min-w-0 flex-1 items-center gap-3"
@@ -105,7 +115,7 @@ export const ContextBar = memo(function ContextBar({
       <div className="ml-auto flex shrink-0 items-center gap-3">
         {kind === 'download' ? (
           <ContextBarActions
-            showClear={view === 'completed'}
+            showClear={showClear}
             onNewDownload={onNewDownload}
             onPauseAll={onPauseAll}
             onResumeAll={onResumeAll}

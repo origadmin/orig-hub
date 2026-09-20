@@ -2,7 +2,16 @@ import { useState, type JSX } from 'react'
 import { cn } from '../lib/utils'
 import { useTranslation } from '../i18n'
 
-export type ViewId = 'all' | 'downloading' | 'completed' | 'media' | 'tg' | 'settings'
+/**
+ * 导航视图枚举。
+ *
+ * APP 核心是下载工具，下载队列按 `download.status` 的七态拆成四档导航：
+ *   - downloading → downloading | queued | idle
+ *   - paused      → paused
+ *   - completed   → completed
+ *   - failed      → error | cancelled
+ */
+export type ViewId = 'all' | 'downloading' | 'paused' | 'completed' | 'failed' | 'media' | 'tg' | 'settings'
 
 interface Props {
   view: ViewId
@@ -14,21 +23,12 @@ interface Props {
   onCategoryChange: (c: string | null) => void
   collapsed: boolean
   onToggle: () => void
-  counts: { active: number; completed: number; total: number }
+  counts: { downloading: number; paused: number; completed: number; failed: number; total: number }
   /** Telegram 已绑定/已登录（由登录绑定态驱动） */
   tgBound: boolean
   /** TG 功能就绪（常规开关开 + 可用性探测 ok）；false 时 TG 导航整体隐藏（入口级门控） */
   tgReady: boolean
 }
-
-/**
- * 隐藏下载模块（可逆开关）。
- *
- * 依据：用户裁定「下载不需要，因为不使用这个下载逻辑」——主流程是 TG 抓取 → 缓存入库 →
- * 媒体库管理/播放，不经过 orig-daemon 的下载任务队列。置 false 即可恢复全部下载入口。
- */
-const DOWNLOAD_MODULE_HIDDEN = true
-const HIDDEN_VIEWS: ViewId[] = ['downloading', 'completed']
 
 const NAV_ITEMS: { id: ViewId; labelKey: string; icon: JSX.Element }[] = [
   {
@@ -41,11 +41,29 @@ const NAV_ITEMS: { id: ViewId; labelKey: string; icon: JSX.Element }[] = [
     ),
   },
   {
+    id: 'paused',
+    labelKey: 'nav.paused',
+    icon: (
+      <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M8 5v14M16 5v14" />
+      </svg>
+    ),
+  },
+  {
     id: 'completed',
     labelKey: 'nav.completed',
     icon: (
       <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+      </svg>
+    ),
+  },
+  {
+    id: 'failed',
+    labelKey: 'nav.failed',
+    icon: (
+      <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+        <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v4m0 3.5h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
       </svg>
     ),
   },
@@ -261,18 +279,18 @@ export function Sidebar({
           )}
         </div>
 
-        {NAV_ITEMS.filter(
-          (item) =>
-            (!DOWNLOAD_MODULE_HIDDEN || !HIDDEN_VIEWS.includes(item.id)) &&
-            (item.id !== 'tg' || (tgBound && tgReady)),
-        ).map((item) => {
+        {NAV_ITEMS.filter((item) => item.id !== 'tg' || (tgBound && tgReady)).map((item) => {
           const active = view === item.id
           const count =
             item.id === 'downloading'
-              ? counts.active
-              : item.id === 'completed'
-                ? counts.completed
-                : 0
+              ? counts.downloading
+              : item.id === 'paused'
+                ? counts.paused
+                : item.id === 'completed'
+                  ? counts.completed
+                  : item.id === 'failed'
+                    ? counts.failed
+                    : 0
           return (
             <button
               key={item.id}

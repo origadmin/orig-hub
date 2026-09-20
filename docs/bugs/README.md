@@ -111,7 +111,7 @@
 | BUG-079 | 缓存字节：频道 chip `truncate` 截名致同名难辨 +「预计释放」显示全量而非选中量。修：新增 `tg.bytesSelected` 由**选中集合**求和即时反馈（`cache-bytes-selected-preview`）；chip 改 `whitespace-nowrap` 不截名 | fixed | shell |
 | BUG-080 | 缓存清理后媒体库条目仍在且外观如常，但 `file_path=NULL` → `/api/media/items/:id/raw` 返回 404，点了播不了且无提示。修：`EpisodeView.has_bytes`（`file_path IS NOT NULL`，**不新增列**）+ `hasMediaBytes()` 唯一判据入口；无字节时占位、不给播放按钮，TG 源给「重新缓存」、非 TG 标「文件已丢失」。**关键例外：TG 图片不落盘（BUG-049），`file_path` 空 ≠ 丢失，判据优先级必须把 `source=tg && kind=photo` 排在最前** | fixed | engine+shell |
 | BUG-081 | 「清理入口在本面板的『缓存字节』页签」提示在**本页签自己也显示**（自指）。修：仅 `view !== 'bytes'` 时渲染（`cache-purge-hint`） | fixed | shell |
-| BUG-082 | 左侧 Navi 缺「下载中/已完成」—— 被 `DOWNLOAD_MODULE_HIDDEN` 开关整体隐藏（`Sidebar.tsx:30`），且**无替代筛选入口**。评估（已推翻旧结论）：**APP 核心是下载工具**，缺的是**下载队列**状态筛选，与 TG 无关；三档不够，引擎七态中 `paused`/`error`/`cancelled` 无归宿，建议定档五档（全部/下载中/已暂停/已完成/失败·已取消）；状态与分类应改为正交下钻而非同级互斥。待拍板 3 项 | open | shell |
+| BUG-082 | 左侧 Navi 缺「下载中/已完成」—— 被 `DOWNLOAD_MODULE_HIDDEN` 开关整体隐藏（`Sidebar.tsx:30`），且**无替代筛选入口**。评估（已推翻旧结论）：**APP 核心是下载工具**，缺的是**下载队列**状态筛选，与 TG 无关；三档不够，引擎七态中 `paused`/`error`/`cancelled` 无归宿，建议定档五档（全部/下载中/已暂停/已完成/失败·已取消）；状态与分类应改为正交下钻而非同级互斥。待拍板 3 项（①已定案五档） | fixed | shell |
 | BUG-083 | 顶部下载工具栏仅 `isDownloadView` 下渲染，媒体库/TG 下整行空白（`<header>` 常驻定高，**布局不跳动，无需额外占位**）。评估：媒体库/TG **不显示**下载按钮（按钮语义指向 daemon 队列，而媒体库条目与 TG 缓存任务都不是其对象，常显会误导）。建议把该栏改为「上下文栏」：低改本放视图标题+全局态，中成本把内容区工具条上行合并。待拍板：工具条上行还是留在内容区 | fixed | shell |
 | BUG-084 | 提交信息混入 CR（CRLF）：同内容提交哈希不同（`206ee70` vs `645d2c7` 同 tree 仅差结尾行尾）、后代哈希全变，78 条里 76 条 message 含 CR。修：门禁加 CR 检测——`check-commit-msgs.py` 按字节取 `%B` + 生效点基线（历史欠账只告警、新增阻断）+ `--self-test`，`commit-msg` 钩子用字面 CR + `grep -U`；AGENTS.md §2/§7 同步。存量 76 条待重写，见待拍板 | fixed | build |
 

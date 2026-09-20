@@ -4,7 +4,7 @@ import { SpeedChip } from './ContextBarStatus'
 import { useStore } from '../store/useStore'
 import {
   selectActiveCount,
-  selectHasCompleted,
+  selectHasClearable,
   selectHasPaused,
 } from '../store/selectors'
 import { useTranslation } from '../i18n'
@@ -16,11 +16,11 @@ import type { OnAction } from './ContextBar'
  *
  * 按钮文案、图标、尺寸、变体沿用原 header 内联按钮组（BUG-083 只搬位置，不改语义）。
  * disabled 依据**由本组件自己订阅**（`selectActiveCount` / `selectHasPaused` /
- * `selectHasCompleted`），父级不传高频值进来；回调全部是 `useEvent` 恒定引用。
+ * `selectHasClearable`），父级不传高频值进来；回调全部是 `useEvent` 恒定引用。
  */
 
 export interface ContextBarActionsProps {
-  /** 仅 completed 视图显示「清空」 */
+  /** completed / failed 两个终态档显示「清空」 */
   showClear: boolean
   onNewDownload: OnAction
   onPauseAll: OnAction
@@ -38,7 +38,7 @@ export const ContextBarActions = memo(function ContextBarActions({
   const { t } = useTranslation()
   const activeCount = useStore(selectActiveCount)
   const hasPaused = useStore(selectHasPaused)
-  const hasCompleted = useStore(selectHasCompleted)
+  const hasClearable = useStore(selectHasClearable)
   const busy = activeCount > 0
 
   return (
@@ -101,7 +101,7 @@ export const ContextBarActions = memo(function ContextBarActions({
           size="sm"
           variant="ghost"
           onClick={onClearCompleted}
-          disabled={!hasCompleted}
+          disabled={!hasClearable}
           title={t('main.clearHint')}
         >
           {t('main.clear')}

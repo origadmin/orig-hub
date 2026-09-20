@@ -17,8 +17,8 @@ import { ensureDaemon, daemonStatus } from '../api/tauri'
 import { cn } from '../lib/utils'
 
 export function MainLayout() {
-  // 默认落地媒体库（下载模块已按用户裁定隐藏，见 Sidebar 的 DOWNLOAD_MODULE_HIDDEN）
-  const [view, setView] = useState<ViewId>('media')
+  // APP 核心是下载工具，默认落地全部下载
+  const [view, setView] = useState<ViewId>('all')
   const [collapsed, setCollapsed] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
   const { t } = useTranslation()
@@ -45,17 +45,17 @@ export function MainLayout() {
     return () => clearInterval(timer)
   }, [init, refresh, setDaemon])
 
-  // TG 未绑定时，若当前停留在 TG 视图则退回媒体库（由登录绑定态驱动，非插件开关）
+  // TG 未绑定时，若当前停留在 TG 视图则退回全部下载（由登录绑定态驱动，非插件开关）
   useEffect(() => {
-    if (!accounts.tg.bound && view === 'tg') setView('media')
+    if (!accounts.tg.bound && view === 'tg') setView('all')
   }, [accounts.tg.bound, view])
 
-  // 功能被摘除时（开关关 / 探测到不可用）把用户从 TG 视图送回媒体库，
+  // 功能被摘除时（开关关 / 探测到不可用）把用户从 TG 视图送回全部下载，
   // 避免停留在已被门控隐藏的面板上。探测未返回（null）不算不可用。
   useEffect(() => {
     if (view !== 'tg') return
     const unavailable = tgAvailability !== null && tgAvailability.status !== 'ok'
-    if (!tgEnabled || unavailable) setView('media')
+    if (!tgEnabled || unavailable) setView('all')
   }, [tgEnabled, tgAvailability, view])
 
   // TG 开关变化时重探测可用性：开启侧 daemon 拉起 orig-tg 需要时间，最多重试 5 次；
@@ -88,9 +88,31 @@ export function MainLayout() {
     return () => clearTimeout(t)
   }, [toast, clearToast])
 
+  /**
+   * 真正在跑的任务（downloading | queued）：**只**驱动速度合计（下方 `totalSpeed`），不含 idle。
+   *
+   * 注意：「全部暂停」按钮的可用性**不是**由本变量提供的 —— 它由 `selectActiveCount`
+   * （`store/selectors.ts:33-34`）独立订阅，经 `ContextBarActions` 的 `busy` 消费。
+   * 两者**口径一致**（同为 downloading | queued）但**不是同一个数据源**：
+   * 改这里不会影响那个按钮，反之亦然。
+   *
+   * 也不要把本变量并进 `downloadingBucket` —— 那会让 idle 任务也计入「真正在跑」，
+   * 于是只有 idle 时「全部暂停」亮起却空转（正是本 BUG 要根除的死按钮）。
+   */
   const active = downloads.filter((d) => d.status === 'downloading' || d.status === 'queued')
+  /**
+   * 「下载中」档 = 下载中 | 排队 | 空闲。与侧栏徽标、状态栏共用同一口径，
+   * 保证「徽标数 == 点进去的条数」；注意与上面的 active 不是一回事 ——
+   * active 只算真正在跑的，不含 idle（否则只有 idle 任务时「全部暂停」会亮起却空转，
+   * 那就是新造一个死按钮）。
+   */
+  const downloadingBucket = downloads.filter(
+    (d) => d.status === 'downloading' || d.status === 'queued' || d.status === 'idle',
+  )
   const paused = downloads.filter((d) => d.status === 'paused')
   const completed = downloads.filter((d) => d.status === 'completed')
+  // 失败档：error 与 cancelled 同属「未成功终态」，合并成一档导航
+  const failed = downloads.filter((d) => d.status === 'error' || d.status === 'cancelled')
   const totalSpeed = active.reduce((sum, d) => sum + (d.speed || 0), 0)
 
   // 全局聚合进度（BUG-004）：管理中任务（下载中/排队/已暂停）的累计字节占比。
@@ -117,16 +139,23 @@ export function MainLayout() {
   const handleResumeAll = useEvent(() => void resumeAll().catch(() => {}))
   const handleClearCompleted = useEvent(() => void clearCompleted().catch(() => {}))
 
+  /**
+   * 档位过滤（BUG-082）：下载四档与 `download.status` 七态一一对应，
+   * 任一态都恰好落进一档，不再有「混档显示」或「无档可归」的死角
+   * （`idle` 归入下载中档，否则它四档皆不可见）。
+   */
   const baseVisible =
     view === 'settings'
       ? downloads
       : view === 'completed'
         ? completed
-        : view === 'downloading'
-          ? downloads.filter(
-              (d) => d.status === 'downloading' || d.status === 'queued' || d.status === 'paused' || d.status === 'idle' || d.status === 'error',
-            )
-          : downloads
+        : view === 'failed'
+          ? failed
+          : view === 'paused'
+            ? paused
+            : view === 'downloading'
+              ? downloadingBucket
+              : downloads
   const visible = categoryFilter
     ? baseVisible.filter((d) => d.category === categoryFilter)
     : baseVisible
@@ -158,7 +187,13 @@ export function MainLayout() {
           onCategoryChange={setCategoryFilter}
           collapsed={collapsed}
           onToggle={() => setCollapsed((c) => !c)}
-          counts={{ active: active.length, completed: completed.length, total: downloads.length }}
+          counts={{
+            downloading: downloadingBucket.length,
+            paused: paused.length,
+            completed: completed.length,
+            failed: failed.length,
+            total: downloads.length,
+          }}
           tgBound={accounts.tg.bound}
           tgReady={tgFeatureReady}
         />
@@ -218,10 +253,20 @@ export function MainLayout() {
           {/* Status bar */}
           <footer className="flex h-8 shrink-0 items-center justify-between border-t border-border-subtle px-4 text-[11px] text-muted">
             <span>
+              {/*
+                注意：这里的键名 `active` 是 **i18n 模板占位符契约**（对应 zh/en
+                双语模板 `main.status` 里的 `{active}`），**不得**与 <Sidebar counts>
+                的 `downloading` 键统一命名 —— 两边同名纯属巧合，语义不同源：
+                  · 本处 `active` 受 zh-CN.json / en-US.json 的模板占位符约束；
+                  · Sidebar 的 `downloading` 是组件 props 字段名。
+                改任一侧都需要**同步双语模板**：占位符缺失不会报错、只显示空字符串，
+                状态栏这个数会静默消失而 tsc 照样绿（典型假绿）。
+              */}
               {t('main.status', {
-                active: active.length,
+                active: downloadingBucket.length,
                 paused: paused.length,
                 completed: completed.length,
+                failed: failed.length,
               })}
             </span>
             <span className={cn('flex items-center gap-1.5')}>

@@ -55,9 +55,18 @@ export const selectActiveSpeedLabel = (s: RootState): string =>
 export const selectHasPaused = (s: RootState): boolean =>
   s.downloads.some((d: Download) => d.status === 'paused')
 
-/** 是否存在已完成任务（「清空」的 disabled 依据） */
-export const selectHasCompleted = (s: RootState): boolean =>
-  s.downloads.some((d: Download) => d.status === 'completed')
+/**
+ * 是否存在可清空任务（completed | error | cancelled）——「清空」的 disabled 依据。
+ *
+ * 与 `useStore.clearCompleted` 的扫描口径严格一致（BUG-082）：失败页也挂「清空」，
+ * 若只用「是否存在 completed」判 disabled，则在「只有失败任务」时按钮恒灰 ——
+ * 那就又造出一个「按钮有、动作不可达」的死按钮。返回布尔 → 仅在有/无之间翻转。
+ */
+export const selectHasClearable = (s: RootState): boolean =>
+  s.downloads.some(
+    (d: Download) =>
+      d.status === 'completed' || d.status === 'error' || d.status === 'cancelled',
+  )
 
 /** SSE 实时链路是否连通（低频：仅在断线/重连时翻转） */
 export const selectConnected = (s: RootState): boolean => s.connected
