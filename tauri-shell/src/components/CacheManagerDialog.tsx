@@ -5,6 +5,7 @@ import { Progress } from './ui/progress'
 import { CacheBytesPanel } from './CacheBytesPanel'
 import { cn } from '../lib/utils'
 import { useTranslation } from '../i18n'
+import { describeTgFailure } from '../lib/tgReason'
 import { useStore } from '../store/useStore'
 import { useEvent } from '../hooks/useEvent'
 import { findMediaItemIdByRef, getMediaItem, mediaItemUrl } from '../api/media'
@@ -256,8 +257,13 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
         </p>
       ) : null}
       {task.status === 'failed' && task.error ? (
-        <p className="mt-1 truncate text-[11px] text-red-500" title={task.error}>
-          {task.error}
+        // 与 TgPanel 共用同一映射（BUG-111）：此前这里连「受保护内容」的特例都没有，
+        // 任务失败原因一律原样渲染（`request error: dropped (cancelled)` 直接进界面）。
+        <p
+          className="mt-1 truncate text-[11px] text-red-500"
+          title={describeTgFailure(task.error, t)}
+        >
+          {describeTgFailure(task.error, t)}
         </p>
       ) : null}
       {missing ? (

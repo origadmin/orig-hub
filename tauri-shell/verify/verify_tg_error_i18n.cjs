@@ -193,6 +193,46 @@ async function main() {
       live.message.length > 0 && !live.message.includes('{'),
       JSON.stringify(live.message),
     )
+    // ---- 任务失败原因（BUG-111，第三条泄漏路径：daemon 聚合 → 任务错误 → 界面）----
+    const taskMsg = await page.evaluate(async () => {
+      const r = await import('/src/lib/tgReason.ts')
+      const i18n = await import('/src/i18n/index.ts')
+      const f = r.describeTgFailure
+      return {
+        dropped: f('request error: dropped (cancelled)', i18n.t),
+        protectedMedia: f('os error 5: 拒绝访问', i18n.t),
+        unknown: f('no active cache task with this id', i18n.t),
+        empty: f('', i18n.t),
+        textNetwork: i18n.t('tg.reasonNetwork'),
+        textProtected: i18n.t('tg.protectedMedia'),
+        textFallback: i18n.t('tg.cacheFailed'),
+      }
+    })
+
+    // 12. 真实留存过的那条失败原因（时间戳 02:05:12，见 BUG-111）必须显示中文。
+    check(
+      'persisted task error "dropped" renders the i18n network text',
+      taskMsg.dropped === taskMsg.textNetwork,
+      JSON.stringify(taskMsg.dropped),
+    )
+    // 13. 领域特例优先于通用分类（原本只在 TgPanel 手写了一份）。
+    check(
+      'protected media keeps its dedicated message',
+      taskMsg.protectedMedia === taskMsg.textProtected,
+      JSON.stringify(taskMsg.protectedMedia),
+    )
+    // 14. 反向证伪：认不出的原因保留原文，不得被套上「暂时不可用」。
+    check(
+      'unrecognised task error keeps its raw reason',
+      taskMsg.unknown === 'no active cache task with this id',
+      JSON.stringify(taskMsg.unknown),
+    )
+    // 15. 原因为空时走兜底文案，不给空白。
+    check(
+      'empty task error falls back to tg.cacheFailed',
+      taskMsg.empty === taskMsg.textFallback,
+      JSON.stringify(taskMsg.empty),
+    )
   } finally {
     await browser.close()
   }

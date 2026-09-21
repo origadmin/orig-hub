@@ -65,3 +65,35 @@ export function logTgReason(reason: string | null | undefined, tag = 'tg'): void
   if (!raw) return
   console.debug(`[${tag}] availability reason (raw, not rendered):`, raw)
 }
+
+/**
+ * 任务失败原因 → **可直接渲染**的最终文案（BUG-111）。
+ *
+ * 与 `classifyTgReason` 的区别：那个只回答「属于哪一类」，这里给出最终字符串，
+ * 并把散落各处的两条既有约定收在一处：
+ *
+ * - `tg.protectedMedia`：受保护内容的领域特例，**优先于**通用分类。
+ *   它原本只在 TgPanel 里手写了一份，CacheManagerDialog 完全没有 ——
+ *   同一语义两处实现，改需求时会齐刷刷错成一样（BUG-087 的教训）。
+ * - 分类不出的一律保留原文：与 `api/tg.ts::tgFailureMessage` 同一条理由 ——
+ *   把「没有这个任务」说成「暂时不可用」是谎报，还会给出错误的可行动指引。
+ *
+ * **本函数不负责打日志**（保持纯函数）：留痕由持有原文的调用方自行
+ * `logTgReason`，否则同一条原因在两处渲染点会被记两遍。
+ *
+ * @param raw 任务里持久化的失败原因原文
+ * @param t 翻译函数
+ * @param fallbackKey 原因为空时用的 i18n 键
+ */
+export function describeTgFailure(
+  raw: string | null | undefined,
+  t: (key: string) => string,
+  fallbackKey = 'tg.cacheFailed',
+): string {
+  const s = (raw ?? '').trim()
+  if (!s) return t(fallbackKey)
+  if (/os error 5|拒绝访问|access denied/i.test(s)) return t('tg.protectedMedia')
+  const key = classifyTgReason(s)
+  if (key === 'tg.reasonUnknown') return s
+  return t(key)
+}

@@ -37,7 +37,7 @@ import { ensureTg, tgSaveConfig } from '../api/tauri'
 import { CacheManagerDialog } from './CacheManagerDialog'
 import { useStore } from '../store/useStore'
 import { useTgSearch } from '../store/tgSearch'
-import { classifyTgReason, logTgReason } from '../lib/tgReason'
+import { classifyTgReason, describeTgFailure, logTgReason } from '../lib/tgReason'
 import { useTgRetry } from '../lib/tgRetry'
 import {
   ALBUM_MAX_TILES,
@@ -647,11 +647,9 @@ export function TgPanel(
     if (reportedFailuresRef.current.has(cacheTask.id)) return
     reportedFailuresRef.current.add(cacheTask.id)
     const raw = cacheTask.error ?? ''
-    setError(
-      /os error 5|拒绝访问|access denied/i.test(raw)
-        ? t('tg.protectedMedia')
-        : raw || t('tg.cacheFailed'),
-    )
+    // 原文只进日志（`describeTgFailure` 是纯函数，不留痕 —— 避免同一条原因被记两遍）。
+    logTgReason(raw, 'tg-task')
+    setError(describeTgFailure(raw, t))
   }, [cacheTask, setError, t])
 
 
