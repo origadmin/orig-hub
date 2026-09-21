@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt};
@@ -29,7 +30,6 @@ use grammers_client::session::storages::SqliteSession;
 use grammers_client::session::types::PeerRef;
 use grammers_client::{Client as TgClient, SenderPool, SignInError, tl};
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::login::{
@@ -95,7 +95,12 @@ pub struct GrammersClient {
     /// 而进程继续存活、`/api/tg/session` 继续报 `Authorized`、`/api/tg/diag` 继续报
     /// `health:ok` —— 全部是谎言。**丢弃 JoinHandle 等于销毁任务死亡的证据。**
     /// 这里保留句柄，使链路中断可被观测。
-    sender: Option<JoinHandle<()>>,
+    ///
+    /// 句柄本身交给看门狗任务去 `await`（见 `connect()`），本字段只留**死亡标志**：
+    /// runner 一旦结束（正常退出 / panic / 被取消）就置 true，并连同**退出原因**打进日志。
+    /// 只留 `is_finished()` 是不够的 —— 那只能回答「死了没有」，
+    /// 回答不了「怎么死的」，而不知道病因就无法决定能否自愈（BUG-106 待确认项）。
+    sender_dead: Arc<AtomicBool>,
     /// 发起登录码请求时需要 api_hash（grammers 0.10 的 `request_login_code(phone, api_hash)`）。
     api_hash: String,
     pending: Mutex<Pending>,
@@ -135,8 +140,44 @@ impl GrammersClient {
         // 驱动 sender pool 的后台任务（到各 DC 的连接按需建立）。
         //
         // BUG-106：句柄**必须保留**（不再 `let _runner = ...`）—— 它是判断
-        // 「链路是否还活着」的唯一依据。详见 `GrammersClient::sender` 字段注释。
+        // 「链路是否还活着」的唯一依据。详见 `GrammersClient::sender_dead` 字段注释。
         let runner = tokio::spawn(pool.runner.run());
+        let sender_dead = Arc::new(AtomicBool::new(false));
+        let flag = sender_dead.clone();
+        // 看门狗：**await 句柄以拿到退出原因**。
+        //
+        // 只有把句柄 await 掉才能区分「正常返回」/「panic」/「被取消」，并取出 panic payload。
+        // 没有这段文字，下次 runner 死掉时我们仍然只知道「链路断了」，
+        // 知道不了病因 —— 于是永远无法判断「重连是否只是把崩溃变成崩溃循环」。
+        tokio::spawn(async move {
+            match runner.await {
+                Ok(()) => {
+                    flag.store(true, Ordering::SeqCst);
+                    eprintln!(
+                        "[tg] MTProto sender runner exited without panic; \
+                         subsequent RPCs will fail with Dropped until restart"
+                    );
+                }
+                Err(e) => {
+                    flag.store(true, Ordering::SeqCst);
+                    match e.try_into_panic() {
+                        Ok(payload) => {
+                            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                                (*s).to_string()
+                            } else if let Some(s) = payload.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "<non-string panic payload>".to_string()
+                            };
+                            eprintln!("[tg] MTProto sender runner PANICKED: {msg}");
+                        }
+                        Err(e) => {
+                            eprintln!("[tg] MTProto sender runner task was cancelled: {e}");
+                        }
+                    }
+                }
+            }
+        });
 
         // 已登录则直接进入 Authorized 并记录 user_id；否则为 Anonymous。
         let mut pending = Pending {
@@ -159,7 +200,7 @@ impl GrammersClient {
 
         Ok(Self {
             inner,
-            sender: Some(runner),
+            sender_dead,
             api_hash,
             pending: Mutex::new(pending),
             peer_cache: tokio::sync::Mutex::new(HashMap::new()),
@@ -342,11 +383,8 @@ impl Client for GrammersClient {
     /// runner 一旦退出（panic 或主动结束），`invoke()` 会**永久**返回
     /// `RequestError::Dropped`，且不会自愈 —— 所以这里必须如实报 `false`。
     fn link_alive(&self) -> bool {
-        match &self.sender {
-            Some(h) => !h.is_finished(),
-            // 构造时必然 Some；走到这里说明客户端未真正建立，按「链路断了」处理更保守。
-            None => false,
-        }
+        // 由看门狗任务在 runner 结束（无论何种原因）时置位。
+        !self.sender_dead.load(Ordering::SeqCst)
     }
 
     async fn messages(
