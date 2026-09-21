@@ -190,6 +190,9 @@ async fn logs(State(st): State<Arc<AppState>>, Query(q): Query<LogsQuery>) -> im
 /// 没有任何代码据它分支，故障因此对系统其余部分不可见（BUG-023）。
 async fn diag(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     let view = st.client.view().await;
+    // 存量撞名（BUG-104）：本端点是**手动**触发的诊断快照（AccountsPanel 按钮），
+    // 不在任何轮询路径上，故这里的 DB 读不构成轮询压力。
+    let collisions = st.store.duplicate_file_paths(20).await.unwrap_or_default();
     Json(json!({
         "health": "ok",
         "port": st.config.port,
@@ -202,6 +205,7 @@ async fn diag(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "proxy": st.config.proxy,
         "session_phase": view.phase,
         "log_lines": st.logs.len(),
+        "file_path_collisions": collisions,
     }))
 }
 

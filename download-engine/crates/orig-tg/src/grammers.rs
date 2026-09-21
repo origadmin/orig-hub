@@ -417,13 +417,18 @@ impl Client for GrammersClient {
         let message = found.ok_or(ClientError::MediaNotFound)?;
 
         let media = message.media().ok_or(ClientError::MediaNotFound)?;
+        // 落盘命名（BUG-100）：三种形态都必须带 `<chat>`/`<msg>` 唯一标识——
+        // `photo-<chat>_<msg>.jpg` / `doc-<chat>_<msg>.<ext>` / `<清洗名>-<chat>-<msg>.<ext>`。
+        // 曾用裸原始名，两个频道各发一个 `video_2024.mp4` 会落到**完全相同**的 `file_path`，
+        // 两个 `media_item` 于是共享一个文件：清掉其中一条即 unlink 掉另一条的字节，
+        // 另一条状态字段不复位 → UI 仍显示「已缓存」，点开 404 且没有重新缓存入口。
         let filename = match &media {
             Media::Photo(_) => format!("photo-{}_{}.jpg", chat_id, message_id),
             Media::Document(doc) => {
                 let name = doc.name().unwrap_or_default().trim().to_string();
                 if !name.is_empty() {
                     // TG 文档名常含 Windows 非法字符（| : ? * 等），直接落盘会 os error 5/123。
-                    sanitize_filename(&name)
+                    cache_filename(&name, chat_id, message_id)
                 } else {
                     let mime = doc.mime_type().unwrap_or("bin");
                     let ext = extension_for_mime(mime).unwrap_or("bin");
@@ -754,6 +759,62 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
+/// 落盘文件名的字符上限（不含目录部分）。
+///
+/// Windows `MAX_PATH` = 260，而下载目录本身常在 60~120 字符量级，且落盘期间还有
+/// `.part` 临时后缀（BUG-024 原子落盘，+5 字符）。故文件名留 180 字符安全档。
+/// 超长时**只截名字部分**：`-chat-msg` 唯一后缀与扩展名永不参与截断，
+/// 唯一性优先于可读性（截断破坏唯一性 = BUG-100 原样复发）。
+const MAX_CACHE_FILENAME_CHARS: usize = 180;
+
+/// 生成带唯一后缀的落盘文件名：`<清洗后名字>-<chat_id>-<message_id>.<ext>`（BUG-100）。
+///
+/// **过渡方案，不是最终形态**：后续 hash blob 存储改造
+/// （`docs/design/blob-store-design.md`：`<download_dir>/blobs/ab/cd/<sha256hex>`）
+/// 落地后由它的迁移任务统一搬运存量文件，届时本函数即可退役。
+///
+/// **只影响新建**：存量行的 `file_path` 已写进数据库，改它们的命名会让新代码找不到旧文件
+/// 并制造数据错位，故存量一律不动（撞名只由 `Store::duplicate_file_paths` 暴露，不自动修复）。
+fn cache_filename(name: &str, chat_id: i64, message_id: i64) -> String {
+    let clean = sanitize_filename(name);
+    let (stem, ext) = split_ext(&clean);
+    let suffix = format!("-{chat_id}-{message_id}");
+    let ext_part = match ext {
+        Some(e) => format!(".{e}"),
+        None => String::new(),
+    };
+    // 先扣掉不可截断的两段，剩下的预算才给名字 —— 顺序反了会截掉唯一后缀。
+    let budget = MAX_CACHE_FILENAME_CHARS.saturating_sub(suffix.len() + ext_part.len());
+    let stem = truncate_chars(&stem, budget);
+    // 名字被截到 0（超长扩展名等极端输入）时兜底，避免产出以 `-` 开头的怪名。
+    let stem = if stem.is_empty() {
+        "media".to_string()
+    } else {
+        stem
+    };
+    format!("{stem}{suffix}{ext_part}")
+}
+
+/// 拆出主干与扩展名：`a.tar.gz` → `("a.tar", Some("gz"))`；无扩展名 → `(原名, None)`。
+fn split_ext(name: &str) -> (String, Option<String>) {
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string());
+    let ext = path.extension().map(|s| s.to_string_lossy().into_owned());
+    (stem, ext)
+}
+
+/// 按**字符**（不是字节）截断：UTF-8 中文名按字节切会产生非法序列，落盘直接 os error。
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect()
+    }
+}
+
 /// 把 `iter_download` 的 chunk 流包装成只产出区间字节的流：
 /// 先丢弃 `skip_lead` 个前端字节（首个 chunk 的头部对齐多余字节），
 /// 再限制累计输出不超过 `take` 字节（`None` 表示不加限制读到末尾）。
@@ -1065,5 +1126,57 @@ mod tests {
             "persist 后不得残留 .part"
         );
         assert_eq!(std::fs::read(&final_path).unwrap(), b"abcdef");
+    }
+
+    /// BUG-100 核心：同名文件在不同频道/不同消息下必须落到**不同**文件名。
+    /// 这是「清一条、另一条变死链」的唯一防线。
+    #[test]
+    fn cache_filename_is_unique_across_chats_and_messages() {
+        let a = cache_filename("video_2024.mp4", -100111, 42);
+        let b = cache_filename("video_2024.mp4", -100222, 42);
+        let c = cache_filename("video_2024.mp4", -100111, 43);
+        assert_ne!(a, b, "不同频道同名不得撞名");
+        assert_ne!(a, c, "同频道不同消息不得撞名");
+        assert!(a.ends_with("-100111-42.mp4"), "唯一后缀须保留扩展名在后: {a}");
+        assert!(a.starts_with("video_2024-"), "原始名须在前，便于人肉检索: {a}");
+    }
+
+    /// 非法字符仍须清洗（Windows 落盘 os error 5/123），且与唯一后缀共存。
+    #[test]
+    fn cache_filename_sanitizes_illegal_chars() {
+        // 频道 id 为负（Telegram 惯例），故后缀形如 `--1001-7`；双横杠是预期的、
+        // 不影响唯一性，也不参与清洗（清洗只作用于原始名部分）。
+        let n = cache_filename("a:b|c?d*e.mp4", -1001, 7);
+        assert_eq!(n, "a_b_c_d_e--1001-7.mp4");
+        // 空名/纯非法名走兜底，不得产出空文件名。
+        assert_eq!(cache_filename("", -1001, 7), "download--1001-7.bin");
+        // 无扩展名：后缀照带，不补假扩展名。
+        assert_eq!(cache_filename("README", -1001, 7), "README--1001-7");
+        // 正 id（用户/群组）不产生双横杠。
+        assert_eq!(cache_filename("a.mp4", 1001, 7), "a-1001-7.mp4");
+    }
+
+    /// 超长名截断时**只能截名字部分**：chat/msg 后缀与扩展名必须完整存活，
+    /// 否则唯一性被截断破坏，BUG-100 原样复发。
+    #[test]
+    fn cache_filename_truncates_stem_but_keeps_unique_suffix() {
+        let long = "很".repeat(400);
+        let n = cache_filename(&format!("{long}.mkv"), -1001234567890, 987654321);
+        let suffix = "-1001234567890-987654321.mkv";
+        assert!(
+            n.ends_with(suffix),
+            "唯一后缀与扩展名不得被截断: {}… (len={})",
+            &n[n.len().saturating_sub(40)..],
+            n.chars().count()
+        );
+        assert!(
+            n.chars().count() <= MAX_CACHE_FILENAME_CHARS,
+            "总长须受控（Windows MAX_PATH）: {}",
+            n.chars().count()
+        );
+        // 极端：扩展名长到把名字预算吃光 → 兜底名，仍带唯一后缀。
+        let huge_ext = format!("x.{}", "e".repeat(300));
+        let n2 = cache_filename(&huge_ext, -1001, 7);
+        assert!(n2.starts_with("media--1001-7."), "预算耗尽须兜底而非产出空名: {n2}");
     }
 }

@@ -83,6 +83,19 @@ pub struct StoredQuery {
     pub limit: u32,
 }
 
+/// 一条存量 `file_path` 撞名记录（BUG-100 检测面）。
+///
+/// `count` = 共享该路径的行数；> 1 即意味着清掉其中一条会打掉其余条的字节。
+#[derive(Debug, Clone, Serialize)]
+pub struct FilePathCollision {
+    /// 来源表（`media_item` / `media_message`），决定后果落在哪一侧。
+    pub table: String,
+    /// 被多个条目共享的落盘路径。
+    pub path: String,
+    /// 共享该路径的行数。
+    pub count: i64,
+}
+
 /// libsql 本地 SQLite 存储。
 pub struct Store {
     /// `pub(crate)` 供 `media` 模块复用同一连接（资料库与 TG 流水同库）。
@@ -679,6 +692,44 @@ impl Store {
             let p: String = r.get(1)?;
             out.push((id, p));
         }
+        Ok(out)
+    }
+
+    /// 存量 `file_path` 撞名清单（BUG-100 **检测面**，只读）。
+    ///
+    /// 判据就是「按 `file_path` 分组，count > 1」：这些行共享同一个磁盘文件，
+    /// 清掉其中任一条会 unlink 掉其余条的字节，而其余条的状态字段不会复位。
+    ///
+    /// **只报不修**：自动修复意味着替用户决定删哪个文件/哪条记录，
+    /// 这里只把清单暴露给启动对账日志与 `/api/tg/diag`，由人决定。
+    /// 新落盘已由 `grammers::cache_filename` 带 chat/message 唯一后缀，
+    /// 故存量会自然收敛（清掉重下即不再撞名），不需要迁移。
+    pub async fn duplicate_file_paths(
+        &self,
+        limit: usize,
+    ) -> libsql::Result<Vec<FilePathCollision>> {
+        let mut out = Vec::new();
+        // 两张表都要查：`media_item` 决定「条目能不能播」，`media_message` 决定
+        // 「TG 流水能不能重新取字节」——只查一张会漏掉另一侧的死链。
+        for table in ["media_item", "media_message"] {
+            let sql = format!(
+                "SELECT file_path, COUNT(*) AS c FROM {table} \
+                 WHERE file_path IS NOT NULL AND file_path <> '' \
+                 GROUP BY file_path HAVING COUNT(*) > 1 ORDER BY c DESC LIMIT ?1"
+            );
+            let mut rows = self.conn.query(&sql, params![limit as i64]).await?;
+            while let Some(r) = rows.next().await? {
+                let path: String = r.get(0)?;
+                let count: i64 = r.get(1)?;
+                out.push(FilePathCollision {
+                    table: table.to_string(),
+                    path,
+                    count,
+                });
+            }
+        }
+        // 多的排前面：撞得最狠的路径最该先看。
+        out.sort_by(|a, b| b.count.cmp(&a.count));
         Ok(out)
     }
 
@@ -1554,5 +1605,56 @@ mod tests {
         assert_eq!(TaskClearScope::parse("all"), Some(TaskClearScope::All));
         assert_eq!(TaskClearScope::parse("success"), Some(TaskClearScope::Success));
         assert_eq!(TaskClearScope::parse("failed"), Some(TaskClearScope::Failed));
+    }
+
+    /// BUG-100 检测面：同一 `file_path` 被多行占用时必须被报出来（**只报不修**）。
+    ///
+    /// 这正是「两个频道各发一个 `video_2024.mp4`」的存量形态：清掉一条会打掉另一条的字节，
+    /// 而另一条的状态字段不会复位。两张表都要能查到。
+    #[tokio::test]
+    async fn duplicate_file_paths_reports_shared_paths_in_both_tables() {
+        let s = store("dup_paths").await;
+
+        // 各不相同的路径：不得误报。
+        s.upsert_message(11, 1, Some("a"), Some("video/mp4"), Some(1), Some("video"), Some(1), None, None)
+            .await
+            .unwrap();
+        s.mark_downloaded(11, 1, Some(r#"C:\cache\unique-a.mp4"#)).await.unwrap();
+        assert!(
+            s.duplicate_file_paths(20).await.unwrap().is_empty(),
+            "唯一路径不得报撞名"
+        );
+
+        // 两个**不同频道**落到同一路径 = BUG-100 的存量撞名。
+        s.upsert_message(11, 2, Some("b"), Some("video/mp4"), Some(1), Some("video"), Some(2), None, None)
+            .await
+            .unwrap();
+        s.upsert_message(22, 3, Some("c"), Some("video/mp4"), Some(1), Some("video"), Some(3), None, None)
+            .await
+            .unwrap();
+        s.mark_downloaded(11, 2, Some(r#"C:\cache\video_2024.mp4"#)).await.unwrap();
+        s.mark_downloaded(22, 3, Some(r#"C:\cache\video_2024.mp4"#)).await.unwrap();
+
+        // media_item 侧同样撞名（决定「条目能不能播」）。
+        s.upsert_media_item("tg", "11:2", "b", "video", Some(r#"C:\cache\video_2024.mp4"#), None, None, None)
+            .await
+            .unwrap();
+        s.upsert_media_item("tg", "22:3", "c", "video", Some(r#"C:\cache\video_2024.mp4"#), None, None, None)
+            .await
+            .unwrap();
+
+        let dups = s.duplicate_file_paths(20).await.unwrap();
+        let shared: Vec<&FilePathCollision> = dups
+            .iter()
+            .filter(|d| d.path == r#"C:\cache\video_2024.mp4"#)
+            .collect();
+        // 两张表各一条（同一路径在两表分别成组，不是合并计数）。
+        assert_eq!(shared.len(), 2, "media_item 与 media_message 都要报: {dups:?}");
+        assert!(shared.iter().all(|d| d.count == 2), "每组应为 2 行共享: {shared:?}");
+        let tables: Vec<&str> = shared.iter().map(|d| d.table.as_str()).collect();
+        assert!(tables.contains(&"media_item"));
+        assert!(tables.contains(&"media_message"));
+        // 唯一路径仍未被误报。
+        assert!(!dups.iter().any(|d| d.path.contains("unique-a")));
     }
 }

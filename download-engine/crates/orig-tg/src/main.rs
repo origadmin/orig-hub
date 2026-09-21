@@ -189,6 +189,29 @@ async fn main() {
     // 首份读快照：服务启动即有数据，避免首个 GET 返回空列表。
     state.refresh_cache_tasks().await;
 
+    // 存量文件名撞车对账（BUG-100）：**只报不修**。
+    // 新落盘已带 chat/message 唯一后缀，存量不动（改存量命名会让新代码找不到旧文件）。
+    // 这里把撞名清单暴露出来，修复动作（清哪条、要不要重下）由人决定 ——
+    // 自动修复等于替用户删文件，是明确禁止的。
+    match state.store.duplicate_file_paths(20).await {
+        Ok(dups) if !dups.is_empty() => {
+            let shared: i64 = dups.iter().map(|d| d.count).sum();
+            let msg = format!(
+                "file_path collision: {} path(s) shared by {shared} row(s); \
+                 worst: {} x{} in {}",
+                dups.len(),
+                dups[0].path,
+                dups[0].count,
+                dups[0].table
+            );
+            eprintln!("[warn] {msg}");
+            // 同时进环形日志：前端 `/api/tg/logs` 与设置页日志面板可直接看到，不必翻进程输出。
+            state.push_log(format!("[warn] {msg}"));
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[warn] file path collision audit failed: {e}"),
+    }
+
     // 后台监控只在 TG 可用时启动：不可用时它只会周期性失败刷日志，没有意义。
     // mock 构建照常启动（它同样是「可用」态），否则合成夹具的喂数行为会与生产路径分叉，
     // 让验收覆盖不到真实链路。
