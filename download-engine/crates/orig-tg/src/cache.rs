@@ -874,6 +874,9 @@ async fn stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::state::Availability;
+    use crate::store::Store;
 
     #[test]
     fn inside_dir_accepts_child_and_rejects_sibling() {
@@ -1017,5 +1020,68 @@ mod tests {
         assert_ne!(BytesPresence::Present, BytesPresence::Missing);
         assert_ne!(BytesPresence::Missing, BytesPresence::Unknown);
         assert_ne!(BytesPresence::Present, BytesPresence::Unknown);
+    }
+
+    // ---- BUG-109：清理失败必须被如实计入 `failed`，不得再谎报 `removed` ----
+
+    async fn state() -> Arc<AppState> {
+        Arc::new(AppState::new(
+            Arc::new(crate::unavailable::UnavailableClient::new("test")),
+            Config::default(),
+            Availability::Unavailable("test".to_string()),
+            false,
+            Store::open(":memory:").await.expect("in-memory store must open"),
+        ))
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("orig_cache_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 删不掉时必须计 `failed`，**不得**计入 `removed` / `bytes` ——
+    /// 此前无论成败都返回 `removed: 1`，用户于是以为清理成功而文件还在。
+    #[tokio::test]
+    async fn purge_reports_failed_when_the_file_cannot_be_removed() {
+        let dir = tmp_dir("purge_fail");
+        let st = state().await;
+        // 路径在 dir 内（`inside_dir` 对不存在的文件退到父目录判定），
+        // 但文件本身不存在 → `remove_file` 必然失败。
+        let missing = dir.join("gone.mp4");
+        let it = CachedBytesDetail {
+            id: 1,
+            title: "t".into(),
+            source: "tg".into(),
+            ref_key: "not-a-valid-tg-ref".into(),
+            file_path: missing.to_string_lossy().into_owned(),
+        };
+        let p = purge_item(&st, &dir, &it).await;
+        assert_eq!(p.failed, 1, "删不掉必须计 failed");
+        assert_eq!(p.removed, 0, "删不掉绝不能计入 removed —— 那正是谎报");
+        assert_eq!(p.bytes, 0, "没删掉就不该报释放了字节");
+        assert!(st.logs.recent(20).iter().any(|l| l.contains("purge_item")), "失败必须留痕");
+    }
+
+    /// 真删掉了才算 `removed` 与 `bytes`（反向约束：别把 failed 写反了把成功也算失败）。
+    #[tokio::test]
+    async fn purge_reports_removed_when_the_file_is_gone() {
+        let dir = tmp_dir("purge_ok");
+        let st = state().await;
+        let f = dir.join("real.mp4");
+        std::fs::write(&f, vec![0u8; 512]).unwrap();
+        let it = CachedBytesDetail {
+            id: 2,
+            title: "t".into(),
+            // 非 tg 来源：`reset_tg_flag` 直接返回 true，本案只验证字节删除这一半。
+            source: "local".into(),
+            ref_key: "x".into(),
+            file_path: f.to_string_lossy().into_owned(),
+        };
+        let p = purge_item(&st, &dir, &it).await;
+        assert_eq!(p.removed, 1, "真删掉了必须计 removed");
+        assert_eq!(p.failed, 0, "成功不应被误计为失败");
+        assert_eq!(p.bytes, 512, "释放字节数须如实");
+        assert!(!f.exists(), "文件必须真的被删掉");
     }
 }
