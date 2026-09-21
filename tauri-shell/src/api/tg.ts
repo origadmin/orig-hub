@@ -10,6 +10,8 @@ import type {
   TgStoredItem,
   TgStoredMessage,
 } from '../types'
+import { t } from '../i18n'
+import { classifyTgReason, logTgReason } from '../lib/tgReason'
 
 /** orig-tg 默认端口（与 Rust 侧 orig-tg 监听端口一致，独立于 daemon 的 9876） */
 export const TG_PORT = 9877
@@ -19,14 +21,55 @@ const port = Number(import.meta.env.VITE_TG_PORT ?? TG_PORT)
 
 export const TG_BASE = `http://127.0.0.1:${port}`
 
+/** 从响应体取服务端给的 `error` 字段（本服务统一 `{"error": "..."}` 形状）。 */
+function extractErrorField(body: string): string | null {
+  const s = body.trim()
+  if (!s.startsWith('{')) return null
+  try {
+    const j = JSON.parse(s) as { error?: unknown }
+    return typeof j.error === 'string' ? j.error : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 构造**给用户看**的失败文案（BUG-110 的前端半边）。
+ *
+ * `request()` 抛出的 `message` 会被 17 个文件、62 处调用点直接 `setError` 渲染，
+ * 所以**在这里一处**替换就能让全部 TG 调用点合规；反之，只要这里是原文，
+ * 那 62 处无一幸免 —— 这是「在源头修」而非「逐处打补丁」的同一条理由
+ * （后端 BUG-110 也是这样修的）。
+ *
+ * 两条硬规则：
+ *
+ * 1. **原文只进日志**（`logTgReason`），绝不进界面 —— 对齐 `tgReason.ts` 的既定约定。
+ * 2. **只翻译确认识别的错误**，识别不出的一律保留原文。
+ *    把「未选中任何消息」说成「Telegram 暂时不可用，请稍后重试」是**另一种谎报**，
+ *    而且更糟：它给了错误的可行动指引，用户会照着做然后更困惑。
+ */
+function tgFailureMessage(status: number, statusText: string, body: string): string {
+  const raw = (body ? extractErrorField(body) ?? body : `${status} ${statusText}`.trim()).trim()
+  logTgReason(raw, 'tg-request')
+  const key = classifyTgReason(raw)
+  if (key === 'tg.reasonUnknown') return raw || t(key)
+  return t(key)
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${TG_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...init,
-  })
+  let res: Response
+  try {
+    res = await fetch(`${TG_BASE}${path}`, {
+      headers: { 'Content-Type': 'application/json' },
+      ...init,
+    })
+  } catch (e) {
+    // fetch 本身失败（orig-tg 未启动 / 端口不通 / 被拦截）：同样不得直出原文。
+    throw new Error(tgFailureMessage(0, '', e instanceof Error ? e.message : String(e)))
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => '')
-    throw new Error(`${res.status} ${res.statusText}${body ? `: ${body}` : ''}`)
+    throw new Error(tgFailureMessage(res.status, res.statusText, body))
   }
   if (res.status === 204) return undefined as T
   return res.json() as Promise<T>

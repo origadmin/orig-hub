@@ -42,7 +42,11 @@ export function classifyTgReason(reason: string | null | undefined): TgReasonKey
   if (/unauthoriz|auth key|session|credential|phone|password|login|code/i.test(raw))
     return 'tg.reasonAuth'
   if (
-    /mtproto|connect|network|proxy|socks|timeout|timed out|eof|refused|reset by peer|dns|read 0 bytes|unreachable|i\/o|transport/i.test(
+    // `dropped` 是 grammers `RequestError::Dropped` 的签名（原文
+    // `request error: dropped (cancelled)`），含义是 MTProto 发信任务已死 ——
+    // 它**不含** mtproto/connect/network 任何一词，不单独列出就会被判成 Unknown
+    // 从而保留英文原文（即「没修到」）。'cancelled' 太宽（用户主动取消也用它），故只加 dropped。
+    /mtproto|connect|network|proxy|socks|timeout|timed out|eof|refused|reset by peer|dns|read 0 bytes|unreachable|i\/o|transport|failed to fetch|load failed|networkerror|dropped/i.test(
       raw,
     )
   )
