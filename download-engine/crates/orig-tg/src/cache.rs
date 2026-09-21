@@ -84,6 +84,41 @@ pub fn inside_dir(dir: &Path, p: &str) -> bool {
     c.starts_with(&d)
 }
 
+/// 磁盘字节真值（BUG-101）：`file_path` 只是数据库里的**承诺**，不是字节本身。
+///
+/// 三态而非布尔，是为了不重蹈 `inside_dir` 的覆辙——它在 canonicalize 失败时
+/// 静默返回 `false`，把「判断不出来」和「确实不在目录内」混为一谈。
+/// 这里同理：`Unknown` 必须能被区分，因为两种后续动作完全不同。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BytesPresence {
+    /// 文件存在且非空 → 可以走本地播放。
+    Present,
+    /// **确认**不在磁盘上（不存在 / 零字节 / 不是文件）→ 状态必须复位。
+    Missing,
+    /// stat 失败但**不是**「不存在」（权限、文件被独占、路径非法…）→ 判定失败。
+    /// 既不声称可本地播，也**不**复位状态（不该为一次瞬态错误让条目重新走一遍下载）。
+    Unknown,
+}
+
+/// 探测落盘字节是否真的可用（BUG-101）。
+///
+/// 用 `tokio::fs` 而非 `std::fs`：调用方都在 async 读路径上，同步 syscall 会占住运行时线程。
+/// 成本是**每次一个 stat 系统调用**（微秒级、不碰 DB），一次列表至多 stat 该频道已缓存的行数；
+/// 典型的几十行远低于一次 DB 查询，故不做批量上限裁剪——裁剪等于放行未校验项，
+/// BUG-101（「已缓存」却 404）会原样复发。
+pub async fn probe_cached_bytes(path: &str) -> BytesPresence {
+    if path.trim().is_empty() {
+        return BytesPresence::Missing;
+    }
+    match tokio::fs::metadata(path).await {
+        // 零字节文件 = 下载写成半截就断了，与「文件没了」同样不可播。
+        Ok(m) if m.is_file() && m.len() > 0 => BytesPresence::Present,
+        Ok(_) => BytesPresence::Missing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BytesPresence::Missing,
+        Err(_) => BytesPresence::Unknown,
+    }
+}
+
 /// `DELETE /api/cache/items/:id` — 清缓存·单条：**只删字节，条目保留**
 /// （回「仅入库」浏览态，可重新缓存）。
 async fn clear_item(
@@ -855,5 +890,52 @@ mod tests {
     fn age_of_missing_file_is_zero() {
         let missing = std::env::temp_dir().join("orig_cache_definitely_missing.mp4");
         assert_eq!(age_days(&missing.to_string_lossy(), now_secs()), 0);
+    }
+
+    /// BUG-101 判据：只有「文件在且非空」才算可播；空路径与不存在一律 `Missing`。
+    #[tokio::test]
+    async fn probe_cached_bytes_needs_a_non_empty_file() {
+        let dir = std::env::temp_dir().join(format!("orig_cache_probe_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("ok.mp4");
+        std::fs::write(&ok, b"bytes").unwrap();
+
+        assert_eq!(
+            probe_cached_bytes(&ok.to_string_lossy()).await,
+            BytesPresence::Present
+        );
+        // 零字节 = 写了一半就断，与「文件没了」同样不可播。
+        let empty = dir.join("empty.mp4");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            probe_cached_bytes(&empty.to_string_lossy()).await,
+            BytesPresence::Missing
+        );
+        assert_eq!(
+            probe_cached_bytes(&dir.join("gone.mp4").to_string_lossy()).await,
+            BytesPresence::Missing
+        );
+        assert_eq!(probe_cached_bytes("").await, BytesPresence::Missing);
+        assert_eq!(probe_cached_bytes("   ").await, BytesPresence::Missing);
+    }
+
+    /// BUG-101 边界：目录不是文件，且**目录路径**不得被当成可用字节。
+    #[tokio::test]
+    async fn probe_cached_bytes_rejects_directories() {
+        let dir = std::env::temp_dir().join(format!("orig_cache_probedir_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            probe_cached_bytes(&dir.to_string_lossy()).await,
+            BytesPresence::Missing
+        );
+    }
+
+    /// BUG-101 的三态设计要点：`Unknown` 必须与 `Missing` 分开——
+    /// 前者只撤回「可本地播」的承诺，后者才会复位状态。三态必须真的互不相同。
+    #[test]
+    fn bytes_presence_has_three_distinct_states() {
+        assert_ne!(BytesPresence::Present, BytesPresence::Missing);
+        assert_ne!(BytesPresence::Missing, BytesPresence::Unknown);
+        assert_ne!(BytesPresence::Present, BytesPresence::Unknown);
     }
 }

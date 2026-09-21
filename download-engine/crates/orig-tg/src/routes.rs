@@ -1620,7 +1620,20 @@ async fn clear_stored(
 }
 
 /// GET /api/tg/downloaded/:chat_id — 该频道已缓存清单：messageId → 落盘路径。
-/// 供前端 feed/缓存库合并统一缓存状态（DB 为唯一真相源，刷新后状态不丢）。
+///
+/// 这份清单直接决定前端 `local ? tgLocalFileUrl : tgFileUrl`（`TgPanel.tsx` 播放器取源），
+/// 所以「在清单里」= 对外承诺「这个文件能本地播」。故 BUG-105 修在这里：
+/// **承诺之前先 stat 磁盘**，DB 的 `downloaded` 标志位只说明「曾经下过」。
+///
+/// 三态处置：
+/// - `Present` → 正常给出路径（本地播放）；
+/// - `Missing` → 从清单剔除（本次即回落在线流，不会 404）+ 复位 DB 状态，
+///   让「缓存 / 重新缓存」入口自然出现（这正是修复的核心目标，不是可选项）；
+/// - `Unknown` → 从清单剔除（不承诺本地播）但**不动 DB**，且记一条日志。
+///
+/// 性能：本端点原本就是一次 DB 读，新增的只有 stat（文件系统，非 DB），
+/// 没有把额外 DB 读带进轮询路径。复位写入只在**确认缺失**时发生，
+/// 且复位后该行不再进入 `list_downloaded`，故一次收敛、不会每轮重复写。
 async fn downloaded_map(
     State(st): State<Arc<AppState>>,
     Path(chat_id): Path<i64>,
@@ -1631,8 +1644,42 @@ async fn downloaded_map(
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     let mut map = serde_json::Map::new();
+    let mut missing: Vec<i64> = Vec::new();
+    let mut unknown = 0usize;
     for (id, path) in rows {
-        map.insert(id.to_string(), serde_json::Value::String(path));
+        match crate::cache::probe_cached_bytes(&path).await {
+            crate::cache::BytesPresence::Present => {
+                map.insert(id.to_string(), serde_json::Value::String(path));
+            }
+            crate::cache::BytesPresence::Missing => {
+                missing.push(id);
+            }
+            crate::cache::BytesPresence::Unknown => {
+                unknown += 1;
+            }
+        }
+    }
+    if unknown > 0 {
+        st.push_log(format!(
+            "downloaded_map channel={chat_id}: {unknown} cached path(s) unstatable; \
+             treated as not-local WITHOUT resetting db state"
+        ));
+    }
+    if !missing.is_empty() {
+        let mut reset = 0usize;
+        for id in &missing {
+            // `clear_downloaded`：置空 file_path + 复位 downloaded（文件已不在，unlink 静默）。
+            // 复位后前端所有派生自该标志的 UI（已缓存徽标、播放入口）一并返回未缓存态。
+            if st.store.clear_downloaded(chat_id, *id).await.unwrap_or(false) {
+                reset += 1;
+            }
+        }
+        if reset > 0 {
+            st.push_log(format!(
+                "downloaded_map channel={chat_id}: {reset} cached row(s) reset to not-downloaded: \
+                 bytes missing on disk"
+            ));
+        }
     }
     Ok(Json(json!({ "downloaded": map })))
 }
