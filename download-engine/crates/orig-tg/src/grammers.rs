@@ -135,13 +135,25 @@ pub struct GrammersClient {
 
 impl GrammersClient {
     /// RPC 失败归类的**无 self 形式**，供 `Self` 尚未构造完的调用点使用。
+    ///
+    /// 判据是**两条信号的或**：
+    ///
+    /// - `link_dead`：看门狗已置死亡标志；
+    /// - 错误原文含 `dropped`：grammers 的 `RequestError::Dropped`（显示为
+    ///   `request error: dropped (cancelled)`）**只在发信任务已死时出现**，
+    ///   它本身就是链路已死的证据。
+    ///
+    /// 第二条不是冗余：runner 死亡 → 标志置位与在途 RPC 失败是**并发**的，
+    /// 标志可能晚一步。只靠标志，死亡后的**首批**失败仍会被判成 400。
+    /// 判「是否已死」不能只依赖一个由别的任务异步写入的标志。
     fn classify_rpc_err(link_dead: bool, e: impl std::fmt::Display) -> ClientError {
-        if link_dead {
+        let raw = e.to_string();
+        if link_dead || raw.contains("dropped") {
             ClientError::Unavailable(format!(
-                "MTProto link is down (sender runner exited); restart orig-tg to recover: {e}"
+                "MTProto link is down (sender runner exited); restart orig-tg to recover: {raw}"
             ))
         } else {
-            ClientError::Other(e.to_string())
+            ClientError::Other(raw)
         }
     }
 
@@ -1378,6 +1390,19 @@ mod tests {
         assert!(
             matches!(e, ClientError::Other(_)),
             "链路活着时应仍为 Other，实际: {e}"
+        );
+    }
+
+    /// 竞态证明：标志**尚未**置位时，错误原文本身也必须能证明链路已死。
+    ///
+    /// runner 死亡 → 标志置位与在途 RPC 失败是**并发**的，标志可能晚一步；
+    /// 只靠标志，死亡后的首批失败仍会报成 400 —— 而用户看到的正是这批。
+    #[test]
+    fn dropped_error_proves_link_down_even_before_the_flag_is_set() {
+        let e = GrammersClient::classify_rpc_err(false, "request error: dropped (cancelled)");
+        assert!(
+            matches!(e, ClientError::Unavailable(_)),
+            "dropped 本身就是链路已死的证据，不该依赖标志是否已置位，实际: {e}"
         );
     }
 
