@@ -120,6 +120,79 @@ async function main() {
       typeof got.textUnknown === 'string' && got.textUnknown !== 'tg.reasonUnknown',
       JSON.stringify(got.textUnknown),
     )
+    // ---- 真函数 tgFailureMessage 的四条分岔 ----
+    // 只测 classifyTgReason 不够：分类对了、这里的组装或分岔写错，界面照样错。
+    const shaped = await page.evaluate(async () => {
+      const api = await import('/src/api/tg.ts')
+      const i18n = await import('/src/i18n/index.ts')
+      const f = api.tgFailureMessage
+      return {
+        network: f(
+          503,
+          'Service Unavailable',
+          '{"error":"MTProto link is down (sender runner exited); restart orig-tg to recover: request error: dropped (cancelled)"}',
+        ),
+        validation: f(400, 'Bad Request', '{"error":"messageIds is empty"}'),
+        serverFault: f(500, 'Internal Server Error', '{"error":"database is locked"}'),
+        fetchFailed: f(0, '', 'Failed to fetch'),
+        textUnknown: i18n.t('tg.reasonUnknown'),
+        textNetwork: i18n.t('tg.reasonNetwork'),
+      }
+    })
+
+    // 6. 用户真正会遇到的那条：链路已死的 503 → 网络类中文文案。
+    check(
+      '503 link-down renders the i18n network text',
+      shaped.network === shaped.textNetwork,
+      JSON.stringify(shaped.network),
+    )
+    // 7. 反向证伪：校验类 400 必须保留原文，不得被翻译成「暂时不可用」。
+    check(
+      '400 validation error keeps its raw reason',
+      shaped.validation === 'messageIds is empty',
+      JSON.stringify(shaped.validation),
+    )
+    // 8. 5xx 且原因不可识别 → 通用「暂时不可用」（服务端故障，如实表述）。
+    check(
+      'unrecognised 5xx falls back to the generic unavailable text',
+      shaped.serverFault === shaped.textUnknown,
+      JSON.stringify(shaped.serverFault),
+    )
+    // 9. fetch 本身失败（orig-tg 没起来）不得裸抛 "Failed to fetch"。
+    check(
+      'fetch failure renders the i18n network text',
+      shaped.fetchFailed === shaped.textNetwork,
+      JSON.stringify(shaped.fetchFailed),
+    )
+
+    // ---- 活体：真实 request() 打真实服务 ----
+    const live = await page.evaluate(async () => {
+      const api = await import('/src/api/tg.ts')
+      const out = { diagOk: false, threw: false, message: '' }
+      try {
+        const d = await api.tgDiag()
+        out.diagOk = Boolean(d && d.port)
+      } catch {
+        out.diagOk = false
+      }
+      try {
+        await api.cancelCacheTask(999999)
+      } catch (e) {
+        out.threw = true
+        out.message = e instanceof Error ? e.message : String(e)
+      }
+      return out
+    })
+
+    // 10. 回归护栏：成功路径没被这次改动弄坏。
+    check('live tgDiag() still succeeds', live.diagOk === true, String(live.diagOk))
+    // 11. 活体失败路径：抛出的文案里不得再带 JSON 原文。
+    check('live failure threw', live.threw === true, String(live.threw))
+    check(
+      'live failure message leaks no raw JSON body',
+      live.message.length > 0 && !live.message.includes('{'),
+      JSON.stringify(live.message),
+    )
   } finally {
     await browser.close()
   }

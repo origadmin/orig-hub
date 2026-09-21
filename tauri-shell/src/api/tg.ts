@@ -36,6 +36,9 @@ function extractErrorField(body: string): string | null {
 /**
  * 构造**给用户看**的失败文案（BUG-110 的前端半边）。
  *
+ * 导出是为了让验收脚本能对**这个真函数**断言（见 `verify/verify_tg_error_i18n.cjs`）：
+ * 只测它依赖的 `classifyTgReason` 不够 —— 分类对了而这里的组装/分岔写错，界面照样错。
+ *
  * `request()` 抛出的 `message` 会被 17 个文件、62 处调用点直接 `setError` 渲染，
  * 所以**在这里一处**替换就能让全部 TG 调用点合规；反之，只要这里是原文，
  * 那 62 处无一幸免 —— 这是「在源头修」而非「逐处打补丁」的同一条理由
@@ -48,12 +51,18 @@ function extractErrorField(body: string): string | null {
  *    把「未选中任何消息」说成「Telegram 暂时不可用，请稍后重试」是**另一种谎报**，
  *    而且更糟：它给了错误的可行动指引，用户会照着做然后更困惑。
  */
-function tgFailureMessage(status: number, statusText: string, body: string): string {
+export function tgFailureMessage(status: number, statusText: string, body: string): string {
   const raw = (body ? extractErrorField(body) ?? body : `${status} ${statusText}`.trim()).trim()
   logTgReason(raw, 'tg-request')
   const key = classifyTgReason(raw)
-  if (key === 'tg.reasonUnknown') return raw || t(key)
-  return t(key)
+  if (key !== 'tg.reasonUnknown') return t(key)
+  // 识别不出原因时按状态码分岔：
+  // - 5xx 是**服务端/依赖故障**，给通用「暂时不可用」是如实表述；
+  // - 4xx 一律保留原文 —— 那多半是请求本身的问题（如「未选中任何消息」），
+  //   说成「暂时不可用」就是谎报，还会给出错误的可行动指引。
+  //   响应体为空（连原因都没有）时同样保留状态行：不给没依据的说法。
+  if (status >= 500) return t('tg.reasonUnknown')
+  return raw || t('tg.reasonUnknown')
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
