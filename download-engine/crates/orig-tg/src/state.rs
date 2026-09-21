@@ -199,3 +199,66 @@ impl AppState {
         self.dialog_scanning.load(Ordering::Relaxed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::store::Store;
+    use crate::unavailable::UnavailableClient;
+
+    async fn state() -> AppState {
+        AppState::new(
+            // UnavailableClient：link_alive() == false，正是「链路断了」的情形。
+            Arc::new(UnavailableClient::new("test: link down")),
+            Config::default(),
+            Availability::Unavailable("test".to_string()),
+            false,
+            Store::open(":memory:").await.expect("in-memory store must open"),
+        )
+    }
+
+    fn has(st: &AppState, needle: &str) -> bool {
+        st.logs.recent(50).iter().any(|l| l.contains(needle))
+    }
+
+    /// BUG-106 的关键保证：**第一次一定留痕**。
+    ///
+    /// 节流是为了防日志风暴，绝不能变成「什么都不记」—— 那恰恰是本条的病根
+    /// （错误在源头被销毁，只剩表象）。这条断言是防止有人把节流写成静默。
+    #[tokio::test]
+    async fn throttled_log_always_records_the_first_occurrence() {
+        let st = state().await;
+        st.push_log_throttled("thumb", 60, "FIRST-OCCURRENCE");
+        assert!(
+            has(&st, "FIRST-OCCURRENCE"),
+            "首次失败必须留痕 —— 节流不得把第一条也吞掉"
+        );
+    }
+
+    /// 风暴抑制：同一 key 在窗口内只记一条，但**不同 key 互不干扰**
+    /// （缩略图被抑制时，messages 的失败仍必须可见）。
+    #[tokio::test]
+    async fn throttled_log_suppresses_burst_without_hiding_other_keys() {
+        let st = state().await;
+        st.push_log_throttled("thumb", 60, "T1");
+        st.push_log_throttled("thumb", 60, "T2"); // 同 key 同窗口 → 抑制
+        st.push_log_throttled("messages", 60, "M1"); // 不同 key → 记录
+
+        assert!(has(&st, "T1"), "首条须留痕");
+        assert!(!has(&st, "T2"), "同一 key 的连发须被抑制，避免冲垮环形日志");
+        assert!(
+            has(&st, "M1"),
+            "不同 key 必须独立计数 —— 别让缩略图的风暴把消息失败也吞了"
+        );
+    }
+
+    /// 不节流接口（低频路径）保持每条都记。
+    #[tokio::test]
+    async fn plain_push_log_records_every_line() {
+        let st = state().await;
+        st.push_log("A1");
+        st.push_log("A2");
+        assert!(has(&st, "A1") && has(&st, "A2"), "低频路径不得丢日志");
+    }
+}
