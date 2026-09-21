@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -36,6 +37,23 @@ use crate::login::{
     Channel, Client, ClientError, DownloadOutcome, Folder, LoginPhase, MediaItem, MediaRange,
     MediaStream, SessionView, Thumbnail,
 };
+
+/// 把 panic payload 转成可读字符串（BUG-106）。
+///
+/// `panic!` 的 payload 只保证是 `Box<dyn Any + Send>`，**没保证是字符串**：
+/// `panic!("{}", x)` 给 `String`，`panic!("literal")` 给 `&str`，
+/// 而 `panic!(some_vec)` 之类给的是别的类型。
+/// 直接 `downcast_ref::<&str>()` 而不再兜一层，遇到非字符串 payload 就只能打印
+/// 「panicked」—— 病因在最关键的那一处被丢掉。这里三种情况分别处理。
+fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
 
 /// 单块下载请求的字节数（介于 grammers 的 MIN=4KiB 与 MAX=512KiB 之间）。
 static RANGE_CHUNK: i32 = 512 * 1024;
@@ -162,14 +180,10 @@ impl GrammersClient {
                     flag.store(true, Ordering::SeqCst);
                     match e.try_into_panic() {
                         Ok(payload) => {
-                            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                                (*s).to_string()
-                            } else if let Some(s) = payload.downcast_ref::<String>() {
-                                s.clone()
-                            } else {
-                                "<non-string panic payload>".to_string()
-                            };
-                            eprintln!("[tg] MTProto sender runner PANICKED: {msg}");
+                            eprintln!(
+                                "[tg] MTProto sender runner PANICKED: {}",
+                                panic_payload_to_string(payload)
+                            );
                         }
                         Err(e) => {
                             eprintln!("[tg] MTProto sender runner task was cancelled: {e}");
@@ -1242,5 +1256,70 @@ mod tests {
         let huge_ext = format!("x.{}", "e".repeat(300));
         let n2 = cache_filename(&huge_ext, -1001, 7);
         assert!(n2.starts_with("media--1001-7."), "预算耗尽须兜底而非产出空名: {n2}");
+    }
+
+    /// BUG-106：把「看门狗能否取出 panic 病因」做成可执行的断言。
+    ///
+    /// 这段 downcast 逻辑是「下次 runner 死掉时能不能定性」的唯一依靠 ——
+    /// 它一旦失效，日志里就只剩一句 `PANICKED: <non-string panic payload>`，
+    /// 等于病因在最关键处又被丢掉，和这次的故障一模一样。
+    ///
+    /// **这里刻意不真 spawn 一个会 panic 的任务**：实测在 libtest 的默认多线程模式下，
+    /// 只要本模块里有测试真的让 tokio 任务 panic，整个测试进程就会稳定崩在
+    /// `STATUS_ACCESS_VIOLATION (0xc0000005)`（连续两次必现；`--test-threads=1` 则 64/64 全绿，
+    /// 只跑这两个也全绿 —— 是并发与 panic 处理的交互，不是本逻辑的问题）。
+    /// 留一个必然让 CI 崩的测试换一点点覆盖率不划算，故改为直接构造 payload：
+    /// 三种分支照样覆盖，而 `try_into_panic()` 本身是 tokio 的 API，不需要我们替它担保。
+    #[test]
+    fn panic_payload_to_string_covers_every_payload_shape() {
+        // `panic!("literal")` 的 payload 是 &'static str。
+        let p: Box<dyn Any + Send> = Box::new("literal-boom");
+        assert_eq!(
+            panic_payload_to_string(p),
+            "literal-boom",
+            "字面量 panic 的病因必须完整可见"
+        );
+
+        // `panic!("{}", x)` 的 payload 是 String。
+        let p: Box<dyn Any + Send> = Box::new(String::from("formatted-boom"));
+        assert_eq!(
+            panic_payload_to_string(p),
+            "formatted-boom",
+            "格式化 panic 的病因必须完整可见"
+        );
+
+        // 非字符串 payload：不得 panic、不得产出空串，必须明确标注「取不到」，
+        // 绝不能把占位符伪装成病因。
+        let p: Box<dyn Any + Send> = Box::new(vec![1u8, 2, 3]);
+        assert_eq!(
+            panic_payload_to_string(p),
+            "<non-string panic payload>",
+            "非字符串 payload 必须被明确标注"
+        );
+    }
+
+    /// 看门狗的另一半：runner **正常结束**时也必须被判定为死亡（并走 `Ok(())` 分支）。
+    ///
+    /// 不 panic，因此不涉及上面那个并发崩溃，可以放心用真实 tokio 任务验证。
+    /// 这条同时是反向约束：若有人把「正常返回」误当成「还活着」，`link_alive` 就会说谎。
+    #[tokio::test]
+    async fn watchdog_treats_clean_return_as_death() {
+        let dead = Arc::new(AtomicBool::new(false));
+        let flag = dead.clone();
+        let h = tokio::spawn(async {});
+        tokio::spawn(async move {
+            match h.await {
+                Ok(()) => {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                Err(_) => unreachable!("本任务不 panic 也不取消"),
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            dead.load(Ordering::SeqCst),
+            "runner 正常结束也必须置死亡标志 —— 它一结束后续 RPC 就恒失败"
+        );
     }
 }
