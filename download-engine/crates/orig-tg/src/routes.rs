@@ -193,8 +193,15 @@ async fn diag(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     // 存量撞名（BUG-104）：本端点是**手动**触发的诊断快照（AccountsPanel 按钮），
     // 不在任何轮询路径上，故这里的 DB 读不构成轮询压力。
     let collisions = st.store.duplicate_file_paths(20).await.unwrap_or_default();
+    // BUG-106：链路活性必须参与健康判定。此前 `health` 恒为 "ok"、只读本地状态，
+    // 于是 sender runner 死后「全部接口报绿、实际全残」—— 用户只能在点了某个真发
+    // 请求的功能时才撞见裸露的 400。链路断了就如实报 degraded。
+    let link_alive = st.client.link_alive();
+    let health = if link_alive { "ok" } else { "degraded" };
     Json(json!({
-        "health": "ok",
+        "health": health,
+        // 与 `health` 同源但更直白，便于调用方直接判真假而不用比对字符串。
+        "link_alive": link_alive,
         "port": st.config.port,
         "available": st.availability.is_ready(),
         "mode": st.availability.label(),
@@ -542,11 +549,33 @@ fn parse_range(value: Option<&HeaderValue>) -> Result<Option<MediaRange>, ApiErr
     Ok(Some(MediaRange::Closed(start, end)))
 }
 
-/// POST /api/tg/cache/clear — 清空分组缓存（仅清缓存表，不删除任何用户数据）。
+/// GET /api/tg/folders — 用户自定义分组（DialogFilter）。
+///
+/// **失败降级而非裸抛 400（BUG-106）**：原实现 `st.client.folders().await?` 会把
+/// grammers 传输层原文（`request error: dropped (cancelled)`）直接变成 400 响应体，
+/// 前端只能原样弹给用户。而**同一个失败**在 `dialogs` handler 里是
+/// `if let Ok(folders) = ...` 被容忍的 —— 同一依赖两种容错策略，本身就是缺陷。
+///
+/// 这里统一为「降级 + 留痕」：**响应体仍是数组**（前端 `listTgFolders(): Promise<TgFolder[]>`，
+/// 改形状会直接破坏解析），失败时返回空数组 —— 左栏退化为只显示「未分组」，
+/// 而不是把传输层原文弹给用户。原因必须记进 `/api/tg/logs`（**绝不静默吞错**），
+/// 链路活性另由 `GET /api/tg/diag` 的 `link_alive` 如实暴露。
 async fn folders(State(st): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     ensure_authorized(&st).await?;
-    let folders = st.client.folders().await?;
-    Ok(Json(folders))
+    match st.client.folders().await {
+        Ok(folders) => Ok(Json(folders)),
+        Err(e) => {
+            let reason = e.to_string();
+            // 链路已断时给出可行动的说明，而不是让上层去猜传输层原文。
+            let hint = if st.client.link_alive() {
+                "folders request failed"
+            } else {
+                "MTProto link is down (sender runner exited); restart orig-tg to recover"
+            };
+            st.push_log(&format!("/api/tg/folders: degraded to [] -> {reason} ({hint})"));
+            Ok(Json(vec![]))
+        }
+    }
 }
 
 #[derive(Deserialize)]

@@ -75,6 +75,11 @@ impl Client for UnavailableClient {
         Err(self.err())
     }
 
+    /// 未配置 / 不可用的实现根本没有 MTProto 链路（BUG-106）。
+    fn link_alive(&self) -> bool {
+        false
+    }
+
     async fn messages(
         &self,
         _chat_id: i64,

@@ -21,6 +21,12 @@ pub const TG_PORT: u16 = 9877;
 /// （防火墙静默丢包等极端情况不该挂住 `/api/config`）。
 const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// `tg_stop` 后等待子进程真正退出的上限（BUG-106）。
+///
+/// 目的是让 OS 释放 9877，避免紧接着的 `tg_start` 误判「端口有人」而跳过拉起。
+/// kill 后正常退出是毫秒级；这里给足余量，超时也不阻塞调用方。
+const TG_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 探测 127.0.0.1:{port} 是否已有监听者。
 ///
 /// 为什么需要它（BUG-091）：orig-tg 可能由**别的发起方**拉起 —— 上一轮 daemon 遗留、
@@ -187,6 +193,15 @@ impl AppState {
         let mut g = self.tg_child.lock().await;
         if let Some(c) = g.as_mut() {
             let _ = c.kill().await;
+            // BUG-106：kill 之后**必须等它真正退出**，否则端口还没释放。
+            //
+            // 后续 `tg_start_on` 先探端口：`tg_port_has_listener(9877)` 若撞上这个
+            // 「已 kill 但仍持端口」的将死进程，就会返回 true → **提前 return 且不拉起**
+            // → `PUT /api/config/tg {enabled:true}` 回 `tg_running:true`，
+            // 而进程列表里根本没有 orig-tg。实测该竞态让 TG 永久下线且无法通过开关恢复。
+            //
+            // `wait()` 同时回收僵尸进程句柄；超时不阻塞调用方（端口最终仍会释放）。
+            let _ = tokio::time::timeout(TG_STOP_WAIT_TIMEOUT, c.wait()).await;
         }
         *g = None;
     }

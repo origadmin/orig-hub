@@ -155,6 +155,17 @@ pub trait Client: Send + Sync {
     async fn dialogs(&self) -> Result<Vec<Channel>, ClientError>;
     /// 枚举用户自定义分组（DialogFilter），含每组归属的频道 id（Bot API 对话 id 空间）。
     async fn folders(&self) -> Result<Vec<Folder>, ClientError>;
+    /// MTProto 发信链路是否仍然活着（BUG-106）。
+    ///
+    /// `false` = 链路已断：此后所有**实时** RPC 都会返回 `RequestError::Dropped`
+    /// （原文 `request error: dropped (cancelled)`）。而只读本地库/会话文件的接口
+    /// （如 `session` / `dialogs` 缓存）仍会正常返回 —— 这正是「全接口报绿、实际全残」
+    /// 的成因。健康接口必须先看这个方法，不能只看会话授权态。
+    ///
+    /// 默认 `true`：mock / 无网实现不走真实 MTProto，不存在链路死亡问题。
+    fn link_alive(&self) -> bool {
+        true
+    }
     /// 拉取指定会话的媒体历史（从新到旧），最多 `limit` 条**媒体消息**（纯文本跳过）。
     ///
     /// `before_id` 为历史游标（exclusive）：`Some(id)` 时只返回 message_id < id 的消息；

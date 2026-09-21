@@ -29,6 +29,7 @@ use grammers_client::session::storages::SqliteSession;
 use grammers_client::session::types::PeerRef;
 use grammers_client::{Client as TgClient, SenderPool, SignInError, tl};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::login::{
@@ -86,6 +87,15 @@ struct MediaMeta {
 /// 包装 grammers 客户端的真实实现。
 pub struct GrammersClient {
     inner: TgClient,
+    /// MTProto 发信后台任务句柄（BUG-106）。
+    ///
+    /// 此前写成 `let _runner = tokio::spawn(pool.runner.run())` —— JoinHandle 当场被
+    /// 丢弃（detach），runner 退出 / panic 之后**无人知晓**：此后每一次 `invoke()`
+    /// 都恒返回 `RequestError::Dropped`（`request error: dropped (cancelled)`），
+    /// 而进程继续存活、`/api/tg/session` 继续报 `Authorized`、`/api/tg/diag` 继续报
+    /// `health:ok` —— 全部是谎言。**丢弃 JoinHandle 等于销毁任务死亡的证据。**
+    /// 这里保留句柄，使链路中断可被观测。
+    sender: Option<JoinHandle<()>>,
     /// 发起登录码请求时需要 api_hash（grammers 0.10 的 `request_login_code(phone, api_hash)`）。
     api_hash: String,
     pending: Mutex<Pending>,
@@ -123,7 +133,10 @@ impl GrammersClient {
         let pool = SenderPool::with_configuration(Arc::new(session), api_id, params);
         let inner = TgClient::new(pool.handle);
         // 驱动 sender pool 的后台任务（到各 DC 的连接按需建立）。
-        let _runner = tokio::spawn(pool.runner.run());
+        //
+        // BUG-106：句柄**必须保留**（不再 `let _runner = ...`）—— 它是判断
+        // 「链路是否还活着」的唯一依据。详见 `GrammersClient::sender` 字段注释。
+        let runner = tokio::spawn(pool.runner.run());
 
         // 已登录则直接进入 Authorized 并记录 user_id；否则为 Anonymous。
         let mut pending = Pending {
@@ -146,6 +159,7 @@ impl GrammersClient {
 
         Ok(Self {
             inner,
+            sender: Some(runner),
             api_hash,
             pending: Mutex::new(pending),
             peer_cache: tokio::sync::Mutex::new(HashMap::new()),
@@ -321,6 +335,18 @@ impl Client for GrammersClient {
             });
         }
         Ok(out)
+    }
+
+    /// 链路活性（BUG-106）：sender runner 还在跑才算活着。
+    ///
+    /// runner 一旦退出（panic 或主动结束），`invoke()` 会**永久**返回
+    /// `RequestError::Dropped`，且不会自愈 —— 所以这里必须如实报 `false`。
+    fn link_alive(&self) -> bool {
+        match &self.sender {
+            Some(h) => !h.is_finished(),
+            // 构造时必然 Some；走到这里说明客户端未真正建立，按「链路断了」处理更保守。
+            None => false,
+        }
     }
 
     async fn messages(

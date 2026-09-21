@@ -1499,7 +1499,6 @@ impl Store {
                 // 才存 `Some(end)`，否则会把单集意外标成 `Some(slot)`（语义错误，
                 // `get_series` / UI 会以为是合集）。
                 let declared_end = episode_no_end.filter(|e| *e >= *episode_no);
-                let width = declared_end.map(|e| e - *episode_no).unwrap_or(0);
                 let occupied_season = occupied.entry(*season).or_default();
                 let declared_free = (*episode_no..=declared_end.unwrap_or(*episode_no))
                     .all(|n| !occupied_season.contains(&n));
