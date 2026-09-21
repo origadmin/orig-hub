@@ -67,6 +67,8 @@ esac
 
 STALE=0
 missing=0
+# 壳 target 里「该到位却缺失」的产物数（check 模式下只告警，不阻断 —— 未构建过壳是合法的）。
+MISSING=0
 
 for name in orig-tg orig-daemon; do
   SRC="$REL/$name.exe"
@@ -91,8 +93,21 @@ for name in orig-tg orig-daemon; do
     D="$SHELL_TAURI/$d"
     [ -d "$D" ] || continue
     for fn in "$name.exe" "$name-$TRIPLE.exe"; do
-      [ -e "$D/$fn" ] || continue
-      [ "$MODE" = "--check" ] || cp -f "$SRC" "$D/$fn"
+      # 「目标文件不存在就跳过」是**假绿**的温床（BUG-106 实踩）：
+      # 为了让开 Windows 的文件占用，惯例是把被占用的 exe 改名成 `*.locked-by-<pid>`，
+      # 改名后这里看到「文件不存在」就 continue，于是新二进制根本没写进去，
+      # 而脚本照样输出 OK —— 壳继续跑旧引擎，用户体感「改了没生效」且没有任何提示。
+      #
+      # 正确做法：sync 模式一律写（目录存在即认为该产物该到位）；check 模式对缺失告警，
+      # 让「从来没同步过」变成可见信息而不是静默通过。
+      if [ -e "$D/$fn" ]; then
+        [ "$MODE" = "--check" ] || cp -f "$SRC" "$D/$fn" || fail "$name: 无法写入 $d/$fn（可能被运行中的进程占用，先把该 exe 改名成 *.locked-by-<pid> 再重试）"
+      elif [ "$MODE" = "--check" ]; then
+        info "WARN - $name: 壳 target 缺少 $d/$fn（尚未同步过）"
+        MISSING=$((MISSING + 1))
+      else
+        cp -f "$SRC" "$D/$fn" || fail "$name: 无法写入 $d/$fn（可能被运行中的进程占用，先把该 exe 改名成 *.locked-by-<pid> 再重试）"
+      fi
     done
   done
 done
@@ -112,6 +127,9 @@ if [ "$STALE" -gt 0 ]; then
 fi
 if [ "$missing" -gt 0 ]; then
   info "WARN - $missing 个产物缺失，已跳过（未阻断）。"
+fi
+if [ "$MISSING" -gt 0 ]; then
+  info "WARN - $MISSING 个壳 target 产物缺失（sync 模式会自动补齐，未阻断）。"
 fi
 
 [ "$MODE" = "--check" ] && info "OK - sidecar 产物与源码同步（check only）" || info "OK - sidecar 已同步到 externalBin 源与壳 target（debug/release）"
