@@ -1107,28 +1107,6 @@ impl Store {
         Ok(true)
     }
 
-    /// 按 `(source, ref)` 删除条目（级联清标签/剧集归属）。
-    ///
-    /// 用于 TG 缓存清除时的双向联动：缓存没了 → 媒体库不留死条目
-    /// （否则下次缓存 upsert 又会出现，看起来像「删不掉」）。
-    /// 返回是否真的删了行。
-    pub async fn delete_media_item_by_ref(
-        &self,
-        source: &str,
-        ref_key: &str,
-    ) -> libsql::Result<bool> {
-        let row = self
-            .row_opt(
-                "SELECT id FROM media_item WHERE source = ?1 AND ref = ?2",
-                params![source.to_string(), ref_key.to_string()],
-            )
-            .await?;
-        let Some(r) = row else { return Ok(false) };
-        let id: i64 = r.get(0)?;
-        self.delete_media_item(id).await?;
-        Ok(true)
-    }
-
     // ---- 剧集（series / episodes） ----
 
     /// 剧集列表（含分集数、季数、标签）。
