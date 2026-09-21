@@ -85,11 +85,18 @@
   （单流吞吐 = chunk/RTT ≈ 0.5MB/s，播放器必然卡顿），必须走 `parallel_range_stream`
   （K=4 分片并行、按序合并）；媒体元数据/缩略图必须过 `lru.rs::TtlLru` 缓存——
   同一 `(chat,msg)` 的 seek/续 Range/重渲染不得重复付出 `get_messages_by_id` RPC（~1.2s）。
-- **缓存即入库 + 双向删除联动（BUG-029）**：任何缓存成功路径（worker/手动）**必须**
+- **缓存即入库 + 单向删除联动（BUG-029 / BUG-051 边界）**：任何缓存成功路径（worker/手动）**必须**
   `upsert_media_item(source="tg", ref="{chat}:{msg}", ...)`——媒体库是缓存的主视图，
-  只写 `media_message` 等于内容对用户不可见。删除必须**双向联动**：清缓存 → 删对应
-  media_item；删 TG 来源条目 → 清缓存副本。单向删除会在下次缓存 upsert 时「复活」，
-  表现为删不掉。ref 约定全局唯一：`source="tg"`、`ref="<chat_id>:<message_id>"`。
+  只写 `media_message` 等于内容对用户不可见。删除联动是**单向**的（BUG-051 定下的边界：缓存是
+  「订阅内容 → 媒体库」的**入库准备物**，清掉准备物不等于删掉成品）：
+  ① **清缓存只回收字节**——条目退回「仅入库」态（`file_path` 置空、`downloaded` 清零）、
+  可重新缓存；**条目本身永不删除**（`cache.rs::purge_item` 只 unlink 字节，`cache.rs::clear`
+  的注释即这条不变量），**禁止为「清了缓存」而回头删 media_item** —— 那条正向级联是错的，
+  历史上为它写的 `delete_media_item_by_ref` 已因零调用被移除（BUG-096）；
+  ② **删 TG 来源条目必须连带清字节**——`orig-tg/src/routes.rs:1951` 的 `delete_media_item`
+  先删下载目录内的文件、再对 `source=="tg"` 解 ref 后 `clear_downloaded`；缺这一步，
+  下次缓存 upsert（按 `source+ref` 幂等）会把条目「复活」，表现为删不掉。
+  ref 约定全局唯一：`source="tg"`、`ref="<chat_id>:<message_id>"`。
 - **restart_tg.py 必须以 Popen+wait 托管**：Windows 的 `os.execve` 是「spawn+立即退出(0)」
   的模拟，父进程退出即被任务托管判定结束并回收进程树（服务刚连上就被杀）。
 - **投递契约铁律（BUG-031）**：`/api/media/items/:id/raw`（媒体库）与 `/api/tg/local/:chat/:msg`
