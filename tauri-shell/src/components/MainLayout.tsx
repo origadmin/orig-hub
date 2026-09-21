@@ -148,6 +148,8 @@ export function MainLayout() {
    * 会让 `ContextBar` / `ContextBarActions` 的 memo 形同虚设（AGENTS.md §5）。
    */
   const handleNewDownload = useEvent(() => setAddOpen(true))
+  // 这三个 store 方法内部已聚合失败并通过 toast 提示（见 useStore 的 pauseAll 等），
+  // 此处的 catch 仅为防止 unhandled rejection —— 不要再叠一层 toast，否则同一失败弹两遍。
   const handlePauseAll = useEvent(() => void pauseAll().catch(() => {}))
   const handleResumeAll = useEvent(() => void resumeAll().catch(() => {}))
   const handleClearCompleted = useEvent(() => void clearCompleted().catch(() => {}))

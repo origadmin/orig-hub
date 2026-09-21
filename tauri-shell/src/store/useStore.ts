@@ -374,34 +374,76 @@ export const useStore = create<DownloadState>((set, get) => ({
     await get().refresh()
   },
 
-  /** 全部暂停（仅作用于下载中/排队中任务） */
+  /**
+   * 批量操作失败必须**聚合后如实提示**（BUG-106 同类病根：静默吞错）。
+   *
+   * 此前每条都 `.catch(() => {})`，调用方再吞一次 —— 于是「全部暂停」在 daemon 不可用
+   * 时会**一条都没暂停成功，而界面毫无反应**：用户分不清是「没有符合条件的任务」
+   * 还是「操作失败了」。对比单条 `pause`：`await` 抛出、由 `DownloadItem` 用 `setError`
+   * 提示 —— 同一功能两套容错策略，批量那条是缺的那一半。
+   *
+   * 批量语义是「尽力而为」：单条失败不中断其余，但**结束时必须把失败数说清楚**。
+   */
   pauseAll: async () => {
     const targets = get().downloads.filter(
       (d) => d.status === 'downloading' || d.status === 'queued',
     )
+    let failed = 0
+    let firstErr: unknown = null
     for (const d of targets) {
-      await apiDownloadAction(d.id, 'pause').catch(() => {})
+      try {
+        await apiDownloadAction(d.id, 'pause')
+      } catch (e) {
+        failed += 1
+        firstErr ??= e
+      }
     }
     await get().refresh()
+    if (failed > 0) {
+      const reason = firstErr instanceof Error ? firstErr.message : String(firstErr)
+      set({ toast: `${failed}/${targets.length} 个任务暂停失败：${reason}` })
+    }
   },
 
   /** 全部开始（仅作用于已暂停任务） */
   resumeAll: async () => {
     const targets = get().downloads.filter((d) => d.status === 'paused')
+    let failed = 0
+    let firstErr: unknown = null
     for (const d of targets) {
-      await apiDownloadAction(d.id, 'resume').catch(() => {})
+      try {
+        await apiDownloadAction(d.id, 'resume')
+      } catch (e) {
+        failed += 1
+        firstErr ??= e
+      }
     }
     await get().refresh()
+    if (failed > 0) {
+      const reason = firstErr instanceof Error ? firstErr.message : String(firstErr)
+      set({ toast: `${failed}/${targets.length} 个任务续跑失败：${reason}` })
+    }
   },
 
   clearCompleted: async () => {
     const completed = get().downloads.filter(
       (d) => d.status === 'completed' || d.status === 'error' || d.status === 'cancelled',
     )
+    let failed = 0
+    let firstErr: unknown = null
     for (const d of completed) {
-      await apiRemoveDownload(d.id).catch(() => {})
+      try {
+        await apiRemoveDownload(d.id)
+      } catch (e) {
+        failed += 1
+        firstErr ??= e
+      }
     }
     await get().refresh()
+    if (failed > 0) {
+      const reason = firstErr instanceof Error ? firstErr.message : String(firstErr)
+      set({ toast: `${failed}/${completed.length} 条记录清除失败：${reason}` })
+    }
   },
 
   updateSettings: (patch) =>
