@@ -233,6 +233,12 @@ fn parse_days(raw: Option<&String>) -> Result<u64, ApiError> {
 struct Purged {
     removed: u64,
     skipped: u64,
+    /// 删除或状态复位**失败**的条数（BUG-109）。
+    ///
+    /// 没有它之前，`purge_item` 无论成败都返回 `removed: 1` —— 用户看到
+    /// 「已清理 N 项、释放 X 字节」，而文件其实还在磁盘上。
+    /// 这正是本函数注释里点名的那类不一致：「清字节却仍显示『已缓存』」。
+    failed: u64,
     bytes: u64,
 }
 
@@ -240,6 +246,7 @@ impl Purged {
     fn add(&mut self, p: Purged) {
         self.removed += p.removed;
         self.skipped += p.skipped;
+        self.failed += p.failed;
         self.bytes += p.bytes;
     }
 }
@@ -257,12 +264,39 @@ async fn purge_item(st: &Arc<AppState>, dir: &Path, it: &CachedBytesDetail) -> P
         };
     }
     let bytes = std::fs::metadata(&it.file_path).map(|m| m.len()).unwrap_or(0);
-    let _ = std::fs::remove_file(&it.file_path);
-    let _ = st.store.set_item_file_path(it.id, None).await;
+    // BUG-109：两步都不能静默 —— 任一步失败，这条就**没有真正清掉**，
+    // 却会被计成 removed，用户于是以为清理成功（而文件还在、条目仍显示已缓存）。
+    let removed_file = std::fs::remove_file(&it.file_path);
+    let cleared = st.store.set_item_file_path(it.id, None).await;
+    let mut failed = 0u64;
+    if let Err(e) = &removed_file {
+        failed = 1;
+        st.push_log(&format!(
+            "purge_item: remove_file failed for {} (id={}): {e}",
+            it.file_path, it.id
+        ));
+    }
+    if let Err(e) = &cleared {
+        failed = 1;
+        st.push_log(&format!(
+            "purge_item: set_item_file_path(None) failed for id={}: {e} \
+             （字节已删但条目仍显示已缓存）",
+            it.id
+        ));
+    }
     reset_tg_flag(st, &it.source, &it.ref_key).await;
+    if failed > 0 {
+        return Purged {
+            removed: 0,
+            skipped: 0,
+            failed,
+            bytes: 0,
+        };
+    }
     Purged {
         removed: 1,
         skipped: 0,
+        failed: 0,
         bytes,
     }
 }
@@ -413,10 +447,11 @@ pub async fn clear(
             acc.add(p);
         }
         st.push_log(&format!(
-            "/api/cache/clear ids={} hit={hit} removed={} skipped={} bytes={}",
+            "/api/cache/clear ids={} hit={hit} removed={} skipped={} failed={} bytes={}",
             ids.len(),
             acc.removed,
             acc.skipped,
+            acc.failed,
             acc.bytes
         ));
         return Ok(Json(json!({
@@ -426,6 +461,7 @@ pub async fn clear(
             "hit": hit,
             "removed": acc.removed,
             "skipped": acc.skipped,
+            "failed": acc.failed,
             "bytesFreed": acc.bytes,
         })));
     }
@@ -460,14 +496,15 @@ pub async fn clear(
             }
         }
         st.push_log(&format!(
-            "/api/cache/clear scope=orphan removed={} skipped={} bytes={} truncated={truncated}",
-            acc.removed, acc.skipped, acc.bytes
+            "/api/cache/clear scope=orphan removed={} skipped={} failed={} bytes={} truncated={truncated}",
+            acc.removed, acc.skipped, acc.failed, acc.bytes
         ));
         return Ok(Json(json!({
             "ok": true,
             "scope": "orphan",
             "removed": acc.removed,
             "skipped": acc.skipped,
+            "failed": acc.failed,
             "bytesFreed": acc.bytes,
             "truncated": truncated,
         })));
@@ -496,10 +533,11 @@ pub async fn clear(
         acc.add(p);
     }
     st.push_log(&format!(
-        "/api/cache/clear scope={} olderThanDays={days} removed={} skipped={} bytes={}",
+        "/api/cache/clear scope={} olderThanDays={days} removed={} skipped={} failed={} bytes={}",
         scope.as_str(),
         acc.removed,
         acc.skipped,
+        acc.failed,
         acc.bytes
     ));
     Ok(Json(json!({
@@ -507,6 +545,7 @@ pub async fn clear(
         "scope": scope.as_str(),
         "removed": acc.removed,
         "skipped": acc.skipped,
+        "failed": acc.failed,
         "bytesFreed": acc.bytes,
         "olderThanDays": if scope == ClearScope::Stale { Some(days) } else { None },
     })))
