@@ -170,6 +170,14 @@ interface DownloadState {
   tgRunning: boolean
   /** 启停 TG 插件：写 daemon（运行时生效+持久化），同步 tgEnabled/tgRunning */
   setTgEnabled: (enabled: boolean) => Promise<boolean>
+  /**
+   * 缓存管理（「入库流水线」）面板开关。
+   *
+   * 入口原先独占 `TgPanel` 顶部一整行（1248x41 的容器里只放一个 89x28 的按钮），
+   * 现上移到上下文栏右槽 —— 跨子树（`MainLayout` 触发 / `TgPanel` 渲染），开关只能提到 store。
+   */
+  tgCacheManagerOpen: boolean
+  setTgCacheManagerOpen: (v: boolean) => void
 
   /** 账号绑定中心状态（当前仅 Telegram，后续可扩展其他账号） */
   accounts: AccountsState
@@ -442,6 +450,8 @@ export const useStore = create<DownloadState>((set, get) => ({
   closeViewer: () => set({ viewer: null }),
   setCategoryFilter: (c) => set({ categoryFilter: c }),
   setPendingMediaFocus: (ref) => set({ pendingMediaFocus: ref }),
+  tgCacheManagerOpen: false,
+  setTgCacheManagerOpen: (v) => set({ tgCacheManagerOpen: v }),
 
   /** 启停 TG 插件：写 daemon（拉起/终止 orig-tg 子服务），成功同步开关与运行态 */
   setTgEnabled: async (enabled) => {

@@ -2,6 +2,8 @@ import { memo } from 'react'
 import type { ViewId } from './Sidebar'
 import { ContextBarActions } from './ContextBarActions'
 import { ContextBarStatus } from './ContextBarStatus'
+import { TgGlobalSearch } from './TgGlobalSearch'
+import { TgCacheEntry } from './TgCacheEntry'
 import { useTranslation } from '../i18n'
 
 /**
@@ -105,12 +107,18 @@ export const ContextBar = memo(function ContextBar({
 
   return (
     <div
-      className="flex min-w-0 flex-1 items-center gap-3"
+      className="grid min-w-0 flex-1 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3"
       aria-label={t('ctx.barLabel')}
       data-testid="context-bar"
     >
       <ViewTitle view={view} categoryFilter={categoryFilter} />
-      <div className="ml-auto flex shrink-0 items-center gap-3">
+      {/* 中槽：TG 视图的全局监控查找（BUG-100 方案 A）。
+          只在 tg 视图挂载；组件内部自判可用性与自持高频输入 state，本栏不订阅。
+          三列网格而非 flex：左右两列同为 `1fr`，中槽才是**真正的居中** ——
+          flex 下中槽只在「标题之后到右槽之前」的剩余空间里居中，实测偏左 53px。 */}
+      {view === 'tg' ? <TgGlobalSearch /> : null}
+      <div className="col-start-3 flex shrink-0 items-center justify-end gap-3">
+        {view === 'tg' ? <TgCacheEntry /> : null}
         {kind === 'download' ? (
           <ContextBarActions
             showClear={showClear}

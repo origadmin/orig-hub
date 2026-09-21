@@ -36,6 +36,7 @@ import type {
 import { ensureTg, tgSaveConfig } from '../api/tauri'
 import { CacheManagerDialog } from './CacheManagerDialog'
 import { useStore } from '../store/useStore'
+import { useTgSearch } from '../store/tgSearch'
 import { classifyTgReason, logTgReason } from '../lib/tgReason'
 import { useTgRetry } from '../lib/tgRetry'
 import {
@@ -202,7 +203,7 @@ export function TgPanel(
   } = {},
 ) {
   const { t } = useTranslation()
-  const { setError, openViewer, tgAvailability, accounts } = useStore()
+  const { setError, openViewer, tgAvailability, accounts, refreshTgState } = useStore()
   /**
    * TG 依赖故障（不可用/不可达）：直接以「不可用 + 原因」取代面板内容。
    *
@@ -243,6 +244,12 @@ export function TgPanel(
     logTgReason(rawReason, 'tg-panel')
   }, [rawReason])
 
+  // 进入 TG 面板时补一次状态刷新（BUG-097 的事件驱动信号源之一）：仅在挂载时触发一次，
+  // 不新增轮询；失败由 refreshTgState 内部 `logTgReason` 分类留痕，不静默吞掉。
+  useEffect(() => {
+    void refreshTgState()
+  }, [refreshTgState])
+
   /**
    * 「重试连接」出口（BUG-094）：orig-tg 只在启动时连一次，失败后不会自愈，
    * 所以未授权/不可用时必须给用户一个显式重连入口 —— 否则就算他把代理修好了，
@@ -271,15 +278,18 @@ export function TgPanel(
   /** 显式刷新信号：提示条点击时触发消息流重载 */
   const [feedReloadTick, setFeedReloadTick] = useState(0)
   /**
-   * 监控内容查找（唯一搜索框，在频道标题栏）：跨全部监控频道筛内容。
-   * 输入非空时第二列切换为结果视图（按频道分组）；清空即回到原视图。
+   * 监控内容查找：跨全部监控频道筛内容，输入非空时第二列切换为结果视图（按频道分组）。
+   *
+   * 搜索框已上移到顶部上下文栏（`TgGlobalSearch`，BUG-100 方案 A），状态落在
+   * `store/tgSearch`。这里**只订阅防抖后的 `committed`** —— 若订阅输入框原文，
+   * 每次按键都会重渲染本面板（2000+ 行），AGENTS.md §5 明令禁止。
    */
-  const [globalSearchInput, setGlobalSearchInput] = useState('')
-  const [globalSearch, setGlobalSearch] = useState('')
-  const [globalHits, setGlobalHits] = useState<
-    (TgStoredMessage & { channelTitle?: string })[]
-  >([])
-  const [globalSearching, setGlobalSearching] = useState(false)
+  const globalSearch = useTgSearch((s) => s.committed)
+  const globalHits = useTgSearch((s) => s.hits)
+  const globalSearching = useTgSearch((s) => s.searching)
+  const setGlobalHits = useTgSearch((s) => s.setHits)
+  const setGlobalSearching = useTgSearch((s) => s.setSearching)
+  const clearGlobalSearch = useTgSearch((s) => s.clear)
 
   const [syncing, setSyncing] = useState(false)
   const [downloadedPaths, setDownloadedPaths] = useState<Map<string, string>>(new Map())
@@ -299,8 +309,10 @@ export function TgPanel(
    */
   /** 当前唯一缓存任务（后端单飞：任意时刻至多一个在呈现；设计裁定「task 只返回一个结果」） */
   const [cacheTask, setCacheTask] = useState<TgCacheTask | null>(null)
-  /** 缓存管理面板开关（BUG-029：缓存任务的可观测面——数量/进度/状态） */
-  const [cacheManagerOpen, setCacheManagerOpen] = useState(false)
+  /** 缓存管理面板开关（BUG-029：缓存任务的可观测面——数量/进度/状态）。
+   *  入口在上下文栏，故开关提到 store（跨子树共享）。 */
+  const cacheManagerOpen = useStore((s) => s.tgCacheManagerOpen)
+  const setCacheManagerOpen = useStore((s) => s.setTgCacheManagerOpen)
   /** 已提示过的失败任务：避免轮询把同一个错误反复弹给用户 */
   const reportedFailuresRef = useRef<Set<number>>(new Set())
   /** APP 首启配置（api_id/api_hash 由壳持久化，未配置时显示配置卡） */
@@ -646,11 +658,7 @@ export function TgPanel(
   // v0.4.3：分组内订阅频道可直接点进内容页（在线流浏览）；监控频道仍走本地真列表。
   // （搜索词为全局状态，切频道时保留——结果视图跨频道，无需串台清理。）
 
-  // 全局监控查找：防抖 300ms → 跨全部监控频道查本地已同步消息
-  useEffect(() => {
-    const h = setTimeout(() => setGlobalSearch(globalSearchInput.trim()), 300)
-    return () => clearTimeout(h)
-  }, [globalSearchInput])
+  // 全局监控查找：`committed` 由 `TgGlobalSearch` 防抖 300ms 写入，本面板只负责查询
   useEffect(() => {
     if (!globalSearch) {
       setGlobalHits([])
@@ -672,7 +680,7 @@ export function TgPanel(
     return () => {
       cancelled = true
     }
-  }, [globalSearch, setError])
+  }, [globalSearch, setError, setGlobalHits, setGlobalSearching])
 
   /** 点全局命中 → 打开预览（已缓存走本地流，未缓存在线流），标题带频道名 */
   const onGlobalHitPreview = useEvent((hit: TgStoredMessage & { channelTitle?: string }) => {
@@ -1031,47 +1039,15 @@ export function TgPanel(
   )
 
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+    <div
+      className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+      data-testid="tg-panel-root"
+    >
       {/*
-        顶部工具条：**常驻**的「缓存管理」入口（补偿可达性）。
-        「传输中」导航移除后，缓存任务的入口只剩频道详情页头部那一处，
-        必须先点进某个频道才看得到 —— 全局入口就此消失。
-        这里把它放回面板顶部，与是否选中频道无关。
-
-        未授权/不可用（`unavailable`）时**照样显示**：缓存任务与缓存字节是**本地数据**
-        （实测 `/api/tg/cache/tasks` 与 `/api/cache/stats` 在未授权时仍 200），
-        TG 连不上时恰恰更需要查看与清理；真连不上服务（`unreachable`）才隐藏。
+        原先这里的顶部工具条只为「缓存管理」一个按钮而存在：1248x41 的容器里只有
+        一个 89x28 的按钮 —— 一整行被单个按钮占着。入口已上移到上下文栏右槽
+        （`TgCacheEntry`，与连接态/速度同处一行），本行整条删除，不留空 div 占位。
       */}
-      {tgServiceUp && (
-        <div
-          className="flex shrink-0 items-center justify-end border-b border-border-subtle/60 px-3 py-1.5"
-          data-testid="tg-toolbar"
-        >
-          <button
-            type="button"
-            onClick={() => setCacheManagerOpen(true)}
-            title={t('tg.cacheManagerHint')}
-            className="flex h-7 shrink-0 items-center gap-1 rounded px-2 text-[11px] text-fg-muted hover:bg-surface-2 hover:text-fg-strong"
-            data-testid="tg-cache-manager-entry"
-          >
-            <svg
-              className="h-3.5 w-3.5"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              strokeWidth={1.5}
-              aria-hidden="true"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M20 7.5 12 12 4 7.5m8 4.5v9M4 7.5C4 5.015 7.582 3 12 3s8 2.015 8 4.5M4 7.5v9C4 18.985 7.582 21 12 21s8-2.015 8-4.5v-9"
-              />
-            </svg>
-            {t('tg.cacheManager')}
-          </button>
-        </div>
-      )}
       <div className="flex min-h-0 flex-1">
       {tgDebugOffline && tgAvailability ? (
         /* 调试期离线：预期态，中性呈现，不报警 */
@@ -1191,16 +1167,33 @@ export function TgPanel(
         <>
       <aside className="flex w-72 shrink-0 flex-col border-r border-border-subtle bg-surface/30">
         {/* 上段：监控列表（本地真列表，点击 → 第二列显示内容；标题行可折叠/展开） */}
-        <div className="flex items-center justify-between border-b border-border-subtle/60 px-3 py-2">
+        <div className="flex items-center gap-1.5 border-b border-border-subtle/60 px-3 py-2">
           <button
+            type="button"
+            aria-label={monitorOpen ? t('tg.monitorCollapse') : t('tg.monitorExpand')}
+            aria-expanded={monitorOpen}
+            data-testid="monitor-collapse-toggle"
             onClick={() => setMonitorOpen((v) => !v)}
-            className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+            className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted hover:bg-surface-2 hover:text-fg-strong"
           >
-            <span className="w-3 shrink-0 text-[10px] text-muted">{monitorOpen ? '▾' : '▸'}</span>
-            <h3 className="truncate text-[13px] font-semibold text-fg-strong">
-              ⭐ {t('tg.navMonitor')} ({monitoredList.length})
-            </h3>
+            <svg
+              className="h-3.5 w-3.5"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={2}
+              aria-hidden="true"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d={monitorOpen ? 'M6 9l6 6 6-6' : 'M9 6l6 6-6 6'}
+              />
+            </svg>
           </button>
+          <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold text-fg-strong">
+            ⭐ {t('tg.navMonitor')} ({monitoredList.length})
+          </h3>
           <Button
             variant="ghost"
             size="sm"
@@ -1314,16 +1307,12 @@ export function TgPanel(
         {globalSearch ? (
           <>
             {/* 全局监控内容查找结果：跨全部监控频道，按频道分组（新→旧混排后归组）。
-                搜索框与频道标题栏是同一个输入（autoFocus 接管焦点，切视图不打断输入）。 */}
+                搜索框已上移到上下文栏（BUG-100），这里只留范围说明 / 命中数 / 清除，
+                避免同一 state 出现第二个输入框。 */}
             <header className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-4 py-2.5">
-              <input
-                autoFocus
-                type="search"
-                value={globalSearchInput}
-                onChange={(e) => setGlobalSearchInput(e.target.value)}
-                placeholder={t('tg.globalSearchPlaceholder')}
-                className="h-8 min-w-0 flex-1 rounded-md border border-border-subtle bg-surface-2/60 px-3 text-[12px] text-fg-strong outline-none placeholder:text-muted focus:border-accent/60"
-              />
+              <span className="min-w-0 flex-1 truncate text-[10px] text-muted/80">
+                {t('tg.globalSearchScope')}
+              </span>
               <span className="shrink-0 text-[11px] tabular-nums text-muted">
                 {globalHits.length}
               </span>
@@ -1331,7 +1320,7 @@ export function TgPanel(
                 variant="ghost"
                 size="sm"
                 className="h-7 shrink-0 px-2 text-[11px]"
-                onClick={() => setGlobalSearchInput('')}
+                onClick={clearGlobalSearch}
               >
                 {t('tg.globalSearchClear')}
               </Button>
@@ -1468,14 +1457,6 @@ export function TgPanel(
                   </p>
                 )}
               </div>
-              {/* 监控内容搜索：跨全部监控频道（顶部标题与按钮之间；输入非空 → 第二列切结果视图） */}
-              <input
-                type="search"
-                value={globalSearchInput}
-                onChange={(e) => setGlobalSearchInput(e.target.value)}
-                placeholder={t('tg.globalSearchPlaceholder')}
-                className="h-8 w-48 shrink-0 rounded-md border border-border-subtle bg-surface-2/60 px-3 text-[12px] text-fg-strong outline-none placeholder:text-muted focus:border-accent/60"
-              />
               {selectedMonitored ? (
                 <Chip tone="success">{t('tg.monitoring')}</Chip>
               ) : (
@@ -1490,7 +1471,8 @@ export function TgPanel(
               )}
             </header>
 
-            {/* 监控内容搜索已上移到标题栏（跨全部监控频道）；单频道过滤是它的子集，不再单设一框 */}
+            {/* 监控内容搜索已上移到顶部上下文栏（跨全部监控频道，BUG-100 方案 A）；
+                单频道过滤是它的子集，此处不再单设一框，也不再与结果视图头部各留一份。 */}
 
             {/* 消息流（滚动容器） */}
             <div
