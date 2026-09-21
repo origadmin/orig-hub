@@ -188,7 +188,19 @@ function groupAlbums(feed: FeedItem[]): FeedItem[][] {
  * 第二栏：聊天式媒体流（最新在底部，滚到顶按 beforeId 加载更早历史）。
  * 关系链：分组 → 组内列表 → 添加 → 监控列表 → 显示。
  */
-export function TgPanel({ onOpenAccounts }: { onOpenAccounts?: () => void } = {}) {
+export function TgPanel(
+  {
+    onOpenAccounts,
+    onOpenMedia,
+  }: {
+    onOpenAccounts?: () => void
+    /**
+     * 入库流水线的「去媒体库查看」出口：切到媒体库视图。
+     * `view` 是 MainLayout 的局部 state，面板自己切不了，只能由宿主给。
+     */
+    onOpenMedia?: () => void
+  } = {},
+) {
   const { t } = useTranslation()
   const { setError, openViewer, tgAvailability, accounts } = useStore()
   /**
@@ -1593,7 +1605,11 @@ export function TgPanel({ onOpenAccounts }: { onOpenAccounts?: () => void } = {}
       )}
       </div>
       {cacheManagerOpen ? (
-        <CacheManagerDialog channels={channels} onClose={() => setCacheManagerOpen(false)} />
+        <CacheManagerDialog
+          channels={channels}
+          onClose={() => setCacheManagerOpen(false)}
+          onOpenMedia={onOpenMedia}
+        />
       ) : null}
     </div>
   )

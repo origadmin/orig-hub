@@ -168,6 +168,15 @@ export function MainLayout() {
    * 不在此处另起一套登录流程 —— 登录表单归 `AccountsPanel`，只有一份实现。
    */
   const handleGoAccounts = useEvent(() => handleView('settings'))
+  /**
+   * 入库流水线 → 媒体库的跨视图出口。
+   *
+   * 缓存是「订阅内容 → 媒体库」的入库准备物，成品在媒体库里：流水线点了
+   * 「去媒体库查看」，就地起播之后要落在媒体库（而不是回到 TG 面板），
+   * 否则「查看」只是一次播放器弹出，用户从没到达过成品所在的地方。
+   * 视图 state 在本组件（局部），接线只能是这一个回调 —— 组件间不另开通道。
+   */
+  const handleOpenMedia = useEvent(() => handleView('media'))
 
   /**
    * 档位过滤（BUG-082）：下载三档（下载中 / 已暂停 / 已完成）各对应一组状态，
@@ -256,10 +265,10 @@ export function MainLayout() {
             )}
           >
             {view === 'settings' ? (
-              <SettingsPanel />
+              <SettingsPanel onOpenMedia={handleOpenMedia} />
             ) : view === 'tg' ? (
               <ErrorBoundary>
-                <TgPanel onOpenAccounts={handleGoAccounts} />
+                <TgPanel onOpenAccounts={handleGoAccounts} onOpenMedia={handleOpenMedia} />
               </ErrorBoundary>
             ) : view === 'media' ? (
               <ErrorBoundary>

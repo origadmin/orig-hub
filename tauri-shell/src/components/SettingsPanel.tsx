@@ -80,7 +80,7 @@ interface CategoryRow {
  * - 下载 Tab：默认目录全宽排版 + 自动分类规则编辑（可增删后缀规则）
  * - 多网卡 Tab：参与列表 + 公式权重展示（主 2 份 / 附属 1 份）
  */
-export function SettingsPanel() {
+export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}) {
   const { t, language, setLanguage, supported } = useTranslation()
   const { settings, updateSettings, daemon, setError, tgEnabled, tgRunning, setTgEnabled } =
     useStore()
@@ -888,7 +888,7 @@ export function SettingsPanel() {
                       disabled={cacheUsageLoaded && clearableCount === 0}
                       onClick={() => setCacheManagerOpen(true)}
                       data-testid="clear-cache-files"
-                      title={t('tg.bytesOpenManager')}
+                      title={t('tg.ingestCleanupSection')}
                     >
                       {t('tg.clearCacheFile')}
                     </Button>
@@ -995,6 +995,7 @@ export function SettingsPanel() {
           initialView="bytes"
           onClose={() => setCacheManagerOpen(false)}
           onTasksChanged={() => void refreshCacheUsage()}
+          onOpenMedia={onOpenMedia}
         />
       ) : null}
     </div>

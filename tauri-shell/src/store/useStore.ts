@@ -131,6 +131,16 @@ interface DownloadState {
   /** 当前选中的分类筛选（null = 不过滤）；与 view 配合用于「全部文件」下钻 */
   categoryFilter: string | null
   setCategoryFilter: (c: string | null) => void
+  /**
+   * 入库流水线 → 媒体库的跳转焦点（`source="tg"` 的 ref，形如 `<chatId>:<msgId>`）。
+   *
+   * 缓存是「订阅内容 → 媒体库」的入库准备物，成品在媒体库。流水线的「去媒体库查看」
+   * 因此是一次**跨视图跳转**：先在流水线里就地起播（播放器是全屏覆盖层），再把视图
+   * 切到媒体库并把这个 ref 记在这里 —— 媒体库挂载时消费它（定位条目 / 起播），
+   * 于是关掉播放器后用户落在媒体库而不是回到 TG 面板。null = 无待消费的焦点。
+   */
+  pendingMediaFocus: string | null
+  setPendingMediaFocus: (ref: string | null) => void
 
   /** TG 可选插件开关（daemon [tg] enabled）；false 时侧边栏隐藏 TG 模块 */
   tgEnabled: boolean
@@ -190,6 +200,7 @@ export const useStore = create<DownloadState>((set, get) => ({
   toast: null,
   categories: [],
   categoryFilter: null,
+  pendingMediaFocus: null,
   tgEnabled: false,
   tgRunning: false,
   accounts: loadAccounts(),
@@ -387,6 +398,7 @@ export const useStore = create<DownloadState>((set, get) => ({
     set((s) => (s.viewer ? { viewer: { ...s.viewer, index: i } } : s)),
   closeViewer: () => set({ viewer: null }),
   setCategoryFilter: (c) => set({ categoryFilter: c }),
+  setPendingMediaFocus: (ref) => set({ pendingMediaFocus: ref }),
 
   /** 启停 TG 插件：写 daemon（拉起/终止 orig-tg 子服务），成功同步开关与运行态 */
   setTgEnabled: async (enabled) => {

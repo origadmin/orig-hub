@@ -9,7 +9,9 @@ import {
   deleteMediaItem,
   deleteEpisode,
   deleteSeries,
+  findMediaItemIdByRef,
   getLibraryStats,
+  getMediaItem,
   listMediaItems,
   listSeries,
   listTags,
@@ -43,6 +45,28 @@ type View = 'items' | 'series' | 'seriesDetail'
 const PAGE = 120
 
 /**
+ * 单个内容条目 → 播放项。
+ *
+ * 模块级（而非组件内箭头函数）：「去媒体库查看」的跳转焦点消费发生在 effect 里，
+ * 闭包里若捕获每次渲染都新建的函数，effect 依赖要么漂移、要么只能靠禁用依赖来压住。
+ * 与下面组件内的 `toViewerItems` 是同一份映射的两形态（单条 / 列表），不各写一套。
+ */
+function toViewerItem(i: MediaItem): ViewerItem {
+  return {
+    key: `media-${i.id}`,
+    chatId: 0,
+    messageId: i.id,
+    kind: i.kind,
+    caption: i.title,
+    // 介绍单独下发：返回行显示标题、底部行显示介绍，两处不重复。
+    description: i.description ?? null,
+    src: mediaItemUrl(i.id),
+    poster: i.poster ?? null,
+    seriesId: i.seriesId ?? null,
+  }
+}
+
+/**
  * 媒体资料库（v0.6.0）：**用户可管理的**内容目录，替代原先只读的 TG 缓存列表。
  *
  * 结构（对齐主流媒体站）：
@@ -52,7 +76,7 @@ const PAGE = 120
  */
 export function MediaLibraryPanel() {
   const { t } = useTranslation()
-  const { setError, openViewer } = useStore()
+  const { setError, openViewer, pendingMediaFocus, setPendingMediaFocus } = useStore()
 
   // ---- 服务探活（媒体资料库与 TG 同进程；APP 模式由壳托管拉起）----
   const [alive, setAlive] = useState(false)
@@ -207,19 +231,7 @@ export function MediaLibraryPanel() {
 
   // ---------- 播放（交给全局播放器页）----------
   /** 内容条目 → 播放项；带 seriesId 的条目会让播放器挂出分集列表 */
-  const toViewerItems = (list: MediaItem[]): ViewerItem[] =>
-    list.map((i) => ({
-      key: `media-${i.id}`,
-      chatId: 0,
-      messageId: i.id,
-      kind: i.kind,
-      caption: i.title,
-      // 介绍单独下发：返回行显示标题、底部行显示介绍，两处不重复。
-      description: i.description ?? null,
-      src: mediaItemUrl(i.id),
-      poster: i.poster ?? null,
-      seriesId: i.seriesId ?? null,
-    }))
+  const toViewerItems = (list: MediaItem[]): ViewerItem[] => list.map(toViewerItem)
 
   /**
    * 分集 → 内容条目：剧集详情页入口与网格入口共用同一映射。
@@ -296,6 +308,37 @@ export function MediaLibraryPanel() {
   const deleteItem = useCallback((item: MediaItem) => {
     setConfirmDelete({ kind: 'items', ids: [item.id] })
   }, [])
+
+  /**
+   * 消费「入库流水线 → 媒体库」的跳转焦点（`pendingMediaFocus` = tg ref）。
+   *
+   * 流水线的「去媒体库查看」**先就地起播、再切视图**：播放器是全屏覆盖层，
+   * 所以用户点下去的第一眼是成品在播；切过来时播放器若还在，这里就只清标记 ——
+   * 再开一次等于把用户刚打开的那一次播放顶掉（关不掉的感觉就从这儿来）。
+   * 播放器已关（或由别的路径带焦点进来）时才按 ref 重新起播。
+   *
+   * 按 ref 现查而不是在当前页列表里找：列表受分页与筛选限制，**不在当前页不等于
+   * 不在库里**；在列表里找不到的分支若一直挂着标记，会在用户翻页时突然弹一次播放。
+   */
+  useEffect(() => {
+    if (!pendingMediaFocus) return
+    const ref = pendingMediaFocus
+    setPendingMediaFocus(null)
+    if (useStore.getState().viewer) return
+    let alive = true
+    void (async () => {
+      try {
+        const id = await findMediaItemIdByRef('tg', ref)
+        if (!alive || id == null) return
+        openViewer({ items: [toViewerItem(await getMediaItem(id))], index: 0 })
+      } catch {
+        /* 媒体库已在此处，查不到就停在库里，不弹错 */
+      }
+    })()
+    return () => {
+      alive = false
+    }
+  }, [pendingMediaFocus, openViewer, setPendingMediaFocus])
 
   const playEpisode = (index: number) => {
     if (!detail) return

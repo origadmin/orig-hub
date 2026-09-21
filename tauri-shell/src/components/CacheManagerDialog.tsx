@@ -1,50 +1,50 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { CheckSquare, HardDrive, RotateCcw, Square, X } from 'lucide-react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ChevronDown, ChevronRight, X } from 'lucide-react'
 import { Button } from './ui/button'
 import { Progress } from './ui/progress'
 import { CacheBytesPanel } from './CacheBytesPanel'
 import { cn } from '../lib/utils'
 import { useTranslation } from '../i18n'
+import { useStore } from '../store/useStore'
+import { useEvent } from '../hooks/useEvent'
+import { findMediaItemIdByRef, getMediaItem, mediaItemUrl } from '../api/media'
 import {
   cancelCacheTask,
   deleteCacheTask,
-  deleteCacheTasksByIds,
-  getCacheStats,
   listAllCacheTasks,
   listTgDialogs,
   retryCacheTask,
 } from '../api/tg'
-import type { TgCacheTask, TgChannel } from '../types'
+import type { TgCacheTask, TgChannel, ViewerItem } from '../types'
 
 /**
- * 缓存管理面板。
+ * 入库流水线面板（原「缓存管理」）。
  *
- * ## 边界（动词最小化 + 范围参数化）
+ * ## 它到底是什么（概念修正）
  *
- * 缓存管理只有两类对象：**任务记录**（时间线）与**缓存文件**（磁盘字节）。
- * 此前把「动词」当成要枚举的东西（单删 / 全删 / 清除记录 / 清除终态 …），
- * 于是每想到一个场景就加一个按钮 —— 必然无限叠加（「清空失败」就成了第 N 个）。
- * 收敛后：**记录面** = 取消 / 重试 / 删除；**字节面** = 清除缓存文件。
+ * 缓存下来的字节**就是媒体库条目的本体**：`cache_one` → `mark_downloaded` →
+ * `upsert_media_item(source="tg", ref="{chat}:{msg}")`，不存在第二份拷贝
+ * （媒体库播放直接读 `media_item.file_path`）。所以这里不是「TG 的一个缓存资产箱」，
+ * 而是**订阅内容 → 媒体库的入库流水线**：一条记录 = 一次入库尝试，终点是媒体库的成品。
+ * 呈现层据此重排（分组按入库口径、动作给出「去媒体库查看」），数据层一行未动。
  *
- * ## 为什么删除要能「全选 / 部分选择」
+ * ## 两个页签为什么不合并
  *
- * 此前批量动词只有一个 `清除记录`，范围由上方分段（全部/成功/失败）决定 ——
- * 意味着**只能整档清，不能挑着清**；想删三条不相邻的记录只能一条一条点，
- * 用户原话「一个一个删？」。选择本身才是诉求，靠枚举档位永远追不上
- * （清空失败 / 清空成功 / 清空中断…），故批量动作改为**勾选驱动**：
- * 每行一个勾选框、表头全选、`删除所选 (N)`。点全选即等价于原来的「全部」档。
+ * **入库流水线**（任务域）与**回收临时文件**（磁盘域）是两件事：合并会让「字节管理」
+ * 重新变回主视角 —— 那正是本次要纠正的错位。故只改名易位：流水线默认在前，
+ * 字节回收收进次位页签。
+ *
+ * ## 为什么删掉了「全选 / 删除所选」
+ *
+ * 勾选驱动是为「挑着清记录」服务的；而清记录本身就是个假需求 —— 记录是流水线的
+ * 历史，一条条删它不释放任何字节（字节在回收页签），只是让「哪条消息入过库」变
+ * 得无从追溯。留一个「单条删除」给确有需要的人就够了，批量删除整个撤掉。
  *
  * ## 为什么每条删除都要确认
  *
- * 记录一旦删掉，那条消息的缓存历史就没了（重新缓存要回 TG 翻消息）；
+ * 记录一旦删掉，那条消息的入库历史就没了（重新入库要回 TG 翻消息）；
  * 行内一个小按钮贴着手滑就到，误点代价不小。确认条内**如实报出活跃任务数**——
- * 删活跃记录等于停掉正在跑的下载，不说清楚就是偷偷改状态。
- *
- * ## 「清除缓存文件」为什么不在这个面板里
- *
- * 它是释放磁盘字节的动作，与「设置 → 通用 → TG 模块」下的清理项是**同一个后端动作**
- * （`POST /api/cache/clear`）。两个入口两个说法只会让人以为是两件事，故只保留设置页那一个；
- * 本面板保留占用读数，便于对照「记录没了但字节还在」这类困惑。
+ * 删活跃记录等于停掉正在跑的入库，不说清楚就是偷偷改状态。
  */
 
 const STATUS_KEY: Record<TgCacheTask['status'], string> = {
@@ -69,7 +69,28 @@ const STATUS_STYLE: Record<TgCacheTask['status'], string> = {
 const ACTIVE_STATUS = new Set<TgCacheTask['status']>(['queued', 'running'])
 const RETRYABLE = new Set<TgCacheTask['status']>(['failed', 'cancelled', 'interrupted'])
 
-/** 筛选档：**只筛列表**（批量动作已改为勾选驱动，不再由它决定范围）。 */
+/**
+ * 入库分组（呈现口径）：一条记录处在入库流程的哪一段。
+ *
+ * 与 `TgCacheTask.status` 是「多对一」而非一一对应 —— 后端状态表达的是**任务机**的
+ * 状态（排队/在跑/终态/异常终态），界面要表达的是**用户关心的进度**（成了没/在跑/
+ * 卡住了）。把六种状态平铺成六段就是让用户自己去归类，故收敛成四段。
+ */
+type IngestGroup = 'ingested' | 'ingesting' | 'failed' | 'cancelled'
+
+const GROUP_OF: Record<TgCacheTask['status'], IngestGroup> = {
+  queued: 'ingesting',
+  running: 'ingesting',
+  done: 'ingested',
+  failed: 'failed',
+  interrupted: 'failed',
+  cancelled: 'cancelled',
+}
+
+/** 主视图（统计条 + 分组标签）覆盖的分组；`cancelled` 收进「更多」折叠，不占主视图。 */
+const MAIN_GROUPS: IngestGroup[] = ['ingested', 'ingesting', 'failed']
+
+/** 筛选档：**只筛列表**，与批量动作无关（批量删除已整个撤掉）。 */
 type Scope = 'all' | 'success' | 'failed'
 
 const SCOPE_TABS: Array<{ key: Scope; labelKey: string }> = [
@@ -78,28 +99,31 @@ const SCOPE_TABS: Array<{ key: Scope; labelKey: string }> = [
   { key: 'failed', labelKey: 'tg.cacheScopeFailed' },
 ]
 
-function scopeCount(scope: Scope, counts: Record<string, number>, tasks: TgCacheTask[]): number {
-  const c = (k: string) => counts[k] ?? 0
-  switch (scope) {
-    case 'all':
-      return tasks.length
-    case 'success':
-      return c('done')
-    case 'failed':
-      return c('failed') + c('cancelled') + c('interrupted')
+/** 按入库分组统计（服务端已给 counts，这里只做呈现口径的归并）。 */
+function groupCounts(counts: Record<string, number>): Record<IngestGroup, number> {
+  const out: Record<IngestGroup, number> = {
+    ingested: 0,
+    ingesting: 0,
+    failed: 0,
+    cancelled: 0,
   }
+  for (const [status, group] of Object.entries(GROUP_OF) as Array<
+    [TgCacheTask['status'], IngestGroup]
+  >) {
+    out[group] += counts[status] ?? 0
+  }
+  return out
 }
 
-function fmtBytes(n: number): string {
-  if (n < 1024) return `${n} B`
-  const units = ['KB', 'MB', 'GB', 'TB']
-  let v = n / 1024
-  let i = 0
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024
-    i += 1
+function scopeCount(scope: Scope, groups: Record<IngestGroup, number>): number {
+  switch (scope) {
+    case 'all':
+      return MAIN_GROUPS.reduce((a, g) => a + groups[g], 0)
+    case 'success':
+      return groups.ingested
+    case 'failed':
+      return groups.failed
   }
-  return `${v.toFixed(v >= 100 ? 0 : 1)} ${units[i]}`
 }
 
 function fmtWhen(sec: number): string {
@@ -108,8 +132,176 @@ function fmtWhen(sec: number): string {
   return `${d.getMonth() + 1}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-/** 待确认的删除：单条 / 勾选的批量。 */
-type Confirm = { kind: 'one'; id: number } | { kind: 'batch' } | null
+/**
+ * 流水线的一行（AGENTS.md §5：高频路径的行组件必须 `memo` 化）。
+ *
+ * 行内动作**按组切换**，且只有一条主按钮：已入库 → 去媒体库查看（成品的出口）；
+ * 入库失败 → 重试；入库中 → 取消。删除记录退为次级动作（记录是历史，不是资产）。
+ */
+const IngestTaskRow = memo(function IngestTaskRow(props: {
+  task: TgCacheTask
+  /** 频道标题（宿主没给频道表时退回 `#<chatId>`） */
+  title: string
+  busy: boolean
+  /** 该行是否正在确认「删除记录」 */
+  confirming: boolean
+  /** 该行点过「去媒体库查看」但 by-ref 未命中（成品不在库里） */
+  missing: boolean
+  onGoLibrary: (task: TgCacheTask) => void
+  onRetry: (task: TgCacheTask) => void
+  onCancel: (task: TgCacheTask) => void
+  onAskDelete: (task: TgCacheTask) => void
+  onDelete: (task: TgCacheTask) => void
+  onDismissDelete: () => void
+}) {
+  const {
+    task,
+    title,
+    busy,
+    confirming,
+    missing,
+    onGoLibrary,
+    onRetry,
+    onCancel,
+    onAskDelete,
+    onDelete,
+    onDismissDelete,
+  } = props
+  const { t } = useTranslation()
+  const pct = task.total > 0 ? (task.done / task.total) * 100 : 0
+  const active = ACTIVE_STATUS.has(task.status)
+  const ingested = task.status === 'done'
+  const retryable = RETRYABLE.has(task.status)
+  const single = task.groupId == null
+  return (
+    <div
+      className="rounded-md border border-border-subtle bg-surface-2/40 p-2.5"
+      data-testid="cache-task-row"
+      data-status={task.status}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <span
+            className={cn(
+              'shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium',
+              STATUS_STYLE[task.status],
+            )}
+          >
+            {t(STATUS_KEY[task.status])}
+          </span>
+          <span className="truncate text-xs text-fg-strong">
+            {title} · {single ? t('tg.cacheScopeSingle') : t('tg.cacheScopeGroup')} ·{' '}
+            {t('tg.cacheCountUnit', { n: task.messageIds.length })}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {ingested ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              disabled={busy}
+              onClick={() => onGoLibrary(task)}
+              data-testid="cache-task-golibrary"
+            >
+              {t('tg.ingestGoLibrary')}
+            </Button>
+          ) : null}
+          {retryable ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              disabled={busy}
+              onClick={() => onRetry(task)}
+              data-testid="cache-task-retry"
+            >
+              {t('tg.cacheRetry')}
+            </Button>
+          ) : null}
+          {active ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              disabled={busy}
+              onClick={() => onCancel(task)}
+              data-testid="cache-task-cancel"
+            >
+              {t('tg.cacheCancel')}
+            </Button>
+          ) : null}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2 text-[11px]"
+            disabled={busy}
+            onClick={() => onAskDelete(task)}
+            data-testid="cache-task-delete"
+          >
+            {t('tg.cacheDelete')}
+          </Button>
+        </div>
+      </div>
+      <div className="mt-1.5 flex items-center gap-2">
+        <Progress value={pct} animated={task.status === 'running'} smoothMs={4800} className="flex-1" />
+        <span className="shrink-0 text-[11px] tabular-nums text-fg-muted">
+          {task.done}/{task.total}
+        </span>
+        <span className="shrink-0 text-[11px] text-fg-muted">{fmtWhen(task.updatedAt)}</span>
+      </div>
+      {active && task.currentId != null ? (
+        <p className="mt-1 text-[11px] text-fg-muted">
+          {t('tg.cacheCurrentMsg', { id: task.currentId })}
+        </p>
+      ) : null}
+      {task.status === 'failed' && task.error ? (
+        <p className="mt-1 truncate text-[11px] text-red-500" title={task.error}>
+          {task.error}
+        </p>
+      ) : null}
+      {missing ? (
+        <p className="mt-1 text-[11px] text-fg-muted" data-testid="cache-task-notinlib">
+          {t('tg.ingestNotInLibrary')}
+        </p>
+      ) : null}
+      {/* 单条删除确认内联到当前任务行：用户清楚「删的是哪一条」 */}
+      {confirming ? (
+        <div
+          className="mt-1.5 rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[11px] leading-relaxed text-destructive"
+          data-testid="cache-confirm-inline"
+        >
+          {t('tg.cacheDeleteConfirmOne')}
+          {active ? <span className="ml-1">{t('tg.cacheDeleteConfirmRunning')}</span> : null}
+          <div className="mt-1.5 flex justify-end gap-2">
+            <Button
+              variant="destructive"
+              size="sm"
+              className="h-7 px-2.5 text-[11px]"
+              disabled={busy}
+              onClick={() => onDelete(task)}
+              data-testid="cache-confirm-inline-yes"
+            >
+              {t('tg.cacheDeleteConfirmYes')}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2.5 text-[11px]"
+              onClick={onDismissDelete}
+              data-testid="cache-confirm-inline-no"
+            >
+              {t('tg.cacheDeleteConfirmNo')}
+            </Button>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+})
+
+/** 待确认的删除：只有单条（批量删除已撤掉）。 */
+type Confirm = { kind: 'one'; id: number } | null
 
 export function CacheManagerDialog(props: {
   channels?: TgChannel[]
@@ -119,28 +311,42 @@ export function CacheManagerDialog(props: {
   /**
    * 打开时落在哪个页签（BUG-059）。
    *
-   * 设置页的「清除缓存文件」不再就地全清，而是打开本面板的「缓存字节」页签 ——
+   * 设置页的「回收临时文件」不再就地全清，而是打开本面板的「回收临时文件」页签 ——
    * 同一个清理能力只有一个家，两处入口只是两个门。
    */
   initialView?: 'tasks' | 'bytes'
+  /**
+   * 「去媒体库查看」的跨视图出口（切到媒体库视图）。
+   *
+   * 由 MainLayout 提供（`view` 是它的局部 state）：流水线先就地起播，再借这个回调
+   * 把用户送到成品所在的媒体库。宿主没给时只在本地起播（不切视图），能力不消失。
+   */
+  onOpenMedia?: () => void
 }) {
-  const { channels, onClose, onTasksChanged, initialView = 'tasks' } = props
+  const { channels, onClose, onTasksChanged, initialView = 'tasks', onOpenMedia } = props
   const { t } = useTranslation()
+  const { openViewer, setPendingMediaFocus } = useStore()
   const [view, setView] = useState<'tasks' | 'bytes'>(initialView)
   const [tasks, setTasks] = useState<TgCacheTask[]>([])
   const [counts, setCounts] = useState<Record<string, number>>({})
-  const [stats, setStats] = useState<{ files: number; bytes: number; external: number }>({
-    files: 0,
-    bytes: 0,
-    external: 0,
-  })
   const [scope, setScope] = useState<Scope>('all')
-  const [sel, setSel] = useState<Set<number>>(new Set())
   const [confirm, setConfirm] = useState<Confirm>(null)
+  /** 点过「去媒体库查看」但库里查不到成品的 ref：行内如实写「尚未入库」。 */
+  const [missRefs, setMissRefs] = useState<Set<string>>(new Set())
+  /** 已取消分组默认折叠（不占主视图），展开才看。 */
+  const [cancelledOpen, setCancelledOpen] = useState(false)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
   const aliveRef = useRef(true)
+  /**
+   * 已查过的 tg ref → 媒体库条目 id（`null` = 查过但不在库里）。
+   *
+   * 与 TgPanel 的 `photoCheckedRef` 同一写法：**同一个 ref 只问一次后端**。
+   * 不做列表级 `source="tg"` 筛选（后端 `listMediaItems` 不支持），也不在每次渲染
+   * 重查 —— by-ref 是幂等读，但十几个行一起渲染就会变成十几个请求。
+   */
+  const libRefCache = useRef<Map<string, number | null>>(new Map())
   // 拖拽误关防护：只有在遮罩上按下**且**抬起时才关闭（面板内拖到遮罩松手会误关）。
   const downOnOverlay = useRef(false)
 
@@ -205,7 +411,9 @@ export function CacheManagerDialog(props: {
   const sigRef = useRef('')
   const load = useCallback(async () => {
     try {
-      const [res, st] = await Promise.all([listAllCacheTasks(), getCacheStats()])
+      // 磁盘占用读数（`getCacheStats`）已随「回收临时文件」页签下移：流水线只关心
+      // 入库进度，顶部再摆一个「已缓存多少字节」正是把字节当资产的旧视角。
+      const res = await listAllCacheTasks()
       if (!aliveRef.current) return
       const list = res.tasks ?? []
       const nextCounts = res.counts ?? {}
@@ -219,16 +427,7 @@ export function CacheManagerDialog(props: {
         sigRef.current = sig
         setTasks(list)
         setCounts(nextCounts)
-        // 勾选集跟随列表收敛：删掉的行不能留在选中态里（否则「已选 3 项」会虚报，
-        // 下次删除还会拿旧 id 打后端）。返回同一引用表示无变化，不触发重渲染。
-        setSel((prev) => {
-          if (prev.size === 0) return prev
-          const alive = new Set(list.map((x) => x.id))
-          const next = new Set([...prev].filter((id) => alive.has(id)))
-          return next.size === prev.size ? prev : next
-        })
       }
-      setStats({ files: st.files ?? 0, bytes: st.bytes ?? 0, external: st.external ?? 0 })
       setErr('')
     } catch (e) {
       if (aliveRef.current) setErr(e instanceof Error ? e.message : String(e))
@@ -283,61 +482,87 @@ export function CacheManagerDialog(props: {
   /** 原任务重试（BUG-078）：按 id 复位同一条记录为 queued，不再新建任务。 */
   const retry = (task: TgCacheTask) => act(() => retryCacheTask(task.id))
 
-  const removeOne = (id: number) =>
-    act(async () => {
-      await deleteCacheTask(id)
-      setSel((prev) => {
-        if (!prev.has(id)) return prev
-        const next = new Set(prev)
-        next.delete(id)
-        return next
-      })
-    })
+  const removeOne = (id: number) => act(() => deleteCacheTask(id))
 
-  const removeSelected = () => {
-    const ids = [...sel]
-    if (ids.length === 0) return
-    return act(async () => {
-      await deleteCacheTasksByIds(ids)
-      setSel(new Set())
-    })
-  }
+  /**
+   * 「去媒体库查看」：一次入库的终点是媒体库里的成品，出口就该通向成品。
+   *
+   * 走 by-ref（`source="tg"`、`ref="{chat}:{msg}"`），不按 chat 全量筛 —— 后端
+   * `listMediaItems` 只支持 kind/q/tag/series，本次不为这个出口新增后端能力。
+   * 命中即**就地起播**（播放器是全屏覆盖层），再把焦点 ref 交给媒体库、切视图，
+   * 于是关掉播放器后用户落在成品所在的库里；未命中就如实写「尚未入库」——
+   * 「已入库」却跳不到成品，比不给出这个按钮更让人困惑。
+   */
+  const goLibrary = useEvent(async (task: TgCacheTask) => {
+    const msgId = task.messageIds[0]
+    if (msgId == null) return
+    const ref = `${task.chatId}:${msgId}`
+    let id = libRefCache.current.get(ref)
+    if (id === undefined) {
+      try {
+        id = await findMediaItemIdByRef('tg', ref)
+      } catch {
+        id = null
+      }
+      libRefCache.current.set(ref, id)
+    }
+    if (!aliveRef.current) return
+    if (id == null) {
+      setMissRefs((prev) => (prev.has(ref) ? prev : new Set(prev).add(ref)))
+      return
+    }
+    try {
+      const item = await getMediaItem(id)
+      if (!aliveRef.current) return
+      const viewerItem: ViewerItem = {
+        key: `media-${item.id}`,
+        chatId: 0,
+        messageId: item.id,
+        kind: item.kind,
+        caption: item.title,
+        description: item.description ?? null,
+        src: mediaItemUrl(item.id),
+        poster: item.poster ?? null,
+        seriesId: item.seriesId ?? null,
+      }
+      setPendingMediaFocus(ref)
+      openViewer({ items: [viewerItem], index: 0, title: item.title || undefined })
+      onOpenMedia?.()
+    } catch (e) {
+      if (aliveRef.current) setErr(e instanceof Error ? e.message : String(e))
+    }
+  })
 
-  // 筛选：三档标签**只决定看什么**。批量动作的作用范围由勾选决定（见文件头注释）。
+  // 筛选：三档标签**只决定看什么**（批量删除已撤掉，它不再决定任何动作的范围）。
   const visible = useMemo(() => {
     switch (scope) {
       case 'all':
-        return tasks
+        return tasks.filter((x) => GROUP_OF[x.status] !== 'cancelled')
       case 'success':
-        return tasks.filter((x) => x.status === 'done')
+        return tasks.filter((x) => GROUP_OF[x.status] === 'ingested')
       case 'failed':
-        return tasks.filter((x) => RETRYABLE.has(x.status))
+        return tasks.filter((x) => GROUP_OF[x.status] === 'failed')
     }
   }, [scope, tasks])
 
-  const visibleIds = useMemo(() => visible.map((x) => x.id), [visible])
-  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => sel.has(id))
-  const someVisibleSelected = !allVisibleSelected && visibleIds.some((id) => sel.has(id))
+  /** 已取消单独成组：不占主视图（统计条与分组标签都不算它），只留在「更多」里。 */
+  const cancelled = useMemo(() => tasks.filter((x) => GROUP_OF[x.status] === 'cancelled'), [tasks])
 
-  const toggle = (id: number) =>
-    setSel((prev) => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
+  /** 统计条的三段读数（呈现口径，服务端 counts 按状态给，这里按入库分组归并）。 */
+  const groups = useMemo(() => groupCounts(counts), [counts])
 
-  const toggleAllVisible = () =>
-    setSel((prev) => {
-      const next = new Set(prev)
-      if (allVisibleSelected) visibleIds.forEach((id) => next.delete(id))
-      else visibleIds.forEach((id) => next.add(id))
-      return next
-    })
-
-  const selCount = sel.size
-  /** 勾选里正在跑的任务数：删它等于停掉下载，确认条必须说清。 */
-  const selActiveCount = tasks.filter((x) => sel.has(x.id) && ACTIVE_STATUS.has(x.status)).length
+  // 行内回调必须引用恒定，否则行组件的 memo 白做（AGENTS.md §5）。
+  const onRetry = useEvent((task: TgCacheTask) => void retry(task))
+  const onCancelTask = useEvent((task: TgCacheTask) => void act(() => cancelCacheTask(task.id)))
+  // 「去媒体库查看」同样必须引用恒定：写成内联箭头函数的话，行组件每次渲染都收到新的
+  // prop，`memo` 直接失效 —— 轮询一刷新就整列表重渲染（AGENTS.md §5）。
+  const onGoLibrary = useEvent((task: TgCacheTask) => void goLibrary(task))
+  const onAskDelete = useEvent((task: TgCacheTask) => setConfirm({ kind: 'one', id: task.id }))
+  const onDelete = useEvent((task: TgCacheTask) => {
+    setConfirm(null)
+    void removeOne(task.id)
+  })
+  const onDismissDelete = useEvent(() => setConfirm(null))
 
   return (
     <div
@@ -375,7 +600,8 @@ export function CacheManagerDialog(props: {
           </div>
         </div>
 
-        {/* 两个页签：任务记录（时间线）/ 缓存字节（磁盘）。
+        {/* 两个页签：入库流水线（任务域，默认）/ 回收临时文件（磁盘域）。
+            不合并：合并会让「字节管理」重新变回主视角，那正是本次要纠正的错位。
             清理能力只有一个家，设置页只是另一个门（BUG-059）。 */}
         <div className="mt-3 flex items-center gap-1.5" data-testid="cache-tabs">
           {(
@@ -401,289 +627,150 @@ export function CacheManagerDialog(props: {
           ))}
         </div>
 
-        {/* 磁盘占用：只读读数。字节的释放动作在「缓存字节」页签，这里只负责如实显示 */}
-        <div className="mt-2.5 flex items-center gap-2 rounded-md border border-border-subtle bg-surface-2/40 px-2.5 py-2 text-xs text-fg-muted">
-          <HardDrive className="h-3.5 w-3.5 shrink-0" />
-          <span className="truncate">
-            {t('tg.cacheUsage', { size: fmtBytes(stats.bytes), n: stats.files })}
+        {/* 入库统计条：三段读数（已入库 / 入库中 / 失败）。
+            原先是「已缓存 {size} · {n} 个文件」—— 那是把字节当资产的口径；流水线的
+            主视角是**进度**，字节的释放归「回收临时文件」页签（那里自带占用读数）。 */}
+        <div
+          className="mt-2.5 flex flex-wrap items-center gap-1.5 rounded-md border border-border-subtle bg-surface-2/40 px-2.5 py-2 text-xs text-fg-muted"
+          aria-label={t('tg.ingestSummary', {
+            done: groups.ingested,
+            active: groups.ingesting,
+            failed: groups.failed,
+          })}
+          data-testid="cache-ingest-summary"
+        >
+          <span className="shrink-0" data-testid="ingest-summary-done">
+            {t('tg.ingestStatusIngested')} {groups.ingested}
           </span>
-          {stats.external > 0 ? (
-            <span className="shrink-0 text-[11px]">· {t('tg.cacheExternal', { n: stats.external })}</span>
-          ) : null}
-          {/* 只在**不在这个页签**时才指路（BUG-081）：用户已经站在「缓存字节」页签上
-              还被告知「清理入口在缓存字节页签」，是一句指向自己的话 —— 提示一旦自指，
-              就不再是指路，而是噪音。 */}
-          {view !== 'bytes' ? (
-            <span
-              className="ml-auto shrink-0 text-[10.5px] text-muted"
-              data-testid="cache-purge-hint"
-            >
-              {t('tg.cachePurgeHere')}
-            </span>
-          ) : null}
+          <span className="shrink-0 text-muted">·</span>
+          <span className="shrink-0" data-testid="ingest-summary-active">
+            {t('tg.ingestStatusIngesting')} {groups.ingesting}
+          </span>
+          <span className="shrink-0 text-muted">·</span>
+          <span className="shrink-0" data-testid="ingest-summary-failed">
+            {t('tg.ingestStatusFailed')} {groups.failed}
+          </span>
         </div>
 
         {view === 'tasks' ? (
           <>
-            {/* —— 任务记录页签（时间线：记录怎么删，不动磁盘字节）—— */}
-            {/* 筛选档：只筛列表 */}
+            {/* —— 入库流水线页签（进度与出口：记录怎么来的、成品在哪）—— */}
+            {/* 分组档：只筛列表（批量删除已撤掉，它不再决定任何动作的范围）。
+                映射：全部 = 已入库+入库中+入库失败（已取消不进主视图）；
+                已入库 = done；入库失败 = failed + interrupted。 */}
             <div className="mt-3 flex flex-wrap items-center gap-1.5">
-          {SCOPE_TABS.map(({ key, labelKey }) => (
-            <button
-              key={key}
-              type="button"
-              onClick={() => setScope(key)}
-              className={cn(
-                'rounded-full px-2.5 py-1 text-xs transition-colors',
-                scope === key
-                  ? 'bg-accent/15 font-medium text-accent'
-                  : 'bg-surface-2 text-fg-muted hover:text-fg-strong',
-              )}
-              data-testid={`cache-scope-${key}`}
-            >
-              {t(labelKey)} · {scopeCount(key, counts, tasks)}
-            </button>
-          ))}
-        </div>
-
-        {/* 选择工具条：全选（当前筛选内）+ 删除所选 */}
-        <div className="mt-2 flex items-center gap-2 rounded-md border border-border-subtle/70 bg-surface-2/25 px-2 py-1.5">
-          <button
-            type="button"
-            onClick={toggleAllVisible}
-            disabled={visibleIds.length === 0}
-            className="flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] text-fg-mid hover:bg-surface-2 disabled:opacity-50"
-            data-testid="cache-select-all"
-          >
-            {allVisibleSelected ? (
-              <CheckSquare className="h-3.5 w-3.5" />
-            ) : (
-              <Square className={cn('h-3.5 w-3.5', someVisibleSelected && 'text-accent')} />
-            )}
-            {t('tg.cacheSelectAll')}
-          </button>
-          <span className="text-[11px] text-fg-muted" data-testid="cache-selected-count">
-            {t('tg.cacheSelectedCount', { n: selCount })}
-          </span>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="ml-auto h-7 px-2 text-[11px]"
-            disabled={busy || selCount === 0}
-            onClick={() => setConfirm({ kind: 'batch' })}
-            data-testid="cache-delete-selected"
-          >
-            {t('tg.cacheDeleteSelected', { n: selCount })}
-          </Button>
-        </div>
-
-        {/* 确认条：单条与批量的唯一提交口（不只是多一次点击，而是把「要删几条」写清楚） */}
-        {confirm?.kind === 'batch' ? (
-          <div
-            className="mt-2 rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[11px] leading-relaxed text-destructive"
-            data-testid="cache-confirm"
-          >
-            {/* 单条确认已内联到**该任务行**（BUG-078），这里只服务批量删除 */}
-            {t('tg.cacheDeleteConfirmBatch', { n: selCount })}
-            {selActiveCount > 0 ? (
-              <span className="ml-1">{t('tg.cacheDeleteConfirmRunning')}</span>
-            ) : null}
-            <div className="mt-1.5 flex justify-end gap-2">
-              <Button
-                variant="destructive"
-                size="sm"
-                className="h-7 px-2.5 text-[11px]"
-                disabled={busy}
-                onClick={() => {
-                  setConfirm(null)
-                  void removeSelected()
-                }}
-                data-testid="cache-confirm-yes"
-              >
-                {t('tg.cacheDeleteConfirmYes')}
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-7 px-2.5 text-[11px]"
-                onClick={() => setConfirm(null)}
-                data-testid="cache-confirm-no"
-              >
-                {t('tg.cacheDeleteConfirmNo')}
-              </Button>
+              {SCOPE_TABS.map(({ key, labelKey }) => (
+                <button
+                  key={key}
+                  type="button"
+                  onClick={() => setScope(key)}
+                  className={cn(
+                    'rounded-full px-2.5 py-1 text-xs transition-colors',
+                    scope === key
+                      ? 'bg-accent/15 font-medium text-accent'
+                      : 'bg-surface-2 text-fg-muted hover:text-fg-strong',
+                  )}
+                  data-testid={`cache-scope-${key}`}
+                >
+                  {t(labelKey)} · {scopeCount(key, groups)}
+                </button>
+              ))}
             </div>
-          </div>
-        ) : null}
 
-        {err ? <p className="mt-2 text-xs text-red-500">{err}</p> : null}
+            {err ? <p className="mt-2 text-xs text-red-500">{err}</p> : null}
 
-        {/* 任务列表 */}
+        {/* 入库记录列表 */}
         <div className="mt-3 min-h-0 flex-1 space-y-2 overflow-y-auto">
-          {visible.map((task) => {
-            const pct = task.total > 0 ? (task.done / task.total) * 100 : 0
-            const active = ACTIVE_STATUS.has(task.status)
-            const retryable = RETRYABLE.has(task.status)
-            const single = task.groupId == null
-            const on = sel.has(task.id)
-            return (
-              <div
-                key={task.id}
-                className={cn(
-                  'rounded-md border bg-surface-2/40 p-2.5',
-                  on ? 'border-accent/60 bg-accent/5' : 'border-border-subtle',
-                )}
-                data-testid="cache-task-row"
-                data-selected={on ? 'true' : undefined}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex min-w-0 items-center gap-2">
-                    <button
-                      type="button"
-                      role="checkbox"
-                      aria-checked={on}
-                      aria-label={t('tg.cacheSelectRow')}
-                      onClick={() => toggle(task.id)}
-                      className="shrink-0 rounded p-0.5 text-fg-mid hover:bg-surface-2"
-                      data-testid={`cache-task-check-${task.id}`}
-                    >
-                      {on ? (
-                        <CheckSquare className="h-3.5 w-3.5 text-accent" />
-                      ) : (
-                        <Square className="h-3.5 w-3.5" />
-                      )}
-                    </button>
-                    <span
-                      className={cn(
-                        'shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium',
-                        STATUS_STYLE[task.status],
-                      )}
-                    >
-                      {t(STATUS_KEY[task.status])}
-                    </span>
-                    <span className="truncate text-xs text-fg-strong">
-                      {titleOf(task.chatId) ?? `频道 ${task.chatId}`} ·{' '}
-                      {single ? t('tg.cacheScopeSingle') : t('tg.cacheScopeGroup')} ·{' '}
-                      {t('tg.cacheCountUnit', { n: task.messageIds.length })}
-                    </span>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-1.5">
-                    {active ? (
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        disabled={busy}
-                        onClick={() => void act(() => cancelCacheTask(task.id))}
-                        data-testid="cache-task-cancel"
-                      >
-                        {t('tg.cacheCancel')}
-                      </Button>
-                    ) : null}
-                    {retryable ? (
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        title={t('tg.cacheRetry')}
-                        aria-label={t('tg.cacheRetry')}
-                        disabled={busy}
-                        onClick={() => void retry(task)}
-                        data-testid="cache-task-retry"
-                      >
-                        <RotateCcw className="h-3.5 w-3.5" />
-                      </Button>
-                    ) : null}
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      disabled={busy}
-                      onClick={() => setConfirm({ kind: 'one', id: task.id })}
-                      data-testid="cache-task-delete"
-                    >
-                      {t('tg.cacheDelete')}
-                    </Button>
-                  </div>
-                </div>
-                <div className="mt-1.5 flex items-center gap-2">
-                  <Progress
-                    value={pct}
-                    animated={task.status === 'running'}
-                    smoothMs={4800}
-                    className="flex-1"
-                  />
-                  <span className="shrink-0 text-[11px] tabular-nums text-fg-muted">
-                    {task.done}/{task.total}
-                  </span>
-                  <span className="shrink-0 text-[11px] text-fg-muted">
-                    {fmtWhen(task.updatedAt)}
-                  </span>
-                </div>
-                {active && task.currentId != null ? (
-                  <p className="mt-1 text-[11px] text-fg-muted">
-                    {t('tg.cacheCurrentMsg', { id: task.currentId })}
-                  </p>
-                ) : null}
-                {task.status === 'failed' && task.error ? (
-                  <p className="mt-1 truncate text-[11px] text-red-500" title={task.error}>
-                    {task.error}
-                  </p>
-                ) : null}
-                {/* 单条删除确认内联到当前任务下（BUG-078）：点删除不再在面板顶部弹框，
-                    而是紧贴该任务行——用户清楚「删的是哪一条」。批量删除仍走顶部确认条。 */}
-                {confirm?.kind === 'one' && confirm.id === task.id ? (
-                  <div
-                    className="mt-1.5 rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[11px] leading-relaxed text-destructive"
-                    data-testid="cache-confirm-inline"
-                  >
-                    {t('tg.cacheDeleteConfirmOne')}
-                    {ACTIVE_STATUS.has(task.status) ? (
-                      <span className="ml-1">{t('tg.cacheDeleteConfirmRunning')}</span>
-                    ) : null}
-                    <div className="mt-1.5 flex justify-end gap-2">
-                      <Button
-                        variant="destructive"
-                        size="sm"
-                        className="h-7 px-2.5 text-[11px]"
-                        disabled={busy}
-                        onClick={() => {
-                          setConfirm(null)
-                          void removeOne(task.id)
-                        }}
-                        data-testid="cache-confirm-inline-yes"
-                      >
-                        {t('tg.cacheDeleteConfirmYes')}
-                      </Button>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="h-7 px-2.5 text-[11px]"
-                        onClick={() => setConfirm(null)}
-                        data-testid="cache-confirm-inline-no"
-                      >
-                        {t('tg.cacheDeleteConfirmNo')}
-                      </Button>
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            )
-          })}
+          {visible.map((task) => (
+            <IngestTaskRow
+              key={task.id}
+              task={task}
+              title={titleOf(task.chatId) ?? `频道 ${task.chatId}`}
+              busy={busy}
+              confirming={confirm?.kind === 'one' && confirm.id === task.id}
+              missing={
+                task.messageIds[0] != null &&
+                missRefs.has(`${task.chatId}:${task.messageIds[0]}`)
+              }
+              onGoLibrary={onGoLibrary}
+              onRetry={onRetry}
+              onCancel={onCancelTask}
+              onAskDelete={onAskDelete}
+              onDelete={onDelete}
+              onDismissDelete={onDismissDelete}
+            />
+          ))}
           {!loading && visible.length === 0 ? (
             <div className="flex h-24 items-center justify-center text-xs text-fg-muted">
               {tasks.length === 0 ? t('tg.cacheTaskHint') : t('tg.cacheNoTasks')}
             </div>
           ) : null}
         </div>
+
+        {/* 已取消：收进「更多」折叠。它是「用户自己叫停」的历史，既不是进度也不是
+            失败，摆在主视图里只会稀释「还有多少没入库」这个真问题。 */}
+        {cancelled.length > 0 ? (
+          <div className="mt-2 shrink-0 border-t border-border-subtle/60 pt-2">
+            <button
+              type="button"
+              onClick={() => setCancelledOpen((o) => !o)}
+              aria-expanded={cancelledOpen}
+              className="flex items-center gap-1 rounded px-1 py-0.5 text-[11px] text-fg-mid hover:bg-surface-2"
+              data-testid="cache-more-toggle"
+            >
+              {cancelledOpen ? (
+                <ChevronDown className="h-3.5 w-3.5" />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5" />
+              )}
+              {t('tg.ingestStatusCancelled')} · {cancelled.length}
+            </button>
+            {cancelledOpen ? (
+              <div className="mt-2 max-h-40 space-y-2 overflow-y-auto">
+                {cancelled.map((task) => (
+                  <IngestTaskRow
+                    key={task.id}
+                    task={task}
+                    title={titleOf(task.chatId) ?? `频道 ${task.chatId}`}
+                    busy={busy}
+                    confirming={confirm?.kind === 'one' && confirm.id === task.id}
+                    missing={false}
+                    onGoLibrary={onGoLibrary}
+                    onRetry={onRetry}
+                    onCancel={onCancelTask}
+                    onAskDelete={onAskDelete}
+                    onDelete={onDelete}
+                    onDismissDelete={onDismissDelete}
+                  />
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
           </>
         ) : (
-          <CacheBytesPanel
-            // 频道标题：条目明细只带 chatId（数字），不给标题就只能显示 `#-1002533442302`。
-            chatTitleOf={titleOf}
-            onChanged={() => {
-              // 字节清掉后宿主读数会变（占用/文件数），必须重拉；任务记录不受影响但一起拉也就一次请求。
-              sigRef.current = ''
-              void load()
-              onTasksChanged?.()
-            }}
-          />
+          <div className="mt-3 flex min-h-0 flex-1 flex-col">
+            {/* 回收临时文件（原「缓存字节」）：字节**必须**能回收，只是读起来应当是
+                「回收入库准备物的临时文件」，而不是「管理缓存资产」。 */}
+            <div className="shrink-0 rounded-md border border-border-subtle/70 bg-surface-2/25 px-2.5 py-2">
+              <p className="text-[12px] font-medium text-fg-strong">
+                {t('tg.ingestCleanupSection')}
+              </p>
+              <p className="mt-0.5 text-[11px] leading-relaxed text-fg-muted">
+                {t('tg.ingestCleanupHint')}
+              </p>
+            </div>
+            <CacheBytesPanel
+              // 频道标题：条目明细只带 chatId（数字），不给标题就只能显示 `#-1002533442302`。
+              chatTitleOf={titleOf}
+              onChanged={() => {
+                // 字节回收后宿主读数会变（占用/文件数），必须重拉；任务记录不受影响但一起拉也就一次请求。
+                sigRef.current = ''
+                void load()
+                onTasksChanged?.()
+              }}
+            />
+          </div>
         )}
       </div>
     </div>
