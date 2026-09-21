@@ -630,14 +630,17 @@ async fn local_file(
 }
 
 /// 下载目录当前生效值：DB 设置 > env/默认配置。
+/// A leading `~` from either source is expanded (BUG-071).
 async fn effective_download_dir(st: &AppState) -> String {
-    st.store
+    let raw = st
+        .store
         .get_setting("download_dir")
         .await
         .ok()
         .flatten()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| st.config.download_dir.to_string_lossy().into_owned())
+        .unwrap_or_else(|| st.config.download_dir.to_string_lossy().into_owned());
+    orig_core::paths::expand_tilde(&raw).to_string_lossy().into_owned()
 }
 
 #[derive(Deserialize)]
@@ -661,6 +664,9 @@ async fn put_config(
     if dir.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "downloadDir is empty"));
     }
+    // Expand a user-typed leading `~` *before* creating the directory and
+    // persisting it, otherwise Windows would materialise `<CWD>/~/...` (BUG-071).
+    let dir = orig_core::paths::expand_tilde(&dir).to_string_lossy().into_owned();
     // 预创建校验：目录不可创建（权限/非法字符）时拒绝保存。
     tokio::fs::create_dir_all(&dir)
         .await
@@ -701,6 +707,7 @@ async fn download(
 // ---- 缓存任务：服务端持有任务态，与 HTTP 请求解耦 ----
 
 /// 解析落盘目录：请求显式 dir > DB 设置（前端可改） > env/默认配置。
+/// A leading `~` from any source is expanded (BUG-071).
 async fn resolve_cache_dir(st: &AppState, req_dir: Option<String>) -> String {
     let db_dir = st
         .store
@@ -709,10 +716,11 @@ async fn resolve_cache_dir(st: &AppState, req_dir: Option<String>) -> String {
         .ok()
         .flatten()
         .filter(|s| !s.trim().is_empty());
-    req_dir
+    let raw = req_dir
         .filter(|s| !s.is_empty())
         .or(db_dir)
-        .unwrap_or_else(|| st.config.download_dir.to_string_lossy().into_owned())
+        .unwrap_or_else(|| st.config.download_dir.to_string_lossy().into_owned());
+    orig_core::paths::expand_tilde(&raw).to_string_lossy().into_owned()
 }
 
 /// 已缓存且落盘文件仍在时的路径（幂等跳过依据）。

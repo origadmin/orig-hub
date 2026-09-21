@@ -43,12 +43,19 @@ error(omitempty),eta,connections,added_at,time_taken,avg_speed`。
 ## 下载目录三层解析（既定标准）
 
 ```
-请求 output_path  →  配置 download_dir  →  平台默认目录（~/Downloads）
+请求 output_path  →  配置 download_dir  →  平台默认目录（OS 已知文件夹）
 ```
 
 - 配置层：`SURGE_DOWNLOAD_DIR` 环境变量 或 `download-engine.toml` 的 `download_dir`。
 - 前端「默认下载路径」设置落到该配置；「首次是默认、之后按配置」= 配置持久化后每次读它，
   仅配置为空才用平台默认。
+- **平台默认目录走 OS 已知文件夹 API**（`orig-core::paths::default_download_dir`）：Windows 用
+  `SHGetKnownFolderPath(FOLDERID_Downloads)`（尊重用户把「下载」重定向到其它盘），
+  macOS/Linux 用标准目录；**不再手拼 `$HOME/Downloads`**（MSYS/Git Bash 的 `$HOME` 是
+  Unix 风格路径，Windows 打不开）。取不到时依次降级到 `<home>/Downloads`、当前目录，**每步打日志**。
+- **前导 `~` 会被显式展开**：`~/Downloads`（含 `~\Downloads`）按真实主目录展开成绝对路径；
+  配置、环境变量、请求 `output_path`、orig-tg 运行期设置均统一处理，字面 `~` 绝不进文件系统
+  （否则 Windows 会建出 `<CWD>/~/Downloads`）。`~user/...` 或路径中间的 `~` 不展开。
 - 仅当三者皆空才落当前目录（极端兜底）。
 - **`output_path` / `download_dir` 均为目录**；最终落盘路径 = `目录 / URL 派生文件名`
   （与 orig-hub `OutputDir + UrlFilename` 完全一致）。URL 派生文件名取 `path.rsplit('/')`
@@ -62,7 +69,7 @@ error(omitempty),eta,connections,added_at,time_taken,avg_speed`。
 cd download-engine
 cargo build                              # 国内 rsproxy 镜像，免翻墙
 
-# 运行（守护进程，监听 9876）
+# 运行（守护进程，监听 9876）；~ 会被展开为真实主目录
 SURGE_DOWNLOAD_DIR=~/Downloads PORT=9876 cargo run -p orig-daemon
 
 # 鉴权（可选）

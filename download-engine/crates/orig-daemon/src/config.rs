@@ -4,8 +4,9 @@
 //!   1. 环境变量（优先，便于容器/CI 覆盖）
 //!   2. `download-engine.toml` 简单 `key = "value"` 行 + `[classify]` 段
 //!
-//! 下载目录三层解析见 [`resolve_output`]：
-//!   请求 output_path → 配置 download_dir → 平台默认目录（~/Downloads）
+//! Download directory three-layer resolution, see [`resolve_output`]:
+//!   request output_path → config download_dir → platform default directory
+//!   (OS known folder; never a literal `~/Downloads`, see BUG-071)
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -188,7 +189,9 @@ impl Config {
 
         if let Ok(d) = std::env::var("SURGE_DOWNLOAD_DIR") {
             if !d.is_empty() {
-                cfg.download_dir = Some(PathBuf::from(d));
+                // Expand a user-typed leading `~` up front so no later consumer
+                // ever sees a literal tilde (BUG-071).
+                cfg.download_dir = Some(orig_core::paths::expand_tilde(&d));
             }
         }
         if let Ok(m) = std::env::var("SURGE_MAX_CONNECTIONS") {
@@ -213,7 +216,11 @@ impl Config {
             // 顶层键值
             for (k, v) in &parser.top {
                 match k.as_str() {
-                    "download_dir" if !v.is_empty() => cfg.download_dir = Some(PathBuf::from(v)),
+                    "download_dir" if !v.is_empty() => {
+                        // Legacy configs may hold `~/Downloads`; expand it here so
+                        // an upgrade never lands in `<CWD>/~/Downloads` (BUG-071).
+                        cfg.download_dir = Some(orig_core::paths::expand_tilde(v))
+                    }
                     "max_connections" => {
                         if let Ok(n) = v.parse() { cfg.max_connections = n; }
                     }
@@ -427,39 +434,43 @@ impl Config {
     }
 }
 
-/// 平台默认下载目录（对齐 orig-hub：~/Downloads）。
+/// Platform default download directory.
+///
+/// Delegates to [`orig_core::paths::default_download_dir`]: the OS known-folder
+/// API (Windows `SHGetKnownFolderPath(FOLDERID_Downloads)`), so a user-relocated
+/// Downloads folder is honoured and `$HOME` is never probed by hand (BUG-071).
 pub fn default_download_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join("Downloads");
-    }
-    if let Ok(prof) = std::env::var("USERPROFILE") {
-        return PathBuf::from(prof).join("Downloads");
-    }
-    PathBuf::from(".")
+    orig_core::paths::default_download_dir()
 }
 
-/// 三层解析：请求 dir → 配置 download_dir → 平台默认目录（~/Downloads）。
-/// 仅当三者皆空才落到当前目录（极端兜底）。
+/// Three-layer resolution: request dir → config download_dir → platform default
+/// directory. A leading `~` in either the request or the config is expanded to
+/// the real home directory, so a literal tilde never reaches the filesystem.
+/// Only when all three are empty does it fall back to the current directory.
 pub fn resolve_output(req_dir: Option<&str>, cfg: &Config, filename: &str) -> PathBuf {
     let base = req_dir
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| cfg.download_dir.clone())
+        .map(orig_core::paths::expand_tilde)
+        .or_else(|| cfg.download_dir.as_deref().map(orig_core::paths::expand_tilde_path))
         .unwrap_or_else(default_download_dir);
     base.join(filename)
 }
 
-/// 三层解析 + 自动分类（R3）：
-/// - 请求显式指定 output_path → 不分类（尊重用户选择）
-/// - `enabled` 为 true（请求级 classify 或配置开启）→ 在基础目录下按扩展名归档子目录
-/// - 否则 → 与 [`resolve_output`] 完全一致（回归）
+/// Three-layer resolution + auto classification (R3):
+/// - request specifies output_path explicitly → no classification (respect user choice)
+/// - `enabled` (request-level classify or config enabled) → archive into a
+///   sub-directory derived from the extension
+/// - otherwise → identical to [`resolve_output`] (regression)
+///
+/// A leading `~` in the config download_dir is expanded just like in
+/// [`resolve_output`] (BUG-071).
 pub fn resolve_output_classified(
     req_dir: Option<&str>,
     cfg: &Config,
     filename: &str,
     enabled: bool,
 ) -> PathBuf {
-    // 用户显式指定目录：不分类
+    // user explicitly picked a directory: do not classify
     if req_dir.is_some_and(|s| !s.is_empty()) {
         return resolve_output(req_dir, cfg, filename);
     }
@@ -468,7 +479,8 @@ pub fn resolve_output_classified(
     }
     let base = cfg
         .download_dir
-        .clone()
+        .as_deref()
+        .map(orig_core::paths::expand_tilde_path)
         .unwrap_or_else(default_download_dir);
     let category = cfg.classify.classify(filename);
     base.join(category).join(filename)
@@ -576,5 +588,83 @@ mod tests {
         assert!(cfg2.classify.enabled);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BUG-071 migration: a legacy config that stored `~/Downloads` must resolve
+    /// to a real absolute path after upgrading — never `<CWD>/~/Downloads`.
+    #[test]
+    fn legacy_tilde_config_migrates_to_absolute_path() {
+        use std::io::Write;
+
+        let Some(home) = orig_core::paths::home_dir() else {
+            return; // no home directory here: expansion is impossible by definition
+        };
+
+        let dir = std::env::temp_dir().join(format!("orig-daemon-bug071-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("download-engine.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Old-style config, exactly what a pre-fix user would have on disk.
+        f.write_all(b"download_dir = \"~/Downloads\"\nport = 9876\n").unwrap();
+        drop(f);
+
+        let cfg = Config::load_from(path.to_str().unwrap());
+        let stored = cfg.download_dir.clone().expect("download_dir must be parsed");
+        assert!(
+            !stored.to_string_lossy().contains('~'),
+            "literal tilde must be expanded, got {}",
+            stored.display()
+        );
+        assert_eq!(stored, home.join("Downloads"), "must expand to the real home dir");
+        assert!(stored.is_absolute(), "expanded dir must be absolute: {}", stored.display());
+
+        // The full resolution path must not panic and must stay tilde-free.
+        let out = resolve_output(None, &cfg, "a.bin");
+        assert_eq!(out, home.join("Downloads").join("a.bin"));
+        assert!(
+            !out.to_string_lossy().contains('~'),
+            "resolved path must not contain a literal tilde: {}",
+            out.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A request-supplied `~/...` directory must be expanded too (BUG-071).
+    #[test]
+    fn request_tilde_dir_is_expanded() {
+        let Some(home) = orig_core::paths::home_dir() else {
+            return;
+        };
+        let cfg = Config::default();
+        let p = resolve_output(Some("~/my-dl"), &cfg, "f.bin");
+        assert_eq!(p, home.join("my-dl").join("f.bin"));
+        assert!(!p.to_string_lossy().contains('~'));
+    }
+
+    /// Programmatic configs (e.g. built by tests or sidecars) may still carry a
+    /// tilde; the classified path must expand it as well (BUG-071).
+    #[test]
+    fn classified_tilde_config_is_expanded() {
+        let Some(home) = orig_core::paths::home_dir() else {
+            return;
+        };
+        let mut c = ClassifyConfig::default();
+        c.enabled = true;
+        let cfg = Config {
+            download_dir: Some(PathBuf::from("~/Downloads")),
+            classify: c,
+            ..Config::default()
+        };
+        let p = resolve_output_classified(None, &cfg, "a.zip", true);
+        assert_eq!(p, home.join("Downloads").join("Archives").join("a.zip"));
+    }
+
+    /// The platform default directory must be a real path, never a literal tilde.
+    #[test]
+    fn default_download_dir_has_no_literal_tilde() {
+        let d = default_download_dir();
+        assert!(!d.as_os_str().is_empty());
+        assert!(!d.to_string_lossy().contains('~'), "got {}", d.display());
     }
 }

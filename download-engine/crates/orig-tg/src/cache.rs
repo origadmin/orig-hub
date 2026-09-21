@@ -52,6 +52,9 @@ pub fn router() -> Router<Arc<AppState>> {
 }
 
 /// 生效的下载目录（运行期设置覆盖 env 默认值）——缓存字节的**唯一可删区**。
+///
+/// A leading `~` from the stored setting (user-typed) is expanded here, so the
+/// literal tilde never reaches the filesystem (BUG-071).
 pub async fn download_dir(st: &AppState) -> PathBuf {
     let raw = st
         .store
@@ -61,7 +64,7 @@ pub async fn download_dir(st: &AppState) -> PathBuf {
         .flatten()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| st.config.download_dir.to_string_lossy().into_owned());
-    PathBuf::from(raw)
+    orig_core::paths::expand_tilde(&raw)
 }
 
 /// 路径是否位于下载目录内（决定「能不能删」）。

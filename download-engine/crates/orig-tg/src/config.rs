@@ -96,7 +96,8 @@ impl Config {
         }
         if let Ok(v) = std::env::var("ORIG_TG_DOWNLOAD_DIR") {
             if !v.is_empty() {
-                cfg.download_dir = PathBuf::from(v);
+                // Expand a leading `~` typed by the user (BUG-071).
+                cfg.download_dir = orig_core::paths::expand_tilde(&v);
             }
         }
         if let Ok(v) = std::env::var("ORIG_TG_PROXY") {
@@ -116,6 +117,24 @@ mod tests {
     fn defaults_listen_independently_from_daemon() {
         assert_eq!(Config::default().port, 9877);
         assert_eq!(Config::default().bind, "127.0.0.1");
+    }
+
+    /// BUG-071 migration: a legacy `ORIG_TG_DOWNLOAD_DIR=~/Downloads` must be
+    /// expanded to a real absolute path, never kept as a literal tilde.
+    #[test]
+    fn legacy_tilde_download_dir_env_is_expanded() {
+        let Some(home) = orig_core::paths::home_dir() else {
+            return; // no home directory here: expansion is impossible by definition
+        };
+        unsafe {
+            std::env::set_var("ORIG_TG_DOWNLOAD_DIR", "~/Downloads");
+        }
+        let cfg = Config::load();
+        unsafe {
+            std::env::remove_var("ORIG_TG_DOWNLOAD_DIR");
+        }
+        assert_eq!(cfg.download_dir, home.join("Downloads"));
+        assert!(!cfg.download_dir.to_string_lossy().contains('~'));
     }
 
     #[test]
