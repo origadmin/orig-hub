@@ -134,6 +134,36 @@ pub struct GrammersClient {
 }
 
 impl GrammersClient {
+    /// RPC 失败归类的**无 self 形式**，供 `Self` 尚未构造完的调用点使用。
+    fn classify_rpc_err(link_dead: bool, e: impl std::fmt::Display) -> ClientError {
+        if link_dead {
+            ClientError::Unavailable(format!(
+                "MTProto link is down (sender runner exited); restart orig-tg to recover: {e}"
+            ))
+        } else {
+            ClientError::Other(e.to_string())
+        }
+    }
+
+    /// RPC 失败的**源头归类**（BUG-110）。
+    ///
+    /// 链路已断时的失败**不是客户端错误**：请求本身合法，死的是上游依赖
+    /// （MTProto 发信任务）。此前一律包成 `ClientError::Other`，而
+    /// `From<ClientError> for ApiError` 把 `Other` 映射成 **400 Bad Request + 原文**，
+    /// 三重错：
+    ///
+    /// 1. **状态码撒谎**：依赖故障被报成 4xx「你的请求有问题」，前端据此
+    ///    既不重试、也不提示「稍后再试」，故障被读成用户操作失误；
+    /// 2. **裸漏内部原文**：`request error: dropped (cancelled)` 直接进 UI；
+    /// 3. **端点级补丁必然漏**：BUG-106 给 `folders` / `thumb` / `cache_one`
+    ///    各写了一份降级与 hint，但只要某条路径走 `From`（如 `/api/tg/file`
+    ///    的 `Err(e) => Err(e.into())`），补丁就失效。
+    ///
+    /// 在**源头**归类正确，全部端点自动正确 —— 不依赖每个 handler 都记得降级。
+    fn rpc_err(&self, e: impl std::fmt::Display) -> ClientError {
+        Self::classify_rpc_err(!self.link_alive(), e)
+    }
+
     /// 连接 Telegram 并建立/恢复 MTProto 会话。
     pub async fn connect(cfg: &Config) -> Result<Self, ClientError> {
         let (api_id, api_hash) = match (cfg.api_id, cfg.api_hash.as_ref()) {
@@ -204,7 +234,8 @@ impl GrammersClient {
         if inner
             .is_authorized()
             .await
-            .map_err(|e| ClientError::Other(e.to_string()))?
+            // `Self` 尚未构造完：用无 self 形式（此时 runner 刚起来，链路视为活）。
+            .map_err(|e| Self::classify_rpc_err(sender_dead.load(Ordering::SeqCst), e))?
         {
             pending.phase = LoginPhase::Authorized;
             if let Ok(user) = inner.get_me().await {
@@ -236,7 +267,7 @@ impl GrammersClient {
         while let Some(dialog) = iter
             .next()
             .await
-            .map_err(|e| ClientError::Other(e.to_string()))?
+            .map_err(|e| self.rpc_err(e))?
         {
             let id = dialog.peer().id().bot_api_dialog_id().unwrap_or(0);
             let pref = dialog.peer_ref();
@@ -288,7 +319,7 @@ impl Client for GrammersClient {
             Err(SignInError::SignUpRequired) => {
                 Err(ClientError::Other("sign up required in official client first".into()))
             }
-            Err(e) => Err(ClientError::Other(e.to_string())),
+            Err(e) => Err(self.rpc_err(e)),
         }
     }
 
@@ -305,7 +336,7 @@ impl Client for GrammersClient {
                 Ok(LoginPhase::Authorized)
             }
             Err(SignInError::InvalidPassword(_)) => Err(ClientError::InvalidPassword),
-            Err(e) => Err(ClientError::Other(e.to_string())),
+            Err(e) => Err(self.rpc_err(e)),
         }
     }
 
@@ -327,7 +358,7 @@ impl Client for GrammersClient {
         while let Some(dialog) = iter
             .next()
             .await
-            .map_err(|e| ClientError::Other(e.to_string()))?
+            .map_err(|e| self.rpc_err(e))?
         {
             // 枚举时顺便填充 PeerRef 缓存（媒体/消息接口后续直接命中）。
             let id = dialog.peer().id().bot_api_dialog_id().unwrap_or(0);
@@ -343,7 +374,7 @@ impl Client for GrammersClient {
             .inner
             .invoke(&tl::functions::messages::GetDialogFilters {})
             .await
-            .map_err(|e| ClientError::Other(e.to_string()))?;
+            .map_err(|e| self.rpc_err(e))?;
         let filters = match result {
             tl::enums::messages::DialogFilters::Filters(f) => f.filters,
         };
@@ -423,7 +454,7 @@ impl Client for GrammersClient {
             let Some(m) = iter
                 .next()
                 .await
-                .map_err(|e| ClientError::Other(e.to_string()))?
+                .map_err(|e| self.rpc_err(e))?
             else {
                 break; // 无更多消息
             };
@@ -489,7 +520,7 @@ impl Client for GrammersClient {
             .inner
             .get_messages_by_id(peer, &[message_id as i32])
             .await
-            .map_err(|e| ClientError::Other(e.to_string()))?
+            .map_err(|e| self.rpc_err(e))?
             .into_iter()
             .find_map(|m| m);
         let message = found.ok_or(ClientError::MediaNotFound)?;
@@ -569,7 +600,7 @@ impl Client for GrammersClient {
             .inner
             .get_messages_by_id(peer, &[message_id as i32])
             .await
-            .map_err(|e| ClientError::Other(e.to_string()))?
+            .map_err(|e| self.rpc_err(e))?
             .into_iter()
             .find_map(|m| m);
         let Some(message) = found else {
@@ -625,7 +656,7 @@ impl Client for GrammersClient {
                     .inner
                     .get_messages_by_id(peer, &[message_id as i32])
                     .await
-                    .map_err(|e| ClientError::Other(e.to_string()))?
+                    .map_err(|e| self.rpc_err(e))?
                     .into_iter()
                     .find_map(|m| m);
                 let message = found.ok_or(ClientError::MediaNotFound)?;
@@ -725,7 +756,7 @@ impl GrammersClient {
             .inner
             .get_messages_by_id(peer, &[message_id as i32])
             .await
-            .map_err(|e| ClientError::Other(e.to_string()))?
+            .map_err(|e| self.rpc_err(e))?
             .into_iter()
             .find_map(|m| m);
         let Some(message) = found else { return Ok(None) };
@@ -773,7 +804,7 @@ impl GrammersClient {
             let Some(chunk) = iter
                 .next()
                 .await
-                .map_err(|e| ClientError::Other(e.to_string()))?
+                .map_err(|e| self.rpc_err(e))?
             else {
                 break;
             };
@@ -1320,6 +1351,49 @@ mod tests {
         assert!(
             dead.load(Ordering::SeqCst),
             "runner 正常结束也必须置死亡标志 —— 它一结束后续 RPC 就恒失败"
+        );
+    }
+
+    /// BUG-110：链路已断时的 RPC 失败必须归为「上游依赖不可用」，
+    /// 不能落进 `Other` 兜底桶 —— 后者会被 `From<ClientError>` 映射成 400。
+    #[test]
+    fn rpc_failure_is_unavailable_when_link_is_down() {
+        let e = GrammersClient::classify_rpc_err(true, "request error: dropped (cancelled)");
+        assert!(
+            matches!(e, ClientError::Unavailable(_)),
+            "链路已断应归为 Unavailable，实际: {}",
+            e
+        );
+        assert!(
+            e.to_string().contains("MTProto link is down"),
+            "原因必须可行动（含链路已断与恢复指引），实际: {e}"
+        );
+    }
+
+    /// 反向证伪：链路活着时**不能**误升为 503，否则普通 RPC 失败会被当成依赖故障，
+    /// 前端会据此提示「重启服务」——把小错说成大修。
+    #[test]
+    fn rpc_failure_stays_other_when_link_is_alive() {
+        let e = GrammersClient::classify_rpc_err(false, "some ordinary rpc error");
+        assert!(
+            matches!(e, ClientError::Other(_)),
+            "链路活着时应仍为 Other，实际: {e}"
+        );
+    }
+
+    /// 端到端锁住状态码：整条链路走完（ClientError -> ApiError -> HTTP）必须是 503。
+    ///
+    /// 只测 `classify_rpc_err` 的变体还不够 —— 变体对了但 `From` 映射写错（或将来被改）
+    /// 仍会回到 400。这条断言的是**最终对用户可见的那个数字**。
+    #[test]
+    fn link_down_rpc_failure_is_503_not_400() {
+        use axum::response::IntoResponse;
+        let e = GrammersClient::classify_rpc_err(true, "request error: dropped (cancelled)");
+        let res: axum::response::Response = crate::routes::ApiError::from(e).into_response();
+        assert_eq!(
+            res.status(),
+            503,
+            "链路已断是依赖故障，绝不能报成 4xx（会被读成用户操作失误）"
         );
     }
 }
