@@ -27,6 +27,7 @@ proxy-test-file.bin
 coverage/
 verify_shots/
 docs/preview/
+docs/prototypes/
 download-engine/acceptance-evidence.txt
 
 # ============ 日志 ============
