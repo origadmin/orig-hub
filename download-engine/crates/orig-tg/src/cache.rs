@@ -150,13 +150,27 @@ async fn clear_item(
         ));
     }
 
-    let _ = std::fs::remove_file(&path);
+    // BUG-109：删文件失败**不能**被吞掉再报 `cleared: true` —— 那是把失败说成成功。
+    std::fs::remove_file(&path).map_err(|e| {
+        st.push_log(&format!("/api/cache/items/{id}: remove_file failed: {e}"));
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to delete cache file: {e}"),
+        )
+    })?;
     st.store
         .set_item_file_path(id, None)
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     // TG 来源：字节没了要同步复位 downloaded，否则「已缓存」状态说谎。
-    reset_tg_flag(&st, &item.source, &item.ref_key).await;
+    // 复位失败同样如实报错（否则条目会在下次 upsert 时复活 —— BUG-029）。
+    if !reset_tg_flag(&st, &item.source, &item.ref_key).await {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cache bytes cleared but the downloaded flag could not be reset; \
+             the entry may reappear on the next sync",
+        ));
+    }
 
     st.push_log(&format!("/api/cache/items/{id} cleared"));
     Ok(Json(json!({"ok": true, "cleared": true})))
@@ -284,7 +298,10 @@ async fn purge_item(st: &Arc<AppState>, dir: &Path, it: &CachedBytesDetail) -> P
             it.id
         ));
     }
-    reset_tg_flag(st, &it.source, &it.ref_key).await;
+    // TG 来源的 downloaded 复位失败同样算失败：字节没了但标记还在，条目会「复活」。
+    if !reset_tg_flag(st, &it.source, &it.ref_key).await {
+        failed = 1;
+    }
     if failed > 0 {
         return Purged {
             removed: 0,
@@ -649,12 +666,33 @@ pub async fn clear_preview(
 }
 
 /// 复位 TG 侧的 `downloaded` 标记（TG 来源条目专用；其它来源无此状态）。
-async fn reset_tg_flag(st: &Arc<AppState>, source: &str, ref_key: &str) {
+/// 复位 TG 来源的 `downloaded` 标记。**返回是否真的复位成功**（BUG-109）。
+///
+/// 此前是 `let _ = ...clear_downloaded(...)` —— 失败被静默吞掉。这恰恰是 BUG-029 点名的
+/// 症状成因：清了字节但 `downloaded` 没复位，**下次缓存 upsert 会让条目「复活」**，
+/// 用户看到的就是「删不掉」。它比「文件没删掉」更隐蔽：磁盘上确实没了，
+/// 但界面仍显示已缓存。故调用方必须据此如实报错，不能假装成功。
+async fn reset_tg_flag(st: &Arc<AppState>, source: &str, ref_key: &str) -> bool {
     if source != "tg" {
-        return;
+        // 非 TG 来源本就没有 downloaded 标记需要复位。
+        return true;
     }
-    if let Some((chat, msg)) = parse_tg_ref(ref_key) {
-        let _ = st.store.clear_downloaded(chat, msg).await;
+    let Some((chat, msg)) = parse_tg_ref(ref_key) else {
+        // source 标着 tg 却解析不出 (chat, msg) —— 数据异常，留痕并如实报失败。
+        st.push_log(&format!(
+            "reset_tg_flag: cannot parse tg ref {ref_key:?}; downloaded flag left set"
+        ));
+        return false;
+    };
+    match st.store.clear_downloaded(chat, msg).await {
+        Ok(_) => true,
+        Err(e) => {
+            st.push_log(&format!(
+                "reset_tg_flag: clear_downloaded({chat},{msg}) failed: {e} \
+                 （字节已清但 downloaded 仍为 true → 条目可能复活）"
+            ));
+            false
+        }
     }
 }
 
