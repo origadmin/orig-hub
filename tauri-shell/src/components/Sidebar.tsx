@@ -244,9 +244,11 @@ export function Sidebar({
                 className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
               >
                 <span className="shrink-0">{FolderIcon}</span>
-                <span className="flex-1 truncate text-left">{t('nav.all')}</span>
+                {/* 单行原语（BUG-058）：名称 `min-w-0 truncate` 允许收缩并截断（全名留在 title），
+                    计数 `shrink-0 tabular-nums` 保证「名称被截断而不是计数被挤掉」。 */}
+                <span className="min-w-0 flex-1 truncate text-left">{t('nav.all')}</span>
                 {counts.total > 0 && (
-                  <span className="shrink-0 rounded-full bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-fg-soft">
+                  <span className="shrink-0 rounded-full bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-fg-soft">
                     {counts.total}
                   </span>
                 )}
@@ -285,7 +287,7 @@ export function Sidebar({
                         : 'text-fg-soft hover:bg-surface-2 hover:text-fg-mid',
                     )}
                   >
-                    <span className="flex-1 truncate text-left">{t(`category.${cat}`, undefined, cat)}</span>
+                    <span className="min-w-0 flex-1 truncate text-left">{t(`category.${cat}`, undefined, cat)}</span>
                   </button>
                 )
               })}
@@ -322,9 +324,11 @@ export function Sidebar({
               <span className="shrink-0">{item.icon}</span>
               {!collapsed && (
                 <>
-                  <span className="flex-1 text-left">{t(item.labelKey)}</span>
+                  {/* 单行原语（BUG-058）：名称 `min-w-0 truncate`（允许收缩 + 截断，全名留在 title），
+                      计数 `shrink-0 tabular-nums`（永不先被压掉、数字等宽不抖动）。 */}
+                  <span className="min-w-0 flex-1 truncate text-left">{t(item.labelKey)}</span>
                   {count > 0 && (
-                    <span className="rounded-full bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-fg-soft">
+                    <span className="shrink-0 rounded-full bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-fg-soft">
                       {count}
                     </span>
                   )}
