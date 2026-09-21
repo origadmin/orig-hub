@@ -18,7 +18,12 @@
  *      it really opens the viewer (by-ref hit) or says "not in library yet";
  *   4. reverse proof: the removed actions (select all / delete selected) and
  *      the removed "failed-cancelled" bucket are NOT on the page;
- *   5. the byte reclaim UI did not disappear -- it moved into the second tab.
+ *   5. the byte reclaim UI did not disappear -- it moved into the second tab;
+ *   6. reverse proof (de-dup): the "ingest pipeline" entry button exists exactly
+ *      ONCE and only in the top toolbar. It used to be duplicated in the channel
+ *      detail header; that copy was dropped. Counting is what makes this a real
+ *      guard -- asserting "the entry exists" would pass with 0, 1 or 2 copies,
+ *      so a regression that re-adds the duplicate would look like a success.
  *
  * Usage:
  *   node verify/verify_ingest_pipeline.cjs                 # 5180 + orig-tg 9877
@@ -247,6 +252,49 @@ async function main() {
       return 1
     }
     await check('tg.view.opened', () => true)
+
+    // ---- de-dup guard: the entry must exist exactly once, in the toolbar ----
+    // Taken before the dialog opens so the count reflects the panel itself.
+    //
+    // The duplicate copy used to live in the channel detail header, so the count
+    // is worthless unless that header is actually mounted: it appears only after
+    // a channel is auto-selected (monitored rows arrive over the wire). Waiting
+    // for it is what keeps this assertion from being vacuous -- measuring right
+    // after `tg-toolbar` shows up catches the pre-selection frame, where the
+    // duplicate is not in the DOM yet and a 2-copy regression still reads as 1.
+    const detailReady = await page
+      .waitForFunction(
+        () => Boolean(document.querySelector('header input[type="search"]')),
+        { timeout: WAIT_TIMEOUT_MS, intervalMs: 200 },
+      )
+      .then(() => true)
+      .catch(() => false)
+    const entrySnap = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button')).filter(
+        b => (b.textContent || '').trim() === '入库流水线',
+      )
+      return {
+        total: buttons.length,
+        tagged: buttons.filter(
+          b => b.getAttribute('data-testid') === 'tg-cache-manager-entry',
+        ).length,
+        inToolbar: buttons.filter(b => b.closest('[data-testid="tg-toolbar"]')).length,
+        inChannelHeader: buttons.filter(b => b.closest('header')).length,
+        channelDetailRendered: Boolean(document.querySelector('header input[type="search"]')),
+      }
+    })
+    // `total === 1` catches both directions: 0 = the toolbar copy was wrongly
+    // deleted, 2 = the channel-header duplicate came back. `detailReady` is part
+    // of the predicate on purpose: without the detail header mounted the count
+    // cannot see the regression site, so it must not pass silently.
+    await check('ingest.entry.single', () =>
+      detailReady &&
+      entrySnap.channelDetailRendered &&
+      entrySnap.total === 1 &&
+      entrySnap.tagged === 1 &&
+      entrySnap.inToolbar === 1 &&
+      entrySnap.inChannelHeader === 0,
+    `entry buttons=${JSON.stringify(entrySnap)} detailReady=${detailReady}`)
 
     await check('ingest.dialog.entry.clickable', () =>
       clickTestId(page, 'tg-cache-manager-entry'),

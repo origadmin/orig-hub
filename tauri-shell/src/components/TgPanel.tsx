@@ -1476,28 +1476,6 @@ export function TgPanel(
                 placeholder={t('tg.globalSearchPlaceholder')}
                 className="h-8 w-48 shrink-0 rounded-md border border-border-subtle bg-surface-2/60 px-3 text-[12px] text-fg-strong outline-none placeholder:text-muted focus:border-accent/60"
               />
-              <button
-                type="button"
-                onClick={() => setCacheManagerOpen(true)}
-                title={t('tg.cacheManager')}
-                className="flex h-7 shrink-0 items-center gap-1 rounded px-2 text-[11px] text-fg-muted hover:bg-surface-2 hover:text-fg-strong"
-              >
-                <svg
-                  className="h-3.5 w-3.5"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                  strokeWidth={1.5}
-                  aria-hidden="true"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    d="M20 7.5 12 12 4 7.5m8 4.5v9M4 7.5C4 5.015 7.582 3 12 3s8 2.015 8 4.5M4 7.5v9C4 18.985 7.582 21 12 21s8-2.015 8-4.5v-9"
-                  />
-                </svg>
-                {t('tg.cacheManager')}
-              </button>
               {selectedMonitored ? (
                 <Chip tone="success">{t('tg.monitoring')}</Chip>
               ) : (
