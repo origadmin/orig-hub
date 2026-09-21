@@ -7,6 +7,7 @@ import { useStore } from '../store/useStore'
 import { useTranslation } from '../i18n'
 import { classifyTgReason, logTgReason } from '../lib/tgReason'
 import { useTgRetry } from '../lib/tgRetry'
+import { resolveTgFeatureReady } from '../store/selectors'
 import { getTgSession, startTgLogin, submitTgCode, tgDiag, tgLogs } from '../api/tg'
 import type { TgDiag, TgSession } from '../types'
 
@@ -33,7 +34,7 @@ function normalizeE164(countryCode: string, national: string): string {
  */
 export function AccountsPanel() {
   const { t } = useTranslation()
-  const { accounts, setTgAccount, setError, refreshTgSession, tgAvailability, tgEnabled } = useStore()
+  const { accounts, setTgAccount, setError, refreshTgState, tgAvailability, tgEnabled } = useStore()
   const tg = accounts.tg
   /**
    * TG 依赖是否处于故障态（不可用/不可达）。
@@ -44,15 +45,14 @@ export function AccountsPanel() {
   const tgBroken = tgAvailability !== null && tgAvailability.status !== 'ok'
 
   /**
-   * 入口级门控（与 `MainLayout.tsx` 的 `tgFeatureReady` **同一语义**，BUG-094）：
-   * 开关关 OR orig-tg 进程不可达（unreachable） → 不渲染 TG 绑定卡。
+   * 入口级门控：判据唯一来源 `store/selectors.ts::resolveTgFeatureReady`（BUG-087 / BUG-097），
+   * 与 `MainLayout`（经 `tgReady` 传给 `Sidebar`）同读一处，不再各写一份。
    *
    * `unavailable`（进程活着、连不上 Telegram）**必须继续显示绑定卡**：
    * 那正是用户需要看到失败原因并重新配置（改代理 / 重登）的时刻，
    * 把入口一起藏掉，TG 面板里的出口就成了一条死路。
    */
-  const tgFeatureReady =
-    tgEnabled && (tgAvailability === null || tgAvailability.status !== 'unreachable')
+  const tgFeatureReady = resolveTgFeatureReady(tgEnabled, tgAvailability)
   /** 故障原因（分类降级后的 i18n 键，绝不直出后端原文 —— BUG-088） */
   const bannerReasonKey = classifyTgReason(
     tgAvailability !== null && tgAvailability.status === 'unavailable'
@@ -60,11 +60,12 @@ export function AccountsPanel() {
       : null,
   )
 
-  // 挂载时校准一次登录态：后端会话已 Authorized（含持久化加载的会话）则自动恢复为「已绑定」。
-  // refreshTgSession 幂等——只在绑定态或 phase 变化时才写 store；后端不可达时保持现状并静默。
+  // 挂载时刷新一次登录态（事件驱动，非轮询）：后端会话已 Authorized（含持久化加载的会话）
+  // 则自动恢复为「已绑定」。`refreshTgState` 等值短路——只在状态签名变化时才写 store；
+  // 失败由内部 `logTgReason` 分类留痕，**不再 `.catch(() => {})` 静默吞掉**（BUG-090 / BUG-097）。
   useEffect(() => {
-    refreshTgSession().catch(() => {})
-  }, [refreshTgSession])
+    void refreshTgState()
+  }, [refreshTgState])
 
   /**
    * 「重试连接」出口（BUG-094）：与 TgPanel 引导区共用 `useTgRetry`，

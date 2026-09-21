@@ -57,9 +57,11 @@ export async function retryTgConnection(): Promise<TgRetryOutcome> {
     logTgReason(e instanceof Error ? e.message : String(e), 'tg-retry')
     return 'failed'
   }
-  // 重建后拉一次最新状态：让用户立刻看到结果（启动/操作触发，非轮询）
+  // 重建后拉一次最新状态：让用户立刻看到结果（启动/操作触发，非轮询）。
+  // 用 `refreshTgState`（而非只刷会话）：ensure_tg 会重启 orig-tg，`tg_running`
+  // 也会变化，只刷会话会让设置页的「启动中/运行中」停在旧值（BUG-097）。
   try {
-    await useStore.getState().refreshTgSession()
+    await useStore.getState().refreshTgState()
   } catch (e) {
     logTgReason(e instanceof Error ? e.message : String(e), 'tg-retry-refresh')
   }

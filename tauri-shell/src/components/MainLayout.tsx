@@ -10,6 +10,7 @@ import { ErrorBoundary } from './ui/ErrorBoundary'
 import { TitleBar } from './TitleBar'
 import { ContextBar } from './ContextBar'
 import { useStore } from '../store/useStore'
+import { resolveTgFeatureReady } from '../store/selectors'
 import { CONN_DOT, CONN_LABEL, useConnState } from '../store/connState'
 import { useEvent } from '../hooks/useEvent'
 import { useTranslation } from '../i18n'
@@ -26,19 +27,18 @@ export function MainLayout() {
   const { t } = useTranslation()
   /** 连接态：与上下文栏、侧栏底部同源（BUG-087，唯一来源 `store/connState.ts`） */
   const connState = useConnState()
-  const { downloads, init, setDaemon, setDaemonAlive, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, viewer, setViewerIndex, closeViewer, tgEnabled, tgAvailability, refreshTgSession } = useStore()
+  const { downloads, init, setDaemon, setDaemonAlive, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, viewer, setViewerIndex, closeViewer, tgEnabled, tgAvailability, refreshTgState, probeTg } = useStore()
 
-  /** TG 入口级门控（用户裁定：常规 TG 开关控制整个 TG 内容）：
+  /**
+   * TG 入口级门控（用户裁定：常规 TG 开关控制整个 TG 内容）：
    *  开关关 OR orig-tg 进程不可达 → 侧栏 TG 导航整体隐藏；
    *  面板级故障卡只作保底回退。`tgAvailability === null` 为探测未返回的瞬态，
    *  按 ready 处理避免首帧闪烁（探测毫秒级，init() 挂载即触发）。
    *
-   *  **「服务可用」= orig-tg 进程可达**（BUG-094）：只有 `unreachable`（连进程都
-   *  够不到）才算服务不在；`unavailable`（进程活着、连不上 Telegram）恰恰是最需要
-   *  让用户进来修的场景（改代理 / 重新登录），把它判成「功能不存在」而隐藏入口，
-   *  就等于把唯一的修复入口一起藏掉。 */
-  const tgFeatureReady =
-    tgEnabled && (tgAvailability === null || tgAvailability.status !== 'unreachable')
+   *  判据**唯一来源**是 `store/selectors.ts::resolveTgFeatureReady`（BUG-087 / BUG-097）：
+   *  Sidebar 经 `tgReady` prop、AccountsPanel 直接调用，都读同一处，不再各写一份。
+   */
+  const tgFeatureReady = resolveTgFeatureReady(tgEnabled, tgAvailability)
 
   useEffect(() => {
     init()
@@ -80,28 +80,16 @@ export function MainLayout() {
     if (!tgEnabled || serviceDown) setView('all')
   }, [tgEnabled, tgAvailability, view])
 
-  // TG 开关变化时重探测可用性：开启侧 daemon 拉起 orig-tg 需要时间，最多重试 5 次；
-  // 关闭侧探一次即可（必为不可达，TG 入口随之摘除）。
+  // TG 开关变化 / 启动期重探测（BUG-097）：退避探测已抽成 store 的 `probeTg` 复用 ——
+  // 开启侧 daemon 拉起 orig-tg 需要时间，最多重试 5 次、就绪即停；关闭侧探一次即可
+  // （必为不可达，TG 入口随之摘除）。这是**有界探测**，不是常驻轮询。
   useEffect(() => {
     if (!tgEnabled) {
-      void refreshTgSession()
+      void refreshTgState()
       return
     }
-    let attempts = 0
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const probe = () => {
-      void refreshTgSession().then(() => {
-        const st = useStore.getState().tgAvailability
-        if ((st === null || st.status !== 'ok') && ++attempts < 5) {
-          timer = setTimeout(probe, 1500)
-        }
-      })
-    }
-    probe()
-    return () => {
-      if (timer) clearTimeout(timer)
-    }
-  }, [tgEnabled, refreshTgSession])
+    return probeTg()
+  }, [tgEnabled, refreshTgState, probeTg])
 
   // 全局错误 toast：按钮/操作失败时的用户可见反馈（自动消失）
   useEffect(() => {

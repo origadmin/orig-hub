@@ -73,3 +73,20 @@ export const selectConnected = (s: RootState): boolean => s.connected
 
 /** daemon 进程是否存活（启动时写一次，非实时；只作三态灯的降级判据） */
 export const selectDaemonAlive = (s: RootState): boolean => s.daemon?.alive === true
+
+/**
+ * TG 入口级门控的**单一判据**（BUG-094 / BUG-097）。
+ *
+ * 常规开关开 且 orig-tg 进程可达即显示入口；`unavailable`（进程活着、连不上
+ * Telegram）仍算可用 —— 那正是用户需要进去修的状态（改代理 / 重新登录），
+ * 藏掉入口等于切断唯一的修复路径。`null` = 探测未返回的瞬态，按可用处理避免首帧闪烁。
+ *
+ * `MainLayout`（经 `tgReady` 传给 `Sidebar`）与 `AccountsPanel` 必须**同读此处**，
+ * 不得各写一份（BUG-087 的教训：同语义多处各写各的，最后齐刷刷错成同一个值）。
+ */
+export function resolveTgFeatureReady(
+  tgEnabled: boolean,
+  tgAvailability: RootState['tgAvailability'],
+): boolean {
+  return tgEnabled && (tgAvailability === null || tgAvailability.status !== 'unreachable')
+}

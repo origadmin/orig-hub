@@ -20,10 +20,32 @@ import {
   subscribeEvents,
 } from '../api/daemon'
 import { getTgSession } from '../api/tg'
+import { logTgReason } from '../lib/tgReason'
 import type { AddDownloadRequest, ViewerItem } from '../types'
 
 const SETTINGS_KEY = 'orig-hub:settings'
 const ACCOUNTS_KEY = 'orig-hub:accounts'
+
+/** TG 有界退避探测：最多 5 次、每次间隔 1.5s（启动期，非轮询；BUG-097） */
+const TG_PROBE_MAX_ATTEMPTS = 5
+const TG_PROBE_DELAY_MS = 1500
+
+/**
+ * 进行中的 TG 探测链取消函数（同一时刻至多一条）。
+ *
+ * `init()` 的启动探测与 `MainLayout` 开关翻转的探测可能并存，若各起一条链会叠加请求；
+ * 这里做单例：重复触发只取消旧的、重启一条（BUG-097）。
+ */
+let tgProbeCancel: (() => void) | null = null
+
+/**
+ * TG 可用性签名（BUG-097 等值短路用）：
+ * 事件驱动刷新可能高频触发，签名未变就不 setState，避免无谓重渲染（AGENTS.md §5）。
+ */
+function tgAvailabilityKey(a: TgAvailability | null): string {
+  if (!a) return 'null'
+  return a.status === 'unavailable' ? `unavailable:${a.reason ?? ''}` : a.status
+}
 
 /**
  * 由「通信结果」反推的 daemon 状态（BUG-090）。
@@ -161,8 +183,20 @@ interface DownloadState {
   loadAccounts: () => void
   /** 更新某个账户的绑定态（持久化到 localStorage） */
   setTgAccount: (patch: Partial<TgAccount>) => void
-  /** 校准 TG 绑定态：向 orig-tg 查询会话 phase==='Authorized'（失败静默） */
+  /** 校准 TG 绑定态：向 orig-tg 查询会话 phase==='Authorized'（失败分类留痕，不吞错） */
   refreshTgSession: () => Promise<void>
+  /**
+   * 刷新 TG 状态（**BUG-097 的唯一刷新入口**）：`tgEnabled`/`tgRunning` 来自 daemon
+   * `/api/config`，`tgAvailability`/`bound` 来自 orig-tg `/api/tg/session`。
+   * 两者都等值短路，失败分类留痕。
+   */
+  refreshTgState: () => Promise<void>
+  /**
+   * 启动期 / 开关翻转后的**有界退避探测**（BUG-097 P0-2）：orig-tg 冷启动首次握手
+   * 约 4s，一次探测定终身会永久冻结状态。有界（≤5 次）、就绪即停、**不是轮询**。
+   * @returns cancel —— 组件卸载 / 依赖变化时清除未决定时器
+   */
+  probeTg: () => () => void
 
   init: () => Promise<void>
   refresh: () => Promise<void>
@@ -257,6 +291,9 @@ export const useStore = create<DownloadState>((set, get) => ({
       () => {
         set({ connected: true })
         get().setDaemonAlive(true)
+        // 顺带补一次 TG 状态刷新（BUG-097 的事件驱动信号源）：冷启动时 orig-tg
+        // 常晚于 SSE 就绪，这条信号让 TG 状态在服务起来后自动转正（等值短路，无重渲染）。
+        void get().refreshTgState()
       },
       () => set({ connected: false }),
     )
@@ -271,12 +308,18 @@ export const useStore = create<DownloadState>((set, get) => ({
         tgEnabled: cfg.tg_enabled,
         tgRunning: cfg.tg_running,
       })
-    } catch {
-      // 配置不可达时静默：菜单暂不列出分类
+    } catch (e) {
+      // 配置不可达：分类暂不列出（菜单退化）。失败**分类留痕**，不静默吞掉（BUG-097）；
+      // TG 状态由下方 refreshTgState + 有界退避探测补正。
+      logTgReason(e instanceof Error ? e.message : String(e), 'init-config')
     }
     // 4. 校准账号绑定态（orig-tg 会话）
     get().loadAccounts()
-    await get().refreshTgSession().catch(() => {})
+    // 一次性校准：失败由 refreshTgState 内部分类留痕，不再 `.catch(() => {})`（BUG-090 / BUG-097）
+    await get().refreshTgState()
+    // 启动期不能一次定终身（BUG-097）：orig-tg 冷启动首次握手实测约 4s，上面这一次
+    // 探测多半赶不上；交给有界退避探测，在服务就绪后自动转正（就绪即停，非轮询）。
+    get().probeTg()
   },
 
   refresh: async () => {
@@ -435,6 +478,13 @@ export const useStore = create<DownloadState>((set, get) => ({
     //     - unavailable：orig-tg 活着但连不上 Telegram（后端给出原因），保留上次 bound
     //     - unreachable：连 orig-tg 进程都够不到，保留上次 bound
     //   后两种都**不清空**登录态——因为「不知道」不等于「没登录」。
+    //
+    // 等值短路（BUG-097）：事件驱动刷新可能高频触发，签名未变不 setState。
+    const applyAvailability = (next: TgAvailability) => {
+      if (tgAvailabilityKey(get().tgAvailability) !== tgAvailabilityKey(next)) {
+        set({ tgAvailability: next })
+      }
+    }
     let session
     try {
       session = await getTgSession()
@@ -442,16 +492,16 @@ export const useStore = create<DownloadState>((set, get) => ({
       // 后台可用性探测失败（orig-tg 未运行 / 离线调试）：仅记录状态，不弹红色错误 toast——
       // 网页调试阶段 orig-tg 本就可能离线，弹「503 / fetch failed」会让调试环境变成错误环境。
       // 状态仍可见（侧栏据此隐藏 TG），故障并未被掩盖。
-      set({ tgAvailability: { status: 'unreachable' } })
+      // 失败**分类留痕**（原文只进日志），不静默吞掉（BUG-090 / BUG-097）。
+      logTgReason(e instanceof Error ? e.message : String(e), 'tg-session')
+      applyAvailability({ status: 'unreachable' })
       return
     }
     if (session?.available === false) {
-      set({
-        tgAvailability: { status: 'unavailable', reason: session.reason ?? null },
-      })
+      applyAvailability({ status: 'unavailable', reason: session.reason ?? null })
       return
     }
-    set({ tgAvailability: { status: 'ok' } })
+    applyAvailability({ status: 'ok' })
     const tg = get().accounts.tg
     if (!session?.phase) return
     const bound = session.phase === 'Authorized'
@@ -463,4 +513,77 @@ export const useStore = create<DownloadState>((set, get) => ({
       )
     }
   },
+
+  /**
+   * 刷新 TG 状态（**BUG-097 的唯一刷新入口**）。
+   *
+   * 两个状态各有真源，这里合并刷新：
+   *   - `tgEnabled` / `tgRunning` ← daemon `/api/config`（插件开关 + 子服务探活）；
+   *   - `tgAvailability` / `bound` ← orig-tg `/api/tg/session`（refreshTgSession）。
+   * 两者都**等值短路**：签名未变不 setState，避免事件驱动的重复刷新造成重渲染。
+   * 失败一律**分类留痕**（logTgReason），绝不 `.catch(() => {})` 静默吞掉（BUG-090 / BUG-097）。
+   */
+  refreshTgState: async () => {
+    try {
+      const cfg = await getConfig()
+      set((s) =>
+        s.tgEnabled === cfg.tg_enabled && s.tgRunning === cfg.tg_running
+          ? s
+          : { tgEnabled: cfg.tg_enabled, tgRunning: cfg.tg_running },
+      )
+    } catch (e) {
+      // daemon 不可达：运行态保持上次值（「不知道」不等于「停了」），原文只进日志
+      logTgReason(e instanceof Error ? e.message : String(e), 'tg-config')
+    }
+    await get().refreshTgSession()
+  },
+
+  /**
+   * 启动期 / 开关翻转后的**有界退避探测**（BUG-097 P0-2）。
+   *
+   * 从 MainLayout 原「开关翻转 → 最多 5×1.5s」逻辑抽出，让启动阶段也复用：
+   * orig-tg 冷启动首次 MTProto 握手实测约 4s，一次探测定终身会让
+   * `tgRunning`/`tgAvailability` 永久冻结在 `false`/`unreachable`。
+   *
+   * **不是轮询**（AGENTS.md §5 轮询三律）：次数有界（≤5）、退避触发、就绪即停；
+   * 每次刷新都等值短路，故不会造成高频重渲染。
+   * 同一时刻至多一条链（模块级单例）：重复触发只重启，不叠加请求。
+   *
+   * @returns cancel —— 组件卸载 / 依赖变化时清除未决定时器
+   */
+  probeTg: () => {
+    tgProbeCancel?.()
+    let attempts = 0
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let cancelled = false
+    const probe = () => {
+      void get().refreshTgState().then(() => {
+        if (cancelled) return
+        const st = get().tgAvailability
+        if ((st === null || st.status !== 'ok') && ++attempts < TG_PROBE_MAX_ATTEMPTS) {
+          timer = setTimeout(probe, TG_PROBE_DELAY_MS)
+        }
+      })
+    }
+    const cancel = () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+      if (tgProbeCancel === cancel) tgProbeCancel = null
+    }
+    tgProbeCancel = cancel
+    probe()
+    return cancel
+  },
 }))
+
+/**
+ * 开发期调试钩子（**仅 dev 构建**）：把 store 挂到 `window.__origStore`。
+ *
+ * 验收探针需要人为制造「陈旧快照」（把 `tgRunning`/`tgAvailability` 改回启动期
+ * 那次探测的值）以证明事件驱动刷新路径真的生效（BUG-097 的冻结现象无法用正常
+ * UI 操作复现）。生产构建里 `import.meta.env.DEV` 为 false，整段被 tree-shake，
+ * 不向页面脚本暴露内部状态。
+ */
+if (import.meta.env.DEV && typeof window !== 'undefined') {
+  ;(window as unknown as { __origStore?: typeof useStore }).__origStore = useStore
+}
