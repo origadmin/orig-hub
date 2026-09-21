@@ -5,8 +5,8 @@
  * 断言三件事：
  *   1) **不留白**：媒体库 / TG / 设置三视图的左槽都有视图标题、右槽都有连接态灯；
  *   2) **不跳动**：切换视图时 header 的 top / height 完全一致（这是「不需要占位」的前提）；
- *   3) **下载分支未死**：四档下载视图（下载中 / 已暂停 / 已完成 / 失败·已取消）仍渲染
- *      新建 / 全部暂停 / 全部开始（终态两档追加「清空」），且 disabled 态正确。
+ *   3) **下载分支未死**：三档下载视图（下载中 / 已暂停 / 已完成）仍渲染
+ *      新建 / 全部暂停 / 全部开始（「已完成」档追加「清空」），且 disabled 态正确。
  *
  * 前置：vite dev（默认 http://127.0.0.1:5180）、orig-daemon 已起。
  * 用法：NODE_PATH=<managed-node-workspace>/node_modules node tauri-shell/verify/shot_context_bar.cjs
@@ -93,7 +93,6 @@ async function main() {
     'nav-downloading': '下载中',
     'nav-paused': '已暂停',
     'nav-completed': '已完成',
-    'nav-failed': '失败·已取消',
   }
 
   const geo = []
@@ -117,8 +116,8 @@ async function main() {
       const texts = bar.buttons.map((b) => b.text)
       check(`${testid} 有下载操作按钮`, texts.length >= 3, JSON.stringify(bar.buttons))
       const hasClear = texts.some((x) => x.includes('清空'))
-      if (testid === 'nav-completed' || testid === 'nav-failed') {
-        // 终态两档必须给「清空」：store 的 clearCompleted 覆盖 completed|error|cancelled
+      if (testid === 'nav-completed') {
+        // 只有「已完成」档给「清空」：失败·已取消档已移除，失败项靠行内「删除」单条清理
         check(`${testid} 有「清空」`, hasClear, JSON.stringify(texts))
       } else {
         // 反向断言：进行中两档不挂「清空」（否则会误删终态记录）

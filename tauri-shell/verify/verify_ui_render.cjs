@@ -47,7 +47,6 @@ const REQUIRED_TESTIDS = [
   'nav-downloading',
   'nav-completed',
   'nav-paused',
-  'nav-failed',
   'nav-media',
   'nav-settings',
   'all-files-row',

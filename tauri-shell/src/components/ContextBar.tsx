@@ -43,8 +43,7 @@ export function resolveContextKind(view: ViewId): ContextKind {
   return view === 'all' ||
     view === 'downloading' ||
     view === 'paused' ||
-    view === 'completed' ||
-    view === 'failed'
+    view === 'completed'
     ? 'download'
     : 'status'
 }
@@ -55,7 +54,6 @@ export const TITLE_KEY: Record<ViewId, string> = {
   downloading: 'nav.downloading',
   paused: 'nav.paused',
   completed: 'nav.completed',
-  failed: 'nav.failed',
   media: 'nav.media',
   tg: 'nav.tg',
   settings: 'nav.settings',
@@ -101,9 +99,9 @@ export const ContextBar = memo(function ContextBar({
   const { t } = useTranslation()
   const kind = resolveContextKind(view)
 
-  /** 终态两档（已完成 / 失败·已取消）都显示「清空」：
-   *  store 的 clearCompleted 已覆盖 completed | error | cancelled 三种状态，语义正好对齐。 */
-  const showClear = view === 'completed' || view === 'failed'
+  /** 只有「已完成」档挂「清空」：失败·已取消档已移除，失败项不再有独立导航页，
+   *  其单条清理走 `DownloadItem` 行内的「删除」按钮（覆盖 completed | error | cancelled）。 */
+  const showClear = view === 'completed'
 
   return (
     <div

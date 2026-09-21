@@ -133,7 +133,10 @@ export function MainLayout() {
   )
   const paused = downloads.filter((d) => d.status === 'paused')
   const completed = downloads.filter((d) => d.status === 'completed')
-  // 失败档：error 与 cancelled 同属「未成功终态」，合并成一档导航
+  // error 与 cancelled 同属「未成功终态」。**只服务状态栏读数**（下方 `main.status` 的
+  // `{failed}` 占位符），**不再驱动导航** —— 失败·已取消档已移除，失败任务在「全部文件」里
+  // 以行内红色错误文字标记 + 行内「删除」处理。删掉这行 tsc 照样绿（占位符缺失只显示空
+  // 字符串），状态栏的失败数会静默消失 —— 典型假绿，勿删。
   const failed = downloads.filter((d) => d.status === 'error' || d.status === 'cancelled')
   const totalSpeed = active.reduce((sum, d) => sum + (d.speed || 0), 0)
 
@@ -167,22 +170,21 @@ export function MainLayout() {
   const handleGoAccounts = useEvent(() => handleView('settings'))
 
   /**
-   * 档位过滤（BUG-082）：下载四档与 `download.status` 七态一一对应，
-   * 任一态都恰好落进一档，不再有「混档显示」或「无档可归」的死角
-   * （`idle` 归入下载中档，否则它四档皆不可见）。
+   * 档位过滤（BUG-082）：下载三档（下载中 / 已暂停 / 已完成）各对应一组状态，
+   * `idle` 归入下载中档（否则它三档皆不可见）。
+   * `error | cancelled` **没有专属档位**（失败·已取消导航档已移除）：它们落在最后的
+   * `downloads` 兜底分支，即只在「全部文件」里可见，靠行内红色错误文字 + 行内「删除」处理。
    */
   const baseVisible =
     view === 'settings'
       ? downloads
       : view === 'completed'
         ? completed
-        : view === 'failed'
-          ? failed
-          : view === 'paused'
-            ? paused
-            : view === 'downloading'
-              ? downloadingBucket
-              : downloads
+        : view === 'paused'
+          ? paused
+          : view === 'downloading'
+            ? downloadingBucket
+            : downloads
   const visible = categoryFilter
     ? baseVisible.filter((d) => d.category === categoryFilter)
     : baseVisible
@@ -218,7 +220,6 @@ export function MainLayout() {
             downloading: downloadingBucket.length,
             paused: paused.length,
             completed: completed.length,
-            failed: failed.length,
             total: downloads.length,
           }}
           tgReady={tgFeatureReady}

@@ -6,18 +6,19 @@ import { CONN_DOT, CONN_LABEL, useConnState } from '../store/connState'
 /**
  * 导航视图枚举。
  *
- * APP 核心是下载工具，下载队列按 `download.status` 的七态拆成四档导航：
+ * APP 核心是下载工具，下载队列按 `download.status` 的七态拆成三档导航：
  *   - downloading → downloading | queued | idle
  *   - paused      → paused
  *   - completed   → completed
- *   - failed      → error | cancelled
+ *
+ * `error | cancelled` **不再单列一档**（用户裁定）：失败任务继续在「全部文件」里显示，
+ * 靠行内红色错误文字标记 + 行内「删除」按钮处理，不为它占用一级导航位。
  */
 export type ViewId =
   | 'all'
   | 'downloading'
   | 'paused'
   | 'completed'
-  | 'failed'
   | 'media'
   | 'tg'
   | 'settings'
@@ -32,7 +33,7 @@ interface Props {
   onCategoryChange: (c: string | null) => void
   collapsed: boolean
   onToggle: () => void
-  counts: { downloading: number; paused: number; completed: number; failed: number; total: number }
+  counts: { downloading: number; paused: number; completed: number; total: number }
   /**
    * TG 功能就绪（常规开关开 + orig-tg 服务可达）；false 时 TG 导航整体隐藏（入口级门控）。
    *
@@ -69,15 +70,6 @@ const NAV_ITEMS: { id: ViewId; labelKey: string; icon: JSX.Element }[] = [
     icon: (
       <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
         <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-      </svg>
-    ),
-  },
-  {
-    id: 'failed',
-    labelKey: 'nav.failed',
-    icon: (
-      <svg className="h-4.5 w-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-        <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v4m0 3.5h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
       </svg>
     ),
   },
@@ -310,11 +302,9 @@ export function Sidebar({
               ? counts.downloading
               : item.id === 'paused'
                 ? counts.paused
-                : item.id === 'completed'
-                  ? counts.completed
-                  : item.id === 'failed'
-                    ? counts.failed
-                    : 0
+              : item.id === 'completed'
+                ? counts.completed
+                : 0
           return (
             <button
               key={item.id}
