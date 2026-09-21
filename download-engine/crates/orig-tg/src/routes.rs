@@ -598,10 +598,33 @@ async fn messages(
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_authorized(&st).await?;
     let limit = q.limit.clamp(1, 100);
-    let items = st.client.messages(chat_id, limit, q.before_id).await?;
-    // 拉满一页则可能还有更早历史；不足一页说明已到顶。
-    let has_more = items.len() as u32 >= limit;
-    Ok(Json(json!({"items": items, "hasMore": has_more})))
+    // BUG-106：不再把传输层原文裸抛成 400。
+    //
+    // **这里刻意不降级成空列表** —— 「这个频道没有消息」和「这次没取到消息」是两回事，
+    // 返回 `items: []` 会让用户以为频道是空的（把失败伪装成成功）。故如实返回 503，
+    // 并把「链路已断 → 重启 orig-tg 可恢复」作为可行动提示一并返回。
+    match st.client.messages(chat_id, limit, q.before_id).await {
+        Ok(items) => {
+            // 拉满一页则可能还有更早历史；不足一页说明已到顶。
+            let has_more = items.len() as u32 >= limit;
+            Ok(Json(json!({"items": items, "hasMore": has_more})))
+        }
+        Err(e) => {
+            let reason = e.to_string();
+            let hint = if st.client.link_alive() {
+                "messages request failed"
+            } else {
+                "MTProto link is down; restart orig-tg to recover"
+            };
+            st.push_log(&format!(
+                "/api/tg/messages/{chat_id}: failed -> {reason} ({hint})"
+            ));
+            Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("{hint}: {reason}"),
+            ))
+        }
+    }
 }
 
 /// GET /api/tg/thumb/:chat_id/:message_id — 轻量缩略图（image/jpeg 字节流）。
@@ -613,8 +636,33 @@ async fn thumb(
     Path((chat_id, message_id)): Path<(i64, i64)>,
 ) -> Result<Response, ApiError> {
     ensure_authorized(&st).await?;
-    let Some(t) = st.client.thumb(chat_id, message_id).await? else {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, "thumbnail not available"));
+    // BUG-106：缩略图是列表海报专用，**取不到就该让前端降级占位（404）**，
+    // 而不是把传输层原文裸抛成 400。
+    //
+    // 链路一断，一页几十张缩略图会刷出几十个 `400 dropped (cancelled)`，
+    // 用户看到的是「整个 TG 功能 400」，实际只是图片暂时取不到 ——
+    // 错误被放大成与真实影响完全不成比例的样子。故统一按 404（无缩略图）处理，
+    // 但**必须留痕**：链路状态另由 `/api/tg/diag.link_alive` 如实暴露。
+    let t = match st.client.thumb(chat_id, message_id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "thumbnail not available"));
+        }
+        Err(e) => {
+            let reason = e.to_string();
+            let hint = if st.client.link_alive() {
+                "thumbnail request failed"
+            } else {
+                "MTProto link is down; restart orig-tg to recover"
+            };
+            // 高频路径：节流留痕（同一分钟最多一条），避免日志被冲垮掩盖真病因。
+            st.push_log_throttled(
+                "thumb",
+                60,
+                format!("/api/tg/thumb/{chat_id}/{message_id}: degraded -> {reason} ({hint})"),
+            );
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "thumbnail not available"));
+        }
     };
     let mut res = Response::new(axum::body::Body::from(t.bytes));
     res.headers_mut().insert(
@@ -776,7 +824,27 @@ async fn cache_one(
     message_id: i64,
     dir: &str,
 ) -> Result<(DownloadOutcome, Option<i64>), ApiError> {
-    let outcome = st.client.download(chat_id, message_id, dir).await?;
+    // BUG-106：下载失败同样不再裸抛传输层原文。
+    // 失败**必须**是失败（不能伪装成成功），但要给出可行动的原因而不是
+    // `request error: dropped (cancelled)` 这种只有维护者才懂的串。
+    let outcome = match st.client.download(chat_id, message_id, dir).await {
+        Ok(o) => o,
+        Err(e) => {
+            let reason = e.to_string();
+            let hint = if st.client.link_alive() {
+                "download failed"
+            } else {
+                "MTProto link is down; restart orig-tg to recover"
+            };
+            st.push_log(&format!(
+                "cache_one({chat_id},{message_id}): failed -> {reason} ({hint})"
+            ));
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("{hint}: {reason}"),
+            ));
+        }
+    };
     // 缓存状态入库（BUG-016 根因：此前从未标记，列表永远显示未缓存）。
     // 元数据回填（D1 根因）：mark_downloaded 的兜底 upsert 只写 downloaded/file_path，
     // 未监控频道的行缺 type/mime/size/date/duration/group_id → 缓存库显 📄、聚合失效。

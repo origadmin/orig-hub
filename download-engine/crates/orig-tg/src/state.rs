@@ -1,9 +1,9 @@
 //! orig-tg 服务共享状态。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::RwLock;
 
@@ -116,6 +116,12 @@ pub struct AppState {
     /// 缓存 worker 单飞门禁：同一时刻至多一个 worker 协程在跑（进程内判定；
     /// DB 侧 `has_running_cache_task` 是跨请求的慢判定，两者配合防双跑）。
     cache_worker_alive: AtomicBool,
+    /// 节流留痕用的「上次记录时刻」表（BUG-106）。
+    ///
+    /// 缩略图这类高频路径一页就是几十个请求，链路一断会灌进几十上百条**内容相同**
+    /// 的日志 —— 环形日志被冲掉，真正的病因反而找不到了。按 key 节流，
+    /// 保证「出了事一定留痕」的同时不制造日志风暴。
+    log_throttle: Mutex<HashMap<String, Instant>>,
 }
 
 impl AppState {
@@ -136,6 +142,7 @@ impl AppState {
             dialog_scanning: AtomicBool::new(false),
             cache_tasks: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             cache_worker_alive: AtomicBool::new(false),
+            log_throttle: Mutex::new(HashMap::new()),
         }
     }
 
@@ -164,6 +171,27 @@ impl AppState {
 
     pub fn push_log(&self, line: impl AsRef<str>) {
         self.logs.push(line);
+    }
+
+    /// 节流留痕（BUG-106）：同一 `key` 在 `secs` 内只记一条。
+    ///
+    /// 用于高频路径（列表缩略图等）。**绝不静默吞错** —— 降级分支必须留痕，
+    /// 否则「每次都失败但没人知道」又会变成下一个谜案；节流只是防止日志被冲垮。
+    pub fn push_log_throttled(&self, key: &str, secs: u64, line: impl AsRef<str>) {
+        let mut g = match self.log_throttle.lock() {
+            Ok(g) => g,
+            // 锁中毒：宁可不节流也要留痕（丢日志比多记几条更糟）。
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = Instant::now();
+        let due = match g.get(key) {
+            Some(t) => now.duration_since(*t) >= Duration::from_secs(secs),
+            None => true,
+        };
+        if due {
+            g.insert(key.to_string(), now);
+            self.logs.push(line);
+        }
     }
 
     /// 读取后台扫描状态（Relaxed：仅作进度提示，无并发数据依赖）。
