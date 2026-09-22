@@ -49,18 +49,37 @@ IDX_ID_RE = re.compile(r"^\|\s*BUG-(\d{3})\s*\|")
 # 字段格式在历史上演进过（`- 状态: fixed` / `- **状态**: fixed` / `**状态**: fixed` /
 # `- **Status**: fixed` / `- **严重级**: major / ...`），门禁对**历史条目**容忍这些写法
 # （否则等于要求改历史，而改历史就是伪造），对 RULE_FROM 起的新条目要求统一格式与枚举取值。
-FIELD_RE = re.compile(
-    r"^\s*[-*]*\s*\*{0,2}"
-    r"(状态|发现日期|模块|严重程度|严重级|报告轮次|Status|Severity|Date|Module)"
-    r"\*{0,2}\s*[:：]\s*(.+?)\s*$"
+#
+# 为什么改成「先抓任意字段名、再查白名单」：旧写法把字段名硬编码在正则里，
+# 于是**正则不匹配的字段被静默忽略** —— 门禁完全不知道它存在，规则恒不触发。
+# 实测踩到：给轻量档加的 `- 档位: light` 一直没被 FIELD_RE 收录，
+# 「轻量档写了根因要报错」这条规则**永远不生效**，而门禁照样报 OK（假绿）。
+# 症状与病因相距极远：以为是规则写错，其实是**字段根本没解析进来**。
+NOW_FIELD_RE = re.compile(
+    r"^\s*[-*]*\s*\*{0,2}(状态|发现日期|模块|严重程度|严重级|报告轮次|档位"
+    r"|Status|Severity|Date|Module|Tier)\*{0,2}\s*[:：]\s*(.+?)\s*$"
 )
+# 「字段形状」探测：`- <名字>: <值>` 这种行**看起来是字段**。
+# 若它不被 NOW_FIELD_RE 命中，说明写了门禁不认识的字段名 —— 必须报错，
+# 否则该字段（连同依赖它的规则）会静默失效。
+FIELD_SHAPE_RE = re.compile(r"^\s*[-*]*\s*\*{0,2}([A-Za-z\u4e00-\u9fff]{2,12})\*{0,2}\s*[:：]\s*\S")
+NOW_FIELD_NAMES = {
+    "状态", "发现日期", "模块", "严重程度", "严重级", "报告轮次", "档位",
+    "Status", "Severity", "Date", "Module", "Tier",
+}
 ALIAS = {
     "严重级": "严重程度",
     "Status": "状态",
     "Severity": "严重程度",
     "Date": "发现日期",
     "Module": "模块",
+    "Tier": "档位",
 }
+
+# 登记档位：标准档（默认）/ 轻量档。
+# 轻量档仅减免 `## 现象/根因/复现/关联` 四段，**不减免** 编号/索引/状态机/`## 验收证据`/
+# 跨机器可核引用 —— 履历完整性与标准档完全相同（docs/rules/bug-registry.md 二、三节）。
+TIERS = {"standard", "light"}
 
 
 def parse_index_row(line: str) -> tuple[int, str, str] | None:
@@ -193,10 +212,39 @@ def main() -> int:
         lines = text.splitlines()
 
         field: dict[str, str] = {}
+        # ① 字段解析：**全文扫描**。这是对既有行为的原样保持 —— 绝不缩窄，
+        #    否则会打断老文件（实测：BUG-028 第 3 行就有 `## 状态` 标题，
+        #    `- 状态: fixed` 在其后；若把解析也限到首个 `##` 之前，该文件立刻报
+        #    「缺少字段 状态」—— 缩窄扫描范围的回归，症状看着却像文件本身不合规）。
         for line in lines:
-            m = FIELD_RE.match(line.strip())
+            m = NOW_FIELD_RE.match(line.strip())
             if m:
                 field[ALIAS.get(m.group(1), m.group(1))] = m.group(2).strip()
+
+        # ② 未知字段名告警：**只扫头部元数据块**（首个 `##` 之前）。
+        #    为什么两个关注点范围不同：解析要**全**（漏掉会毁掉依赖它的规则），
+        #    告警要**准**（全文扫描时正文散文 `触发:` / `进行中:` / `更麻烦的是:`
+        #    被当成字段名，505 个候选里 **471 个是误伤**，门禁从 OK 变 FAIL 333 项）。
+        #    为什么是 warn 而不是 err：放过的后果是**该字段与依赖它的规则静默失效**
+        #    （实测：`- 档位:` 未被收录时，「轻量档写了根因」永远不触发，门禁照报 OK）；
+        #    但存量里 14 个字段名（`修复者` / `发现方式` / `优先级` / `严重度`…）是
+        #    **真实在用**的合法字段，且 `发现方式` 出现在 BUG-110/111/112 等他人在途
+        #    登记上 —— 一 err 就把并行会话的提交挡死。
+        #    判据：字段名漂移是**模式演进**，不是**提交者的错** —— 让它可见（warn），
+        #    不让它阻断（err）。
+        first_h = next(
+            (i for i, l in enumerate(lines) if l.startswith("## ")), len(lines)
+        )
+        for line in lines[:first_h]:
+            if NOW_FIELD_RE.match(line.strip()):
+                continue
+            s = FIELD_SHAPE_RE.match(line.strip())
+            if s and s.group(1) not in NOW_FIELD_NAMES:
+                warn(
+                    f"{rel}: 不认识的字段名 `{s.group(1)}:` —— 门禁不会解析它，"
+                    f"依赖该字段的规则将静默失效；若它是约定字段请加进 NOW_FIELD_RE，"
+                    f"若是笔误请改为 {sorted(NOW_FIELD_NAMES)}"
+                )
 
         # 状态是唯一的历史全量字段：值取首个 token（`fixed（2026-09-18 已验收）` → `fixed`）
         raw_status = field.get("状态", "")
@@ -231,11 +279,31 @@ def main() -> int:
             continue
 
         # 5. 验收章节
+        #    `- 档位: light`（轻量档）**不减免履历**：编号仍唯一、仍进索引、仍被 commit-msg 引用、
+        #    仍必须带 `## 验收证据`。它只免掉 `## 现象/根因/复现/关联` 四段 ——
+        #    对 i18n／常量／样式这类小改，那四段写出来只会是「某处缺键 → 没加 → 打开界面 → 无」的空话。
+        #    判据（docs/rules/bug-registry.md）：无法在索引行一句话内说清根因的，不许用轻量档 ——
+        #    故轻量档若仍写了 `## 根因`，那是**误用档位**（该写就该留在标准档），报错而非放过。
+        #    此处其余检查**一个字都不放宽** —— 档位是「不写空话的许可」，不是「降低验收门槛的许可」。
+        tier_val = ""
+        if "档位" in field:
+            tier_val = re.split(r"[\s（(]", field["档位"].strip())[0]
+            if tier_val not in TIERS:
+                err(f"{rel}: 档位 `{field['档位']}` 不在枚举 {sorted(TIERS)}")
+        light_tier = tier_val == "light"
         has_ev = re.search(r"^##\s*验收证据\s*$", text, re.M) is not None
         has_fix = re.search(r"^##\s*修复\s*$", text, re.M) is not None
+        if light_tier and re.search(r"^##\s*根因\s*$", text, re.M):
+            err(
+                f"{rel}: 档位 light 但写了 `## 根因` —— 轻量档只用于「无法在索引行一句话内"
+                f"说清根因」的小改；既然有根因要分析，请升为标准档（去掉 `- 档位:` 行）"
+            )
         if not has_ev:
             if n >= RULE_FROM:
-                err(f"{rel}: 状态 {status} 但没有 `## 验收证据` 节（BUG-{RULE_FROM:03d} 起强制）")
+                err(
+                    f"{rel}: 状态 {status} 但没有 `## 验收证据` 节（BUG-{RULE_FROM:03d} 起强制）"
+                    f"（轻量档同样必需 —— 档位只减免 现象/根因/复现/关联 四段）"
+                )
             elif not has_fix:
                 warn(f"{rel}: 状态 {status} 但既无 `## 验收证据` 也无 `## 修复` 节")
         if has_ev:
