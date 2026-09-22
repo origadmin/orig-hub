@@ -499,6 +499,46 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
     ] {
         conn.execute(trigger_sql,()).await?;
     }
+
+    // ── BUG-124 规则级不变量：删分集必须同时清掉它挂的备用源行 ──
+    //
+    // 缺陷原形：三个删除入口（`remove_episode` / `delete_series` / `delete_media_item`）
+    // 只 `DELETE FROM media_episode`，从不碰 `media_episode_source`。而该表 `item_id`
+    // 是**全表 UNIQUE**，孤儿行仍占着那个名额 —— 此后把该条目挂到**任何**分集都会
+    // `UNIQUE constraint failed: media_episode_source.item_id`（报错，不是静默失败）；
+    // 该表无外键级联、跨进程重启仍残留，条目被永久锁死，用户无法自愈。
+    //
+    // 为什么用触发器，而不是在三个入口各补一句 DELETE（BUG-110 的教训）：「逐点打补丁」
+    // 意味着下一条新写路径必然又漏。触发器一处生效，覆盖全部现有入口与**将来任何新增入口**。
+    // 这与上面 BUG-044 用触发器守「备用源只能是视频」是同一思路。
+    //
+    // ⚠️ 退役触发器必须**显式 DROP**：`CREATE TRIGGER IF NOT EXISTS` 只防「重复创建」，
+    // 既不会让**另一个名字**的旧触发器失效，也不会在触发器**定义变更**时刷新它。BUG-044
+    // 已踩过这个坑（旧触发器留在已升级的库上，全新库单测测不出来，表现为「剧集建成却 0 分集」）。
+    // 故沿用该处写法：先 DROP 再 CREATE，确保已升级库上跑的一定是当前定义。
+    conn.execute_batch("DROP TRIGGER IF EXISTS trg_media_episode_cleanup_sources;")
+        .await?;
+    // 触发器语句**单独 execute，不放进建表批**（BUG-032：批里只允许新旧库都存在的对象）。
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS trg_media_episode_cleanup_sources
+             AFTER DELETE ON media_episode
+             FOR EACH ROW
+             BEGIN
+                 DELETE FROM media_episode_source WHERE episode_id = OLD.id;
+             END",
+        (),
+    )
+    .await?;
+    // 清理历史孤儿行（一次全量）。**必须放在触发器创建之后**：触发器只对创建**之后**的
+    // DELETE 生效，无法追溯清理「建触发器之前」已产生的孤儿行 —— 包括本次迁移早段的启动
+    // 修复（删非法分集）以及历史版本留下的残留。故触发器管将来，这条 DELETE 管过去。
+    // 判据与验收一致：`episode_id` 在 `media_episode` 里已找不到的备用源行。
+    conn.execute(
+        "DELETE FROM media_episode_source
+          WHERE episode_id NOT IN (SELECT id FROM media_episode)",
+        (),
+    )
+    .await?;
     Ok(())
 }
 
@@ -3054,6 +3094,165 @@ mod tests {
             .create_series("C", None, "series", None, Some("tg:group:2:9"))
             .await
             .unwrap();
+    }
+
+    /// 验收判据（BUG-103 已用过）：`media_episode_source` 左连接 `media_episode`
+    /// 的悬空行计数。0 = 无孤儿。
+    const ORPHAN_SOURCE_SQL: &str = "SELECT COUNT(*) FROM media_episode_source src
+          LEFT JOIN media_episode e ON e.id = src.episode_id
+         WHERE e.id IS NULL";
+
+    /// 回归（BUG-124）：三个删除入口留下的**孤儿备用源行**必须在数据层被清掉。
+    ///
+    /// 缺陷原形：`remove_episode` / `delete_series` / `delete_media_item` 只删
+    /// `media_episode`，从不碰 `media_episode_source`；而该表 `item_id` 全表 UNIQUE，
+    /// 孤儿行占死名额，此后该条目挂到**任何**分集都 `UNIQUE constraint failed`，
+    /// 且无外键级联、跨进程重启仍残留 → 条目永久锁死，用户无法自愈。
+    ///
+    /// 修法：`migrate()` 里加 AFTER DELETE 触发器（管将来）+ 一次全量清理（管过去）。
+    /// 本测试同时覆盖「旧库→新代码」迁移路径（全新库测不出升级库的坑，见 BUG-044 教训）。
+    #[tokio::test]
+    async fn legacy_orphan_source_rows_are_cleaned_and_trigger_prevents_new_ones() {
+        let path = tmp_db("legacy_orphan_src");
+        // ① 造「旧库 + 孤儿行」：schema 无 cleanup 触发器，且 media_episode_source 里
+        //    有一行指向**已被删掉**的分集（episode_id=999 在 media_episode 里不存在）。
+        {
+            let conn = libsql::Builder::new_local(&path).build().await.unwrap().connect().unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE media_item (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, ref TEXT NOT NULL,
+                    title TEXT NOT NULL, kind TEXT NOT NULL, file_path TEXT, poster TEXT,
+                    size INTEGER, duration INTEGER, width INTEGER, height INTEGER,
+                    added_at INTEGER NOT NULL, UNIQUE(source, ref)
+                );
+                CREATE TABLE media_series (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT,
+                    kind TEXT NOT NULL DEFAULT 'series', poster TEXT, year INTEGER,
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE media_episode (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, series_id INTEGER NOT NULL,
+                    item_id INTEGER NOT NULL, season INTEGER NOT NULL DEFAULT 1,
+                    episode_no INTEGER NOT NULL DEFAULT 1, title TEXT,
+                    UNIQUE(series_id, season, episode_no)
+                );
+                CREATE TABLE media_episode_source (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, episode_id INTEGER NOT NULL,
+                    item_id INTEGER NOT NULL UNIQUE, created_at INTEGER NOT NULL,
+                    UNIQUE(episode_id, item_id)
+                );
+                INSERT INTO media_item (source, ref, title, kind, added_at) VALUES
+                    ('tg','o:1','a','video',1), ('tg','o:2','b','video',2);
+                INSERT INTO media_series (title, kind, created_at, updated_at) VALUES ('旧剧','series',1,1);
+                INSERT INTO media_episode (series_id, item_id, season, episode_no) VALUES (1,1,1,1);
+                -- 历史孤儿行：episode_id=999 已无对应分集
+                INSERT INTO media_episode_source (episode_id, item_id, created_at) VALUES (999,2,1);
+                "#,
+            )
+            .await
+            .unwrap();
+        }
+
+        // ② 新代码打开旧库：必须成功（失败会让调用方回落空库，表现为「用户数据全没了」），
+        //    且历史孤儿行被清理、触发器建成。
+        let s = Store::open(&path)
+            .await
+            .expect("旧库必须能被新代码打开（迁移失败=回落空库=数据全丢）");
+        assert_eq!(
+            scalar_i64(&s.conn, "SELECT COUNT(*) FROM media_series").await,
+            1,
+            "迁移不得丢数据"
+        );
+        assert_eq!(
+            scalar_i64(&s.conn, ORPHAN_SOURCE_SQL).await,
+            0,
+            "历史孤儿行必须在迁移时被清理"
+        );
+        assert_eq!(
+            scalar_i64(
+                &s.conn,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger'
+                   AND name='trg_media_episode_cleanup_sources'"
+            )
+            .await,
+            1,
+            "cleanup 触发器应建成"
+        );
+
+        // ③ 反向证伪：**绕过触发器**直插一条孤儿行，判据必须能报出 1 —— 否则上面
+        //    「=0」的断言可能是假绿（查询本身写错却恒为 0）。
+        let ghost = s
+            .upsert_media_item("tg", "ghost:1", "ghost", "video", None, None, None, None)
+            .await
+            .unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO media_episode_source (episode_id, item_id, created_at)
+                 VALUES (999999, ?1, 1)",
+                params![ghost],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar_i64(&s.conn, ORPHAN_SOURCE_SQL).await,
+            1,
+            "直插的孤儿行必须被判据报出（反向证伪：否则断言是假的）"
+        );
+        s.conn
+            .execute("DELETE FROM media_episode_source WHERE item_id = ?1", params![ghost])
+            .await
+            .unwrap();
+        assert_eq!(scalar_i64(&s.conn, ORPHAN_SOURCE_SQL).await, 0, "证伪行应被清掉");
+
+        // ④ 三个删除入口逐个验证：删完孤儿计数必须为 0。
+        // 入口 1：remove_episode（删单集）
+        let sid = s.create_series("S1", None, "series", None, None).await.unwrap();
+        let a = s.upsert_media_item("tg", "r:1", "a", "video", None, None, None, None).await.unwrap();
+        let b = s.upsert_media_item("tg", "r:2", "b", "video", None, None, None, None).await.unwrap();
+        let ep = s.add_episode(sid, a, 1, 1).await.unwrap();
+        assert!(s.attach_episode_source(ep, b).await.unwrap(), "前置条件：B 应挂为该集备用源");
+        s.remove_episode(ep).await.unwrap();
+        assert_eq!(
+            scalar_i64(&s.conn, ORPHAN_SOURCE_SQL).await,
+            0,
+            "remove_episode 删分集后不得留孤儿备用源行"
+        );
+
+        // 入口 2：delete_series（删整部剧集）
+        let sid2 = s.create_series("S2", None, "series", None, None).await.unwrap();
+        let c = s.upsert_media_item("tg", "r:3", "c", "video", None, None, None, None).await.unwrap();
+        let d = s.upsert_media_item("tg", "r:4", "d", "video", None, None, None, None).await.unwrap();
+        let ep2 = s.add_episode(sid2, c, 1, 1).await.unwrap();
+        assert!(s.attach_episode_source(ep2, d).await.unwrap());
+        s.delete_series(sid2).await.unwrap();
+        assert_eq!(
+            scalar_i64(&s.conn, ORPHAN_SOURCE_SQL).await,
+            0,
+            "delete_series 删剧集后不得留孤儿备用源行"
+        );
+
+        // 入口 3：delete_media_item（删条目，连带删它的分集）
+        let sid3 = s.create_series("S3", None, "series", None, None).await.unwrap();
+        let e = s.upsert_media_item("tg", "r:5", "e", "video", None, None, None, None).await.unwrap();
+        let f = s.upsert_media_item("tg", "r:6", "f", "video", None, None, None, None).await.unwrap();
+        let ep3 = s.add_episode(sid3, e, 1, 1).await.unwrap();
+        assert!(s.attach_episode_source(ep3, f).await.unwrap());
+        s.delete_media_item(e).await.unwrap();
+        assert_eq!(
+            scalar_i64(&s.conn, ORPHAN_SOURCE_SQL).await,
+            0,
+            "delete_media_item 删条目后不得留孤儿备用源行"
+        );
+
+        // ⑤ 跨重启：清理与触发器都是持久化的，不是本连接内存态。
+        drop(s);
+        let s2 = Store::open(&path).await.unwrap();
+        assert_eq!(
+            scalar_i64(&s2.conn, ORPHAN_SOURCE_SQL).await,
+            0,
+            "重启后仍不得有孤儿行"
+        );
     }
 
     /// 追加分集的幂等粒度：**同季**去重，跨季允许。
