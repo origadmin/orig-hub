@@ -155,6 +155,9 @@
 | BUG-141 | i18n 硬编码中文 253 行分布 25 文件（en-US 界面混中文）——BUG-128 同病新实例（SeriesDetail/ImportDialog KIND_LABEL 等），无门禁检测 | open | shell |
 | BUG-142 | i18n 孤儿 key 42 个（收敛残骸）误导维护；36 组同值 key 部分为刻意分离（BUG-128 裁定）禁盲并 | open | shell |
 | BUG-143 | ImportDialog 默认目录硬编码 D:\test_videos 开发残留进生产 UI | open | shell |
+| BUG-144 | 设计外「视频库」独立导航入口（S4）——挤占 TG 导航并造成回归 | open | shell |
+| BUG-145 | 媒体库不展示来源名 / 来源离线无明路（S2/S3 落地） | open | shell |
+| BUG-146 | 缺陷登记门禁 §13.3 冲突：未识别字段静默失效 + 轻量档减免验收证据 | open | docs |
 
 ## 历史欠账
 
