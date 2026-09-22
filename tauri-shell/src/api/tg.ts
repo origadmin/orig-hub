@@ -442,14 +442,26 @@ export async function listAllCacheTasks(): Promise<{
 }
 
 /**
+ * 外部文件（导入/扫描带进来的、位于下载目录之外）：**永不参与清理**，只如实计数。
+ * BUG-136 起 `/api/cache/stats` 与 `/api/cache/clear/preview` 同形状，故共用这一个类型。
+ */
+export type CacheExternalBytes = {
+  count: number
+  bytes: number
+  /** 恒为 false：外部文件是用户自己的文件，清理链永不删除 */
+  removable: boolean
+}
+
+/**
  * GET /api/cache/stats — 缓存磁盘占用（`files` / `bytes` / `external`）。
  * 「清除缓存文件」是释放磁盘的动作，不知道占多少就是盲操作。
+ * `external` 与 `CacheClearPreview` 同形状（BUG-136），可跨接口复用读数。
  */
 export async function getCacheStats(): Promise<{
   ok: boolean
   files: number
   bytes: number
-  external: number
+  external: CacheExternalBytes
 }> {
   return request('/api/cache/stats')
 }
@@ -463,7 +475,7 @@ export type CacheClearPreview = {
   /** 孤儿：磁盘上有、库里没有任何条目指向 */
   orphan: { count: number; bytes: number; truncated: boolean }
   /** 外部文件（导入/扫描带进来的）：**永不参与清理**，只如实计数 */
-  external: { count: number; bytes: number; removable: boolean }
+  external: CacheExternalBytes
   stale: { count: number; bytes: number }
   /** 失败/取消/中断任务涉及过的消息所占字节 */
   failed: { count: number; bytes: number }

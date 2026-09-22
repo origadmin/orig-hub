@@ -366,6 +366,20 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// 单个登记文件的磁盘字节：**是普通文件才有值**（BUG-136 起 `stats` 与
+/// `clear/preview` 共用的唯一口径）。
+///
+/// 此前两处各写一套：`preview` 用 `metadata().map(len)`（目录也会算出一个长度），
+/// `stats` 用 `metadata()` + `is_file()`（只数文件）。同一事实两套实现必然漂移，
+/// 故收口到这一处。文件可能已被手工删掉：返回 `None` 而不是报错 —— 读数面对的
+/// 是随时在变的磁盘，不是一张静态表。
+fn file_len(path: &str) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+}
+
 /// 文件年龄（天）。取不到时间戳时返回 0 = **不算陈旧**（宁可少删）。
 fn age_days(path: &str, now: u64) -> u64 {
     let Ok(meta) = std::fs::metadata(path) else {
@@ -599,7 +613,7 @@ pub async fn clear_preview(
     for it in items.iter() {
         // 文件可能已被手工删掉：`bytes` 记 0 而不是报错（预览必须容错，
         // 它面对的是随时在变的磁盘，不是一张静态表）。
-        let size = std::fs::metadata(&it.file_path).map(|m| m.len()).unwrap_or(0);
+        let size = file_len(&it.file_path).unwrap_or(0);
         let inside = inside_dir(&dir, &it.file_path);
         let age = age_days(&it.file_path, now);
         let failed = failed_keys.contains(&it.ref_key);
@@ -851,7 +865,11 @@ fn parse_ids(raw: &str) -> Result<Vec<i64>, ApiError> {
 /// 「清除缓存文件」是释放磁盘的动作，**不知道占多少就是盲操作**——这是此前漏掉的必需项。
 /// `bytes` 只统计真实存在的、**位于下载目录内**的字节；`external` 是导入/扫描带进来的
 /// 外部文件（永不删除，只如实计数）。
-/// 外部文件（永不删除，只如实计数）。
+///
+/// `external` 的形状与 `GET /api/cache/clear/preview` **逐字一致**（BUG-136）：
+/// 此前这里是纯计数数字，那边是 `{count,bytes,removable}`，同一字段两种形状会让调用方
+/// 无法复用读数；且这里一个字节都不累加，本地导入占着磁盘却不出现在任何数字里。
+/// 字节口径复用 [`file_len`]，与 preview 同源，**不另写一套 stat 逻辑**。
 async fn stats(
     State(st): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -862,20 +880,26 @@ async fn stats(
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
-    let (mut bytes, mut files, mut external) = (0u64, 0u64, 0u64);
+    let (mut bytes, mut files, mut external, mut external_bytes) = (0u64, 0u64, 0u64, 0u64);
     for it in items {
+        // 与 `clear_preview` 共用 `file_len`：两处对同一文件的读数必须逐字一致。
+        let size = file_len(&it.file_path);
         if !inside_dir(&dir, &it.file_path) {
             external += 1;
+            external_bytes += size.unwrap_or(0);
             continue;
         }
-        if let Ok(m) = std::fs::metadata(&it.file_path) {
-            if m.is_file() {
-                bytes += m.len();
-                files += 1;
-            }
+        if let Some(n) = size {
+            bytes += n;
+            files += 1;
         }
     }
-    Ok(Json(json!({"ok": true, "files": files, "bytes": bytes, "external": external})))
+    Ok(Json(json!({
+        "ok": true,
+        "files": files,
+        "bytes": bytes,
+        "external": {"count": external, "bytes": external_bytes, "removable": false},
+    })))
 }
 
 #[cfg(test)]
