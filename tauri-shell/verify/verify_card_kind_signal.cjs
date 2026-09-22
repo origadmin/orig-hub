@@ -41,11 +41,16 @@
  *   3. **自证伪模式**（`ORIG_VERIFY_REVERT=1`）：把修复前形态注回真实 DOM
  *      （图标改回播放三角 + 移除类型徽标），跑同一套断言 → 必须 exit 1。
  *      这条才证到「缺陷真出现时这套断言会红」；死端口那轮只证到可达性守卫。
+ *   4. **BUG-128 自证伪**（`ORIG_VERIFY_REVERT_I18N=1`）：en-US 那一轮把徽标文案
+ *      改回硬编码中文（徽标仍在，只是文案错了）→ en-US 两条断言必须 exit 1，
+ *      而 zh-CN 断言保持全绿。这条专证「硬编码中文」这一具体形态可被检出 ——
+ *      第 3 条只删徽标，压不到它。
  *
  * Usage:
  *   node verify/verify_card_kind_signal.cjs                    # http://127.0.0.1:5180
  *   APP_URL=http://127.0.0.1:59999 node verify/verify_card_kind_signal.cjs   # 反向证伪 1
  *   ORIG_VERIFY_REVERT=1 node verify/verify_card_kind_signal.cjs             # 反向证伪 3（期望 exit 1）
+ *   ORIG_VERIFY_REVERT_I18N=1 node verify/verify_card_kind_signal.cjs        # 反向证伪 4（期望 exit 1）
  *   ORIG_VERIFY_OUT=<临时目录> node verify/verify_card_kind_signal.cjs        # 产物目录
  *
  * Exit codes: 0 = 全部断言通过, 1 = 断言失败（页面问题）,
@@ -91,6 +96,26 @@ const BENIGN_CONSOLE = [/favicon/i, /DevTools/i, /Download the React DevTools/i]
  * 不设这个开关，脚本就只能证明自己会绿，不能证明自己会红。
  */
 const REVERT_TO_PRE_FIX = process.env.ORIG_VERIFY_REVERT === '1'
+
+/**
+ * 自证伪模式（`ORIG_VERIFY_REVERT_I18N=1`，BUG-128 专用）。
+ *
+ * `ORIG_VERIFY_REVERT` 是把类型徽标**整个删掉** —— 它证明的是「徽标缺失会被抓到」，
+ * 证不到「徽标在、但文案是硬编码中文」也会被抓到。这两件事不一样：前者只压到
+ * 「等值断言非空转」，后者才压到 BUG-128 的具体形态。
+ *
+ * 打开后，在 en-US 那一轮把徽标文案改回**硬编码中文**（`图片` / `视频`），
+ * 期望 en-US 的两条断言变红 → exit 1；同时 zh-CN 的断言应保持全绿，
+ * 从而证明失败被精确归因到 en-US 场景，而不是断言整体失灵。
+ */
+const REVERT_I18N_TO_PRE_FIX = process.env.ORIG_VERIFY_REVERT_I18N === '1'
+
+/**
+ * BUG-128 修复前的硬编码徽标文案（自证伪用）。
+ *
+ * 只在这里出现一次 —— 注入页面时作为参数传进去，注入函数本身不含中文字面量。
+ */
+const PRE_FIX_KIND_LABEL = { video: '视频', photo: '图片', audio: '音频', file: '文档' }
 
 /** 断言结果收集器（模块级：失败路径也要能 dump 已跑过的项）。 */
 const results = []
@@ -394,6 +419,38 @@ async function injectPreFixIntoGrid(page) {
       }
       return n
     }),
+  )
+}
+
+/**
+ * 自证伪（BUG-128）：把当前网格的徽标文案改回**硬编码中文**，模拟修复前形态。
+ *
+ * 与 `injectPreFixIntoGrid` 的区别：那个删徽标，这个**保留**徽标只换文案 ——
+ * 专门用来压 BUG-128 的那两条断言（等值 + CJK 扫描）是否真的有判别力。
+ *
+ * @param {object} page CDP page
+ * @param {Record<string, string>} labels kind → 硬编码中文文案
+ * @returns {Promise<number>} 被改写的卡片数
+ */
+async function injectPreFixLabelsIntoGrid(page, labels) {
+  return Number(
+    await page.evaluate(map => {
+      const layerSelector = '[class*="bg-black/45"]'
+      let n = 0
+      for (const card of document.querySelectorAll('[data-testid="media-card"]')) {
+        const badge = card.querySelector('[data-testid="item-kind"]')
+        if (!badge) continue
+        const layer = card.querySelector(layerSelector)
+        const svg = layer ? layer.querySelector('svg') : null
+        const cls = svg ? svg.getAttribute('class') || '' : ''
+        // 用悬浮图标反推 kind —— 它语言无关，可以当作地面真值
+        const kind = /lucide-zoom-in\b/.test(cls) ? 'photo' : /lucide-play\b/.test(cls) ? 'video' : null
+        if (!kind || !map[kind]) continue
+        badge.textContent = map[kind]
+        n++
+      }
+      return n
+    }, labels),
   )
 }
 
@@ -779,6 +836,12 @@ async function main() {
     if (enPhotoSynced) check('en-US 图片分类网格刷新到后端条数', true, `expected=${photoExpected}`)
     // 自证伪通道在新一轮里也要续上：切视图后 DOM 重建，注入会丢
     if (REVERT_TO_PRE_FIX) await injectPreFixIntoGrid(page)
+    if (REVERT_I18N_TO_PRE_FIX) {
+      const n = await injectPreFixLabelsIntoGrid(page, PRE_FIX_KIND_LABEL)
+      console.log(
+        `[verify:card-kind] FALSIFY(i18n): 已把 ${n} 张图片卡片的徽标改回硬编码中文（模拟 BUG-128 修复前）`,
+      )
+    }
 
     {
       const grid = await page.evaluate(collectGridInPage)
