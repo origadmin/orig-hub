@@ -537,21 +537,43 @@ export function SeriesDetail(props: {
           </h4>
           <div className="flex gap-2 overflow-x-auto pb-1" data-testid="series-gallery">
             {photoEps.map((ep, i) => (
-              <button
+              // 外层用 div 而非 button：每张图里要放「浏览」与「移除」两个按钮，
+              // 外层若仍是 button 会形成**嵌套按钮**（HTML 非法，点击语义也会串）。
+              <div
                 key={ep.id}
-                type="button"
-                onClick={() => setViewerIndex(i)}
-                title={ep.title || '浏览图片'}
-                data-testid="series-gallery-item"
-                className="h-16 w-24 shrink-0 overflow-hidden rounded border border-border-subtle bg-surface-2"
+                className="group relative h-16 w-24 shrink-0 overflow-hidden rounded border border-border-subtle bg-surface-2"
               >
-                <img
-                  src={mediaItemUrl(ep.itemId)}
-                  alt={ep.title || '剧集图片'}
-                  loading="lazy"
-                  className="h-full w-full object-cover"
-                />
-              </button>
+                <button
+                  type="button"
+                  onClick={() => setViewerIndex(i)}
+                  title={ep.title || '浏览图片'}
+                  data-testid="series-gallery-item"
+                  className="block h-full w-full"
+                >
+                  <img
+                    src={mediaItemUrl(ep.itemId)}
+                    alt={ep.title || '剧集图片'}
+                    loading="lazy"
+                    className="h-full w-full object-cover"
+                  />
+                </button>
+                {/* 移除入口：与分集列表的「移除」同一语义（只摘除归属，内容留在资料库）。
+                    ⚠️ 已取证（2026-09-22，实测本机 orig-tg）：TG 自动成剧的图片分集被摘除后，
+                    `append_episodes_ranged`（media.rs:1714）只按**当前** media_episode 行去重，
+                    没有任何「已摘除」负向记录 —— 同一 TG 组下一次重新缓存/同步会把它**重新编回**
+                    （实测：移除 itemId=143 后再次 append，该图复活）。要「删了不回来」，
+                    后端需补一条 tombstone（负向记录）。详见 BUG-112 风险节。 */}
+                <button
+                  type="button"
+                  onClick={() => onRemoveEpisode(ep)}
+                  title="从剧集中移除（内容保留在资料库）"
+                  aria-label="从剧集中移除（内容保留在资料库）"
+                  data-testid="series-gallery-remove"
+                  className="absolute right-0.5 top-0.5 flex h-5 w-5 items-center justify-center rounded bg-black/60 text-white opacity-0 transition-opacity hover:bg-destructive focus-visible:opacity-100 group-hover:opacity-100"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
             ))}
           </div>
         </div>
