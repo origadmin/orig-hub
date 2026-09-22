@@ -129,7 +129,8 @@ async function main() {
   const clearable = (pv0.total?.count ?? 0) + (pv0.orphan?.count ?? 0)
   const paths0 = await filePaths()
   console.log(
-    `CACHE: files=${st0.files} bytes=${st0.bytes} external=${st0.external} ` +
+    // BUG-136 起 `stats.external` 与 `preview.external` 同形状（{count,bytes,removable}）。
+    `CACHE: files=${st0.files} bytes=${st0.bytes} external=${st0.external.count} ` +
       `clearable=${clearable} orphan=${pv0.orphan?.count}`,
   )
 
@@ -275,8 +276,10 @@ async function main() {
       const extText = extRows > 0 ? await page.locator('[data-testid="cache-bytes-external"]').first().innerText() : ''
       check(
         '③c 外部文件数如实（有则报数、无则不出现）',
-        st0.external > 0 ? extRows > 0 && extText.includes(String(st0.external)) : extRows === 0,
-        `api.external=${st0.external} ui="${extText.replace(/\s+/g, ' ')}" rows=${extRows}`,
+        st0.external.count > 0
+          ? extRows > 0 && extText.includes(String(st0.external.count))
+          : extRows === 0,
+        `api.external=${st0.external.count} ui="${extText.replace(/\s+/g, ' ')}" rows=${extRows}`,
       )
 
       // ─────────── ④ 分档按钮齐备且按可清理量禁用 ───────────
@@ -465,7 +468,7 @@ async function main() {
     total: checks.length,
     passed: checks.length - failed.length,
     failed: failed.map((c) => c.name),
-    cache: { files: st0.files, bytes: st0.bytes, external: st0.external, clearable },
+    cache: { files: st0.files, bytes: st0.bytes, external: st0.external.count, clearable },
     checks,
   }
   fs.writeFileSync(path.join(OUT, 'result.json'), JSON.stringify(report, null, 2))
