@@ -12,6 +12,7 @@ import {
 } from 'lucide-react'
 import type { MediaItem } from '../../api/media'
 import { mediaItemUrl } from '../../api/media'
+import { useTranslation } from '../../i18n'
 import { coverFit, fmtDuration, fmtSize, hasMediaBytes } from '../../lib/tgmedia'
 import {
   generateImageThumb,
@@ -55,14 +56,22 @@ const KIND_ACTION_ICON: Record<string, LucideIcon> = {
 const FALLBACK_ACTION_ICON: LucideIcon = Maximize2
 
 /**
- * 类型徽标文案（BUG-123）：不 hover 也能分辨条目类型。
+ * 类型徽标文案（BUG-123 引入，BUG-128 改为 i18n 键）。
+ *
+ * 这里存的是 **i18n 键**，不是文案 —— tauri-shell 是双语应用，硬编码中文会让
+ * 英文界面里混排「视频」「图片」（BUG-128）。渲染时才用 `t()` 求值。
+ *
+ * 为什么不复用 `media.videos` / `media.photos`：那三个是**复数分类名**
+ * （左栏分类按钮的文案），徽标是**单数类型名**，语义不同 —— 复用会让将来改
+ * 分类名时意外改掉徽标。
+ *
  * 视觉刻意压低（10px、半透明黑底）—— 它是辅助信号，不抢标题与封面的戏。
  */
-const KIND_LABEL: Record<string, string> = {
-  video: '视频',
-  photo: '图片',
-  audio: '音频',
-  file: '文档',
+const KIND_LABEL_KEY: Record<string, string> = {
+  video: 'media.kindVideo',
+  photo: 'media.kindPhoto',
+  audio: 'media.kindAudio',
+  file: 'media.kindFile',
 }
 
 /**
@@ -197,7 +206,18 @@ function MediaCardBase(props: {
 
   /** 悬浮图标按类型取（BUG-123），未知类型退回中性「打开」 */
   const ActionIcon = KIND_ACTION_ICON[item.kind] ?? FALLBACK_ACTION_ICON
-  const kindLabel = KIND_LABEL[item.kind]
+
+  /**
+   * 徽标文案（BUG-128）：必须走 `useTranslation()`，**不能**裸 import 模块级 `t()`。
+   *
+   * 模块级 `t()` 读的是 `useStore.getState()`（i18n/index.ts），它自己**不订阅**语言；
+   * 真正订阅 `settings.language` 的是 `useTranslation()`。而本组件外层包着 `memo`，
+   * 裸 `t()` 会让用户切语言后卡片**不重渲染** —— 徽标停在上一个语言，直到别的 prop
+   * 变了才顺带刷新。那正是本条缺陷最容易踩的坑，所以订阅必须挂在组件上。
+   */
+  const { t } = useTranslation()
+  const kindKey = KIND_LABEL_KEY[item.kind]
+  const kindLabel = kindKey ? t(kindKey) : null
 
   return (
     <div
