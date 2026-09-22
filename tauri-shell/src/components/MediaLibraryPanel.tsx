@@ -3,8 +3,6 @@ import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { useTranslation } from '../i18n'
 import { useStore } from '../store/useStore'
-import { enqueueCacheTask, tgHealth } from '../api/tg'
-import { ensureTg } from '../api/tauri'
 import {
   deleteMediaItem,
   deleteEpisode,
@@ -36,7 +34,14 @@ import { ImportDialog } from './media/ImportDialog'
 import { BulkTagDialog, TagManagerDialog } from './media/TagManagerDialog'
 import { AddToSeriesDialog, CreateSeriesDialog, MergeSeriesDialog } from './media/SeriesDialog'
 import { ItemEditDialog } from './media/ItemEditDialog'
-import { fmtSize, isRawFileName, parseTgRef } from '../lib/tgmedia'
+import {
+  fmtSize,
+  isRawFileName,
+  canRecacheFromSource,
+  recacheFromSource,
+  probeIngestBackend,
+  ensureIngestBackend,
+} from '../lib/mediaSources'
 import type { ViewerItem } from '../types'
 
 type Tab = 'all' | MediaKind
@@ -82,12 +87,12 @@ export function MediaLibraryPanel() {
   const [alive, setAlive] = useState(false)
   useEffect(() => {
     const isTauri = '__TAURI_INTERNALS__' in window
-    tgHealth()
+    probeIngestBackend()
       .then(() => setAlive(true))
       .catch(async () => {
         if (!isTauri) return
         try {
-          await ensureTg()
+          await ensureIngestBackend()
           setAlive(true)
         } catch {
           setAlive(false)
@@ -353,13 +358,8 @@ export function MediaLibraryPanel() {
    */
   const recacheItem = useCallback(
     (item: MediaItem) => {
-      if (item.source !== 'tg') return
-      const tg = parseTgRef(item.ref)
-      if (!tg) {
-        setError('这条内容的来源标识不是 chat:msg，无法重新缓存')
-        return
-      }
-      enqueueCacheTask({ chatId: tg.chatId, messageIds: [tg.messageId] })
+      if (!canRecacheFromSource(item.source)) return
+      recacheFromSource(item.ref, item.source)
         .then(() => setError('已重新入队缓存，完成后字节会回到资料库'))
         .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
     },
