@@ -156,6 +156,34 @@ function fromLive(chatId: number, m: TgMediaItem): FeedItem {
   }
 }
 
+/** 全局命中 → feed 视图模型（与 `fromStored` 同构，键前缀 `g-` 区分来源） */
+function fromHit(h: TgStoredMessage): FeedItem {
+  return {
+    key: `g-${h.channelId}-${h.messageId}`,
+    chatId: h.channelId,
+    messageId: h.messageId,
+    caption: h.caption,
+    mimeType: h.mimeType,
+    size: h.size,
+    type: h.type ?? guessMediaType(h.mimeType),
+    date: h.date ?? h.createdAt,
+    duration: h.duration,
+    groupId: h.groupId,
+    downloaded: h.downloaded,
+  }
+}
+
+/**
+ * 能否进内置播放器（BUG-137 邻居序列的准入判据）。
+ *
+ * `MediaViewer` 内部按 `modeOf(kind)` 分流：photo → 浏览、video/audio → 连播，
+ * 而 `file` 是 `none`（没有可呈现形态）。把 `file` 塞进序列，‹ › 就会在两个
+ * 「不支持预览」的条目之间空翻 —— 那不是邻居，是噪音。
+ */
+function isPlayable(u: FeedItem): boolean {
+  return u.type !== 'file'
+}
+
 /**
  * 相册聚合（v0.4.2）：把相邻且同 (chatId, groupId) 的消息合并为一个相册单元。
  * feed 为旧→新顺序；无 groupId 的消息（历史旧行/单条媒体）各自成单元。
@@ -680,25 +708,25 @@ export function TgPanel(
     }
   }, [globalSearch, setError, setGlobalHits, setGlobalSearching])
 
+  /**
+   * 命中集里的**可播**子集 —— 全局搜索预览的邻居序列（BUG-137）。
+   *
+   * 顺序即命中顺序（用户看到的那一行行结果），不按频道重排。
+   */
+  const playableHits = useMemo(() => globalHits.map(fromHit).filter(isPlayable), [globalHits])
+
   /** 点全局命中 → 打开预览（已缓存走本地流，未缓存在线流），标题带频道名 */
   const onGlobalHitPreview = useEvent((hit: TgStoredMessage & { channelTitle?: string }) => {
-    const item: FeedItem = {
-      key: `g-${hit.channelId}-${hit.messageId}`,
-      chatId: hit.channelId,
-      messageId: hit.messageId,
-      caption: hit.caption,
-      mimeType: hit.mimeType,
-      size: hit.size,
-      type: hit.type ?? guessMediaType(hit.mimeType),
-      date: hit.date ?? hit.createdAt,
-      duration: hit.duration,
-      groupId: hit.groupId,
-      downloaded: hit.downloaded,
-    }
+    const item = fromHit(hit)
+    // BUG-137：命中集就是邻居序列（跨频道搜索结果按命中顺序）。此前这里只传
+    // `[item]`，于是 TG 侧永远没有上一条/下一条，而同一个播放器在媒体库侧能连播整剧。
+    const seq = playableHits
+    const idx = seq.findIndex((u) => u.key === item.key)
     openViewer({
       title: hit.channelTitle,
-      index: 0,
-      items: toViewerItems([item]),
+      // 点击项不可播（file）时它不在序列里 —— 单条打开，不谎报位置。
+      index: idx < 0 ? 0 : idx,
+      items: toViewerItems(idx < 0 ? [item] : seq),
     })
   })
 
@@ -866,6 +894,41 @@ export function TgPanel(
   // ---- 内容流相册聚合：相邻同 groupId 的消息合并为一个相册气泡（v0.4.2） ----
   const albumUnits = useMemo(() => groupAlbums(feed), [feed])
 
+  /**
+   * 当前流里的**可播**序列 —— 单条气泡与相册预览共用的邻居序列（BUG-137）。
+   *
+   * 顺序与 feed 一致：`albumUnits` 是按 feed 顺序切出来的，展平即 feed 本身，
+   * 所以相册的最后一张之后能走到**下一个单元**（相邻相册 / 下一条单发），
+   * 而不是像此前那样走到组内末尾就断了。
+   */
+  const playableFeed = useMemo(() => feed.filter(isPlayable), [feed])
+
+  /**
+   * 打开内置播放器并带上邻居序列（BUG-137）。
+   *
+   * 三处入口此前各自只传单条或单相册，于是 TG 侧永远没有上一条/下一条，而媒体库侧
+   * 同一个播放器能连播整部剧集 —— 同一播放器两种能力，用户感知为「时好时坏」。
+   * 这里统一按「点击项在可播序列中的真实位置」给 `index`（`MediaViewer` 内部还会
+   * 按 kind 再分流：图片走浏览、视频/音频走连播）。
+   *
+   * 点击项本身不可播（`file`）时它不在序列里 —— 此时退回调用方给的兜底列表
+   * （单条或本相册），**不拿 0 顶上去**：那会打开另一条，等于谎报位置。
+   */
+  const openPlayable = useEvent(
+    (item: FeedItem | undefined, fallback: FeedItem[], fallbackIndex: number) => {
+      const idx = item ? playableFeed.findIndex((u) => u.key === item.key) : -1
+      if (!item || idx < 0) {
+        openViewer({
+          title: selectedChannel?.title,
+          index: fallbackIndex,
+          items: toViewerItems(fallback),
+        })
+        return
+      }
+      openViewer({ title: selectedChannel?.title, index: idx, items: toViewerItems(playableFeed) })
+    },
+  )
+
   /** 归一化 feed 条目 → 全局播放器条目（已缓存走本地流并带在线降级，未缓存直连在线流） */
   const toViewerItems = (unit: FeedItem[]) =>
     unit.map((u) => {
@@ -1017,23 +1080,20 @@ export function TgPanel(
   const onBubbleDownload = useEvent((item: FeedItem) => void doDownload(item))
   const onBubbleImportPhoto = useEvent((item: FeedItem) => void importPhoto(item))
   const onBubbleOpen = useEvent((item: FeedItem) => void openDownloaded(item))
-  const onBubblePreview = useEvent((item: FeedItem) =>
-    openViewer({
-      title: selectedChannel?.title,
-      index: 0,
-      items: toViewerItems([item]),
-    }),
-  )
+  const onBubblePreview = useEvent((item: FeedItem) => openPlayable(item, [item], 0))
   const onAlbumDownload = useEvent((items: FeedItem[]) => void downloadAlbum(items))
   const onAlbumCancel = useEvent((items: FeedItem[]) =>
     void cancelAlbum(`a-${items[0].chatId}-${items[0].groupId}`),
   )
+  /**
+   * 相册预览：`items` 是**一个**相册单元，序列却要覆盖**相邻单元**（BUG-137）。
+   *
+   * 组内位置 `index` 是单元内下标，不能直接拿去当全流下标：换算交给
+   * `openPlayable`（按 key 在可播序列里定位）。走到组内最后一张之后因此还能继续
+   * 翻到下一个单元，而不是像此前那样断在相册边界。
+   */
   const onAlbumPreview = useEvent((index: number, items: FeedItem[]) =>
-    openViewer({
-      title: selectedChannel?.title,
-      index,
-      items: toViewerItems(items),
-    }),
+    openPlayable(items[index], items, index),
   )
 
   return (
@@ -1344,6 +1404,8 @@ export function TgPanel(
                           key={`${hit.channelId}-${hit.messageId}`}
                           type="button"
                           onClick={() => onGlobalHitPreview(hit)}
+                          data-testid="tg-hit-preview"
+                          data-message-id={hit.messageId}
                           className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-surface-2/70"
                         >
                           <span className="w-10 shrink-0 text-center text-[9px] text-muted">
@@ -1817,6 +1879,8 @@ const AlbumBubble = memo(function AlbumBubble(props: {
                 key={it.key}
                 type="button"
                 onClick={() => onPreview(i, items)}
+                data-testid={`tg-album-tile-${i}`}
+                data-message-id={it.messageId}
                 className={cn(
                   'relative block w-full overflow-hidden rounded-lg bg-surface-2',
                   // 单图给自然比例（整幅呈现）；多图用方形格保证网格整齐
@@ -1936,11 +2000,13 @@ function PhotoBlock({ item, onPreview }: { item: FeedItem; onPreview: () => void
     )
   }
   return (
-    <button
-      type="button"
-      onClick={onPreview}
-      className="block w-full overflow-hidden rounded-lg bg-surface-2"
-    >
+      <button
+        type="button"
+        onClick={onPreview}
+        className="block w-full overflow-hidden rounded-lg bg-surface-2"
+        data-testid="tg-photo-preview"
+        data-message-id={item.messageId}
+      >
       <img
         src={tgThumbUrl(item.chatId, item.messageId)}
         alt={item.caption || ''}

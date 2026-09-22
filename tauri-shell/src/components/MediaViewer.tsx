@@ -140,6 +140,7 @@ export function MediaViewer(props: {
     <div
       className={cn('flex min-h-0 flex-col bg-surface/20', className)}
       data-testid="media-viewer"
+      data-message-id={cur.messageId}
     >
       {/* 返回行：← 返回 + 标题 + 位置/总数 */}
       <div className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-3 py-2.5">
@@ -158,11 +159,19 @@ export function MediaViewer(props: {
             {t('player.browse')}
           </span>
         )}
-        <span className="min-w-0 flex-1 truncate text-[12px] text-muted">
+        <span
+          className="min-w-0 flex-1 truncate text-[12px] text-muted"
+          data-testid="viewer-title"
+        >
           {title || cur.caption?.trim() || `#${cur.messageId}`}
         </span>
         {positionText && (
-          <span className="shrink-0 text-[11px] tabular-nums text-muted">{positionText}</span>
+          <span
+            className="shrink-0 text-[11px] tabular-nums text-muted"
+            data-testid="viewer-position"
+          >
+            {positionText}
+          </span>
         )}
       </div>
 
@@ -175,6 +184,7 @@ export function MediaViewer(props: {
               type="button"
               aria-label={browse ? t('player.prevPhoto') : t('player.prevItem')}
               onClick={() => goTo(prevItem)}
+              data-testid="viewer-prev"
               className="absolute left-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-lg text-white hover:bg-white/20"
             >
               ‹
@@ -218,6 +228,7 @@ export function MediaViewer(props: {
               type="button"
               aria-label={browse ? t('player.nextPhoto') : t('player.nextItem')}
               onClick={() => goTo(nextItem)}
+              data-testid="viewer-next"
               className="absolute right-3 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-white/10 text-lg text-white hover:bg-white/20"
             >
               ›
