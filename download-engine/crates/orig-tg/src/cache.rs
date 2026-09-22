@@ -20,6 +20,7 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use serde::Serialize;
 use serde_json::json;
 
 use crate::media::CachedBytesDetail;
@@ -92,7 +93,10 @@ pub fn inside_dir(dir: &Path, p: &str) -> bool {
 /// 三态而非布尔，是为了不重蹈 `inside_dir` 的覆辙——它在 canonicalize 失败时
 /// 静默返回 `false`，把「判断不出来」和「确实不在目录内」混为一谈。
 /// 这里同理：`Unknown` 必须能被区分，因为两种后续动作完全不同。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// BUG-132：`BytesPresence` 现在要随条目一起下发到前端（条目视图与分集视图共用同一判据），
+// 故补 `Serialize`。`lowercase` → JSON 里是 `"present" / "missing" / "unknown"`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BytesPresence {
     /// 文件存在且非空 → 可以走本地播放。
     Present,

@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use libsql::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 
+use crate::cache::{probe_cached_bytes, BytesPresence};
 use crate::store::Store;
 
 fn now_secs() -> i64 {
@@ -539,6 +540,91 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
         (),
     )
     .await?;
+
+    // ── BUG-126 规则级不变量：用户摘除的内容不得被**自动路径**重新编回 ──
+    //
+    // 缺陷原形（BUG-112 取证实测）：`append_episodes_ranged` 只按**当前** `media_episode`
+    // 行去重，`remove_episode` 也不留任何「已摘除」记录 —— 于是同一 TG 组下一次重新缓存
+    // （自动成剧）会把用户刚摘掉的条目**原样编回**，表现为「删了又回来」。
+    //
+    // 修法：摘除分集时写一条墓碑 `(series_id, item_id)`，自动路径追加时跳过命中墓碑的
+    // 候选条目；用户**显式**再加（`add_episode` / `append_episodes` /
+    // `attach_episode_source` / `merge_series`）清掉墓碑 —— 用户意图高于系统惯例，
+    // 否则误删后再也加不回来，等于把 bug 修成另一个 bug。
+    //
+    // 身份取「内容」`(series_id, item_id)` 而非「槽位」`(series_id, season, episode_no)`：
+    // `remove_episode` 会重排该季后续集号，槽位在删掉中间一集后整体位移，拿它做墓碑会出现
+    // 「删了 E1 却把 E2 的位置也封掉」这类怪事；内容身份跨重编号稳定。
+    //
+    // ── 跨剪枝存活（BUG-126 追加）──
+    // `prune_empty_series` 会在剧集 0 分集时**删掉剧集行**，触发器随之清墓碑；若该剧是 TG
+    // 自动成剧（有 `source_key`），下次同组同步会按 `source_key` 重建剧集（**新 id**），
+    // 旧墓碑 `(旧 series_id, item_id)` 不再匹配 → 条目复活。用户场景**真实命中**：一个只有
+    // 1~2 张图的组，把图**全部**移除 → 剧集被剪枝 → 下次同步图全回来。
+    //
+    // 修法：墓碑额外**快照**该剧当时的 `source_key`。它是「TG 自动成剧的幂等来源键」
+    // （`media_series.source_key`，带 `WHERE source_key IS NOT NULL` 唯一索引，且有
+    // `find_series_by_source_key` 反查）—— 重建后 **id 变、key 不变**，故 key 是稳定身份。
+    // 匹配条件：`series_id = ?` **或** `(source_key IS NOT NULL AND source_key = ?)`。
+    // 手工建的剧集没有来源键（key = NULL），第二个条件恒假，仍只靠 series_id。
+    //
+    // 表**单独** `CREATE TABLE IF NOT EXISTS`，不进上面的建表批（BUG-032：批里只允许出现
+    // 新旧库都存在的对象；新表虽然安全，但保持与 `media_episode_source` 同一写法更好审）。
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS media_episode_removed (
+            series_id  INTEGER NOT NULL,
+            item_id    INTEGER NOT NULL,
+            removed_at INTEGER NOT NULL,
+            source_key TEXT,
+            PRIMARY KEY (series_id, item_id)
+        )",
+        (),
+    )
+    .await?;
+    // 旧库补列（BUG-032 纪律）：**单独** `pragma_table_info` 探测 + `ALTER TABLE ADD COLUMN`，
+    // 绝不把新列塞进任何批、也不让批里出现引用它的语句 —— 否则旧库首次启动会整批失败，
+    // `Store::open` 回落空库，表现得像「用户数据全没了」。
+    let probe = conn
+        .prepare(
+            "SELECT 1 FROM pragma_table_info('media_episode_removed') WHERE name = 'source_key'",
+        )
+        .await?;
+    let exists = probe.query(()).await?.next().await?.is_some();
+    if !exists {
+        conn.execute(
+            "ALTER TABLE media_episode_removed ADD COLUMN source_key TEXT",
+            (),
+        )
+        .await?;
+    }
+    // 剧集被删时连带清墓碑，否则行会泄漏。用触发器而非逐入口补 DELETE（BUG-110/124 教训）：
+    // 删 `media_series` 的入口有三个 —— `delete_series`、`prune_empty_series`、以及本函数
+    // 早段的空剧集清理 —— 将来还会更多，逐点打补丁必漏。
+    //
+    // ⚠️ **只清 `source_key IS NULL` 的墓碑**：手工剧集（无来源键）没有任何路径会重建它
+    // （自动成剧的 `find_series_by_source_key` 只按非空 key 反查），清掉是安全的；而
+    // **带来源键的墓碑必须活过剧集删除** —— 否则上面的跨剪枝识别白做，自动路径重建后
+    // 立刻复活。带键墓碑的最终清理走**用户显式**路径 `delete_series_explicit`。
+    //
+    // ⚠️ 关联条件只用**同名字段** `series_id = OLD.id`。`media_series.id` 与 `media_episode.id`
+    // 都是小整数自增，跨表借位关联（如 `episode_id = OLD.id`）会在小整数区间**偶然命中**
+    // 别的表的行 —— 那不是「几乎不会发生」，是「迟早会」。故此处刻意不做任何跨表关联。
+    //
+    // ⚠️ 与 BUG-044 / BUG-124 同一纪律：先 DROP 再 CREATE。`CREATE TRIGGER IF NOT EXISTS`
+    // 只防重复创建，**不会**在触发器定义变更时刷新已升级库上的旧定义。
+    conn.execute_batch("DROP TRIGGER IF EXISTS trg_media_series_cleanup_removed;")
+        .await?;
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS trg_media_series_cleanup_removed
+             AFTER DELETE ON media_series
+             FOR EACH ROW
+             BEGIN
+                 DELETE FROM media_episode_removed
+                  WHERE series_id = OLD.id AND source_key IS NULL;
+             END",
+        (),
+    )
+    .await?;
     Ok(())
 }
 
@@ -612,6 +698,14 @@ pub struct MediaItem {
     pub tags: Vec<TagRef>,
     pub series_id: Option<i64>,
     pub series_title: Option<String>,
+    /// 磁盘字节真值（BUG-132）：**唯一**的「这条内容现在能不能本地播」判据。
+    ///
+    /// 为什么不能沿用 `file_path IS NOT NULL`：那是数据库里的**承诺**不是字节本身 ——
+    /// 文件被外部删除 / 下载写成 0 字节时它照样说「有」。前端曾因此落到
+    /// `Boolean(item.filePath)` 兜底，与分集视图的 `hasBytes` 形成两套判据。
+    /// 现在条目与分集都改由 `probe_cached_bytes()` 探测，且**保留三态**不压成布尔
+    /// （`Unknown` = stat 失败但并非不存在，既不声称可播也不复位状态）。
+    pub bytes_presence: BytesPresence,
 }
 
 /// 剧集列表项（含分集数，卡片墙用）。
@@ -770,7 +864,29 @@ fn media_item_from_row(r: &Row) -> libsql::Result<MediaItem> {
         series_id: r.get(12)?,
         series_title: r.get(13)?,
         description: r.get(14)?,
+        // 占位值：**必须由调用方** `attach_bytes_presence()` 覆盖。
+        // 这里填 `Missing` 而不是 `Unknown` —— `Unknown` 的语义是「stat 失败、别动状态」，
+        // 用它当初始值会让「忘了探测」看起来像一次合法判定。填 `Missing` 则方向保守：
+        // 宁可说没有（UI 给重缓存入口），不要说有（点开播不了）。
+        bytes_presence: BytesPresence::Missing,
     })
+}
+
+/// 给一批条目补上磁盘字节真值（BUG-132）。
+///
+/// **凡是返回 `MediaItem` 的出口都必须过这一道** —— 否则下发的是上面的占位值。
+/// 当前出口只有 `list_media_items` / `get_media_item` 两个；**新增出口时同样必须调用**。
+///
+/// 成本：每条一次 stat（`tokio::fs`，不占运行时线程、不碰 DB）。一页至多 500 条，
+/// 远低于一次 DB 查询；这里**不做批量裁剪** —— 裁剪等于放行未校验的条目，
+/// BUG-101（「已缓存」却 404）会原样复发。
+pub async fn attach_bytes_presence(items: &mut [MediaItem]) {
+    for it in items.iter_mut() {
+        it.bytes_presence = match it.file_path.as_deref() {
+            Some(p) => probe_cached_bytes(p).await,
+            None => BytesPresence::Missing,
+        };
+    }
 }
 
 /// 内容行投影。
@@ -839,6 +955,7 @@ impl Store {
             out.push(media_item_from_row(&r)?);
         }
         self.attach_item_tags(&mut out).await?;
+        attach_bytes_presence(&mut out).await; // BUG-132：出口必须补字节真值
         Ok(out)
     }
 
@@ -919,6 +1036,7 @@ impl Store {
                 let mut v = vec![it];
                 self.attach_item_tags(&mut v).await?;
                 it = v.remove(0);
+                attach_bytes_presence(std::slice::from_mut(&mut it)).await; // BUG-132
                 Ok(Some(it))
             }
             None => Ok(None),
@@ -1261,12 +1379,15 @@ impl Store {
         let stmt = self
             .conn
             .prepare(
-                // 末列 `i.file_path IS NOT NULL` = `has_bytes`（BUG-080），不新增列：
-                // 「有没有字节」就是 `file_path` 有没有值，再存一份布尔必会与之漂移。
+                // 末列取 `i.file_path` 本身（BUG-080 加的列不改，仍不新增列）。
+                // BUG-132：原先这里取 `i.file_path IS NOT NULL` 直接当 `has_bytes` ——
+                // 那是数据库里的**承诺**不是字节本身（文件被外部删 / 下载写成 0 字节
+                // 时它照样说「有」），且与条目视图的判据不是同一个。现在改为读出路径后
+                // 走 `probe_cached_bytes()`，与条目视图**同一套真值**。
                 "SELECT e.id, e.item_id, e.season, e.episode_no,
                         i.title, i.poster, i.duration, i.kind, i.description,
                         e.origin_series_title, e.origin_episode_no, i.source, i.ref,
-                        e.episode_no_end, i.file_path IS NOT NULL
+                        e.episode_no_end, i.file_path
                    FROM media_episode e
                    LEFT JOIN media_item i ON i.id = e.item_id
                   WHERE e.series_id = ?1
@@ -1276,6 +1397,12 @@ impl Store {
         let mut rows = stmt.query(params![id]).await?;
         let mut episodes = Vec::new();
         while let Some(r) = rows.next().await? {
+            // BUG-132：同 `attach_bytes_presence` —— 分集与条目共用 `probe_cached_bytes`。
+            let file_path: Option<String> = r.get(14)?;
+            let presence = match file_path.as_deref() {
+                Some(p) => probe_cached_bytes(p).await,
+                None => BytesPresence::Missing,
+            };
             episodes.push(EpisodeView {
                 id: r.get(0)?,
                 item_id: r.get(1)?,
@@ -1291,9 +1418,9 @@ impl Store {
                 source: r.get(11)?,
                 ref_key: r.get(12)?,
                 episode_no_end: r.get(13)?,
-                // SQLite 的 `IS NOT NULL` 是 0/1 整数，按整数读再转 bool —— 不对驱动做
-                // 「INTEGER → bool」的隐式假设。
-                has_bytes: r.get::<i64>(14).unwrap_or(0) != 0,
+                // BUG-132：`Present` 才算有字节。`Unknown`（stat 失败但并非不存在）
+                // 按「不声称可播」处理 —— 与 `cache.rs` 的三态语义一致。
+                has_bytes: presence == BytesPresence::Present,
                 sources: Vec::new(),
             });
         }
@@ -1569,6 +1696,9 @@ impl Store {
                         ],
                     )
                     .await?;
+                // BUG-126：合并是**用户显式**操作 → 清掉目标剧集上该内容的墓碑。
+                // 否则用户刚并进来的内容仍被系统当作「已摘除」，后续自动路径会莫名跳过它。
+                self.clear_episode_tombstones(target_id, &[*item_id]).await?;
                 report.added += 1;
                 have.entry(*season).or_default().insert(*item_id);
                 let occupied_season = occupied.entry(*season).or_default();
@@ -1666,6 +1796,15 @@ impl Store {
         }
     }
 
+    /// 删除剧集行（分集 + 标签 + 剧集）。**低层结构删除**。
+    ///
+    /// ⚠️ 刻意**不碰墓碑**（BUG-126）：本方法也是**系统路径**的入口 —— 自动成剧在「重建出的
+    /// 剧集一条都挂不上」时会回滚删掉它（`routes.rs` 的 `n == 0` 分支）。若在这里按
+    /// `source_key` 清墓碑，回滚会把「用户摘除」的负向记录一并抹掉 → 下一次同步立刻复活，
+    /// 等于没修。
+    ///
+    /// 带来源键的墓碑由**用户显式**删剧 [`Store::delete_series_explicit`] 清；无来源键的
+    /// 墓碑由 `trg_media_series_cleanup_removed` 在删行时顺带清（手工剧集无重建路径）。
     pub async fn delete_series(&self, id: i64) -> libsql::Result<()> {
         self.conn
             .execute("DELETE FROM media_episode WHERE series_id = ?1", params![id])
@@ -1679,9 +1818,41 @@ impl Store {
         Ok(())
     }
 
+    /// **用户主动删剧**：删剧集行，并清掉这部剧的墓碑（两种形态：按 `series_id` 与按
+    /// `source_key`）。语义：用户删的是「**这部剧**」，负向记录已完成使命。
+    ///
+    /// 与自动剪枝 [`Store::prune_empty_series`] 刻意区分：剪枝只清 `source_key IS NULL` 的
+    /// 墓碑（见 `migrate` 触发器注释），**带键墓碑必须活过剪枝** —— 否则「删了又回来」。
+    /// 这条走**用户显式**路径，把带键墓碑一并清掉才是对的。
+    pub async fn delete_series_explicit(&self, id: i64) -> libsql::Result<()> {
+        // 必须在删行**之前**读 `source_key`：删完就查不到了。
+        let key = self.series_source_key(id).await?;
+        self.delete_series(id).await?;
+        self.conn
+            .execute(
+                "DELETE FROM media_episode_removed WHERE series_id = ?1",
+                params![id],
+            )
+            .await?;
+        if let Some(k) = key {
+            self.conn
+                .execute(
+                    "DELETE FROM media_episode_removed
+                      WHERE source_key IS NOT NULL AND source_key = ?1",
+                    params![k],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     /// 加入分集。同 (series, season, episode_no) 已存在则更新指向的条目。
     ///
     /// 不收标题：分集的标题永远等于它指向条目的标题（见 [`EpisodeView::title`]）。
+    ///
+    /// 这是**用户显式**的单条加入入口 → 先清掉该内容的墓碑（BUG-126）。
+    /// 清墓碑**不能**下沉到 `add_episode_ranged`：`append_episodes_ranged`（自动路径）
+    /// 也走那里，下沉会让自动路径顺手把墓碑清掉，等于没修。
     pub async fn add_episode(
         &self,
         series_id: i64,
@@ -1689,12 +1860,17 @@ impl Store {
         season: i64,
         episode_no: i64,
     ) -> libsql::Result<i64> {
+        self.clear_episode_tombstones(series_id, &[item_id]).await?;
         self.add_episode_ranged(series_id, item_id, season, episode_no, None)
             .await
     }
 
     /// 同 `add_episode`，但支持合集范围（BUG-039）：`episode_no_end` 记录该条目
     /// 占用槽位的终点（如 1-2 集合集：no=1, end=2）。NULL = 单集。
+    ///
+    /// ⚠️ 这是**低层原语**，**不查墓碑**（BUG-126）：调用方自行决定语义 ——
+    /// 用户显式路径请走 `add_episode`（会清墓碑），自动路径请走
+    /// `append_episodes_ranged`（会跳过墓碑）。
     pub async fn add_episode_ranged(
         &self,
         series_id: i64,
@@ -1733,12 +1909,19 @@ impl Store {
     }
 
     /// 把多条内容按当前顺序批量追加为同一季的连续集号。
+    ///
+    /// 这是**用户显式**的「加入剧集」入口 → 先清掉这些内容的墓碑再追加（BUG-126）。
+    ///
+    /// 自动路径（同组重新缓存 / 自动成剧 / 同步重建）**直接调**
+    /// [`Store::append_episodes_ranged`]，不经这里 —— 所以那条路上的墓碑仍然生效，
+    /// 这正是本条要拦的「删了又回来」。
     pub async fn append_episodes(
         &self,
         series_id: i64,
         season: i64,
         item_ids: &[i64],
     ) -> libsql::Result<i64> {
+        self.clear_episode_tombstones(series_id, item_ids).await?;
         let items: Vec<(i64, Option<(i64, i64)>)> =
             item_ids.iter().map(|id| (*id, None)).collect();
         self.append_episodes_ranged(series_id, season, &items).await
@@ -1751,6 +1934,9 @@ impl Store {
     ///   - 未声明条目：依次排到最大终点之后。
     /// `COALESCE(episode_no_end, episode_no)` 让合集的终点参与「下一个可用位」计算，
     /// 避免 1-2 集合集之后把下一集编成 2（与合集第二集撞位）。
+    ///
+    /// ⚠️ 这是**自动路径的内核**：命中墓碑（BUG-126）的候选条目一律跳过。用户显式加入
+    /// 请走 `append_episodes` / `add_episode`，那两条路会先清墓碑。
     pub async fn append_episodes_ranged(
         &self,
         series_id: i64,
@@ -1784,9 +1970,17 @@ impl Store {
         // 而不是整个剧集：条目「位置」的唯一性本来就按季定义，同一素材被用户显式放进
         // 另一季（如 S1 正片 + S2 回顾）是合法编排，不该被全局去重吞掉。
         let have = self.season_item_ids(series_id, season).await?;
+        // BUG-126：用户摘除过的内容不得被**自动路径**重新编回（否则表现为「删了又回来」）。
+        // 按剧集一次取回墓碑集合，避免在候选循环里逐条查库。
+        let removed = self.removed_item_ids(series_id).await?;
         let mut added = 0;
         for (id, range) in items {
             if have.contains(id) {
+                continue;
+            }
+            // 墓碑只拦**自动路径**：本函数是自动成剧 / 同组重新缓存的内核。用户显式加入走
+            // `append_episodes`（先清墓碑）或 `add_episode`，不会走到这里被拦。
+            if removed.contains(id) {
                 continue;
             }
             // 声明区间完整空闲才落声明位；否则回退到最大终点之后的下一空闲带
@@ -1813,15 +2007,24 @@ impl Store {
     /// 把条目挂为某集的**备用来源**（BUG-039 冲突1：同一集有多个缓存来源）。
     /// 槽位语义 = 位置，主条目只有一个；多出来的来源挂备用，不挤占位置。
     /// 幂等：已是备用源或已是主条目则不动。返回是否新挂。
+    ///
+    /// 这是**用户显式**操作 → 清掉该内容的墓碑（BUG-126）。
     pub async fn attach_episode_source(&self, episode_id: i64, item_id: i64) -> libsql::Result<bool> {
-        let primary: Option<i64> = self
+        let row = self
             .row_opt(
-                "SELECT item_id FROM media_episode WHERE id = ?1",
+                "SELECT item_id, series_id FROM media_episode WHERE id = ?1",
                 params![episode_id],
             )
-            .await?
-            .map(|r| r.get::<i64>(0))
-            .transpose()?;
+            .await?;
+        let (primary, series_id): (Option<i64>, Option<i64>) = match row {
+            Some(r) => (Some(r.get::<i64>(0)?), Some(r.get::<i64>(1)?)),
+            None => (None, None),
+        };
+        // 清墓碑放在幂等早退**之前**：条目已是该集主条目时同样要清，否则会留下一条
+        // 「系统仍认为它被摘除」的陈旧墓碑，日后自动路径会莫名跳过它。
+        if let Some(sid) = series_id {
+            self.clear_episode_tombstones(sid, &[item_id]).await?;
+        }
         if primary == Some(item_id) {
             return Ok(false);
         }
@@ -1936,25 +2139,62 @@ impl Store {
         }
     }
 
-    /// 移除分集（内容条目保留）。
+    /// 移除分集（内容条目保留），并写下「已摘除」墓碑（BUG-126）。
+    ///
+    /// 墓碑拦住**自动路径**（同组重新缓存 / 自动成剧 / 同步重建）把它重新编回；
+    /// 用户**显式**再加会清掉墓碑（见 [`Store::clear_episode_tombstones`]）。
     pub async fn remove_episode(&self, episode_id: i64) -> libsql::Result<()> {
         // 先取出归属与位置，删后重排该季后续集号（BUG-031：此前删中间一集会留下断层，
         // 出现 S1E1、S1E3 这种编号跳跃）。
         let info = {
             let stmt = self
                 .conn
-                .prepare("SELECT series_id, season, episode_no FROM media_episode WHERE id = ?1")
+                .prepare(
+                    "SELECT series_id, season, episode_no, item_id FROM media_episode WHERE id = ?1",
+                )
                 .await?;
             let mut rows = stmt.query(params![episode_id]).await?;
             match rows.next().await? {
-                Some(r) => Some((r.get::<i64>(0)?, r.get::<i64>(1)?, r.get::<i64>(2)?)),
+                Some(r) => Some((
+                    r.get::<i64>(0)?,
+                    r.get::<i64>(1)?,
+                    r.get::<i64>(2)?,
+                    r.get::<i64>(3)?,
+                )),
                 None => None,
             }
+        };
+        // 该集挂的**全部来源**（主条目 + 备用源）必须在删行**之前**读出：BUG-124 的
+        // `trg_media_episode_cleanup_sources` 会在 DELETE 时把备用源行一并清掉，之后再也
+        // 反查不到它们挂过哪一集。
+        //
+        // 备用源一并封住的理由：用户删的是「**这一集**」，备用源是这一集的组成部分；
+        // 不一并封住，它们会以「另一集」的形态回来。
+        let alt_item_ids: Vec<i64> = {
+            let stmt = self
+                .conn
+                .prepare("SELECT item_id FROM media_episode_source WHERE episode_id = ?1")
+                .await?;
+            let mut rows = stmt.query(params![episode_id]).await?;
+            let mut out = Vec::new();
+            while let Some(r) = rows.next().await? {
+                out.push(r.get::<i64>(0)?);
+            }
+            out
         };
         self.conn
             .execute("DELETE FROM media_episode WHERE id = ?1", params![episode_id])
             .await?;
-        if let Some((sid, season, no)) = info {
+        if let Some((sid, season, no, item_id)) = info {
+            // 墓碑（BUG-126）。写在 `prune_empty_series` **之前**：若这一集是该剧最后一集，
+            // 剧集会被删 —— 但墓碑里带了该剧 `source_key` 的**快照**，而触发器只清
+            // `source_key IS NULL` 的行，故带键墓碑能活过剪枝；自动路径按 key 重建剧集后
+            // 仍认得它（见 `migrate` 中该表的「跨剪枝存活」注释）。
+            let key = self.series_source_key(sid).await?;
+            self.tombstone_episode(sid, item_id, key.as_deref()).await?;
+            for alt in &alt_item_ids {
+                self.tombstone_episode(sid, *alt, key.as_deref()).await?;
+            }
             self.conn
                 .execute(
                     "UPDATE media_episode SET episode_no = episode_no - 1
@@ -1971,6 +2211,102 @@ impl Store {
             self.prune_empty_series(sid).await?;
         }
         Ok(())
+    }
+
+    /// 记一条「已摘除」墓碑（幂等，BUG-126）。
+    ///
+    /// 身份是 `(series_id, item_id)`，并额外**快照**该剧当时的 `source_key` —— 见 [`migrate`]
+    /// 里该表的注释（为什么用「内容」而不是「槽位」，以及 key 如何让墓碑活过剪枝）。
+    /// 重复摘除刷新时间戳与 key 快照。
+    async fn tombstone_episode(
+        &self,
+        series_id: i64,
+        item_id: i64,
+        source_key: Option<&str>,
+    ) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO media_episode_removed (series_id, item_id, removed_at, source_key)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(series_id, item_id) DO UPDATE SET
+                   removed_at = excluded.removed_at,
+                   source_key = excluded.source_key",
+                params![series_id, item_id, now_secs(), source_key],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// 该剧集的 TG 幂等来源键（手工建剧集为 `None`）。BUG-126：墓碑跨剪枝识别用。
+    async fn series_source_key(&self, series_id: i64) -> libsql::Result<Option<String>> {
+        let row = self
+            .row_opt(
+                "SELECT source_key FROM media_series WHERE id = ?1",
+                params![series_id],
+            )
+            .await?;
+        match row {
+            Some(r) => Ok(r.get::<Option<String>>(0)?),
+            None => Ok(None),
+        }
+    }
+
+    /// 清除指定内容的「已摘除」墓碑（BUG-126：**用户显式操作**高于系统惯例）。
+    ///
+    /// 返回被清掉的墓碑行数（0 = 本来就没有墓碑）。
+    ///
+    /// 调用方必须是「用户明确表达了意图」的入口 —— `add_episode` / `append_episodes` /
+    /// `attach_episode_source` / `merge_series`。**自动路径不得调用**：自动路径要的是
+    /// 「跳过墓碑」，清了就等于没修。
+    ///
+    /// 清除**两种形态**：按 `series_id`，以及按该剧的 `source_key`（覆盖「剧集被剪枝后按
+    /// key 重建」留下的墓碑）。手工剧集 key 为 NULL，第二个条件恒假，行为不变。
+    pub async fn clear_episode_tombstones(
+        &self,
+        series_id: i64,
+        item_ids: &[i64],
+    ) -> libsql::Result<usize> {
+        let key = self.series_source_key(series_id).await?;
+        let mut cleared = 0usize;
+        for item_id in item_ids {
+            cleared += self
+                .conn
+                .execute(
+                    "DELETE FROM media_episode_removed
+                      WHERE item_id = ?1
+                        AND (series_id = ?2
+                             OR (source_key IS NOT NULL AND source_key = ?3))",
+                    params![*item_id, series_id, key.as_deref()],
+                )
+                .await? as usize;
+        }
+        Ok(cleared)
+    }
+
+    /// 该剧集下被用户摘除过的条目集合（BUG-126 墓碑）。
+    ///
+    /// 供**自动路径**（`append_episodes_ranged`）跳过用；按剧集一次取回，
+    /// 避免在候选循环里逐条查库。
+    ///
+    /// 匹配**两种形态**：`series_id = ?` 或 `(source_key IS NOT NULL AND source_key = ?)`。
+    /// 后者让墓碑活过剪枝：TG 自动成剧的剧集被 `prune_empty_series` 删掉后，下次同步按
+    /// `source_key` 重建的是**新 id**，只有 key 认得出来。手工剧集 key 为 NULL，退化为只按 id。
+    pub async fn removed_item_ids(&self, series_id: i64) -> libsql::Result<HashSet<i64>> {
+        let key = self.series_source_key(series_id).await?;
+        let stmt = self
+            .conn
+            .prepare(
+                "SELECT item_id FROM media_episode_removed
+                  WHERE series_id = ?1
+                     OR (source_key IS NOT NULL AND source_key = ?2)",
+            )
+            .await?;
+        let mut rows = stmt.query(params![series_id, key.as_deref()]).await?;
+        let mut out: HashSet<i64> = HashSet::new();
+        while let Some(r) = rows.next().await? {
+            out.insert(r.get::<i64>(0)?);
+        }
+        Ok(out)
     }
 
     /// 一批条目的 kind 集合（历史接口：诊断/统计用）。
@@ -3252,6 +3588,403 @@ mod tests {
             scalar_i64(&s2.conn, ORPHAN_SOURCE_SQL).await,
             0,
             "重启后仍不得有孤儿行"
+        );
+    }
+
+    // ───────────────────────── BUG-126：摘除墓碑 ─────────────────────────
+
+    /// 剧集里当前编排的条目 id（顺序即编排顺序）。
+    async fn episode_item_ids(s: &Store, series_id: i64) -> Vec<i64> {
+        s.get_series(series_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .episodes
+            .iter()
+            .map(|e| e.item_id)
+            .collect()
+    }
+
+    /// 某条目在剧集里的分集 id（不在剧集里则为 0）。
+    async fn episode_id_of(s: &Store, series_id: i64, item_id: i64) -> i64 {
+        s.get_series(series_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .episodes
+            .iter()
+            .find(|e| e.item_id == item_id)
+            .map(|e| e.id)
+            .unwrap_or(0)
+    }
+
+    /// 墓碑行数（BUG-126 判据）。
+    async fn tombstone_count(s: &Store) -> i64 {
+        scalar_i64(&s.conn, "SELECT COUNT(*) FROM media_episode_removed").await
+    }
+
+    /// 剧集是否仍存在（BUG-126 剪枝判据）。
+    async fn series_exists(s: &Store, series_id: i64) -> bool {
+        s.get_series(series_id).await.unwrap().is_some()
+    }
+
+    /// 回归（BUG-126）：用户摘除的内容**不得**被自动路径重新编回；
+    /// 但用户**显式**再加必须能加回来（否则是把 bug 修成另一个 bug）。
+    ///
+    /// 缺陷原形（BUG-112 在活库上实测）：`append_episodes_ranged` 只按**当前**
+    /// `media_episode` 行去重，`remove_episode` 不留任何负向记录 —— 同一 TG 组下一次重新
+    /// 缓存（自动成剧）把用户刚摘掉的图片**原样编回**，表现为「删了又回来」。
+    #[tokio::test]
+    async fn automatic_append_does_not_resurrect_removed_episode_but_explicit_add_does() {
+        let s = Store::open(tmp_db("tombstone")).await.unwrap();
+        let a = s
+            .upsert_media_item("tg", "k:1", "a", "photo", None, None, None, None)
+            .await
+            .unwrap();
+        let b = s
+            .upsert_media_item("tg", "k:2", "b", "photo", None, None, None, None)
+            .await
+            .unwrap();
+        let sid = s
+            .create_series("S", None, "series", None, Some("tg:msgs:1:1"))
+            .await
+            .unwrap();
+
+        // 自动成剧：同组两条一起编入。
+        assert_eq!(
+            s.append_episodes_ranged(sid, 1, &[(a, None), (b, None)]).await.unwrap(),
+            2
+        );
+
+        // 用户摘除 a 所在的那一集。
+        let ep_a = episode_id_of(&s, sid, a).await;
+        assert_ne!(ep_a, 0, "前置条件：a 应在剧集里");
+        s.remove_episode(ep_a).await.unwrap();
+        assert!(!episode_item_ids(&s, sid).await.contains(&a), "前置条件：a 已摘除");
+
+        // ① 自动路径（同组重新缓存 / 自动成剧）：不得复活。
+        assert_eq!(
+            s.append_episodes_ranged(sid, 1, &[(a, None), (b, None)]).await.unwrap(),
+            0,
+            "自动路径不得把用户摘除的条目编回（BUG-126）"
+        );
+        assert!(!episode_item_ids(&s, sid).await.contains(&a), "a 不得被复活");
+
+        // ② 用户显式「加入剧集」：必须能加回来（墓碑被清）。
+        assert_eq!(
+            s.append_episodes(sid, 1, &[a]).await.unwrap(),
+            1,
+            "用户显式加入必须生效（否则误删后再也加不回来）"
+        );
+        assert!(episode_item_ids(&s, sid).await.contains(&a), "a 应被显式加回");
+
+        // ③ 再摘一次，改走单条显式入口 `add_episode`：同样必须能加回。
+        let ep_a = episode_id_of(&s, sid, a).await;
+        s.remove_episode(ep_a).await.unwrap();
+        assert_eq!(
+            s.append_episodes_ranged(sid, 1, &[(a, None)]).await.unwrap(),
+            0,
+            "摘除后自动路径仍不得复活"
+        );
+        s.add_episode(sid, a, 1, 9).await.unwrap();
+        assert!(
+            episode_item_ids(&s, sid).await.contains(&a),
+            "add_episode 是用户显式操作，必须能加回"
+        );
+    }
+
+    /// 回归（BUG-126）：摘除分集时，该集挂的**备用源**条目一并封住。
+    ///
+    /// 理由：用户删的是「**这一集**」，备用源是这一集的组成部分；不一并封住，它们会以
+    /// 「另一集」的形态回来（自动成剧按条目重新编入）。
+    #[tokio::test]
+    async fn removing_an_episode_tombstones_its_alternate_sources_too() {
+        let s = Store::open(tmp_db("tombstone_alt")).await.unwrap();
+        let main = s
+            .upsert_media_item("tg", "al:1", "main", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let alt = s
+            .upsert_media_item("tg", "al:2", "alt", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let filler = s
+            .upsert_media_item("tg", "al:3", "filler", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let sid = s.create_series("S", None, "series", None, None).await.unwrap();
+
+        let ep = s.add_episode(sid, main, 1, 1).await.unwrap();
+        assert!(
+            s.attach_episode_source(ep, alt).await.unwrap(),
+            "前置条件：alt 应挂为该集备用源"
+        );
+        // 再放一集，保证剧集不因清空而被 prune（剧集没了墓碑也会随之被清，测不到本意）。
+        s.add_episode(sid, filler, 1, 2).await.unwrap();
+
+        s.remove_episode(ep).await.unwrap();
+
+        // 主条目与备用源都应被封住：自动路径一律编不回来。
+        assert_eq!(
+            s.append_episodes_ranged(sid, 1, &[(main, None), (alt, None)]).await.unwrap(),
+            0,
+            "主条目与备用源都不得被自动路径编回"
+        );
+        let live = episode_item_ids(&s, sid).await;
+        assert!(!live.contains(&main) && !live.contains(&alt));
+
+        // 用户显式加入仍可（备用源条目也能被显式编成正式分集）。
+        assert_eq!(
+            s.append_episodes(sid, 1, &[alt]).await.unwrap(),
+            1,
+            "显式加入备用源条目必须生效"
+        );
+        assert!(episode_item_ids(&s, sid).await.contains(&alt));
+    }
+
+    /// 回归（BUG-126）：删剧集只清**本剧**的墓碑，不得误伤别的剧集。
+    ///
+    /// 为什么必须显式测：`media_series.id`、`media_episode.id`、`media_episode_removed.series_id`
+    /// 都是小整数自增。关联条件若写成跨表借位（如 `episode_id = OLD.id`），会在小整数区间
+    /// **偶然命中**别的表的行 —— 表现为「删 A 剧把 B 剧的墓碑也清了」，且很难复现。
+    #[tokio::test]
+    async fn deleting_a_series_clears_only_its_own_tombstones() {
+        let s = Store::open(tmp_db("tombstone_scope")).await.unwrap();
+        let mut items = Vec::new();
+        for i in 0..4 {
+            items.push(
+                s.upsert_media_item(
+                    "tg",
+                    &format!("sc:{i}"),
+                    &format!("i{i}"),
+                    "photo",
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let s1 = s.create_series("S1", None, "series", None, None).await.unwrap();
+        let s2 = s.create_series("S2", None, "series", None, None).await.unwrap();
+        // 每部剧两集：摘掉第一集后剧集仍在（否则 prune 会把墓碑一并清掉，测不到本意）。
+        let e1 = s.add_episode(s1, items[0], 1, 1).await.unwrap();
+        s.add_episode(s1, items[1], 1, 2).await.unwrap();
+        let e2 = s.add_episode(s2, items[2], 1, 1).await.unwrap();
+        s.add_episode(s2, items[3], 1, 2).await.unwrap();
+
+        s.remove_episode(e1).await.unwrap();
+        s.remove_episode(e2).await.unwrap();
+        assert_eq!(tombstone_count(&s).await, 2, "前置条件：两部剧各一条墓碑");
+
+        s.delete_series(s1).await.unwrap();
+        assert_eq!(tombstone_count(&s).await, 1, "删 S1 后应只剩 S2 的那条");
+        assert_eq!(
+            scalar_i64(
+                &s.conn,
+                &format!("SELECT COUNT(*) FROM media_episode_removed WHERE series_id = {s2}")
+            )
+            .await,
+            1,
+            "S2 的墓碑必须保留（不得被 S1 的删除误伤）"
+        );
+        // S2 的墓碑仍应生效：自动路径编不回来。
+        assert_eq!(
+            s.append_episodes_ranged(s2, 1, &[(items[2], None)]).await.unwrap(),
+            0,
+            "S2 的墓碑仍应拦住自动路径"
+        );
+    }
+
+    /// 实测（BUG-126 规格第 3 条的前提）：`media_episode.item_id` **没有**全表唯一约束 ——
+    /// 同一内容可以同时是「另一剧的主条目」与「本剧某集的备用源」。
+    ///
+    /// 因此「备用源一并 tombstone」的安全性**不来自**「理论上不可能同时是别集主源」，
+    /// 而来自墓碑按 `(series_id, item_id)` 限定在**本剧**：别的剧集（乃至同剧别的季）的
+    /// 既有编排不受影响。本测试把「前提」与「安全性」一并钉住。
+    #[tokio::test]
+    async fn tombstone_is_scoped_to_its_series_even_if_item_is_primary_elsewhere() {
+        let s = Store::open(tmp_db("tombstone_scoped")).await.unwrap();
+        let x = s
+            .upsert_media_item("tg", "sp:1", "x", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let y = s
+            .upsert_media_item("tg", "sp:2", "y", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let f = s
+            .upsert_media_item("tg", "sp:3", "f", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let s1 = s.create_series("S1", None, "series", None, None).await.unwrap();
+        let s2 = s.create_series("S2", None, "series", None, None).await.unwrap();
+
+        // x 是 S2 的主条目……
+        s.add_episode(s2, x, 1, 1).await.unwrap();
+        // ……同时挂成 S1 某集的备用源（实测：这是**允许**的）。
+        let ep_y = s.add_episode(s1, y, 1, 1).await.unwrap();
+        s.add_episode(s1, f, 1, 2).await.unwrap();
+        assert!(
+            s.attach_episode_source(ep_y, x).await.unwrap(),
+            "实测：同一内容可同时是另一剧的主条目与本剧的备用源（media_episode.item_id 无全表唯一约束）"
+        );
+
+        // 摘除 S1 的那一集 → 墓碑 (S1, x) 与 (S1, y)。
+        s.remove_episode(ep_y).await.unwrap();
+
+        assert_eq!(
+            s.append_episodes_ranged(s1, 1, &[(x, None)]).await.unwrap(),
+            0,
+            "本剧墓碑应拦住自动路径"
+        );
+        assert!(
+            episode_item_ids(&s, s2).await.contains(&x),
+            "墓碑必须限定在本剧：不得影响 S2 里 x 的既有编排"
+        );
+    }
+
+    /// 回归（BUG-126 跨剪枝）：TG 自动成剧的剧集被**剪枝**后，按 `source_key` 重建仍被拦。
+    ///
+    /// 缺陷原形（用户真实场景）：一个只有 1 张图的 TG 组，用户把图移除 → 该剧 0 分集 →
+    /// `prune_empty_series` 删掉剧集行 → 触发器清墓碑 → 下次同组同步按 `source_key` 重建
+    /// （**新 id**）→ 旧墓碑 `(旧 id, item)` 不再匹配 → **图回来了**。
+    /// 修法：墓碑快照 `source_key`，匹配时按 key 兜底；触发器只清 `source_key IS NULL` 的墓碑。
+    #[tokio::test]
+    async fn tombstone_survives_prune_and_blocks_source_key_rebuild() {
+        let s = Store::open(tmp_db("tombstone_prune")).await.unwrap();
+        let a = s
+            .upsert_media_item("tg", "pr:1", "a", "photo", None, None, None, None)
+            .await
+            .unwrap();
+        let sid = s
+            .create_series("S", None, "series", None, Some("tg:group:1:1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.append_episodes_ranged(sid, 1, &[(a, None)]).await.unwrap(),
+            1
+        );
+
+        // 用户移除这部剧**唯一**一集 → 触发剪枝。
+        let ep = episode_id_of(&s, sid, a).await;
+        s.remove_episode(ep).await.unwrap();
+        assert!(!series_exists(&s, sid).await, "前置条件：0 分集应触发剪枝删剧");
+        assert_eq!(
+            tombstone_count(&s).await,
+            1,
+            "带 source_key 的墓碑必须活过剪枝（否则第 1 步白做）"
+        );
+
+        // 下次同组同步：按 source_key 重建剧集（新 id）→ 不得复活。
+        assert_eq!(
+            s.find_series_by_source_key("tg:group:1:1").await.unwrap(),
+            None,
+            "前置条件：剧集已被剪枝，反查应为空"
+        );
+        let sid2 = s
+            .create_series("S", None, "series", None, Some("tg:group:1:1"))
+            .await
+            .unwrap();
+        assert_ne!(sid2, sid, "重建必然是新 id");
+        assert_eq!(
+            s.append_episodes_ranged(sid2, 1, &[(a, None)]).await.unwrap(),
+            0,
+            "按 source_key 重建的剧集必须仍被墓碑拦住（BUG-126 跨剪枝）"
+        );
+        assert!(!episode_item_ids(&s, sid2).await.contains(&a));
+
+        // 用户显式加入仍能加回（清墓碑也覆盖按 key 的形态）。
+        assert_eq!(s.append_episodes(sid2, 1, &[a]).await.unwrap(), 1);
+        assert!(episode_item_ids(&s, sid2).await.contains(&a));
+    }
+
+    /// 实测结论（BUG-126 规格第 7 条）：**手工剧集**（`source_key IS NULL`）被剪枝后，
+    /// 其墓碑被触发器清掉是**可接受**的。
+    ///
+    /// 依据：没有任何路径会重建手工剧集 —— 自动成剧的反查 `find_series_by_source_key`
+    /// 只按**非空** key 匹配（`WHERE source_key = ?`），手工剧集永远匹配不到；自动成剧的
+    /// 建剧一律 `Some(key)`。故清掉墓碑不会导致复活，反而避免行泄漏。
+    #[tokio::test]
+    async fn manual_series_prune_clears_its_tombstone() {
+        let s = Store::open(tmp_db("tombstone_manual_prune")).await.unwrap();
+        let a = s
+            .upsert_media_item("tg", "mp:1", "a", "photo", None, None, None, None)
+            .await
+            .unwrap();
+        // 手工建剧：source_key = None。
+        let sid = s.create_series("Manual", None, "series", None, None).await.unwrap();
+        s.add_episode(sid, a, 1, 1).await.unwrap();
+
+        let ep = episode_id_of(&s, sid, a).await;
+        s.remove_episode(ep).await.unwrap();
+
+        assert!(!series_exists(&s, sid).await, "前置条件：0 分集应触发剪枝删剧");
+        assert_eq!(
+            tombstone_count(&s).await,
+            0,
+            "手工剧集无重建路径 → 剪枝清墓碑是可接受的（避免行泄漏）"
+        );
+        // 佐证「无重建路径」：手工剧集的 source_key 为 NULL，任何非空 key 都反查不到它。
+        assert_eq!(
+            s.find_series_by_source_key("tg:group:1:1").await.unwrap(),
+            None
+        );
+    }
+
+    /// 回归（BUG-126）：低层 `delete_series`（自动成剧**回滚**用的那条）**不得**清带键墓碑；
+    /// 用户显式 `delete_series_explicit` 才把两种形态都清掉。
+    ///
+    /// 为什么必须分开：回滚删的是「刚重建出来的空壳」，若它顺手清墓碑，用户摘除记录会被抹掉
+    /// → 下一次同步立刻复活 —— 正好把本次修复抵消掉。
+    #[tokio::test]
+    async fn low_level_delete_keeps_keyed_tombstones_but_explicit_delete_clears_them() {
+        let s = Store::open(tmp_db("tombstone_delete_split")).await.unwrap();
+        let a = s
+            .upsert_media_item("tg", "ds:1", "a", "photo", None, None, None, None)
+            .await
+            .unwrap();
+        let b = s
+            .upsert_media_item("tg", "ds:2", "b", "photo", None, None, None, None)
+            .await
+            .unwrap();
+        let sid = s
+            .create_series("S", None, "series", None, Some("tg:group:9:9"))
+            .await
+            .unwrap();
+        s.add_episode(sid, a, 1, 1).await.unwrap();
+        s.add_episode(sid, b, 1, 2).await.unwrap();
+        let ep_a = episode_id_of(&s, sid, a).await;
+        s.remove_episode(ep_a).await.unwrap();
+        assert_eq!(tombstone_count(&s).await, 1);
+
+        // 低层删（回滚路径）：带键墓碑必须保留。
+        s.delete_series(sid).await.unwrap();
+        assert_eq!(
+            tombstone_count(&s).await,
+            1,
+            "低层 delete_series 不得清带键墓碑（自动成剧回滚依赖此行为）"
+        );
+
+        // 重建同 key 剧集 → 仍被拦。
+        let sid2 = s
+            .create_series("S", None, "series", None, Some("tg:group:9:9"))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.append_episodes_ranged(sid2, 1, &[(a, None)]).await.unwrap(),
+            0,
+            "低层删剧后重建，墓碑仍应生效"
+        );
+
+        // 用户显式删剧：两种形态都清。
+        s.delete_series_explicit(sid2).await.unwrap();
+        assert_eq!(
+            tombstone_count(&s).await,
+            0,
+            "用户显式删剧应清掉带键墓碑（负向记录已完成使命）"
         );
     }
 
@@ -4582,5 +5315,105 @@ mod tests {
         assert_eq!(e.item_id, item);
         assert_eq!(e.episode_no, 1);
         assert_eq!(e.episode_no_end, Some(2));
+    }
+
+    // ─────────────────── BUG-132：字节真值判据 ───────────────────
+
+    fn item_with_path(id: i64, path: Option<String>) -> MediaItem {
+        MediaItem {
+            id,
+            source: "tg".into(),
+            ref_key: format!("1:{id}"),
+            title: "t".into(),
+            description: None,
+            kind: "video".into(),
+            file_path: path,
+            poster: None,
+            size: None,
+            duration: None,
+            width: None,
+            height: None,
+            added_at: 0,
+            tags: Vec::new(),
+            series_id: None,
+            series_title: None,
+            // 构造时的占位值（见 `media_item_from_row` 的注释）
+            bytes_presence: BytesPresence::Missing,
+        }
+    }
+
+    /// BUG-132 的核心：**「数据库说有路径」不等于「磁盘上有字节」**。
+    ///
+    /// 反向证伪价值：旧判据是 `file_path IS NOT NULL`，它对下面 `gone.mp4`
+    /// 这一条会回答「有字节」。若本用例对旧实现也能通过，它就失去了证伪能力 ——
+    /// 所以这里**必须**断言「路径非空 + 文件已删」→ `Missing`，而不只是断言空路径。
+    #[tokio::test]
+    async fn attach_bytes_presence_reports_missing_when_file_gone() {
+        let dir = std::env::temp_dir().join(format!("orig_bug132_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("ok.mp4");
+        std::fs::write(&ok, b"bytes").unwrap();
+
+        let mut items = vec![
+            item_with_path(1, Some(ok.to_string_lossy().to_string())),
+            // 路径非空，但磁盘上从来没这个文件 —— 旧判据会说「有」
+            item_with_path(2, Some(dir.join("gone.mp4").to_string_lossy().to_string())),
+            item_with_path(3, None),
+        ];
+        attach_bytes_presence(&mut items).await;
+
+        assert_eq!(items[0].bytes_presence, BytesPresence::Present);
+        assert_eq!(
+            items[1].bytes_presence,
+            BytesPresence::Missing,
+            "file_path 非空但磁盘上没有文件 —— 必须判 Missing（旧判据 `IS NOT NULL` 会判成有）"
+        );
+        assert_eq!(items[2].bytes_presence, BytesPresence::Missing);
+    }
+
+    /// 同一条目在文件被**外部删除后**必须翻转结论：
+    /// 证明判据读的是磁盘当前状态，而不是建条目时写进库的那一次承诺。
+    #[tokio::test]
+    async fn attach_bytes_presence_flips_after_external_delete() {
+        let dir = std::env::temp_dir().join(format!("orig_bug132_flip_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("later_deleted.mp4");
+        std::fs::write(&p, b"bytes").unwrap();
+
+        let mut items = vec![item_with_path(1, Some(p.to_string_lossy().to_string()))];
+        attach_bytes_presence(&mut items).await;
+        assert_eq!(items[0].bytes_presence, BytesPresence::Present);
+
+        std::fs::remove_file(&p).unwrap();
+        attach_bytes_presence(&mut items).await;
+        assert_eq!(
+            items[0].bytes_presence,
+            BytesPresence::Missing,
+            "文件被外部删除后必须翻转 —— 判据读的是磁盘，不是库里的承诺"
+        );
+    }
+
+    /// 条目视图（`bytes_presence`）与分集视图（`has_bytes`）必须**同源**：
+    /// 两者都由 `probe_cached_bytes` 得出，故对同一路径必须给出一致的「能不能播」。
+    #[tokio::test]
+    async fn episode_and_item_views_agree_on_bytes() {
+        let dir = std::env::temp_dir().join(format!("orig_bug132_agree_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("both.mp4");
+        std::fs::write(&p, b"bytes").unwrap();
+        let path = p.to_string_lossy().to_string();
+
+        let mut items = vec![item_with_path(1, Some(path.clone()))];
+        attach_bytes_presence(&mut items).await;
+        // 分集侧同样的换算（见 `get_series`）：只有 Present 才算 has_bytes
+        let episode_has_bytes = probe_cached_bytes(&path).await == BytesPresence::Present;
+
+        assert_eq!(items[0].bytes_presence, BytesPresence::Present);
+        assert!(episode_has_bytes);
+        assert_eq!(
+            items[0].bytes_presence == BytesPresence::Present,
+            episode_has_bytes,
+            "条目视图与分集视图对同一条内容必须给出一致结论（BUG-132 分叉的直接断言）"
+        );
     }
 }

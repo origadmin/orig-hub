@@ -1382,6 +1382,10 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
                                 st.push_log(&format!(
                                     "cache task {task_id}: series {sid} rolled back ({why})"
                                 ));
+                                // 回滚用**低层** `delete_series`（不碰墓碑，BUG-126）：这里删的是
+                                // 刚重建出来的空壳，用户的「已摘除」记录必须留下 —— 若顺手清了
+                                // 墓碑，下一次同组同步就会把条目复活（用户主动删剧走
+                                // `delete_series_explicit`，那才清墓碑）。
                                 if let Err(e) = st.store.delete_series(sid).await {
                                     st.push_log(&format!(
                                         "cache task {task_id}: rollback series {sid} failed: {e}"
@@ -2615,12 +2619,16 @@ async fn patch_media_series(
 }
 
 /// `DELETE /api/media/series/:id` — 删剧集（内容条目保留，仅解除归属）。
+///
+/// 走**用户显式**删剧入口（BUG-126）：连带清掉这部剧的墓碑（按 `series_id` 与按
+/// `source_key` 两种形态）。不能用低层 `delete_series` —— 那条是自动成剧回滚用的，
+/// 清了墓碑会让「用户摘除」的记录被回滚抹掉，下次同步复活。
 async fn delete_media_series(
     State(st): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
     st.store
-        .delete_series(id)
+        .delete_series_explicit(id)
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     Ok(Json(json!({"ok": true})))
