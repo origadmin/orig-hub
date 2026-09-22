@@ -352,7 +352,7 @@ export function Sidebar({
           data-conn-state={connState}
         >
           <span
-            className={cn('h-2 w-2 shrink-0 rounded-full', CONN_DOT[connState])}
+            className={cn('h-1.5 w-1.5 shrink-0 rounded-full', CONN_DOT[connState])}
           />
           {!collapsed && (
             <span className="text-[11px] text-muted">{t(CONN_LABEL[connState])}</span>

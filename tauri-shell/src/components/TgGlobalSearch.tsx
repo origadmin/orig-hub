@@ -51,6 +51,12 @@ export const TgGlobalSearch = memo(function TgGlobalSearch() {
         className="flex h-7 w-80 min-w-0 items-center gap-2 rounded-md border border-border-subtle bg-surface-2/40 px-2"
         data-testid="tg-global-search"
       >
+        <span
+          className="shrink-0 rounded bg-surface-2/60 px-1.5 py-0.5 text-[10px] text-muted"
+          data-testid="tg-global-search-scope"
+        >
+          {t('tg.globalSearchScope')}
+        </span>
         <svg
           className="h-3.5 w-3.5 shrink-0 text-muted"
           fill="none"

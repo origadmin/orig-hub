@@ -269,6 +269,7 @@
   "tg.globalSearchPlaceholder": "搜索全部监控频道的内容…",
   "tg.globalSearchTitle": "监控内容查找",
   "tg.globalSearchClear": "清除",
+  "tg.channelSearchScope": "频道",
   "tg.globalSearchScope": "仅搜索已同步到本地的监控消息",
   "tg.thumbUnavailable": "缩略图暂不可用",
   "tg.monitorViewHint": "本地监控列表，离线也可浏览已入库内容",

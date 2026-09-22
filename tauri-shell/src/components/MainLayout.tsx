@@ -10,11 +10,14 @@ import { ErrorBoundary } from './ui/ErrorBoundary'
 import { TitleBar } from './TitleBar'
 import { ContextBar } from './ContextBar'
 import { useStore } from '../store/useStore'
-import { resolveTgFeatureReady } from '../store/selectors'
+import {
+  resolveTgFeatureReady,
+  selectActiveSpeedLabel,
+  selectHasActiveSpeed,
+} from '../store/selectors'
 import { CONN_DOT, CONN_LABEL, useConnState } from '../store/connState'
 import { useEvent } from '../hooks/useEvent'
 import { useTranslation } from '../i18n'
-import { formatSpeed } from '../lib/utils'
 import { ensureDaemon, daemonStatus } from '../api/tauri'
 import { health } from '../api/daemon'
 import { cn } from '../lib/utils'
@@ -27,6 +30,9 @@ export function MainLayout() {
   const { t } = useTranslation()
   /** 连接态：与上下文栏、侧栏底部同源（BUG-087，唯一来源 `store/connState.ts`） */
   const connState = useConnState()
+  // BUG-134: 状态栏下载速度改读全局选择器，与全局速度文案同源（不再用 active.reduce 自算一套）
+  const activeSpeedLabel = useStore(selectActiveSpeedLabel)
+  const hasActiveSpeed = useStore(selectHasActiveSpeed)
   const { downloads, init, setDaemon, setDaemonAlive, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, viewer, setViewerIndex, closeViewer, tgEnabled, tgAvailability, refreshTgState, probeTg } = useStore()
 
   /**
@@ -98,18 +104,8 @@ export function MainLayout() {
     return () => clearTimeout(t)
   }, [toast, clearToast])
 
-  /**
-   * 真正在跑的任务（downloading | queued）：**只**驱动速度合计（下方 `totalSpeed`），不含 idle。
-   *
-   * 注意：「全部暂停」按钮的可用性**不是**由本变量提供的 —— 它由 `selectActiveCount`
-   * （`store/selectors.ts:33-34`）独立订阅，经 `ContextBarActions` 的 `busy` 消费。
-   * 两者**口径一致**（同为 downloading | queued）但**不是同一个数据源**：
-   * 改这里不会影响那个按钮，反之亦然。
-   *
-   * 也不要把本变量并进 `downloadingBucket` —— 那会让 idle 任务也计入「真正在跑」，
-   * 于是只有 idle 时「全部暂停」亮起却空转（正是本 BUG 要根除的死按钮）。
-   */
-  const active = downloads.filter((d) => d.status === 'downloading' || d.status === 'queued')
+  // BUG-134: 状态栏下载速度改读 `selectActiveSpeedLabel`（store/selectors.ts），与全局速度文案同源，
+  // 不再在此处用 `active.reduce` 自算一套口径。
   /**
    * 「下载中」档 = 下载中 | 排队 | 空闲。与侧栏徽标、状态栏共用同一口径，
    * 保证「徽标数 == 点进去的条数」；注意与上面的 active 不是一回事 ——
@@ -126,8 +122,6 @@ export function MainLayout() {
   // 以行内红色错误文字标记 + 行内「删除」处理。删掉这行 tsc 照样绿（占位符缺失只显示空
   // 字符串），状态栏的失败数会静默消失 —— 典型假绿，勿删。
   const failed = downloads.filter((d) => d.status === 'error' || d.status === 'cancelled')
-  const totalSpeed = active.reduce((sum, d) => sum + (d.speed || 0), 0)
-
   // 全局聚合进度（BUG-004）：管理中任务（下载中/排队/已暂停）的累计字节占比。
   const aggregate = downloads.filter(
     (d) => d.status === 'downloading' || d.status === 'queued' || d.status === 'paused',
@@ -304,6 +298,10 @@ export function MainLayout() {
               现与上下文栏、侧栏底部同读 `useConnState()`，文案与配色一律取自
               `store/connState.ts` 的 `CONN_LABEL` / `CONN_DOT`。
             */}
+            {/*
+              BUG-134：下载速度读 `selectActiveSpeedLabel`（store/selectors.ts），
+              与全局速度文案同一来源；速度微抖但显示值未变时不触发重渲染。
+            */}
             <span
               className={cn('flex items-center gap-1.5')}
               data-testid="statusbar-conn"
@@ -313,8 +311,8 @@ export function MainLayout() {
                 className={cn('h-1.5 w-1.5 shrink-0 rounded-full', CONN_DOT[connState])}
               />
               {t(CONN_LABEL[connState])}
-              {totalSpeed > 0 && (
-                <span className="font-mono text-accent">{formatSpeed(totalSpeed)}</span>
+              {hasActiveSpeed && (
+                <span className="font-mono text-accent">{activeSpeedLabel}</span>
               )}
             </span>
           </footer>

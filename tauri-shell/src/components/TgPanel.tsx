@@ -1377,6 +1377,12 @@ export function TgPanel(
               </h3>
             </header>
             <div className="border-b border-border-subtle/60 px-3 pb-2 pt-2">
+              <span
+                className="mb-1 block text-[10px] text-muted"
+                data-testid="tg-group-search-scope"
+              >
+                {t('tg.channelSearchScope')}
+              </span>
               <Input
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}

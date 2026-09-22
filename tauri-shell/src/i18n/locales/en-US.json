@@ -269,6 +269,7 @@
   "tg.globalSearchPlaceholder": "Search all monitored channels…",
   "tg.globalSearchTitle": "Monitor search",
   "tg.globalSearchClear": "Clear",
+  "tg.channelSearchScope": "Channels",
   "tg.globalSearchScope": "Only locally synced monitored messages are searched",
   "tg.thumbUnavailable": "Thumbnail unavailable",
   "tg.monitorViewHint": "Local monitor list; cached content stays readable offline",
