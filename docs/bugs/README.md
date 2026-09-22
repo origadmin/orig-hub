@@ -145,13 +145,13 @@
 | BUG-131 | 媒体库工具条搜索/排序仅 items 视图生效却恒渲染（view 默认 series 第一眼即无效）+ filterActive 假筛选态 + 标签 chip 切视图行为不一致——搜索框/排序/filterActive 三件必须同批修复 | open | shell |
 | BUG-132 | 条目「有无字节」判据分叉——Rust MediaItem 无 has_bytes 致条目视图恒走 file_path 判定（BUG-105 已判不可靠），probe_cached_bytes 三态未接线；ItemEditDialog canClear 同病 | fixed | engine+shell |
 | BUG-133 | 媒体库「占用空间」展示登记值 SUM(size)——清缓存后数字不变被质疑没删成功；应主显磁盘真值并标注口径，不改 BUG-051 行为 | open | engine+shell |
-| BUG-134 | 连接态三处重复渲染（已同源，左下灯 h-2 其余 h-1.5）+ 速度双实现（MainLayout totalSpeed 绕过 selectors）——收敛方式待拍板 | open | shell |
+| BUG-134 | 连接态三处重复渲染（已同源，左下灯 h-2 其余 h-1.5）+ 速度双实现（MainLayout totalSpeed 绕过 selectors）——收敛方式待拍板 | fixed | shell |
 | BUG-135 | 删除媒体条目时 remove_file 与 clear_downloaded 失败被 let _ = 静默吞——接口假成功，违背 BUG-109 如实报错判定 | open | engine |
 | BUG-136 | cache 接口 external 字段双形状双口径——stats 返数字且不累加字节、clear/preview 返对象且累加 | open | engine |
 | BUG-137 | TG 内置播放器三入口只传单条/单相册——无上/下一条，媒体库侧同播放器却可连播整剧，能力不一致 | open | shell |
 | BUG-138 | media:list 无读缓存——fetchCache.cacheKey 未覆盖条目列表，每次进 items 视图发真请求 | open | shell |
 | BUG-139 | 「打开已下载」走系统默认播放器、「预览」走内置播放器——同一「打开」动词两种行为无标注，且绕过解码健康提示 | open | shell |
-| BUG-140 | TG 分组模式频道过滤搜索框与全局消息搜索并存无作用域标注（placeholder 文案本身准确） | open | shell |
+| BUG-140 | TG 分组模式频道过滤搜索框与全局消息搜索并存无作用域标注（placeholder 文案本身准确） | fixed | shell |
 | BUG-141 | i18n 硬编码中文 253 行分布 25 文件（en-US 界面混中文）——BUG-128 同病新实例（SeriesDetail/ImportDialog KIND_LABEL 等），无门禁检测 | open | shell |
 | BUG-142 | i18n 孤儿 key 42 个（收敛残骸）误导维护；36 组同值 key 部分为刻意分离（BUG-128 裁定）禁盲并 | open | shell |
 | BUG-143 | ImportDialog 默认目录硬编码 D:\test_videos 开发残留进生产 UI | open | shell |
