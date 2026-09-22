@@ -230,6 +230,8 @@
   "tg.addMonitor": "Add monitor",
   "tg.sync": "Sync now",
   "tg.syncing": "Syncing…",
+  "tg.monitorCollapse": "Collapse monitor list",
+  "tg.monitorExpand": "Expand monitor list",
   "tg.storedHeading": "Stored media",
   "tg.downloaded": "Cached",
   "tg.protectedMedia": "Protected or access denied; cannot cache. Try online playback.",

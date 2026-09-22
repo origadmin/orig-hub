@@ -230,6 +230,8 @@
   "tg.addMonitor": "添加监控",
   "tg.sync": "立即同步",
   "tg.syncing": "同步中…",
+  "tg.monitorCollapse": "收起监控列表",
+  "tg.monitorExpand": "展开监控列表",
   "tg.storedHeading": "已入库媒体",
   "tg.downloaded": "已缓存",
   "tg.protectedMedia": "该内容受保护或访问被拒绝，无法缓存，可尝试在线播放",
