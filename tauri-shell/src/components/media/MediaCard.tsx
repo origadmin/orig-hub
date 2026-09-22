@@ -1,5 +1,15 @@
 import { memo, useEffect, useRef, useState } from 'react'
-import { CloudOff, Pencil, Trash2 } from 'lucide-react'
+import type { LucideIcon } from 'lucide-react'
+import {
+  CloudOff,
+  FileText,
+  Maximize2,
+  Music,
+  Pencil,
+  Play,
+  Trash2,
+  ZoomIn,
+} from 'lucide-react'
 import type { MediaItem } from '../../api/media'
 import { mediaItemUrl } from '../../api/media'
 import { coverFit, fmtDuration, fmtSize, hasMediaBytes } from '../../lib/tgmedia'
@@ -15,6 +25,44 @@ const KIND_ICON: Record<string, string> = {
   photo: '🖼',
   audio: '🎵',
   file: '📄',
+}
+
+/**
+ * 悬浮操作层图标 —— **按条目类型分流**（BUG-123）。
+ *
+ * 缺陷现场：用户点开一张图片，进到的却是视频播放器。根因不是分流缺失
+ * （`MediaViewer.modeOf` 早就按 `kind` 分好了），而是**点击之前无从分辨**：
+ * 网格里视频与图片都只有一张缩略图，且 hover 层统一挂着一个播放三角 ——
+ * 图片卡片 hover 也显示 ▶，用户自然以为点下去是播放。
+ *
+ * 所以图标只表达「点开会进入哪种视图」，不表达「能不能播」：
+ *   - video → `Play`（播放语义，保持原状）
+ *   - photo → `ZoomIn`（**看图语义**；绝不能用播放三角，那正是本缺陷的误导源）
+ *   - audio → `Music`（音符，点开是播放器但载体是音频，与视频的视觉区分）
+ *   - file / 未知 → `Maximize2`（中性的「打开」，不承诺任何媒体行为）
+ *
+ * 硬约束：**任何「只用一张缩略图代表条目」的设计都会复现本条缺陷。**
+ * 换皮、换布局时这条不能丢 —— 卡片必须在点击前就给出类型信号
+ * （hover 图标 + 常驻类型徽标，两者互补：前者要悬停，后者不用）。
+ */
+const KIND_ACTION_ICON: Record<string, LucideIcon> = {
+  video: Play,
+  photo: ZoomIn,
+  audio: Music,
+  file: FileText,
+}
+/** 未知类型不给任何媒体语义，退回中性的「打开」 */
+const FALLBACK_ACTION_ICON: LucideIcon = Maximize2
+
+/**
+ * 类型徽标文案（BUG-123）：不 hover 也能分辨条目类型。
+ * 视觉刻意压低（10px、半透明黑底）—— 它是辅助信号，不抢标题与封面的戏。
+ */
+const KIND_LABEL: Record<string, string> = {
+  video: '视频',
+  photo: '图片',
+  audio: '音频',
+  file: '文档',
 }
 
 /**
@@ -147,6 +195,10 @@ function MediaCardBase(props: {
   const playable = hasMediaBytes(item)
   const recacheable = !playable && Boolean(onRecache)
 
+  /** 悬浮图标按类型取（BUG-123），未知类型退回中性「打开」 */
+  const ActionIcon = KIND_ACTION_ICON[item.kind] ?? FALLBACK_ACTION_ICON
+  const kindLabel = KIND_LABEL[item.kind]
+
   return (
     <div
       ref={boxRef}
@@ -187,10 +239,10 @@ function MediaCardBase(props: {
               </span>
             )}
 
-            {/* 悬浮操作层 */}
+            {/* 悬浮操作层：图标按类型分流（BUG-123），不再是统一播放三角 */}
             <span className="absolute inset-0 flex items-center justify-center bg-black/45 opacity-0 transition-opacity group-hover:opacity-100">
-              <span className="flex h-9 w-9 items-center justify-center rounded-full bg-white/90 text-sm text-black">
-                ▶
+              <span className="flex h-9 w-9 items-center justify-center rounded-full bg-white/90 text-black">
+                <ActionIcon className="h-4 w-4" aria-hidden="true" />
               </span>
             </span>
 
@@ -232,6 +284,21 @@ function MediaCardBase(props: {
         {episodeLabel ? (
           <span className="absolute left-1 top-1 rounded bg-accent/90 px-1.5 py-0.5 text-[10px] font-semibold text-white">
             {episodeLabel}
+          </span>
+        ) : null}
+
+        {/* 类型徽标（BUG-123）：不 hover 也能分辨图片/视频/音频。
+            位置选**左下角**，理由是四角只剩它空着：左上 `left-1 top-1` 是集号徽标，
+            右上 `right-1 top-1` 是多选勾选框，右下 `bottom-1 right-1` 是时长徽标
+            （卡片右下角另有常驻的编辑/删除条）；左下既不冲突，又与右下的时长徽标
+            同处一条基线，读起来像一组元信息。
+            `pointer-events-none`：它压在封面按钮上，不能吞掉那一角的点击。 */}
+        {kindLabel ? (
+          <span
+            className="pointer-events-none absolute bottom-1 left-1 rounded bg-black/65 px-1 py-0.5 text-[10px] font-medium leading-none text-white/90"
+            data-testid="item-kind"
+          >
+            {kindLabel}
           </span>
         ) : null}
 
