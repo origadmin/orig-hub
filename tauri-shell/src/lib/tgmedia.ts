@@ -124,16 +124,21 @@ export function parseTgRef(ref?: string | null): { chatId: number; messageId: nu
  * 判据优先级：
  *   1. TG 图片**不落盘**（BUG-049）：raw 端点现场代理 TG 缩略图字节，
  *      `file_path` 为空也能显示 —— 那是「没有本地副本」，不是「丢失」；
- *   2. 后端下发的 `hasBytes`（分集视图；条目视图改看 `filePath`）；
- *   3. 有落盘路径即有字节。
+ *   2. 后端下发的**字节真值**：条目视图是 `bytesPresence`（三态），分集视图是 `hasBytes`
+ *      （布尔）。二者**同源** —— 都由后端 `probe_cached_bytes()` 探测磁盘得出（BUG-132），
+ *      不会再出现「分集说有、条目说没有」。
+ *   3. 有落盘路径即有字节 —— **仅作兜底**：后端尚未下发真值时（旧 daemon / 未走探测的
+ *      出口）保留旧行为，避免一次升级就让整库显示为「无字节」。
  */
 export function hasMediaBytes(item: {
   kind?: string | null
   source?: string | null
   filePath?: string | null
   hasBytes?: boolean | null
+  bytesPresence?: string | null
 }): boolean {
   if (item.source === 'tg' && item.kind === 'photo') return true
+  if (item.bytesPresence != null) return item.bytesPresence === 'present'
   if (item.hasBytes != null) return item.hasBytes
   return Boolean(item.filePath)
 }

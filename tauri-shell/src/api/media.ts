@@ -32,6 +32,12 @@ export interface MediaItem {
   description?: string | null
   kind: MediaKind
   filePath?: string | null
+  /**
+   * 磁盘字节真值（`present` / `missing` / `unknown`），由后端 `probe_cached_bytes()` 探测。
+   * BUG-132：条目视图与分集视图共用它 —— 不要再用 `Boolean(filePath)` 判「有没有字节」，
+   * 那是数据库里的承诺，文件被外部删除 / 0 字节时它照样说有。
+   */
+  bytesPresence?: string | null
   /** 前端生成的封面 data-uri（视频抽帧 / 图片缩略） */
   poster?: string | null
   size?: number | null

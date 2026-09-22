@@ -4,6 +4,7 @@ import { Input } from '../ui/input'
 import { importMediaItems, scanDirectory } from '../../api/media'
 import type { ScannedFile } from '../../api/media'
 import { fmtSize } from '../../lib/tgmedia'
+import { getRecentDirs } from '../../lib/recentDirs'
 
 const KIND_LABEL: Record<string, string> = {
   video: '视频',
@@ -23,7 +24,9 @@ export function ImportDialog(props: {
   onError: (msg: string) => void
 }) {
   const { onClose, onImported, onError } = props
-  const [dir, setDir] = useState('D:\\test_videos')
+  // BUG-143：原先硬编码 `D:\test_videos`（开发期调试残留，会带到用户机器上）。
+  // 改为「上次用过的目录，没有就留空」—— 复用现成的 recentDirs，不新造一套持久化。
+  const [dir, setDir] = useState(() => getRecentDirs()[0] ?? '')
   const [scanning, setScanning] = useState(false)
   const [found, setFound] = useState<ScannedFile[] | null>(null)
   const [excluded, setExcluded] = useState<Set<string>>(new Set())
@@ -106,7 +109,7 @@ export function ImportDialog(props: {
               <Input
                 value={dir}
                 onChange={(e) => setDir(e.target.value)}
-                placeholder="例如 D:\\test_videos"
+                placeholder="选择要导入的目录"
                 className="h-8 text-xs"
                 spellCheck={false}
               />

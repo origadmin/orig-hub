@@ -460,7 +460,11 @@ export function MediaLibraryPanel() {
     setUnassignedOnly(false)
   }, [])
 
-  const filterActive = activeTagId !== null || search.trim() !== '' || unassignedOnly
+  // BUG-131：`activeTagId` 对 series 视图同样生效（`loadSeries` 消费它），故不加视图条件；
+  // `unassignedOnly` 只在 items 视图渲染；`search` 只在 items 视图真正参与过滤 ——
+  // 否则 series 视图会呈现「已过滤」的假象（显示「清除筛选」却没有过滤发生）。
+  const filterActive =
+    activeTagId !== null || (view === 'items' && search.trim() !== '') || unassignedOnly
 
   /**
    * 删除确认的目标集：卡片逐条 = `[id]`，工具栏批量 = 当前勾选。
@@ -687,25 +691,33 @@ export function MediaLibraryPanel() {
       <div className="flex min-w-0 flex-1 flex-col">
         {/* 工具条 */}
         <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border-subtle/60 px-3 py-2">
-          <div className="w-44 min-w-0">
-            <Input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder={t('media.search')}
-              className="h-7 text-xs"
-            />
-          </div>
-          <select
-            value={sort}
-            onChange={(e) => setSort(e.target.value as typeof sort)}
-            className="h-7 rounded-md border border-border-subtle bg-surface px-2 text-[11px] text-fg-strong"
-          >
-            <option value="recent">{t('media.sortRecent')}</option>
-            <option value="oldest">{t('media.sortOldest')}</option>
-            <option value="title">{t('media.sortTitle')}</option>
-            <option value="duration">{t('media.sortDuration')}</option>
-            <option value="size">{t('media.sortSize')}</option>
-          </select>
+          {/* BUG-131：搜索与排序只对 items 视图生效，故只在 items 视图渲染 ——
+              恒渲染但恒无效，等于控件在撒谎（同排「仅未归集」早已是这种守卫写法）。 */}
+          {view === 'items' ? (
+            <div className="w-44 min-w-0">
+              <Input
+                data-testid="media-search-input"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder={t('media.search')}
+                className="h-7 text-xs"
+              />
+            </div>
+          ) : null}
+          {view === 'items' ? (
+            <select
+              data-testid="media-sort-select"
+              value={sort}
+              onChange={(e) => setSort(e.target.value as typeof sort)}
+              className="h-7 rounded-md border border-border-subtle bg-surface px-2 text-[11px] text-fg-strong"
+            >
+              <option value="recent">{t('media.sortRecent')}</option>
+              <option value="oldest">{t('media.sortOldest')}</option>
+              <option value="title">{t('media.sortTitle')}</option>
+              <option value="duration">{t('media.sortDuration')}</option>
+              <option value="size">{t('media.sortSize')}</option>
+            </select>
+          ) : null}
           {view === 'items' ? (
             <label className="flex items-center gap-1 text-[11px] text-muted">
               <input

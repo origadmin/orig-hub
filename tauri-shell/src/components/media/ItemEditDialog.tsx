@@ -6,7 +6,7 @@ import type { MediaItem, MediaTag } from '../../api/media'
 import { mediaItemUrl } from '../../api/media'
 import { clearCacheItem } from '../../api/tg'
 import { TagPicker } from './TagManagerDialog'
-import { coverFit, fmtSize } from '../../lib/tgmedia'
+import { coverFit, fmtSize, hasMediaBytes } from '../../lib/tgmedia'
 
 /**
  * 单条内容编辑：**标题 + 介绍 + 标签**（封面由卡片自动抽帧生成，也可在此预览）。
@@ -30,8 +30,12 @@ export function ItemEditDialog(props: {
   const [busy, setBusy] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
   const [clearing, setClearing] = useState(false)
-  /** 有 `filePath` 才有字节可清；没有时不显示入口（比显示后报 422 诚实）。 */
-  const canClear = Boolean(item.filePath)
+  /**
+   * 有字节才可清；没有时不显示入口（比显示后报 422 诚实）。
+   * BUG-132：判据改为与卡片 / 分集**同一套**（后端字节真值）——
+   * 原先只看 `filePath`，文件被外部删掉后这里仍显示「清除缓存」，点了才发现没东西可清。
+   */
+  const canClear = hasMediaBytes(item)
 
   useEffect(() => {
     setTitle(item.title)
