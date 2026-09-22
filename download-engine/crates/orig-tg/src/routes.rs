@@ -2108,6 +2108,13 @@ async fn patch_media_item(
 /// 只删**下载目录内**的字节（缓存自己产出的）；导入/扫描进来的外部文件不在下载
 /// 目录内，永不删除——那些是用户自己的文件，不是缓存。
 /// 修 BUG-051：此前只复位 TG 标记、不删文件，留下孤儿文件。
+/// 修 BUG-135：两处失败**不再被 `let _ =` 吞掉**——BUG-109 已裁定「必须如实报错」，
+/// 同仓 `cache::reset_tg_flag` 就是按这条规则写的，本函数此前与它自相矛盾：
+/// - 清 TG `downloaded` 失败 → **中止**删除并 500。它失败会让条目被下次同步「复活」，
+///   删除等于没删；「删了又回来」这个错误状态不允许存在，宁可报错也不能假装成功。
+/// - 删字节失败 → **不中止**（用户意图优先；残留字节有兜底回收通道
+///   `POST /api/cache/clear?scope=orphan`），但必须 warn 留痕（含路径与 io::Error）
+///   并在响应里如实带 `bytesRemoved:false` / `bytesError`。
 async fn delete_media_item(
     State(st): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -2118,19 +2125,41 @@ async fn delete_media_item(
         .get_media_item(id)
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    // 字节面默认「没有要删的字节 / 字节已不在」：条目无路径、外部文件（永不删）
+    // 都落在这一档，只有**真的删失败**才翻成 false。
+    let mut bytes_removed = true;
+    let mut bytes_error: Option<String> = None;
     if let Some(item) = &existing {
         if let Some(p) = item.file_path.as_deref() {
             let dir = crate::cache::download_dir(&st).await;
             if crate::cache::inside_dir(&dir, p) {
-                let _ = std::fs::remove_file(p);
+                if let Err(e) = std::fs::remove_file(p) {
+                    bytes_removed = false;
+                    bytes_error = Some(e.to_string());
+                    let msg = format!(
+                        "delete_media_item: remove_file failed for {p} (item {id}): {e}; \
+                         entry deleted anyway, bytes left behind \
+                         (reclaim via POST /api/cache/clear?scope=orphan)"
+                    );
+                    tracing::warn!("{msg}");
+                    st.push_log(&format!("WARN {msg}"));
+                }
             }
         }
         // 双向联动（TG 来源条目）：删媒体库条目 → 同步清 TG 缓存副本。
         // 否则下次缓存 upsert（按 source+ref 幂等）会把条目"复活"，看起来像删不掉。
-        if item.source == "tg" {
-            if let Some((chat, msg)) = parse_tg_ref(&item.ref_key) {
-                let _ = st.store.clear_downloaded(chat, msg).await;
-            }
+        // 复用 `cache::reset_tg_flag`（唯一实现，清字节那条链也用它）：**失败即中止**，
+        // 与本文件此前吞掉失败的做法相反——留一个清不掉的 `downloaded` 标记，
+        // 等于把「删了又回来」这个 bug 固化成数据。
+        if !crate::cache::reset_tg_flag(&st, &item.source, &item.ref_key).await {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "cannot delete media item {id}: the tg downloaded flag could not be cleared \
+                     (see server log), so the entry would reappear on the next sync; \
+                     nothing was deleted"
+                ),
+            ));
         }
     }
     st.store
@@ -2139,10 +2168,16 @@ async fn delete_media_item(
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     // `removed:0` = 这条本来就不存在（**幂等删除**，不报 404）。必须如实区分：
     // 一个恒真的 `{"ok": true}` 会让调用方无法判断「删掉了」还是「本来就没有」。
-    Ok(Json(json!({
+    let mut body = json!({
         "ok": true,
         "removed": if existing.is_some() { 1 } else { 0 },
-    })))
+        "bytesRemoved": bytes_removed,
+    });
+    // 只在真的删失败时带上原因：成功路径不带空字段，调用方无需判空串。
+    if let Some(e) = bytes_error {
+        body["bytesError"] = json!(e);
+    }
+    Ok(Json(body))
 }
 
 /// 解析 TG 引用 `"<chat_id>:<message_id>"`（缓存即入库的 ref 约定）。

@@ -676,7 +676,9 @@ pub async fn clear_preview(
 /// 症状成因：清了字节但 `downloaded` 没复位，**下次缓存 upsert 会让条目「复活」**，
 /// 用户看到的就是「删不掉」。它比「文件没删掉」更隐蔽：磁盘上确实没了，
 /// 但界面仍显示已缓存。故调用方必须据此如实报错，不能假装成功。
-async fn reset_tg_flag(st: &Arc<AppState>, source: &str, ref_key: &str) -> bool {
+/// 由 `routes::delete_media_item` 复用（删条目与清字节共用同一条「复位失败即如实报错」
+/// 规则，不写第二套）——故为 `pub(crate)`。
+pub(crate) async fn reset_tg_flag(st: &Arc<AppState>, source: &str, ref_key: &str) -> bool {
     if source != "tg" {
         // 非 TG 来源本就没有 downloaded 标记需要复位。
         return true;
@@ -848,6 +850,7 @@ fn parse_ids(raw: &str) -> Result<Vec<i64>, ApiError> {
 ///
 /// 「清除缓存文件」是释放磁盘的动作，**不知道占多少就是盲操作**——这是此前漏掉的必需项。
 /// `bytes` 只统计真实存在的、**位于下载目录内**的字节；`external` 是导入/扫描带进来的
+/// 外部文件（永不删除，只如实计数）。
 /// 外部文件（永不删除，只如实计数）。
 async fn stats(
     State(st): State<Arc<AppState>>,
