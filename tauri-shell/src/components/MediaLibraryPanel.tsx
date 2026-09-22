@@ -39,8 +39,11 @@ import {
   isRawFileName,
   canRecacheFromSource,
   recacheFromSource,
-  probeIngestBackend,
-  ensureIngestBackend,
+  probeLibraryBackend,
+  ensureLibraryBackend,
+  probeRecacheBackends,
+  ensureSourceBackend,
+  sourceLabelKey,
 } from '../lib/mediaSources'
 import type { ViewerItem } from '../types'
 
@@ -83,22 +86,47 @@ export function MediaLibraryPanel() {
   const { t } = useTranslation()
   const { setError, openViewer, pendingMediaFocus, setPendingMediaFocus } = useStore()
 
-  // ---- 服务探活（媒体资料库与 TG 同进程；APP 模式由壳托管拉起）----
+  // ---- 资料库后端探活（**不探 TG**：TG 只是来源之一，挂了不影响库）----
   const [alive, setAlive] = useState(false)
-  useEffect(() => {
+  const [libRetrying, setLibRetrying] = useState(false)
+  const probeLibrary = useCallback(async () => {
     const isTauri = '__TAURI_INTERNALS__' in window
-    probeIngestBackend()
-      .then(() => setAlive(true))
-      .catch(async () => {
-        if (!isTauri) return
-        try {
-          await ensureIngestBackend()
-          setAlive(true)
-        } catch {
-          setAlive(false)
-        }
-      })
+    if (await probeLibraryBackend()) {
+      setAlive(true)
+      return
+    }
+    if (!isTauri) {
+      setAlive(false)
+      return
+    }
+    setLibRetrying(true)
+    try {
+      await ensureLibraryBackend()
+      setAlive(await probeLibraryBackend())
+    } catch {
+      setAlive(false)
+    } finally {
+      setLibRetrying(false)
+    }
   }, [])
+  useEffect(() => {
+    void probeLibrary()
+  }, [probeLibrary])
+
+  /**
+   * 来源后端存活态（S3）：**只**影响「重新缓存」入口，不影响库的浏览/管理。
+   * TG 未启动 → 重缓存按钮置灰并给原因，而不是点了报错、更不是面板整体不可用。
+   */
+  const [sourceAlive, setSourceAlive] = useState<Record<string, boolean>>({})
+  useEffect(() => {
+    let stop = false
+    void probeRecacheBackends().then((m) => {
+      if (!stop) setSourceAlive(m)
+    })
+    return () => {
+      stop = true
+    }
+  }, [alive])
 
   // ---- 数据 ----
   const [stats, setStats] = useState<LibraryStats | null>(null)
@@ -113,7 +141,8 @@ export function MediaLibraryPanel() {
 
   // ---- 视图状态 ----
   const [tab, setTab] = useState<Tab>('all')
-  /** 落地视图 = 剧集墙：剧集是一级实体，内容挂在它下面（见左栏层级说明） */
+  /** 落地视图 = 剧集墙：剧集是一级实体，内容挂在它下面（见左栏层级说明）；
+   *  视频库（锁定类型）直接落在内容网格——它是「按类型管的库」，不是剧集墙。 */
   const [view, setView] = useState<View>('series')
   const [activeSeriesId, setActiveSeriesId] = useState<number | null>(null)
   const [activeTagId, setActiveTagId] = useState<number | null>(null)
@@ -357,14 +386,53 @@ export function MediaLibraryPanel() {
    * 丢了就是丢了，给一个必然失败的入口不如如实标「文件已丢失」。
    */
   const recacheItem = useCallback(
-    (item: MediaItem) => {
+    async (item: MediaItem) => {
       if (!canRecacheFromSource(item.source)) return
-      recacheFromSource(item.ref, item.source)
-        .then(() => setError('已重新入队缓存，完成后字节会回到资料库'))
-        .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      // 来源后端没起（如 TG 未启动）：先尝试拉起，拉不起就**如实告知并停手**，
+      // 绝不静默失败——「点了没反应」比「点了告诉我为什么」糟得多。
+      if (sourceAlive[item.source] === false) {
+        try {
+          await ensureSourceBackend(item.source)
+          setSourceAlive((prev) => ({ ...prev, [item.source]: true }))
+        } catch {
+          setError(t('media.recacheUnavailable', { source: t(sourceLabelKey(item.source)) }))
+          return
+        }
+      }
+      try {
+        await recacheFromSource(item.ref, item.source)
+        setError(t('media.recacheQueued'))
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e))
+      }
     },
-    [setError],
+    [setError, sourceAlive, t],
   )
+
+  /** 重新缓存入口被阻断的原因（来源后端不可用）；未阻断返回 null */
+  const recacheBlockedReason = useCallback(
+    (source: string): string | null => {
+      if (!canRecacheFromSource(source)) return null
+      return sourceAlive[source] === false
+        ? t('media.recacheUnavailable', { source: t(sourceLabelKey(source)) })
+        : null
+    },
+    [sourceAlive, t],
+  )
+
+  /** 用户主动重连来源后端（TG 未启动时给一条明路，而不是死按钮） */
+  const reconnectSources = useCallback(async () => {
+    const next = await probeRecacheBackends()
+    setSourceAlive(next)
+  }, [])
+
+  /** 当前不可用的「可重缓存来源」——只影响重新缓存，不影响浏览/管理 */
+  const downSources = useMemo(
+    () => Object.keys(sourceAlive).filter((s) => sourceAlive[s] === false),
+    [sourceAlive],
+  )
+  const hasDownSource = downSources.length > 0
+  const downSourceLabels = downSources.map((s) => t(sourceLabelKey(s))).join('、')
 
   // ---------- 选择 ----------
   // `useCallback`：卡片已 `memo` 化（BUG-026），回调每次渲染换新引用会让 memo 全落空。
@@ -523,7 +591,12 @@ export function MediaLibraryPanel() {
       {/* ───────── 左栏导航 ───────── */}
       <aside className="flex w-52 shrink-0 flex-col border-r border-border-subtle/60">
         <div className="shrink-0 border-b border-border-subtle/60 px-3 py-2.5">
-          <h3 className="truncate text-[13px] font-semibold text-fg-strong">🎬 {t('media.title')}</h3>
+          <h3
+            className="truncate text-[13px] font-semibold text-fg-strong"
+            data-testid="media-panel-title"
+          >
+            {'🎬 ' + t('media.title')}
+          </h3>
           {stats ? (
             <p className="mt-0.5 truncate text-[10px] text-muted">
               {stats.items} 项 · {fmtSize(stats.totalSize)}
@@ -585,12 +658,13 @@ export function MediaLibraryPanel() {
             {t('media.contentAll')}
           </p>
           {(() => {
-            const all: [Tab, string, number][] = [
+            const rows: [Tab, string, number][] = [
               ['all', t('media.all'), stats?.items ?? 0],
               ['video', t('media.videos'), stats?.videos ?? 0],
               ['photo', t('media.photos'), stats?.photos ?? 0],
               ['audio', t('media.audios'), stats?.audios ?? 0],
             ]
+            const all = rows
             const on = view === 'items' && activeTagId === null
             /*
              * 计数 0 的分类**不渲染**（BUG-068）：
@@ -817,10 +891,43 @@ export function MediaLibraryPanel() {
           </div>
         </header>
 
+        {/*
+          来源后端不可用的**非阻断**提示（S3）：
+          TG 没起只意味着「暂时不能原路取回字节」，库本身照常可浏览可管理。
+          这里写死成整页占位是错的——那是把「一个来源不可用」渲染成「库不可用」。
+        */}
+        {alive && hasDownSource ? (
+          <div
+            className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 bg-surface-2/50 px-3 py-1.5 text-[11px] text-muted"
+            data-testid="media-source-offline-banner"
+          >
+            <span className="min-w-0 flex-1 truncate">
+              {t('media.sourceOfflineHint', { sources: downSourceLabels })}
+            </span>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-6 px-2 text-[11px]"
+              onClick={() => void reconnectSources()}
+            >
+              {t('media.reconnectSource')}
+            </Button>
+          </div>
+        ) : null}
+
         {/* 内容区 */}
         {!alive ? (
-          <div className="flex min-h-0 flex-1 items-center justify-center p-10">
+          <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-10">
             <p className="text-sm text-muted">{t('media.offline')}</p>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 px-3 text-xs"
+              disabled={libRetrying}
+              onClick={() => void probeLibrary()}
+            >
+              {libRetrying ? t('media.connecting') : t('media.retryConnect')}
+            </Button>
           </div>
         ) : view === 'seriesDetail' && detail ? (
           <SeriesDetail
@@ -912,8 +1019,9 @@ export function MediaLibraryPanel() {
                     // 逐条删除：目标集显式给 `[id]`，与工具栏批量走同一条确认路径
                     onDelete={deleteItem}
                     onPosterReady={onPosterReady}
-                    // 无字节且来自 TG 时给「重新缓存」（BUG-080）
+                    // 无字节且来源支持原路取回时给「重新缓存」（BUG-080）
                     onRecache={recacheItem}
+                    recacheBlockedReason={recacheBlockedReason(item.source)}
                   />
                 ))}
               </div>

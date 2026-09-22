@@ -13,7 +13,13 @@ import {
 import type { MediaItem } from '../../api/media'
 import { mediaItemUrl } from '../../api/media'
 import { useTranslation } from '../../i18n'
-import { coverFit, fmtDuration, fmtSize, hasMediaBytes } from '../../lib/tgmedia'
+import {
+  coverFit,
+  fmtDuration,
+  fmtSize,
+  hasMediaBytes,
+  sourceLabelKey,
+} from '../../lib/mediaSources'
 import {
   generateImageThumb,
   generateVideoPoster,
@@ -104,10 +110,16 @@ function MediaCardBase(props: {
   /** 封面生成并回写成功后回调（用于就地更新列表，避免整页刷新） */
   onPosterReady?: (patch: { id: number; poster: string; duration?: number }) => void
   /**
-   * 重新缓存入口（BUG-080）：TG 来源条目在字节被清掉后可原路取回。
-   * 非 TG 来源没有「原路」可言，条目会拿到 `null`，展示层只标「文件已丢失」。
+   * 重新缓存入口（BUG-080）：来源支持原路取回的条目在字节被清掉后可取回。
+   * 不支持的来源拿到 `null`，展示层只标「文件已丢失」。
    */
   onRecache?: (item: MediaItem) => void
+  /**
+   * 重新缓存**当前不可用**的原因（S3：来源后端没起，如 TG 未登录/未启动）。
+   * 有值时按钮置灰并在 title 给出原因 —— 宁可给一个说清楚的死按钮，
+   * 也不给一个点了必然报错的活按钮。
+   */
+  recacheBlockedReason?: string | null
 }) {
   const {
     item,
@@ -119,6 +131,7 @@ function MediaCardBase(props: {
     onDelete,
     onPosterReady,
     onRecache,
+    recacheBlockedReason = null,
   } = props
   const [poster, setPoster] = useState<string | null>(item.poster ?? null)
   const [genFailed, setGenFailed] = useState(false)
@@ -218,6 +231,11 @@ function MediaCardBase(props: {
   const { t } = useTranslation()
   const kindKey = KIND_LABEL_KEY[item.kind]
   const kindLabel = kindKey ? t(kindKey) : null
+  /**
+   * 来源标签（S2）：库只记录 `source` 这个可扩展的来源类型，**不感知 TG**。
+   * 「是不是 TG」是展示层用 `sourceLabelKey` 问出来的，不是写死在卡片里的。
+   */
+  const sourceLabel = t(sourceLabelKey(item.source))
 
   return (
     <div
@@ -280,21 +298,31 @@ function MediaCardBase(props: {
           <div
             className="flex h-full w-full flex-col items-center justify-center gap-1 px-1 text-muted"
             data-testid="item-nobytes"
-            title={recacheable ? '字节已清理：可重新从 TG 缓存' : '文件已丢失：磁盘上找不到字节'}
+            title={
+              recacheable
+                ? recacheBlockedReason ?? t('media.recacheFrom', { source: sourceLabel })
+                : t('media.fileMissingHint')
+            }
           >
             <CloudOff className="h-5 w-5" />
             <span className="text-[10px] leading-none">
-              {recacheable ? '缓存已清理' : '文件已丢失'}
+              {recacheable ? t('media.bytesCleared') : t('media.fileMissing')}
             </span>
             {recacheable ? (
               <button
                 type="button"
+                disabled={Boolean(recacheBlockedReason)}
                 onClick={() => onRecache?.(item)}
-                className="rounded-full bg-accent/90 px-1.5 py-0.5 text-[10px] font-medium leading-none text-white transition-colors hover:bg-accent"
-                title="重新从 TG 拉取字节（条目保留在资料库）"
+                className={[
+                  'rounded-full px-1.5 py-0.5 text-[10px] font-medium leading-none text-white transition-colors',
+                  recacheBlockedReason
+                    ? 'cursor-not-allowed bg-muted/40'
+                    : 'bg-accent/90 hover:bg-accent',
+                ].join(' ')}
+                title={recacheBlockedReason ?? t('media.recacheFrom', { source: sourceLabel })}
                 data-testid="item-recache"
               >
-                重新缓存
+                {t('media.recache')}
               </button>
             ) : null}
           </div>
@@ -350,6 +378,14 @@ function MediaCardBase(props: {
         </p>
         <p className="flex items-center gap-1 truncate text-[10px] text-muted">
           <span>{fmtSize(item.size)}</span>
+          {/* 来源徽标（S2）：一眼分清这条内容是从哪来的 */}
+          <span
+            className="shrink-0 rounded bg-surface-2/70 px-1 text-[10px] leading-none text-muted"
+            data-testid="item-source"
+            title={t('media.fromSource', { source: sourceLabel })}
+          >
+            {sourceLabel}
+          </span>
           {item.seriesTitle ? <span className="truncate">· {item.seriesTitle}</span> : null}
         </p>
         {item.tags.length > 0 ? (

@@ -4,9 +4,16 @@ import { Input } from '../ui/input'
 import { patchMediaItem, setItemTags } from '../../api/media'
 import type { MediaItem, MediaTag } from '../../api/media'
 import { mediaItemUrl } from '../../api/media'
-import { clearCacheItem } from '../../api/tg'
 import { TagPicker } from './TagManagerDialog'
-import { coverFit, fmtSize, hasMediaBytes } from '../../lib/tgmedia'
+// 媒体库不直接碰 TG 模块：清缓存是「库」的动作，来源知识封在 mediaSources 里
+import {
+  clearCachedBytes,
+  coverFit,
+  fmtSize,
+  hasMediaBytes,
+  sourceLabelKey,
+} from '../../lib/mediaSources'
+import { useTranslation } from '../../i18n'
 
 /**
  * 单条内容编辑：**标题 + 介绍 + 标签**（封面由卡片自动抽帧生成，也可在此预览）。
@@ -24,6 +31,7 @@ export function ItemEditDialog(props: {
   onError: (msg: string) => void
 }) {
   const { item, tags, onClose, onSaved, onError } = props
+  const { t } = useTranslation()
   const [title, setTitle] = useState(item.title)
   const [desc, setDesc] = useState(item.description ?? '')
   const [selected, setSelected] = useState<number[]>(item.tags.map((t) => t.id))
@@ -70,7 +78,7 @@ export function ItemEditDialog(props: {
   const doClearCache = async () => {
     setClearing(true)
     try {
-      await clearCacheItem(item.id)
+      await clearCachedBytes(item.id)
       setConfirmClear(false)
       onSaved()
       onClose()
@@ -107,6 +115,10 @@ export function ItemEditDialog(props: {
           </div>
           <div className="min-w-0 flex-1 space-y-1 text-[10.5px] text-muted">
             <p className="truncate">类型：{item.kind}</p>
+            {/* 来源（S2）：库只存 `source` 这个可扩展的来源类型，展示层问 mediaSources 拿标签 */}
+            <p className="truncate" data-testid="item-edit-source">
+              来源：{t(sourceLabelKey(item.source))}
+            </p>
             <p className="truncate">大小：{fmtSize(item.size)}</p>
             <p className="truncate" title={item.filePath ?? ''}>
               路径：{item.filePath ?? '—'}

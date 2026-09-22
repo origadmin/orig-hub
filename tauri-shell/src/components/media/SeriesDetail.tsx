@@ -17,7 +17,14 @@ import { Button } from '../ui/button'
 import { Input } from '../ui/input'
 import type { MediaEpisode, MediaSeries, MediaSeriesDetail, MediaTag } from '../../api/media'
 import { mediaItemUrl } from '../../api/media'
-import { coverFit, fmtDuration, hasMediaBytes, parseTgRef } from '../../lib/tgmedia'
+import {
+  canRecacheFromSource,
+  coverFit,
+  fmtDuration,
+  hasMediaBytes,
+  recacheFromSource,
+  sourceLabelKey,
+} from '../../lib/mediaSources'
 import {
   setSeriesTags,
   patchSeries,
@@ -25,9 +32,9 @@ import {
   moveEpisode,
   switchEpisodeSource,
 } from '../../api/media'
-import { enqueueCacheTask } from '../../api/tg'
 import { generateVideoPoster } from '../../lib/poster'
 import { TagPicker } from './TagManagerDialog'
+import { useTranslation } from '../../i18n'
 
 const KIND_LABEL: Record<string, string> = {
   series: '剧集',
@@ -101,6 +108,7 @@ export function SeriesDetail(props: {
   onChanged: () => void
   onError: (msg: string) => void
 }) {
+  const { t } = useTranslation()
   const {
     detail,
     tags,
@@ -138,20 +146,18 @@ export function SeriesDetail(props: {
    * 重新缓存某一集（BUG-080）。
    *
    * 清缓存只删字节、留条目：这一集仍在剧集列表里，却会以「可播」的外观呈现，
-   * 点下去 raw 端点 404。这里给 TG 来源一个**原路取回**的入口（`ref` 里的
+   * 点下去 raw 端点 404。这里给**支持原路取回的来源**一个入口（TG 的 `ref` 里
    * `chat:msg` 就是下载地址）；本地导入的文件没有原路，只如实标「文件已丢失」。
+   *
+   * 判定走 `canRecacheFromSource(source)`，**不写死 'tg'** —— 来源是可扩展的，
+   * 今天只有 TG 能原路取回，明天 OSS/S3 也能，剧集页不该知道这件事。
    */
   const recacheEpisode = (ep: MediaEpisode) => {
-    if (ep.source !== 'tg') {
-      onError('这一集不是 TG 来源，没有可重新拉取的地址')
+    if (!canRecacheFromSource(ep.source)) {
+      onError(`这一集的来源（${t(sourceLabelKey(ep.source))}）没有可重新拉取的地址`)
       return
     }
-    const tg = parseTgRef(ep.ref)
-    if (!tg) {
-      onError('这一集的来源标识不是 chat:msg，无法重新缓存')
-      return
-    }
-    enqueueCacheTask({ chatId: tg.chatId, messageIds: [tg.messageId] })
+    recacheFromSource(ep.ref, ep.source)
       .then(() => onError('已重新入队缓存，完成后这一集会恢复播放'))
       .catch((e: unknown) => onError(e instanceof Error ? e.message : String(e)))
   }
@@ -662,16 +668,20 @@ export function SeriesDetail(props: {
                             className="flex h-11 w-20 shrink-0 flex-col items-center justify-center gap-0.5 rounded border border-dashed border-border-subtle bg-surface-2 px-0.5 text-muted"
                             data-testid="episode-nobytes"
                             title={
-                              ep.source === 'tg'
-                                ? '字节已清理：可重新从 TG 缓存'
-                                : '文件已丢失：磁盘上找不到字节'
+                              canRecacheFromSource(ep.source)
+                                ? t('media.recacheFrom', {
+                                    source: t(sourceLabelKey(ep.source)),
+                                  })
+                                : t('media.fileMissingHint')
                             }
                           >
                             <CloudOff className="h-3.5 w-3.5" />
                             <span className="text-[9px] leading-none">
-                              {ep.source === 'tg' ? '未缓存' : '文件丢失'}
+                              {canRecacheFromSource(ep.source)
+                                ? t('media.notCached')
+                                : t('media.fileMissing')}
                             </span>
-                            {ep.source === 'tg' ? (
+                            {canRecacheFromSource(ep.source) ? (
                               <button
                                 type="button"
                                 onClick={() => recacheEpisode(ep)}
@@ -755,10 +765,10 @@ export function SeriesDetail(props: {
                             {ep.ref && (
                               <span
                                 className="text-muted/70"
-                                title={`${ep.source === 'tg' ? 'TG' : '本地'} · ${ep.ref}`}
+                                title={`${t(sourceLabelKey(ep.source))} · ${ep.ref}`}
                               >
                                 {' · '}
-                                {ep.source === 'tg' ? 'TG' : '本地'}
+                                {t(sourceLabelKey(ep.source))}
                               </span>
                             )}
                           </p>

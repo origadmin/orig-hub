@@ -3,7 +3,7 @@ import { Button } from '../ui/button'
 import { Input } from '../ui/input'
 import { importMediaItems, scanDirectory } from '../../api/media'
 import type { ScannedFile } from '../../api/media'
-import { fmtSize } from '../../lib/tgmedia'
+import { fmtSize } from '../../lib/mediaSources'
 import { getRecentDirs } from '../../lib/recentDirs'
 
 const KIND_LABEL: Record<string, string> = {
