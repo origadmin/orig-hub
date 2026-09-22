@@ -75,18 +75,27 @@ export const selectConnected = (s: RootState): boolean => s.connected
 export const selectDaemonAlive = (s: RootState): boolean => s.daemon?.alive === true
 
 /**
- * TG 入口级门控的**单一判据**（BUG-094 / BUG-097）。
+ * TG 入口级门控的**单一判据**（BUG-094 / BUG-097；2026-09-23 修订以修复回归）。
  *
- * 常规开关开 且 orig-tg 进程可达即显示入口；`unavailable`（进程活着、连不上
- * Telegram）仍算可用 —— 那正是用户需要进去修的状态（改代理 / 重新登录），
- * 藏掉入口等于切断唯一的修复路径。`null` = 探测未返回的瞬态，按可用处理避免首帧闪烁。
+ * 入口是否显示**只由开关决定**：`tgEnabled` 为真即显示。
  *
- * `MainLayout`（经 `tgReady` 传给 `Sidebar`）与 `AccountsPanel` 必须**同读此处**，
- * 不得各写一份（BUG-087 的教训：同语义多处各写各的，最后齐刷刷错成同一个值）。
+ * 历史实现会在 `tgAvailability.status === 'unreachable'` 时把入口一起藏掉，
+ * 但那恰恰是最该让用户看见的状态——orig-tg 进程没起来，用户需要点进面板去
+ * 「设置 → 账号」启动 / 重试。藏掉入口等于把唯一的自救路径也切断，与 BUG-094/097
+ * 的本意（「入口常驻，让用户能进去修」）自相矛盾，正是本次回归的根因。
+ *
+ * `unavailable`（进程活着、连不上 Telegram）与 `unreachable`（连进程都够不到）
+ * **都不再隐藏入口**；两种故障态的修复横幅与「启动 / 重试」出口由 `AccountsPanel`
+ * / `TgPanel` 在面板内渲染。可用性只用于面板内的状态展示，不再参与入口级门控。
+ *
+ * 注意（设计决策，非静默改写）：`tgAvailability` 形参保留以维持调用方签名稳定，
+ * 入口级门控不再依据它分支。此处刻意与 `TgCacheEntry` 的 `unreachable` 隐藏逻辑
+ * 区分——缓存入口需要真实服务才能查看，而导航入口是用户进入修复面板的唯一入口。
  */
 export function resolveTgFeatureReady(
   tgEnabled: boolean,
   tgAvailability: RootState['tgAvailability'],
 ): boolean {
-  return tgEnabled && (tgAvailability === null || tgAvailability.status !== 'unreachable')
+  void tgAvailability
+  return tgEnabled
 }
