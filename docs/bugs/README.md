@@ -1,30 +1,11 @@
-# 缺陷追踪约定（BUG-XXX.md）
+# 缺陷追踪（索引）
 
-每个缺陷一个文件，命名 `BUG-<编号>.md`，编号自 `BUG-001` 起自增。模板如下：
+本文件是缺陷**索引表**。**登记规格（标准档／轻量档）、索引行规格、门禁行为、建档要点
+一律见 `docs/rules/bug-registry.md`** —— 那些内容只在新建／修改登记时需要，不随索引常驻。
 
-```markdown
-# BUG-<编号>: <一句话标题>
-
-- 状态: open | in_progress | fixed | wontfix | closed
-- 发现日期: YYYY-MM-DD
-- 模块: engine | shell
-- 严重程度: low | mid | high | critical
-
-## 现象
-<用户/测试观察到的现象>
-
-## 根因
-<定位到的代码位置与原因，附 file:line>
-
-## 复现
-<最小复现步骤 / 验证脚本>
-
-## 修复
-<改动摘要 + 验收方式>
-
-## 关联
-<相关 BUG / 提交 / 文档>
-```
+速览：每缺陷一个 `BUG-<编号>.md`，编号自 1 起自增；状态机
+`open → in_progress → fixed / wontfix → closed`；`fixed` 必须带 `## 验收证据`
+（含至少一条跨机器可核验的引用）；`fix` 类提交必须引用 `BUG-<编号>`。
 
 ## 当前登记
 
@@ -141,7 +122,7 @@
 | BUG-110 | 链路已断的 RPC 失败被归类成 **400 并裸漏传输层原文** —— `grammers.rs` 里 12 处 RPC 失败一律包成 `ClientError::Other`，而 `From<ClientError> for ApiError` 把 `Other` 映射成 `400 + e.to_string()`。`dropped (cancelled)` 实为 MTProto 发信任务已死（上游依赖不可用，应 503），却被报成 4xx「你的请求有问题」，前端据此不重试、不提示，故障被读成用户操作失误。**BUG-106 的端点级降级漏了走 `From` 的路径**（已确认 `/api/tg/file` 的 `Err(e) => Err(e.into())`），这是「逐端点打补丁」的结构性缺陷。修：新增 `classify_rpc_err` / `rpc_err`，在**源头**按链路活性归类（断 → `Unavailable` → 503 + 可行动原因），12 处调用点全改，所有端点自动正确 | fixed | engine+shell |
 | BUG-111 | **任务失败原因（持久化在 DB）在界面原样直出传输层原文** —— 修完 BUG-110 后查 daemon 聚合路径 `/api/activity`，发现一条仍留存的失败任务 `error="request error: dropped (cancelled)"`（`updated_at` 2026-09-22 02:05:12，任务 id=65 至今 `failed:1`）—— 这同时补上了 BUG-110 缺失的**活体证据**：链路静默死亡确实发生过。两处渲染点都不分类：TgPanel 只特判了「受保护内容」、CacheManagerDialog 完全没有（同一语义两份实现）。修：`lib/tgReason.ts` 增 `describeTgFailure`（纯函数、不打日志，避免正文与 title 双记），把「领域特例 + 分类 + 翻译 + 保留原文兜底」收在一处，两处共用 | fixed | shell |
 | BUG-112 | **剧集里的图片无法从剧集中移除** —— `SeriesDetail.tsx:178-183` 把 episodes 切成 `photoEps`（图册区 533-556：只有打开灯箱的按钮）与 `playEps`（分集列表：行内才有「移除」/上移/下移/编辑）。于是「从剧集移除一张图片」这个动作在 UI 上**根本不存在**，能进不能出。后端能力一直都在（`DELETE /api/media/episodes/:id`；`remove_episode` 会重排该季集号并 prune 空剧集），只是前端没接上；用户唯一的替代路径 `DELETE /api/media/items/:id` 是**连字节从资料库删除**，语义不同。修：图册区补移除入口、复用 `onRemoveEpisode`（后端无需改）。**修复前必须先取证「移除后会不会被 TG 自动成剧 upsert 复活」**（BUG-029 的先例：单向删除会复活），若复活则需负向记录而非只删行 | in_progress | shell |
-| BUG-126 | 从剧集移除的分集会被**重新编回**（缺 tombstone 负向记录）—— 实测：`append` item143 → epId393 → `DELETE` 393 → 图册清空 → **再次 `append` [143] → `{"added":1}`、epId394 复活**。根因：`append_episodes_ranged`（`media.rs:1714`）**只按当前 `media_episode` 行去重**，行删了去重依据就没了；`remove_episode`（`:1900`）**不写任何负向记录**；全库无外键级联。另一条独立路径：移除唯一分集 → `prune_empty_series` 删剧集 → 下次同步按 `source_key` 落空 → **新建剧集并重新编入**（两个触发点都要覆盖）。影响：**BUG-112 的「移除」是半坏的**（入口已实施但语义不成立，故 112 只能 `in_progress`）；与 BUG-029「单向删除会复活」同一错误模式换了位置。修：tombstone 负向记录，**必须在数据层表达**（触发器/约束）而非逐调用点判断（BUG-110 教训），且要定义「用户主动重新加入时必须能加回」的语义；与 BUG-124 同期做 | open | engine |
+| BUG-126 | 从剧集移除的分集会被**重新编回**（缺 tombstone 负向记录）—— 实测：`append` item143 → epId393 → `DELETE` 393 → 图册清空 → **再次 `append` [143] → `{"added":1}`、epId394 复活**。根因：`append_episodes_ranged`（`media.rs:1714`）**只按当前 `media_episode` 行去重**，行删了去重依据就没了；`remove_episode`（`:1900`）**不写任何负向记录**；全库无外键级联。另一条独立路径：移除唯一分集 → `prune_empty_series` 删剧集 → 下次同步按 `source_key` 落空 → **新建剧集并重新编入**（两个触发点都要覆盖）。影响：**BUG-112 的「移除」是半坏的**（入口已实施但语义不成立，故 112 只能 `in_progress`）；与 BUG-029「单向删除会复活」同一错误模式换了位置。修：tombstone 负向记录，**必须在数据层表达**（触发器/约束）而非逐调用点判断（BUG-110 教训），且要定义「用户主动重新加入时必须能加回」的语义；与 BUG-124 同期做 | fixed | engine |
 | BUG-113 | 单集多视频**缺「质量」与「主版本」语义** —— 多源结构其实**已经存在**（`media_episode_source`，BUG-039），attach / switch-primary / detach 三个 API 与前端同名函数都在。真正的缺口四条：无质量字段（只有 `size/width/height`，无码率、无 `quality`）；主源仍是**隐式**的 `media_episode.item_id`（无 `is_primary` 列）；备用源按 `created_at ASC` 排序 → **先来的是主**，与质量无关；UI 只有一个「N 源」按钮**盲目把 `sources[0]` 提为主**（`SeriesDetail.tsx:692-709`），用户看不到质量差异也无从选择。**更正**：评审文档 `media-tg-review-2026-09-22.md` 第 20/67-69/204-209 行断言「单集多视频在数据模型上不可能」**是错的** —— 只看了 `episode.item_id` 是 1:1，忽略了已存在的 `media_episode_source`。改造须守住：BUG-044 触发器（备用源只收 video）、`item_id` 全表 UNIQUE、建表批只许新旧库共有列（BUG-032） | open | engine+shell |
 | BUG-114 | 在线流**零背压** —— `media_file()` 用 `Body::from_stream` 直透 grammers 下载流，而 `DELIVERY_BUDGET_FACTOR` 全仓只在 `routes.rs:2324`（`serve_local_file`）用过一次：**BUG-033 只修了本地路径，在线路径漏了**。后果与 BUG-033 实测一致：灌数据速率远超解码速率 → Chromium 读满 buffer 即 abort → 同一区域反复重取（2x 下 137 请求 / 792 MiB / 冗余 63x）。离线优先拍板后 Remote 降级为**过渡态兜底**：仍须修，但不再是最紧急的一条（让位给 BUG-115/116）。修：统一 `deliver()` 单一入口，两条路都过 `throttle`；验收必须 1x 与倍速**各记一段**，判卡顿用真实上屏帧（BUG-034） | open | engine |
 | BUG-115 | 「加入媒体库」**只入库、不落盘** → 断网后打不开 —— 用户以为「进了我的库 = 在我电脑上」，实际只写了索引、字节还在 Telegram。`media_item` 没有「字节状态」字段，编目与落盘被压成同一个动作，而 `TgPanel.tsx:1885-1915` 的**同一个按钮按内容类型走两种语义**（含视频=落盘+入库，纯图=只入库不落盘）。**已定案（用户 2026-09-22 拍板：离线优先）**：合并为一个动作「入库即落盘」，**取消「只入库、不落盘」这条路径** —— 它是本条、BUG-116、BUG-117 三个问题的**共同源头**；图片同样落盘；失败必须给显式重试入口，**不得静默降级为「仅入库」** | open | engine+shell |
@@ -158,7 +139,22 @@
 | BUG-127 | `aria-label` 用了**从未落地**的 i18n 键 —— TG 面板监控折叠按钮读屏念出原始键名 `tg.monitorCollapse`。`docs/design/tg-ux-implementation-plan.md:61` **明确列了「新增这两个键」这一步**，代码用了、资源文件没有；`i18n/index.ts:50` 回退链 `dict[key] ?? MESSAGES['zh-CN'][key] ?? fallback ?? key` **缺省回退到 key 本身**，于是缺键不报错、不空白，而是**把键名当文案渲染** —— 静默失败，界面看不出错，只有读屏用户受影响。已补 `zh-CN` / `en-US` 两处键；验收为**静态键存在性核对**（引用数 1 / 定义数 0 即缺陷态），证据强度低于渲染验收，已如实标注 | fixed | shell |
 | BUG-128 | 卡片**类型徽标文案硬编码中文** —— BUG-123 新增的 `KIND_LABEL` 直接写字面量「视频」「图片」「音频」「文档」，而 `tauri-shell` 是双语应用（`t()` 取当前 locale），切 `en-US` 时卡片上仍是中文、与周围英文混排。根因：**本仓库第一处「渲染给用户的纯文本」绕过 i18n**（同文件既有 `KIND_ICON` 是 emoji，与语言无关故不构成缺陷；换成文字标签才构成）。**中文环境完全看不出**（值恰好就是中文），属**单语可见**缺陷，且现有门禁不检测硬编码文案。修：走 i18n 通道，**不得改变 zh-CN 渲染值**（BUG-123 验收脚本断言徽标恰为「图片」/「视频」），并补一条 en-US 渲染断言 —— 只测 zh-CN 测不出来。**已修**（`a42381b`）：新增 `media.kindVideo/kindPhoto/kindAudio/kindFile` 四键（**不复用**复数的 `media.videos/photos/audios`，语义不同），`KIND_LABEL` 改存 i18n 键、用 `useTranslation()` 求值（**不能**用裸 `t()`：它不订阅 `settings.language`，而卡片被 `memo` 包着，切语言不会重渲染）。验收 44/44 PASS；**本条专属证伪** `ORIG_VERIFY_REVERT_I18N=1`（把徽标改回硬编码中文）→ exit 1 且**只有 en-US 两条变红**（42/44），zh-CN 断言保持全绿 —— 失败被精确归因到 en-US 场景。**不能用** BUG-123 的 `ORIG_VERIFY_REVERT`（删徽标）代替：那只证到「徽标缺失」，证不到「文案硬编码」 | fixed | shell |
 | BUG-129 | `addEpisode`（`POST /api/media/series/:id/episodes`）默认 `episodeNo=1` 是**按槽位 upsert** —— 槽位已被占用时**静默覆盖**（实测 `389` 顶掉 `390`）：不报错、不提示、被顶掉的原条目去向不明。**可达性已核实：前端零调用** —— `addEpisode` 只在 `api/media.ts:314` 定义，全 `tauri-shell/src` 无调用点；前端「加入剧集」实际走 `appendEpisodes` → `/episodes/append`（顺序追加、不挤占），故严重度定 **low**：不是「用户现在会丢数据」，而是**潜伏隐患**（端点暴露在 REST 上，任何外部调用或将来新增的前端入口都会踩，且表现是静默覆盖、无从归因）。这是 **BUG-113 第 5 条**（`attach/detachEpisodeSource` 定义零调用）的**同类**：**定义了却没人用的 API 最容易在无人验证的状态下腐化**，本项目已两次出现，值得当成一类问题看待。修：先确认有无外部消费者；无则**删端点**或**要求显式覆盖意图**（缺省返回 409），**不要**只改默认值 | open | engine |
+| BUG-130 | **合集（一个视频含多集）缺时间偏移，且与「单集多源」无法共存** —— 用户 2026-09-22 指出 D1（同集多源归并）隐含了「1 个条目 = 1 集」的假设，对合集不成立。**先说清现状，避免误判成「完全不支持」**：合集链路**是通的** —— `parse_episode_range`（`media.rs:2951`）能解析 `EP01-02`/`第3~4集`/`10-20集合集`，`ranged_items`（`routes.rs:2158`，读 **TG 消息 caption**）已接在自动成剧上，`media_episode.episode_no_end` 存储，占用快照按 `COALESCE(episode_no_end, episode_no)` 展开（注释写明「合集不会被打成单集」），UI 也渲染 `S1E1-2`。**但从未被真实数据走过**：库里 43 个分集**带区间 = 0**，标题含区间的两条（item 355/356）**根本不在任何剧集里** ⇒ 整条链路「通了但空转」，只在单测里走过。**两处真缺口**：① **播放无时间偏移**（全仓零命中 `start_sec`/offset）—— 点合集就是**从头播整个文件**，进度条时间轴是整个文件，想看第 4 集只能手动拖；② **合集与「单独的第 4 集文件」无法共存为多源** —— 合集占着 3、4 槽位，单独的 EP4 会被推到**第 5 集**，而按用户拍板它本该是「第 4 集的另一个源」；更麻烦的是**模型里没有「第 4 集」这一行可挂**（合集是一行 `E3-4`），要支持得展开成 N 行或引入「段」层，且需放宽 `media_episode_source.item_id` 全表 UNIQUE（BUG-039 不变量）。**关键未知：时间区间从哪来** —— 章节元数据最自然但本仓无探测能力（BUG-122 实测无 ffmpeg），手动标注一定能做但要逐条标，按时长等分不可靠；**在拿到时间区间前两条缺口都无法真修**，只能把语义做诚实。取证纪律：我用 `grep` 接 `head` 得出「无生产调用点」是**错的**（`head` 截断 10 行截掉了 `routes.rs:2169`）——**存在性判断不能用 `head`** | open | engine+shell |
 | BUG-105 | 「能不能播」判数据库字段不判磁盘 —— `GET /api/tg/downloaded/:chat_id` 把 `downloaded` 标志位直接译成「messageId → 路径」清单，而它就是前端 `local ? tgLocalFileUrl : tgFileUrl`（`TgPanel.tsx`）的唯一来源：**在清单里 = 承诺能本地播**，却从未 stat 过磁盘。文件被手动删除后仍判「已缓存」→ 本地 URL 404，且因状态仍是已缓存而**不出现「重新缓存」入口**，用户卡死。**已修**：新增 `cache::probe_cached_bytes` 返回**三态**（`Present` 给出路径 / `Missing` 剔除清单并复位 DB 使重新缓存入口出现 / `Unknown` 剔除清单但**不**复位）——三态是为了不重蹈 `inside_dir` 静默 false 的覆辙，一次瞬态 stat 失败不得触发无谓重下。性能：本端点原本就是一次 DB 读，本次**零新增 DB 读**，新增的只有 `tokio::fs::metadata`（stat 文件系统非 DB，单次调用微秒级，不做上限裁剪，裁剪等于放行未校验项）；复位写入只在确认缺失时发生且复位后该行不再入列表，故一次收敛。未覆盖：媒体库 `has_bytes` 仍为 `file_path IS NOT NULL` 派生（待 BUG-098 的 `asset_state`） | fixed | engine |
+
+| BUG-131 | 媒体库工具条搜索/排序仅 items 视图生效却恒渲染（view 默认 series 第一眼即无效）+ filterActive 假筛选态 + 标签 chip 切视图行为不一致——搜索框/排序/filterActive 三件必须同批修复 | open | shell |
+| BUG-132 | 条目「有无字节」判据分叉——Rust MediaItem 无 has_bytes 致条目视图恒走 file_path 判定（BUG-105 已判不可靠），probe_cached_bytes 三态未接线；ItemEditDialog canClear 同病 | fixed | engine+shell |
+| BUG-133 | 媒体库「占用空间」展示登记值 SUM(size)——清缓存后数字不变被质疑没删成功；应主显磁盘真值并标注口径，不改 BUG-051 行为 | open | engine+shell |
+| BUG-134 | 连接态三处重复渲染（已同源，左下灯 h-2 其余 h-1.5）+ 速度双实现（MainLayout totalSpeed 绕过 selectors）——收敛方式待拍板 | open | shell |
+| BUG-135 | 删除媒体条目时 remove_file 与 clear_downloaded 失败被 let _ = 静默吞——接口假成功，违背 BUG-109 如实报错判定 | open | engine |
+| BUG-136 | cache 接口 external 字段双形状双口径——stats 返数字且不累加字节、clear/preview 返对象且累加 | open | engine |
+| BUG-137 | TG 内置播放器三入口只传单条/单相册——无上/下一条，媒体库侧同播放器却可连播整剧，能力不一致 | open | shell |
+| BUG-138 | media:list 无读缓存——fetchCache.cacheKey 未覆盖条目列表，每次进 items 视图发真请求 | open | shell |
+| BUG-139 | 「打开已下载」走系统默认播放器、「预览」走内置播放器——同一「打开」动词两种行为无标注，且绕过解码健康提示 | open | shell |
+| BUG-140 | TG 分组模式频道过滤搜索框与全局消息搜索并存无作用域标注（placeholder 文案本身准确） | open | shell |
+| BUG-141 | i18n 硬编码中文 253 行分布 25 文件（en-US 界面混中文）——BUG-128 同病新实例（SeriesDetail/ImportDialog KIND_LABEL 等），无门禁检测 | open | shell |
+| BUG-142 | i18n 孤儿 key 42 个（收敛残骸）误导维护；36 组同值 key 部分为刻意分离（BUG-128 裁定）禁盲并 | open | shell |
+| BUG-143 | ImportDialog 默认目录硬编码 D:\test_videos 开发残留进生产 UI | open | shell |
 
 ## 历史欠账
 
