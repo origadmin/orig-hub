@@ -1368,9 +1368,9 @@ export function TgPanel(
                 搜索框已上移到上下文栏（BUG-100），这里只留范围说明 / 命中数 / 清除，
                 避免同一 state 出现第二个输入框。 */}
             <header className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-4 py-2.5">
-              <span className="min-w-0 flex-1 truncate text-[10px] text-muted/80">
-                {t('tg.globalSearchScope')}
-              </span>
+              {/* 原此处常驻「仅搜索已同步到本地的监控消息」（03bf4d4 引入）。
+                  同 TgGlobalSearch：能力限制说明不做常驻元素，改在空态按需解释。 */}
+              <span className="min-w-0 flex-1" />
               <span className="shrink-0 text-[11px] tabular-nums text-muted">
                 {globalHits.length}
               </span>

@@ -51,12 +51,14 @@ export const TgGlobalSearch = memo(function TgGlobalSearch() {
         className="flex h-7 w-80 min-w-0 items-center gap-2 rounded-md border border-border-subtle bg-surface-2/40 px-2"
         data-testid="tg-global-search"
       >
-        <span
-          className="shrink-0 rounded bg-surface-2/60 px-1.5 py-0.5 text-[10px] text-muted"
-          data-testid="tg-global-search-scope"
-        >
-          {t('tg.globalSearchScope')}
-        </span>
+        {/*
+          原此处常驻一条「仅搜索已同步到本地的监控消息」作用域 chip（f437571 引入）。
+          已移除：那是**能力限制说明**，不是搜索功能的一部分，常驻占据搜索框最靠前的
+          视觉位属于主客倒置——把「这个搜索有局限」当成第一眼信息递给用户，还挤占
+          `w-80` 里本就紧张的输入宽度。BUG-100 的三条约束与验收要点（AC3b：全页
+          input 恒为 1；结果展示来自哪个频道）**均未要求常驻范围标注**。
+          限制说明改为**按需出现**：只在「搜不到」的空态里解释原因（TgPanel 空态）。
+        */}
         <svg
           className="h-3.5 w-3.5 shrink-0 text-muted"
           fill="none"
