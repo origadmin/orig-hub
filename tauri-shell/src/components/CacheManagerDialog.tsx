@@ -12,6 +12,7 @@ import { findMediaItemIdByRef, getMediaItem, mediaItemUrl } from '../api/media'
 import {
   cancelCacheTask,
   deleteCacheTask,
+  deleteCacheTasksByIds,
   listAllCacheTasks,
   listTgDialogs,
   retryCacheTask,
@@ -35,11 +36,19 @@ import type { TgCacheTask, TgChannel, ViewerItem } from '../types'
  * 重新变回主视角 —— 那正是本次要纠正的错位。故只改名易位：流水线默认在前，
  * 字节回收收进次位页签。
  *
- * ## 为什么删掉了「全选 / 删除所选」
+ * ## 为什么必须有「全选 / 删除所选」（BUG-149）
  *
- * 勾选驱动是为「挑着清记录」服务的；而清记录本身就是个假需求 —— 记录是流水线的
- * 历史，一条条删它不释放任何字节（字节在回收页签），只是让「哪条消息入过库」变
- * 得无从追溯。留一个「单条删除」给确有需要的人就够了，批量删除整个撤掉。
+ * 记录只增不减：`cache_task` 没有任何保留策略（无自动 GC），且终态后再次入队是
+ * `INSERT` 新行（`docs/design/ingest-pipeline-assessment.md` 3.10）。只有「单条删除」
+ * 时，清 20 条要 20 次点击加 20 次确认 —— 等于没有清理能力。
+ *
+ * 曾在 `9bee7b8` 以「清记录是假需求」为由把批量删除整个撤掉：那是**无编号的自主
+ * 重构**，且推翻了三天前刚验收的 BUG-054（用户原文「清理需要有全选，部分选择这些吧？
+ * 一个一个删？」）。现按 L1 档（多选删除）恢复，依据见
+ * `docs/design/ingest-pipeline-redesign-assessment.md` §1.4。
+ *
+ * 清记录**不释放字节**（字节在回收页签）—— 所以记录值得保留，但也不该被当成资产
+ * 管理动作：批量删除走原子端点，且必须先确认、如实报出影响面。
  *
  * ## 为什么每条删除都要确认
  *
@@ -148,6 +157,11 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
   confirming: boolean
   /** 该行点过「去媒体库查看」但 by-ref 未命中（成品不在库里） */
   missing: boolean
+  /** 该行是否参与批量选择（「更多」里的已取消组不参与：全选的语义是当前筛选内） */
+  selectable: boolean
+  /** 该行是否已被勾中 */
+  selected: boolean
+  onToggleSelect: (task: TgCacheTask) => void
   onGoLibrary: (task: TgCacheTask) => void
   onRetry: (task: TgCacheTask) => void
   onCancel: (task: TgCacheTask) => void
@@ -161,6 +175,9 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
     busy,
     confirming,
     missing,
+    selectable,
+    selected,
+    onToggleSelect,
     onGoLibrary,
     onRetry,
     onCancel,
@@ -180,8 +197,20 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
       data-testid="cache-task-row"
       data-status={task.status}
     >
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2">
+      <div className="flex items-center gap-2">
+        {selectable ? (
+          <input
+            type="checkbox"
+            className="h-3.5 w-3.5 shrink-0 accent-accent"
+            checked={selected}
+            disabled={busy}
+            onChange={() => onToggleSelect(task)}
+            aria-label={t('tg.cacheSelectRow')}
+            title={t('tg.cacheSelectRow')}
+            data-testid="cache-select-row"
+          />
+        ) : null}
+        <div className="flex min-w-0 flex-1 items-center gap-2">
           <span
             className={cn(
               'shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium',
@@ -306,8 +335,14 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
   )
 })
 
-/** 待确认的删除：只有单条（批量删除已撤掉）。 */
-type Confirm = { kind: 'one'; id: number } | null
+/**
+ * 待确认的删除。
+ *
+ * `one` = 行内单条；`batch` = 勾选的若干条（BUG-149 恢复，BUG-054 验收形态）。
+ * 批量走原子端点 `DELETE /api/cache/tasks?ids=…`，不循环调单条 —— 循环调单条没有
+ * 原子性也没有影响面，正是 BUG-054 时代要摆脱的旧形态。
+ */
+type Confirm = { kind: 'one'; id: number } | { kind: 'batch'; ids: number[] } | null
 
 export function CacheManagerDialog(props: {
   channels?: TgChannel[]
@@ -337,6 +372,9 @@ export function CacheManagerDialog(props: {
   const [counts, setCounts] = useState<Record<string, number>>({})
   const [scope, setScope] = useState<Scope>('all')
   const [confirm, setConfirm] = useState<Confirm>(null)
+  /** 批量选择的记录 id（BUG-149）。只存 id，选中集与列表按 id 求交，故任务被删/列表
+   *  刷新后自然收敛，不需要额外的清理 effect。 */
+  const [selected, setSelected] = useState<Set<number>>(() => new Set())
   /** 点过「去媒体库查看」但库里查不到成品的 ref：行内如实写「尚未入库」。 */
   const [missRefs, setMissRefs] = useState<Set<string>>(new Set())
   /** 已取消分组默认折叠（不占主视图），展开才看。 */
@@ -491,6 +529,22 @@ export function CacheManagerDialog(props: {
   const removeOne = (id: number) => act(() => deleteCacheTask(id))
 
   /**
+   * 批量删除：一次 `DELETE /api/cache/tasks?ids=…` 删掉勾选的几条（BUG-149）。
+   *
+   * 不循环调单条：单条循环没有原子性（中途失败会留下半清不清的状态），也报不出
+   * 影响面。删完把这几条退出选中集，避免「已选 3 条」指着已经不存在的记录。
+   */
+  const removeMany = async (ids: number[]) => {
+    await act(() => deleteCacheTasksByIds(ids))
+    if (!aliveRef.current) return
+    setSelected((prev) => {
+      const next = new Set(prev)
+      for (const id of ids) next.delete(id)
+      return next
+    })
+  }
+
+  /**
    * 「去媒体库查看」：一次入库的终点是媒体库里的成品，出口就该通向成品。
    *
    * 走 by-ref（`source="tg"`、`ref="{chat}:{msg}"`），不按 chat 全量筛 —— 后端
@@ -539,7 +593,7 @@ export function CacheManagerDialog(props: {
     }
   })
 
-  // 筛选：三档标签**只决定看什么**（批量删除已撤掉，它不再决定任何动作的范围）。
+  // 筛选：三档标签**只决定看什么**，同时它也是「全选」的作用范围。
   const visible = useMemo(() => {
     switch (scope) {
       case 'all':
@@ -556,6 +610,44 @@ export function CacheManagerDialog(props: {
 
   /** 统计条的三段读数（呈现口径，服务端 counts 按状态给，这里按入库分组归并）。 */
   const groups = useMemo(() => groupCounts(counts), [counts])
+
+  /**
+   * 当前筛选内被勾中的 id（BUG-149）。
+   *
+   * 用「当前可见行 ∩ 选中集」导出，而不是直接用选中集：列表刷新/记录被删/切筛选档后
+   * 选中集自然收敛，不会残留一个看不见却会被删掉的 id。
+   */
+  const selectedIds = useMemo(
+    () => visible.filter((x) => selected.has(x.id)).map((x) => x.id),
+    [visible, selected],
+  )
+  const allVisibleSelected = visible.length > 0 && selectedIds.length === visible.length
+
+  const onToggleSelect = useEvent((task: TgCacheTask) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(task.id)) next.delete(task.id)
+      else next.add(task.id)
+      return next
+    })
+  })
+  const onToggleAll = useEvent(() => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      // 全中则取消当前筛选内的，否则补齐（BUG-054 的「表头全选」语义）。
+      for (const x of visible) {
+        if (allVisibleSelected) next.delete(x.id)
+        else next.add(x.id)
+      }
+      return next
+    })
+  })
+
+  /** 待删集合里有多少条是活跃任务：删活跃记录等于停掉正在跑的入库，必须如实报。 */
+  const batchConfirm = confirm?.kind === 'batch' ? confirm : null
+  const batchActiveCount = batchConfirm
+    ? tasks.filter((x) => batchConfirm.ids.includes(x.id) && ACTIVE_STATUS.has(x.status)).length
+    : 0
 
   // 行内回调必须引用恒定，否则行组件的 memo 白做（AGENTS.md §5）。
   const onRetry = useEvent((task: TgCacheTask) => void retry(task))
@@ -683,6 +775,76 @@ export function CacheManagerDialog(props: {
               ))}
             </div>
 
+            {/* 选择工具条：全选（当前筛选内）+ 已选计数 + 删除所选（BUG-149）。
+                没有它，清 20 条 done 要 20 次点击加 20 次确认 —— 等于没有清理能力。 */}
+            {visible.length > 0 ? (
+              <div
+                className="mt-2 flex items-center gap-2 text-[11px] text-fg-muted"
+                data-testid="cache-select-bar"
+              >
+                <label className="flex shrink-0 items-center gap-1.5">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 accent-accent"
+                    checked={allVisibleSelected}
+                    disabled={busy}
+                    onChange={() => onToggleAll()}
+                    aria-label={t('tg.cacheSelectAll')}
+                    data-testid="cache-select-all"
+                  />
+                  {t('tg.cacheSelectAll')}
+                </label>
+                <span className="shrink-0" data-testid="cache-selected-count">
+                  {t('tg.cacheSelectedCount', { n: selectedIds.length })}
+                </span>
+                <span className="min-w-0 flex-1" />
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  disabled={busy || selectedIds.length === 0}
+                  onClick={() => setConfirm({ kind: 'batch', ids: selectedIds })}
+                  data-testid="cache-delete-selected"
+                >
+                  {t('tg.cacheDeleteSelected', { n: selectedIds.length })}
+                </Button>
+              </div>
+            ) : null}
+
+            {/* 批量确认条（BUG-054 验收形态：任何删除都要确认，且如实报出活跃任务数） */}
+            {batchConfirm ? (
+              <div
+                className="mt-2 rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[11px] leading-relaxed text-destructive"
+                data-testid="cache-confirm-batch"
+              >
+                {t('tg.cacheDeleteConfirmBatch', { n: batchConfirm.ids.length })}
+                {batchActiveCount > 0 ? (
+                  <span className="ml-1">{t('tg.cacheDeleteConfirmRunning')}</span>
+                ) : null}
+                <div className="mt-1.5 flex justify-end gap-2">
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    className="h-7 px-2.5 text-[11px]"
+                    disabled={busy}
+                    onClick={() => void removeMany(batchConfirm.ids)}
+                    data-testid="cache-confirm-batch-yes"
+                  >
+                    {t('tg.cacheDeleteConfirmYes')}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2.5 text-[11px]"
+                    onClick={() => setConfirm(null)}
+                    data-testid="cache-confirm-batch-no"
+                  >
+                    {t('tg.cacheDeleteConfirmNo')}
+                  </Button>
+                </div>
+              </div>
+            ) : null}
+
             {err ? <p className="mt-2 text-xs text-red-500">{err}</p> : null}
 
         {/* 入库记录列表 */}
@@ -698,6 +860,9 @@ export function CacheManagerDialog(props: {
                 task.messageIds[0] != null &&
                 missRefs.has(`${task.chatId}:${task.messageIds[0]}`)
               }
+              selectable
+              selected={selected.has(task.id)}
+              onToggleSelect={onToggleSelect}
               onGoLibrary={onGoLibrary}
               onRetry={onRetry}
               onCancel={onCancelTask}
@@ -741,6 +906,9 @@ export function CacheManagerDialog(props: {
                     busy={busy}
                     confirming={confirm?.kind === 'one' && confirm.id === task.id}
                     missing={false}
+                    selectable={false}
+                    selected={false}
+                    onToggleSelect={onToggleSelect}
                     onGoLibrary={onGoLibrary}
                     onRetry={onRetry}
                     onCancel={onCancelTask}

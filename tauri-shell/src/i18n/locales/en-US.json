@@ -202,6 +202,8 @@
   "tg.cacheSelectAll": "Select all",
   "tg.cacheSelectRow": "Select this record",
   "tg.cacheSelectedCount": "{n} selected",
+  "tg.cacheDeleteSelected": "Delete selected ({n})",
+  "tg.cacheDeleteConfirmBatch": "Delete the {n} selected records?",
   "tg.cacheDeleteConfirmOne": "Delete this record?",
   "tg.cacheDeleteConfirmRunning": "Running tasks among them will be stopped. Only records are deleted; cached bytes are kept.",
   "tg.cacheDeleteConfirmYes": "Delete",

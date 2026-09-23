@@ -197,6 +197,8 @@
   "tg.cacheSelectAll": "全选",
   "tg.cacheSelectRow": "选择该记录",
   "tg.cacheSelectedCount": "已选 {n} 条",
+  "tg.cacheDeleteSelected": "删除所选（{n}）",
+  "tg.cacheDeleteConfirmBatch": "确定删除所选 {n} 条记录？",
   "tg.cacheDeleteConfirmOne": "确定删除这条记录？",
   "tg.cacheDeleteConfirmRunning": "其中正在进行的任务会被停止。仅删除记录，已缓存的字节不受影响。",
   "tg.cacheDeleteConfirmYes": "删除",
