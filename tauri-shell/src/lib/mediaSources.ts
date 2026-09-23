@@ -12,7 +12,7 @@
  * `MediaLibraryPanel` / `MediaCard` / `SeriesDetail` 等媒体库组件只允许 import 本文件，
  * 不得再碰 `lib/tgmedia`（即使只是通用格式化工具，也已在本文件 re-export，统一从这里取）。
  */
-import { clearCacheItem, enqueueCacheTask, tgHealth } from '../api/tg'
+import { clearCacheItem, enqueueCacheTask, tgDiag } from '../api/tg'
 import { ensureDaemon, ensureTg } from '../api/tauri'
 import { getLibraryStats } from '../api/media'
 import {
@@ -55,10 +55,18 @@ const tgAdapter: SourceAdapter = {
     if (!tg) throw new Error('这条内容的来源标识不是 chat:msg，无法重新缓存')
     await enqueueCacheTask({ chatId: tg.chatId, messageIds: [tg.messageId] })
   },
+  /**
+   * 探的是**可用性**，不是进程存活。
+   *
+   * `GET /health` 只要进程在就 200 —— 于是「orig-tg 在跑但 TG 没连上（未登录/离线调试/
+   * 连接失败）」会被判成健康，媒体库据此给出「重新缓存」活按钮，用户点了才吃一个 503。
+   * 判「能不能原路取回字节」必须问 `/api/tg/diag` 的 `available`：它才是 TG 客户端
+   * 真实可用与否的真值（未登录 / MTProto 断连时 false，并带 `unavailable_reason`）。
+   */
   async health() {
     try {
-      await tgHealth()
-      return true
+      const d = await tgDiag()
+      return Boolean(d.available)
     } catch {
       return false
     }
