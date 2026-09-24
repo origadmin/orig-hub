@@ -80,6 +80,14 @@ interface FeedItem {
   date?: number
   /** 媒体时长（秒；视频/音频才有，v0.4.1） */
   duration?: number
+  /**
+   * 已缓存文件的绝对路径（BUG-150）。
+   *
+   * 判型兜底需要它：历史行 `type` 与 `mime` 可能双缺（后端 `keep_serializing_if`
+   * 会把 `Option::None` 的 `type` 整个省掉），此时落盘扩展名是最后一道判型依据 ——
+   * 「已下载的 .jpg 被判成 file/视频」正是漏了它造成的。
+   */
+  filePath?: string
   /** TG 相册分组 ID（grouped_id；同组相邻消息聚合为一个相册气泡，v0.4.2） */
   groupId?: number
   downloaded?: boolean
@@ -133,9 +141,10 @@ function fromStored(m: TgStoredMessage): FeedItem {
     caption: m.caption,
     mimeType: m.mimeType,
     size: m.size,
-    type: m.type ?? guessMediaType(m.mimeType),
+    type: m.type ?? guessMediaType(m.mimeType, m.filePath),
     date: m.date ?? m.createdAt,
     duration: m.duration,
+    filePath: m.filePath,
     groupId: m.groupId,
     downloaded: m.downloaded,
   }
@@ -149,6 +158,8 @@ function fromLive(chatId: number, m: TgMediaItem): FeedItem {
     caption: m.caption,
     mimeType: m.mimeType,
     size: m.size,
+    // `TgMediaItem` 没有落盘路径列（该端点不返回 filePath），兜底只用 mime ——
+    // 这是有意的：不能传一个不存在的字段来假装满足判型契约。
     type: m.type ?? guessMediaType(m.mimeType),
     date: m.date,
     duration: m.duration,
@@ -165,9 +176,10 @@ function fromHit(h: TgStoredMessage): FeedItem {
     caption: h.caption,
     mimeType: h.mimeType,
     size: h.size,
-    type: h.type ?? guessMediaType(h.mimeType),
+    type: h.type ?? guessMediaType(h.mimeType, h.filePath),
     date: h.date ?? h.createdAt,
     duration: h.duration,
+    filePath: h.filePath,
     groupId: h.groupId,
     downloaded: h.downloaded,
   }
@@ -182,6 +194,25 @@ function fromHit(h: TgStoredMessage): FeedItem {
  */
 function isPlayable(u: FeedItem): boolean {
   return u.type !== 'file'
+}
+
+/**
+ * 同型序列的准入判据（BUG-150）。
+ *
+ * `isPlayable` 只回答「能不能呈现」，**不回答「是不是同一种呈现」**——而邻居序列要的是
+ * 后者：点图片时 ‹ › 应当只在图片间翻，点视频时只在视频间连播。把 photo 与 video 编进
+ * 同一个序列，与把 `file` 编进去的后果在性质上完全一样：‹ › 会翻到「不是这个模式」的
+ * 东西（播完一段视频，下一"条"是张图），用户感知为「图片被当视频播放」。
+ *
+ * `MediaViewer.tsx:18-21` 已写明这条设计（「若把图片也编进播放序列，播完第 2 集会
+ * 自动连播到第 3 集（图片）」），但它只落在播放器内部的 `modeOf` 分流上 —— 分流发生在
+ * 序列构造之后，管不住序列本身。本函数把同一条约束**前移到数据侧**。
+ */
+function isSameKind(a: FeedItem, b: FeedItem): boolean {
+  if (!isPlayable(a) || !isPlayable(b)) return false
+  // video 与 audio 共用播放态（`modeOf` 同为 'play'），互为邻居；photo 独立成组。
+  const group = (t: FeedItem['type']) => (t === 'video' || t === 'audio' ? 'play' : 'browse')
+  return group(a.type) === group(b.type)
 }
 
 /**
@@ -318,6 +349,17 @@ export function TgPanel(
   const setGlobalHits = useTgSearch((s) => s.setHits)
   const setGlobalSearching = useTgSearch((s) => s.setSearching)
   const clearGlobalSearch = useTgSearch((s) => s.clear)
+  /**
+   * 搜索结果里**已展开**的那条命中（BUG-151）。
+   *
+   * 此前点命中行直接开播放器，用户没有「先看清这是不是我找的那条」的机会（正文、
+   * 类型、时间、大小全看不到），对无可播媒体的命中更是只能看到「不支持预览」。
+   * 现在点行 = 就地展开内容；播放退为展开态内的显式二次动作。
+   *
+   * 用 ref 键（`chatId:messageId`）而不是索引：结果列表会随关键词变化重排。
+   */
+  const [expandedHit, setExpandedHit] = useState<string | null>(null)
+  const hitKeyOf = (h: TgStoredMessage) => `${h.channelId}:${h.messageId}`
 
   const [syncing, setSyncing] = useState(false)
   const [downloadedPaths, setDownloadedPaths] = useState<Map<string, string>>(new Map())
@@ -691,6 +733,9 @@ export function TgPanel(
       setGlobalSearching(false)
       return
     }
+    // 关键词变了 → 结果集换了，上一轮展开的那条可能已不在列表里（BUG-151）。
+    // 收起而不按 ref 保留：留着会出现「没有一行是展开态，却记着一个展开键」的悬空状态。
+    setExpandedHit(null)
     let cancelled = false
     setGlobalSearching(true)
     searchTgMonitorMessages(globalSearch)
@@ -712,15 +757,23 @@ export function TgPanel(
    * 命中集里的**可播**子集 —— 全局搜索预览的邻居序列（BUG-137）。
    *
    * 顺序即命中顺序（用户看到的那一行行结果），不按频道重排。
+   * BUG-150：它只用于「这条能不能打开播放器」的准入判断；真正的邻居序列必须再按
+   * 点击项的 kind 收窄（`sameSeqOf`），否则点图片会串到视频。
    */
   const playableHits = useMemo(() => globalHits.map(fromHit).filter(isPlayable), [globalHits])
+
+  /** 命中集里与 `item` 同型的子序列（BUG-150，跨频道搜索结果版）。 */
+  const sameKindOfHits = useEvent((item: FeedItem): FeedItem[] =>
+    playableHits.filter((u) => isSameKind(u, item)),
+  )
 
   /** 点全局命中 → 打开预览（已缓存走本地流，未缓存在线流），标题带频道名 */
   const onGlobalHitPreview = useEvent((hit: TgStoredMessage & { channelTitle?: string }) => {
     const item = fromHit(hit)
     // BUG-137：命中集就是邻居序列（跨频道搜索结果按命中顺序）。此前这里只传
     // `[item]`，于是 TG 侧永远没有上一条/下一条，而同一个播放器在媒体库侧能连播整剧。
-    const seq = playableHits
+    // BUG-150：序列按点击项 kind 收窄 —— 点图片只在图片命中间翻，不串到视频。
+    const seq = sameKindOfHits(item)
     const idx = seq.findIndex((u) => u.key === item.key)
     openViewer({
       title: hit.channelTitle,
@@ -895,28 +948,44 @@ export function TgPanel(
   const albumUnits = useMemo(() => groupAlbums(feed), [feed])
 
   /**
-   * 当前流里的**可播**序列 —— 单条气泡与相册预览共用的邻居序列（BUG-137）。
+   * 按点击项的 kind 取**同型**邻居序列（BUG-150）。
+   *
+   * 此前这里是 `playableFeed = feed.filter(isPlayable)` —— 照片与视频混在一个序列里，
+   * 于是点图片后 ‹ › 会翻到视频（用户报的「图片被当视频播放」）。
    *
    * 顺序与 feed 一致：`albumUnits` 是按 feed 顺序切出来的，展平即 feed 本身，
-   * 所以相册的最后一张之后能走到**下一个单元**（相邻相册 / 下一条单发），
-   * 而不是像此前那样走到组内末尾就断了。
+   * 所以相册的最后一张之后能走到**下一个同型单元**（相邻相册 / 下一条同型单发），
+   * 而不是走到组内末尾就断。
    */
-  const playableFeed = useMemo(() => feed.filter(isPlayable), [feed])
+  const sameKindSeq = useMemo(() => {
+    const cache = new Map<string, FeedItem[]>()
+    return (item: FeedItem | undefined): FeedItem[] => {
+      if (!item || !isPlayable(item)) return []
+      const k = item.type
+      let seq = cache.get(k)
+      if (!seq) {
+        seq = feed.filter((u) => isSameKind(u, item))
+        cache.set(k, seq)
+      }
+      return seq
+    }
+  }, [feed])
 
   /**
    * 打开内置播放器并带上邻居序列（BUG-137）。
    *
    * 三处入口此前各自只传单条或单相册，于是 TG 侧永远没有上一条/下一条，而媒体库侧
    * 同一个播放器能连播整部剧集 —— 同一播放器两种能力，用户感知为「时好时坏」。
-   * 这里统一按「点击项在可播序列中的真实位置」给 `index`（`MediaViewer` 内部还会
-   * 按 kind 再分流：图片走浏览、视频/音频走连播）。
+   * 这里统一按「点击项在**同型**序列中的真实位置」给 `index`（BUG-150：序列必须同型，
+   * `MediaViewer` 内部按 kind 再分流只保证不跨型连播，管不住序列本身混型）。
    *
    * 点击项本身不可播（`file`）时它不在序列里 —— 此时退回调用方给的兜底列表
    * （单条或本相册），**不拿 0 顶上去**：那会打开另一条，等于谎报位置。
    */
   const openPlayable = useEvent(
     (item: FeedItem | undefined, fallback: FeedItem[], fallbackIndex: number) => {
-      const idx = item ? playableFeed.findIndex((u) => u.key === item.key) : -1
+      const seq = sameKindSeq(item)
+      const idx = item ? seq.findIndex((u) => u.key === item.key) : -1
       if (!item || idx < 0) {
         openViewer({
           title: selectedChannel?.title,
@@ -925,7 +994,7 @@ export function TgPanel(
         })
         return
       }
-      openViewer({ title: selectedChannel?.title, index: idx, items: toViewerItems(playableFeed) })
+      openViewer({ title: selectedChannel?.title, index: idx, items: toViewerItems(seq) })
     },
   )
 
@@ -1398,31 +1467,76 @@ export function TgPanel(
                       {title} · {hits.length}
                     </p>
                     {hits.map((hit) => {
-                      const typ = hit.type ?? guessMediaType(hit.mimeType)
+                      const typ = hit.type ?? guessMediaType(hit.mimeType, hit.filePath)
+                      const rk = hitKeyOf(hit)
+                      const open = expandedHit === rk
+                      const item = fromHit(hit)
+                      const playable = isPlayable(item)
                       return (
-                        <button
-                          key={`${hit.channelId}-${hit.messageId}`}
-                          type="button"
-                          onClick={() => onGlobalHitPreview(hit)}
-                          data-testid="tg-hit-preview"
-                          data-message-id={hit.messageId}
-                          className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-surface-2/70"
-                        >
-                          <span className="w-10 shrink-0 text-center text-[9px] text-muted">
-                            {typ === 'photo' ? '图片' : typ === 'video' ? '视频' : typ === 'audio' ? '音频' : '文件'}
-                          </span>
-                          <span className="min-w-0 flex-1 truncate text-[12px] text-fg-mid">
-                            {hit.caption}
-                          </span>
-                          {hit.downloaded && (
-                            <span className="shrink-0 text-[9px] text-success">
-                              {t('tg.downloaded')}
+                        <div key={rk} className="mb-0.5">
+                          {/* 行 = 「展开这条内容」；播放是展开态里的二次动作（BUG-151）。
+                              此前整行 onClick 直接开播放器，用户没有核对内容的机会。 */}
+                          <button
+                            type="button"
+                            onClick={() => setExpandedHit(open ? null : rk)}
+                            aria-expanded={open}
+                            data-testid="tg-hit-row"
+                            data-message-id={hit.messageId}
+                            className={cn(
+                              'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-surface-2/70',
+                              open && 'bg-surface-2/70',
+                            )}
+                          >
+                            <span className="w-6 shrink-0 text-center text-[9px] text-muted">
+                              {open ? '▾' : '▸'}
                             </span>
-                          )}
-                          <span className="shrink-0 text-[9px] tabular-nums text-muted">
-                            {fmtTime(hit.date ?? hit.createdAt)}
-                          </span>
-                        </button>
+                            <span className="w-10 shrink-0 text-center text-[9px] text-muted">
+                              {typ === 'photo' ? '图片' : typ === 'video' ? '视频' : typ === 'audio' ? '音频' : '文件'}
+                            </span>
+                            <span className="min-w-0 flex-1 truncate text-[12px] text-fg-mid">
+                              {hit.caption}
+                            </span>
+                            {hit.downloaded && (
+                              <span className="shrink-0 text-[9px] text-success">
+                                {t('tg.downloaded')}
+                              </span>
+                            )}
+                            <span className="shrink-0 text-[9px] tabular-nums text-muted">
+                              {fmtTime(hit.date ?? hit.createdAt)}
+                            </span>
+                          </button>
+
+                          {/* 展开态：复用 feed 的气泡呈现（同一份内容一个样子），
+                              播放按钮只在**可播**时给出 —— 对纯文本/无媒体命中给播放按钮
+                              等于把用户送进「不支持预览」。 */}
+                          {open ? (
+                            <div className="px-2 pb-1 pt-0.5" data-testid="tg-hit-detail">
+                              <MessageBubble
+                                item={item}
+                                downloading={downloading.has(item.messageId)}
+                                downloadedPath={downloadedPaths.get(item.key)}
+                                photoInLibrary={photoLibRefs.has(`${item.chatId}:${item.messageId}`)}
+                                onDownload={onBubbleDownload}
+                                onImportPhoto={onBubbleImportPhoto}
+                                onOpenDownloaded={onBubbleOpen}
+                                onPreview={onBubblePreview}
+                              />
+                              {playable ? (
+                                <div className="mt-1 flex justify-end">
+                                  <Button
+                                    variant="secondary"
+                                    size="sm"
+                                    className="h-6 px-2 text-[10px]"
+                                    onClick={() => onGlobalHitPreview(hit)}
+                                    data-testid="tg-hit-play"
+                                  >
+                                    {t('tg.play')}
+                                  </Button>
+                                </div>
+                              ) : null}
+                            </div>
+                          ) : null}
+                        </div>
                       )
                     })}
                   </div>
@@ -1854,22 +1968,24 @@ const AlbumBubble = memo(function AlbumBubble(props: {
 
         {/*
          * 组内宫格：列数**按数量自适应**（1→单图 / 2→2列 / 3→3列 / 4→2×2 /
-         * 5..9→3 列，即 5/6/7/8/9 宫格），图片一律 `object-contain`。
+         * 5..10→3 列，即 5–10 宫格），图片一律 `object-contain`。
          *
          * 两处都改必然性、而非调数值：
          *  - 旧版固定 `grid-cols-2` + `aspect-square` + `object-cover`：4 图以上永远
          *    2 列（9 张图排成 5 行的长条），且 cover 把每张图**裁掉边缘** —— 用户报的
          *    「图片被截取、没有九宫格」就是这个组合造成的。宫格形状是数量决定的函数，
          *    不是写死的常量。
-         *  - 超过 9 张按平台惯例折进第 9 格的 `+N`，其余图片在全屏浏览页里连翻
-         *    （该页本来就遍历整组，不存在看不到的图）。
+         *  - `ALBUM_MAX_TILES` **必须 ≥ 10**（BUG-160）：TG 相册上限 10，宫格上限一旦低于
+         *    平台上限，满员相册的第 10 个内容就会被折进 `+N`、不作为独立瓦片出现（用户报
+         *    的「最多 9 个内容 / 第 10 个被拆出去」）。现为 10 ⇒ 真实相册恒显示全量；
+         *    `+N` 只对「> 10」起防御作用，其余图片在全屏浏览页里连翻。
          */}
         <div
           data-testid="album-grid"
           className={cn('grid gap-1.5', albumGridClass(items.length))}
         >
           {items.slice(0, ALBUM_MAX_TILES).map((it, i) => {
-            const typ = it.type ?? guessMediaType(it.mimeType)
+            const typ = it.type ?? guessMediaType(it.mimeType, it.filePath)
             const dur = fmtDuration(it.duration)
             const overflow = items.length - ALBUM_MAX_TILES
             const isLastTile = i === ALBUM_MAX_TILES - 1 && overflow > 0

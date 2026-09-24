@@ -389,6 +389,7 @@
   "media.confirmRemoveItemsHint": "Removes {n} entries from the library (tags and series links included). Original files on disk are NOT deleted; cached bytes are handled under \"Clear cache\".",
   "media.confirmDeleteSeries": "Delete series",
   "media.confirmDeleteSeriesHint": "Deletes the series and its episode list. The media entries themselves stay in the library as unassigned items.",
+  "media.seriesGone": "This series has been deleted or merged. Returned to the series list.",
   "media.confirm": "Confirm",
   "player.region": "Video player",
   "player.controls": "Playback controls",

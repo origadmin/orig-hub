@@ -62,7 +62,7 @@ export function MediaViewer(props: {
    */
   const showEpisodes = Boolean(seriesId)
   /** 分集数据（单一来源）：侧栏列表与「即将播放 第 N 集」标注共用同一份 */
-  const { detail, loading, error } = useSeriesDetail(seriesId)
+  const { detail, loading, error, notFound } = useSeriesDetail(seriesId)
 
   const mode = modeOf(cur?.kind)
   /**
@@ -248,6 +248,7 @@ export function MediaViewer(props: {
             episodes={detail?.episodes ?? []}
             loading={loading}
             error={error}
+            notFound={notFound}
             currentItemId={cur.messageId}
             onSelect={selectEpisode}
             isSelectable={isSelectable}

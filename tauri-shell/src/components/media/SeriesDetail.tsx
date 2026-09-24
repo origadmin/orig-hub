@@ -141,6 +141,16 @@ export function SeriesDetail(props: {
   /** 槽位草稿（季号/集号）：与标题/介绍一起在同一个面板里提交 */
   const [epSeason, setEpSeason] = useState('1')
   const [epNo, setEpNo] = useState('1')
+  /**
+   * 合集区间终点（BUG-153）。
+   *
+   * 一条分集可以覆盖**一段**集号（E3-4，一个视频装着两集的量），此前编辑面板只给起点，
+   * 于是这种分集的终点既改不了、也退不回单集 —— 用户原话「多集无法编辑，集数只能修改前」。
+   * 后端 `EpisodeEdit.episode_no_end` 是三态（不传=不改 / null=清除区间 / n=设为 n），
+   * 前端此前**从不传这个字段**，等于把后端能力砍掉一半。
+   * 空串 = 单集（提交时显式传 null，不能省略字段，否则「改回单集」的意图丢失）。
+   */
+  const [epEnd, setEpEnd] = useState('')
 
   /**
    * 重新缓存某一集（BUG-080）。
@@ -175,6 +185,8 @@ export function SeriesDetail(props: {
     setEpDraft(ep.description ?? '')
     setEpSeason(String(ep.season))
     setEpNo(String(ep.episodeNo))
+    // 合集分集预填终点（单集为空串）——BUG-153：不预填等于用户一保存就把区间冲成单集。
+    setEpEnd(ep.episodeNoEnd != null ? String(ep.episodeNoEnd) : '')
   }
 
   /**
@@ -281,6 +293,9 @@ export function SeriesDetail(props: {
    * 集号允许任意值（2、3…不必从 1 连续）；若目标槽已被同剧另一条占用，后端对调两条的
    * 槽位 —— 所以这里不做「号是否重复」的客户端校验，那会把后端已经能正确处理的情形
    * 变成假报错。只挡明显非法的输入（空/非正整数）。
+   *
+   * 合集区间终点（`episodeNoEnd`）随本次提交一起下发 —— 两集合装在一个文件里的分集
+   * 此前只能改起点，这里是它唯一的编辑入口（BUG-153）。
    */
   const saveEp = async (epId: number) => {
     const season = Number(epSeason)
@@ -293,6 +308,34 @@ export function SeriesDetail(props: {
       onError('标题不能为空 —— 空标题会让这条内容在资料库里变成一张认不出的卡')
       return
     }
+    /*
+     * 区间终点（BUG-153）：
+     *  - 留空      → `null`，显式表达「改回单集」。**必须传字段**：后端 Option<Option<i64>>，
+     *                省略字段是「不改」，那样用户清空输入后区间还在，等于点了保存没反应。
+     *  - 非数字    → 拦下（含小数、负数）。
+     *  - `<= 起点` → 按单集处理（传 `null`）并提示。
+     *
+     * 「<= 起点 视为单集」而不是「直接报错」：单个视频装一段集号是本模型的常态，
+     * E5-5 与 E5 是同一个东西的两种写法。用户的意图是「它不再是一段」，报错会逼他
+     * 把 5 改成 4（更小的数字反而合法）—— 那才是把用户往错的方向推。故这里归一化并
+     * 内联说明，让「输入被接受了，且被当成单集」这件事可见。
+     */
+    const endRaw = epEnd.trim()
+    let end: number | null = null
+    let endHint = ''
+    if (endRaw !== '') {
+      const n = Number(endRaw)
+      if (!Number.isInteger(n) || n < 1) {
+        onError('结束集号必须是 ≥ 1 的整数（留空 = 单集）')
+        return
+      }
+      if (n <= no) {
+        end = null
+        endHint = `结束集号 ${n} 不大于起始集号 ${no}，已按单集保存`
+      } else {
+        end = n
+      }
+    }
     setBusy(true)
     try {
       await patchEpisode(epId, {
@@ -300,8 +343,11 @@ export function SeriesDetail(props: {
         description: epDraft.trim() || null,
         season,
         episodeNo: no,
+        // 恒定下发：省略字段 = 后端「不改」，清空区间就永远生效不了
+        episodeNoEnd: end,
       })
       setEditingEp(null)
+      if (endHint) onError(endHint)
       onChanged()
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e))
@@ -810,8 +856,10 @@ export function SeriesDetail(props: {
                         <div className="mt-1.5 space-y-1.5 pl-[4.25rem]">
                           {/* 标题改在行内（与列表同一行），不再单独开一行（BUG-076）。
                               槽位：允许任意 ≥1 的整数（2、3…不必从 1 连续）。
-                              目标槽被占用时后端对调两条，故这里不拦「号重复」。 */}
-                          <div className="flex items-center gap-2 text-[11px] text-muted">
+                              目标槽被占用时后端对调两条，故这里不拦「号重复」。
+                              「结束集」是合集区间终点：留空即单集（BUG-153）——这是
+                              一个视频装多集时唯一能改终点/退回单集的入口。 */}
+                          <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
                             <span>第</span>
                             <input
                               type="number"
@@ -834,8 +882,20 @@ export function SeriesDetail(props: {
                               className="h-6 w-14 rounded-md border border-border-subtle bg-surface px-1.5 text-[11px] text-fg-strong"
                             />
                             <span>集</span>
+                            <span className="text-muted/70">至</span>
+                            <input
+                              type="number"
+                              min={1}
+                              value={epEnd}
+                              onChange={(e) => setEpEnd(e.target.value)}
+                              placeholder="留空=单集"
+                              aria-label="结束集号（留空=单集）"
+                              data-testid="episode-end-input"
+                              className="h-6 w-20 rounded-md border border-border-subtle bg-surface px-1.5 text-[11px] text-fg-strong"
+                            />
+                            <span>集</span>
                             <span className="text-[10px] text-muted/80">
-                              （号被占用时会与那一集互换位置）
+                              （一条内容装多集时填终点；号被占用时会与那一集互换位置）
                             </span>
                           </div>
                           <textarea

@@ -18,7 +18,7 @@ import {
   patchSeries,
   setItemTags,
 } from '../api/media'
-import { loadSeriesDetail } from '../hooks/useSeriesDetail'
+import { loadSeriesDetail, isSeriesNotFound } from '../hooks/useSeriesDetail'
 import { cacheKey, cached, invalidateCache } from '../lib/fetchCache'
 import type {
   LibraryStats,
@@ -257,11 +257,26 @@ export function MediaLibraryPanel() {
         setActiveSeriesId(id)
         setView('seriesDetail')
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e))
+        const msg = e instanceof Error ? e.message : String(e)
+        // 剧集已被删除/合并：清掉死缓存、退回剧集墙并给语义提示，而不是卡在 404。
+      if (isSeriesNotFound(e)) {
+        invalidateCache(cacheKey.seriesDetail(id))
+        // 必须同时作废「剧集列表」缓存：loadSeries 走的是 cached(seriesList(tag))，
+        // 只清 detail 缓存的话它会命中旧列表、墙仍残留死卡（BUG-159 复现关键）。
+        invalidateCache(cacheKey.seriesList(activeTagId))
+        invalidateCache(cacheKey.seriesList(null))
+        setDetail(null)
+        setActiveSeriesId(null)
+        setView('series')
+        void loadSeries()
+        setError(t('media.seriesGone'))
+        return
       }
-    },
-    [setError],
-  )
+      setError(msg)
+    }
+  },
+  [activeTagId, setError, t, loadSeries],
+)
 
   // ---------- 播放（交给全局播放器页）----------
   /** 内容条目 → 播放项；带 seriesId 的条目会让播放器挂出分集列表 */
@@ -448,6 +463,26 @@ export function MediaLibraryPanel() {
 
   const visibleIds = useMemo(() => items.map((i) => i.id), [items])
 
+  /**
+   * 选择集的**作用域身份**（BUG-155）。
+   *
+   * `selected` 装的是 item id，而列表随「视图 / 类型页 / 标签 / 搜索」整组换掉：
+   * 在「全部内容」勾了 9 条 → 切到剧集墙，工具栏仍显示「已选 9 项 / 加入剧集 / 移除」，
+   * 但这 9 条在新视图里**一个都看不见**（用户原话：「全选本页 … 依然是全局过滤」）。
+   * 打开剧集详情同理 —— 详情页展示的是分集，不是条目选择集。
+   *
+   * 修法：作用域一变就清空。用「重算身份」而不是手写 `useEffect` 监听 `view`——
+   * 后者要额外枚举 tabs/标签/搜索，漏一处就漏一处；这里任一维度变化都会重算。
+   * 在渲染期 setState 是 React 官方的「按 prop 变化调整 state」写法，会在本次渲染
+   * 落地前重渲染，不会有「先画一帧旧选择态」的闪烁。
+   */
+  const selectScope = `${view}|${tab}|${activeTagId ?? ''}|${search.trim()}|${unassignedOnly ? 1 : 0}`
+  const [selectionScope, setSelectionScope] = useState(selectScope)
+  if (selectionScope !== selectScope) {
+    setSelectionScope(selectScope)
+    if (selected.size > 0) setSelected(new Set())
+  }
+
   // ---------- 操作 ----------
   const onPosterReady = useCallback(
     (patch: { id: number; poster: string; duration?: number }) => {
@@ -618,6 +653,7 @@ export function MediaLibraryPanel() {
           </p>
           <button
             type="button"
+            data-testid="media-rail-series-all"
             className={railBtn(view === 'series' && activeTagId === null)}
             onClick={() => {
               setView('series')
@@ -805,6 +841,16 @@ export function MediaLibraryPanel() {
           ) : null}
 
           <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-1.5">
+            {/*
+             * BUG-155：「全选本页」只属于 items 视图 —— 它填的是 `selected`，而 `selected`
+             * 全部落点是 item 级（MediaCard 勾选、批量打标、加入剧集、批量删除），
+             * `visibleIds` 也来自 `items`。剧集墙上点它会把**当前不可见的 items id**
+             * 塞进选择集：工具栏切成「N 已选」，但没有任何东西可被看见/被操作 ——
+             * 这就是用户说的「依然是全局过滤」。
+             *
+             * 「导入目录 / 新建剧集 / 标签管理」是**库级动作**（不读 `selected`），
+             * 任何视图下都该能用，故**不给它们加视图条件**；要收窄的是同排的「全选本页」。
+             */}
             {selected.size > 0 ? (
               <>
                 <span className="mr-1 text-[11px] text-muted">
@@ -852,16 +898,19 @@ export function MediaLibraryPanel() {
               </>
             ) : (
               <>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 px-2 text-[11px]"
-                  onClick={() => {
-                    setSelected(new Set(visibleIds))
-                  }}
-                >
-                  {t('media.selectAll')}
-                </Button>
+                {view === 'items' ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2 text-[11px]"
+                    data-testid="media-select-all"
+                    onClick={() => {
+                      setSelected(new Set(visibleIds))
+                    }}
+                  >
+                    {t('media.selectAll')}
+                  </Button>
+                ) : null}
                 <Button
                   variant="outline"
                   size="sm"

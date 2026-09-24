@@ -389,6 +389,7 @@
   "media.confirmRemoveItemsHint": "将从资料库移除 {n} 条内容（标签与剧集归属一并解除）；磁盘上的原文件不会被删除，缓存字节请在「清理缓存」里处理。",
   "media.confirmDeleteSeries": "删除剧集",
   "media.confirmDeleteSeriesHint": "将删除该剧集及其分集编排，剧集内的内容条目会保留在资料库中（变为散片）。",
+  "media.seriesGone": "该系列已被删除或合并，已返回剧集列表",
   "media.confirm": "确认",
   "player.region": "视频播放器",
   "player.controls": "播放控制",

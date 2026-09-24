@@ -34,6 +34,8 @@ export interface EpisodeListProps {
   currentItemId: number
   loading?: boolean
   error?: string | null
+  /** 剧集已被删除/合并（后端 404），用于给出语义化提示而非裸报错 */
+  notFound?: boolean
   onSelect: (itemId: number) => void
   /** 该项是否在当前列表内（否则禁用） */
   isSelectable?: (itemId: number) => boolean
@@ -46,6 +48,7 @@ export function EpisodeList({
   currentItemId,
   loading,
   error,
+  notFound,
   onSelect,
   isSelectable,
   className,
@@ -131,7 +134,11 @@ export function EpisodeList({
 
       {empty && (
         <div className="p-3 text-[11px] text-muted">
-          {error ? t('player.episodesFailed') : t('player.episodesEmpty')}
+          {notFound
+            ? t('media.seriesGone')
+            : error
+              ? t('player.episodesFailed')
+              : t('player.episodesEmpty')}
         </div>
       )}
 

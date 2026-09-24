@@ -26,18 +26,30 @@ export function peekSeriesDetail(id: number): MediaSeriesDetail | undefined {
  * 数据来自 [`loadSeriesDetail`] 的共享缓存，因此「侧栏渲染」与「播放器标注」
  * 读到的必然是同一份，不会一个在 loading、一个已就绪。
  */
+/**
+ * 剧集不存在的错误特征：后端对「查无此剧集」返回 404 + 文案 `series not found`，
+ * `request()`（api/media.ts）会把 body.error 文案直接作为 message；若 body 解析失败
+ * 则退化为裸状态码 `404 Not Found`。两路都识别，避免漏判。
+ */
+export function isSeriesNotFound(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : typeof err === 'string' ? err : ''
+  return /series not found/i.test(msg) || /^404\b/.test(msg.trim())
+}
+
 export function useSeriesDetail(seriesId: number | null | undefined) {
   const [detail, setDetail] = useState<MediaSeriesDetail | null>(() =>
     seriesId == null ? null : (peekSeriesDetail(seriesId) ?? null),
   )
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [notFound, setNotFound] = useState(false)
 
   useEffect(() => {
     if (!seriesId) {
       setDetail(null)
       setLoading(false)
       setError(null)
+      setNotFound(false)
       return
     }
     // 已缓存：同步取用，不发请求也不闪 loading（切集/返回时不会白一下）。
@@ -46,17 +58,22 @@ export function useSeriesDetail(seriesId: number | null | undefined) {
       setDetail(hit)
       setLoading(false)
       setError(null)
+      setNotFound(false)
       return
     }
     let cancelled = false
     setLoading(true)
     setError(null)
+    setNotFound(false)
     loadSeriesDetail(seriesId)
       .then((d) => {
         if (!cancelled) setDetail(d)
       })
       .catch((e: unknown) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : String(e))
+          setNotFound(isSeriesNotFound(e))
+        }
       })
       .finally(() => {
         if (!cancelled) setLoading(false)
@@ -66,7 +83,7 @@ export function useSeriesDetail(seriesId: number | null | undefined) {
     }
   }, [seriesId])
 
-  return { detail, loading, error }
+  return { detail, loading, error, notFound }
 }
 
 /** 分集按 季 → 集 排序（后端顺序不保证，展示需要稳定序） */

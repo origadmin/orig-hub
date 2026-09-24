@@ -243,6 +243,9 @@ export const useStore = create<DownloadState>((set, get) => ({
   categories: [],
   categoryFilter: null,
   pendingMediaFocus: null,
+  // 入口级门控（resolveTgFeatureReady）只由 `tgEnabled` 决定；`tgEnabled` 仅在
+  // `getConfig()` 成功（daemon 可达且插件开启）时被置 true。故 daemon 不可达 /
+  // 插件关闭时入口保持隐藏——不可用就不展示（不呈现死按钮，违反设计）。
   tgEnabled: false,
   tgRunning: false,
   accounts: loadAccounts(),
