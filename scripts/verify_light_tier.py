@@ -13,6 +13,7 @@
 import importlib.util
 import os
 import re
+import shutil
 import sys
 
 spec = importlib.util.spec_from_file_location("cb", "scripts/check-bugs.py")
@@ -20,7 +21,11 @@ cb = importlib.util.module_from_spec(spec)
 sys.argv = ["check-bugs.py"]
 spec.loader.exec_module(cb)
 
-FIXDIR = os.path.join(os.environ["TEMP"], "lt")
+FIXDIR = os.path.join(os.environ["TEMP"], f"lt-{os.getpid()}")
+# 固定路径会让**并行会话的两次运行**互相踩掉对方的夹具（实测踩到：
+# `FileNotFoundError: ...\Temp\lt\BUG-901.md` —— 另一进程先删了目录）。
+# 夹具目录必须按进程唯一。夹具**由本脚本自己生成**，不依赖外部预置文件
+# （预置文件的旧写法会让「脚本单独可跑」不成立，且夹具内容与脚本脱节）。
 RE_EV = re.compile(r"^##\s*验收证据\s*$", re.M)
 RE_RC = re.compile(r"^##\s*根因\s*$", re.M)
 
@@ -74,6 +79,28 @@ def run(fixture, expect, label, expect_clean=False):
 
 
 if __name__ == "__main__":
+    os.makedirs(FIXDIR, exist_ok=True)
+
+    # 夹具在本脚本内定义并落盘 —— 保证「单独可跑」，且夹具内容随脚本演进。
+    # 每个夹具 = 头部字段行 + 正文；缺什么就少写什么，不做字符串手术。
+    HEAD = "## 现象\n内容\n"
+    EV = "## 验收证据\n`download-engine/verify/x.py`\n"
+    FIXTURES = {
+        # 规则A：轻量档缺 `## 验收证据` → 期望报「验收证据」
+        "BUG-901.md": "- 档位: light\n" + HEAD,
+        # 规则B：轻量档写了 `## 根因` → 期望报「根因」
+        "BUG-902.md": "- 档位: light\n" + HEAD + "## 根因\n内容\n" + EV,
+        # 规则C：档位取值不在枚举 → 期望报「枚举」
+        "BUG-903.md": "- 档位: bogus\n" + HEAD + EV,
+        # 规则D：合法轻量档 → 期望零报错
+        "BUG-904.md": "- 档位: light\n" + HEAD + EV,
+        # 规则E：未知字段名 → 期望报「不认识的字段名」（防规则静默失效）
+        "BUG-905.md": "- 档位: light\n- 发现方式: 人工\n" + HEAD + EV,
+    }
+    for name, text in FIXTURES.items():
+        with open(os.path.join(FIXDIR, name), "w", encoding="utf-8") as f:
+            f.write(text)
+
     print("=== 反向证伪：每条新规则都必须能 FAIL ===")
     a = run("BUG-901.md", "验收证据", "规则A  轻量档也必须有验收证据")
     b = run("BUG-902.md", "根因", "规则B  轻量档写了根因 = 误用档位")
@@ -83,6 +110,7 @@ if __name__ == "__main__":
 
     print()
     allok = a and b and c and d and e
+    shutil.rmtree(FIXDIR, ignore_errors=True)
     print("结论: " + ("ALL PASS — 规则有牙齿、不误伤、且不会静默失效" if allok
                       else "FAIL — 存在假绿或误伤"))
     sys.exit(0 if allok else 1)
