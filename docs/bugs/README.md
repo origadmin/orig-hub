@@ -179,6 +179,7 @@
 | BUG-165 | 进度条拖拽期每个 pointermove 都写 `currentTime` 提交 seek——未松手（未确认态）即发请求，实测 2s 拖拽 7 发 7 取消的请求风暴；修：拖拽只更新视觉 `dragRatio`，pointerup 才提交唯一一次 seek | fixed | shell |
 | BUG-166 | 「解码吃力」把数据晚到型丢帧误判为解码吞吐不足（`waiting/stalled` 不重置基线 + 判定不看缓冲健康）——无可见卡顿却常驻误导提示；修：stall 恢复重置基线 + 缓冲领先 <2s 时绝不置位，三阶段行为测试 P1 验牙/P2 恢复/P3 断供抑制 | fixed | shell |
 | BUG-167 | TG 后台加载瞬时失败走 store `setError`（error+toast 双写）升级为全局「无法连接到 Telegram」断言——与三处 `useConnState` 连接灯同屏矛盾的第二真相源；修：后台加载静默/内联（feed 失败改面板内联 `tg.feedLoadFailed`）、用户主动动作保留反馈，该文案当且仅当用户操作真实失败或引擎 `available:false` | fixed | shell |
+| BUG-169 | 「实时已连接」三处渲染点被用户裁定「三个状态点未收敛」——唯一状态点=唯一渲染点；修：移除侧栏/底栏重复指示，只留顶栏 `context-conn`（BUG-164 保证全视图覆盖），四视图探针断言全 DOM 恰 1 个状态点且 live | fixed | shell |
 | BUG-168 | 媒体库图片与剧集无集级关联：一集挂不了自己的图，混编组照片还各占一个集号；修：新表 `media_episode_image`（多对多挂载 + sort_no + photo-only 触发器兜底）+ replace-all 挂图/幂等摘除路由 + `EpisodeView.images` 批量下发 + 自动入库「照片挂到前面视频所在集」（photo-only 组不变）+ 前端集卡挂图/摘图/图片选择对话框 | fixed | engine+shell |
 
 ## 历史欠账

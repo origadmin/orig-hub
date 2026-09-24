@@ -15,7 +15,6 @@ import {
   selectActiveSpeedLabel,
   selectHasActiveSpeed,
 } from '../store/selectors'
-import { CONN_DOT, CONN_LABEL, useConnState } from '../store/connState'
 import { useEvent } from '../hooks/useEvent'
 import { useTranslation } from '../i18n'
 import { ensureDaemon, daemonStatus } from '../api/tauri'
@@ -28,8 +27,7 @@ export function MainLayout() {
   const [collapsed, setCollapsed] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
   const { t } = useTranslation()
-  /** 连接态：与上下文栏、侧栏底部同源（BUG-087，唯一来源 `store/connState.ts`） */
-  const connState = useConnState()
+  // 连接态唯一渲染点在顶部上下文栏（BUG-169）：此处不再订阅 useConnState。
   // BUG-134: 状态栏下载速度改读全局选择器，与全局速度文案同源（不再用 active.reduce 自算一套）
   const activeSpeedLabel = useStore(selectActiveSpeedLabel)
   const hasActiveSpeed = useStore(selectHasActiveSpeed)
@@ -293,28 +291,15 @@ export function MainLayout() {
               })}
             </span>
             {/*
-              连接态**不在此处判定**（BUG-087）：此前这里是硬编码「daemon 已连接」+ 恒绿点，
-              daemon 真断线时底部照绿，与上下文栏的「daemon 未连接」同屏打架。
-              现与上下文栏、侧栏底部同读 `useConnState()`，文案与配色一律取自
-              `store/connState.ts` 的 `CONN_LABEL` / `CONN_DOT`。
+              连接状态点**唯一**（BUG-169，用户裁定）：全应用只保留顶部上下文栏一处
+              （`ContextBar` / `ContextBarActions` 的 `ConnLight`，testid `context-conn`）。
+              BUG-087 时代「三处同读一个真相源」仍被用户读成「三个状态点」——
+              唯一状态点 = 唯一渲染点，此处与侧栏底部的重复指示已移除。
+              底栏只保留下载速度读数（BUG-134，来源不变）。
             */}
-            {/*
-              BUG-134：下载速度读 `selectActiveSpeedLabel`（store/selectors.ts），
-              与全局速度文案同一来源；速度微抖但显示值未变时不触发重渲染。
-            */}
-            <span
-              className={cn('flex items-center gap-1.5')}
-              data-testid="statusbar-conn"
-              data-conn-state={connState}
-            >
-              <span
-                className={cn('h-1.5 w-1.5 shrink-0 rounded-full', CONN_DOT[connState])}
-              />
-              {t(CONN_LABEL[connState])}
-              {hasActiveSpeed && (
-                <span className="font-mono text-accent">{activeSpeedLabel}</span>
-              )}
-            </span>
+            {hasActiveSpeed && (
+              <span className="font-mono text-accent">{activeSpeedLabel}</span>
+            )}
           </footer>
         </div>
       </div>

@@ -1,7 +1,6 @@
 import { useState, type JSX } from 'react'
 import { cn } from '../lib/utils'
 import { useTranslation } from '../i18n'
-import { CONN_DOT, CONN_LABEL, useConnState } from '../store/connState'
 
 /**
  * 导航视图枚举。
@@ -127,8 +126,7 @@ export function Sidebar({
   tgReady,
 }: Props) {
   const { t } = useTranslation()
-  /** 连接态：与上下文栏、底部状态栏同源（BUG-087，唯一来源 `store/connState.ts`） */
-  const connState = useConnState()
+  // 连接态唯一渲染点在顶部上下文栏（BUG-169）：侧栏底部指示已移除，不再订阅 useConnState。
   const [catOpen, setCatOpen] = useState(false)
   /**
    * 「全部文件」行是否点亮（BUG-089）：只看当前是否**全部文件视图**。
@@ -338,27 +336,6 @@ export function Sidebar({
           )
         })}
       </nav>
-
-      {/* 底部状态 */}
-      <div className={cn('border-t border-border-subtle p-3', collapsed && 'p-2')}>
-        {/*
-          连接态**不在此处判定**（BUG-087）：此前是硬编码「daemon 运行中」+ 恒绿点，
-          daemon 真断线时侧栏照绿，与上下文栏 / 底部状态栏同屏打架。
-          现三者同读 `useConnState()`，文案与配色取自 `store/connState.ts`。
-        */}
-        <div
-          className={cn('flex items-center gap-2', collapsed && 'justify-center')}
-          data-testid="sidebar-conn"
-          data-conn-state={connState}
-        >
-          <span
-            className={cn('h-1.5 w-1.5 shrink-0 rounded-full', CONN_DOT[connState])}
-          />
-          {!collapsed && (
-            <span className="text-[11px] text-muted">{t(CONN_LABEL[connState])}</span>
-          )}
-        </div>
-      </div>
     </aside>
   )
 }
