@@ -175,6 +175,7 @@
 | BUG-161 | 验收/诊断脚本默认直连生产 orig-tg(9877) 写用户真实库且无守卫、不清理——媒体库残留 `DiagCard_<ms>` 孤儿剧集 | fixed | build |
 | BUG-162 | `delete_media_item` 在删字节之后才判 TG 标记——标记清不掉时已删字节却 500 声称 `nothing was deleted`（中止点晚于破坏性动作） | fixed | engine |
 | BUG-163 | 本地投递节流配额每请求从 0 起算——响应头 3–28 ms 秒回但 body 首块被扣住 440–725 ms（起播/seek/断线重取/卡片抽帧都各付一次），播放与浏览双重卡顿 | fixed | engine |
+| BUG-164 | 下载类视图顶栏无连接灯——三角落连接态指示在 `all/downloading/paused/completed` 四视图恒三缺一（`ContextBarActions` 分支从未接入 BUG-087 的统一灯）；修：抽 `ConnLight` 两分支共用 | fixed | shell |
 
 ## 历史欠账
 
