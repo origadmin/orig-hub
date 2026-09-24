@@ -91,6 +91,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/api/media/items/:id/tags", axum::routing::put(set_media_item_tags))
         .route("/api/media/items/:id/raw", get(media_item_raw))
         .route("/api/media/items/by-ref", get(media_item_by_ref))
+        .route("/api/media/export/preview", get(export_preview))
         .route(
             "/api/media/series",
             get(list_media_series).post(create_media_series),
@@ -2334,6 +2335,68 @@ async fn media_stats(
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     Ok(Json(json!(s)))
+}
+
+/// GET /api/media/export/preview?seriesIds=1,2,3 — 导出完备性校验（byte-ownership P5，只读）。
+///
+/// 逐剧集列出导出阻断项（缺字节/缺简介/缺图/零字节）；`seriesIds` 缺省 = 全库。
+/// **一动词一端点**：这里是只读 preview，真正的导出动作属 P6 另端点 —— 校验
+/// 不产生任何写副作用，可随意重复调用。
+#[derive(Deserialize)]
+struct ExportPreviewQuery {
+    /// 逗号分隔的剧集 id；缺省/空 = 全库。
+    #[serde(rename = "seriesIds", default)]
+    series_ids: Option<String>,
+}
+
+async fn export_preview(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<ExportPreviewQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let ids: Option<Vec<i64>> = match q.series_ids.as_deref() {
+        None | Some("") => None,
+        Some(raw) => Some(
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.parse::<i64>().map_err(|_| {
+                        ApiError::new(StatusCode::BAD_REQUEST, &format!("invalid seriesId: {s}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    };
+    let series = st
+        .store
+        .export_readiness(ids.as_deref())
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let mut by_kind: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut issues_total: u64 = 0;
+    for s in &series {
+        for i in &s.issues {
+            *by_kind.entry(i.kind.to_string()).or_default() += 1;
+            issues_total += 1;
+        }
+    }
+    let series_ready = series.iter().filter(|s| s.issues.is_empty()).count();
+    st.push_log(&format!(
+        "/api/media/export/preview: {} series, {} issue(s) (ready {}/{})",
+        series.len(),
+        issues_total,
+        series_ready,
+        series.len()
+    ));
+    Ok(Json(json!({
+        "series": series,
+        "summary": {
+            "seriesTotal": series.len(),
+            "seriesReady": series_ready,
+            "issuesTotal": issues_total,
+            "byKind": by_kind,
+        }
+    })))
 }
 
 /// 导入请求体：批量条目（本地路径或 TG 引用）。

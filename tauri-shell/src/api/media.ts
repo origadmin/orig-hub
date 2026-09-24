@@ -289,6 +289,43 @@ export async function setItemTags(id: number, tagIds: number[]): Promise<{ ok: b
 
 // ────────────────── 剧集 ──────────────────
 
+/** 导出完备性单类问题（byte-ownership P5） */
+export interface ExportIssue {
+  episodeId: number
+  /** 展示形集号（"S1E2"） */
+  episodeNo: string
+  /** bytes（缺字节/文件不存在）| description（缺简介）| image（缺图）| empty（零字节文件） */
+  kind: 'bytes' | 'description' | 'image' | 'empty' | string
+  detail: string
+}
+
+/** 单部剧集的导出完备性报告：issues 为空 = 可导出 */
+export interface SeriesExportReport {
+  seriesId: number
+  title: string
+  issues: ExportIssue[]
+}
+
+export interface ExportPreviewResult {
+  series: SeriesExportReport[]
+  summary: {
+    seriesTotal: number
+    seriesReady: number
+    issuesTotal: number
+    byKind: Record<string, number>
+  }
+}
+
+/**
+ * GET /api/media/export/preview?seriesIds=1,2 — 导出完备性校验（只读）。
+ * `seriesIds` 缺省 = 全库；真正导出动作属 P6 另端点，这里只列问题清单。
+ */
+export async function previewExport(seriesIds?: number[]): Promise<ExportPreviewResult> {
+  const qs =
+    seriesIds && seriesIds.length > 0 ? `?seriesIds=${seriesIds.map(encodeURIComponent).join(',')}` : ''
+  return request<ExportPreviewResult>(`/api/media/export/preview${qs}`)
+}
+
 /** 列出剧集。`tagId` 用于按标签筛剧集（TG 自动归档的 #标签 落在剧集上）。 */
 export async function listSeries(tagId?: number | null): Promise<MediaSeries[]> {
   const qs = tagId == null ? '' : `?tagId=${tagId}`

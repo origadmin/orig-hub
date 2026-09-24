@@ -8,7 +8,7 @@ import { DirectoryPicker } from './DirectoryPicker'
 import { InterfacePickerDialog, type InterfaceSelection } from './InterfacePickerDialog'
 import { AccountsPanel } from './AccountsPanel'
 import { getConfig, listInterfaces, saveClassifyConfig, saveProxyConfig, verifyProxy } from '../api/daemon'
-import { getCacheClearPreview, getCacheStats } from '../api/tg'
+import { getCacheClearPreview, getCacheStats, getTgConfig, setTgLibraryDir } from '../api/tg'
 import { CacheManagerDialog } from './CacheManagerDialog'
 import { useStore } from '../store/useStore'
 import { useTranslation } from '../i18n'
@@ -120,6 +120,10 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
   const [cacheUsageLoaded, setCacheUsageLoaded] = useState(false)
   const [cacheManagerOpen, setCacheManagerOpen] = useState(false)
 
+  // 库根目录（byte-ownership P5）：编辑态 + 已保存值（变化才写，避免每次保存都打 PUT）
+  const [libDir, setLibDir] = useState('')
+  const [libDirSaved, setLibDirSaved] = useState('')
+
   // 缓存占用：进设置页读一次（不轮询 —— 它只在清理前后变化，轮询是白耗）
   useEffect(() => {
     void refreshCacheUsage()
@@ -190,6 +194,13 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
     loadProxy()
     listInterfaces()
       .then(({ primary }) => setAutoPrimary(primary?.name ?? null))
+      .catch(() => {})
+    // 库根（P5）：tg 不可达时留空展示 —— 保存时才报错，不阻塞其他设置项
+    getTgConfig()
+      .then((c) => {
+        setLibDir(c.libraryDir ?? '')
+        setLibDirSaved(c.libraryDir ?? '')
+      })
       .catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -298,6 +309,34 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
     }
   }
 
+  /** 保存库根目录（byte-ownership P5）：只在编辑态 ≠ 已保存值时打 PUT。
+   *  失败走全局 setError（BUG-167 约定：用户主动操作的失败可见），不静默吞掉。 */
+  const persistLibrary = async () => {
+    const next = libDir.trim()
+    if (next === libDirSaved) return
+    try {
+      const r = await setTgLibraryDir(next)
+      const saved = r.libraryDir ?? next
+      setLibDir(saved)
+      setLibDirSaved(saved)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  /** 打开库根文件夹（tauri opener 通道；浏览器 dev 下无插件 —— 记录后静默） */
+  const openLibraryFolder = async () => {
+    const target = libDirSaved || libDir
+    if (!target) return
+    try {
+      const { openPath } = await import('@tauri-apps/plugin-opener')
+      await openPath(target)
+    } catch (e) {
+      console.error('openPath failed', e)
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
   /** 保存整个设置页（全局） */
   const handleSave = async () => {
     // enabledInterfaces：附属网卡名 → 权重份数（默认 1）
@@ -312,6 +351,7 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
     })
     await persistClassify()
     await persistProxy()
+    await persistLibrary()
     setSaved(true)
     setTimeout(() => setSaved(false), 1500)
   }
@@ -413,6 +453,33 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
                   </div>
                   <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
                     {t('downloads.dirNote')}
+                  </p>
+                </div>
+
+                <div className="h-px bg-border-subtle/60" />
+
+                {/* 库根目录（byte-ownership P5）：归仓字节的家 + 打开文件夹 */}
+                <div>
+                  <div className="flex items-center justify-between">
+                    <p className="text-[13px] font-medium text-fg-strong">{t('downloads.libDir')}</p>
+                    <p className="text-[11px] text-muted">{t('downloads.libDirHint')}</p>
+                  </div>
+                  <div className="mt-2 flex items-start gap-2">
+                    <div className="min-w-0 flex-1">
+                      <DirectoryPicker value={libDir} onChange={setLibDir} placeholder={t('downloads.dirPlaceholder')} onError={setError} />
+                    </div>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 shrink-0 px-2 text-xs"
+                      disabled={!libDir && !libDirSaved}
+                      onClick={openLibraryFolder}
+                    >
+                      {t('downloads.openFolder')}
+                    </Button>
+                  </div>
+                  <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
+                    {t('downloads.libDirNote')}
                   </p>
                 </div>
 

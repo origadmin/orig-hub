@@ -875,6 +875,27 @@ pub struct SeriesDetail {
     pub episodes: Vec<EpisodeView>,
 }
 
+/// 导出完备性单类问题（byte-ownership P5）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportIssue {
+    pub episode_id: i64,
+    /// 展示形集号（"S1E3"；合集区间只给起始槽位）。
+    pub episode_no: String,
+    /// `bytes`（缺字节/文件不存在）| `description`（缺简介）| `image`（缺图）| `empty`（零字节文件）
+    pub kind: &'static str,
+    pub detail: String,
+}
+
+/// 单部剧集的导出完备性报告：`issues` 为空 = 可导出。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeriesExportReport {
+    pub series_id: i64,
+    pub title: String,
+    pub issues: Vec<ExportIssue>,
+}
+
 /// 合并时被跳过的分集明细。
 ///
 /// **必须回传**：跳过是合并里唯一「少搬了东西」的地方，静默吞掉会让用户以为
@@ -1610,6 +1631,110 @@ impl Store {
             }
         }
         Ok(Some(SeriesDetail { series, episodes }))
+    }
+
+    /// 导出完备性校验（byte-ownership P5，只读）。
+    ///
+    /// 逐剧集列出四类导出阻断项：缺字节（`file_path` 缺失或解析后文件不存在，走
+    /// [`crate::cache::resolve_item_path`] + stat，与条目/分集视图同一套字节真值）、
+    /// 缺简介、缺图（无集级挂图且条目无 poster）、零字节文件。`series_ids` 为
+    /// None = 全库。一集可同时命中多类 —— issues 全列出，用户一次看清要补什么。
+    ///
+    /// 判定刻意**不复用** [`Self::get_series`]：那是详情页的重量级组装（备用来源、
+    /// 逐集探测），全库校验只需要一条 join + 逐集一次 stat；单独走批量 SQL，
+    /// N 部剧集 O(1) 查询而非 O(N)。
+    pub async fn export_readiness(
+        &self,
+        series_ids: Option<&[i64]>,
+    ) -> libsql::Result<Vec<SeriesExportReport>> {
+        let mut sql = String::from(
+            "SELECT s.id, s.title, e.id, e.season, e.episode_no,
+                    i.description, i.poster, i.file_path,
+                    EXISTS(SELECT 1 FROM media_episode_image m WHERE m.episode_id = e.id)
+               FROM media_series s
+               JOIN media_episode e ON e.series_id = s.id
+               LEFT JOIN media_item i ON i.id = e.item_id",
+        );
+        let params_vec: Vec<i64> = series_ids.unwrap_or(&[]).to_vec();
+        if !params_vec.is_empty() {
+            let placeholders = params_vec.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            sql.push_str(&format!(" WHERE s.id IN ({placeholders})"));
+        }
+        sql.push_str(" ORDER BY s.id ASC, e.season ASC, e.episode_no ASC, e.id ASC");
+        let stmt = self.conn.prepare(&sql).await?;
+        let mut rows = stmt
+            .query(if params_vec.is_empty() {
+                Vec::<i64>::new()
+            } else {
+                params_vec
+            })
+            .await?;
+        let lib_root = self.library_root().await;
+        let mut reports: Vec<SeriesExportReport> = Vec::new();
+        let mut cur: Option<SeriesExportReport> = None;
+        while let Some(r) = rows.next().await? {
+            // s / e 是内连接（必非 NULL）；i 是 LEFT JOIN，可空列一律 Option。
+            let series_id: i64 = r.get(0)?;
+            let title: String = r.get(1)?;
+            let ep_id: i64 = r.get(2)?;
+            let season: i64 = r.get(3)?;
+            let ep_no: i64 = r.get(4)?;
+            let description: Option<String> = r.get(5)?;
+            let poster: Option<String> = r.get(6)?;
+            let file_path: Option<String> = r.get(7)?;
+            let has_images: bool = r.get::<Option<i64>>(8)?.unwrap_or(0) != 0;
+
+            if cur.as_ref().map(|c| c.series_id) != Some(series_id) {
+                if let Some(prev) = cur.take() {
+                    reports.push(prev);
+                }
+                cur = Some(SeriesExportReport {
+                    series_id,
+                    title,
+                    issues: Vec::new(),
+                });
+            }
+            let report = cur.as_mut().unwrap();
+            let ep_label = format!("S{season}E{ep_no}");
+            let mut push = |kind: &'static str, detail: String| {
+                report.issues.push(ExportIssue {
+                    episode_id: ep_id,
+                    episode_no: ep_label.clone(),
+                    kind,
+                    detail,
+                });
+            };
+
+            // 字节：file_path 缺失 / 解析后文件不存在 / 不可访问；零字节单独成类
+            //（「下载半截断了」与「根本没下」是两种不同的补救：重试缓存 vs 重新缓存）。
+            match file_path.as_deref() {
+                None => push("bytes", "未缓存（无文件记录）".into()),
+                Some(p) => {
+                    let abs = crate::cache::resolve_item_path(&lib_root, p);
+                    match tokio::fs::metadata(&abs).await {
+                        Ok(m) if m.is_file() && m.len() > 0 => {}
+                        Ok(_) => push("empty", format!("零字节文件（{}）", abs.display())),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            push("bytes", format!("文件不存在（{}）", abs.display()))
+                        }
+                        Err(e) => push("bytes", format!("无法访问（{e}）")),
+                    }
+                }
+            }
+            // 简介：条目 description 缺失或全空白（与 EpisodeView 同源字段）。
+            if description.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                push("description", "缺简介".into());
+            }
+            // 图：无集级挂图且条目无 poster（TG 图片经浏览器代理另有「即时可见」语义，
+            // 但导出是对外交付，代理不可随行 —— 两处都没有就是真缺图）。
+            if !has_images && poster.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                push("image", "缺封面/挂图".into());
+            }
+        }
+        if let Some(last) = cur.take() {
+            reports.push(last);
+        }
+        Ok(reports)
     }
 
     /// 新建剧集，返回 id。`source_key` 为幂等来源键（非 TG 自动成剧时为 None，
@@ -5818,5 +5943,124 @@ mod tests {
             episode_has_bytes,
             "条目视图与分集视图对同一条内容必须给出一致结论（BUG-132 分叉的直接断言）"
         );
+    }
+
+    // ───────────────── 导出完备性校验（byte-ownership P5） ─────────────────
+
+    /// 四类 issue 各造一集 + 一部零问题剧集（「可导出」）：
+    ///   - E1 完好：库内相对路径 + 非空文件 + 有简介 + 有 poster → 0 issue；
+    ///   - E2 文件指向不存在路径 → bytes；
+    ///   - E3 未缓存（file_path NULL）→ bytes；缺简介 → description；缺图 → image；
+    ///   - E4 零字节文件 → empty（且挂了图 → 不重复报 image）。
+    /// 另断言 `series_ids` 过滤与「全库」两种调用形态。
+    #[tokio::test]
+    async fn export_readiness_flags_missing_bytes_description_image_and_empty() {
+        let path = tmp_db("export_readiness");
+        let s = Store::open(&path).await.unwrap();
+        // 库根指向独立临时目录：完好集的 file_path 以库根相对形式落在这里。
+        let lib_root = std::env::temp_dir().join(format!("orig_export_lib_{}", std::process::id()));
+        std::fs::create_dir_all(&lib_root).unwrap();
+        s.set_setting("library_dir", &lib_root.to_string_lossy())
+            .await
+            .unwrap();
+
+        let sid_ok = s.create_series("Ready", None, "series", None, None).await.unwrap();
+        let sid_bad = s.create_series("Broken", None, "series", None, None).await.unwrap();
+
+        // E1：完好 —— 真实非空文件（相对路径，走 resolve），简介 + poster 齐。
+        let good_rel = "chat-1/1-good.mp4";
+        std::fs::create_dir_all(lib_root.join("chat-1")).unwrap();
+        std::fs::write(lib_root.join("chat-1/1-good.mp4"), b"real bytes").unwrap();
+        let i_good = s
+            .upsert_media_item(
+                "tg", "g:1", "good", "video",
+                Some(good_rel), Some(10), Some(60), Some("有介绍"),
+            )
+            .await
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE media_item SET poster = 'data:image/png;base64,x' WHERE id = ?1",
+                params![i_good],
+            )
+            .await
+            .unwrap();
+        let _ = s.add_episode(sid_ok, i_good, 1, 1).await.unwrap();
+
+        // E2：file_path 指向不存在的文件 → bytes。
+        let i_ghost = s
+            .upsert_media_item(
+                "tg", "g:2", "ghost", "video",
+                Some("chat-1/2-gone.mp4"), Some(10), Some(60), Some("d"),
+            )
+            .await
+            .unwrap();
+        let _ = s.add_episode(sid_bad, i_ghost, 1, 1).await.unwrap();
+
+        // E3：未缓存 + 缺简介 + 缺图（一集三类 issue）。
+        let i_bare = s
+            .upsert_media_item("tg", "g:3", "bare", "video", None, None, Some(60), None)
+            .await
+            .unwrap();
+        let _ = s.add_episode(sid_bad, i_bare, 1, 2).await.unwrap();
+
+        // E4：零字节文件 → empty；挂了集级图 → 不报 image；简介 + poster 有。
+        let empty_rel = "chat-1/4-empty.mp4";
+        std::fs::write(lib_root.join("chat-1/4-empty.mp4"), b"").unwrap();
+        let i_zero = s
+            .upsert_media_item(
+                "tg", "g:4", "zero", "video",
+                Some(empty_rel), Some(0), Some(60), Some("d"),
+            )
+            .await
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE media_item SET poster = 'data:image/png;base64,y' WHERE id = ?1",
+                params![i_zero],
+            )
+            .await
+            .unwrap();
+        let ep4 = s.add_episode(sid_bad, i_zero, 1, 3).await.unwrap();
+        let img_item = s
+            .upsert_media_item("tg", "g:5", "cover", "photo", None, None, None, None)
+            .await
+            .unwrap();
+        s.attach_episode_images(ep4, &[img_item]).await.unwrap();
+
+        // 全库：两部都回，Broken 恰好 5 条 issue（bytes×2 + description + image + empty）。
+        let all = s.export_readiness(None).await.unwrap();
+        assert_eq!(all.len(), 2, "全库校验必须覆盖两部剧集");
+        let ready = all.iter().find(|r| r.title == "Ready").unwrap();
+        assert!(ready.issues.is_empty(), "完好剧集必须零 issue（可导出）");
+        let broken = all.iter().find(|r| r.title == "Broken").unwrap();
+        let kinds: Vec<&str> = broken.issues.iter().map(|i| i.kind).collect();
+        assert_eq!(
+            kinds.iter().filter(|k| **k == "bytes").count(),
+            2,
+            "E2 文件不存在 + E3 未缓存 → 两条 bytes"
+        );
+        assert!(kinds.contains(&"description"), "E3 缺简介");
+        assert!(kinds.contains(&"image"), "E3 缺图");
+        assert_eq!(kinds.iter().filter(|k| **k == "empty").count(), 1, "E4 零字节");
+        // E4 挂了图且 poster 有 → 不报 image；E2/E3 无挂图无 poster（E3 报 image 已覆盖）。
+        let ep4_issues: Vec<&str> = broken
+            .issues
+            .iter()
+            .filter(|i| i.episode_no == "S1E3")
+            .map(|i| i.kind)
+            .collect();
+        assert_eq!(ep4_issues, vec!["empty"], "E4 只报 empty，不重复报 image/bytes");
+        // episode_id 指向分集而非条目（前端表格定位用）。
+        assert!(
+            broken.issues.iter().all(|i| i.episode_id > 0 && i.episode_no.starts_with('S')),
+            "issue 必须带 episode_id 与集号标签"
+        );
+
+        // 按 id 过滤：只查 Ready → 只回 Ready 且零 issue。
+        let only = s.export_readiness(Some(&[sid_ok])).await.unwrap();
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].title, "Ready");
+        assert!(only[0].issues.is_empty());
     }
 }

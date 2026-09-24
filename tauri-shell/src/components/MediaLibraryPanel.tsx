@@ -33,6 +33,7 @@ import { SeriesCard, SeriesDetail } from './media/SeriesDetail'
 import { ImportDialog } from './media/ImportDialog'
 import { BulkTagDialog, TagManagerDialog } from './media/TagManagerDialog'
 import { AddToSeriesDialog, CreateSeriesDialog, MergeSeriesDialog } from './media/SeriesDialog'
+import { ExportPreviewDialog } from './media/ExportPreviewDialog'
 import { ItemEditDialog } from './media/ItemEditDialog'
 import {
   fmtSize,
@@ -161,6 +162,8 @@ export function MediaLibraryPanel() {
   // ---- 弹窗 ----
   const [importOpen, setImportOpen] = useState(false)
   const [tagMgrOpen, setTagMgrOpen] = useState(false)
+  // 导出预览（P5）：只读完备性校验，不做导出本体（P6）
+  const [exportOpen, setExportOpen] = useState(false)
   const [bulkTagOpen, setBulkTagOpen] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
   const [addToOpen, setAddToOpen] = useState(false)
@@ -931,6 +934,15 @@ export function MediaLibraryPanel() {
                   variant="outline"
                   size="sm"
                   className="h-7 px-2 text-[11px]"
+                  data-testid="media-export-preview"
+                  onClick={() => setExportOpen(true)}
+                >
+                  {t('media.export')}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
                   onClick={() => setTagMgrOpen(true)}
                 >
                   🏷 {t('media.manageTags')}
@@ -1139,6 +1151,14 @@ export function MediaLibraryPanel() {
             clearSelection()
             await refreshAll()
           }}
+          onError={(m) => setError(m)}
+        />
+      ) : null}
+
+      {exportOpen ? (
+        <ExportPreviewDialog
+          series={series}
+          onClose={() => setExportOpen(false)}
           onError={(m) => setError(m)}
         />
       ) : null}

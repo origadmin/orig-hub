@@ -284,9 +284,9 @@ export function tgThumbUrl(chatId: number | string, messageId: number | string):
   return `${TG_BASE}/api/tg/thumb/${encodeURIComponent(String(chatId))}/${encodeURIComponent(String(messageId))}`
 }
 
-/** GET /api/tg/config — 运行时配置（缓存下载目录等） */
-export async function getTgConfig(): Promise<{ downloadDir: string }> {
-  return request<{ downloadDir: string }>('/api/tg/config')
+/** GET /api/tg/config — 运行时配置（缓存下载目录、库根等） */
+export async function getTgConfig(): Promise<{ downloadDir: string; libraryDir?: string }> {
+  return request<{ downloadDir: string; libraryDir?: string }>('/api/tg/config')
 }
 
 /** PUT /api/tg/config — 更新缓存下载目录（持久化到 app_setting，立即生效） */
@@ -294,6 +294,17 @@ export async function setTgDownloadDir(downloadDir: string): Promise<{ downloadD
   return request<{ downloadDir: string }>('/api/tg/config', {
     method: 'PUT',
     body: JSON.stringify({ downloadDir }),
+  })
+}
+
+/**
+ * PUT /api/tg/config — 更新库根目录（byte-ownership P2/P5）。
+ * 后端做 expand_tilde + 预创建校验（不可创建时 400），成功后立即用于之后的归仓。
+ */
+export async function setTgLibraryDir(libraryDir: string): Promise<{ libraryDir: string }> {
+  return request<{ libraryDir: string }>('/api/tg/config', {
+    method: 'PUT',
+    body: JSON.stringify({ libraryDir }),
   })
 }
 
