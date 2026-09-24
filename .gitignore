@@ -110,3 +110,9 @@ analyze*.js
 # e2e/verify 类脚本按用途归类为本地验证，不入库（对齐 EE 的 probe_*.mjs 规则）
 tauri-shell/verify-e2e.mjs
 .workbuddy-ai/
+
+# scratch acceptance evidence (not source)
+.scratch_accept_evidence.txt
+
+# WorkBuddy workspace marker (not orig-hub source)
+/package.json
