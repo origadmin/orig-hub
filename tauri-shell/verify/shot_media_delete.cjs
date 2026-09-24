@@ -48,6 +48,10 @@ const OUT =
 const URL = process.env.APP_URL || 'http://127.0.0.1:5180'
 const API = 'http://127.0.0.1:9877'
 
+// BUG-161 污染防线：本脚本会写后端；默认拒绝写生产实例（9877），
+// 需显式 ORIG_VERIFY_ALLOW_PROD_WRITES=1 或改用隔离实例（见 verify/README.md §4）。
+require('./lib/sandbox.cjs').guardWrites('shot_media_delete.cjs', API)
+
 const checks = []
 function check(name, ok, detail) {
   checks.push({ name, ok: !!ok, detail })

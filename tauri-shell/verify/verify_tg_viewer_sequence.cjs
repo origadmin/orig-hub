@@ -315,18 +315,35 @@ async function main() {
     `${TG_API}/api/tg/monitor/messages?channelId=${encodeURIComponent(String(chatId))}&limit=50`,
   )
   const items = (msgs && Array.isArray(msgs.items) ? msgs.items : []) || []
-  // 可播 = `type !== 'file'`（与 `TgPanel.isPlayable` 同判据，但取自后端）
+  // 序列准入（BUG-150 之后）：先排除 `file`（无可呈现形态），再按**呈现方式**分组 ——
+  // photo 独立成浏览组，video/audio 共用播放组。与 `TgPanel.isSameKind` 同判据，
+  // 但**取自后端**（地面真值不依赖被测代码）。
+  //
+  // 为什么这里必须是同型而不是「可播」：BUG-137 当时按 `type !== 'file'` 算分母，
+  // 于是「点图片」时把视频也算进分母 —— 那个分母描述的是一条**混排**序列，
+  // 而混排序列正是用户报的「图片被当视频播放」（BUG-150）。分母的判据与序列的
+  // 判据必须是同一条，否则验收本身就在固化缺陷。
+  const groupOf = t => (t === 'photo' ? 'browse' : t === 'video' || t === 'audio' ? 'play' : null)
   const playable = items.filter(m => (m.type || 'file') !== 'file')
+  // 期望分母按 kind 取：调用方用 `kind` 选出被点瓦片的同型子序列。
+  const sameKindOf = kind => {
+    const g = groupOf(kind)
+    if (!g) return []
+    return playable.filter(m => groupOf(m.type) === g)
+  }
   const albumMembers = playable.filter(m => m.groupId != null)
   const outsideAlbum = playable.filter(m => m.groupId == null)
-  const expectedTotal = playable.length
 
   console.log(
     `[verify:tg-viewer] backend truth: channel=${chatId} (${channel.title}) ` +
-      `items=${items.length} playable=${expectedTotal} album=${albumMembers.length} ` +
-      `outsideAlbum=${outsideAlbum.length}`,
+      `items=${items.length} playable=${playable.length} album=${albumMembers.length} ` +
+      `outsideAlbum=${outsideAlbum.length} ` +
+      `[photo=${playable.filter(m => m.type === 'photo').length} ` +
+      `video=${playable.filter(m => m.type === 'video').length}]`,
   )
-  if (expectedTotal < 2 || albumMembers.length < 2 || outsideAlbum.length < 1) {
+  // 注意：断言「跨相册」需要相册本身仍是期望序列的一段，所以先确认相册是
+  // **同型**的（混型相册在修复后会被拆开，断言的前提就不成立了）。
+  if (playable.length < 2 || albumMembers.length < 2 || outsideAlbum.length < 1) {
     console.error(
       '[verify:tg-viewer] fixture too small: need >=2 album members and >=1 message outside the album',
     )
@@ -393,6 +410,25 @@ async function main() {
     )
     await page.screenshot(path.join(OUT_DIR, '01-tg-feed.png'))
 
+    // ---------- 期望分母：按**被点瓦片的 kind** 取同型子序列（BUG-150）----------
+    //
+    // 被测行为：点某种 kind 的瓦片 → 播放器拿到的邻居序列 = 该 kind 的整个同型子集。
+    // 因此分母不能再用「全部可播」（那是混排，正是被修的缺陷），必须按 kind 取。
+    // 相册成员取第一个可判型成员的 kind 作为该相册的 kind（同型相册是修复后的常态）。
+    const albumKind = (albumMembers.find(m => m.type === 'photo' || m.type === 'video' || m.type === 'audio') || {}).type
+    const albumSeq = sameKindOf(albumKind)
+    const expectedTotal = albumSeq.length
+    console.log(
+      `[verify:tg-viewer] expected (same-kind): albumKind=${albumKind} expectedTotal=${expectedTotal} ` +
+        `(mixed would be ${playable.length})`,
+    )
+    // 前置：本 fixture 必须能区分同型与混排（否则这条断言恒真，等于没测）
+    check(
+      '前置：同型分母 ≠ 混排分母（否则本脚本无法区分缺陷是否已修）',
+      expectedTotal !== playable.length,
+      `sameKind=${expectedTotal} mixed=${playable.length} albumKind=${albumKind}`,
+    )
+
     // ---------- 正向：相册**最后一张**必须能翻到相册之外 ----------
     console.log('')
     console.log('--- 正向：相册最后一张 → 下一条（BUG-137 核心）---')
@@ -408,11 +444,17 @@ async function main() {
       atLastTile.open,
       JSON.stringify(atLastTile),
     )
+    // 位置 = 相册内下标（从 1 起）/ 该 kind 的同型序列长度。
+    // 相册是序列的一段（同型），所以「第 n 张」的 n 等于相册内下标，
+    // 分母则是**整个同型流**（BUG-137 要的「跨出相册」；BUG-150 追加「同型」）。
+    const albumKindCount = albumSeq.filter(m => m.groupId != null).length
     check(
-      `★ 位置分母 = 整个可播流（${albumMembers.length}/${expectedTotal}），不是相册长度 ` +
-        `（修复前会是 ${albumMembers.length}/${albumMembers.length}）`,
+      `★ 位置分母 = 整个同型流（${albumMembers.length}/${expectedTotal}），不是相册长度 ` +
+        `（修复前会是 ${albumMembers.length}/${albumKindCount || albumMembers.length}）`,
       atLastTile.position === `${albumMembers.length}/${expectedTotal}`,
-      `position=${JSON.stringify(atLastTile.position)}`,
+      `position=${JSON.stringify(atLastTile.position)} expected=${
+        albumMembers.length
+      }/${expectedTotal} albumKind=${albumKind}`,
     )
     check(
       '★ 相册最后一张仍有「下一条」（序列跨出了相册）',
@@ -434,10 +476,12 @@ async function main() {
 
     check(
       '★ 点「下一条」走到相册之外的条目（按 messageId 与后端核对）',
-      outsideAlbum.some(m => Number(m.messageId) === afterNext.messageId),
-      `viewer.messageId=${afterNext.messageId} outsideAlbum=${JSON.stringify(
-        outsideAlbum.map(m => m.messageId),
-      )}`,
+      // 必须限定在**同型**相册之外：混排口径下「相册之外」会把另一 kind 也算进来，
+      // 而修复后序列根本不该跨型（BUG-150）。被点瓦片的 kind 已由 albumKind 确定。
+      sameKindOf(albumKind).some(m => Number(m.messageId) === afterNext.messageId),
+      `viewer.messageId=${afterNext.messageId} outsideAlbum(sameKind)=${JSON.stringify(
+        sameKindOf(albumKind).filter(m => m.groupId == null).map(m => m.messageId),
+      )} albumKind=${albumKind}`,
     )
     check(
       `末位位置为 ${expectedTotal}/${expectedTotal} 且不再有「下一条」（序列到此为止）`,

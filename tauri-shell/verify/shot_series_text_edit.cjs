@@ -47,6 +47,10 @@ const fs = require('fs')
 
 const APP = process.env.APP_URL || 'http://127.0.0.1:5180'
 const API = process.env.API_BASE || 'http://127.0.0.1:9877'
+
+// BUG-161 污染防线：本脚本会写后端；默认拒绝写生产实例（9877），
+// 需显式 ORIG_VERIFY_ALLOW_PROD_WRITES=1 或改用隔离实例（见 verify/README.md §4）。
+require('./lib/sandbox.cjs').guardWrites('shot_series_text_edit.cjs', API)
 const OUT = process.env.ORIG_SHOT_OUT || path.join(__dirname, '..', '..', 'verify_shots', 'ep_text')
 fs.mkdirSync(OUT, { recursive: true })
 

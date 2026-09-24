@@ -128,3 +128,39 @@ node verify/shot_context_bar.cjs
 | `RESULT: UNREACHABLE (exit 2)` | 端口无监听 / 浏览器起不来 | `npm run dev`；或设 `EDGE_PATH` |
 | 找不到浏览器 | `CDP: no local Edge/Chrome found` | 设 `EDGE_PATH` 指向本机 Edge |
 | 浏览器起不来 | DevTools 超时 | 确认没有残留 `--remote-debugging-port` 实例占端口 |
+
+---
+
+## 4. 污染防线：禁止误写用户真实库（BUG-161）
+
+**根因**：本目录历史上多数脚本把后端地址**默认指向生产实例**
+`http://127.0.0.1:9877`（背后是用户真实库 `%APPDATA%\com.origadmin.orighub\tg\store.db`），
+且**没有任何守卫阻止写入**；清理只写在 `finally` 里，脚本被 kill / 未走 `finally` 时残留即落地。
+后果：媒体库里出现了 `DiagCard_<ms>` 这类 0 分集的**孤儿剧集卡**（用户可见），
+即「没有正确标题/内容」的条目。
+
+**防线**：`verify/lib/sandbox.cjs`。所有**会写后端**的脚本（`shot_clear_center` /
+`shot_item_cache` / `shot_media_delete` / `shot_media_tags` / `shot_series_text_edit` /
+`verify_merge_frontend` / `verify_series_not_found`）已在文件头接入 `guardWrites(...)`：
+
+- 目标是生产 9877 时**默认拒绝执行**（`exit 2`），并打印隔离实例的拉起用法；
+- 确需在生产实例上写验证时，必须显式授权：`ORIG_VERIFY_ALLOW_PROD_WRITES=1`；
+- 授权后自动安装进程级清理钩子（`beforeExit` / `SIGINT` / `SIGTERM` / `uncaughtException`），
+  配合 `createTempSeries()`（建实体即自动登记删除），让「建了不删」在 API 上不可表达；
+- 残留清点（只读）：`listResidue(base)` / `sweepResidue(base,{apply})` —— `apply` 亦需
+  `ORIG_VERIFY_ALLOW_PROD_WRITES=1` 才会真删。
+
+**推荐姿态**——写验证一律指向**隔离实例**（独立端口 + 唯一库名 + mock 构建）：
+
+```sh
+cd download-engine
+CARGO_TARGET_DIR=target-mock cargo build -p orig-tg --release --features mock
+ORIG_TG_PORT=19877 ORIG_TG_DB="$TMP/store-$(date +%s).db" \
+ORIG_TG_SESSION="$TMP/s.session" ORIG_TG_MOCK=1 \
+  target-mock/release/orig-tg.exe >"$TMP/server.log" 2>&1 &
+# 前端另起 dev 指向隔离端口：VITE_TG_PORT=19877 npm run dev
+# 脚本侧：ORIG_MEDIA_API=http://127.0.0.1:19877 node verify/xxx.cjs
+```
+
+**只读脚本**（`verify_card_kind_signal` / `verify_ingest_pipeline` / `verify_tg_viewer_sequence` /
+`verify_ui_render` / `verify_tg_error_i18n` / `shot_context_bar`）不写库，可直接对生产实例跑。
