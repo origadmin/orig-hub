@@ -944,6 +944,7 @@ export function MediaLibraryPanel() {
                   variant="outline"
                   size="sm"
                   className="h-7 px-2 text-[11px]"
+                  data-testid="media-tag-manage"
                   onClick={() => setTagMgrOpen(true)}
                 >
                   🏷 {t('media.manageTags')}

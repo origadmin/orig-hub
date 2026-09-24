@@ -423,6 +423,7 @@ export function SeriesDetail(props: {
             variant="outline"
             size="sm"
             className="h-7 px-2 text-[11px]"
+            data-testid="series-tag-edit"
             onClick={() => {
               setSelected(detail.tags.map((t) => t.id))
               setEditingTags((v) => !v)
@@ -537,7 +538,7 @@ export function SeriesDetail(props: {
           </p>
           {/* 标签 chips：原独立的「标签展示行」合并进 Hero 右列（整页重排） */}
           {detail.tags.length > 0 ? (
-            <div className="mt-1.5 flex flex-wrap gap-x-1.5 gap-y-0.5">
+            <div className="mt-1.5 flex flex-wrap gap-x-1.5 gap-y-0.5" data-testid="series-hero-tags">
               {detail.tags.map((t) => (
                 <TagToken key={t.id} name={t.name} />
               ))}
