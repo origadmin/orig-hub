@@ -28,6 +28,19 @@
  * 每条断言都打印实测值，且对改版前的代码必然失败（旧版：chip 条/聚焦区/desc tab 非 0、
  * 封面 80×44、介绍不在 Hero、无「第 N 季」分组）。
  *
+ * 623ba93 复测补充（D1/D2/D3）：
+ *   D1-1 Hero 海报：720/820/900 三个宽度实测量到的宽高必须都是 320×180
+ *       （上一轮实测 320×634 / 320×535 / 320×180，self-start 修复后应恒为 320×180）；
+ *   D1-2 720px 下被裁掉的元素按 testid 计数打印（上一轮：14 个 episode-remove）。
+ *       壳最小宽度 900 → 720 的裁剪只记 WARNING；900/820 上裁剪数必须为 0；
+ *   D2  去重反例：series 101（单集，集介绍与剧集介绍逐字相同 120 字）的这段文案
+ *       在整页 innerText 里出现次数 === 1（旧行为是 2），且行内不再渲染介绍 <p>，
+ *       但 episode-slot / episode-edit 仍各 1 个（编辑入口不能跟着被折叠掉）；
+ *   D3  去重正例：本集介绍 ≠ 剧集介绍时行内必须照常渲染 —— 先取活数据（series 3 的
+ *       S1E1 自带 291 字本集介绍 vs 484 字剧集介绍），再**经 UI 现场造一条**
+ *       （episode-edit → textarea 写值 → episode-save），断言行内介绍 <p> 存在、
+ *       文本等于所存值且与 Hero 介绍不同；最后把原值改回去（探针不留测试文案）。
+ *
  * Usage:  node verify/verify_series_detail_rows.cjs
  * Env:    APP_PORT(默认5180) ORIG_VERIFY_OUT PROBE(1=只 dump testid)
  * Exit:   0 = 全部通过；2 = 断言失败
@@ -54,6 +67,14 @@ const SERIES_IMAGES = 80
 const SERIES_DESC = 101
 /** 「介绍只出现一次」的主验对象：80 的介绍长 119 字，且其可播分集的集介绍为空 → 不混淆两个字段 */
 const SERIES_DESC_SINGLE = 80
+/**
+ * 去重**正例**对象（623ba93 的 showEpDesc 不能把「真有独立本集介绍」的那一份也吃掉）：
+ * series 3 的 S1E1（ep 131）自带 291 字本集介绍，剧集介绍 484 字 —— 两者逐字不同，
+ * 是活数据里现成的「本集介绍 ≠ 剧集介绍」样本（实测自 /api/media/series/3）。
+ */
+const SERIES_DESC_DIFF = 3
+/** 行内「本集介绍」textarea（无 testid，只能按 placeholder 定位） */
+const EP_DESC_TA = 'textarea[placeholder="本集介绍…"]'
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -77,6 +98,26 @@ async function waitTestid(page, testid, timeout = 10000) {
 async function waitTestidSoft(page, testid, timeout = 6000) {
   try {
     await waitTestid(page, testid, timeout)
+    return true
+  } catch (_e) {
+    return false
+  }
+}
+
+/** 等任意 CSS 选择器出现（本集介绍 textarea 没有 data-testid） */
+async function waitSelectorSoft(page, selector, timeout = 8000) {
+  try {
+    await page.waitForFunction((s) => !!document.querySelector(s), { timeout, args: [selector] })
+    return true
+  } catch (_e) {
+    return false
+  }
+}
+
+/** 等任意 CSS 选择器消失 */
+async function waitSelectorGone(page, selector, timeout = 10000) {
+  try {
+    await page.waitForFunction((s) => !document.querySelector(s), { timeout, args: [selector] })
     return true
   } catch (_e) {
     return false
@@ -237,6 +278,64 @@ const READ_HERO_DESC = () => {
   if (!text) return null
   return { text, head: text.slice(0, 40) }
 }
+
+/**
+ * 每一行的「本集介绍」渲染情况。
+ *
+ * 行内介绍 <p> 没有 testid，按它的排版类名 `whitespace-pre-wrap` 定位（行内其余
+ * <p> 分别是标题 `truncate` 与副行 `text-[10px]`，不会误命中）。回传 `descs` 计数：
+ * 623ba93 之后，与剧集介绍逐字相同的那一集必须**不渲染**介绍 <p>（descs === 0），
+ * 真有独立介绍的那一集必须渲染（descs === 1）。
+ */
+const READ_ROW_DESCS = () => {
+  const slots = Array.from(document.querySelectorAll('[data-testid="episode-slot"]'))
+  return slots.map((slot, i) => {
+    const li = slot.closest('li')
+    const ps = li
+      ? Array.from(li.querySelectorAll('p')).filter((p) =>
+          String(p.className).includes('whitespace-pre-wrap'),
+        )
+      : []
+    return {
+      row: i,
+      slot: (slot.textContent || '').trim(),
+      descs: ps.length,
+      text: ps.length ? (ps[0].textContent || '').trim() : null,
+    }
+  })
+}
+
+/**
+ * 写 React 受控 textarea。
+ *
+ * 直接 `el.value = x` 不会触发 React 的 onChange（value tracker 认为没变），必须走
+ * 原型上的原生 setter 再派发 input 事件 —— 否则「保存」提交的仍是旧值，
+ * 探针就会用一个没真正写进去的值去断言，等于空断言。
+ */
+const SET_TEXTAREA_VALUE = (selector, value) => {
+  const el = document.querySelector(selector)
+  if (!el) return { ok: false, reason: `no element for ${selector}` }
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set
+  if (!setter) return { ok: false, reason: 'no native value setter' }
+  setter.call(el, value)
+  el.dispatchEvent(new Event('input', { bubbles: true }))
+  return { ok: true, readback: el.value }
+}
+
+/** 点某一行的 episode-edit（面板是行内展开的，必须点中目标行，不能取全局第一个） */
+const CLICK_ROW_EDIT = (row) => {
+  const slots = Array.from(document.querySelectorAll('[data-testid="episode-slot"]'))
+  const slot = slots[row]
+  if (!slot) return { ok: false, reason: `no episode-slot at row ${row}` }
+  const li = slot.closest('li')
+  const btn = li ? li.querySelector('[data-testid="episode-edit"]') : null
+  if (!btn) return { ok: false, reason: `no episode-edit inside row ${row}` }
+  btn.click()
+  return { ok: true, slot: (slot.textContent || '').trim() }
+}
+
+/** 与页面内 COUNT_OCCURRENCES 同一套归一化规则（innerText 的换行不参与比较） */
+const normText = (s) => String(s || '').replace(/\s+/g, '')
 
 async function main() {
   fs.mkdirSync(OUT_DIR, { recursive: true })
@@ -406,6 +505,8 @@ async function main() {
             }
           }
         }
+        const clippedTally = {}
+        for (const c of clipped) clippedTally[c.tid] = (clippedTally[c.tid] || 0) + 1
         return {
           docScrollW: document.documentElement.scrollWidth,
           docClientW: document.documentElement.clientWidth,
@@ -416,6 +517,7 @@ async function main() {
           rows: document.querySelectorAll('[data-testid="episode-slot"]').length,
           clippedCount: clipped.length,
           clippedSample: clipped.slice(0, 3),
+          clippedTally,
         }
       })
       console.log(`[rows] narrow ${w}px container:`, JSON.stringify(box))
@@ -438,13 +540,24 @@ async function main() {
             'Note: src-tauri/tauri.conf.json minWidth=900, so 720px is below the shell minimum and unreachable in the product.',
         )
       }
-      if (n720.rest.posterH > 200) {
-        warns.push(
-          `at 720px the hero poster is stretched to ${n720.rest.posterW}x${n720.rest.posterH} ` +
-            '(aspect-video defeated by flex align-stretch once the right column grows taller) — below minWidth 900.',
-        )
-      }
     }
+    // D1-1（复测 623ba93 的 self-start）：海报在 720/820/900 三个宽度上都必须保持 320×180
+    const poster720ok = n720.rest.posterW === 320 && n720.rest.posterH === 180
+    console.log(
+      `[rows] D1-1 hero poster @720px: ${n720.rest.posterW}x${n720.rest.posterH} (expect 320x180) ->`,
+      poster720ok,
+    )
+    if (!poster720ok) {
+      fails.push(`hero poster is not 320x180 at 720px: ${n720.rest.posterW}x${n720.rest.posterH}`)
+    }
+    // D1-2（复测上一轮记录的裁剪）：720px 下被裁掉的是哪些元素、各多少个
+    const removeClipped720 = (n720.rest.clippedTally || {})['episode-remove'] || 0
+    console.log(
+      `[rows] D1-2 clipped nodes @720px by testid:`,
+      JSON.stringify(n720.rest.clippedTally),
+      '| episode-remove clipped:',
+      removeClipped720,
+    )
     if (n720.rest.docScrollW !== n720.rest.docClientW) {
       warns.push(`page-level horizontal overflow at 720px: ${n720.rest.docScrollW} != ${n720.rest.docClientW}`)
     }
@@ -475,13 +588,19 @@ async function main() {
         fails.push(`episode cover < 150px at ${w}px viewport: ${n.rest.coverW}`)
       }
       if (!(n.rest.rows > 0)) fails.push(`no episode row rendered at ${w}px`)
-      // 支持范围内的最窄窗口上，Hero 海报必须保持 320×180（不被拉伸）
-      if (w === 900 && !(n.rest.posterW >= 300 && n.rest.posterH >= 170 && n.rest.posterH <= 190)) {
-        fails.push(`hero poster not 320x180 at 900px: ${n.rest.posterW}x${n.rest.posterH}`)
+      // D1-1：海报在壳最小宽度 900 上也必须保持 320×180（820 顺带复测）
+      const posterOk = n.rest.posterW === 320 && n.rest.posterH === 180
+      console.log(
+        `[rows] D1-1 hero poster @${w}px: ${n.rest.posterW}x${n.rest.posterH} (expect 320x180) ->`,
+        posterOk,
+      )
+      if (!posterOk) {
+        fails.push(`hero poster is not 320x180 at ${w}px: ${n.rest.posterW}x${n.rest.posterH}`)
       }
-      if (w === 820 && n.rest.posterH > 200) {
-        warns.push(
-          `at 820px (still below minWidth 900) the hero poster is stretched to ${n.rest.posterW}x${n.rest.posterH}`,
+      // 支持范围内的宽度上不允许有元素被裁掉
+      if (n.rest.clippedCount !== 0) {
+        fails.push(
+          `clipped nodes inside the episode list at ${w}px: ${JSON.stringify(n.rest.clippedTally)}`,
         )
       }
     }
@@ -621,11 +740,41 @@ async function main() {
       if (!pos101 || !pos101.descBeforeSeason) {
         fails.push(`series 101 description is not inside the hero: ${JSON.stringify(pos101)}`)
       }
+      // ── D2 去重反例（623ba93 的核心断言）─────────────────────────────────
+      // series 101 只有 1 集，且该集介绍与剧集介绍**逐字相同**（同一条 TG 文案，120 字）。
+      // 623ba93 之前：Hero 一份 + 行内「本集介绍」一份 = 整页 2 次；之后必须恰好 1 次。
+      console.log(
+        `[rows] D2 dedup(series 101, identical ep/series desc): occurrences=${n101} (expect 1) ` +
+          `| len=${desc101.text.length} | first40=${JSON.stringify(desc101.text.slice(0, 40))}`,
+      )
       if (n101 !== 1) {
-        warns.push(
-          `series 101: description text appears ${n101}x in page innerText — its single episode's ` +
-            'description is byte-identical to the series description (same TG caption), and the row ' +
-            'renders 本集介绍 by design. Two fields, two places: not the same block rendered twice.',
+        fails.push(
+          `series 101: the description (episode desc byte-identical to the series desc, ${desc101.text.length} chars) ` +
+            `appears ${n101}x in page innerText, expected exactly 1 (hero only) — ${JSON.stringify(desc101.text.slice(0, 40))}`,
+        )
+      }
+      // 反例的配套取证：行内不该再有介绍 <p>，但编辑入口必须还在
+      const rows101 = await page.evaluate(READ_ROW_DESCS)
+      const entries101 = await page.evaluate(() => ({
+        slot: document.querySelectorAll('[data-testid="episode-slot"]').length,
+        edit: document.querySelectorAll('[data-testid="episode-edit"]').length,
+      }))
+      const rowDesc101 = rows101.reduce((acc, r) => acc + r.descs, 0)
+      console.log(
+        '[rows] D2 series 101 rows:',
+        JSON.stringify(rows101.map((r) => ({ row: r.row, slot: r.slot, descs: r.descs }))),
+        '| entries:',
+        JSON.stringify(entries101),
+      )
+      if (rowDesc101 !== 0) {
+        fails.push(
+          `series 101: the row still renders ${rowDesc101} episode-description <p> although it is ` +
+            'byte-identical to the series description (should be hidden by showEpDesc)',
+        )
+      }
+      if (entries101.slot !== 1 || entries101.edit !== 1) {
+        fails.push(
+          `series 101: episode edit entry lost — episode-slot=${entries101.slot}, episode-edit=${entries101.edit} (expect 1/1)`,
         )
       }
       if (pos101 && !(pos101.heroLines > 1)) {
@@ -635,6 +784,175 @@ async function main() {
     await scrollListTop(page)
     await shot(page, 'rows-desc.png', null)
 
+    // ══ 9) 去重正例：本集介绍 ≠ 剧集介绍时，行内必须照常渲染（series 3）══════
+    // 反例只证明「相同的被折叠」，正例才证明「不同的没被误杀」——两者缺一不可：
+    // 把 showEpDesc 写成常量 false 也能让反例通过，只有正例能挡住这种假修复。
+    await openSeriesById(page, SERIES_DESC_DIFF)
+    const heroDiff = await page.evaluate(READ_HERO_DESC)
+    console.log(
+      '[rows] D3 series 3 hero desc: len=',
+      heroDiff ? heroDiff.text.length : null,
+      '| first40=',
+      JSON.stringify(heroDiff ? heroDiff.text.slice(0, 40) : null),
+    )
+    if (!heroDiff) {
+      fails.push(`series ${SERIES_DESC_DIFF} has no hero description to compare against`)
+    }
+
+    // 9a) 活数据正例：series 3 的 S1E1（ep 131）自带 291 字本集介绍，与 484 字剧集介绍逐字不同
+    const rowsLive = await page.evaluate(READ_ROW_DESCS)
+    console.log(
+      '[rows] D3 series 3 row descriptions (live data):',
+      JSON.stringify(
+        rowsLive.map((r) => ({
+          row: r.row,
+          slot: r.slot,
+          descs: r.descs,
+          len: r.text ? r.text.length : 0,
+          head: r.text ? r.text.slice(0, 40) : null,
+        })),
+      ),
+    )
+    const liveDistinct = rowsLive.filter((r) => r.descs > 0)
+    if (!liveDistinct.length) {
+      fails.push(
+        `series ${SERIES_DESC_DIFF}: no episode row renders its own description <p> — the dedup rule ` +
+          'over-suppressed a description that differs from the series description',
+      )
+    } else if (heroDiff) {
+      const r0 = liveDistinct[0]
+      console.log(
+        `[rows] D3 dedup positive (live): row ${r0.row} ${r0.slot} desc len=${r0.text.length} ` +
+          `| row first40=${JSON.stringify(r0.text.slice(0, 40))}`,
+      )
+      console.log(
+        `[rows] D3 dedup positive (live): hero first40=${JSON.stringify(heroDiff.text.slice(0, 40))}`,
+      )
+      if (normText(r0.text) === normText(heroDiff.text)) {
+        fails.push('series 3: the row description equals the series description (expected them to differ)')
+      }
+      const nLive = await page.evaluate(COUNT_OCCURRENCES, r0.text)
+      console.log('[rows] D3 dedup positive (live): row desc occurrences in innerText =', nLive, '(expect 1)')
+      if (nLive !== 1) {
+        fails.push(`series 3: the distinct episode description appears ${nLive}x in innerText (expected 1)`)
+      }
+    }
+
+    // 9b) 经 UI 现场造一条：episode-edit → 面板里写一条与剧集介绍不同的本集介绍 → 保存。
+    //     同时验证 623ba93 的承诺：「只影响展示，编辑入口始终保留」。
+    const uiRow = liveDistinct.length ? liveDistinct[0].row : 0
+    const opened = await page.evaluate(CLICK_ROW_EDIT, uiRow)
+    console.log('[rows] D3 UI episode-edit click:', JSON.stringify(opened))
+    if (!opened.ok) {
+      fails.push(`could not open the episode edit panel from the UI: ${JSON.stringify(opened)}`)
+    }
+    const panelUp = await waitSelectorSoft(page, EP_DESC_TA, 8000)
+    const prefilled = await page.evaluate((sel) => {
+      const el = document.querySelector(sel)
+      return el ? { value: String(el.value || ''), len: String(el.value || '').length } : null
+    }, EP_DESC_TA)
+    console.log(
+      '[rows] D3 UI panel opened:',
+      panelUp,
+      '| prefilled len=',
+      prefilled ? prefilled.len : null,
+      '| prefilled first40=',
+      JSON.stringify(prefilled ? prefilled.value.slice(0, 40) : null),
+    )
+    if (!panelUp || !prefilled) {
+      fails.push(
+        `episode-edit did not open an editable episode description panel (${EP_DESC_TA} missing) — ` +
+          'the edit entry is supposed to stay reachable after the dedup change',
+      )
+    } else if (!(prefilled.len > 0)) {
+      fails.push('episode description panel opened but its textarea is empty (should be prefilled)')
+    } else {
+      const stamped = `QA 本集独立介绍 ${new Date().toISOString()} — 与剧集介绍不同，用于验证去重不误杀`
+      const setRes = await page.evaluate(SET_TEXTAREA_VALUE, EP_DESC_TA, stamped)
+      const readback = await page.evaluate((sel) => String(document.querySelector(sel).value || ''), EP_DESC_TA)
+      console.log(
+        '[rows] D3 UI typed episode desc: len=',
+        stamped.length,
+        '| textarea readback === typed:',
+        readback === stamped,
+        '| set=',
+        JSON.stringify(setRes && setRes.ok),
+      )
+      if (readback !== stamped) {
+        fails.push(
+          `could not write the episode description through the UI (React value did not update): ${JSON.stringify(readback.slice(0, 40))}`,
+        )
+      }
+      await clickTestid(page, 'episode-save')
+      const panelClosed = await waitSelectorGone(page, EP_DESC_TA, 10000)
+      await delay(700)
+      const rowsSaved = await page.evaluate(READ_ROW_DESCS)
+      const rSaved = rowsSaved[uiRow]
+      console.log('[rows] D3 UI panel closed after 保存:', panelClosed)
+      console.log(
+        `[rows] D3 dedup positive (UI-created): row ${uiRow} ${rSaved ? rSaved.slot : '?'} descs=`,
+        rSaved ? rSaved.descs : null,
+        '| row first40=',
+        JSON.stringify(rSaved && rSaved.text ? rSaved.text.slice(0, 40) : null),
+      )
+      console.log(
+        '[rows] D3 dedup positive (UI-created): hero first40=',
+        JSON.stringify(heroDiff ? heroDiff.text.slice(0, 40) : null),
+      )
+      if (!panelClosed) fails.push('episode edit panel did not close after clicking 保存')
+      if (!rSaved || !(rSaved.descs > 0)) {
+        fails.push(
+          `after saving a distinct episode description through the UI, row ${uiRow} renders no description <p>`,
+        )
+      } else {
+        if (normText(rSaved.text) !== normText(stamped)) {
+          fails.push(
+            `row ${uiRow} description is not the text saved through the UI: ${JSON.stringify(rSaved.text.slice(0, 60))}`,
+          )
+        }
+        if (heroDiff && normText(rSaved.text) === normText(heroDiff.text)) {
+          fails.push('row description equals the hero description (the positive case must differ)')
+        }
+        const nStamped = await page.evaluate(COUNT_OCCURRENCES, stamped)
+        console.log('[rows] D3 dedup positive (UI-created): saved text occurrences in innerText =', nStamped, '(expect 1)')
+        if (nStamped !== 1) {
+          fails.push(`the episode description saved through the UI appears ${nStamped}x in innerText (expected 1)`)
+        }
+      }
+      await shot(page, 'rows-desc-diff.png', 'episode-slot')
+
+      // 还原：探针不得在资料库里留下测试文案。原值取面板预填值，改回后再断言一次。
+      const original = prefilled.value
+      const reopened = await page.evaluate(CLICK_ROW_EDIT, uiRow)
+      const panelUp2 = await waitSelectorSoft(page, EP_DESC_TA, 8000)
+      await page.evaluate(SET_TEXTAREA_VALUE, EP_DESC_TA, original)
+      const readback2 = await page.evaluate((sel) => String(document.querySelector(sel).value || ''), EP_DESC_TA)
+      await clickTestid(page, 'episode-save')
+      await waitSelectorGone(page, EP_DESC_TA, 10000)
+      await delay(700)
+      const rowsRestored = await page.evaluate(READ_ROW_DESCS)
+      const rRestored = rowsRestored[uiRow]
+      const restored = Boolean(rRestored && normText(rRestored.text) === normText(original))
+      console.log(
+        '[rows] D3 UI restore: reopen=',
+        JSON.stringify(reopened && reopened.ok),
+        '| panel=',
+        panelUp2,
+        '| typed back === original:',
+        readback2 === original,
+        '| row desc restored:',
+        restored,
+        '| len=',
+        rRestored && rRestored.text ? rRestored.text.length : null,
+      )
+      if (!restored) {
+        fails.push(
+          `RESTORE FAILED: episode row ${uiRow} of series ${SERIES_DESC_DIFF} still holds the probe text; ` +
+            `manual restore value = ${JSON.stringify(original)}`,
+        )
+      }
+    }
+
     // ══ 8) 截图文件真实落盘 ══════════════════════════════════════════════════
     for (const name of [
       'rows-wide.png',
@@ -642,6 +960,7 @@ async function main() {
       'rows-narrow.png',
       'rows-narrow-hero.png',
       'rows-desc.png',
+      'rows-desc-diff.png',
     ]) {
       const file = path.join(OUT_DIR, name)
       let size = -1
