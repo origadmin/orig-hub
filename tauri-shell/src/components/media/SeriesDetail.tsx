@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   ChevronDown,
   ChevronUp,
@@ -44,58 +44,6 @@ const KIND_LABEL: Record<string, string> = {
   series: '剧集',
   collection: '合集',
   album: '图集',
-}
-
-/**
- * 介绍文本：统一「裁剪/全显」规则（总介绍与单集介绍共用）。
- *
- * 规则（基础逻辑）：
- *  - 未超 `maxLines` 行 → 全部显示，无任何按钮；
- *  - 超出 → 折叠到 `maxLines` 行，出现「展开/收起」；
- *  - 用户手写的换行（\n）永远保留；长无空格串（URL 等）强制可断行，不撑破容器。
- */
-function DescText(props: { text: string; maxLines: number; className?: string }) {
-  const { text, maxLines, className } = props
-  const [expanded, setExpanded] = useState(false)
-  const [clamped, setClamped] = useState(false)
-  const ref = useRef<HTMLParagraphElement>(null)
-  useEffect(() => {
-    setExpanded(false)
-    setClamped(false)
-    const el = ref.current
-    if (!el) return
-    // 折叠态量溢出：scrollHeight > clientHeight 即内容比可视区高（+1 容亚像素误差）
-    setClamped(el.scrollHeight > el.clientHeight + 1)
-  }, [text, maxLines])
-  return (
-    <div className={className}>
-      <p
-        ref={ref}
-        style={
-          expanded
-            ? undefined
-            : {
-                display: '-webkit-box',
-                WebkitLineClamp: maxLines,
-                WebkitBoxOrient: 'vertical',
-                overflow: 'hidden',
-              }
-        }
-        className="whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-muted"
-      >
-        {text}
-      </p>
-      {clamped && (
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="mt-0.5 text-[10px] text-accent hover:underline"
-        >
-          {expanded ? '收起' : '展开'}
-        </button>
-      )}
-    </div>
-  )
 }
 
 /** 剧集详情：元数据头 + 按季分组的分集列表（可播放/移除） */
@@ -231,6 +179,25 @@ export function SeriesDetail(props: {
   const focusThumb = activeEp
     ? activeEp.poster ?? (activeEp.kind === 'photo' ? mediaItemUrl(activeEp.itemId) : null)
     : null
+
+  /**
+   * 合并介绍区：当前呈现「本集介绍」还是「全剧介绍」。
+   *
+   * 总介绍与集介绍此前分处两处（Hero 常驻总介绍 + 聚焦区再显示一次集介绍）——
+   * 重复且割裂，实际数据里很多集的简介就是复制的剧集简介。现在**只留一处**，
+   * 用 tab 在同一个位置里切换两种来源。
+   *
+   * 默认跟随内容：聚焦集有介绍 → 本集；没有 → 回落全剧（否则一进页面就是一片空态）。
+   * 切集时按同一规则重置；在同一集里用户手选的 tab 保持不变（不因刷新而跳回）。
+   */
+  const [descTab, setDescTab] = useState<'ep' | 'series'>(() =>
+    (playEps[0]?.description ?? '').trim() ? 'ep' : 'series',
+  )
+  useEffect(() => {
+    setDescTab(activeEp?.description?.trim() ? 'ep' : 'series')
+    // 只在「换集」时重置；同一集内的刷新不应覆盖用户手选的 tab
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeEp?.id])
 
   /** 按季分组（季号升序）——只编排可播发的内容（视频）。 */
   const seasons = useMemo(() => {
@@ -561,58 +528,55 @@ export function SeriesDetail(props: {
               ))}
             </div>
           ) : null}
-          {detail.description || editingDesc ? (
-            <div className="mt-1.5">
-              {editingDesc ? (
-                <div className="space-y-1.5">
-                  <textarea
-                    value={descDraft}
-                    onChange={(e) => setDescDraft(e.target.value)}
-                    placeholder="剧集介绍…"
-                    rows={3}
-                    className="w-full resize-none rounded-md border border-border-subtle bg-surface px-2 py-1.5 text-[11.5px] text-fg-strong"
-                  />
-                  <div className="flex gap-2">
-                    <Button size="sm" className="h-6 px-2.5 text-[11px]" disabled={busy} onClick={() => void saveDesc()}>
-                      保存
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-6 px-2.5 text-[11px]"
-                      onClick={() => setEditingDesc(false)}
-                    >
-                      取消
-                    </Button>
-                  </div>
-                </div>
-              ) : (
-                <div className="group/desc relative">
-                  {/* 总介绍：≤5 行全显；超出折叠 + 展开/收起（DescText 统一规则） */}
-                  <DescText text={detail.description || ''} maxLines={5} className="pr-12" />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setDescDraft(detail.description ?? '')
-                      setEditingDesc(true)
-                    }}
-                    className="absolute right-0 top-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] text-muted hover:bg-surface-2 hover:text-fg-mid"
-                  >
-                    <Pencil className="h-3 w-3" /> 编辑
-                  </button>
-                </div>
-              )}
+          {/*
+            剧集介绍：**不再常驻展示**。
+            总介绍此前在 Hero 里占一大段，下方聚焦区又显示一次（集）介绍 —— 两处重复
+            且割裂。现在整页只有一个简介位（聚焦区下方的合并介绍区），Hero 只留
+            **编辑入口**：编辑态是瞬态，点开才出现，不算常驻展示。
+          */}
+          {editingDesc ? (
+            <div className="mt-1.5 space-y-1.5">
+              <textarea
+                value={descDraft}
+                onChange={(e) => setDescDraft(e.target.value)}
+                placeholder="剧集介绍…"
+                aria-label="剧集介绍"
+                data-testid="series-desc-input"
+                rows={3}
+                className="w-full resize-none rounded-md border border-border-subtle bg-surface px-2 py-1.5 text-[11.5px] text-fg-strong"
+              />
+              <div className="flex gap-2">
+                <Button
+                  size="sm"
+                  className="h-6 px-2.5 text-[11px]"
+                  disabled={busy}
+                  onClick={() => void saveDesc()}
+                  data-testid="series-desc-save"
+                >
+                  保存
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-6 px-2.5 text-[11px]"
+                  onClick={() => setEditingDesc(false)}
+                  data-testid="series-desc-cancel"
+                >
+                  取消
+                </Button>
+              </div>
             </div>
           ) : (
             <button
               type="button"
               onClick={() => {
-                setDescDraft('')
+                setDescDraft(detail.description ?? '')
                 setEditingDesc(true)
               }}
               className="mt-1 self-start rounded px-1.5 py-0.5 text-[10.5px] text-accent hover:bg-accent/10"
+              data-testid="series-desc-edit"
             >
-              ＋ 添加剧集介绍
+              {detail.description ? t('media.editSeriesDesc') : t('media.addSeriesDesc')}
             </button>
           )}
         </div>
@@ -870,16 +834,11 @@ export function SeriesDetail(props: {
                         </span>
                       )}
                     </p>
-                    {/* 本集介绍：聚焦布局下整屏都归这一集，完整多行展示（不截断、不折叠） */}
-                    {editingEp === activeEp.id ? null : activeEp.description ? (
-                      <p className="mt-1.5 whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[11.5px] leading-relaxed text-muted">
-                        {activeEp.description}
-                      </p>
-                    ) : (
-                      <p className="mt-1.5 text-[11.5px] text-muted/70">
-                        {t('media.episodeNoDescription')}
-                      </p>
-                    )}
+                    {/*
+                      本集介绍**不在这里展示**：它与剧集总介绍合并到聚焦区下方的
+                      唯一简介区（`desc-body`）里。编辑入口（`episode-edit` 铅笔）仍留在
+                      本行 —— 点开后面板里的集介绍 textarea 照旧可编辑。
+                    */}
                     <div className="mt-auto flex flex-wrap items-center gap-2 pt-3">
                       {hasMediaBytes(activeEp) ? (
                         <Button
@@ -1021,6 +980,84 @@ export function SeriesDetail(props: {
                     </div>
                   </div>
                 ) : null}
+              </section>
+            ) : null}
+
+            {/*
+              合并介绍区（唯一的简介位）：**本集**与**全剧**两条文案在这里切换。
+              此前总介绍常驻 Hero、聚焦区再显示一次集介绍 —— 两处重复且割裂
+              （实际数据里很多集的简介就是复制的剧集简介）。合并后整页只有这一处简介。
+
+              位置：聚焦区之后、集号切换条之前 —— 先看清这一集是什么，再读它讲什么，
+              最后用切换条翻到别的集。
+            */}
+            {activeEp ? (
+              <section
+                className="mt-3 rounded-lg border border-border-subtle/60 bg-surface-2/30 p-3"
+                aria-label={t('media.descSectionLabel')}
+                data-testid="desc-section"
+              >
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setDescTab('ep')}
+                    aria-pressed={descTab === 'ep'}
+                    data-testid="desc-tab-ep"
+                    className={`rounded-full border px-2.5 py-0.5 text-[11px] transition-colors ${
+                      descTab === 'ep'
+                        ? 'border-accent bg-accent/10 text-accent'
+                        : 'border-border-subtle text-muted hover:border-accent/40 hover:text-fg-mid'
+                    }`}
+                  >
+                    {t('media.descTabEp')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDescTab('series')}
+                    aria-pressed={descTab === 'series'}
+                    data-testid="desc-tab-series"
+                    className={`rounded-full border px-2.5 py-0.5 text-[11px] transition-colors ${
+                      descTab === 'series'
+                        ? 'border-accent bg-accent/10 text-accent'
+                        : 'border-border-subtle text-muted hover:border-accent/40 hover:text-fg-mid'
+                    }`}
+                  >
+                    {t('media.descTabSeries')}
+                  </button>
+                  {/* 编辑入口跟随当前 tab：本集 → 打开本集编辑面板（里面有集介绍
+                      textarea）；全剧 → 打开 Hero 里的总介绍编辑态。 */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (descTab === 'ep') {
+                        openEpisodeEdit(activeEp)
+                      } else {
+                        setDescDraft(detail.description ?? '')
+                        setEditingDesc(true)
+                      }
+                    }}
+                    title={
+                      descTab === 'ep'
+                        ? '编辑本集（标题 / 季号 / 集号 / 介绍）'
+                        : t('media.editSeriesDesc')
+                    }
+                    aria-label={
+                      descTab === 'ep' ? '编辑本集介绍' : t('media.editSeriesDesc')
+                    }
+                    data-testid={descTab === 'ep' ? 'desc-edit-ep' : 'desc-edit-series'}
+                    className="ml-auto flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] text-muted hover:bg-surface-2 hover:text-fg-mid"
+                  >
+                    <Pencil className="h-3 w-3" /> 编辑
+                  </button>
+                </div>
+                {/* 内容：完整多行展示（不截断、不折叠）——裁剪会把长简介读成半句 */}
+                <div className="mt-1.5" data-testid="desc-body">
+                  <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[11.5px] leading-relaxed text-muted">
+                    {descTab === 'ep'
+                      ? activeEp.description || t('media.descEmptyEp')
+                      : detail.description || t('media.descEmptySeries')}
+                  </p>
+                </div>
               </section>
             ) : null}
 
