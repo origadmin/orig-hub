@@ -26,6 +26,16 @@ const MOCK_CODE: &str = "00000";
 /// 合成频道 id（仅测试构建下存在）。
 const MOCK_CHAT_ID: i64 = -1009876543210;
 
+/// 合成「专辑频道」id（BUG-160 验收夹具）：只放一个**满员（10 成员）相册**。
+///
+/// 与 [`MOCK_CHAT_ID`] 并列而非替换 —— 原频道（3 项相册 + 单发视频）一字不动，
+/// 以免破坏依赖它的既有断言与验收脚本。
+const MOCK_ALBUM_CHAT_ID: i64 = -1009876543211;
+
+/// 满员相册的 `grouped_id`（BUG-160）：TG 一条 media group 的平台上限即 10，
+/// 10 条成员共享此键 ⇒ 前端 `groupAlbums` 必须归为**一个**相册单元。
+const MOCK_ALBUM_GROUP: i64 = 9002;
+
 /// 1×1 透明 GIF（35 字节，标准最小合法 GIF）：让 `<img>` 能真正解码。
 /// 若返回 None，路由会回 JSON 404，浏览器对 `<img>` 的此类响应触发 ORB 拦截并刷
 /// `ERR_BLOCKED_BY_ORB`，把真正的错误信号淹没在噪音里。
@@ -76,12 +86,23 @@ impl Client for MockClient {
     }
 
     async fn dialogs(&self) -> Result<Vec<Channel>, ClientError> {
-        Ok(vec![Channel {
-            id: MOCK_CHAT_ID,
-            title: "Mock Channel".to_string(),
-            username: Some("mock".to_string()),
-            folder: None,
-        }])
+        Ok(vec![
+            Channel {
+                id: MOCK_CHAT_ID,
+                title: "Mock Channel".to_string(),
+                username: Some("mock".to_string()),
+                folder: None,
+            },
+            // BUG-160：并存的「专辑频道」，只放一个 10 成员相册。独立频道让
+            // 「10 成员 → 10 个瓦片」的真实渲染验收直接命中该相册（无需在同一
+            // 频道里区分多个相册），且不触碰上面那个既有频道。
+            Channel {
+                id: MOCK_ALBUM_CHAT_ID,
+                title: "Mock Album (10)".to_string(),
+                username: Some("mockalbum".to_string()),
+                folder: None,
+            },
+        ])
     }
 
     async fn folders(&self) -> Result<Vec<Folder>, ClientError> {
@@ -90,11 +111,10 @@ impl Client for MockClient {
 
     async fn messages(
         &self,
-        _chat_id: i64,
+        chat_id: i64,
         _limit: u32,
         _before_id: Option<i64>,
     ) -> Result<Vec<MediaItem>, ClientError> {
-        // 合成内容：一个 3 项相册（同 group_id）+ 一条单发视频，覆盖两种缓存入口。
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -111,6 +131,18 @@ impl Client for MockClient {
             group_id: group,
             has_media: true,
         };
+
+        // BUG-160 验收夹具：独立的「专辑频道」= 一个**满员（10 成员）相册**。
+        // 10 条媒体消息共享同一 `grouped_id`（[`MOCK_ALBUM_GROUP`]），是
+        // 「相册宫格必须渲染出全部成员」这条规则的极值夹具（TG 相册上限正是 10）。
+        // 它**新增而不改动** [`MOCK_CHAT_ID`] 的既有夹具，以免破坏既有断言/验收脚本。
+        if chat_id == MOCK_ALBUM_CHAT_ID {
+            return Ok((1..=10)
+                .map(|k| mk(k, Some(MOCK_ALBUM_GROUP), &format!("Mock album10 · {k}")))
+                .collect());
+        }
+
+        // 既有夹具：一个 3 项相册（同 group_id）+ 一条单发视频，覆盖两种缓存入口。
         Ok(vec![
             mk(1, Some(9001), "Mock album · 1"),
             mk(2, Some(9001), "Mock album · 2"),
@@ -178,11 +210,13 @@ impl Client for MockClient {
 
     async fn message_meta(
         &self,
-        _chat_id: i64,
+        chat_id: i64,
         message_id: i64,
     ) -> Result<Option<MediaItem>, ClientError> {
+        // 必须带上真实 `chat_id`（此前硬编码 0）：否则「专辑频道」的成员元数据永远查不到，
+        // 缓存 worker 会把它当「无媒体」跳过（BUG-160 夹具引入后暴露）。
         Ok(self
-            .messages(0, 10, None)
+            .messages(chat_id, 10, None)
             .await?
             .into_iter()
             .find(|m| m.id == message_id))
@@ -213,5 +247,36 @@ mod tests {
         assert_eq!(msgs.len(), 4);
         let grouped = msgs.iter().filter(|m| m.group_id == Some(9001)).count();
         assert_eq!(grouped, 3, "fixture must contain a 3-item album");
+    }
+
+    /// BUG-160 验收夹具：另有一个**满员（10 成员）相册**（独立频道），且**不改动**原夹具。
+    ///
+    /// 判据直接对齐前端 `groupAlbums` 的契约：10 条成员共享同一 `grouped_id` ⇒ 必归为
+    /// **一个**相册单元 ⇒ 宫格渲染 10 个 `tg-album-tile-*`（即 `tileCount === 10`）。
+    #[tokio::test]
+    async fn fixture_has_ten_member_album() {
+        let album = MockClient::default()
+            .messages(MOCK_ALBUM_CHAT_ID, 50, None)
+            .await
+            .unwrap();
+        assert_eq!(album.len(), 10, "专辑频道必须恰好 10 条成员（TG 相册上限）");
+        assert_eq!(
+            album.iter().filter(|m| m.group_id == Some(MOCK_ALBUM_GROUP)).count(),
+            10,
+            "10 条成员必须共享同一 grouped_id（否则 groupAlbums 会拆成多个单元）"
+        );
+
+        // 原夹具不受影响：MOCK_CHAT_ID 仍是「3 项相册 + 1 单发」，与上面互不干扰。
+        let base = MockClient::default()
+            .messages(MOCK_CHAT_ID, 50, None)
+            .await
+            .unwrap();
+        assert_eq!(base.len(), 4);
+        assert_eq!(base.iter().filter(|m| m.group_id == Some(9001)).count(), 3);
+
+        // 两个频道都必须出现在 dialogs 里，否则前端无法打开专辑频道。
+        let dialogs = MockClient::default().dialogs().await.unwrap();
+        assert!(dialogs.iter().any(|c| c.id == MOCK_CHAT_ID));
+        assert!(dialogs.iter().any(|c| c.id == MOCK_ALBUM_CHAT_ID));
     }
 }

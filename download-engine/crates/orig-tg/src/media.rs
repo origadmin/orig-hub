@@ -2957,6 +2957,10 @@ pub struct EpisodeMove {
 /// 规则（内容无关，纯结构）：
 /// - 首行 = 标题；其余非空行合并 = 介绍（`\n` 连接，保留内部换行）；
 /// - 标题行的**行尾 `#标签` 不入标题**——标签有独立通道与展示位，重复占位是脏数据；
+/// - **但首行的第一个词若是 `#` 词，它就是标题、不参与弹尾**（BUG-156）：真实频道的
+///   `#剧名 #演员 #演员` 写法中，行首的 `#` 是「这是剧名」的强信号（标签不会占行首）。
+///   此前「无条件弹掉所有行尾 `#` 词」会把这一整行弹空，剧名**在入口处就丢失**，
+///   退化成「频道名 · 日期」兜底名（在产库已造成两部剧同名不可分辨）。
 /// - 首行为空或剥完标签为空 ⇒ 没有标题（回退由调用方决定），整段退化为介绍；
 /// - 标题过长截断到 [`MAX_TITLE_CHARS`]，避免一整段长文顶在标题上。
 pub fn split_caption(caption: &str) -> (Option<String>, Option<String>) {
@@ -2973,11 +2977,17 @@ pub fn split_caption(caption: &str) -> (Option<String>, Option<String>) {
 
     let title = {
         let mut toks: Vec<&str> = first.split_whitespace().collect();
-        while let Some(last) = toks.last() {
-            if last.starts_with('#') {
-                toks.pop();
-            } else {
-                break;
+        // BUG-156：`toks[0]` 以 `#` 开头 ⇒ 它是标题，从 `toks[1:]` 起才弹尾。
+        // 只弹「行尾标签」而不弹「行首剧名」，两种写法由此各自成立：
+        //   `#剧名 #演员`  ->  `#剧名`      （留第一个词）
+        //   `标题行 #a #b` ->  `标题行`      （行为完全不变）
+        let from = usize::from(toks.first().is_some_and(|t| t.starts_with('#')));
+        while toks.len() > from {
+            match toks.last() {
+                Some(last) if last.starts_with('#') => {
+                    toks.pop();
+                }
+                _ => break,
             }
         }
         toks.join(" ")
@@ -4563,6 +4573,110 @@ mod tests {
         let (t5, d5) = split_caption("   ");
         assert_eq!(t5, None);
         assert_eq!(d5, None);
+    }
+
+    /// BUG-156：首行**整行都是 `#` 词**时，第一个 `#` 词是**剧名**，必须保留。
+    ///
+    /// 用例全部取自**真实库的首行样本**（见 `docs/bugs/BUG-156.md`）—— 此前单测样例
+    /// 都是手写的，没有一条来自真实库，所以这条缺口与它的测试缺口同时存在。
+    #[test]
+    fn split_caption_keeps_leading_hash_title() {
+        // 真实库正例：`#剧名 #演员…` → 保留第一个 `#` 词
+        assert_eq!(
+            split_caption("#神雕侠侣 #刘亦菲").0.as_deref(),
+            Some("#神雕侠侣")
+        );
+        assert_eq!(
+            split_caption("#18岁太奶奶驾到重整家族荣耀 #李柯以 #杨姝音 #孟娜")
+                .0
+                .as_deref(),
+            Some("#18岁太奶奶驾到重整家族荣耀")
+        );
+        assert_eq!(
+            split_caption("#存在感零 #杨幂 #赵今麦").0.as_deref(),
+            Some("#存在感零")
+        );
+        // 单个 `#` 词：整行即剧名
+        assert_eq!(split_caption("#周也").0.as_deref(), Some("#周也"));
+        assert_eq!(split_caption("#存在感零").0.as_deref(), Some("#存在感零"));
+        // 在产库实际被吞掉的三条
+        assert_eq!(
+            split_caption("#ai成人短剧 #AI短剧 #ai成人 #神墓 #黑丝")
+                .0
+                .as_deref(),
+            Some("#ai成人短剧")
+        );
+        // 括号型标签式剧名（`extract_hash_tags` 专门扩展过写法）
+        assert_eq!(
+            split_caption("#《异世界男妓》").0.as_deref(),
+            Some("#《异世界男妓》")
+        );
+
+        // P2 回归：有非 `#` 标题词时行为**完全不变**，行尾标签仍不占标题位
+        assert_eq!(
+            split_caption("标题行 #a #b\n正文").0.as_deref(),
+            Some("标题行")
+        );
+        assert_eq!(
+            split_caption("💥 母子系列【艳母献身记】EP6 预览 #艳母献身记 #母子乱伦 #AI短剧")
+                .0
+                .as_deref(),
+            Some("💥 母子系列【艳母献身记】EP6 预览")
+        );
+
+        // 首行 `#剧名` + 正文：标题与介绍各归其位
+        let (t, d) = split_caption("#神雕侠侣 #刘亦菲\n免费观看\n更新至第 8 集");
+        assert_eq!(t.as_deref(), Some("#神雕侠侣"));
+        assert_eq!(d.as_deref(), Some("免费观看\n更新至第 8 集"));
+    }
+
+    /// BUG-156 P3：断言必须打在**生产调用链**上 ——
+    /// `normalized_series_name(split_caption(cap).0)`。
+    ///
+    /// 只测内层 `normalized_series_name` 会漏掉本档：BUG-152 的单测直接调内层时是绿的，
+    /// 而生产链入口 `split_caption` 先把整行清空 → 剧名在**入口处**就没了。
+    /// 这里用真实库首行做输入，断言**最终剧名非空且不含集号**。
+    #[test]
+    fn series_name_survives_the_real_caption_chain() {
+        // 真实库首行（前 15 条样本中的典型形态）+ 集号写法
+        let real_first_lines = [
+            "#周也",
+            "#18岁太奶奶驾到重整家族荣耀 #李柯以 #杨姝音 #孟娜",
+            "#大厨小婿 #陈姝君 #朱容君 #景漫",
+            "#我的女友景甜 #景甜",
+            "#存在感零",
+            "#存在感零 #杨幂 #赵今麦",
+            "#第七次心跳 #马芯妤 #张宸予 #国书瑄",
+            "#张婧仪",
+            "#古力娜扎",
+            "#赵丽颖",
+            "#朱珠",
+            "#张嘉倪",
+            "#神雕侠侣 #刘亦菲",
+            "#闯关东 #宋佳 #牛莉 #黄小蕾",
+            "#陈都灵",
+            "#ai成人短剧 #AI短剧 #ai成人 #神墓 #黑丝",
+        ];
+        for line in real_first_lines {
+            let (title, _) = split_caption(line);
+            let name = crate::routes::normalized_series_name(&title.unwrap_or_default());
+            assert!(
+                !name.trim().is_empty(),
+                "series name must not be lost on the production chain (input={line:?})"
+            );
+        }
+
+        // 带集号的真实形态：剧名留下、集号剥掉
+        let (t, _) = split_caption("#神雕侠侣 #刘亦菲");
+        assert_eq!(
+            crate::routes::normalized_series_name(&t.unwrap_or_default()),
+            "#神雕侠侣"
+        );
+        let (t2, _) = split_caption("💥 母子系列【艳母献身记】 EP6 预览 #艳母献身记");
+        assert_eq!(
+            crate::routes::normalized_series_name(&t2.unwrap_or_default()),
+            "💥 母子系列【艳母献身记】"
+        );
     }
 
     /// 剧集是通用归档容器 —— **图片也能成为分集**（浏览位），

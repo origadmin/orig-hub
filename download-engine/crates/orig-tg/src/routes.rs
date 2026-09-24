@@ -894,11 +894,6 @@ async fn import_cached_file(
         .await
         .ok()
         .flatten();
-    let file_name = std::path::Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_string();
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|s| s.to_str())
@@ -913,7 +908,18 @@ async fn import_cached_file(
         .and_then(|m| m.caption.as_deref())
         .map(split_caption)
         .unwrap_or((None, None));
-    let title = caption_title.unwrap_or(file_name);
+    // BUG-154：无 caption（或首行为空）时**不再把落盘文件名当标题**。
+    //
+    // 此前是 `caption_title.unwrap_or(file_name)`：TG 落盘名是 `photo--xxx` 之类的
+    // 合成串（非用户可读），它被当成 title 存库后，条目卡片显示的就是这个内部名；
+    // 而前端 `isRawFileName` 又把它判掉 → 兜底成 `#<itemId>`，用户看到的就是
+    // 「临时标题」。标题缺失应当**如实表达为缺失**（空串），让展示层知道
+    // 「这条没有标题」，而不是把内部文件名伪装成标题。
+    //
+    // 空串是刻意的：`upsert_media_item` 的 `ON CONFLICT` 用
+    // `COALESCE(NULLIF(excluded.title, ''), media_item.title)` —— 重新缓存一条
+    // 早期已落文件名的旧行时，空串不会覆盖它，也不会把「没有标题」写成非空假值。
+    let title = caption_title.unwrap_or_default();
     let description = caption_desc;
     let kind = crate::media::classify_ext(&ext)
         .map(str::to_string)
@@ -1315,16 +1321,34 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
             Some(cap) => split_caption(&cap),
             None => (None, None),
         };
-        // 无 caption（或首行为空）才回退到「频道名 · 日期」：宁可有个可分辨的名字，
-        // 也不要一堆同名「未命名」。
+        // BUG-152：剧集名必须由 caption 的**规范化剧集名**（去集号）决定，而不是
+        // 「整批 message_ids 的第一个 caption」——后者是非确定性的：分多批入库时，
+        // 第一批到底是哪一条取决于缓存顺序，首条恰好带 `EP01` 时，整部剧的 title
+        // 就成了 `X EP01`，后续批次只是 append，标题永远钉死在那个带集号的首条上
+        // （用户看到的就是「标题多集、第一个成为多集标题、后面累加」）。
+        //
+        // `split_caption` 只切「标题行 + 正文」，集号另由 `normalized_series_name`
+        // 从标题行里剥掉（集号可能在行尾，也可能在行中 + 推广文案）。
         let title = match title {
-            Some(t) => t,
+            Some(t) => normalized_series_name(&t),
+            // 无 caption（或首行为空）才回退到「频道名 · 日期」：宁可有个可分辨的名字，
+            // 也不要一堆同名「未命名」。
             None => {
                 let base = channel_title(st, task.chat_id)
                     .await
                     .unwrap_or_else(|| format!("TG {}", task.chat_id));
                 format!("{base} · {}", ymd_str(task.created_at as u64))
             }
+        };
+        // 极端情形：整条标题行就是一个集号（如 `EP01`），剥完为空 —— 此时退回
+        // 频道名 · 日期，而不是写一个空剧名（空标题在 UI 上等于不可辨识）。
+        let title = if title.trim().is_empty() {
+            let base = channel_title(st, task.chat_id)
+                .await
+                .unwrap_or_else(|| format!("TG {}", task.chat_id));
+            format!("{base} · {}", ymd_str(task.created_at as u64))
+        } else {
+            title
         };
 
         // 幂等键优先用 TG 相册 group_id（与入队去重键 `g:{chat}:{group}` 同源）；
@@ -1341,6 +1365,19 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
         // 不再按组内构成派生 album/collection。
         match st.store.find_series_by_source_key(&key).await {
             Ok(Some(sid)) => {
+                // BUG-152：追加批次**不静默覆盖**已有标题 —— 每次 ckpt 用本批首条 caption
+                // 重算出的「候选剧集名」只是候选，若与本剧现有 title 不同，保持现有
+                // （避免标题随批次抖动），但要留痕以便诊断「为什么候选与现有不一致」。
+                if let Ok(Some(cur)) = st.store.get_series(sid).await {
+                    if cur.series.title != title {
+                        tracing::debug!(
+                            "BUG-152 series {sid} title kept as {:?}; batch candidate {:?} ignored \
+                             (source_key={key})",
+                            cur.series.title,
+                            title
+                        );
+                    }
+                }
                 match st
                     .store
                     .append_episodes_ranged(sid, 1, &ranged_items(st, task.chat_id, &media_pairs).await)
@@ -1972,10 +2009,14 @@ async fn import_media_items(
                 Some(r) => r,
                 None => continue,
             };
+            // BUG-154：TG 引用 `"<chat_id>:<message_id>"` 是**内部标识**，不是标题。
+            // 调用方没给 title 时此前落的就是它 → 展示层看到 `#<itemId>` 式的兜底。
+            // 改为空串：真正的标题由下方「以流水 caption 为准」的服务端切分产出；
+            // caption 也空则如实为空（与 `import_cached_file` 同一裁定）。
             (
                 r.clone(),
                 None,
-                it.title.clone().unwrap_or(r),
+                it.title.clone().unwrap_or_default(),
                 it.kind.clone().unwrap_or_else(|| "file".to_string()),
                 it.size,
             )
@@ -2115,6 +2156,11 @@ async fn patch_media_item(
 /// - 删字节失败 → **不中止**（用户意图优先；残留字节有兜底回收通道
 ///   `POST /api/cache/clear?scope=orphan`），但必须 warn 留痕（含路径与 io::Error）
 ///   并在响应里如实带 `bytesRemoved:false` / `bytesError`。
+/// 修 BUG-162：**先判标记、再删字节**。清 TG `downloaded` 标记是**第一个**可能中止的
+/// 检查点，必须排在任何破坏性动作（`remove_file`）之前——否则一旦标记清不掉，函数
+/// 返回 500 时字节已被删，而 500 文案却自称 `nothing was deleted`（自相矛盾，且中止点
+/// 落在破坏性动作之后）。顺序对调后，500 分支下**盘上一个字节未删、DB 行也原封不动**，
+/// 文案与事实一致。
 async fn delete_media_item(
     State(st): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -2130,6 +2176,26 @@ async fn delete_media_item(
     let mut bytes_removed = true;
     let mut bytes_error: Option<String> = None;
     if let Some(item) = &existing {
+        // BUG-162：**先判标记、再删字节**。清 TG `downloaded` 标记是第一个可能中止的
+        // 检查点，必须排在 `remove_file` 之前 —— 否则标记清不掉时，函数在字节已删之后
+        // 才返回 500，与文案 `nothing was deleted` 自相矛盾（中止点在破坏性动作之后）。
+        //
+        // 双向联动（TG 来源条目）：删媒体库条目 → 同步清 TG 缓存副本。
+        // 否则下次缓存 upsert（按 source+ref 幂等）会把条目"复活"，看起来像删不掉。
+        // 复用 `cache::reset_tg_flag`（唯一实现，清字节那条链也用它）：**失败即中止**，
+        // 与本文件此前吞掉失败的做法相反——留一个清不掉的 `downloaded` 标记，
+        // 等于把「删了又回来」这个 bug 固化成数据。
+        if !crate::cache::reset_tg_flag(&st, &item.source, &item.ref_key).await {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "cannot delete media item {id}: the tg downloaded flag could not be cleared \
+                     (see server log), so the entry would reappear on the next sync; \
+                     nothing was deleted"
+                ),
+            ));
+        }
+        // 标记已清除，才轮到破坏性动作：删**下载目录内**的字节（外部文件永不删）。
         if let Some(p) = item.file_path.as_deref() {
             let dir = crate::cache::download_dir(&st).await;
             if crate::cache::inside_dir(&dir, p) {
@@ -2145,21 +2211,6 @@ async fn delete_media_item(
                     st.push_log(&format!("WARN {msg}"));
                 }
             }
-        }
-        // 双向联动（TG 来源条目）：删媒体库条目 → 同步清 TG 缓存副本。
-        // 否则下次缓存 upsert（按 source+ref 幂等）会把条目"复活"，看起来像删不掉。
-        // 复用 `cache::reset_tg_flag`（唯一实现，清字节那条链也用它）：**失败即中止**，
-        // 与本文件此前吞掉失败的做法相反——留一个清不掉的 `downloaded` 标记，
-        // 等于把「删了又回来」这个 bug 固化成数据。
-        if !crate::cache::reset_tg_flag(&st, &item.source, &item.ref_key).await {
-            return Err(ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!(
-                    "cannot delete media item {id}: the tg downloaded flag could not be cleared \
-                     (see server log), so the entry would reappear on the next sync; \
-                     nothing was deleted"
-                ),
-            ));
         }
     }
     st.store
@@ -2209,7 +2260,180 @@ async fn ranged_items(
     out
 }
 
-/// `PUT /api/media/items/:id/tags` — 全量重设标签集合。
+/// 从 caption 的**标题行**里定位代表集号的那一段（BUG-152：剧集名 = 标题行去掉它）。
+///
+/// 返回 `Some((start, end))` = 集号段在 `title` 里的字节区间；无集号信号返回 `None`。
+/// 调用方按 `[..start]` + `[end..]` 拼出剧名（见 [`normalized_series_name`]）。
+///
+/// 与 [`crate::media::parse_episode_range`] 共用同一套集号语法，但目的不同：那边只要
+/// `(start, end)` 数字，这边要的是**可被剥掉的原文区间**。
+///
+/// 两步：
+/// 1. **找锚点**（`#` / `EP` / `第`）：从左往右扫，命中锚点后吃掉紧跟的数字/连接符。
+///    锚点是必需的 —— 剧名本身常含数字（`1990-2020 经典回顾`），没有锚点就无从区分
+///    「集号」与「剧名里的数字」，宁可返回 `None` 也不误剥。
+/// 2. **吃掉尾随噪声**：真实频道的 caption 惯例是「集号 + 推广文案」
+///    （`… EP2 原档 内群抢先更新 连载中 ⭐⭐⭐`）。集号后面跟的往往不是剧名的一部分，
+///    而是频道自带的宣传语与装饰符号，故一路吞到**下一个可能是剧名的片段**为止。
+///
+/// 已知取舍：第 2 步会吞掉集号之后的正文。这是刻意的 —— 集号是**归属信号**，它之后
+/// 的文本属于「这一集」，而非「这部剧名」；保留它会让剧名随集数变化，重新引入
+/// 本轮要修的非确定性。
+fn episode_span(title: &str) -> Option<(usize, usize)> {
+    let t = title.trim_end();
+    // 锚点扫描：`EP`（大小写不敏感）/ `#` / `第` / 裸 `集`。
+    for (idx, c) in t.char_indices() {
+        let anchor_len = if c == '第' {
+            c.len_utf8()
+        } else if c == '#' {
+            // BUG-156 交互：`#12` 是「行内孤立的 # 数字」集号标记
+            // （同 `media::parse_episode_range` 形态 D），但 `#剧名` 的剧名**本身可以以
+            // 数字开头**（`#18岁太奶奶驾到重整家族荣耀`）。两者的前缀在字面上完全一样，
+            // 唯一的分界是**数字之后**：集号标记的数字是**独立 token**
+            // （后面是空白/行尾），剧名的数字后面**紧跟文字**。
+            // 因此这里要求 `#` 后的数字段必须被空白或行尾收尾；否则它不是集号锚点。
+            if !hash_digits_are_standalone(t, idx) {
+                continue;
+            }
+            c.len_utf8()
+        } else if starts_with_ep(&t[idx..]) && ep_anchor_ok(t, idx) {
+            // `EP` 是两字节前缀，锚点从 `idx + 2` 起算。
+            2
+        } else {
+            continue;
+        };
+        let num_start = idx + anchor_len;
+        // 锚点与数字之间允许空白：`EP 03` / `第 3-4 集`。
+        let num_start = num_start + t[num_start..].len() - t[num_start..].trim_start().len();
+        // 集号数字段：数字 + 连接符（含区间 `01-02`）。
+        let digits_end = num_start
+            + t[num_start..]
+                .char_indices()
+                .take_while(|(_, c)| is_ep_number_char(*c))
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+        let has_digit = t[num_start..digits_end].chars().any(|c| c.is_ascii_digit());
+        if !has_digit {
+            continue;
+        }
+        return Some((idx, digits_end));
+    }
+    // 无 `EP`/`#`/`第` 锚点：再认一次「纯数字 + 集」的写法（`10-20集合集`、`1-2集`）。
+    // 单独放在锚点扫描之后，是为了让带锚点的写法（信息更明确）优先。
+    bare_episode_span(t)
+}
+
+/// `t` 中位置 `idx`（一个 `#`）之后是否跟着「**独立数字 token**」——即 `#12` 形态的
+/// 集号标记（BUG-156 交互修正）。
+///
+/// - `#12` / `#12 后续` → 数字后是空白或行尾 → **是**集号标记；
+/// - `#18岁太奶奶…` / `#《异世界男妓》` → 数字后紧跟文字（或根本没有数字）→ **不是**，
+///   它是 `#剧名`，`#` 必须留给标题。
+///
+/// 与 [`crate::media::parse_episode_range`] 形态 D 同规矩（那里也是「行内孤立的 `#` 数字」）。
+fn hash_digits_are_standalone(t: &str, idx: usize) -> bool {
+    let after = &t[idx + 1..];
+    let digits: usize = after
+        .char_indices()
+        .take_while(|(_, c)| c.is_ascii_digit())
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    if digits == 0 {
+        return false;
+    }
+    // 数字之后必须是空白或行尾才算独立 token。
+    match after[digits..].chars().next() {
+        None => true,
+        Some(c) => c.is_whitespace() || c.is_ascii_punctuation(),
+    }
+}
+
+/// `10-20集合集` / `1-2集` 这类**没有显式锚点**的写法：数字段后紧跟 `集`。
+///
+/// 之所以敢认「裸数字 + 集」：`集` 字本身就出现在数字右侧，是强信号；
+/// 而 `1990-2020 经典回顾` 这类剧名里的数字后面**没有** `集`，不会命中。
+fn bare_episode_span(t: &str) -> Option<(usize, usize)> {
+    for (i, c) in t.char_indices() {
+        if !c.is_ascii_digit() {
+            continue;
+        }
+        // 数字段起点：前一个字符不能是字母数字（避免切进 `2020` 的中间）。
+        if t[..i]
+            .chars()
+            .next_back()
+            .map(|p| p.is_alphanumeric())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let digits_end = i
+            + t[i..]
+                .char_indices()
+                .take_while(|(_, c)| is_ep_number_char(*c))
+                .last()
+                .map(|(j, c)| j + c.len_utf8())
+                .unwrap_or(0);
+        // 数字段之后可带空白，然后必须是 `集`。
+        let after = &t[digits_end..];
+        let ws = after.len() - after.trim_start().len();
+        if after[ws..].starts_with('集') {
+            return Some((i, digits_end));
+        }
+    }
+    None
+}
+
+/// `s` 是否以 `EP`/`ep`/`Ep` 开头，且其前一步（由调用方的锚点扫描保证）不是字母数字。
+/// 调用方在 `t.char_indices()` 里逐字符扫描，故这里只需认「以 EP 打头」；
+/// `XEP2` 之类会把锚点落在 `E` 上，需要再挡一层「前一字符非字母数字」（`C#` 式误判防护）。
+fn starts_with_ep(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2 && b[0].eq_ignore_ascii_case(&b'e') && b[1].eq_ignore_ascii_case(&b'p')
+}
+
+/// 位置 `idx` 处的 `EP` 锚点是否可信：前一个字符不能是字母数字
+/// （`XEP2`、`работа.ep2` 之类是剧名/单词的一部分，不是独立集号标记）。
+fn ep_anchor_ok(t: &str, idx: usize) -> bool {
+    match t[..idx].chars().next_back() {
+        Some(c) => !c.is_alphanumeric(),
+        None => true,
+    }
+}
+
+/// 集号数字段允许的字符：数字与区间连接符。
+fn is_ep_number_char(c: char) -> bool {
+    c.is_ascii_digit() || matches!(c, '-' | '~' | '～' | '—')
+}
+
+/// 剧集名规范化（BUG-152）：标题行去掉代表集号的那一段。
+///
+/// **剧名 = 集号之前的全部内容** —— 这是 Telegram 频道 caption 的稳定惯例
+/// （`剧名 EP2 推广文案`）。集号之后的文字属于「这一集」的推销语/状态标注
+/// （`原档`、`内群抢先更新`、`连载中`、`集合集`），不是剧名的一部分；一旦保留，
+/// 剧名就会随集数变化，重新引入本轮要修的非确定性。因此这里**丢弃集号之后的一切**。
+///
+/// 若整个标题行都是集号（剥完为空），回退为原文的 trim 版本 —— 调用方
+/// （`run_one_cache_task`）对空结果另有「频道名 · 日期」兜底，这里不做第二个兜底。
+///
+/// `pub(crate)`：BUG-156 的防再发要求断言打在**生产调用链**
+/// `normalized_series_name(split_caption(cap).0)` 上，测试在 `media.rs` 侧。
+pub(crate) fn normalized_series_name(title_line: &str) -> String {
+    match episode_span(title_line) {
+        Some((start, _end)) => {
+            let name = title_line[..start].trim();
+            if name.is_empty() {
+                // 形如 `EP01` / `第5集`：整行就是集号 —— 交给调用方兜底。
+                String::new()
+            } else {
+                name.to_string()
+            }
+        }
+        None => title_line.trim().to_string(),
+    }
+}
+
 #[derive(Deserialize)]
 struct TagSetReq {
     #[serde(rename = "tagIds", default)]
@@ -2335,6 +2559,24 @@ async fn media_item_raw(
 const DELIVERY_BUDGET_FACTOR: f64 = 6.0;
 /// `duration` 未知时的兜底速率上限（字节/秒）。
 const DELIVERY_FALLBACK_BPS: f64 = 16.0 * 1024.0 * 1024.0;
+/// 初始突发信用（秒）：每个响应开头允许「不计入节流」的时间额度。
+///
+/// 线性速率曲线的「应有耗时」是从 0 开始爬升的，于是**每个请求的第一个块**都要先
+/// 等服务 `chunk / bps` 秒才发出（`CHUNK = 1 MiB` ⇒ 在真实码率下为 135–1000 ms）。
+/// 每次拖进度条、以及 Chromium 的 abort-and-re-request 循环都会重付一次这笔
+/// time-to-first-byte 代价——这正是「播放浏览卡顿异常严重」的主因。
+/// 用**秒**而非字节做信用，可随码率自动缩放（等价于把速率曲线整体右移本秒数），
+/// 稳态速率仍为 `bps`，因此 BUG-033 实测的抑风暴结论不变。
+const DELIVERY_BURST_SECS: f64 = 4.0;
+
+/// 本批发送后「应有」的耗时（秒）。等价于把线性速率曲线整体右移 `burst_secs`：
+/// 开头 `burst_secs` 秒对应的字节立即可发（消除每请求重启的 TTFB 代价），
+/// 之后稳态速率仍是 `bps`（BUG-033 实测的抑风暴结论不变）。
+///
+/// 纯函数：不读 env、不做 IO，便于单测。`bps <= 0` 时由调用方卫兵拦截。
+fn delivery_due_secs(sent_bytes: u64, bps: f64, burst_secs: f64) -> f64 {
+    (sent_bytes as f64 / bps - burst_secs).max(0.0)
+}
 
 /// 目标投递速率（字节/秒）。返回 `0.0` 表示不限速。
 ///
@@ -2351,6 +2593,9 @@ const DELIVERY_FALLBACK_BPS: f64 = 16.0 * 1024.0 * 1024.0;
 ///   - 浏览器缓存开 / 关：137 / 136，无杠杆
 /// 唯一有效的杠杆是**发送速率**：限到 6 MiB/s 后传输量 290 MiB → 19.6 MiB、
 /// 冗余 29x → **1.97x**。
+///
+/// 返回的速率即稳态速率 `bps`；每响应开头的 TTFB 代价由 `delivery_due_secs` 的
+/// **初始突发信用**（见 `DELIVERY_BURST_SECS`）单独消除，二者正交。
 ///
 /// 可用 `ORIG_TG_DELIVERY_BPS` 覆盖（0 = 关闭限速，便于 A/B，无需重编）。
 fn delivery_bps(total: u64, duration_secs: Option<i64>) -> f64 {
@@ -2443,6 +2688,12 @@ async fn serve_local_file(
     const CHUNK: usize = 1024 * 1024;
     // 背压：按「码率 × 余量」节流，避免客户端读够即断、反复重取（见 delivery_bps）。
     let bps = delivery_bps(total, duration_secs);
+    // 初始突发信用（秒）：与 delivery_bps 覆盖 `ORIG_TG_DELIVERY_BPS` 的写法一致，
+    // 可用 `ORIG_TG_DELIVERY_BURST_SECS` 覆盖（解析失败/未设则用默认常量）。
+    let burst_secs = std::env::var("ORIG_TG_DELIVERY_BURST_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(DELIVERY_BURST_SECS);
     let started = std::time::Instant::now();
     let body = futures::stream::unfold((f, len, 0u64), move |(mut f, mut remain, sent)| async move {
         if remain == 0 {
@@ -2458,8 +2709,11 @@ async fn serve_local_file(
                 let sent_next = sent + n as u64;
                 if bps > 0.0 {
                     // 已发送字节数「应有」的耗时减去真实耗时 = 本批还需再等多久。
-                    // 客户端断开时整个 stream 被 drop，这里的 sleep 随之中断，不会泄漏。
-                    let due = sent_next as f64 / bps;
+                    // `delivery_due_secs` 把速率曲线整体右移 `burst_secs`：每个响应开头
+                    // 的 `burst_secs` 对应字节不再等待，消除每请求重启的 TTFB 代价
+                    // （BUG-033 的节流仍在：稳态速率仍为 bps）。客户端断开时整个 stream
+                    // 被 drop，这里的 sleep 随之中断，不会泄漏。
+                    let due = delivery_due_secs(sent_next, bps, burst_secs);
                     let lag = due - started.elapsed().as_secs_f64();
                     if lag > 0.0 {
                         tokio::time::sleep(std::time::Duration::from_secs_f64(lag)).await;
@@ -3051,6 +3305,295 @@ async fn scan_media_dir(
 }
 
 // ---- 内嵌独立网页调试界面 ----
+
+#[cfg(test)]
+mod tests {
+    use super::delete_media_item;
+    use super::delivery_due_secs;
+    use super::normalized_series_name;
+    use super::serve_local_file;
+
+    use std::sync::Arc;
+
+    use axum::extract::{Path, State};
+    use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+
+    use crate::config::Config;
+    use crate::state::{AppState, Availability};
+    use crate::store::Store;
+
+    /// BUG-152 判据 2：剧集名必须**不含集号**，且剧名本身必须完整留下。
+    #[test]
+    fn normalized_series_name_strips_the_episode_token() {
+        // 集号在行尾
+        assert_eq!(normalized_series_name("某剧 EP01"), "某剧");
+        assert_eq!(normalized_series_name("某剧 EP01-02"), "某剧");
+        assert_eq!(normalized_series_name("某剧 EP01-02 集合集"), "某剧");
+        assert_eq!(normalized_series_name("某剧 第5集"), "某剧");
+        assert_eq!(normalized_series_name("某剧 第3~4集"), "某剧");
+        assert_eq!(normalized_series_name("某剧 第 3-4 集"), "某剧");
+        assert_eq!(normalized_series_name("某剧 10-20集合集"), "某剧");
+        assert_eq!(normalized_series_name("某剧 #12"), "某剧");
+        // 无集号信号 → 原样保留
+        assert_eq!(normalized_series_name("某剧"), "某剧");
+        assert_eq!(normalized_series_name(""), "");
+        // 剧名里的数字**不得**被误剥（无集号锚点）
+        assert_eq!(normalized_series_name("1990-2020 经典回顾"), "1990-2020 经典回顾");
+        assert_eq!(normalized_series_name("2019"), "2019");
+        // 括号型标签式剧名（真实 caption 常见写法）不应被当成集号
+        assert_eq!(normalized_series_name("#《异世界男妓》"), "#《异世界男妓》");
+        // 锚点前是字母数字 → 不是集号（`XEP2` 的 ep 属剧名）
+        assert_eq!(normalized_series_name("SEP2"), "SEP2");
+    }
+
+    /// BUG-152 现实场景：真实频道的 caption 惯例是「剧名 + 集号 + 推广文案 + 装饰」。
+    /// 集号可能因此落在**行中**——剧名仍必须剥干净（这是端到端复现里发现的缺口）。
+    #[test]
+    fn normalized_series_name_handles_mid_line_episode_with_promo_tail() {
+        assert_eq!(
+            normalized_series_name("🌟🔥🔥《网调我的冰山妈妈》 EP2 原档 内群抢先更新 连载中 ⭐⭐⭐"),
+            "🌟🔥🔥《网调我的冰山妈妈》"
+        );
+        assert_eq!(
+            normalized_series_name("😀😀😀 #《艳母献身记》 EP1"),
+            "😀😀😀 #《艳母献身记》"
+        );
+        assert_eq!(
+            normalized_series_name("📱 《遥控器：操控全城女神》 第1-9集"),
+            "📱 《遥控器：操控全城女神》"
+        );
+    }
+
+    /// 交付约束的**直接**判据：不论批次怎么切，规范化剧集名都一致 ——
+    /// 这是「多批次入库 title == 一次性全批入库 title」的单测版本。
+    #[test]
+    fn normalized_series_title_is_batch_independent() {
+        // 同一部剧的四条 caption（真实写法：剧名 + 集号 + 标签）
+        let captions = [
+            "异世界男妓-瓦尔哈拉神枪馆 EP01 #短剧",
+            "异世界男妓-瓦尔哈拉神枪馆 EP02 #短剧",
+            "异世界男妓-瓦尔哈拉神枪馆 EP03-04 集合集 #短剧",
+            "异世界男妓-瓦尔哈拉神枪馆 #短剧",
+        ];
+        let normalize = |cap: &str| {
+            let (title, _) = crate::media::split_caption(cap);
+            normalized_series_name(&title.unwrap_or_default())
+        };
+        // 一次性全批：取第一条（等价于 routes 里 first_caption → 规范化）
+        let all_at_once = normalize(captions[0]);
+        // 任意单条分批：结果必须与全批一致
+        for cap in captions {
+            assert_eq!(
+                normalize(cap), all_at_once,
+                "batch split must not change the series title (caption={cap:?})"
+            );
+        }
+        assert_eq!(all_at_once, "异世界男妓-瓦尔哈拉神枪馆");
+    }
+
+    // ---- BUG-162：破坏性动作前必须先判 TG 标记；500 分支下字节必须一字节未删 ----
+
+    /// 构造一个「下载目录」指向独立临时目录的 `AppState`（仅本组用例使用）。
+    async fn state_in_download_dir(dir: &std::path::Path) -> Arc<AppState> {
+        let mut cfg = Config::default();
+        cfg.download_dir = dir.to_path_buf();
+        Arc::new(AppState::new(
+            Arc::new(crate::unavailable::UnavailableClient::new("test")),
+            cfg,
+            Availability::Unavailable("test".to_string()),
+            false,
+            Store::open(":memory:").await.expect("in-memory store must open"),
+        ))
+    }
+
+    /// 每次调用都给出唯一临时目录（进程内并发用例互不串扰）。
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let d = std::env::temp_dir()
+            .join(format!("orig_routes_{tag}_{}_{nanos}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("scratch dir must be creatable");
+        d
+    }
+
+    /// BUG-162 判据：TG 标记清除失败时，接口必须在**动手删字节之前**中止 ——
+    /// 三态实测：HTTP 500、条目仍在、且**盘上字节仍在**（一字节未删）。
+    ///
+    /// 构造「标记清除失败」：`source=tg` 且 `ref` 不可解析 —— `reset_tg_flag` 直接返回
+    /// false（与 QA 复现方式一致）。缺陷原形下顺序相反，字节会先被删掉再返回 500。
+    #[tokio::test]
+    async fn delete_media_item_aborts_before_deleting_bytes_when_tg_flag_cannot_clear() {
+        let dir = scratch_dir("del_tg_flag_fail");
+        let st = state_in_download_dir(&dir).await;
+
+        let f = dir.join("stale.mp4");
+        std::fs::write(&f, vec![0u8; 777]).expect("seed bytes");
+        let file_path = f.to_string_lossy().into_owned();
+        let id = st
+            .store
+            .upsert_media_item(
+                "tg",
+                "not-a-valid-tg-ref",
+                "t",
+                "video",
+                Some(&file_path),
+                Some(777),
+                None,
+                None,
+            )
+            .await
+            .expect("insert item");
+
+        let result = delete_media_item(State(st.clone()), Path(id)).await;
+        let err = match result {
+            Ok(_) => panic!("标记清不掉必须报错，不得假装成功"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "标记清除失败必须如实 500"
+        );
+        assert!(
+            f.exists(),
+            "BUG-162：500 分支下字节必须仍在盘上（缺陷原形是把字节删了再 500）"
+        );
+        assert_eq!(
+            std::fs::metadata(&f).expect("stat bytes").len(),
+            777,
+            "字节数必须与失败前一致"
+        );
+        assert!(
+            st.store.get_media_item(id).await.unwrap().is_some(),
+            "条目必须仍在（`nothing was deleted` 必须为真）"
+        );
+    }
+
+    /// 反向回归：正常删除路径仍然**真的删掉字节**（别把「先判标记」写成「永不删字节」）。
+    #[tokio::test]
+    async fn delete_media_item_still_removes_bytes_for_a_deletable_source() {
+        let dir = scratch_dir("del_ok");
+        let st = state_in_download_dir(&dir).await;
+
+        let f = dir.join("gone.mp4");
+        std::fs::write(&f, vec![0u8; 128]).expect("seed bytes");
+        let file_path = f.to_string_lossy().into_owned();
+        // 非 tg 来源：`reset_tg_flag` 直接放行 —— 验证字节删除这一半仍然工作。
+        let id = st
+            .store
+            .upsert_media_item(
+                "local",
+                "x",
+                "t",
+                "video",
+                Some(&file_path),
+                Some(128),
+                None,
+                None,
+            )
+            .await
+            .expect("insert item");
+
+        let result = delete_media_item(State(st.clone()), Path(id)).await;
+        assert!(result.is_ok(), "非 tg 来源的删除不应报错");
+        assert!(!f.exists(), "正常删除必须真的把字节删掉");
+        assert!(
+            st.store.get_media_item(id).await.unwrap().is_none(),
+            "条目必须从库里移除"
+        );
+    }
+
+    // ---- TTFB：初始突发信用（每响应以「秒」为额度，随码率自动缩放）----
+
+    /// 进程级 env 会跨并行测试相互影响，所有依赖投递 env 的计时用例共用同一把锁。
+    static DELIVERY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 纯数学：burst 信用把速率曲线整体右移，稳态斜率仍是 `1 / bps`。
+    #[test]
+    fn delivery_due_secs_matches_burst_then_ramps() {
+        // 首 1 MiB 落在 4s 信用内 → 「应有耗时」为 0（立即可发）。
+        assert_eq!(delivery_due_secs(1024 * 1024, 1048576.0, 4.0), 0.0);
+        // 8 MiB：应有耗时 8s − 4s 信用 = 4s。
+        assert_eq!(delivery_due_secs(8 * 1024 * 1024, 1048576.0, 4.0), 4.0);
+        // 0 字节 → 0。
+        assert_eq!(delivery_due_secs(0, 1048576.0, 4.0), 0.0);
+    }
+
+    /// 验牙测试：带 burst 信用时，第一个块必须**立即**到达（TTFB 不再是 chunk/bps）。
+    ///
+    /// 4 MiB 文件 + `duration=500` ⇒ 速率被 1 MiB/s 下限钉住；`CHUNK = 1 MiB`，
+    /// 旧实现首块要等 `1MiB / 1MiB/s ≈ 1000 ms`，本用例会因此 FAIL。
+    #[tokio::test]
+    async fn serve_local_file_first_byte_is_immediate() {
+        use futures::StreamExt;
+        let _guard = DELIVERY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 排除外部 env 干扰：清掉 bps / burst 覆盖，走纯默认路径。
+        std::env::remove_var("ORIG_TG_DELIVERY_BPS");
+        std::env::remove_var("ORIG_TG_DELIVERY_BURST_SECS");
+
+        let dir = scratch_dir("first_byte");
+        let f = dir.join("sample.mp4");
+        std::fs::write(&f, vec![0u8; 4 * 1024 * 1024]).expect("seed 4 MiB");
+        let path = f.to_string_lossy().into_owned();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
+
+        // 从发起到取回第一块 = 完整 time-to-first-byte。
+        let t0 = std::time::Instant::now();
+        let resp = match serve_local_file(&path, Some("video"), Some(500), &headers).await {
+            Ok(r) => r,
+            Err(e) => panic!("serve must succeed, got {}: {}", e.status, e.message()),
+        };
+        let mut stream = resp.into_body().into_data_stream();
+        let first = stream.next().await.expect("must yield a first chunk");
+        let elapsed = t0.elapsed();
+        assert!(first.is_ok(), "first chunk must be Ok");
+        assert!(
+            elapsed < std::time::Duration::from_millis(150),
+            "首块必须立即到达（burst 信用生效）；实际耗时 {elapsed:?}"
+        );
+    }
+
+    /// 反向回归：burst 信用不得把稳态节流关掉。
+    ///
+    /// 仅在本用例内设 `ORIG_TG_DELIVERY_BURST_SECS=0`（= 关闭突发信用），
+    /// 4 MiB @ 1 MiB/s 读完整体必须 >= 3.0 s（理论上 ~4 s）。
+    #[tokio::test]
+    async fn serve_local_file_still_throttles() {
+        let _guard = DELIVERY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ORIG_TG_DELIVERY_BPS");
+        std::env::set_var("ORIG_TG_DELIVERY_BURST_SECS", "0");
+
+        let dir = scratch_dir("throttle");
+        let f = dir.join("sample.mp4");
+        std::fs::write(&f, vec![0u8; 4 * 1024 * 1024]).expect("seed 4 MiB");
+        let path = f.to_string_lossy().into_owned();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
+
+        let t0 = std::time::Instant::now();
+        let resp = match serve_local_file(&path, Some("video"), Some(500), &headers).await {
+            Ok(r) => r,
+            Err(e) => panic!("serve must succeed, got {}: {}", e.status, e.message()),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body must be fully readable");
+        let elapsed = t0.elapsed();
+        // 无论断言结果如何都先清 env —— 它是进程级，会污染其他用例。
+        std::env::remove_var("ORIG_TG_DELIVERY_BURST_SECS");
+
+        assert_eq!(body.len(), 4 * 1024 * 1024, "必须读完整体");
+        assert!(
+            elapsed >= std::time::Duration::from_secs(3),
+            "burst=0 时稳态节流必须仍在（4 MiB @ 1 MiB/s ⇒ ~4s）；实际耗时 {elapsed:?}"
+        );
+    }
+}
 
 // 内联单页（无外部资源）：浏览器打开 http://127.0.0.1:9877 即可完成
 // 登录 / 枚举订阅 / 拉史 / 下载 的全流程调试。
