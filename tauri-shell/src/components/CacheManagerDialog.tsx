@@ -6,6 +6,7 @@ import { CacheBytesPanel } from './CacheBytesPanel'
 import { cn } from '../lib/utils'
 import { useTranslation } from '../i18n'
 import { describeTgFailure } from '../lib/tgReason'
+import { deriveEntryState } from '../lib/entryState'
 import { useStore } from '../store/useStore'
 import { useEvent } from '../hooks/useEvent'
 import { findMediaItemIdByRef, getMediaItem, mediaItemUrl } from '../api/media'
@@ -57,14 +58,9 @@ import type { TgCacheTask, TgChannel, ViewerItem } from '../types'
  * 删活跃记录等于停掉正在跑的入库，不说清楚就是偷偷改状态。
  */
 
-const STATUS_KEY: Record<TgCacheTask['status'], string> = {
-  queued: 'tg.statusQueued',
-  running: 'tg.statusRunning',
-  done: 'tg.statusDone',
-  failed: 'tg.statusFailed',
-  cancelled: 'tg.statusCancelled',
-  interrupted: 'tg.statusInterrupted',
-}
+// BUG-170：状态徽标文案改由 `deriveEntryState` 单源派生（见 TaskRow 内
+// ENTRY_LABEL_KEY），不再直接用任务机状态查表 —— 消灭「任务说完了、字节没影」的
+// 呈现空窗。STATUS_KEY 随之删除，STATUS_STYLE（配色按任务机状态）保留。
 
 const STATUS_STYLE: Record<TgCacheTask['status'], string> = {
   queued: 'bg-surface-2 text-fg-muted',
@@ -191,6 +187,21 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
   const ingested = task.status === 'done'
   const retryable = RETRYABLE.has(task.status)
   const single = task.groupId == null
+  // BUG-170：行内状态徽标走**单源派生**（deriveEntryState）——任务 done = 字节
+  // 落库（present）、活跃 = 缓存中、failed/interrupted = 失败、cancelled 归
+  // 「缺字节可重试」档。动作按钮（重试/取消/删除）仍按任务机状态判定，两者语义不同。
+  const entry = deriveEntryState({
+    taskStatus: task.status,
+    bytesPresence: task.status === 'done' ? 'present' : undefined,
+  })
+  const ENTRY_LABEL_KEY: Record<string, string> = {
+    cached: 'tg.statusDone',
+    caching: 'tg.statusRunning',
+    failed: 'tg.statusFailed',
+    // cancelled 在任务机里是独立态（有专门的分组与文案），呈现层保留它：
+    registered: task.status === 'cancelled' ? 'tg.statusCancelled' : 'tg.statusQueued',
+    bytesMissing: task.status === 'cancelled' ? 'tg.statusCancelled' : 'tg.statusQueued',
+  }
   return (
     <div
       className="rounded-md border border-border-subtle bg-surface-2/40 p-2.5"
@@ -217,7 +228,7 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
               STATUS_STYLE[task.status],
             )}
           >
-            {t(STATUS_KEY[task.status])}
+            {t(ENTRY_LABEL_KEY[entry])}
           </span>
           <span className="truncate text-xs text-fg-strong">
             {title} · {single ? t('tg.cacheScopeSingle') : t('tg.cacheScopeGroup')} ·{' '}

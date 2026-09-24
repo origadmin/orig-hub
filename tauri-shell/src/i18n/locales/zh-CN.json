@@ -281,6 +281,8 @@
   "tg.backToFeed": "返回列表",
   "tg.cachedLib": "缓存库",
   "tg.caching": "缓存中",
+  "tg.bytesMissing": "字节未就绪，可重试缓存",
+  "tg.retryCache": "重试缓存",
   "tg.cachingProgress": "缓存中 {n}/{total}",
   "tg.continue": "继续",
   "tg.clearRow": "清除",

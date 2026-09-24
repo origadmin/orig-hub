@@ -195,3 +195,4 @@ bash scripts/install-hooks.sh    # 安装 pre-commit 与 commit-msg（钩子不�
 ```
 
 `fix` 类提交必须引用 `BUG-<编号>`，否则 `commit-msg` 拒绝 —— 让「绕过登记直接修」不可表达。
+| BUG-170 | 入库过渡窗「缓存→不见了→完成→出现了」——登记推迟（P1 已修：T0 事实先登记）+ 前端三源状态拼接（任务轮询/字节快照/DB 标志各按各的节奏，终态→快照时间差呈现空洞）；修：`lib/entryState.ts` 唯一派生函数 `deriveEntryState`（字节真值为唯一事实，过渡窗持有旧态禁止跨源推 intermediate 态），TgPanel 气泡/相册与 CacheManagerDialog 任务行全部改走它，探针断言 200ms 采样 0 消失窗口 + 迁移序列单调 | fixed | shell |

@@ -38,6 +38,8 @@ import { CacheManagerDialog } from './CacheManagerDialog'
 import { useStore } from '../store/useStore'
 import { useTgSearch } from '../store/tgSearch'
 import { classifyTgReason, describeTgFailure, logTgReason } from '../lib/tgReason'
+import { deriveEntryState } from '../lib/entryState'
+import type { EntryState } from '../lib/entryState'
 import { useTgRetry } from '../lib/tgRetry'
 import {
   ALBUM_MAX_TILES,
@@ -110,7 +112,7 @@ function Chip({
   children,
   className,
 }: {
-  tone?: 'muted' | 'accent' | 'success'
+  tone?: 'muted' | 'accent' | 'success' | 'warn'
   children: ReactNode
   className?: string
 }) {
@@ -119,7 +121,9 @@ function Chip({
       ? 'border-accent/30 text-accent'
       : tone === 'success'
         ? 'border-success/40 text-success'
-        : 'border-border-subtle text-fg-mid'
+        : tone === 'warn'
+          ? 'border-red-500/40 text-red-600 dark:text-red-400'
+          : 'border-border-subtle text-fg-mid'
   return (
     <span
       className={cn(
@@ -370,6 +374,21 @@ export function TgPanel(
   const [syncing, setSyncing] = useState(false)
   const [downloadedPaths, setDownloadedPaths] = useState<Map<string, string>>(new Map())
   /**
+   * BUG-170 过渡窗标记：任务从活跃转终态后、字节快照回来前为 true。
+   * 此窗口内单源派生**持有旧态**（事实静默 ≠ 新事实），不再出现
+   * 「既不在缓存中也不在已完成」的空洞。
+   */
+  const awaitingSnapshotRef = useRef(false)
+  /** 单源派生的旧态持有表（key → 上一渲染的 EntryState），驱动前向渲染。 */
+  const entryStateHoldRef = useRef(new Map<string, EntryState>())
+  /**
+   * 相册进度持有表（BUG-170）：进度行是「缓存中」呈现的载体之一——任务终态 →
+   * 字节快照到达的过渡窗内 `activeTask` 已消失，若进度行跟着消失，相册会闪回
+   * 「既无进度也无已缓存」的空洞（跨源 intermediate 态，禁止）。进度在此持有，
+   * 由条目派生状态驱动清除（全部离开 caching 才释放）。
+   */
+  const albumProgressHoldRef = useRef(new Map<string, { done: number; total: number }>())
+  /**
    * 图片入库状态（BUG-049 规则：图片不缓存，最多加入媒体库）：
    * 已入库图片的 ref 集合（`<chatId>:<messageId>`）。feed 变化时对未见过的图片
    * 逐个 by-ref 查询；查过的记入 photoCheckedRef 不再重复请求。
@@ -603,6 +622,9 @@ export function TgPanel(
           }
           return m
         })
+        // 字节快照已回来：单源事实到位，解除「任务终态 → 快照」过渡窗的旧态持有
+        //（BUG-170）。此前的任何持有都只到这一刻为止。
+        awaitingSnapshotRef.current = false
       } catch {
         // 快照失败不阻塞浏览，保持现状
       }
@@ -619,18 +641,10 @@ export function TgPanel(
       : null
 
   /**
-   * 正在写盘的消息号集合（驱动「缓存中」转圈）。
-   * 整组任务同一时刻只有 `currentId` 在写盘，故只把它算作进行中——否则整组会一起转圈。
+   * 「正在写盘」的消息号集合——已被 `entryStateFor`（单源派生，BUG-170）取代：
+   * 状态只从 `deriveEntryState` 出，不再由本集合在渲染点拼接。保留注释说明
+   * 演进史，集合本身删除以免出现第二套「缓存中」判据。
    */
-  const downloading = useMemo(() => {
-    const s = new Set<number>()
-    if (activeTask) {
-      if (activeTask.groupId === undefined || activeTask.groupId === null)
-        activeTask.messageIds.forEach((id) => s.add(id))
-      else if (activeTask.currentId !== undefined) s.add(activeTask.currentId)
-    }
-    return s
-  }, [activeTask])
 
   /** 整组缓存进度（键与渲染处一致：`a-{chatId}-{groupId}`；单飞下至多一项） */
   const albumProgress = useMemo(() => {
@@ -643,6 +657,37 @@ export function TgPanel(
     }
     return m
   }, [activeTask])
+
+  /**
+   * 条目呈现状态**单源派生**（BUG-170）：气泡/相册的「未缓存/缓存中/已缓存/
+   * 缺字节/失败」一律走 [`deriveEntryState`]，禁止在渲染点重写
+   * `Boolean(downloaded || path)` 一类的三源拼接。
+   *
+   * 输入映射：字节真值 = `downloadedPaths`（后端 `downloaded_map` 已按磁盘探测
+   * 过滤，Presence 即真值）；任务态 = 覆盖该消息的 `cacheTask`（含终态——失败
+   * 信号全靠它）；过渡窗 = `awaitingSnapshotRef`（任务终态 → 快照到达之间持有旧态）。
+   */
+  const entryStateFor = useCallback(
+    (item: FeedItem): EntryState => {
+      const taskStatus =
+        cacheTask && cacheTask.chatId === item.chatId && cacheTask.messageIds.includes(item.messageId)
+          ? cacheTask.status
+          : null
+      const prev = entryStateHoldRef.current.get(item.key) ?? null
+      const next = deriveEntryState({
+        bytesPresence: downloadedPaths.has(item.key) ? 'present' : undefined,
+        taskStatus,
+        downloadedFlag: item.downloaded,
+        kind: item.type,
+        source: 'tg',
+        prev,
+        factPending: awaitingSnapshotRef.current,
+      })
+      entryStateHoldRef.current.set(item.key, next)
+      return next
+    },
+    [cacheTask, downloadedPaths],
+  )
 
   /**
    * 轮询签名：id/status/done/currentId/error 任一变化才算「状态真的变了」。
@@ -703,6 +748,9 @@ export function TgPanel(
       cacheTask.status === 'interrupted'
     // 同一任务从活跃 → 终态：收尾刷一次；新任务开始（id 变化）不刷。
     if (!(wasActive && isTerminal && prev.id === cacheTask.id)) return
+    // BUG-170：终态事件本身不是字节事实——先进入过渡窗（持有旧态），
+    // 直到下方快照落库（awaitingSnapshotRef 复位）才允许状态前进。
+    awaitingSnapshotRef.current = true
     let cancelled = false
     void (async () => {
       try {
@@ -717,6 +765,8 @@ export function TgPanel(
           }
           return next
         })
+        // 快照落库：单源事实到位，解除过渡窗持有。
+        awaitingSnapshotRef.current = false
       } catch {
         // 快照失败不阻塞浏览
       }
@@ -1542,7 +1592,7 @@ export function TgPanel(
                             <div className="px-2 pb-1 pt-0.5" data-testid="tg-hit-detail">
                               <MessageBubble
                                 item={item}
-                                downloading={downloading.has(item.messageId)}
+                                state={entryStateFor(item)}
                                 downloadedPath={downloadedPaths.get(item.key)}
                                 photoInLibrary={photoLibRefs.has(`${item.chatId}:${item.messageId}`)}
                                 onDownload={onBubbleDownload}
@@ -1712,7 +1762,7 @@ export function TgPanel(
                       <MessageBubble
                         key={unit[0].key}
                         item={unit[0]}
-                        downloading={downloading.has(unit[0].messageId)}
+                        state={entryStateFor(unit[0])}
                         downloadedPath={downloadedPaths.get(unit[0].key)}
                         photoInLibrary={photoLibRefs.has(`${unit[0].chatId}:${unit[0].messageId}`)}
                         onDownload={onBubbleDownload}
@@ -1725,9 +1775,21 @@ export function TgPanel(
                         key={`album-${unit[0].key}`}
                         items={unit}
                         downloadedCount={
-                          unit.filter((x) => x.downloaded || downloadedPaths.has(x.key)).length
+                          // BUG-170：组内「已缓存」计数走单源派生（字节真值），
+                          // 不再 `x.downloaded || downloadedPaths.has(x.key)` 三源拼接。
+                          unit.filter((x) => entryStateFor(x) === 'cached').length
                         }
-                        progress={albumProgress.get(`a-${unit[0].chatId}-${unit[0].groupId}`)}
+                        progress={(() => {
+                          // BUG-170：进度行持有——终态后快照到达前继续显示最后的
+                          // 「缓存中 n/N」，条目全部离开 caching 才释放（不闪空洞）。
+                          const k = `a-${unit[0].chatId}-${unit[0].groupId}`
+                          const live = albumProgress.get(k)
+                          if (live) albumProgressHoldRef.current.set(k, live)
+                          const held = albumProgressHoldRef.current.get(k)
+                          const stillCaching = unit.some((x) => entryStateFor(x) === 'caching')
+                          if (!live && !stillCaching) albumProgressHoldRef.current.delete(k)
+                          return live ?? (stillCaching ? held : undefined)
+                        })()}
                         groupHasVideo={unit.some((x) => x.type === 'video')}
                         groupInLibrary={unit.every(
                           (x) =>
@@ -1807,7 +1869,9 @@ function mergeFeed(older: FeedItem[], current: FeedItem[]): FeedItem[] {
  */
 const MessageBubble = memo(function MessageBubble(props: {
   item: FeedItem
-  downloading: boolean
+  /** BUG-170：呈现状态由单源派生（deriveEntryState），本组件不再自行拼接 */
+  state: EntryState
+  /** 字节快照路径（播放按钮的事实依据；与 state 互补——photo 恒 cached 但未必有本地文件） */
   downloadedPath?: string
   /** BUG-049：图片已入库（图片不缓存，入库即终态） */
   photoInLibrary: boolean
@@ -1818,7 +1882,7 @@ const MessageBubble = memo(function MessageBubble(props: {
 }) {
   const {
     item: m,
-    downloading,
+    state,
     downloadedPath,
     photoInLibrary,
     onDownload,
@@ -1827,6 +1891,8 @@ const MessageBubble = memo(function MessageBubble(props: {
     onPreview,
   } = props
   const { t } = useTranslation()
+  const cached = state === 'cached'
+  const caching = state === 'caching'
   return (
     <div className="flex flex-col">
       <div className="max-w-[88%] rounded-2xl rounded-tl-md border border-border-subtle bg-surface p-2.5 shadow-sm">
@@ -1834,8 +1900,8 @@ const MessageBubble = memo(function MessageBubble(props: {
         {m.type === 'video' && (
           <VideoBlock
             item={m}
-            downloaded={Boolean(m.downloaded || downloadedPath)}
-            downloading={downloading}
+            downloaded={cached}
+            downloading={caching}
             onDownload={() => onDownload(m)}
           />
         )}
@@ -1859,7 +1925,10 @@ const MessageBubble = memo(function MessageBubble(props: {
         <div className="mt-1.5 flex items-center gap-2">
           <span className="font-mono text-[9px] text-muted">#{m.messageId}</span>
           {m.size ? <span className="text-[10px] text-muted">{fmtSize(m.size)}</span> : null}
-          {(m.downloaded || downloadedPath) && <Chip tone="success">{t('tg.downloaded')}</Chip>}
+          {/* 呈现状态角标（BUG-170 单源派生）：已缓存 / 缺字节 / 失败 三态如实呈现 */}
+          {cached && <Chip tone="success">{t('tg.downloaded')}</Chip>}
+          {state === 'bytesMissing' && <Chip tone="warn">{t('tg.bytesMissing')}</Chip>}
+          {state === 'failed' && <Chip tone="warn">{t('tg.statusFailed')}</Chip>}
           <span className="ml-auto text-[10px] text-muted">{fmtTime(m.date)}</span>
           {/* 缓存/播放按钮：视频与图片同构（BUG-046）——此前视频只靠海报上的 ⬇ 图标，
               图片却有显式「缓存」按钮，逻辑倒置。海报点击行为不变（已缓存=播放，
@@ -1883,10 +1952,15 @@ const MessageBubble = memo(function MessageBubble(props: {
               variant="secondary"
               size="sm"
               className="h-6 px-2 text-[10px]"
-              disabled={downloading}
+              disabled={caching}
               onClick={() => onDownload(m)}
             >
-              {downloading ? t('tg.caching') : t('tg.download')}
+              {/* 缺字节/失败 = 条目在、字节未就绪 → 动词是「重试缓存」（BUG-170 语义定稿） */}
+              {caching
+                ? t('tg.caching')
+                : state === 'bytesMissing' || state === 'failed'
+                  ? t('tg.retryCache')
+                  : t('tg.download')}
             </Button>
           )}
         </div>

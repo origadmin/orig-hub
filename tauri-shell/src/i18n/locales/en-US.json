@@ -286,6 +286,8 @@
   "tg.backToFeed": "Back to list",
   "tg.cachedLib": "Cache Library",
   "tg.caching": "Caching",
+  "tg.bytesMissing": "Bytes not ready — retry caching",
+  "tg.retryCache": "Retry cache",
   "tg.cachingProgress": "Caching {n}/{total}",
   "tg.continue": "Continue",
   "tg.clearRow": "Clear",
