@@ -50,7 +50,25 @@ const NO_FRAME_MS = 3000
 /** 起播 / 跳转 / 改速后的静默期：解码器预热与首帧填充 */
 const WARMUP_MS = 1500
 /** 这些事件上丢帧计数会跳变，必须重设基线，否则旧账会被算成新丢帧 */
-const REBASE_EVENTS = ['loadedmetadata', 'loadeddata', 'seeking', 'seeked', 'ratechange', 'play']
+const REBASE_EVENTS = [
+  'loadedmetadata',
+  'loadeddata',
+  'seeking',
+  'seeked',
+  'ratechange',
+  'play',
+  // BUG-166：stall/缓冲恢复后解码器会爆发性补帧，晚到的帧被整批计为 dropped——
+  // 这是「数据晚到」不是「解码慢」，恢复瞬间必须重置基线。
+  'waiting',
+  'stalled',
+]
+/**
+ * 判定「解码吃力」要求的数据供给下限（BUG-166）：缓冲领先播放位置不足此值时，
+ * 丢帧是**数据晚到**（供给被同管道的其他流量抢走 / 在线流节流），不是解码吞吐不足——
+ * 此时弹「调低播放速度会明显更流畅」是误导（用户实测：无可见卡顿却常驻提示）。
+ * 供给不足期间只跟基线不判定；供给充足（≥2s 领先）仍持续丢帧才允许置位。
+ */
+const DATA_AHEAD_MIN = 2.0
 
 function qualityOf(el: HTMLVideoElement): VideoPlaybackQuality | null {
   return typeof el.getVideoPlaybackQuality === 'function' ? el.getVideoPlaybackQuality() : null
@@ -137,6 +155,15 @@ export function useDecodeHealth(
       lastTotal = q.totalVideoFrames
       // 采样窗内几乎没解出帧（卡缓冲 / 刚起播）：样本不足以判定
       if (dt <= 0 || sampled < MIN_SAMPLED_FRAMES) return
+      // 数据供给不足（BUG-166）：此刻的丢帧是帧晚到被弃，不是解码吞吐不足。
+      // 只跟基线、清空连击，绝不在这种状态置位「解码吃力」。
+      const b = el.buffered
+      const aheadSec = b.length ? b.end(b.length - 1) - el.currentTime : 0
+      if (aheadSec < DATA_AHEAD_MIN) {
+        strainStreak = 0
+        calmStreak = 0
+        return
+      }
 
       const severe = delta / (dt / 1000) > DROP_PER_SEC
       if (severe) {
