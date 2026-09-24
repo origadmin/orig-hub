@@ -418,10 +418,56 @@ export function SeriesDetail(props: {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      {/* 工具条（整页重排）：返回 + 剧集级操作独立置顶 —— 操作按钮原本挤在
+          文字列底部的 `mt-auto` 行里，把头部压得很挤。提出来后头部只承载
+          「海报 + 标题/元信息/标签/简介」，操作入口位置在任何宽度下都稳定。 */}
+      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border-subtle/60 px-4 py-2">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-7 shrink-0 px-2 text-[11px]"
+          onClick={onBack}
+        >
+          ← 返回
+        </Button>
+        <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 px-2 text-[11px]"
+            onClick={() => {
+              setSelected(detail.tags.map((t) => t.id))
+              setEditingTags((v) => !v)
+            }}
+          >
+            <Tag className="h-3.5 w-3.5" />
+            标签
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 px-2 text-[11px]"
+            onClick={onMerge}
+            title="把另一个剧集的内容并入本剧集（源剧集会被删除）"
+          >
+            <GitMerge className="h-3.5 w-3.5" />
+            合并到…
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 px-2 text-[11px] text-destructive"
+            onClick={onDeleteSeries}
+          >
+            删除剧集
+          </Button>
+        </div>
+      </div>
       {/* 头部：封面 + 元数据 */}
       <div className="flex min-w-0 gap-4 border-b border-border-subtle/60 p-4">
         {/* 极窄窗口下隐藏封面：按钮行的可用宽度不能低于单个按钮（否则出界裁剪） */}
-        <div className="hidden h-28 w-48 shrink-0 overflow-hidden rounded-lg bg-surface-2 min-[720px]:block">
+        {/* Hero 海报 320×180（整页重排：原 192×112 太小，撑不起头部视觉重心） */}
+        <div className="hidden aspect-video w-80 shrink-0 overflow-hidden rounded-lg bg-surface-2 min-[720px]:block">
           {cover ? (
             <img
               src={cover}
@@ -440,14 +486,6 @@ export function SeriesDetail(props: {
         </div>
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex items-start gap-2">
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-7 shrink-0 px-2 text-[11px]"
-              onClick={onBack}
-            >
-              ← 返回
-            </Button>
             {editingTitle ? (
               <div className="flex min-w-0 flex-1 items-center gap-1.5">
                 <Input
@@ -484,7 +522,8 @@ export function SeriesDetail(props: {
               </div>
             ) : (
               <>
-                <h3 className="min-w-0 flex-1 truncate pt-1 text-[15px] font-semibold text-fg-strong">
+                {/* 标题允许换行（最多 2 行）：单行 truncate 会把长剧名截成半句 */}
+                <h3 className="min-w-0 flex-1 break-words [overflow-wrap:anywhere] line-clamp-2 text-[15px] font-semibold leading-snug text-fg-strong">
                   {detail.title}
                 </h3>
                 <button
@@ -502,8 +541,28 @@ export function SeriesDetail(props: {
               </>
             )}
           </div>
+          {/* 元信息（整页重排：上移到标题正下方 —— 「这是什么」应先于「讲什么」被读到） */}
+          <p className="mt-1.5 text-[11px] text-muted">
+            {KIND_LABEL[detail.kind] ?? detail.kind}
+            {detail.year ? ` · ${detail.year}` : ''} · {detail.episodeCount} 集 ·{' '}
+            {detail.seasonCount} 季
+          </p>
+          {/* 标签 chips：原独立的「标签展示行」合并进 Hero 右列（整页重排） */}
+          {detail.tags.length > 0 ? (
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
+              {detail.tags.map((t) => (
+                <span
+                  key={t.id}
+                  className="rounded-full px-2 py-0.5 text-[10px]"
+                  style={{ background: `${t.color ?? '#64748b'}22`, color: t.color ?? '#64748b' }}
+                >
+                  {t.name}
+                </span>
+              ))}
+            </div>
+          ) : null}
           {detail.description || editingDesc ? (
-            <div className="mt-1">
+            <div className="mt-1.5">
               {editingDesc ? (
                 <div className="space-y-1.5">
                   <textarea
@@ -529,8 +588,8 @@ export function SeriesDetail(props: {
                 </div>
               ) : (
                 <div className="group/desc relative">
-                  {/* 总介绍：≤3 行全显；超出折叠 + 展开/收起（DescText 统一规则） */}
-                  <DescText text={detail.description || ''} maxLines={3} className="pr-12" />
+                  {/* 总介绍：≤5 行全显；超出折叠 + 展开/收起（DescText 统一规则） */}
+                  <DescText text={detail.description || ''} maxLines={5} className="pr-12" />
                   <button
                     type="button"
                     onClick={() => {
@@ -556,43 +615,6 @@ export function SeriesDetail(props: {
               ＋ 添加剧集介绍
             </button>
           )}
-          <p className="mt-1 text-[11px] text-muted">
-            {KIND_LABEL[detail.kind] ?? detail.kind}
-            {detail.year ? ` · ${detail.year}` : ''} · {detail.episodeCount} 集 ·{' '}
-            {detail.seasonCount} 季
-          </p>
-          <div className="mt-auto flex flex-wrap items-center gap-2 pt-2">
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 px-2 text-[11px]"
-              onClick={() => {
-                setSelected(detail.tags.map((t) => t.id))
-                setEditingTags((v) => !v)
-              }}
-            >
-              <Tag className="h-3.5 w-3.5" />
-              标签
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 px-2 text-[11px]"
-              onClick={onMerge}
-              title="把另一个剧集的内容并入本剧集（源剧集会被删除）"
-            >
-              <GitMerge className="h-3.5 w-3.5" />
-              合并到…
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 px-2 text-[11px] text-destructive"
-              onClick={onDeleteSeries}
-            >
-              删除剧集
-            </Button>
-          </div>
         </div>
       </div>
 
@@ -613,18 +635,6 @@ export function SeriesDetail(props: {
             </Button>
           </div>
         </div>
-      ) : detail.tags.length > 0 ? (
-        <div className="flex shrink-0 flex-wrap gap-1.5 border-b border-border-subtle/60 px-4 py-2">
-          {detail.tags.map((t) => (
-            <span
-              key={t.id}
-              className="rounded-full px-2 py-0.5 text-[10px]"
-              style={{ background: `${t.color ?? '#64748b'}22`, color: t.color ?? '#64748b' }}
-            >
-              {t.name}
-            </span>
-          ))}
-        </div>
       ) : null}
 
       {/* 图片浏览位：图片随内容一起归档进剧集，但**不进播放序列**——它有自己的展位。 */}
@@ -639,7 +649,7 @@ export function SeriesDetail(props: {
               // 外层若仍是 button 会形成**嵌套按钮**（HTML 非法，点击语义也会串）。
               <div
                 key={ep.id}
-                className="group relative h-16 w-24 shrink-0 overflow-hidden rounded border border-border-subtle bg-surface-2"
+                className="group relative h-[120px] w-[160px] shrink-0 overflow-hidden rounded border border-border-subtle bg-surface-2"
               >
                 <button
                   type="button"
@@ -652,7 +662,7 @@ export function SeriesDetail(props: {
                     src={mediaItemUrl(ep.itemId)}
                     alt={ep.title || '剧集图片'}
                     loading="lazy"
-                    className="h-full w-full object-cover"
+                    className={`h-full w-full ${coverFit(ep.kind)}`}
                   />
                 </button>
                 {/* 移除入口：与分集列表的「移除」同一语义（只摘除归属，内容留在资料库）。
@@ -677,7 +687,9 @@ export function SeriesDetail(props: {
         </div>
       ) : null}
 
-      {/* 分集：单集聚焦布局 —— 顶部集号切换条 + 当前一集的大区域 */}
+      {/* 分集：单集聚焦布局 —— 聚焦区在上，集号切换条居中，本集挂图在下。
+          切换条**不能**放进 `episode-focus` 里：那个 section 带 `key={activeEp.id}`，
+          每换一集整条 chip 都会被 remount，横向滚动位置会归零。三者同级可避免这个回归。 */}
       <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto p-4">
         {playEps.length === 0 && photoEps.length === 0 ? (
           <p className="py-10 text-center text-xs text-muted">
@@ -687,85 +699,6 @@ export function SeriesDetail(props: {
           <p className="py-6 text-center text-xs text-muted">本剧集暂无可播放的视频</p>
         ) : (
           <>
-            {/* 集号切换条（单集聚焦）：集数多时横向滚动，一屏始终只呈现一集。
-                chip 上**保留既有 testid `episode-slot`** —— CDP 探针按它的数量断言
-                集数，改成聚焦布局后数量仍必须等于集数。 */}
-            <div
-              className="mb-3 flex gap-3 overflow-x-auto pb-1"
-              aria-label={t('media.episodeSwitcher')}
-              data-testid="episode-switcher"
-            >
-              {seasons.map(([season, eps]) => (
-                <div key={season} className="flex shrink-0 items-center gap-1.5">
-                  <span className="shrink-0 text-[10px] font-medium text-muted">
-                    第 {season} 季
-                  </span>
-                  {eps.map((ep) => {
-                    const on = activeEp?.id === ep.id
-                    /** 缩略图源：poster 优先；photo 无 poster 时用原条目地址（图片即内容） */
-                    const chipThumb =
-                      ep.poster ?? (ep.kind === 'photo' ? mediaItemUrl(ep.itemId) : null)
-                    return (
-                      <button
-                        key={ep.id}
-                        type="button"
-                        onClick={() => setActiveEpId(ep.id)}
-                        aria-pressed={on}
-                        title={ep.title || `S${ep.season}E${ep.episodeNo}`}
-                        data-testid={`episode-chip-${ep.id}`}
-                        className={`flex shrink-0 items-center gap-1.5 rounded-md border px-1.5 py-1 transition-colors ${
-                          on
-                            ? 'border-accent bg-accent/10 ring-1 ring-accent/50'
-                            : 'border-border-subtle bg-surface-2/40 hover:border-accent/40 hover:bg-surface-2'
-                        }`}
-                      >
-                        {/* chip 缩略图 56×32：只作辨识，大图在下方聚焦区 */}
-                        <span className="relative h-8 w-14 shrink-0 overflow-hidden rounded bg-surface-2">
-                          {chipThumb ? (
-                            <img
-                              src={chipThumb}
-                              alt=""
-                              loading="lazy"
-                              className={`h-full w-full ${coverFit(ep.kind)}`}
-                            />
-                          ) : (
-                            <span className="flex h-full w-full items-center justify-center text-muted">
-                              {ep.kind === 'audio' ? (
-                                <Music className="h-3.5 w-3.5" />
-                              ) : (
-                                <Film className="h-3.5 w-3.5" />
-                              )}
-                            </span>
-                          )}
-                        </span>
-                        {/* 集号沿用既有 testid：CDP 探针按 `episode-slot` 的数量断言集数，
-                            改成聚焦布局后数量仍必须等于集数。
-                            点集号仍打开本集编辑面板（与改版前同一语义）：集号是**位置**，
-                            所以「改号」与「换位」是同一件事的两种入口；点 chip 其余部分才是切换。 */}
-                        <span
-                          data-testid="episode-slot"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            openEpisodeEdit(ep)
-                          }}
-                          title="修改季号 / 集号"
-                          className={`cursor-pointer whitespace-nowrap text-[11px] font-medium tabular-nums ${
-                            on ? 'text-accent' : 'text-fg-mid'
-                          }`}
-                        >
-                          {/* 合集显示为区间（E1-2），单集保持 E1 */}
-                          S{ep.season}E{ep.episodeNo}
-                          {ep.episodeNoEnd != null && ep.episodeNoEnd > ep.episodeNo
-                            ? `-${ep.episodeNoEnd}`
-                            : ''}
-                        </span>
-                      </button>
-                    )
-                  })}
-                </div>
-              ))}
-            </div>
-
             {/* 聚焦区：当前这一集的封面（380×214）+ 信息 + 操作 + 本集挂图 */}
             {activeEp ? (
               <section
@@ -1014,38 +947,6 @@ export function SeriesDetail(props: {
                   </div>
                 </div>
 
-                {/* 本集挂图画廊（BUG-168）：200×150，可单张摘除。
-                    两处修正：① img 走 coverFit —— 此前裸 object-cover 会把图片裁切；
-                    ② 源优先读后端已下发的 poster（media.rs:855），没有才回退 raw 原图，
-                    避免大图直出原图造成解码压力。 */}
-                {(activeEp.images?.length ?? 0) > 0 && (
-                  <div className="mt-3 flex flex-wrap gap-2" data-testid="episode-images">
-                    {activeEp.images!.map((img) => (
-                      <div
-                        key={img.itemId}
-                        className="group/img relative aspect-[4/3] w-[200px] max-w-full shrink-0 overflow-hidden rounded border border-border-subtle bg-surface-2"
-                      >
-                        <img
-                          src={img.poster ?? mediaItemUrl(img.itemId)}
-                          alt=""
-                          loading="lazy"
-                          className={`h-full w-full ${coverFit('photo')}`}
-                        />
-                        <button
-                          type="button"
-                          onClick={() => void removeEpisodeImage(activeEp.id, img.itemId)}
-                          title={t('media.removeEpisodeImage')}
-                          aria-label={t('media.removeEpisodeImage')}
-                          data-testid="episode-image-remove"
-                          className="absolute right-0 top-0 flex h-6 w-6 items-center justify-center rounded-bl bg-black/60 text-white opacity-0 transition-opacity hover:bg-destructive focus-visible:opacity-100 group-hover/img:opacity-100"
-                        >
-                          <X className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
                 {editingEp === activeEp.id ? (
                   <div className="mt-3 space-y-1.5">
                     {/* 标题改在上方（与信息同一块），不再单独开一行（BUG-076）。
@@ -1121,6 +1022,118 @@ export function SeriesDetail(props: {
                   </div>
                 ) : null}
               </section>
+            ) : null}
+
+            {/* 集号切换条（单集聚焦）：集数多时横向滚动，一屏始终只呈现一集。
+                chip 上**保留既有 testid `episode-slot`** —— CDP 探针按它的数量断言
+                集数，改成聚焦布局后数量仍必须等于集数。 */}
+            <div
+              className="mt-3 flex gap-3 overflow-x-auto pb-1"
+              aria-label={t('media.episodeSwitcher')}
+              data-testid="episode-switcher"
+            >
+              {seasons.map(([season, eps]) => (
+                <div key={season} className="flex shrink-0 items-center gap-1.5">
+                  <span className="shrink-0 text-[10px] font-medium text-muted">
+                    第 {season} 季
+                  </span>
+                  {eps.map((ep) => {
+                    const on = activeEp?.id === ep.id
+                    /** 缩略图源：poster 优先；photo 无 poster 时用原条目地址（图片即内容） */
+                    const chipThumb =
+                      ep.poster ?? (ep.kind === 'photo' ? mediaItemUrl(ep.itemId) : null)
+                    return (
+                      <button
+                        key={ep.id}
+                        type="button"
+                        onClick={() => setActiveEpId(ep.id)}
+                        aria-pressed={on}
+                        title={ep.title || `S${ep.season}E${ep.episodeNo}`}
+                        data-testid={`episode-chip-${ep.id}`}
+                        className={`flex shrink-0 items-center gap-1.5 rounded-md border px-1.5 py-1 transition-colors ${
+                          on
+                            ? 'border-accent bg-accent/10 ring-1 ring-accent/50'
+                            : 'border-border-subtle bg-surface-2/40 hover:border-accent/40 hover:bg-surface-2'
+                        }`}
+                      >
+                        {/* chip 缩略图 56×32：只作辨识，大图在下方聚焦区 */}
+                        <span className="relative h-8 w-14 shrink-0 overflow-hidden rounded bg-surface-2">
+                          {chipThumb ? (
+                            <img
+                              src={chipThumb}
+                              alt=""
+                              loading="lazy"
+                              className={`h-full w-full ${coverFit(ep.kind)}`}
+                            />
+                          ) : (
+                            <span className="flex h-full w-full items-center justify-center text-muted">
+                              {ep.kind === 'audio' ? (
+                                <Music className="h-3.5 w-3.5" />
+                              ) : (
+                                <Film className="h-3.5 w-3.5" />
+                              )}
+                            </span>
+                          )}
+                        </span>
+                        {/* 集号沿用既有 testid：CDP 探针按 `episode-slot` 的数量断言集数，
+                            改成聚焦布局后数量仍必须等于集数。
+                            点集号仍打开本集编辑面板（与改版前同一语义）：集号是**位置**，
+                            所以「改号」与「换位」是同一件事的两种入口；点 chip 其余部分才是切换。 */}
+                        <span
+                          data-testid="episode-slot"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            openEpisodeEdit(ep)
+                          }}
+                          title="修改季号 / 集号"
+                          className={`cursor-pointer whitespace-nowrap text-[11px] font-medium tabular-nums ${
+                            on ? 'text-accent' : 'text-fg-mid'
+                          }`}
+                        >
+                          {/* 合集显示为区间（E1-2），单集保持 E1 */}
+                          S{ep.season}E{ep.episodeNo}
+                          {ep.episodeNoEnd != null && ep.episodeNoEnd > ep.episodeNo
+                            ? `-${ep.episodeNoEnd}`
+                            : ''}
+                        </span>
+                      </button>
+                    )
+                  })}
+                </div>
+              ))}
+            </div>
+
+            {/* 本集挂图画廊（BUG-168）：200×150，可单张摘除。
+                两处修正：① img 走 coverFit —— 此前裸 object-cover 会把图片裁切；
+                ② 源优先读后端已下发的 poster（media.rs:855），没有才回退 raw 原图，
+                避免大图直出原图造成解码压力。 */}
+            {/* 整页重排：挂图从聚焦区里提出来，落在集号切换条之后 */}
+            {activeEp && (activeEp.images?.length ?? 0) > 0 ? (
+              <div className="mt-3 flex flex-wrap gap-2" data-testid="episode-images">
+                {activeEp.images!.map((img) => (
+                  <div
+                    key={img.itemId}
+                    className="group/img relative aspect-[4/3] w-[200px] max-w-full shrink-0 overflow-hidden rounded border border-border-subtle bg-surface-2"
+                  >
+                    <img
+                      src={img.poster ?? mediaItemUrl(img.itemId)}
+                      alt=""
+                      loading="lazy"
+                      className={`h-full w-full ${coverFit('photo')}`}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void removeEpisodeImage(activeEp.id, img.itemId)}
+                      title={t('media.removeEpisodeImage')}
+                      aria-label={t('media.removeEpisodeImage')}
+                      data-testid="episode-image-remove"
+                      className="absolute right-0 top-0 flex h-6 w-6 items-center justify-center rounded-bl bg-black/60 text-white opacity-0 transition-opacity hover:bg-destructive focus-visible:opacity-100 group-hover/img:opacity-100"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
             ) : null}
           </>
         )}
