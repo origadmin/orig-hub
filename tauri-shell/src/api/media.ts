@@ -33,6 +33,12 @@ export interface MediaItem {
   kind: MediaKind
   filePath?: string | null
   /**
+   * 字节所有权 P2：文件的真实绝对路径（后端按库根解析链统一解析）。
+   * `filePath` 是库内规范形式（归仓成功 = 库根相对路径），展示/导出请用本字段；
+   * 条目无字节时两字段同时缺席。
+   */
+  absolutePath?: string | null
+  /**
    * 磁盘字节真值（`present` / `missing` / `unknown`），由后端 `probe_cached_bytes()` 探测。
    * BUG-132：条目视图与分集视图共用它 —— 不要再用 `Boolean(filePath)` 判「有没有字节」，
    * 那是数据库里的承诺，文件被外部删除 / 0 字节时它照样说有。

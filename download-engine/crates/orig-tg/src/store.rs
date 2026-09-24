@@ -7,7 +7,7 @@
 //! sqlite3 的 LNK2005 多重定义链接冲突。`libsql::Connection` 内部为 `Arc<dyn Conn + Send + Sync>`，
 //! 是 `Clone + Send + Sync`，因此 `Store` 可直接经 `AppState` 的 `Arc` 多线程共享，无需额外锁。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use libsql::params::IntoParams;
@@ -100,6 +100,11 @@ pub struct FilePathCollision {
 pub struct Store {
     /// `pub(crate)` 供 `media` 模块复用同一连接（资料库与 TG 流水同库）。
     pub(crate) conn: Connection,
+    /// 打开时的数据库文件路径（`:memory:` 原样保留）。
+    ///
+    /// 字节所有权 P2：库根的解析链需要它——config.json 与默认库根都取
+    /// `<TG 数据目录>/<...>`，而 TG 数据目录 = 数据库文件的父目录。
+    pub(crate) db_path: PathBuf,
 }
 
 /// 批量清除任务记录的**范围**——动词只有一个（清除），可变的是范围。
@@ -290,6 +295,7 @@ fn stored_message_from_row(r: &Row) -> libsql::Result<StoredMessage> {
 impl Store {
     /// 打开（不存在则创建）数据库并建表。`path` 传 `":memory:"` 使用纯内存库。
     pub async fn open(path: impl AsRef<Path>) -> libsql::Result<Self> {
+        let db_path = path.as_ref().to_path_buf();
         let conn = libsql::Builder::new_local(path).build().await?.connect()?;
         conn.execute_batch(
             r#"
@@ -354,7 +360,7 @@ impl Store {
         migrate_media_message(&conn).await?;
         // 媒体资料库（内容/剧集/标签）：与 TG 流水同库、职责分离。
         crate::media::migrate(&conn).await?;
-        Ok(Self { conn })
+        Ok(Self { conn, db_path })
     }
 
     /// 查询首个结果行；无结果返回 `None`。
@@ -671,6 +677,58 @@ impl Store {
             )
             .await?;
         Ok(())
+    }
+
+    // ---- 库根（byte-ownership P2：单一库根，一处管理） ----
+
+    /// 库根解析链（byte-ownership I2）：
+    ///   1. env `ORIG_TG_LIBRARY_DIR`（容器/CI/sidecar 注入，最高优先）；
+    ///   2. app_setting `library_dir`（PUT /api/tg/config 持久化的运行期覆盖）；
+    ///   3. config.json `libraryDir`（Tauri 壳管理的应用配置；引擎直接读
+    ///      `<数据库文件父目录>/config.json`——生产布局里两者同在 TG 数据目录）；
+    ///   4. 默认 `<TG 数据目录>/library`（与 downloads 同级，D7：库根默认与下载目录同级）。
+    ///
+    /// 前两级与 config.json 的值都过 `expand_tilde`（用户可能手输 `~`，BUG-071 同款）。
+    pub async fn library_root(&self) -> PathBuf {
+        if let Ok(v) = std::env::var("ORIG_TG_LIBRARY_DIR") {
+            if !v.trim().is_empty() {
+                return orig_core::paths::expand_tilde(v.trim());
+            }
+        }
+        if let Ok(Some(v)) = self.get_setting("library_dir").await {
+            if !v.trim().is_empty() {
+                return orig_core::paths::expand_tilde(v.trim());
+            }
+        }
+        if let Some(v) = Self::config_json_library_dir(&self.db_path) {
+            return v;
+        }
+        Self::default_library_root(&self.db_path)
+    }
+
+    /// 默认库根：`<TG 数据目录>/library`。`:memory:`（单测）的父目录为空串，
+    /// 退化为进程 CWD 下的 `library` —— 测试应显式 set_setting 覆盖。
+    pub fn default_library_root(db_path: &Path) -> PathBuf {
+        let base = db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        base.join("library")
+    }
+
+    /// 读 config.json 的 `libraryDir`（缺文件/缺键/解析失败 → None，不阻断）。
+    pub fn config_json_library_dir(db_path: &Path) -> Option<PathBuf> {
+        let base = db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let raw = std::fs::read_to_string(base.join("config.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let dir = v.get("libraryDir")?.as_str()?.trim();
+        if dir.is_empty() {
+            return None;
+        }
+        Some(orig_core::paths::expand_tilde(dir))
     }
 
     // ---- 缓存库（跨频道聚合视图） ----
@@ -1331,6 +1389,51 @@ mod tests {
         let m = s.get_message(1, 100).await.unwrap().unwrap();
         assert!(m.downloaded);
         assert_eq!(m.file_path.as_deref(), Some(r#"C:\cache\video.mp4"#));
+    }
+
+    /// P2 库根解析链：app_setting 覆盖 config.json，config.json 覆盖默认值；
+    /// 默认值 = `<TG 数据目录>/library`（TG 数据目录 = 数据库文件的父目录）。
+    /// env 档（`ORIG_TG_LIBRARY_DIR`）优先级最高但为进程级全局，测试无法并行
+    /// 安全地注入，故不在此覆盖（生产读的是同一行代码路径）。
+    #[tokio::test]
+    async fn library_root_resolution_chain() {
+        let dir = std::env::temp_dir()
+            .join(format!("orig_tg_store_{}_", std::process::id()))
+            .join("libroot_chain");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("store.db");
+        let s = Store::open(&db_path).await.unwrap();
+
+        // 默认档：<db 父目录>/library。
+        assert_eq!(
+            s.library_root().await,
+            Store::default_library_root(&db_path),
+            "无 setting、无 config.json 时必须落到默认库根"
+        );
+
+        // config.json 档：写文件即可（每次调用现读，不需要重开库）。
+        let cfg_dir = dir.join("lib-from-config");
+        std::fs::write(
+            dir.join("config.json"),
+            format!(r#"{{ "libraryDir": "{}" }}"#, cfg_dir.to_string_lossy().replace('\\', "/")),
+        )
+        .unwrap();
+        assert_eq!(
+            s.library_root().await,
+            cfg_dir,
+            "config.json 的 libraryDir 必须覆盖默认值"
+        );
+
+        // app_setting 档：最高优先级（除 env 外）。
+        let setting_dir = dir.join("lib-from-setting");
+        s.set_setting("library_dir", setting_dir.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            s.library_root().await,
+            setting_dir,
+            "app_setting 必须覆盖 config.json 与默认值"
+        );
     }
 
     #[tokio::test]

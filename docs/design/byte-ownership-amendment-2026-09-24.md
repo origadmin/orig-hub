@@ -68,7 +68,7 @@
 | 阶段 | 内容 | 主要落点 |
 |---|---|---|
 | P1 登记前移 | `run_one_cache_task` 逐消息处理时先 ingest（登记）后取字节；回填走专用语句（防 COALESCE 粘路径，MEDIA-DESIGN C3） | `routes.rs`、`store.rs` |
-| P2 归仓移动 | 字节落盘改写到库根（临时名 → 原子 rename）；存量条目懒迁移（下次回填时顺带归仓），不做一次性大迁移 | `cache.rs`、`config.rs`（库根设置） |
+| P2 归仓移动 | 字节落盘改写到库根（临时名 → 原子 rename）；存量条目懒迁移（下次回填时顺带归仓），不做一次性大迁移。**实现偏离注记**：落仓命名采用 `<库根>/<chatSlug>-<chatId>/<messageId>-<titleSlug>.<ext>`，而非 I2 的 `series-slug/ep-NN` —— 集号随剧集重编/重排漂移，消息号 + 标题 slug 是稳定标识，重命名成本为 0；`file_path` 相对路径、失败降级等其余 I2 语义不变 | `cache.rs`、`store.rs`（库根解析链）、`routes.rs`（config/投递/删除） |
 | P3 清理让位 | 清理链按路径前缀（库根）跳过；orphan 判定排除库根 | `cache.rs` |
 | P4 状态单源 | 流水线/条目状态改由 `bytesPresence` + task 单源派生；消灭三源拼接过渡窗 | `TgPanel.tsx`、`CacheManagerDialog.tsx` |
 | P5 设置+校验 | 库根设置项（默认同级 library）；导出完备性校验端点+预览 | 设置页、`routes.rs` |

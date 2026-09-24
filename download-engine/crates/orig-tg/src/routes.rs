@@ -711,6 +711,11 @@ async fn local_file(
     };
     // 契约与媒体库条目投递完全一致（见 serve_local_file）：
     // Range / ETag / Last-Modified / MIME 判定只有一处实现，避免「已缓存播放」退化。
+    // P2：存在性判定以解析后的绝对路径为准（相对 = 库根相对）。
+    let lib_root = st.store.library_root().await;
+    let path = crate::cache::resolve_item_path(&lib_root, &path)
+        .to_string_lossy()
+        .into_owned();
     if !std::path::Path::new(&path).exists() {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "cached file missing"));
     }
@@ -733,37 +738,72 @@ async fn effective_download_dir(st: &AppState) -> String {
 
 #[derive(Deserialize)]
 struct ConfigUpdateReq {
-    #[serde(rename = "downloadDir")]
-    download_dir: String,
+    #[serde(rename = "downloadDir", default)]
+    download_dir: Option<String>,
+    /// byte-ownership P2：库根（归仓字节的家）。缺省 = 沿用既有解析链
+    /// （env > app_setting > config.json > `<TG 数据目录>/library`），不覆盖。
+    #[serde(rename = "libraryDir", default)]
+    library_dir: Option<String>,
 }
 
-/// GET /api/tg/config — 运行时配置快照（缓存下载目录等）。
+/// GET /api/tg/config — 运行时配置快照（缓存下载目录、库根等）。
 async fn get_config(State(st): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     let download_dir = effective_download_dir(&st).await;
-    Ok(Json(json!({ "downloadDir": download_dir })))
+    let library_root = st.store.library_root().await;
+    Ok(Json(json!({
+        "downloadDir": download_dir,
+        "libraryDir": library_root.to_string_lossy(),
+    })))
 }
 
-/// PUT /api/tg/config — 更新运行时配置（当前仅 downloadDir），持久化到 app_setting。
+/// PUT /api/tg/config — 更新运行时配置，持久化到 app_setting。
+///
+/// 两键独立可选，至少给一个（前端只改其一的请求不会被另一键的缺省清掉）。
 async fn put_config(
     State(st): State<Arc<AppState>>,
     Json(req): Json<ConfigUpdateReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let dir = req.download_dir.trim().to_string();
-    if dir.is_empty() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "downloadDir is empty"));
+    if req.download_dir.is_none() && req.library_dir.is_none() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "nothing to update: provide downloadDir and/or libraryDir",
+        ));
     }
-    // Expand a user-typed leading `~` *before* creating the directory and
-    // persisting it, otherwise Windows would materialise `<CWD>/~/...` (BUG-071).
-    let dir = orig_core::paths::expand_tilde(&dir).to_string_lossy().into_owned();
-    // 预创建校验：目录不可创建（权限/非法字符）时拒绝保存。
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, &format!("create dir: {e}")))?;
-    st.store
-        .set_setting("download_dir", &dir)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-    Ok(Json(json!({ "downloadDir": dir })))
+    let mut resp = json!({});
+    if let Some(raw_dir) = &req.download_dir {
+        let dir = raw_dir.trim().to_string();
+        if dir.is_empty() {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "downloadDir is empty"));
+        }
+        // Expand a user-typed leading `~` *before* creating the directory and
+        // persisting it, otherwise Windows would materialise `<CWD>/~/...` (BUG-071).
+        let dir = orig_core::paths::expand_tilde(&dir).to_string_lossy().into_owned();
+        // 预创建校验：目录不可创建（权限/非法字符）时拒绝保存。
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, &format!("create dir: {e}")))?;
+        st.store
+            .set_setting("download_dir", &dir)
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        resp["downloadDir"] = json!(dir);
+    }
+    if let Some(raw_dir) = &req.library_dir {
+        let dir = raw_dir.trim().to_string();
+        if dir.is_empty() {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "libraryDir is empty"));
+        }
+        let dir = orig_core::paths::expand_tilde(&dir).to_string_lossy().into_owned();
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, &format!("create dir: {e}")))?;
+        st.store
+            .set_setting("library_dir", &dir)
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        resp["libraryDir"] = json!(dir);
+    }
+    Ok(Json(resp))
 }
 
 async fn download(
@@ -821,6 +861,10 @@ async fn cached_path(st: &AppState, chat_id: i64, message_id: i64) -> Option<Str
         return None;
     }
     let p = msg.file_path.clone()?;
+    // P2 起个别路径可能是库根相对的：存在性判定必须先解析再 stat。
+    let p = crate::cache::resolve_item_path(&st.store.library_root().await, &p)
+        .to_string_lossy()
+        .into_owned();
     if tokio::fs::metadata(&p).await.is_ok() {
         Some(p)
     } else {
@@ -1633,15 +1677,20 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
         st.refresh_cache_tasks().await;
         // 类型判定（BUG-049 photo 规则分支用）：tg_message 行的 media_type 优先
         //（预扫已保证行就位，离线可判）；缺行才 RPC 取元数据（旧实现同款兜底）。
-        let media_type = match st.store.get_message(task.chat_id, msg_id).await {
-            Ok(Some(m)) => m.media_type,
-            _ => st
-                .client
-                .message_meta(task.chat_id, msg_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|m| m.media_type),
+        // caption 顺带取出（P2 归仓文件命名 titleSlug 用，同一行不查两次）。
+        let (media_type, tg_caption) = match st.store.get_message(task.chat_id, msg_id).await {
+            Ok(Some(m)) => (m.media_type, m.caption),
+            _ => {
+                let meta = st
+                    .client
+                    .message_meta(task.chat_id, msg_id)
+                    .await
+                    .ok()
+                    .flatten();
+                let media_type = meta.as_ref().and_then(|m| m.media_type.clone());
+                let caption = meta.map(|m| m.caption).flatten();
+                (media_type, caption)
+            }
         };
         let photo_rule = media_type.as_deref() == Some("photo");
 
@@ -1683,14 +1732,31 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
             Ok(outcome) => {
                 match &registered {
                     Some((item, _)) => {
-                        // 字节落盘 → 专用语句回填 file_path（不走 COALESCE upsert）；
-                        // 顺手把 kind 对齐到扩展名分类（T0 时无文件可判）。
-                        let ext = path_ext(&outcome.path);
+                        // byte-ownership P2（I2 归仓）：先把字节**移动**进库根
+                        //（失败自动降级：留原位、回填绝对路径，见 house_downloaded_bytes），
+                        // 再用专用语句回填 `file_path` = 库根相对路径（不走 COALESCE
+                        // upsert——MEDIA-DESIGN C3：那会粘住旧路径）；kind 顺手对齐
+                        // 到扩展名分类（T0 时无文件可判）。
+                        let housed = crate::cache::house_downloaded_bytes(
+                            st,
+                            task.chat_id,
+                            msg_id,
+                            &outcome.path,
+                            tg_caption.as_deref(),
+                        )
+                        .await;
+                        // 归仓移动后原落盘位置已空：tg 消息侧的缓存路径必须跟着
+                        // 指到真实文件，否则 `cached_path` 幂等判定会误判「未缓存」。
+                        let _ = st
+                            .store
+                            .mark_downloaded(task.chat_id, msg_id, Some(&housed.absolute_path))
+                            .await;
+                        let ext = path_ext(&housed.absolute_path);
                         let _ = st
                             .store
                             .backfill_item_bytes(
                                 *item,
-                                &outcome.path,
+                                &housed.item_path,
                                 crate::media::classify_ext(&ext),
                             )
                             .await;
@@ -2086,7 +2152,11 @@ async fn downloaded_map(
     let mut missing: Vec<i64> = Vec::new();
     let mut unknown = 0usize;
     for (id, path) in rows {
-        match crate::cache::probe_cached_bytes(&path).await {
+        // P2：库内规范形式（相对 = 库根相对）先解析再探测，口径与投递侧一致。
+        let absolute = crate::cache::resolve_item_path(&st.store.library_root().await, &path)
+            .to_string_lossy()
+            .into_owned();
+        match crate::cache::probe_cached_bytes(&absolute).await {
             crate::cache::BytesPresence::Present => {
                 map.insert(id.to_string(), serde_json::Value::String(path));
             }
@@ -2488,15 +2558,23 @@ async fn delete_media_item(
                 ),
             ));
         }
-        // 标记已清除，才轮到破坏性动作：删**下载目录内**的字节（外部文件永不删）。
+        // 标记已清除，才轮到破坏性动作：删**下载目录或库根内**的字节（外部文件永不删）。
+        // P2 归仓字节在库根下（`file_path` 是库根相对路径），同样属本系统产出——
+        // 删条目是唯一能带走它们的链（`cache/clear` 按 I3 对库根字节让路），漏掉
+        // 这里就会留下无任何回收通道的孤儿。
         if let Some(p) = item.file_path.as_deref() {
             let dir = crate::cache::download_dir(&st).await;
-            if crate::cache::inside_dir(&dir, p) {
-                if let Err(e) = std::fs::remove_file(p) {
+            let lib_root = st.store.library_root().await;
+            let absolute = crate::cache::resolve_item_path(&lib_root, p);
+            let absolute_str = absolute.to_string_lossy().into_owned();
+            let owned = crate::cache::inside_dir(&dir, &absolute_str)
+                || crate::cache::inside_dir(&lib_root, &absolute_str);
+            if owned {
+                if let Err(e) = std::fs::remove_file(&absolute) {
                     bytes_removed = false;
                     bytes_error = Some(e.to_string());
                     let msg = format!(
-                        "delete_media_item: remove_file failed for {p} (item {id}): {e}; \
+                        "delete_media_item: remove_file failed for {absolute_str} (item {id}): {e}; \
                          entry deleted anyway, bytes left behind \
                          (reclaim via POST /api/cache/clear?scope=orphan)"
                     );
@@ -2822,6 +2900,9 @@ async fn media_item_raw(
         }
     };
     // 与 TG 已缓存投递共用同一实现（serve_local_file）：Range / ETag / MIME 一处定义。
+    // P2：file_path 是库内规范形式（相对 = 库根相对），投递前先解析。
+    let lib_root = st.store.library_root().await;
+    let p = crate::cache::resolve_item_path(&lib_root, &p).to_string_lossy().into_owned();
     serve_local_file(&p, Some(item.kind.as_str()), item.duration, &headers).await
 }
 

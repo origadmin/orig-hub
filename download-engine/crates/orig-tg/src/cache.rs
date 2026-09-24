@@ -68,6 +68,148 @@ pub async fn download_dir(st: &AppState) -> PathBuf {
     orig_core::paths::expand_tilde(&raw)
 }
 
+// ---- 库根（byte-ownership P2：归仓移动 + 相对路径） ----
+
+/// 库内条目路径 → 磁盘绝对路径（P2 的**唯一**解析器）。
+///
+/// `media_item.file_path` 自 P2 起存**库根相对路径**（归仓产出）；存量条目仍是
+/// 绝对路径。规则：绝对 → 原样（存量兼容，一字不改）；相对 → join 库根。
+/// **所有**读条目字节的路径都必须先过这一道——直接 stat 相对路径会把
+/// 「文件在库里」误判成「文件没了」。
+pub fn resolve_item_path(lib_root: &Path, path: &str) -> PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        lib_root.join(p)
+    }
+}
+
+/// 文件名安全片段：保留字母数字与 `-._`，其余（空格/斜体符号/路径分隔符…）
+/// 折叠为 `-`，折叠产生的连续 `-` 不重复，掐头去尾，上限 40 字符。空结果返回 None。
+///
+/// 用于归仓命名（`<chatSlug>-<chatId>/<messageId>-<titleSlug>.<ext>`）——
+/// 标题/caption 是任意用户文本，直接进文件名会出现非法字符或路径穿越。
+pub fn slugify(s: &str) -> Option<String> {
+    const MAX: usize = 40;
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        return None;
+    }
+    Some(out.chars().take(MAX).collect())
+}
+
+/// 归仓结果：`media_item.file_path` 该回填什么、文件实际在哪。
+#[derive(Debug, Clone)]
+pub struct HousedBytes {
+    /// 回填 `media_item.file_path` 的规范值：归仓成功 = **库根相对路径**
+    /// （正斜杠，跨平台稳定）；降级 = 原落盘**绝对路径**（I2 降级条款）。
+    pub item_path: String,
+    /// 实际落盘的绝对路径（`mark_downloaded` / 响应 `absolutePath` 用）。
+    pub absolute_path: String,
+}
+
+/// 把下载完成的文件**移动**进库根（I2 归仓 = 移动，不拷贝）。
+///
+/// 命名 `<库根>/<chatSlug>-<chatId>/<messageId>-<titleSlug>.<ext>`——用**稳定标识**
+/// （消息号 + 标题 slug）而非集号：集号会因移动/重编号漂移，消息号永不
+/// （对设计 §4-P2 命名的有意偏离，理由 = 稳定性，文档已注明）。
+/// 两步走：先 rename 到目标目录内的临时名（同卷原子），再 rename 到最终名
+/// （原子发布）——最终名从不以半成品形态出现。
+///
+/// 降级（I2）：mkdir / rename 失败（跨盘、权限、源缺失）→ 文件**留在原位**，
+/// 回填绝对路径，warn 日志——登记事实不回滚。
+pub async fn house_downloaded_bytes(
+    st: &AppState,
+    chat_id: i64,
+    message_id: i64,
+    src: &str,
+    title: Option<&str>,
+) -> HousedBytes {
+    let fallback = || HousedBytes {
+        item_path: src.to_string(),
+        absolute_path: src.to_string(),
+    };
+    let lib_root = st.store.library_root().await;
+    // chatSlug 取频道标题（未监控频道退化 "chat"）；titleSlug 取 caption 首行。
+    let chat_slug = st
+        .store
+        .list_channels()
+        .await
+        .ok()
+        .and_then(|chs| {
+            chs.into_iter()
+                .find(|c| c.channel_id == chat_id)
+                .map(|c| c.title)
+        })
+        .and_then(|t| slugify(&t))
+        .unwrap_or_else(|| "chat".to_string());
+    let title_slug = title
+        .and_then(slugify)
+        .unwrap_or_else(|| "media".to_string());
+    let ext = Path::new(src)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    let chat_dir = format!("{chat_slug}-{chat_id}");
+    let final_name = format!("{message_id}-{title_slug}{ext}");
+    match house_into(&lib_root, &chat_dir, &final_name, Path::new(src)).await {
+        Ok(final_abs) => {
+            let rel = format!("{}/{}", chat_dir.replace('\\', "/"), final_name);
+            HousedBytes {
+                item_path: rel,
+                absolute_path: final_abs.to_string_lossy().into_owned(),
+            }
+        }
+        Err(e) => {
+            let msg = format!(
+                "house_bytes: move into library root failed for {src} -> \
+                 {chat_dir}/{final_name}: {e}; keeping original location (degraded, I2)"
+            );
+            tracing::warn!("{msg}");
+            st.push_log(&format!("WARN {msg}"));
+            fallback()
+        }
+    }
+}
+
+/// 归仓的纯磁盘动作（`house_downloaded_bytes` 的内核，测试直接驱动注入失败）：
+/// `mkdir -p <root>/<chat_dir>` → `rename src -> tmp` → `rename tmp -> final`。
+/// 任一步失败即原样返回错误（调用方降级），不留半成品：tmp 与 final 同目录，
+/// rename 原子；tmp 残留只在「第二步失败」时可能存在，同名下次归仓会覆盖。
+async fn house_into(
+    lib_root: &Path,
+    chat_dir: &str,
+    final_name: &str,
+    src: &Path,
+) -> std::io::Result<PathBuf> {
+    let target_dir = lib_root.join(chat_dir);
+    let final_abs = target_dir.join(final_name);
+    let tmp = target_dir.join(format!(
+        ".incoming-{}{final_name}",
+        now_secs_pid_suffix()
+    ));
+    tokio::fs::create_dir_all(&target_dir).await?;
+    // 同卷移动；跨盘 rename 会整体失败 → 调用方降级（绝不静默拷贝出第二份，D1）。
+    tokio::fs::rename(src, &tmp).await?;
+    tokio::fs::rename(&tmp, &final_abs).await?;
+    Ok(final_abs)
+}
+
+fn now_secs_pid_suffix() -> String {
+    let ts = now_secs();
+    format!("{}-{}", ts, std::process::id())
+}
+
 /// 路径是否位于下载目录内（决定「能不能删」）。
 ///
 /// 用 `canonicalize` 消除软链/相对路径差异；文件已不存在时退到父目录判定
@@ -273,7 +415,19 @@ impl Purged {
 ///
 /// 集合档与分档共用同一实现，避免「某条路忘了复位 TG 标记」这类分支漂移
 /// （清字节却仍显示「已缓存」是最难查的一类不一致）。
-async fn purge_item(st: &Arc<AppState>, dir: &Path, it: &CachedBytesDetail) -> Purged {
+///
+/// byte-ownership I3（P2 起生效）：**库根内的字节一律跳过**——归仓产出视为有主，
+/// 与导入/扫描的外部文件同档（「媒体库里的一切都可导出，暂存区里的一切都可丢弃」）。
+async fn purge_item(st: &Arc<AppState>, dir: &Path, lib_root: &Path, it: &CachedBytesDetail) -> Purged {
+    // 归仓字节：file_path 是库根相对路径；或（库根被配进下载目录内的极端配置）
+    // 解析后落在库根内 —— 两种形态都不进清理工作集。
+    let is_housed = !Path::new(&it.file_path).is_absolute();
+    if is_housed || inside_dir(lib_root, &resolve_item_path(lib_root, &it.file_path).to_string_lossy()) {
+        return Purged {
+            skipped: 1,
+            ..Default::default()
+        };
+    }
     if !inside_dir(dir, &it.file_path) {
         // 外部文件（导入/扫描贴进来的）不是缓存产出的字节，永不删除，只如实计数。
         return Purged {
@@ -474,11 +628,12 @@ pub async fn clear(
             ));
         }
         let items = list_items(&st).await?;
+        let lib_root = st.store.library_root().await;
         let mut acc = Purged::default();
         let mut hit = 0u64;
         for it in items.iter().filter(|x| ids.contains(&x.id)) {
             hit += 1;
-            let p = purge_item(&st, &dir, it).await;
+            let p = purge_item(&st, &dir, &lib_root, it).await;
             acc.add(p);
         }
         st.push_log(&format!(
@@ -513,8 +668,16 @@ pub async fn clear(
 
     // —— 孤儿档：清的是磁盘上**没有条目指向**的文件，条目侧无行可改 ——
     if scope == ClearScope::Orphan {
-        let items = list_items(&st).await?;
-        let known: HashSet<String> = items.iter().map(|i| norm_path(&i.file_path)).collect();
+    // 孤儿判定以「条目解析后的绝对路径」为准：P2 起 `file_path` 存的是库根
+    // 相对路径，直接 canonicalize 会落在 CWD 下必然失配，等于把归仓字节当孤儿
+    // 全删 —— 这是本端点最危险的误删面，故 `known` 集必须先过
+    // [`resolve_item_path`] 再归一。
+    let lib_root = st.store.library_root().await;
+    let items = list_items(&st).await?;
+    let known: HashSet<String> = items
+        .iter()
+        .map(|i| norm_path(&resolve_item_path(&lib_root, &i.file_path).to_string_lossy()))
+        .collect();
         let (files, truncated) = scan_cache_files(&dir, ORPHAN_SCAN_LIMIT);
         let mut acc = Purged::default();
         for (p, size) in &files {
@@ -553,18 +716,24 @@ pub async fn clear(
         HashSet::new()
     };
     let now = now_secs();
+    let lib_root = st.store.library_root().await;
     let mut acc = Purged::default();
     for it in items.iter() {
         let keep = match scope {
             ClearScope::All => true,
-            ClearScope::Stale => age_days(&it.file_path, now) >= days,
+            // 相对路径 = 库根相对，`age_days` 直接 stat 必然取不到 mtime 而
+            // 返回 0（不算陈旧 → 宁可少删）。先解析再取年龄，口径与归仓前一致。
+            ClearScope::Stale => {
+                let p = resolve_item_path(&lib_root, &it.file_path);
+                age_days(&p.to_string_lossy(), now) >= days
+            }
             ClearScope::Failed => failed_keys.contains(&it.ref_key),
             ClearScope::Orphan => unreachable!("orphan 档已提前返回"),
         };
         if !keep {
             continue;
         }
-        let p = purge_item(&st, &dir, it).await;
+        let p = purge_item(&st, &dir, &lib_root, it).await;
         acc.add(p);
     }
     st.push_log(&format!(
@@ -609,13 +778,17 @@ pub async fn clear_preview(
     let (mut failed_count, mut failed_bytes) = (0u64, 0u64);
     let mut by_chat: BTreeMap<i64, (u64, u64)> = BTreeMap::new();
     let mut detail = Vec::new();
+    // P2：file_path 可能是库根相对路径——展示/判定一律先解析到绝对。
+    let lib_root = st.store.library_root().await;
 
     for it in items.iter() {
+        let absolute = resolve_item_path(&lib_root, &it.file_path);
+        let absolute = absolute.to_string_lossy().into_owned();
         // 文件可能已被手工删掉：`bytes` 记 0 而不是报错（预览必须容错，
         // 它面对的是随时在变的磁盘，不是一张静态表）。
-        let size = file_len(&it.file_path).unwrap_or(0);
-        let inside = inside_dir(&dir, &it.file_path);
-        let age = age_days(&it.file_path, now);
+        let size = file_len(&absolute).unwrap_or(0);
+        let inside = inside_dir(&dir, &absolute);
+        let age = age_days(&absolute, now);
         let failed = failed_keys.contains(&it.ref_key);
         let chat = chat_of(&it.source, &it.ref_key);
 
@@ -654,7 +827,15 @@ pub async fn clear_preview(
         }
     }
 
-    let known: HashSet<String> = items.iter().map(|i| norm_path(&i.file_path)).collect();
+    let known: HashSet<String> = items
+        .iter()
+        .map(|i| {
+            norm_path(
+                &resolve_item_path(&lib_root, &i.file_path)
+                    .to_string_lossy(),
+            )
+        })
+        .collect();
     let (files, truncated) = scan_cache_files(&dir, ORPHAN_SCAN_LIMIT);
     let (mut orphan_count, mut orphan_bytes) = (0u64, 0u64);
     for (p, size) in &files {
@@ -863,7 +1044,8 @@ fn parse_ids(raw: &str) -> Result<Vec<i64>, ApiError> {
 /// `GET /api/cache/stats` — 缓存占用（`files` / `bytes` / `external`）。
 ///
 /// 「清除缓存文件」是释放磁盘的动作，**不知道占多少就是盲操作**——这是此前漏掉的必需项。
-/// `bytes` 只统计真实存在的、**位于下载目录内**的字节；`external` 是导入/扫描带进来的
+/// `bytes` 只统计真实存在的、**位于下载目录或库根内**的字节（P2 起归仓字节在库根下，
+/// 同属本系统可清理的缓存）；`external` 是导入/扫描带进来的
 /// 外部文件（永不删除，只如实计数）。
 ///
 /// `external` 的形状与 `GET /api/cache/clear/preview` **逐字一致**（BUG-136）：
@@ -874,6 +1056,7 @@ async fn stats(
     State(st): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let dir = download_dir(&st).await;
+    let lib_root = st.store.library_root().await;
     let items = st
         .store
         .list_cached_items()
@@ -882,9 +1065,14 @@ async fn stats(
 
     let (mut bytes, mut files, mut external, mut external_bytes) = (0u64, 0u64, 0u64, 0u64);
     for it in items {
+        // P2 起条目路径可能是库根相对的：先解析再 stat，口径与 preview 一致。
+        // 「内部」= 下载目录**或**库根（归仓字节也是本系统拥有的缓存字节，
+        // 必须计入 bytes/files，否则清理中心会少报可释放空间）。
+        let absolute = resolve_item_path(&lib_root, &it.file_path);
+        let absolute_str = absolute.to_string_lossy().into_owned();
         // 与 `clear_preview` 共用 `file_len`：两处对同一文件的读数必须逐字一致。
-        let size = file_len(&it.file_path);
-        if !inside_dir(&dir, &it.file_path) {
+        let size = file_len(&absolute_str);
+        if !inside_dir(&dir, &absolute_str) && !inside_dir(&lib_root, &absolute_str) {
             external += 1;
             external_bytes += size.unwrap_or(0);
             continue;
@@ -1077,6 +1265,10 @@ mod tests {
     async fn purge_reports_failed_when_the_file_cannot_be_removed() {
         let dir = tmp_dir("purge_fail");
         let st = state().await;
+        // lib_root 必须与下载目录**不同**：本条目路径在下载目录内但不在库根内，
+        // 否则会命中 P2 的 housed-skip（库根内字节视为有主）而不进清理。
+        let lib = dir.join("_lib");
+        std::fs::create_dir_all(&lib).unwrap();
         // 路径在 dir 内（`inside_dir` 对不存在的文件退到父目录判定），
         // 但文件本身不存在 → `remove_file` 必然失败。
         let missing = dir.join("gone.mp4");
@@ -1087,7 +1279,7 @@ mod tests {
             ref_key: "not-a-valid-tg-ref".into(),
             file_path: missing.to_string_lossy().into_owned(),
         };
-        let p = purge_item(&st, &dir, &it).await;
+        let p = purge_item(&st, &dir, &lib, &it).await;
         assert_eq!(p.failed, 1, "删不掉必须计 failed");
         assert_eq!(p.removed, 0, "删不掉绝不能计入 removed —— 那正是谎报");
         assert_eq!(p.bytes, 0, "没删掉就不该报释放了字节");
@@ -1099,6 +1291,8 @@ mod tests {
     async fn purge_reports_removed_when_the_file_is_gone() {
         let dir = tmp_dir("purge_ok");
         let st = state().await;
+        let lib = dir.join("_lib");
+        std::fs::create_dir_all(&lib).unwrap();
         let f = dir.join("real.mp4");
         std::fs::write(&f, vec![0u8; 512]).unwrap();
         let it = CachedBytesDetail {
@@ -1109,10 +1303,100 @@ mod tests {
             ref_key: "x".into(),
             file_path: f.to_string_lossy().into_owned(),
         };
-        let p = purge_item(&st, &dir, &it).await;
+        let p = purge_item(&st, &dir, &lib, &it).await;
         assert_eq!(p.removed, 1, "真删掉了必须计 removed");
         assert_eq!(p.failed, 0, "成功不应被误计为失败");
         assert_eq!(p.bytes, 512, "释放字节数须如实");
         assert!(!f.exists(), "文件必须真的被删掉");
+    }
+
+    // ── byte-ownership P2：库根解析与归仓移动 ─────────────────────────────
+
+    /// 解析器是 P2 的唯一路径闸门：绝对路径原样（存量条目兼容，一字不改），
+    /// 相对路径 join 库根（归仓条目的规范形式）。
+    #[test]
+    fn resolve_item_path_absolute_passthrough_and_relative_join() {
+        let root = Path::new("/tmp/lib");
+        // 绝对：原样返回，绝不 join。
+        let abs = if cfg!(windows) { r"C:\cache\a.mp4" } else { "/cache/a.mp4" };
+        assert_eq!(resolve_item_path(root, abs), PathBuf::from(abs));
+        // 相对：join 库根；反斜杠由 Path::join 统一为平台分隔符。
+        assert_eq!(resolve_item_path(root, "chat-1/10-title.mp4"), root.join("chat-1/10-title.mp4"));
+    }
+
+    /// slugify 的文件名安全性：非法字符折叠为 `-`、连续折叠、掐头去尾、
+    /// 截断到 40 字符；全非法输入必须返回 None（不能产出空文件名或全 `-`）。
+    #[test]
+    fn slugify_folds_illegal_chars_and_caps_length() {
+        assert_eq!(slugify("Hello, World! 你好").as_deref(), Some("Hello-World-你好"));
+        assert_eq!(slugify("a  //  b").as_deref(), Some("a-b"));
+        assert_eq!(slugify("--edge--case--").as_deref(), Some("edge--case"), "字面 `-` 保留，只掐首尾");
+        assert_eq!(slugify("a/b\\c").as_deref(), Some("a-b-c"), "路径分隔符必须被折叠，不能穿越");
+        let long = slugify(&"x".repeat(100)).unwrap();
+        assert_eq!(long.chars().count(), 40, "文件名片段必须截断");
+        assert_eq!(slugify("///"), None, "全非法输入必须返回 None");
+        assert_eq!(slugify(""), None);
+    }
+
+    /// 归仓主路径：文件**移动**进库根（源位置不再有副本），落在
+    /// `<chatSlug>-<chatId>/<messageId>-<titleSlug>.<ext>`；回填值 = 库根相对
+    /// 路径（正斜杠）。命名只依赖稳定标识 → **确定性**：同参再跑得到同一目标名。
+    #[tokio::test]
+    async fn house_moves_bytes_into_library_root_with_deterministic_name() {
+        let dir = tmp_dir("house_ok");
+        let st = state().await;
+        st.store
+            .set_setting("library_dir", dir.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+
+        let src = dir.join("download").join("src.mp4");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"video-bytes").unwrap();
+
+        // 无频道记录 → chatSlug 退化 "chat"；caption 首行 "My EP 01" → slug。
+        let chat_id = 42i64;
+        let msg_id = 10i64;
+        let housed = house_downloaded_bytes(&st, chat_id, msg_id, &src.to_string_lossy(), Some("My EP 01")).await;
+
+        let expected_rel = format!("chat-{chat_id}/{msg_id}-My-EP-01.mp4");
+        assert_eq!(housed.item_path, expected_rel, "回填值必须是库根相对路径");
+        assert_eq!(
+            Path::new(&housed.absolute_path),
+            &dir.join(&expected_rel),
+            "实际落盘 = 库根 + 相对路径（命名确定性）"
+        );
+        assert!(dir.join(&expected_rel).is_file(), "文件必须真的在库根下");
+        assert!(!src.exists(), "归仓 = 移动，源位置不得留副本");
+
+        // 确定性：另起一个源文件（同 chat/msg/标题），目标名必须与上次相同。
+        let src2 = dir.join("download").join("src2.mp4");
+        std::fs::write(&src2, b"second").unwrap();
+        let housed2 = house_downloaded_bytes(&st, chat_id, msg_id, &src2.to_string_lossy(), Some("My EP 01")).await;
+        assert_eq!(housed2.item_path, expected_rel, "同参输入必须产出同一目标名");
+    }
+
+    /// I2 降级条款：库根不可用（此处把它配置成一个**文件**，mkdir 必败）时
+    /// 文件留在原位、回填绝对路径——登记事实不回滚，也不允许静默丢字节。
+    #[tokio::test]
+    async fn house_falls_back_to_original_location_when_library_root_unusable() {
+        let dir = tmp_dir("house_fallback");
+        let st = state().await;
+        // 把「库根」设成一个真实文件：create_dir_all 会失败。
+        let not_a_dir = dir.join("not-a-dir");
+        std::fs::write(&not_a_dir, b"occupant").unwrap();
+        st.store
+            .set_setting("library_dir", not_a_dir.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+
+        let src = dir.join("keep-here.mp4");
+        std::fs::write(&src, b"bytes").unwrap();
+        let housed = house_downloaded_bytes(&st, 7, 8, &src.to_string_lossy(), Some("t")).await;
+
+        assert_eq!(housed.item_path, src.to_string_lossy(), "降级必须回填原绝对路径");
+        assert_eq!(housed.absolute_path, src.to_string_lossy());
+        assert!(src.exists(), "降级 = 文件留原位");
+        assert!(st.logs.recent(20).iter().any(|l| l.contains("house_bytes")), "降级必须留痕");
     }
 }

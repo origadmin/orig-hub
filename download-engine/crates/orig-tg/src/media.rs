@@ -745,6 +745,12 @@ pub struct MediaItem {
     pub description: Option<String>,
     pub kind: String,
     pub file_path: Option<String>,
+    /// 库根解析后的绝对路径（byte-ownership P2）。`file_path` 是**库内规范形式**
+    ///（归仓成功 = 库根相对路径；降级/外部 = 原样绝对路径），前端展示与导出
+    /// 需要的是文件真实位置 —— 由 `attach_bytes_presence` 在出口统一解析填充
+    ///（`file_path` 为 None 时本字段同样缺席）。
+    #[serde(rename = "absolutePath", skip_serializing_if = "Option::is_none")]
+    pub absolute_path: Option<String>,
     pub poster: Option<String>,
     pub size: Option<i64>,
     pub duration: Option<i64>,
@@ -928,6 +934,8 @@ fn media_item_from_row(r: &Row) -> libsql::Result<MediaItem> {
         title: r.get(3)?,
         kind: r.get(4)?,
         file_path: r.get(5)?,
+        // P2：由 `attach_bytes_presence` 统一解析填充（该函数是所有出口的必经点）。
+        absolute_path: None,
         poster: r.get(6)?,
         size: r.get(7)?,
         duration: r.get(8)?,
@@ -946,7 +954,7 @@ fn media_item_from_row(r: &Row) -> libsql::Result<MediaItem> {
     })
 }
 
-/// 给一批条目补上磁盘字节真值（BUG-132）。
+/// 给一批条目补上磁盘字节真值（BUG-132），并顺手解析绝对路径（P2）。
 ///
 /// **凡是返回 `MediaItem` 的出口都必须过这一道** —— 否则下发的是上面的占位值。
 /// 当前出口只有 `list_media_items` / `get_media_item` 两个；**新增出口时同样必须调用**。
@@ -954,9 +962,17 @@ fn media_item_from_row(r: &Row) -> libsql::Result<MediaItem> {
 /// 成本：每条一次 stat（`tokio::fs`，不占运行时线程、不碰 DB）。一页至多 500 条，
 /// 远低于一次 DB 查询；这里**不做批量裁剪** —— 裁剪等于放行未校验的条目，
 /// BUG-101（「已缓存」却 404）会原样复发。
-pub async fn attach_bytes_presence(items: &mut [MediaItem]) {
+///
+/// P2 起磁盘探测以**解析后的绝对路径**为准（`file_path` 是库根相对路径，
+/// 直接 stat 必然 Missing，等于全库「不可播」）；同一解析结果也回填
+/// `absolute_path`，前端无需重复实现解析链。
+pub async fn attach_bytes_presence(items: &mut [MediaItem], lib_root: &std::path::Path) {
     for it in items.iter_mut() {
-        it.bytes_presence = match it.file_path.as_deref() {
+        it.absolute_path = it
+            .file_path
+            .as_deref()
+            .map(|p| crate::cache::resolve_item_path(lib_root, p).to_string_lossy().into_owned());
+        it.bytes_presence = match it.absolute_path.as_deref() {
             Some(p) => probe_cached_bytes(p).await,
             None => BytesPresence::Missing,
         };
@@ -1029,7 +1045,8 @@ impl Store {
             out.push(media_item_from_row(&r)?);
         }
         self.attach_item_tags(&mut out).await?;
-        attach_bytes_presence(&mut out).await; // BUG-132：出口必须补字节真值
+        let lib_root = self.library_root().await;
+        attach_bytes_presence(&mut out, &lib_root).await; // BUG-132：出口必须补字节真值
         Ok(out)
     }
 
@@ -1110,7 +1127,8 @@ impl Store {
                 let mut v = vec![it];
                 self.attach_item_tags(&mut v).await?;
                 it = v.remove(0);
-                attach_bytes_presence(std::slice::from_mut(&mut it)).await; // BUG-132
+                let lib_root = self.library_root().await;
+                attach_bytes_presence(std::slice::from_mut(&mut it), &lib_root).await; // BUG-132
                 Ok(Some(it))
             }
             None => Ok(None),
@@ -1496,12 +1514,18 @@ impl Store {
             )
             .await?;
         let mut rows = stmt.query(params![id]).await?;
+        // P2：分集探测与条目视图同规 —— 以解析后的绝对路径 stat
+        //（相对路径 = 库根相对，直接 stat 必然落空）。
+        let lib_root = self.library_root().await;
         let mut episodes = Vec::new();
         while let Some(r) = rows.next().await? {
             // BUG-132：同 `attach_bytes_presence` —— 分集与条目共用 `probe_cached_bytes`。
             let file_path: Option<String> = r.get(14)?;
             let presence = match file_path.as_deref() {
-                Some(p) => probe_cached_bytes(p).await,
+                Some(p) => {
+                    let abs = crate::cache::resolve_item_path(&lib_root, p);
+                    probe_cached_bytes(&abs.to_string_lossy()).await
+                }
                 None => BytesPresence::Missing,
             };
             episodes.push(EpisodeView {
@@ -5704,6 +5728,8 @@ mod tests {
             description: None,
             kind: "video".into(),
             file_path: path,
+            // P2：测试用绝对路径，解析为恒等；统一走 attach_bytes_presence 填充。
+            absolute_path: None,
             poster: None,
             size: None,
             duration: None,
@@ -5736,7 +5762,8 @@ mod tests {
             item_with_path(2, Some(dir.join("gone.mp4").to_string_lossy().to_string())),
             item_with_path(3, None),
         ];
-        attach_bytes_presence(&mut items).await;
+        // 测试路径全是绝对路径：lib_root 随便给（解析为恒等）。
+        attach_bytes_presence(&mut items, &dir).await;
 
         assert_eq!(items[0].bytes_presence, BytesPresence::Present);
         assert_eq!(
@@ -5757,11 +5784,11 @@ mod tests {
         std::fs::write(&p, b"bytes").unwrap();
 
         let mut items = vec![item_with_path(1, Some(p.to_string_lossy().to_string()))];
-        attach_bytes_presence(&mut items).await;
+        attach_bytes_presence(&mut items, &dir).await;
         assert_eq!(items[0].bytes_presence, BytesPresence::Present);
 
         std::fs::remove_file(&p).unwrap();
-        attach_bytes_presence(&mut items).await;
+        attach_bytes_presence(&mut items, &dir).await;
         assert_eq!(
             items[0].bytes_presence,
             BytesPresence::Missing,
@@ -5780,7 +5807,7 @@ mod tests {
         let path = p.to_string_lossy().to_string();
 
         let mut items = vec![item_with_path(1, Some(path.clone()))];
-        attach_bytes_presence(&mut items).await;
+        attach_bytes_presence(&mut items, &dir).await;
         // 分集侧同样的换算（见 `get_series`）：只有 Present 才算 has_bytes
         let episode_has_bytes = probe_cached_bytes(&path).await == BytesPresence::Present;
 

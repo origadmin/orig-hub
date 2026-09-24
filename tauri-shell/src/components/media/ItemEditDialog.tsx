@@ -120,8 +120,9 @@ export function ItemEditDialog(props: {
               来源：{t(sourceLabelKey(item.source))}
             </p>
             <p className="truncate">大小：{fmtSize(item.size)}</p>
-            <p className="truncate" title={item.filePath ?? ''}>
-              路径：{item.filePath ?? '—'}
+            {/* P2：filePath 是库内规范形式（相对路径），展示用后端解析好的绝对路径 */}
+            <p className="truncate" title={item.absolutePath ?? item.filePath ?? ''}>
+              路径：{item.absolutePath ?? item.filePath ?? '—'}
             </p>
             {item.seriesTitle ? <p className="truncate">归属：{item.seriesTitle}</p> : null}
           </div>
