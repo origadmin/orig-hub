@@ -1,6 +1,6 @@
 import { memo } from 'react'
 import { Button } from './ui/button'
-import { ConnLight, SpeedChip } from './ContextBarStatus'
+import { SpeedChip } from './ContextBarStatus'
 import { useStore } from '../store/useStore'
 import {
   selectActiveCount,
@@ -12,10 +12,11 @@ import { useTranslation } from '../i18n'
 import type { OnAction } from './ContextBar'
 
 /**
- * 上下文栏右槽（下载类视图）：连接灯 + 聚合速度 + 新建 / 全部暂停 / 全部开始 /（已完成页）清空。
+ * 上下文栏右槽（下载类视图）：聚合速度 + 新建 / 全部暂停 / 全部开始 /（已完成页）清空。
  *
- * 连接灯（BUG-164）：下载视图此前右槽没有连接态，三角落（顶部/侧栏底部/状态栏）
- * 在半数视图缺一；现与状态分支共用 `ConnLight`，判定同源 `store/connState.ts`。
+ * 连接状态点**不在这里**（BUG-169 终裁）：唯一渲染点在 MainLayout 底栏右下角
+ * （`statusbar-conn`），底栏根部单次渲染、无按视图分叉漏接风险；
+ * BUG-164 加的顶栏 `ConnLight` 已随三处收敛一并移除。
  * 按钮文案、图标、尺寸、变体沿用原 header 内联按钮组（BUG-083 只搬位置，不改语义）。
  * disabled 依据**由本组件自己订阅**（`selectActiveCount` / `selectHasPaused` /
  * `selectHasClearable`），父级不传高频值进来；回调全部是 `useEvent` 恒定引用。
@@ -45,7 +46,6 @@ export const ContextBarActions = memo(function ContextBarActions({
 
   return (
     <>
-      <ConnLight />
       <SpeedChip />
       <Button size="sm" onClick={onNewDownload}>
         <svg

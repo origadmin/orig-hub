@@ -48,6 +48,8 @@ async function readBar(page) {
     const header = document.querySelector('[data-testid="context-bar-header"]')
     const title = document.querySelector('[data-testid="context-bar-title"]')
     const conn = document.querySelector('[data-testid="context-conn"]')
+    // BUG-169 终裁：唯一连接状态点在底栏右下角（statusbar-conn）
+    const footerConn = document.querySelector('[data-testid="statusbar-conn"]')
     const speed = document.querySelector('[data-testid="context-speed"]')
     const active = document.querySelector('[data-testid="context-active"]')
     const box = header ? header.getBoundingClientRect() : null
@@ -60,6 +62,8 @@ async function readBar(page) {
       title: title ? (title.textContent || '').trim() : null,
       connState: conn ? conn.getAttribute('data-conn-state') : null,
       connText: conn ? (conn.textContent || '').trim() : null,
+      footerConnState: footerConn ? footerConn.getAttribute('data-conn-state') : null,
+      footerConnText: footerConn ? (footerConn.textContent || '').trim() : null,
       speed: speed ? (speed.textContent || '').trim() : null,
       active: active ? (active.textContent || '').trim() : null,
       top: box ? Math.round(box.top) : null,
@@ -109,8 +113,10 @@ async function main() {
 
     check(`${testid} 上下文栏存在`, bar.hasHeader, shot)
     check(`${testid} 标题为「${expect}」`, bar.title === expect, `实际「${bar.title}」`)
+    // BUG-169 终裁：顶栏右槽不得再有连接态；唯一状态点在底栏（statusbar-conn）
+    check(`${testid} 右槽无连接态（唯一状态点已收到底栏）`, bar.connState === null, `headerState=${bar.connState}`)
+    check(`${testid} 底栏唯一状态点存在`, bar.footerConnState !== null, `state=${bar.footerConnState} text=${bar.footerConnText}`)
     if (testid === 'nav-media' || testid === 'nav-tg' || testid === 'nav-settings') {
-      check(`${testid} 右槽有连接态`, bar.connState !== null, `state=${bar.connState} text=${bar.connText}`)
       check(`${testid} 右槽无下载按钮`, bar.buttons.length === 0, JSON.stringify(bar.buttons))
     } else {
       const texts = bar.buttons.map((b) => b.text)
