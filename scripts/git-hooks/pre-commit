@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# pre-commit 防御纵深：断言当前仓库确为 orig-hub，否则中止。
+# 目的：防止提交误落到 framework 超仓本体 / 其它仓库（历史上破坏的根因之一）。
+toplevel="$(git rev-parse --show-toplevel 2>/dev/null)"
+basename="$(basename "$toplevel")"
+
+# 1) 必须作用于 orig-hub 仓库（无论位于 framework/projects/orig-hub 还是独立目录）
+if [ "$basename" != "orig-hub" ]; then
+  echo "PRE-COMMIT 拦截: git toplevel 解析到 '$toplevel'，末级目录不是 orig-hub。" >&2
+  echo "你不在 orig-hub 仓库内，已中止提交。" >&2
+  exit 1
+fi
+
+# 2) origin 远端必须是 origadmin/orig-hub
+remote="$(git remote get-url origin 2>/dev/null)"
+case "$remote" in
+  *"origadmin/orig-hub"*)
+    ;;
+  *)
+    echo "PRE-COMMIT 拦截: origin 远端为 '$remote'，不是 origadmin/orig-hub。" >&2
+    echo "你不在正确的 orig-hub 仓库内，已中止提交。" >&2
+    exit 1 ;;
+esac
+
+exit 0
