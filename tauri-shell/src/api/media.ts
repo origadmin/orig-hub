@@ -105,6 +105,8 @@ export interface MediaEpisode {
   episodeNoEnd?: number | null
   /** 同槽备用来源（BUG-039）：同一集的其他缓存来源；主条目不在其中 */
   sources?: EpisodeSourceRef[]
+  /** 集级挂图（BUG-168）：一集可挂多张图，同一张图也可挂到多集；不进播放序列 */
+  images?: EpisodeImageMeta[]
   /**
    * 这一集当前有没有字节（BUG-080；后端 `file_path IS NOT NULL`）。
    * 清缓存只删字节留条目，没有它前端无从分辨「点开能播」与「点了 404」。
@@ -117,6 +119,15 @@ export interface EpisodeSourceRef {
   itemId: number
   title?: string | null
   kind?: MediaKind | null
+}
+
+/** 集级挂图元数据（BUG-168）：`media_episode_image` join `media_item` 的读视图 */
+export interface EpisodeImageMeta {
+  itemId: number
+  /** 原文件落盘路径（TG 图片按规则不落盘时为 null，前端用 raw 端点现取） */
+  path?: string | null
+  poster?: string | null
+  bytes?: number | null
 }
 
 /** 合并时被跳过的分集（同一条目已在目标同季） */
@@ -396,6 +407,29 @@ export function switchEpisodeSource(episodeId: number, itemId: number): Promise<
 /** 摘除备用源（内容保留在资料库） */
 export function detachEpisodeSource(episodeId: number, itemId: number): Promise<{ ok: boolean }> {
   return request(`/api/media/episodes/${episodeId}/sources/${itemId}`, { method: 'DELETE' })
+}
+
+/**
+ * 挂图（BUG-168）：**replace-all** —— 按 itemIds 顺序重写该集的图片位。
+ * 只收 photo 条目（非 photo 后端 422，附明细）；集不存在 404。
+ * 追加语义由调用方组合：把既有挂图与新选的一起下发。
+ */
+export function attachEpisodeImages(
+  episodeId: number,
+  itemIds: number[],
+): Promise<{ ok: boolean; attached: number }> {
+  return request(`/api/media/episodes/${episodeId}/images`, {
+    method: 'POST',
+    body: JSON.stringify({ itemIds }),
+  })
+}
+
+/** 摘除一张挂图（幂等；removed:0 = 本来就没挂，调用方如实提示） */
+export function detachEpisodeImage(
+  episodeId: number,
+  itemId: number,
+): Promise<{ ok: boolean; removed: number }> {
+  return request(`/api/media/episodes/${episodeId}/images/${itemId}`, { method: 'DELETE' })
 }
 
 /**

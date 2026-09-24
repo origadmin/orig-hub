@@ -17,6 +17,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use libsql::params;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -135,6 +136,15 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route(
             "/api/media/episodes/:id/sources/:item_id",
             axum::routing::delete(detach_episode_source),
+        )
+        // 集级图片挂载（BUG-168）：一集可挂多张图（replace-all），一图也可挂多集。
+        .route(
+            "/api/media/episodes/:id/images",
+            axum::routing::post(attach_episode_images),
+        )
+        .route(
+            "/api/media/episodes/:id/images/:item_id",
+            axum::routing::delete(detach_episode_image),
         )
         .route("/api/media/tags", get(list_media_tags).post(create_media_tag))
         .route(
@@ -1299,7 +1309,43 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
     // 单条视频、单张图片同样成剧，因为只有剧集才有「标题 + 介绍 + 标签」的完整档案位。
     // 图片随之成为剧集的**浏览位内容**（封面/图册）；播放序列仍在展示层排除非视频，
     // 「播放时不许出现图片」由 `media_episode_source` 只收 video 的触发器结构性保证。
-    let media_pairs: Vec<(i64, i64)> = ingested.clone();
+    //
+    // BUG-168 细化：组内**同时含视频与照片**时，照片不再各占一个集号（那会挤占
+    // 视频的集数，把「第 N 集」变成图片），改挂到它之前最近的视频所在集的图片位
+    // （首个视频之前的照片归首个视频那一集）；photo-only 组保持现状（照片各自成集，
+    // 浏览位语义不变）。条目 kind 一次批量取回（`item_kinds`），不在循环里逐条判型。
+    // 已有历史数据不做回填。
+    let ingested_kinds = st
+        .store
+        .item_kinds(&ingested.iter().map(|(_, id)| *id).collect::<Vec<_>>())
+        .await
+        .unwrap_or_default();
+    let photo_pairs: Vec<(i64, i64)> = ingested
+        .iter()
+        .filter(|(_, id)| {
+            ingested_kinds
+                .get(id)
+                .map(|k| k == "photo")
+                .unwrap_or(false)
+        })
+        .copied()
+        .collect();
+    let has_video = ingested_kinds.values().any(|k| k == "video");
+    let mixed = has_video && !photo_pairs.is_empty();
+    let media_pairs: Vec<(i64, i64)> = if mixed {
+        ingested
+            .clone()
+            .into_iter()
+            .filter(|(_, id)| {
+                ingested_kinds
+                    .get(id)
+                    .map(|k| k != "photo")
+                    .unwrap_or(true)
+            })
+            .collect()
+    } else {
+        ingested.clone()
+    };
 
     // 整组缓存 → 自动成剧（BUG-031）：一批内容按 message_ids 顺序编为第 1..N 集。
     //
@@ -1449,6 +1495,44 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
         ));
         None
     };
+    // BUG-168：混编组（video + photo）的照片挂到目标集的图片位（归属规则见上方
+    // media_pairs 注释）。**追加式**（`add_episode_image`，insert-or-ignore）：
+    // 重复缓存不会挂第二遍，也不得清掉用户已挂的图。挂图没有墓碑 —— 同一组重新
+    // 缓存时用户摘过的图会回来，属已知取舍（历史数据亦不回填）。
+    if mixed && !photo_pairs.is_empty() {
+        if let Some(sid) = sid {
+            let video_pairs: Vec<(i64, i64)> = media_pairs.clone();
+            for (mid, item) in &photo_pairs {
+                // 组内消息顺序中它之前最近的一个视频；前面没有视频则归首个视频。
+                let target_msg = video_pairs
+                    .iter()
+                    .map(|(m, _)| *m)
+                    .filter(|m| *m < *mid)
+                    .max()
+                    .or_else(|| video_pairs.iter().map(|(m, _)| *m).min());
+                let Some(target_msg) = target_msg else {
+                    continue;
+                };
+                let Some((_, target_item)) = video_pairs.iter().find(|(m, _)| *m == target_msg)
+                else {
+                    continue;
+                };
+                match st.store.episode_id_of_item(sid, *target_item).await {
+                    Ok(Some(eid)) => {
+                        if let Err(e) = st.store.add_episode_image(eid, *item).await {
+                            st.push_log(&format!(
+                                "cache task {task_id}: attach photo {mid} to episode {eid}: {e}"
+                            ));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => st.push_log(&format!(
+                        "cache task {task_id}: find episode for item {target_item}: {e}"
+                    )),
+                }
+            }
+        }
+    }
     // 标签归档：剧集与条目**同时**归档（union 语义，不清空手工标签、不产生重复关联）。
     //
     // 此前是「有剧集→只写剧集，没剧集→只写条目」的二选一，于是条目卡片永远显示 0 个
@@ -3184,6 +3268,71 @@ async fn detach_episode_source(
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     Ok(Json(json!({"ok": true})))
+}
+
+// ── 集级图片挂载（BUG-168）─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct EpisodeImagesReq {
+    #[serde(rename = "itemIds")]
+    item_ids: Vec<i64>,
+}
+
+/// `POST /api/media/episodes/:id/images` — 挂图（**replace-all** 语义，BUG-168）。
+/// 按 `itemIds` 数组顺序重写该集的图片位；集不存在 → 404，
+/// 混入非 photo 条目 → 422（附明细，不静默过滤）。
+async fn attach_episode_images(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<EpisodeImagesReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let exists = st
+        .store
+        .row_opt("SELECT 1 FROM media_episode WHERE id = ?1", params![id])
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if exists.is_none() {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "episode not found"));
+    }
+    let kinds = st
+        .store
+        .item_kinds(&body.item_ids)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let rejected: Vec<i64> = body
+        .item_ids
+        .iter()
+        .filter(|id| kinds.get(*id).map(|k| k != "photo").unwrap_or(true))
+        .copied()
+        .collect();
+    if !rejected.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("only photo items can be attached as episode images, rejected: {rejected:?}"),
+        ));
+    }
+    let attached = st
+        .store
+        .attach_episode_images(id, &body.item_ids)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(json!({"ok": true, "attached": attached})))
+}
+
+/// `DELETE /api/media/episodes/:id/images/:item_id` — 摘除一张挂图（幂等，BUG-168）。
+/// 未挂过也 200（`removed:0` 如实回报，不伪装失败也不伪装成功）。
+async fn detach_episode_image(
+    State(st): State<Arc<AppState>>,
+    Path((id, item_id)): Path<(i64, i64)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let removed = st
+        .store
+        .detach_episode_image(id, item_id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(
+        json!({"ok": true, "removed": if removed { 1 } else { 0 }}),
+    ))
 }
 
 /// `DELETE /api/media/episodes/:id` — 从剧集中移除单集（内容保留）。

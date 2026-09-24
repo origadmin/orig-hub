@@ -6,6 +6,7 @@ import {
   Film,
   GitMerge,
   Image as ImageIcon,
+  ImagePlus,
   Music,
   Pencil,
   Play,
@@ -15,7 +16,7 @@ import {
 } from 'lucide-react'
 import { Button } from '../ui/button'
 import { Input } from '../ui/input'
-import type { MediaEpisode, MediaSeries, MediaSeriesDetail, MediaTag } from '../../api/media'
+import type { MediaEpisode, MediaItem, MediaSeries, MediaSeriesDetail, MediaTag } from '../../api/media'
 import { mediaItemUrl } from '../../api/media'
 import {
   canRecacheFromSource,
@@ -31,6 +32,9 @@ import {
   patchEpisode,
   moveEpisode,
   switchEpisodeSource,
+  attachEpisodeImages,
+  detachEpisodeImage,
+  listMediaItems,
 } from '../../api/media'
 import { generateVideoPoster } from '../../lib/poster'
 import { TagPicker } from './TagManagerDialog'
@@ -369,6 +373,22 @@ export function SeriesDetail(props: {
       setBusy(false)
     }
   }
+
+  /**
+   * 摘除一张集级挂图（BUG-168）：只摘关联，图片条目留在资料库。
+   * `removed:0`（本来就没挂）不单独提示 —— 目标态已达成，与成功同观感。
+   */
+  const removeEpisodeImage = async (epId: number, itemId: number) => {
+    try {
+      await detachEpisodeImage(epId, itemId)
+      onChanged()
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  /** 集级挂图选择对话框（BUG-168）：列出媒体库的 photo 条目，多选后 replace-all 挂载 */
+  const [pickingImages, setPickingImages] = useState<MediaEpisode | null>(null)
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -789,6 +809,17 @@ export function SeriesDetail(props: {
                                 {ep.sources!.length + 1} 源
                               </button>
                             )}
+                            {/* 集级挂图（BUG-168）：打开图片选择对话框，给这一集挂/换图片 */}
+                            <button
+                              type="button"
+                              onClick={() => setPickingImages(ep)}
+                              title={t('media.attachImages')}
+                              aria-label={t('media.attachImages')}
+                              data-testid="episode-attach-images"
+                              className="shrink-0 rounded px-1 text-muted hover:bg-surface-2 hover:text-fg-mid"
+                            >
+                              <ImagePlus className="h-3 w-3" />
+                            </button>
                           </div>
                           {/* 副行按类型给语义：图片没有时长概念，显示「--:--」会被误当可播内容 */}
                           <p className="text-[10px] text-muted">
@@ -852,6 +883,38 @@ export function SeriesDetail(props: {
                           移除
                         </Button>
                       </div>
+                      {/* 集级挂图缩略条（BUG-168）：每集自己的图片，可单张摘除。
+                          复用图片条目的 raw 地址作缩略（与剧集图册同一 resolver）。 */}
+                      {(ep.images?.length ?? 0) > 0 && (
+                        <div
+                          className="mt-1.5 flex flex-wrap gap-1.5 pl-[4.25rem]"
+                          data-testid="episode-images"
+                        >
+                          {ep.images!.map((img) => (
+                            <div
+                              key={img.itemId}
+                              className="group/img relative h-12 w-16 shrink-0 overflow-hidden rounded border border-border-subtle bg-surface-2"
+                            >
+                              <img
+                                src={mediaItemUrl(img.itemId)}
+                                alt=""
+                                loading="lazy"
+                                className="h-full w-full object-cover"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => void removeEpisodeImage(ep.id, img.itemId)}
+                                title={t('media.removeEpisodeImage')}
+                                aria-label={t('media.removeEpisodeImage')}
+                                data-testid="episode-image-remove"
+                                className="absolute right-0 top-0 flex h-4 w-4 items-center justify-center rounded-bl bg-black/60 text-white opacity-0 transition-opacity hover:bg-destructive focus-visible:opacity-100 group-hover/img:opacity-100"
+                              >
+                                <X className="h-3 w-3" />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                       {editingEp === ep.id ? (
                         <div className="mt-1.5 space-y-1.5 pl-[4.25rem]">
                           {/* 标题改在行内（与列表同一行），不再单独开一行（BUG-076）。
@@ -997,6 +1060,154 @@ export function SeriesDetail(props: {
           </p>
         </div>
       ) : null}
+
+      {/* 集级挂图选择对话框（BUG-168） */}
+      {pickingImages && (
+        <EpisodeImagePickerDialog
+          episode={pickingImages}
+          onClose={() => setPickingImages(null)}
+          onError={onError}
+          onChanged={onChanged}
+        />
+      )}
+    </div>
+  )
+}
+
+/**
+ * 集级挂图选择对话框（BUG-168）：列出媒体库里 kind=photo 的条目，多选后确认挂载。
+ *
+ * 后端是 **replace-all** 语义（一次请求重写该集的图片位），这里把「既有挂图 + 新勾选」
+ * 一起下发，对用户的观感就是「勾选即追加」，不用理解接口语义。
+ * 确认失败走 `onError`（toast），对话框保持打开、勾选不丢。
+ */
+function EpisodeImagePickerDialog(props: {
+  episode: MediaEpisode
+  onClose: () => void
+  onError: (msg: string) => void
+  onChanged: () => void
+}) {
+  const { t } = useTranslation()
+  const { episode, onClose, onError, onChanged } = props
+  const [photos, setPhotos] = useState<MediaItem[] | null>(null)
+  /** 预填既有挂图：确认时一并下发（replace-all 下表现为「追加勾选」） */
+  const [selected, setSelected] = useState<number[]>(
+    episode.images?.map((i) => i.itemId) ?? [],
+  )
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    listMediaItems({ kind: 'photo', limit: 200 })
+      .then((r) => {
+        if (alive) setPhotos(r.items)
+      })
+      .catch((e: unknown) => {
+        if (alive) onError(e instanceof Error ? e.message : String(e))
+      })
+    return () => {
+      alive = false
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const toggle = (id: number) =>
+    setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]))
+
+  const confirm = async () => {
+    setBusy(true)
+    try {
+      await attachEpisodeImages(episode.id, selected)
+      onChanged()
+      onClose()
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6"
+      onClick={onClose}
+    >
+      <div
+        className="flex max-h-[80vh] w-full max-w-2xl flex-col rounded-lg border border-border-subtle bg-surface p-4"
+        onClick={(e) => e.stopPropagation()}
+        data-testid="episode-image-picker"
+      >
+        <div className="mb-2 flex items-center justify-between">
+          <h4 className="text-[13px] font-semibold text-fg-strong">
+            {t('media.episodeImagesTitle', { no: episode.episodeNo })}
+          </h4>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="关闭"
+            className="flex h-7 w-7 items-center justify-center rounded text-muted hover:bg-surface-2 hover:text-fg-mid"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {photos === null ? (
+            <p className="py-8 text-center text-xs text-muted">…</p>
+          ) : photos.length === 0 ? (
+            <p className="py-8 text-center text-xs text-muted">{t('media.noPhotosInLibrary')}</p>
+          ) : (
+            <div className="grid grid-cols-4 gap-2 sm:grid-cols-6">
+              {photos.map((p) => {
+                const on = selected.includes(p.id)
+                return (
+                  <button
+                    key={p.id}
+                    type="button"
+                    onClick={() => toggle(p.id)}
+                    title={p.title}
+                    aria-pressed={on}
+                    data-testid="episode-image-option"
+                    className={`relative overflow-hidden rounded border transition-colors ${
+                      on ? 'border-accent ring-1 ring-accent' : 'border-border-subtle hover:border-accent/50'
+                    }`}
+                  >
+                    <img
+                      src={mediaItemUrl(p.id)}
+                      alt={p.title}
+                      loading="lazy"
+                      className="aspect-square h-full w-full object-cover"
+                    />
+                    {on && (
+                      <span className="absolute inset-0 flex items-end justify-end bg-accent/20 p-0.5">
+                        <span className="rounded-full bg-accent px-1 text-[9px] font-semibold leading-4 text-white">
+                          ✓
+                        </span>
+                      </span>
+                    )}
+                  </button>
+                )
+              })}
+            </div>
+          )}
+        </div>
+        <div className="mt-3 flex items-center justify-between">
+          <span className="text-[11px] text-muted">{t('media.selectedImages', { n: selected.length })}</span>
+          <div className="flex gap-2">
+            <Button variant="outline" size="sm" className="h-7 px-3 text-[11px]" onClick={onClose}>
+              {t('media.imagePickerCancel')}
+            </Button>
+            <Button
+              size="sm"
+              className="h-7 px-3 text-[11px]"
+              disabled={busy}
+              onClick={() => void confirm()}
+              data-testid="episode-image-picker-confirm"
+            >
+              {t('media.imagePickerConfirm')}
+            </Button>
+          </div>
+        </div>
+      </div>
     </div>
   )
 }

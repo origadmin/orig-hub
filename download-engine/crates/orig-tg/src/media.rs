@@ -376,6 +376,57 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
     )
     .await?;
 
+    // ── 集级图片挂载（BUG-168）──
+    //
+    // 一集可挂 1..n 张图，同一张图也可挂到多集（主键 (episode_id, item_id) 去重，
+    // `sort_no` 保住前端给的顺序）。与 `media_episode_source`（播放来源，只认 video）
+    // 语义正交：这里挂的是**浏览位**图片，永远不进播放序列。
+    //
+    // libsql 本地后端不强制外键，级联清理用触发器表达（与 `trg_media_episode_cleanup_sources`
+    // 同一纪律：⚠️ 先 DROP 再 CREATE，避免旧触发器定义残留）。
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS media_episode_image (
+            episode_id INTEGER NOT NULL,
+            item_id    INTEGER NOT NULL,
+            sort_no    INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (episode_id, item_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_media_episode_image_item ON media_episode_image(item_id);
+        DROP TRIGGER IF EXISTS trg_media_episode_image_cleanup_episode;
+        CREATE TRIGGER trg_media_episode_image_cleanup_episode
+            AFTER DELETE ON media_episode
+            FOR EACH ROW
+            BEGIN
+                DELETE FROM media_episode_image WHERE episode_id = OLD.id;
+            END;
+        DROP TRIGGER IF EXISTS trg_media_episode_image_cleanup_item;
+        CREATE TRIGGER trg_media_episode_image_cleanup_item
+            AFTER DELETE ON media_item
+            FOR EACH ROW
+            BEGIN
+                DELETE FROM media_episode_image WHERE item_id = OLD.id;
+            END;
+        "#,
+    )
+    .await?;
+    // 数据层兜底：只有 photo 条目能挂进图片位（路由层会先给可读的 422，这里拦住
+    // 一切绕过路由的写路径——与 BUG-044 的触发器守门同一思路）。
+    conn.execute_batch(
+        r#"
+        DROP TRIGGER IF EXISTS trg_media_episode_image_photo_only_ins;
+        CREATE TRIGGER trg_media_episode_image_photo_only_ins
+            BEFORE INSERT ON media_episode_image
+            FOR EACH ROW
+            WHEN (SELECT kind FROM media_item WHERE id = NEW.item_id) IS NOT 'photo'
+            BEGIN
+                SELECT RAISE(ABORT, 'episode image must be a photo item');
+            END;
+        "#,
+    )
+    .await?;
+
     // ── BUG-044 规则级不变量：剧集分集与备用源**只能是视频** ──
     //
     // 「图片是浏览点，与视频无关」——播放一个视频永远不能播到一张图片。
@@ -446,6 +497,11 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
     // 单张图片也成剧，因为只有剧集才有「标题 + 介绍 + 标签」的完整档案位。
     // 因此对分集放宽到 `video | photo`；图片作为**浏览位内容**入剧，
     // 播放序列在展示层排除非视频（播放永远与图片无关）。
+    //
+    // BUG-168 细化（自动入库路径）：组内**同时含视频与照片**时，照片不再各占一个
+    // 集号（那会挤占视频的集数、把「第 N 集」变成图片），改挂到它之前最近的视频
+    // 所在集的图片位（`media_episode_image`）；photo-only 组保持现状（照片各自成集，
+    // 浏览位语义不变）。
     //
     // **唯一剩下的硬门是播放源**：`media_episode_source` 仍只接受 video ——
     // 「播放视频时播放到图片」这个错误从此在结构上不可表达，而不是靠展示层自觉。
@@ -775,6 +831,24 @@ pub struct EpisodeView {
     /// 于是清完缓存的分集在外观上与被伪装成可播的正常内容完全一致。
     /// **不新增列**：事实态已经由 `file_path` 表达，这里只是把它读出来。
     pub has_bytes: bool,
+    /// 集级挂图（BUG-168）：一集可挂 1..n 张图，同一张图也可挂到多集。
+    /// 与 `sources`（播放来源，只认 video）语义正交 —— 这里是**浏览位**，不进播放序列。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<EpisodeImageMeta>,
+}
+
+/// 集级挂图元数据（BUG-168）：`media_episode_image` join `media_item` 的读视图。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpisodeImageMeta {
+    /// 图片条目 id（前端据此拼 raw/缩略地址，与图片条目卡同一 resolver）。
+    pub item_id: i64,
+    /// 原文件落盘路径（`media_item.file_path`；TG 图片按规则不落盘时为 None）。
+    pub path: Option<String>,
+    /// 缩略/封面位（`media_item.poster`）。
+    pub poster: Option<String>,
+    /// 磁盘字节真值（`media_item.size`；未落盘为 None）。
+    pub bytes: Option<i64>,
 }
 
 /// 备用来源引用（剧集详情里展示「N 源」并支持切换主源）。
@@ -1422,6 +1496,7 @@ impl Store {
                 // 按「不声称可播」处理 —— 与 `cache.rs` 的三态语义一致。
                 has_bytes: presence == BytesPresence::Present,
                 sources: Vec::new(),
+                images: Vec::new(),
             });
         }
         // 备用来源（BUG-039）：一次查询补齐全部分集的来源列表（避免逐集 N+1）。
@@ -1436,7 +1511,7 @@ impl Store {
                   ORDER BY s.created_at ASC, s.id ASC"
             );
             let stmt = self.conn.prepare(&sql).await?;
-            let mut rows = stmt.query(ids).await?;
+            let mut rows = stmt.query(ids.clone()).await?;
             let mut by_ep: std::collections::HashMap<i64, Vec<SourceRef>> =
                 std::collections::HashMap::new();
             while let Some(r) = rows.next().await? {
@@ -1450,6 +1525,36 @@ impl Store {
             for e in episodes.iter_mut() {
                 if let Some(list) = by_ep.remove(&e.id) {
                     e.sources = list;
+                }
+            }
+        }
+        // 集级挂图（BUG-168）：与上方备用来源同一套批量补齐纪律 —— 一条 join 查全
+        // 部剧集的挂图，按 sort_no 排序，避免逐集 N+1（集数可能上百）。
+        if !ids.is_empty() {
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT m.episode_id, m.item_id, i.file_path, i.poster, i.size
+                   FROM media_episode_image m
+                   LEFT JOIN media_item i ON i.id = m.item_id
+                  WHERE m.episode_id IN ({placeholders})
+                  ORDER BY m.sort_no ASC, m.item_id ASC"
+            );
+            let stmt = self.conn.prepare(&sql).await?;
+            let mut rows = stmt.query(ids).await?;
+            let mut by_ep: std::collections::HashMap<i64, Vec<EpisodeImageMeta>> =
+                std::collections::HashMap::new();
+            while let Some(r) = rows.next().await? {
+                let ep_id: i64 = r.get(0)?;
+                by_ep.entry(ep_id).or_default().push(EpisodeImageMeta {
+                    item_id: r.get(1)?,
+                    path: r.get(2)?,
+                    poster: r.get(3)?,
+                    bytes: r.get(4)?,
+                });
+            }
+            for e in episodes.iter_mut() {
+                if let Some(list) = by_ep.remove(&e.id) {
+                    e.images = list;
                 }
             }
         }
@@ -2104,6 +2209,136 @@ impl Store {
             )
             .await?;
         Ok(())
+    }
+
+    // ── 集级图片挂载（BUG-168）─────────────────────────────────────────
+
+    /// 挂载一批图片到某集（**replace-all** 语义，BUG-168）：事务内先清旧挂图，
+    /// 再按数组顺序重写，`sort_no` = 有效下标（重复 id 只落一条，主键兜底）。
+    /// 条目合法性（存在 + kind='photo'）由路由层校验并给可读的 404/422；
+    /// 触发器 `trg_media_episode_image_photo_only_ins` 拦住一切绕过路由的写路径。
+    /// 返回实际挂上的张数。
+    pub async fn attach_episode_images(
+        &self,
+        episode_id: i64,
+        item_ids: &[i64],
+    ) -> libsql::Result<u64> {
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let res: libsql::Result<u64> = async {
+            self.conn
+                .execute(
+                    "DELETE FROM media_episode_image WHERE episode_id = ?1",
+                    params![episode_id],
+                )
+                .await?;
+            let mut n: u64 = 0;
+            let mut seen = HashSet::new();
+            for item_id in item_ids {
+                if !seen.insert(*item_id) {
+                    continue; // 同一批里的重复 id：去重保序，sort_no 不断号
+                }
+                n += self
+                    .conn
+                    .execute(
+                        "INSERT INTO media_episode_image (episode_id, item_id, sort_no, created_at)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![episode_id, item_id, seen.len() as i64 - 1, now_secs()],
+                    )
+                    .await?;
+            }
+            Ok(n)
+        }
+        .await;
+        match res {
+            Ok(n) => self
+                .conn
+                .execute("COMMIT", ())
+                .await
+                .map(|_| n)
+                .map_err(|e| {
+                    let _ = self.conn.execute("ROLLBACK", ());
+                    e
+                }),
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", ());
+                Err(e)
+            }
+        }
+    }
+
+    /// 单张挂图（幂等 insert-or-ignore）——**自动入库路径**专用（BUG-168）：
+    /// 不得清掉用户已挂的图，`sort_no` 续接到现有末尾。返回是否新挂。
+    pub async fn add_episode_image(&self, episode_id: i64, item_id: i64) -> libsql::Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO media_episode_image
+                     (episode_id, item_id, sort_no, created_at)
+                 VALUES (?1, ?2,
+                         (SELECT COALESCE(MAX(sort_no), -1) + 1 FROM media_episode_image
+                           WHERE episode_id = ?1),
+                         ?3)",
+                params![episode_id, item_id, now_secs()],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// 摘除一张挂图（只删关联行；条目保留在资料库）。返回是否确有摘除
+    /// （未挂过 = false，幂等；调用方如实回报 `removed:0`，不伪装成功）。
+    pub async fn detach_episode_image(&self, episode_id: i64, item_id: i64) -> libsql::Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM media_episode_image WHERE episode_id = ?1 AND item_id = ?2",
+                params![episode_id, item_id],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// 某集的挂图列表（按 sort_no；join 条目带出路径/封面/字节供前端渲染）。
+    pub async fn list_episode_images(
+        &self,
+        episode_id: i64,
+    ) -> libsql::Result<Vec<EpisodeImageMeta>> {
+        let stmt = self
+            .conn
+            .prepare(
+                "SELECT m.item_id, i.file_path, i.poster, i.size
+                   FROM media_episode_image m
+                   LEFT JOIN media_item i ON i.id = m.item_id
+                  WHERE m.episode_id = ?1
+                  ORDER BY m.sort_no ASC, m.item_id ASC",
+            )
+            .await?;
+        let mut rows = stmt.query(params![episode_id]).await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(EpisodeImageMeta {
+                item_id: r.get(0)?,
+                path: r.get(1)?,
+                poster: r.get(2)?,
+                bytes: r.get(3)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 某剧集里某条目所在分集的 id（BUG-168 自动挂图用：照片归到它前面视频所在的集）。
+    /// 同一条目可在同剧多季出现，取首行（挂图目标集在自动路径下至多一个主位）。
+    pub async fn episode_id_of_item(
+        &self,
+        series_id: i64,
+        item_id: i64,
+    ) -> libsql::Result<Option<i64>> {
+        self.row_opt(
+            "SELECT id FROM media_episode WHERE series_id = ?1 AND item_id = ?2 LIMIT 1",
+            params![series_id, item_id],
+        )
+        .await?
+        .map(|r| r.get::<i64>(0))
+        .transpose()
     }
 
     /// 该剧集**某一季**已收录的条目 id 集合（供追加去重；粒度同
