@@ -149,7 +149,9 @@ impl AppState {
         // 端口由入参决定（生产恒为 `TG_PORT`=9877，与 daemon 9876 分离）。
         // 凭据显式注入（不依赖父进程环境继承），保证 Tauri/开机重启后 real 模式仍生效；
         // `[tg]` 段为空时回退同目录 `tg/config.json`（BUG-094）。
-        cmd.env("PORT", port.to_string());
+        // 注意：orig-tg 只读 `ORIG_TG_PORT`（见 orig-tg/src/config.rs::load），
+        // 注入 `PORT` 是错名、会被忽略；仅因 orig-tg 默认端口恰为 9877 才未暴露。
+        cmd.env("ORIG_TG_PORT", port.to_string());
         cmd.kill_on_drop(true);
         // 会话与监控库必须落到稳定数据目录，免得 orig-tg 用 CWD 相对的默认路径，
         // 每次启动 CWD 变化就新生成会话 → 反复登录。目录在注入前先确保存在。
