@@ -117,6 +117,8 @@ export function VideoPlayer({
   const [showCountdown, setShowCountdown] = useState(false)
   const [fatal, setFatal] = useState(false)
   const [fellBack, setFellBack] = useState(false)
+  /** 拖拽中的视觉位置（null = 未在拖拽）：只喂条面渲染，不碰 `currentTime`（BUG-165） */
+  const [dragRatio, setDragRatio] = useState<number | null>(null)
 
   /** 视频轨解不出来 / 解码吃力 —— 两类 onError 抓不到的静默失败（BUG-034）。
    *  换源或改倍速都重设基线：倍速变化会改变所需解码吞吐，旧账不能算到新状态上（BUG-053）。 */
@@ -284,12 +286,15 @@ export function VideoPlayer({
       e.preventDefault()
       const ratio = seekRatioFromClientX(e.clientX)
       if (ratio === null) return
-      seekToRatio(ratio)
+      // 拖拽期**不提交 seek**（BUG-165）：松手前是未确认态，而每次写 `currentTime`
+      // 都会中止旧请求、再发一个新 Range 请求（实测 2s 拖拽 7 发 7 取消）。
+      // 这里只记录视觉位置，条面即时跟手；真正提交在 pointerup。
+      setDragRatio(ratio)
       const el = e.currentTarget
       el.setPointerCapture(e.pointerId)
       setBarHover(true)
     },
-    [seekRatioFromClientX, seekToRatio],
+    [seekRatioFromClientX],
   )
 
   const onBarPointerMove = useCallback(
@@ -297,17 +302,23 @@ export function VideoPlayer({
       if (!e.currentTarget.hasPointerCapture(e.pointerId)) return
       const ratio = seekRatioFromClientX(e.clientX)
       if (ratio === null) return
-      seekToRatio(ratio)
+      setDragRatio(ratio)
     },
-    [seekRatioFromClientX, seekToRatio],
+    [seekRatioFromClientX],
   )
 
-  const onBarPointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
-    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-      e.currentTarget.releasePointerCapture(e.pointerId)
-    }
-    setBarHover(false)
-  }, [])
+  const onBarPointerUp = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId)
+      }
+      setBarHover(false)
+      // 松手 = 确认位：此刻才提交唯一一次 seek（BUG-165）。
+      if (dragRatio !== null) seekToRatio(dragRatio)
+      setDragRatio(null)
+    },
+    [dragRatio, seekToRatio],
+  )
 
   // ---------- 媒体事件 ----------
   const onLoadedMetadata = useCallback(() => {
@@ -432,7 +443,9 @@ export function VideoPlayer({
     return () => document.removeEventListener('keydown', onKey)
   }, [flashCenter, togglePlay, skip, changeVolume, effectiveVolume, toggleMute, toggleFullscreen, togglePiP])
 
-  const playedPct = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0
+  // 拖拽中条面跟手显示拖拽位置（不写 currentTime）；松手后回到真实播放位置
+  const shownSec = dragRatio !== null && duration > 0 ? dragRatio * duration : currentTime
+  const playedPct = duration > 0 ? Math.min(100, (shownSec / duration) * 100) : 0
   const bufferedPct = Math.max(0, Math.min(100, buffered * 100))
 
   return (
@@ -644,10 +657,11 @@ export function VideoPlayer({
             aria-label={t('player.progress')}
             aria-valuemin={0}
             aria-valuemax={Math.floor(duration)}
-            aria-valuenow={Math.floor(currentTime)}
+            aria-valuenow={Math.floor(shownSec)}
             onPointerDown={onBarPointerDown}
             onPointerMove={onBarPointerMove}
             onPointerUp={onBarPointerUp}
+            onPointerCancel={onBarPointerUp}
             onMouseEnter={() => setBarHover(true)}
             onMouseLeave={() => setBarHover(false)}
             className={cn(
@@ -762,7 +776,7 @@ export function VideoPlayer({
 
               {/* 时间 */}
               <span className="min-w-[92px] pl-1 text-xs font-medium tabular-nums text-white/90 md:text-sm">
-                {fmtDuration(Math.floor(currentTime)) || '0:00'} / {fmtDuration(Math.floor(duration)) || '--:--'}
+                {fmtDuration(Math.floor(shownSec)) || '0:00'} / {fmtDuration(Math.floor(duration)) || '--:--'}
               </span>
             </div>
 

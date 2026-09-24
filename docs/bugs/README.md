@@ -176,6 +176,8 @@
 | BUG-162 | `delete_media_item` 在删字节之后才判 TG 标记——标记清不掉时已删字节却 500 声称 `nothing was deleted`（中止点晚于破坏性动作） | fixed | engine |
 | BUG-163 | 本地投递节流配额每请求从 0 起算——响应头 3–28 ms 秒回但 body 首块被扣住 440–725 ms（起播/seek/断线重取/卡片抽帧都各付一次），播放与浏览双重卡顿 | fixed | engine |
 | BUG-164 | 下载类视图顶栏无连接灯——三角落连接态指示在 `all/downloading/paused/completed` 四视图恒三缺一（`ContextBarActions` 分支从未接入 BUG-087 的统一灯）；修：抽 `ConnLight` 两分支共用 | fixed | shell |
+| BUG-165 | 进度条拖拽期每个 pointermove 都写 `currentTime` 提交 seek——未松手（未确认态）即发请求，实测 2s 拖拽 7 发 7 取消的请求风暴；修：拖拽只更新视觉 `dragRatio`，pointerup 才提交唯一一次 seek | fixed | shell |
+| BUG-166 | 「解码吃力」把数据晚到型丢帧误判为解码吞吐不足（`waiting/stalled` 不重置基线 + 判定不看缓冲健康）——无可见卡顿却常驻误导提示；修：stall 恢复重置基线 + 缓冲领先 <2s 时绝不置位，三阶段行为测试 P1 验牙/P2 恢复/P3 断供抑制 | fixed | shell |
 
 ## 历史欠账
 
