@@ -28,10 +28,16 @@ Chromium 的 abort-and-re-request 都会重付这笔 TTFB 代价，表现为「�
   （`kind='video' AND size≥20MiB AND duration>0`，按体积降序取前 N），
   并**排除** `file_path` 含 `test_videos` 的历史验收夹具（会污染码率统计）。
 * **A/B**：支持两个二进制（`--binary A --binary B` 或 `--compare A B`），
-  打印并排对照表 + 每条 `首块改善(ms)` / `吞吐变化(%)`；B 稳态吞吐相对 A 掉 >30%
-  则结论行标 `WARN`。
-* **判据**：`A 首块均值 ≥ 200ms` 且 `B 首块均值 ≤ 100ms` 且 `吞吐未退化 >30%` → `PASS`；
-  否则 `FAIL` 且 `sys.exit(1)`。单二进制为基线采集模式（`BASELINE`，exit 0）。
+  打印并排对照表 + 逐条 `首块改善(ms)` / `A/B 窗口速率` / `稳态比(B/A)`。
+* **判据（非恒绿，断言可红也可绿）**：
+  - `A 首块均值 ≥ 200ms`（复现旧「每请求从零起算」慢首块）+ `B 首块均值 ≤ 100ms`（修复）；
+  - **逐条**首块边界：A 每条须 ≥ 100ms、B 每条须 ≤ 200ms（防均值掩盖单条不过）；
+  - **稳态速率带**：B 的窗口速率须落在 A 的 `[0.5, 1.5]` 倍内（A 无突发，其窗口速率即 `bps`；
+    此带同时是验牙——突发过大使速率飙高 / 稳态观测不到 → 越界 → `FAIL`）。
+  全部满足 → `PASS`；任一不满足 → `FAIL` 且 `sys.exit(1)`。
+  单二进制为基线采集模式（`BASELINE`，exit 0）。
+* **`--self-test`**：无服务 / 无端口 / 无库，用合成数据证明 `verdict_ab` 既能判绿也能判红
+  （恒绿缺陷的回归防护）。
 * **清理**：任何退出路径都 kill 自起进程、删临时库副本，不留端口监听。
 
 退出码
@@ -95,12 +101,19 @@ DEFAULT_TOP_N = 4
 #: 服务端投递块大小（与 routes.rs `CHUNK` 对齐）——首块延迟 ≈ CHUNK / bps。
 SERVER_CHUNK_BYTES = 1024 * 1024
 
-DEFAULT_BUDGET_SECS = 3.0
+#: 观测窗口：必须 > BUG-163 的突发信用（4s），否则 B 的稳态速率观测不到、
+#: 整窗都落在突发里，稳态判据会失效。
+DEFAULT_BUDGET_SECS = 12.0
 
 #: 判据阈值（见模块 docstring）。
-PASS_A_MIN_FIRST_MS = 200.0
-PASS_B_MAX_FIRST_MS = 100.0
-WARN_THROUGHPUT_DROP = 0.30  # >30% 视为退化
+PASS_A_MIN_FIRST_MS = 200.0       # A 首块均值须 >= 此值（复现旧「每请求从零起算」慢首块）
+PASS_B_MAX_FIRST_MS = 100.0       # B 首块均值须 <= 此值（修复后首块接近即时）
+#: 稳态速率带：B 的窗口速率须落在 A 的 [STEADY_MIN, STEADY_MAX] 倍内。
+#: A 无突发，其窗口速率即 bps；故本带即「B 稳态 ≈ bps，无退化」。
+#: 同时构成验牙：突发过大使速率飙高 / 稳态观测不到 → 比值越界 → FAIL（非恒绿）。
+STEADY_MIN = 0.5
+STEADY_MAX = 1.5
+WARN_THROUGHPUT_DROP = 0.30  # 仅作信息性软告警，不再是唯一闸门
 
 #: 这些 env 会改变限速语义，默认从子进程环境里剥离以保证可复现（可用 --a-env/--b-env 注入）。
 DELIVERY_ENV_KEYS = ("ORIG_TG_DELIVERY_BPS", "ORIG_TG_DELIVERY_BURST_SECS")
@@ -747,21 +760,33 @@ def print_run_table(run: RunResult, items: list) -> None:
     print(fmt_table(headers, rows))
 
 
-def print_comparison(run_a: RunResult, run_b: RunResult, items: list) -> dict:
-    """并排对照表 + 聚合。返回汇总 dict。"""
+def _window_rate_mibps(cr) -> float:
+    """窗口内的平均投递速率（MiB/s）。A 无突发，该值即服务端 bps。"""
+    if cr is None or getattr(cr, "error", None) or cr.elapsed_s <= 0 or cr.window_bytes <= 0:
+        return float("nan")
+    return cr.window_bytes / cr.elapsed_s / (1024.0 * 1024.0)
+
+
+def print_comparison(run_a: RunResult, run_b: RunResult, items: list, budget: float) -> dict:
+    """并排对照表 + 聚合。返回汇总 dict（含非恒绿断言所需的逐条字段）。"""
     print()
     print("=== A/B 对照（主路径 bytes=0-）")
     print("    A = %s [%s]" % (run_a.binary, run_a.label))
     print("    B = %s [%s]" % (run_b.binary, run_b.label))
-    headers = ["item", "A首块(ms)", "B首块(ms)", "首块改善(ms)", "A吞吐", "B吞吐", "吞吐变化(%)"]
+    print("    窗口=%.1fs（须 > B 突发信用，否则稳态观测不到）" % budget)
+    headers = ["item", "A首块(ms)", "B首块(ms)", "首块改善(ms)",
+               "A速率", "B速率", "稳态比(B/A)"]
     rows = []
     a_first_vals, b_first_vals = [], []
-    tp_ratios = []
+    steady_ratios = []
+    a_first_oks, b_first_oks = [], []
     for it in items:
         ra = run_a.by_item(it.id, "open")
         rb = run_b.by_item(it.id, "open")
         if ra is None or rb is None or ra.error or rb.error:
             rows.append([it.id, "-", "-", "-", "-", "-", "-"])
+            a_first_oks.append(False)
+            b_first_oks.append(False)
             continue
         a_first, b_first = ra.first_body_ms, rb.first_body_ms
         if not math.isnan(a_first):
@@ -769,68 +794,101 @@ def print_comparison(run_a: RunResult, run_b: RunResult, items: list) -> dict:
         if not math.isnan(b_first):
             b_first_vals.append(b_first)
         improve = (a_first - b_first) if not (math.isnan(a_first) or math.isnan(b_first)) else float("nan")
-        a_tp, b_tp = ra.throughput_mibps, rb.throughput_mibps
-        delta = ((b_tp - a_tp) / a_tp * 100.0) if a_tp > 0 else float("nan")
-        if a_tp > 0:
-            tp_ratios.append(b_tp / a_tp)
+        a_rate = _window_rate_mibps(ra)
+        b_rate = _window_rate_mibps(rb)
+        ratio = b_rate / a_rate if (a_rate > 0 and not math.isnan(b_rate)) else float("nan")
+        # 逐条非恒绿判据：A 须复现旧慢首块；B 须修复为快首块（防均值掩盖单条不过）。
+        a_first_ok = (not math.isnan(a_first)) and a_first >= PASS_A_MIN_FIRST_MS * 0.5
+        b_first_ok = (not math.isnan(b_first)) and b_first <= PASS_B_MAX_FIRST_MS * 2.0
+        a_first_oks.append(a_first_ok)
+        b_first_oks.append(b_first_ok)
+        if not math.isnan(ratio):
+            steady_ratios.append(ratio)
         rows.append([
             it.id,
             _ms(a_first),
             _ms(b_first),
             _ms(improve),
-            "%.2f" % a_tp,
-            "%.2f" % b_tp,
-            "-" if math.isnan(delta) else "%.0f%%" % delta,
+            "-" if math.isnan(a_rate) else "%.2f" % a_rate,
+            "-" if math.isnan(b_rate) else "%.2f" % b_rate,
+            "-" if math.isnan(ratio) else "%.2f" % ratio,
         ])
     print(fmt_table(headers, rows))
 
     a_mean = sum(a_first_vals) / len(a_first_vals) if a_first_vals else float("nan")
     b_mean = sum(b_first_vals) / len(b_first_vals) if b_first_vals else float("nan")
-    tp_ratio = sum(tp_ratios) / len(tp_ratios) if tp_ratios else float("nan")
+    steady_med = (sorted(steady_ratios)[len(steady_ratios) // 2]
+                  if steady_ratios else float("nan"))
     return {
         "a_mean_first_ms": a_mean,
         "b_mean_first_ms": b_mean,
-        "throughput_ratio": tp_ratio,
+        "steady_ratios": steady_ratios,
+        "steady_median": steady_med,
         "n_a": len(a_first_vals),
         "n_b": len(b_first_vals),
+        "n_steady": len(steady_ratios),
+        "a_first_oks": a_first_oks,
+        "b_first_oks": b_first_oks,
     }
 
 
 def verdict_ab(summary: dict) -> tuple:
-    """返回 (status, warn, reason)。"""
+    """返回 (status, warn, reason)。断言**非恒绿**：
+
+    - A 须复现旧慢首块、B 须修复为快首块（均值 + 逐条）。
+    - B 稳态窗口速率须落在 A 的 `[STEADY_MIN, STEADY_MAX]` 倍内
+      （A 无突发，其窗口速率即 `bps`）。此带同时是**验牙**：
+      突发过大使稳态观测不到 / 速率飙高 → 比值越界 → `FAIL`。
+      真实回归（B 稳态速率跌到 0.3×）同样越界 → `FAIL`。
+    """
     a_mean = summary["a_mean_first_ms"]
     b_mean = summary["b_mean_first_ms"]
-    ratio = summary["throughput_ratio"]
     reasons = []
     ok = True
 
     if summary["n_a"] == 0 or summary["n_b"] == 0:
         return "FAIL", False, "A 或 B 无有效主路径样本"
 
+    # ① 均值首块：复现旧行为 + 修复
     if math.isnan(a_mean) or a_mean < PASS_A_MIN_FIRST_MS:
         ok = False
-        reasons.append("A首块均值=%.0fms < %.0fms（未复现旧行为）" % (a_mean, PASS_A_MIN_FIRST_MS))
+        reasons.append("A首块均值=%.0fms < %.0fms（未复现旧慢首块）" % (a_mean, PASS_A_MIN_FIRST_MS))
     else:
         reasons.append("A首块均值=%.0fms >= %.0fms（旧行为已复现）" % (a_mean, PASS_A_MIN_FIRST_MS))
-
     if math.isnan(b_mean) or b_mean > PASS_B_MAX_FIRST_MS:
         ok = False
         reasons.append("B首块均值=%.0fms > %.0fms（未修复）" % (b_mean, PASS_B_MAX_FIRST_MS))
     else:
         reasons.append("B首块均值=%.0fms <= %.0fms（已修复）" % (b_mean, PASS_B_MAX_FIRST_MS))
 
-    warn = False
-    if math.isnan(ratio):
-        reasons.append("吞吐 B/A 不可测")
-    elif ratio < (1.0 - WARN_THROUGHPUT_DROP):
-        warn = True
+    # ② 逐条首块：防止均值掩盖单条不过
+    bad_a = [i for i, v in enumerate(summary["a_first_oks"]) if not v]
+    bad_b = [i for i, v in enumerate(summary["b_first_oks"]) if not v]
+    if bad_a:
         ok = False
-        reasons.append("吞吐 B/A=%.2f（相对 A 掉 >%.0f%%）" % (ratio, WARN_THROUGHPUT_DROP * 100))
+        reasons.append("A 有 %d 条未复现慢首块" % len(bad_a))
+    if bad_b:
+        ok = False
+        reasons.append("B 有 %d 条首块未修复（退化或失效）" % len(bad_b))
+
+    # ③ 稳态速率带（非恒绿核心）
+    sr = summary["steady_ratios"]
+    if not sr:
+        ok = False
+        reasons.append("无可测稳态速率样本")
     else:
-        reasons.append("吞吐 B/A=%.2f（未退化 >%.0f%%）" % (ratio, WARN_THROUGHPUT_DROP * 100))
+        out = [r for r in sr if r < STEADY_MIN or r > STEADY_MAX]
+        med = summary["steady_median"]
+        if out:
+            ok = False
+            reasons.append("稳态比中位数=%.2f，%d/%d 条越界[%.2f,%.2f]（B 稳态退化或突发过大）"
+                           % (med, len(out), len(sr), STEADY_MIN, STEADY_MAX))
+        else:
+            reasons.append("稳态比中位数=%.2f，全部落在[%.2f,%.2f]（B 稳态≈A≈bps，无退化）"
+                           % (med, STEADY_MIN, STEADY_MAX))
 
     status = "PASS" if ok else "FAIL"
-    return status, warn, "；".join(reasons)
+    return status, False, "；".join(reasons)
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +902,85 @@ def parse_env_overrides(pairs: list) -> dict:
         k, v = p.split("=", 1)
         out[k.strip()] = v
     return out
+
+
+# ---------------------------------------------------------------------------
+# 逻辑自检（无服务 / 无端口 / 无库）
+# ---------------------------------------------------------------------------
+@dataclass
+class _StubCR:
+    first_body_ms: float
+    window_bytes: int
+    elapsed_s: float
+    error: Optional[str] = None
+
+
+@dataclass
+class _StubRun:
+    label: str
+    binary: str
+    env_overrides: dict
+    _by: dict
+
+    def by_item(self, item_id, scenario):
+        return self._by.get((item_id, scenario))
+
+
+def _mk_stub_run(label: str, burst, first_ms: float, win_bytes: int, elapsed: float,
+                item_ids) -> _StubRun:
+    env = {}
+    if burst is not None:
+        env["ORIG_TG_DELIVERY_BURST_SECS"] = str(burst)
+    by = {}
+    for i in item_ids:
+        by[(i, "open")] = _StubCR(first_ms, win_bytes, elapsed)
+        by[(i, "seek")] = _StubCR(first_ms, win_bytes, elapsed)
+    return _StubRun(label, "bin://%s" % label, env, by)
+
+
+def run_self_test() -> int:
+    """用合成数据证明 verdict_ab 既能判绿也能判红（恒绿缺陷的回归防护）。
+
+    不启动任何服务、不占端口、不读库。
+    """
+    MIB = 1024 * 1024
+    budget = DEFAULT_BUDGET_SECS
+    items = [type("_It", (), {"id": j, "title": "", "file_path": "", "size": 0,
+                              "duration": 0})() for j in (1, 2, 3)]
+
+    # A 无突发：窗口速率 = 1 MiB/s；首块 500ms（复现旧慢首块）。
+    a = _mk_stub_run("A", None, 500.0, int(12 * MIB), budget, [1, 2, 3])
+    # B 合法修复（突发=4）：稳态速率仍 1 MiB/s；首块 10ms。
+    b_ok = _mk_stub_run("B", 4.0, 10.0, int(12 * MIB), budget, [1, 2, 3])
+    # B 稳态退化：突发=4 但稳态速率跌到 0.3 MiB/s；首块 10ms（首块过关但速率退化）。
+    b_regress = _mk_stub_run("B", 4.0, 10.0, int(3.6 * MIB), budget, [1, 2, 3])
+    # B 验牙：突发=9999 → 速率飙高（窗口内瞬时发完）→ 稳态比越界。
+    b_tooth = _mk_stub_run("B", 9999.0, 1.0, int(12 * MIB), 0.1, [1, 2, 3])
+    # B 首块未修复：突发=4、速率正常，但首块仍 500ms（修复没生效）。
+    b_slow = _mk_stub_run("B", 4.0, 500.0, int(12 * MIB), budget, [1, 2, 3])
+
+    s_ok = print_comparison(a, b_ok, items, budget)
+    s_reg = print_comparison(a, b_regress, items, budget)
+    s_tooth = print_comparison(a, b_tooth, items, budget)
+    s_slow = print_comparison(a, b_slow, items, budget)
+
+    checks = [
+        ("合法修复应 PASS", verdict_ab(s_ok)[0], "PASS"),
+        ("稳态退化应 FAIL", verdict_ab(s_reg)[0], "FAIL"),
+        ("突发=9999 验牙应 FAIL", verdict_ab(s_tooth)[0], "FAIL"),
+        ("首块未修复应 FAIL", verdict_ab(s_slow)[0], "FAIL"),
+    ]
+    all_ok = True
+    for name, got, want in checks:
+        flag = "OK" if got == want else "BAD"
+        if got != want:
+            all_ok = False
+        print("[self-test] %-26s got=%-4s want=%-4s  %s" % (name, got, want, flag))
+    if not all_ok:
+        print("[self-test] FAILED：verdict_ab 仍为恒绿或判据有误")
+        return 1
+    print("[self-test] PASS：verdict_ab 可判绿也可判红（非恒绿）")
+    return 0
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -867,7 +1004,13 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--a-env", action="append", default=[], metavar="K=V", help="仅注入 A 的 env（可重复）")
     ap.add_argument("--b-env", action="append", default=[], metavar="K=V", help="仅注入 B 的 env（可重复）")
     ap.add_argument("--keep-temp", action="store_true", help="保留临时快照目录（排障用）")
+    ap.add_argument("--self-test", action="store_true",
+                    help="无服务/无端口/无库：用合成数据证明 verdict_ab 非恒绿（恒绿缺陷回归防护）")
     args = ap.parse_args(argv)
+
+    # 纯逻辑自检：不碰任何服务/端口/库，直接退出。
+    if args.self_test:
+        return run_self_test()
 
     CLEANUP.install()
 
@@ -973,7 +1116,7 @@ def main(argv: Optional[list] = None) -> int:
 
     warn = False
     if len(runs) == 2:
-        summary = print_comparison(runs[0], runs[1], items)
+        summary = print_comparison(runs[0], runs[1], items, args.budget)
         status, warn, reason = verdict_ab(summary)
         result["verdict"] = {
             "status": status, "warn": warn, "reason": reason, **summary,
