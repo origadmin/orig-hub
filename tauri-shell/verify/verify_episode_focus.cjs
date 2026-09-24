@@ -269,6 +269,55 @@ async function main() {
         fails.push(`episode image not contain (still cropping): ${JSON.stringify(imgs)}`)
     }
 
+    // 7) 合并介绍区：tab 存在、切「全剧」内容具体非空、简介在整页只出现一次（真合并）
+    const tabs = await page.evaluate(() => ({
+      ep: !!document.querySelector('[data-testid="desc-tab-ep"]'),
+      series: !!document.querySelector('[data-testid="desc-tab-series"]'),
+    }))
+    console.log('[ef] desc tabs:', JSON.stringify(tabs))
+    if (!tabs.ep || !tabs.series) fails.push(`desc tabs missing: ${JSON.stringify(tabs)}`)
+
+    await page.evaluate(() => {
+      const el = document.querySelector('[data-testid="desc-tab-series"]')
+      if (el) el.click()
+    })
+    await delay(500)
+    const descSeries = await page.evaluate(() => {
+      const b = document.querySelector('[data-testid="desc-body"]')
+      return b ? (b.textContent || '').trim() : null
+    })
+    console.log('[ef] desc-body (全剧):', (descSeries || '').slice(0, 50))
+    if (!descSeries) fails.push('desc-body empty after switching to 全剧 tab')
+
+    const dup = await page.evaluate(() => {
+      const b = document.querySelector('[data-testid="desc-body"]')
+      if (!b) return null
+      const t = (b.textContent || '').trim()
+      const sample = t.slice(0, 20)
+      if (!sample) return null
+      const all = document.body.innerText || ''
+      let count = 0
+      let i = 0
+      while ((i = all.indexOf(sample, i)) !== -1) {
+        count++
+        i += sample.length
+      }
+      return { count, len: t.length }
+    })
+    console.log('[ef] description occurrences on page:', JSON.stringify(dup))
+    if (dup && dup.count > 1) {
+      fails.push(`description rendered more than once (not merged): ${JSON.stringify(dup)}`)
+    }
+
+    await page.evaluate(() => {
+      const el =
+        document.querySelector('[data-testid="desc-section"]') ||
+        document.querySelector('[data-testid="desc-body"]')
+      if (el) el.scrollIntoView({ block: 'center' })
+    })
+    await delay(400)
+    await page.screenshot(path.join(OUT_DIR, 'ef-desc-merged.png'), { fullPage: true })
+
     // 6) 窄窗口：纵向堆叠 + 无横向溢出
     await page.conn.send(
       'Emulation.setDeviceMetricsOverride',
