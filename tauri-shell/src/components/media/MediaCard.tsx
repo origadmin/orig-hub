@@ -26,6 +26,7 @@ import {
   markPosterFailed,
   posterFailed,
 } from '../../lib/poster'
+import { TagToken } from './TagToken'
 
 const KIND_ICON: Record<string, string> = {
   video: '🎬',
@@ -389,19 +390,10 @@ function MediaCardBase(props: {
           {item.seriesTitle ? <span className="truncate">· {item.seriesTitle}</span> : null}
         </p>
         {item.tags.length > 0 ? (
-          <p className="flex flex-wrap gap-1 pt-0.5" data-testid="item-tags">
+          <p className="flex flex-wrap gap-x-1 gap-y-0.5 pt-0.5" data-testid="item-tags">
             {/* 全量展示：省略成「+N」会让标签看起来像没归档（>3 个时尤其明显）。 */}
             {item.tags.map((tag) => (
-              <span
-                key={tag.id}
-                className="rounded px-1 py-px text-[9px]"
-                style={{
-                  background: `${tag.color ?? '#64748b'}22`,
-                  color: tag.color ?? '#64748b',
-                }}
-              >
-                {tag.name}
-              </span>
+              <TagToken key={tag.id} name={tag.name} />
             ))}
           </p>
         ) : null}

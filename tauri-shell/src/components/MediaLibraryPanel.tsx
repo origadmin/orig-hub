@@ -6,6 +6,7 @@ import { useStore } from '../store/useStore'
 import {
   deleteMediaItem,
   deleteEpisode,
+  createTag,
   deleteSeries,
   findMediaItemIdByRef,
   getLibraryStats,
@@ -781,15 +782,15 @@ export function MediaLibraryPanel() {
                     className={[
                       // 单行原语：`whitespace-nowrap` 禁折行、名称 `truncate`（需 min-w-0）
                       // 允许截断、计数 `shrink-0` 永不先被压掉、`max-w-full` 封顶不撑破容器。
-                      'inline-flex max-w-full items-center gap-1 whitespace-nowrap rounded-full border px-2 py-0.5 text-[10.5px] transition-colors',
-                      on ? 'text-white' : 'text-fg-strong hover:bg-surface-2',
-                    ].join(' ')}
-                    style={
+                      // 形状 `rounded` 且**不带边框/底色**：标签不再有颜色语义，选中靠
+                      // 实心强调底表达（与 TagToken 的 `active` 同一套视觉）。
+                      'inline-flex max-w-full items-baseline gap-1 whitespace-nowrap rounded px-1.5 py-0.5 text-[10.5px] transition-colors',
                       on
-                        ? { background: tag.color ?? '#64748b', borderColor: tag.color ?? '#64748b' }
-                        : { borderColor: `${tag.color ?? '#64748b'}55` }
-                    }
+                        ? 'bg-accent text-white'
+                        : 'text-muted hover:bg-surface-2 hover:text-fg-strong',
+                    ].join(' ')}
                   >
+                    <span className={on ? 'text-white/70' : 'text-accent/80'}>#</span>
                     <span className="min-w-0 truncate">{tag.name}</span>
                     <span className="shrink-0 tabular-nums opacity-70">{count}</span>
                   </button>
@@ -1123,6 +1124,16 @@ export function MediaLibraryPanel() {
           count={selected.size}
           tags={tags}
           onClose={() => setBulkTagOpen(false)}
+          onCreate={async (name) => {
+            try {
+              const r = await createTag(name)
+              await loadMeta()
+              return r.id
+            } catch (e) {
+              setError(e instanceof Error ? e.message : String(e))
+              return null
+            }
+          }}
           onApply={async (tagIds) => {
             for (const id of selected) await setItemTags(id, tagIds)
             clearSelection()
@@ -1190,6 +1201,16 @@ export function MediaLibraryPanel() {
           onClose={() => setEditing(null)}
           onSaved={() => void refreshAll()}
           onError={(m) => setError(m)}
+          onCreateTag={async (name) => {
+            try {
+              const r = await createTag(name)
+              await loadMeta()
+              return r.id
+            } catch (e) {
+              setError(e instanceof Error ? e.message : String(e))
+              return null
+            }
+          }}
         />
       ) : null}
 

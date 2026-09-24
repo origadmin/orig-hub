@@ -27,6 +27,7 @@ import {
   sourceLabelKey,
 } from '../../lib/mediaSources'
 import {
+  createTag,
   setSeriesTags,
   patchSeries,
   patchEpisode,
@@ -38,6 +39,7 @@ import {
 } from '../../api/media'
 import { generateVideoPoster } from '../../lib/poster'
 import { TagPicker } from './TagManagerDialog'
+import { TagToken } from './TagToken'
 import { useTranslation } from '../../i18n'
 
 const KIND_LABEL: Record<string, string> = {
@@ -241,6 +243,25 @@ export function SeriesDetail(props: {
       onError(e instanceof Error ? e.message : String(e))
     } finally {
       setBusy(false)
+    }
+  }
+
+  /**
+   * 打标签时**就地新建**标签。
+   *
+   * `tags` 是父层传下来的只读列表，剧集页自己没有「重新拉标签」的通道；
+   * 但搜不到就让人关掉面板去标签管理绕一圈，是把一个动作劈成两处。
+   * 这里建完交给 `onChanged()`（父层的 `refreshAll` 会连带 `listTags`），
+   * 返回 id 让 `TagPicker` 立刻勾上 —— 用户感知是「一个动作」。
+   */
+  const createTagHere = async (name: string): Promise<number | null> => {
+    try {
+      const r = await createTag(name)
+      onChanged()
+      return r.id
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e))
+      return null
     }
   }
 
@@ -516,15 +537,9 @@ export function SeriesDetail(props: {
           </p>
           {/* 标签 chips：原独立的「标签展示行」合并进 Hero 右列（整页重排） */}
           {detail.tags.length > 0 ? (
-            <div className="mt-1.5 flex flex-wrap gap-1.5">
+            <div className="mt-1.5 flex flex-wrap gap-x-1.5 gap-y-0.5">
               {detail.tags.map((t) => (
-                <span
-                  key={t.id}
-                  className="rounded-full px-2 py-0.5 text-[10px]"
-                  style={{ background: `${t.color ?? '#64748b'}22`, color: t.color ?? '#64748b' }}
-                >
-                  {t.name}
-                </span>
+                <TagToken key={t.id} name={t.name} />
               ))}
             </div>
           ) : null}
@@ -584,7 +599,12 @@ export function SeriesDetail(props: {
 
       {editingTags ? (
         <div className="shrink-0 border-b border-border-subtle/60 bg-surface-2/40 px-4 py-3">
-          <TagPicker tags={tags} selected={selected} onChange={setSelected} />
+          <TagPicker
+            tags={tags}
+            selected={selected}
+            onChange={setSelected}
+            onCreate={createTagHere}
+          />
           <div className="mt-2 flex gap-2">
             <Button size="sm" className="h-7 px-3 text-[11px]" disabled={busy} onClick={() => void saveTags()}>
               保存标签
@@ -1471,15 +1491,9 @@ export function SeriesCard(props: {
           {series.seasonCount} 季 · {series.episodeCount} 集
         </p>
         {series.tags.length > 0 ? (
-          <p className="flex flex-wrap gap-1 pt-0.5">
+          <p className="flex flex-wrap gap-x-1 gap-y-0.5 pt-0.5">
             {series.tags.map((t) => (
-              <span
-                key={t.id}
-                className="rounded px-1 py-px text-[9px]"
-                style={{ background: `${t.color ?? '#64748b'}22`, color: t.color ?? '#64748b' }}
-              >
-                {tags.find((x) => x.id === t.id)?.name ?? t.name}
-              </span>
+              <TagToken key={t.id} name={tags.find((x) => x.id === t.id)?.name ?? t.name} />
             ))}
           </p>
         ) : null}

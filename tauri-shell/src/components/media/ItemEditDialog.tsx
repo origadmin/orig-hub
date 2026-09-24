@@ -29,8 +29,16 @@ export function ItemEditDialog(props: {
   onClose: () => void
   onSaved: () => void
   onError: (msg: string) => void
+  /**
+   * 就地新建标签（供 `TagPicker` 的「新建 #xxx」使用）。
+   *
+   * `tags` 是父层传下来的只读列表，本对话框自己没有刷新标签的通道 ——
+   * 让用户在打标签时搜不到就得先关掉对话框去「标签管理」绕一圈，是把
+   * 两个动作硬拆成两处。创建 + 刷新必须由父层做（它持有 `listTags` 的刷新路径）。
+   */
+  onCreateTag?: (name: string) => Promise<number | null>
 }) {
-  const { item, tags, onClose, onSaved, onError } = props
+  const { item, tags, onClose, onSaved, onError, onCreateTag } = props
   const { t } = useTranslation()
   const [title, setTitle] = useState(item.title)
   const [desc, setDesc] = useState(item.description ?? '')
@@ -157,7 +165,12 @@ export function ItemEditDialog(props: {
             data-testid="item-edit-desc"
           />
           <label className="block text-[11px] text-muted">标签</label>
-          <TagPicker tags={tags} selected={selected} onChange={setSelected} />
+          <TagPicker
+            tags={tags}
+            selected={selected}
+            onChange={setSelected}
+            onCreate={onCreateTag}
+          />
         </div>
 
         <div className="mt-4 flex flex-col gap-2">
