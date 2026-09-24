@@ -128,6 +128,49 @@ async function main() {
     }
     await delay(1200)
 
+    // 1b) 整页：Hero 海报 320×180、「图片 · N」图册 160×120
+    await page.evaluate(() => window.scrollTo(0, 0))
+    await delay(400)
+    const hero = await page.evaluate(() => {
+      const el = document.querySelector('div[class*="min-[720px]"] img')
+      if (!el) return null
+      const r = el.getBoundingClientRect()
+      return { w: Math.round(r.width), h: Math.round(r.height) }
+    })
+    console.log('[ef] hero poster size:', JSON.stringify(hero))
+    if (!hero || hero.w < 300) fails.push(`hero poster not enlarged: ${JSON.stringify(hero)}`)
+
+    const gal = await page.evaluate(() => {
+      const box = document.querySelector('[data-testid="series-gallery"]')
+      if (!box) return null
+      const im = box.querySelector('img')
+      if (!im) return null
+      const r = im.getBoundingClientRect()
+      return {
+        w: Math.round(r.width),
+        h: Math.round(r.height),
+        fit: getComputedStyle(im).objectFit,
+      }
+    })
+    console.log('[ef] series gallery item:', JSON.stringify(gal))
+    if (gal && gal.w < 140) fails.push(`gallery item not enlarged: ${JSON.stringify(gal)}`)
+    await page.screenshot(path.join(OUT_DIR, 'ef-page-top.png'), { fullPage: true })
+
+    // 1c) 文档顺序必须是 episode-focus -> episode-switcher -> episode-images
+    const order = await page.evaluate(() => {
+      const f = document.querySelector('[data-testid="episode-focus"]')
+      const s = document.querySelector('[data-testid="episode-switcher"]')
+      const i = document.querySelector('[data-testid="episode-images"]')
+      if (!f || !s || !i) return null
+      const after = (a, b) =>
+        !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING)
+      return { focusBeforeSwitcher: after(f, s), switcherBeforeImages: after(s, i) }
+    })
+    console.log('[ef] dom order:', JSON.stringify(order))
+    if (!order || !order.focusBeforeSwitcher || !order.switcherBeforeImages) {
+      fails.push(`wrong dom order: ${JSON.stringify(order)}`)
+    }
+
     await waitTestid(page, 'episode-switcher', 12000)
     await delay(800)
 
