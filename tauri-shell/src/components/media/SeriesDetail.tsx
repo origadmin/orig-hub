@@ -157,50 +157,6 @@ export function SeriesDetail(props: {
     [detail.episodes],
   )
 
-  /**
-   * 单集聚焦：当前展示的那一集（**默认第一集**）。
-   *
-   * 集列表改成「一次只呈现一集」后，整屏空间都归这一集 —— 封面与集级挂图才有地方
-   * 放大（此前列表行里的封面只有 80×44、挂图 64×48，用户形容「和 ICON 一样小」）。
-   *
-   * `null` 表示「跟随默认」：切剧集时置空 → 回落到第一集（否则会聚焦到另一部剧里
-   * 同 id 的分集上）；某一集被移除后它也不再出现在 `playEps` 里 → 同样回落第一集。
-   * 用**派生**（find → ?? playEps[0]）而不是在 effect 里同步 state，避免出现一帧
-   * 「聚焦了一个已经不存在的集」的空屏。
-   */
-  const [activeEpId, setActiveEpId] = useState<number | null>(null)
-  useEffect(() => {
-    // 换剧集 → 回到第一集（detail.id 变而分集 id 不变的情形会把焦点带错剧）
-    setActiveEpId(null)
-  }, [detail.id])
-  const activeEp = useMemo(
-    () => playEps.find((e) => e.id === activeEpId) ?? playEps[0] ?? null,
-    [playEps, activeEpId],
-  )
-  /** 聚焦集的大图源：poster 优先；photo 没有 poster 时用原条目地址（图片本身就是内容） */
-  const focusThumb = activeEp
-    ? activeEp.poster ?? (activeEp.kind === 'photo' ? mediaItemUrl(activeEp.itemId) : null)
-    : null
-
-  /**
-   * 合并介绍区：当前呈现「本集介绍」还是「全剧介绍」。
-   *
-   * 总介绍与集介绍此前分处两处（Hero 常驻总介绍 + 聚焦区再显示一次集介绍）——
-   * 重复且割裂，实际数据里很多集的简介就是复制的剧集简介。现在**只留一处**，
-   * 用 tab 在同一个位置里切换两种来源。
-   *
-   * 默认跟随内容：聚焦集有介绍 → 本集；没有 → 回落全剧（否则一进页面就是一片空态）。
-   * 切集时按同一规则重置；在同一集里用户手选的 tab 保持不变（不因刷新而跳回）。
-   */
-  const [descTab, setDescTab] = useState<'ep' | 'series'>(() =>
-    (playEps[0]?.description ?? '').trim() ? 'ep' : 'series',
-  )
-  useEffect(() => {
-    setDescTab(activeEp?.description?.trim() ? 'ep' : 'series')
-    // 只在「换集」时重置；同一集内的刷新不应覆盖用户手选的 tab
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeEp?.id])
-
   /** 按季分组（季号升序）——只编排可播发的内容（视频）。 */
   const seasons = useMemo(() => {
     const map = new Map<number, MediaEpisode[]>()
@@ -404,6 +360,31 @@ export function SeriesDetail(props: {
   /** 集级挂图选择对话框（BUG-168）：列出媒体库的 photo 条目，多选后 replace-all 挂载 */
   const [pickingImages, setPickingImages] = useState<MediaEpisode | null>(null)
 
+  /**
+   * 集级挂图**放大浏览**（BUG-168）。
+   *
+   * 行内缩略条只给 48×36 —— 那只是「这一集挂了图」的证据，看不清内容。点缩略图
+   * 在这里打开一张大图：只读、不进播放器、不占分集槽（与剧集图册灯箱同一约束）。
+   */
+  const [epImageView, setEpImageView] = useState<{ src: string; title: string } | null>(null)
+  /** 展开「全部挂图」的分集行：默认每行只露前 3 张，其余折叠 —— 一集挂十几张图时
+      不能把整条列表撑成图片墙。 */
+  const [expandedImgRows, setExpandedImgRows] = useState<number[]>([])
+  const toggleImgRow = (epId: number) =>
+    setExpandedImgRows((rows) =>
+      rows.includes(epId) ? rows.filter((r) => r !== epId) : [...rows, epId],
+    )
+
+  // 挂图灯箱：Esc 关闭（DOM 焦点不确定，故挂 window）
+  useEffect(() => {
+    if (!epImageView) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setEpImageView(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [epImageView])
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       {/* 工具条（整页重排）：返回 + 剧集级操作独立置顶 —— 操作按钮原本挤在
@@ -545,10 +526,11 @@ export function SeriesDetail(props: {
             </div>
           ) : null}
           {/*
-            剧集介绍：**不再常驻展示**。
-            总介绍此前在 Hero 里占一大段，下方聚焦区又显示一次（集）介绍 —— 两处重复
-            且割裂。现在整页只有一个简介位（聚焦区下方的合并介绍区），Hero 只留
-            **编辑入口**：编辑态是瞬态，点开才出现，不算常驻展示。
+            剧集介绍：**整页只有这一处**。
+            Hero 里常驻整段（whitespace-pre-wrap，换行照原文、不截成单行）——
+            此前把它搬到聚焦区下方的「本集/全剧」合并区，结果是同一份文案在页面上
+            出现两次、且割裂在两处，用户判定「不如之前的左右设计」。改回行式分集列表后，
+            介绍也一并回到 Hero 常驻位；分集列表里只保留**本集**介绍。
           */}
           {editingDesc ? (
             <div className="mt-1.5 space-y-1.5">
@@ -582,17 +564,35 @@ export function SeriesDetail(props: {
                 </Button>
               </div>
             </div>
+          ) : detail.description ? (
+            <div className="mt-1.5 flex items-start gap-1.5">
+              <p className="min-w-0 flex-1 whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[11.5px] leading-relaxed text-muted">
+                {detail.description}
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  setDescDraft(detail.description ?? '')
+                  setEditingDesc(true)
+                }}
+                className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] text-muted hover:bg-surface-2 hover:text-fg-mid"
+                title={t('media.editSeriesDesc')}
+                data-testid="series-desc-edit"
+              >
+                <Pencil className="h-3 w-3" /> 编辑
+              </button>
+            </div>
           ) : (
             <button
               type="button"
               onClick={() => {
-                setDescDraft(detail.description ?? '')
+                setDescDraft('')
                 setEditingDesc(true)
               }}
-              className="mt-1 self-start rounded px-1.5 py-0.5 text-[10.5px] text-accent hover:bg-accent/10"
+              className="mt-1.5 self-start rounded px-1.5 py-0.5 text-[10.5px] text-accent hover:bg-accent/10"
               data-testid="series-desc-edit"
             >
-              {detail.description ? t('media.editSeriesDesc') : t('media.addSeriesDesc')}
+              {t('media.addSeriesDesc')}
             </button>
           )}
         </div>
@@ -672,9 +672,10 @@ export function SeriesDetail(props: {
         </div>
       ) : null}
 
-      {/* 分集：单集聚焦布局 —— 聚焦区在上，集号切换条居中，本集挂图在下。
-          切换条**不能**放进 `episode-focus` 里：那个 section 带 `key={activeEp.id}`，
-          每换一集整条 chip 都会被 remount，横向滚动位置会归零。三者同级可避免这个回归。 */}
+      {/* 分集列表：左右行式（封面在左、标题与操作在右），按季分组。
+          改版来回：这一块曾被改成「单集聚焦 + 底部 chip 切换条」，用户判定
+          「不符合主流设计 / 越改越丑 / 不如之前的左右设计」，故回到行式。
+          唯一保留下来的改动是**封面放大到 160×90**（原 80×44 被形容为「和 ICON 一样小」）。 */}
       <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto p-4">
         {playEps.length === 0 && photoEps.length === 0 ? (
           <p className="py-10 text-center text-xs text-muted">
@@ -683,517 +684,386 @@ export function SeriesDetail(props: {
         ) : playEps.length === 0 ? (
           <p className="py-6 text-center text-xs text-muted">本剧集暂无可播放的视频</p>
         ) : (
-          <>
-            {/* 聚焦区：当前这一集的封面（380×214）+ 信息 + 操作 + 本集挂图 */}
-            {activeEp ? (
-              <section
-                key={activeEp.id}
-                aria-label={t('media.episodeFocusLabel')}
-                data-testid="episode-focus"
-                className="rounded-lg border border-border-subtle/60 bg-surface-2/30 p-3"
-              >
-                {/* 窄窗口纵向堆叠：封面固定 380 宽但带 max-w-full，任何宽度都不横向溢出 */}
-                <div className="flex flex-col gap-3 min-[560px]:flex-row min-[560px]:gap-4">
-                  {/* 无字节（BUG-080）：**不给播放入口**。
-                      一个点了必然 404 的播放按钮，是把「没有字节」伪装成「可以播放」；
-                      这里换成占位 +（TG 来源）重新缓存 /（其余）文件已丢失。 */}
-                  {hasMediaBytes(activeEp) ? (
-                    <button
-                      type="button"
-                      onClick={() => onPlay(detail.episodes.indexOf(activeEp))}
-                      title={
-                        activeEp.kind === 'photo'
-                          ? t('media.episodeBrowse')
-                          : t('player.play')
-                      }
-                      data-testid="episode-focus-cover"
-                      className="relative aspect-video w-[380px] max-w-full shrink-0 overflow-hidden rounded-lg bg-surface-2"
+          seasons.map(([season, eps]) => (
+            <section key={season} className="mb-4">
+              <h4 className="mb-2 text-[12px] font-semibold text-fg-strong">第 {season} 季</h4>
+              <ul className="space-y-1">
+                {eps.map((ep) => {
+                  const idx = detail.episodes.indexOf(ep)
+                  const imgs = ep.images ?? []
+                  /** 默认只露前 3 张，其余折叠 —— 一集挂十几张图时不能把整条列表撑成图片墙 */
+                  const shownImgs = expandedImgRows.includes(ep.id) ? imgs : imgs.slice(0, 3)
+                  return (
+                    <li
+                      key={ep.id}
+                      className="rounded-md border border-transparent px-2 py-1.5 hover:border-border-subtle/60 hover:bg-surface-2/70"
                     >
-                      {focusThumb ? (
-                        /* 封面必须走 coverFit：photo → object-contain（图片是内容本身，
-                           裁掉边缘就是丢内容），非 photo → object-cover（封面只是指代） */
-                        <img
-                          src={focusThumb}
-                          alt={activeEp.title || ''}
-                          className={`h-full w-full ${coverFit(activeEp.kind)}`}
-                        />
-                      ) : (
-                        <span className="flex h-full w-full items-center justify-center text-muted">
-                          {activeEp.kind === 'audio' ? (
-                            <Music className="h-8 w-8" />
-                          ) : (
-                            <Film className="h-8 w-8" />
-                          )}
-                        </span>
-                      )}
-                      {/* 集号徽标：列表行那个独立槽位没了，集号移到封面左上 */}
-                      <span className="pointer-events-none absolute left-1.5 top-1.5 rounded bg-accent/90 px-1.5 py-0.5 text-[11px] font-semibold text-white">
-                        S{activeEp.season}E{activeEp.episodeNo}
-                        {activeEp.episodeNoEnd != null &&
-                        activeEp.episodeNoEnd > activeEp.episodeNo
-                          ? `-${activeEp.episodeNoEnd}`
-                          : ''}
-                      </span>
-                      {/* 动作标识按类型区分：图片是「浏览」，不是「播放」 */}
-                      <span className="absolute inset-0 flex items-center justify-center bg-black/40 text-white opacity-0 transition-opacity hover:opacity-100">
-                        {activeEp.kind === 'photo' ? (
-                          <ImageIcon className="h-8 w-8" />
-                        ) : (
-                          <Play className="h-8 w-8 fill-white" />
-                        )}
-                      </span>
-                    </button>
-                  ) : (
-                    <div
-                      className="flex aspect-video w-[380px] max-w-full shrink-0 flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-border-subtle bg-surface-2 px-2 text-muted"
-                      data-testid="episode-nobytes"
-                      title={
-                        canRecacheFromSource(activeEp.source)
-                          ? t('media.recacheFrom', {
-                              source: t(sourceLabelKey(activeEp.source)),
-                            })
-                          : t('media.fileMissingHint')
-                      }
-                    >
-                      <CloudOff className="h-6 w-6" />
-                      <span className="text-[11px]">
-                        {canRecacheFromSource(activeEp.source)
-                          ? t('media.notCached')
-                          : t('media.fileMissing')}
-                      </span>
-                      {canRecacheFromSource(activeEp.source) ? (
+                      <div className="flex items-center gap-3">
+                        {/* 集号可点：打开本集编辑面板（季号/集号/介绍一起改）。
+                            集号是**位置**，所以「改号」与「换位」是同一件事的两种入口。 */}
                         <button
                           type="button"
-                          onClick={() => recacheEpisode(activeEp)}
-                          className="rounded bg-accent/90 px-2 py-0.5 text-[11px] font-medium leading-none text-white transition-colors hover:bg-accent"
-                          title={t('media.recacheFrom', {
-                            source: t(sourceLabelKey(activeEp.source)),
-                          })}
-                          data-testid="episode-recache"
-                        >
-                          {t('media.recache')}
-                        </button>
-                      ) : null}
-                    </div>
-                  )}
-
-                  <div className="flex min-w-0 flex-1 flex-col">
-                    {editingEp === activeEp.id ? (
-                      /* 标题行内编辑（BUG-076）：textarea 自动换行、完整显示不截断 ——
-                         否则长标题在编辑态被截掉会存错内容 */
-                      <textarea
-                        value={epTitle}
-                        onChange={(e) => setEpTitle(e.target.value)}
-                        placeholder="本集标题"
-                        aria-label="本集标题"
-                        data-testid="episode-title-input"
-                        rows={2}
-                        className="w-full resize-none rounded-md border border-border-subtle bg-surface px-2 py-1 text-[13px] text-fg-strong [overflow-wrap:anywhere]"
-                      />
-                    ) : (
-                      <div className="flex min-w-0 items-start gap-1.5">
-                        <h5 className="min-w-0 flex-1 break-words [overflow-wrap:anywhere] text-[14px] font-semibold leading-snug text-fg-strong">
-                          {activeEp.title || `#${activeEp.itemId}`}
-                        </h5>
-                        <button
-                          type="button"
-                          onClick={() => openEpisodeEdit(activeEp)}
-                          className="shrink-0 rounded px-1 text-muted hover:bg-surface-2 hover:text-fg-mid"
-                          title="编辑本集（标题 / 季号 / 集号 / 介绍）"
-                          data-testid="episode-edit"
-                        >
-                          <Pencil className="h-3.5 w-3.5" />
-                        </button>
-                        {/* 同槽备用来源（BUG-039）：点击切主；摘除在编辑面板 */}
-                        {(activeEp.sources?.length ?? 0) > 0 && (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              void (async () => {
-                                const alt = activeEp.sources![0]
-                                await switchEpisodeSource(activeEp.id, alt.itemId)
-                                onChanged()
-                              })()
-                            }}
-                            title={`备用来源：${activeEp
-                              .sources!.map((s) => s.title || `#${s.itemId}`)
-                              .join('、')}\n点击把第一个备用源切为主条目`}
-                            className="shrink-0 rounded border border-border-subtle/70 px-1 text-[9.5px] text-muted hover:bg-surface-2 hover:text-fg-mid"
-                          >
-                            {activeEp.sources!.length + 1} 源
-                          </button>
-                        )}
-                      </div>
-                    )}
-                    {/* 副行按类型给语义：图片没有时长概念，显示「--:--」会被误当可播内容 */}
-                    <p className="mt-1 text-[11px] text-muted">
-                      {activeEp.kind === 'photo'
-                        ? t('player.photoLabel')
-                        : fmtDuration(activeEp.duration ?? undefined) || '--:--'}
-                      {/* 合并溯源：重编集号后必须让用户知道「这条原来是哪部剧的第几集」，
-                          否则「搬来的 1-2」与目标原有的 1、2 会分不清谁是谁 */}
-                      {(activeEp.originSeriesTitle || activeEp.originEpisodeNo != null) && (
-                        <span className="text-accent/80">
-                          {' · '}
-                          {activeEp.originSeriesTitle
-                            ? `合并自《${activeEp.originSeriesTitle}》`
-                            : '合并自其他剧集'}
-                          {activeEp.originEpisodeNo != null
-                            ? ` 原 E${activeEp.originEpisodeNo}`
-                            : ''}
-                        </span>
-                      )}
-                      {/* 文件来源：「同一内容多源导入」时，这是判断该删哪条的唯一依据
-                          （标题与文件名都不可靠，见 BUG-037） */}
-                      {activeEp.ref && (
-                        <span
-                          className="text-muted/70"
-                          title={`${t(sourceLabelKey(activeEp.source))} · ${activeEp.ref}`}
-                        >
-                          {' · '}
-                          {t(sourceLabelKey(activeEp.source))}
-                        </span>
-                      )}
-                    </p>
-                    {/*
-                      本集介绍**不在这里展示**：它与剧集总介绍合并到聚焦区下方的
-                      唯一简介区（`desc-body`）里。编辑入口（`episode-edit` 铅笔）仍留在
-                      本行 —— 点开后面板里的集介绍 textarea 照旧可编辑。
-                    */}
-                    <div className="mt-auto flex flex-wrap items-center gap-2 pt-3">
-                      {hasMediaBytes(activeEp) ? (
-                        <Button
-                          size="sm"
-                          className="h-7 px-2.5 text-[11px]"
-                          onClick={() => onPlay(detail.episodes.indexOf(activeEp))}
-                          data-testid="episode-focus-play"
-                        >
-                          {activeEp.kind === 'photo' ? (
-                            <ImageIcon className="h-3.5 w-3.5" />
-                          ) : (
-                            <Play className="h-3.5 w-3.5" />
-                          )}
-                          {activeEp.kind === 'photo'
-                            ? t('media.episodeBrowse')
-                            : t('player.play')}
-                        </Button>
-                      ) : null}
-                      {/* 集级挂图（BUG-168）：打开图片选择对话框，给这一集挂/换图片 */}
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="h-7 px-2.5 text-[11px]"
-                        onClick={() => setPickingImages(activeEp)}
-                        title={t('media.attachImages')}
-                        aria-label={t('media.attachImages')}
-                        data-testid="episode-attach-images"
-                      >
-                        <ImagePlus className="h-3.5 w-3.5" />
-                        {t('media.attachImages')}
-                      </Button>
-                      {/* 换位：与同季相邻一集交换槽位（↑/↓ 各一格） */}
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => void moveEp(activeEp.id, 'up')}
-                        title="上移一位（与本季上一集换位）"
-                        data-testid="episode-move-up"
-                        className="flex h-7 w-7 items-center justify-center rounded border border-border-subtle/70 text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid disabled:opacity-40"
-                      >
-                        <ChevronUp className="h-3.5 w-3.5" />
-                      </button>
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => void moveEp(activeEp.id, 'down')}
-                        title="下移一位（与本季下一集换位）"
-                        data-testid="episode-move-down"
-                        className="flex h-7 w-7 items-center justify-center rounded border border-border-subtle/70 text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid disabled:opacity-40"
-                      >
-                        <ChevronDown className="h-3.5 w-3.5" />
-                      </button>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="h-7 px-2.5 text-[11px] text-destructive"
-                        onClick={() => onRemoveEpisode(activeEp)}
-                        title="从剧集中移除（内容保留在资料库）"
-                        data-testid="episode-focus-remove"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                        移除
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-
-                {editingEp === activeEp.id ? (
-                  <div className="mt-3 space-y-1.5">
-                    {/* 标题改在上方（与信息同一块），不再单独开一行（BUG-076）。
-                        槽位：允许任意 ≥1 的整数（2、3…不必从 1 连续）。
-                        目标槽被占用时后端对调两条，故这里不拦「号重复」。
-                        「结束集」是合集区间终点：留空即单集（BUG-153）——这是
-                        一个视频装多集时唯一能改终点/退回单集的入口。 */}
-                    <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
-                      <span>第</span>
-                      <input
-                        type="number"
-                        min={1}
-                        value={epSeason}
-                        onChange={(e) => setEpSeason(e.target.value)}
-                        aria-label="季号"
-                        data-testid="episode-season-input"
-                        className="h-6 w-14 rounded-md border border-border-subtle bg-surface px-1.5 text-[11px] text-fg-strong"
-                      />
-                      <span>季</span>
-                      <span>第</span>
-                      <input
-                        type="number"
-                        min={1}
-                        value={epNo}
-                        onChange={(e) => setEpNo(e.target.value)}
-                        aria-label="集号"
-                        data-testid="episode-no-input"
-                        className="h-6 w-14 rounded-md border border-border-subtle bg-surface px-1.5 text-[11px] text-fg-strong"
-                      />
-                      <span>集</span>
-                      <span className="text-muted/70">至</span>
-                      <input
-                        type="number"
-                        min={1}
-                        value={epEnd}
-                        onChange={(e) => setEpEnd(e.target.value)}
-                        placeholder="留空=单集"
-                        aria-label="结束集号（留空=单集）"
-                        data-testid="episode-end-input"
-                        className="h-6 w-20 rounded-md border border-border-subtle bg-surface px-1.5 text-[11px] text-fg-strong"
-                      />
-                      <span>集</span>
-                      <span className="text-[10px] text-muted/80">
-                        （一条内容装多集时填终点；号被占用时会与那一集互换位置）
-                      </span>
-                    </div>
-                    <textarea
-                      value={epDraft}
-                      onChange={(e) => setEpDraft(e.target.value)}
-                      placeholder="本集介绍…"
-                      rows={2}
-                      className="w-full resize-none rounded-md border border-border-subtle bg-surface px-2 py-1 text-[11px] text-fg-strong"
-                    />
-                    <div className="flex gap-2">
-                      <Button
-                        size="sm"
-                        className="h-6 px-2.5 text-[11px]"
-                        disabled={busy}
-                        onClick={() => void saveEp(activeEp.id)}
-                        data-testid="episode-save"
-                      >
-                        保存
-                      </Button>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="h-6 px-2.5 text-[11px]"
-                        onClick={() => setEditingEp(null)}
-                      >
-                        取消
-                      </Button>
-                    </div>
-                  </div>
-                ) : null}
-              </section>
-            ) : null}
-
-            {/*
-              合并介绍区（唯一的简介位）：**本集**与**全剧**两条文案在这里切换。
-              此前总介绍常驻 Hero、聚焦区再显示一次集介绍 —— 两处重复且割裂
-              （实际数据里很多集的简介就是复制的剧集简介）。合并后整页只有这一处简介。
-
-              位置：聚焦区之后、集号切换条之前 —— 先看清这一集是什么，再读它讲什么，
-              最后用切换条翻到别的集。
-            */}
-            {activeEp ? (
-              <section
-                className="mt-3 rounded-lg border border-border-subtle/60 bg-surface-2/30 p-3"
-                aria-label={t('media.descSectionLabel')}
-                data-testid="desc-section"
-              >
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => setDescTab('ep')}
-                    aria-pressed={descTab === 'ep'}
-                    data-testid="desc-tab-ep"
-                    className={`rounded-full border px-2.5 py-0.5 text-[11px] transition-colors ${
-                      descTab === 'ep'
-                        ? 'border-accent bg-accent/10 text-accent'
-                        : 'border-border-subtle text-muted hover:border-accent/40 hover:text-fg-mid'
-                    }`}
-                  >
-                    {t('media.descTabEp')}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setDescTab('series')}
-                    aria-pressed={descTab === 'series'}
-                    data-testid="desc-tab-series"
-                    className={`rounded-full border px-2.5 py-0.5 text-[11px] transition-colors ${
-                      descTab === 'series'
-                        ? 'border-accent bg-accent/10 text-accent'
-                        : 'border-border-subtle text-muted hover:border-accent/40 hover:text-fg-mid'
-                    }`}
-                  >
-                    {t('media.descTabSeries')}
-                  </button>
-                  {/* 编辑入口跟随当前 tab：本集 → 打开本集编辑面板（里面有集介绍
-                      textarea）；全剧 → 打开 Hero 里的总介绍编辑态。 */}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (descTab === 'ep') {
-                        openEpisodeEdit(activeEp)
-                      } else {
-                        setDescDraft(detail.description ?? '')
-                        setEditingDesc(true)
-                      }
-                    }}
-                    title={
-                      descTab === 'ep'
-                        ? '编辑本集（标题 / 季号 / 集号 / 介绍）'
-                        : t('media.editSeriesDesc')
-                    }
-                    aria-label={
-                      descTab === 'ep' ? '编辑本集介绍' : t('media.editSeriesDesc')
-                    }
-                    data-testid={descTab === 'ep' ? 'desc-edit-ep' : 'desc-edit-series'}
-                    className="ml-auto flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] text-muted hover:bg-surface-2 hover:text-fg-mid"
-                  >
-                    <Pencil className="h-3 w-3" /> 编辑
-                  </button>
-                </div>
-                {/* 内容：完整多行展示（不截断、不折叠）——裁剪会把长简介读成半句 */}
-                <div className="mt-1.5" data-testid="desc-body">
-                  <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[11.5px] leading-relaxed text-muted">
-                    {descTab === 'ep'
-                      ? activeEp.description || t('media.descEmptyEp')
-                      : detail.description || t('media.descEmptySeries')}
-                  </p>
-                </div>
-              </section>
-            ) : null}
-
-            {/* 集号切换条（单集聚焦）：集数多时横向滚动，一屏始终只呈现一集。
-                chip 上**保留既有 testid `episode-slot`** —— CDP 探针按它的数量断言
-                集数，改成聚焦布局后数量仍必须等于集数。 */}
-            <div
-              className="mt-3 flex gap-3 overflow-x-auto pb-1"
-              aria-label={t('media.episodeSwitcher')}
-              data-testid="episode-switcher"
-            >
-              {seasons.map(([season, eps]) => (
-                <div key={season} className="flex shrink-0 items-center gap-1.5">
-                  <span className="shrink-0 text-[10px] font-medium text-muted">
-                    第 {season} 季
-                  </span>
-                  {eps.map((ep) => {
-                    const on = activeEp?.id === ep.id
-                    /** 缩略图源：poster 优先；photo 无 poster 时用原条目地址（图片即内容） */
-                    const chipThumb =
-                      ep.poster ?? (ep.kind === 'photo' ? mediaItemUrl(ep.itemId) : null)
-                    return (
-                      <button
-                        key={ep.id}
-                        type="button"
-                        onClick={() => setActiveEpId(ep.id)}
-                        aria-pressed={on}
-                        title={ep.title || `S${ep.season}E${ep.episodeNo}`}
-                        data-testid={`episode-chip-${ep.id}`}
-                        className={`flex shrink-0 items-center gap-1.5 rounded-md border px-1.5 py-1 transition-colors ${
-                          on
-                            ? 'border-accent bg-accent/10 ring-1 ring-accent/50'
-                            : 'border-border-subtle bg-surface-2/40 hover:border-accent/40 hover:bg-surface-2'
-                        }`}
-                      >
-                        {/* chip 缩略图 56×32：只作辨识，大图在下方聚焦区 */}
-                        <span className="relative h-8 w-14 shrink-0 overflow-hidden rounded bg-surface-2">
-                          {chipThumb ? (
-                            <img
-                              src={chipThumb}
-                              alt=""
-                              loading="lazy"
-                              className={`h-full w-full ${coverFit(ep.kind)}`}
-                            />
-                          ) : (
-                            <span className="flex h-full w-full items-center justify-center text-muted">
-                              {ep.kind === 'audio' ? (
-                                <Music className="h-3.5 w-3.5" />
-                              ) : (
-                                <Film className="h-3.5 w-3.5" />
-                              )}
-                            </span>
-                          )}
-                        </span>
-                        {/* 集号沿用既有 testid：CDP 探针按 `episode-slot` 的数量断言集数，
-                            改成聚焦布局后数量仍必须等于集数。
-                            点集号仍打开本集编辑面板（与改版前同一语义）：集号是**位置**，
-                            所以「改号」与「换位」是同一件事的两种入口；点 chip 其余部分才是切换。 */}
-                        <span
-                          data-testid="episode-slot"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            openEpisodeEdit(ep)
-                          }}
+                          onClick={() => openEpisodeEdit(ep)}
                           title="修改季号 / 集号"
-                          className={`cursor-pointer whitespace-nowrap text-[11px] font-medium tabular-nums ${
-                            on ? 'text-accent' : 'text-fg-mid'
-                          }`}
+                          data-testid="episode-slot"
+                          className="w-12 shrink-0 rounded px-1 py-0.5 text-left text-[11px] font-medium text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid"
                         >
                           {/* 合集显示为区间（E1-2），单集保持 E1 */}
                           S{ep.season}E{ep.episodeNo}
                           {ep.episodeNoEnd != null && ep.episodeNoEnd > ep.episodeNo
                             ? `-${ep.episodeNoEnd}`
                             : ''}
-                        </span>
-                      </button>
-                    )
-                  })}
-                </div>
-              ))}
-            </div>
-
-            {/* 本集挂图画廊（BUG-168）：200×150，可单张摘除。
-                两处修正：① img 走 coverFit —— 此前裸 object-cover 会把图片裁切；
-                ② 源优先读后端已下发的 poster（media.rs:855），没有才回退 raw 原图，
-                避免大图直出原图造成解码压力。 */}
-            {/* 整页重排：挂图从聚焦区里提出来，落在集号切换条之后 */}
-            {activeEp && (activeEp.images?.length ?? 0) > 0 ? (
-              <div className="mt-3 flex flex-wrap gap-2" data-testid="episode-images">
-                {activeEp.images!.map((img) => (
-                  <div
-                    key={img.itemId}
-                    className="group/img relative aspect-[4/3] w-[200px] max-w-full shrink-0 overflow-hidden rounded border border-border-subtle bg-surface-2"
-                  >
-                    <img
-                      src={img.poster ?? mediaItemUrl(img.itemId)}
-                      alt=""
-                      loading="lazy"
-                      className={`h-full w-full ${coverFit('photo')}`}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => void removeEpisodeImage(activeEp.id, img.itemId)}
-                      title={t('media.removeEpisodeImage')}
-                      aria-label={t('media.removeEpisodeImage')}
-                      data-testid="episode-image-remove"
-                      className="absolute right-0 top-0 flex h-6 w-6 items-center justify-center rounded-bl bg-black/60 text-white opacity-0 transition-opacity hover:bg-destructive focus-visible:opacity-100 group-hover/img:opacity-100"
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            ) : null}
-          </>
+                        </button>
+                        {/* 无字节（BUG-080）：**不给播放入口**。
+                            一个点了必然 404 的播放按钮，是把「没有字节」伪装成「可以播放」；
+                            这里换成占位 +（TG 来源）重新缓存 /（其余）文件已丢失。 */}
+                        {hasMediaBytes(ep) ? (
+                          <button
+                            type="button"
+                            onClick={() => onPlay(idx)}
+                            className="relative aspect-video w-40 shrink-0 overflow-hidden rounded bg-surface-2"
+                            title={ep.kind === 'photo' ? '浏览图片' : '播放'}
+                            data-testid="episode-cover"
+                          >
+                            {ep.poster ? (
+                              /* 封面必须走 coverFit：photo → object-contain（图片是内容本身，
+                                 裁掉边缘就是丢内容），非 photo → object-cover（封面只是指代） */
+                              <img
+                                src={ep.poster}
+                                alt=""
+                                loading="lazy"
+                                className={`h-full w-full ${coverFit(ep.kind)}`}
+                              />
+                            ) : ep.kind === 'photo' ? (
+                              <img
+                                src={mediaItemUrl(ep.itemId)}
+                                alt=""
+                                loading="lazy"
+                                className="h-full w-full object-contain"
+                              />
+                            ) : (
+                              <span className="flex h-full w-full items-center justify-center text-muted">
+                                {ep.kind === 'audio' ? (
+                                  <Music className="h-4 w-4" />
+                                ) : (
+                                  <Film className="h-4 w-4" />
+                                )}
+                              </span>
+                            )}
+                            {/* 动作标识按类型区分：图片是「浏览」，不是「播放」 */}
+                            <span className="absolute inset-0 flex items-center justify-center bg-black/40 text-white opacity-0 transition-opacity hover:opacity-100">
+                              {ep.kind === 'photo' ? (
+                                <ImageIcon className="h-4 w-4" />
+                              ) : (
+                                <Play className="h-4 w-4 fill-white" />
+                              )}
+                            </span>
+                          </button>
+                        ) : (
+                          <div
+                            className="flex aspect-video w-40 shrink-0 flex-col items-center justify-center gap-0.5 rounded border border-dashed border-border-subtle bg-surface-2 px-0.5 text-muted"
+                            data-testid="episode-nobytes"
+                            title={
+                              canRecacheFromSource(ep.source)
+                                ? t('media.recacheFrom', {
+                                    source: t(sourceLabelKey(ep.source)),
+                                  })
+                                : t('media.fileMissingHint')
+                            }
+                          >
+                            <CloudOff className="h-3.5 w-3.5" />
+                            <span className="text-[9px] leading-none">
+                              {canRecacheFromSource(ep.source)
+                                ? t('media.notCached')
+                                : t('media.fileMissing')}
+                            </span>
+                            {canRecacheFromSource(ep.source) ? (
+                              <button
+                                type="button"
+                                onClick={() => recacheEpisode(ep)}
+                                className="rounded bg-accent/90 px-1 py-px text-[9px] font-medium leading-none text-white transition-colors hover:bg-accent"
+                                title="重新从 TG 拉取这一集的字节"
+                                data-testid="episode-recache"
+                              >
+                                重新缓存
+                              </button>
+                            ) : null}
+                          </div>
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            {editingEp === ep.id ? (
+                              /* 行内编辑标题（BUG-076）：不再另开一行；textarea 自动换行、
+                                 完整显示不截断——否则长标题在编辑态被截掉会存错内容。 */
+                              <textarea
+                                value={epTitle}
+                                onChange={(e) => setEpTitle(e.target.value)}
+                                placeholder="本集标题"
+                                aria-label="本集标题"
+                                data-testid="episode-title-input"
+                                rows={2}
+                                className="min-w-0 flex-1 resize-none rounded-md border border-border-subtle bg-surface px-1.5 py-1 text-[12.5px] text-fg-strong [overflow-wrap:anywhere]"
+                              />
+                            ) : (
+                              <>
+                                <p
+                                  className="truncate text-[12.5px] text-fg-strong"
+                                  title={ep.title || ''}
+                                >
+                                  {ep.title || `#${ep.itemId}`}
+                                </p>
+                                <button
+                                  type="button"
+                                  onClick={() => openEpisodeEdit(ep)}
+                                  className="shrink-0 rounded px-1 text-muted hover:bg-surface-2 hover:text-fg-mid"
+                                  title="编辑本集（标题 / 季号 / 集号 / 介绍）"
+                                  data-testid="episode-edit"
+                                >
+                                  <Pencil className="h-3 w-3" />
+                                </button>
+                              </>
+                            )}
+                            {/* 同槽备用来源（BUG-039）：点击切主；长按/右键语义不做，摘除在编辑面板 */}
+                            {(ep.sources?.length ?? 0) > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  void (async () => {
+                                    const alt = ep.sources![0]
+                                    await switchEpisodeSource(ep.id, alt.itemId)
+                                    onChanged()
+                                  })()
+                                }}
+                                title={`备用来源：${ep
+                                  .sources!.map((s) => s.title || `#${s.itemId}`)
+                                  .join('、')}\n点击把第一个备用源切为主条目`}
+                                className="shrink-0 rounded border border-border-subtle/70 px-1 text-[9.5px] text-muted hover:bg-surface-2 hover:text-fg-mid"
+                              >
+                                {ep.sources!.length + 1} 源
+                              </button>
+                            )}
+                            {/* 集级挂图（BUG-168）：打开图片选择对话框，给这一集挂/换图片 */}
+                            <button
+                              type="button"
+                              onClick={() => setPickingImages(ep)}
+                              title={t('media.attachImages')}
+                              aria-label={t('media.attachImages')}
+                              data-testid="episode-attach-images"
+                              className="shrink-0 rounded px-1 text-muted hover:bg-surface-2 hover:text-fg-mid"
+                            >
+                              <ImagePlus className="h-3 w-3" />
+                            </button>
+                          </div>
+                          {/* 副行按类型给语义：图片没有时长概念，显示「--:--」会被误当可播内容 */}
+                          <p className="text-[10px] text-muted">
+                            {ep.kind === 'photo'
+                              ? '图片'
+                              : fmtDuration(ep.duration ?? undefined) || '--:--'}
+                            {/* 合并溯源：重编集号后必须让用户知道「这条原来是哪部剧的第几集」，
+                                否则「搬来的 1-2」与目标原有的 1、2 会分不清谁是谁 */}
+                            {(ep.originSeriesTitle || ep.originEpisodeNo != null) && (
+                              <span className="text-accent/80">
+                                {' · '}
+                                {ep.originSeriesTitle
+                                  ? `合并自《${ep.originSeriesTitle}》`
+                                  : '合并自其他剧集'}
+                                {ep.originEpisodeNo != null ? ` 原 E${ep.originEpisodeNo}` : ''}
+                              </span>
+                            )}
+                            {/* 文件来源：「同一内容多源导入」时，这是判断该删哪条的唯一依据
+                                （标题与文件名都不可靠，见 BUG-037） */}
+                            {ep.ref && (
+                              <span
+                                className="text-muted/70"
+                                title={`${t(sourceLabelKey(ep.source))} · ${ep.ref}`}
+                              >
+                                {' · '}
+                                {t(sourceLabelKey(ep.source))}
+                              </span>
+                            )}
+                          </p>
+                          {/* 集级挂图缩略条（BUG-168）：每一集的图片就挂在自己这一行里 ——
+                              48×36 只作「这一集挂了图」的证据，点开看大图，可单张摘除。
+                              缩略源优先用后端已下发的 poster，没有才回退 raw 原图。 */}
+                          {imgs.length > 0 ? (
+                            <div
+                              className="mt-1.5 flex flex-wrap items-center gap-1.5"
+                              data-testid="episode-images"
+                            >
+                              {shownImgs.map((img) => (
+                                <div
+                                  key={img.itemId}
+                                  className="group/img relative h-9 w-12 shrink-0 overflow-hidden rounded border border-border-subtle bg-surface-2"
+                                >
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setEpImageView({
+                                        src: img.poster ?? mediaItemUrl(img.itemId),
+                                        title: ep.title || '',
+                                      })
+                                    }
+                                    title="查看大图"
+                                    aria-label="查看大图"
+                                    data-testid="episode-image-open"
+                                    className="block h-full w-full"
+                                  >
+                                    <img
+                                      src={img.poster ?? mediaItemUrl(img.itemId)}
+                                      alt=""
+                                      loading="lazy"
+                                      className={`h-full w-full ${coverFit('photo')}`}
+                                    />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => void removeEpisodeImage(ep.id, img.itemId)}
+                                    title={t('media.removeEpisodeImage')}
+                                    aria-label={t('media.removeEpisodeImage')}
+                                    data-testid="episode-image-remove"
+                                    className="absolute right-0 top-0 flex h-4 w-4 items-center justify-center rounded-bl bg-black/60 text-white opacity-0 transition-opacity hover:bg-destructive focus-visible:opacity-100 group-hover/img:opacity-100"
+                                  >
+                                    <X className="h-3 w-3" />
+                                  </button>
+                                </div>
+                              ))}
+                              {imgs.length > 3 ? (
+                                <button
+                                  type="button"
+                                  onClick={() => toggleImgRow(ep.id)}
+                                  title={
+                                    expandedImgRows.includes(ep.id)
+                                      ? '收起'
+                                      : `还有 ${imgs.length - 3} 张`
+                                  }
+                                  data-testid="episode-images-toggle"
+                                  className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid"
+                                >
+                                  {expandedImgRows.includes(ep.id) ? '收起' : `+${imgs.length - 3}`}
+                                </button>
+                              ) : null}
+                            </div>
+                          ) : null}
+                          {editingEp === ep.id ? (
+                            <div className="mt-1.5 space-y-1.5">
+                              {/* 标题改在行内（与列表同一行），不再单独开一行（BUG-076）。
+                                  槽位：允许任意 ≥1 的整数（2、3…不必从 1 连续）。
+                                  目标槽被占用时后端对调两条，故这里不拦「号重复」。
+                                  「结束集」是合集区间终点：留空即单集（BUG-153）——这是
+                                  一个视频装多集时唯一能改终点/退回单集的入口。 */}
+                              <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
+                                <span>第</span>
+                                <input
+                                  type="number"
+                                  min={1}
+                                  value={epSeason}
+                                  onChange={(e) => setEpSeason(e.target.value)}
+                                  aria-label="季号"
+                                  data-testid="episode-season-input"
+                                  className="h-6 w-14 rounded-md border border-border-subtle bg-surface px-1.5 text-[11px] text-fg-strong"
+                                />
+                                <span>季</span>
+                                <span>第</span>
+                                <input
+                                  type="number"
+                                  min={1}
+                                  value={epNo}
+                                  onChange={(e) => setEpNo(e.target.value)}
+                                  aria-label="集号"
+                                  data-testid="episode-no-input"
+                                  className="h-6 w-14 rounded-md border border-border-subtle bg-surface px-1.5 text-[11px] text-fg-strong"
+                                />
+                                <span>集</span>
+                                <span className="text-muted/70">至</span>
+                                <input
+                                  type="number"
+                                  min={1}
+                                  value={epEnd}
+                                  onChange={(e) => setEpEnd(e.target.value)}
+                                  placeholder="留空=单集"
+                                  aria-label="结束集号（留空=单集）"
+                                  data-testid="episode-end-input"
+                                  className="h-6 w-20 rounded-md border border-border-subtle bg-surface px-1.5 text-[11px] text-fg-strong"
+                                />
+                                <span>集</span>
+                                <span className="text-[10px] text-muted/80">
+                                  （一条内容装多集时填终点；号被占用时会与那一集互换位置）
+                                </span>
+                              </div>
+                              <textarea
+                                value={epDraft}
+                                onChange={(e) => setEpDraft(e.target.value)}
+                                placeholder="本集介绍…"
+                                rows={2}
+                                className="w-full resize-none rounded-md border border-border-subtle bg-surface px-2 py-1 text-[11px] text-fg-strong"
+                              />
+                              <div className="flex gap-2">
+                                <Button
+                                  size="sm"
+                                  className="h-6 px-2.5 text-[11px]"
+                                  disabled={busy}
+                                  onClick={() => void saveEp(ep.id)}
+                                  data-testid="episode-save"
+                                >
+                                  保存
+                                </Button>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-6 px-2.5 text-[11px]"
+                                  onClick={() => setEditingEp(null)}
+                                >
+                                  取消
+                                </Button>
+                              </div>
+                            </div>
+                          ) : ep.description ? (
+                            /* 本集介绍：整段显示（不截断）——裁成半句比占两行更糟 */
+                            <p className="mt-1 whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[10.5px] leading-relaxed text-muted">
+                              {ep.description}
+                            </p>
+                          ) : null}
+                        </div>
+                        {/* 换位：与同季相邻一集交换槽位（↑/↓ 各一格） */}
+                        <div className="flex shrink-0 flex-col gap-0.5">
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void moveEp(ep.id, 'up')}
+                            title="上移一位（与本季上一集换位）"
+                            data-testid="episode-move-up"
+                            className="flex h-5 w-5 items-center justify-center rounded text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid disabled:opacity-40"
+                          >
+                            <ChevronUp className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void moveEp(ep.id, 'down')}
+                            title="下移一位（与本季下一集换位）"
+                            data-testid="episode-move-down"
+                            className="flex h-5 w-5 items-center justify-center rounded text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid disabled:opacity-40"
+                          >
+                            <ChevronDown className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 shrink-0 px-2 text-[11px] text-destructive"
+                          onClick={() => onRemoveEpisode(ep)}
+                          title="从剧集中移除（内容保留在资料库）"
+                          data-testid="episode-remove"
+                        >
+                          移除
+                        </Button>
+                      </div>
+                    </li>
+                  )
+                })}
+              </ul>
+            </section>
+          ))
         )}
       </div>
 
@@ -1250,6 +1120,33 @@ export function SeriesDetail(props: {
           <p className="absolute bottom-4 left-1/2 -translate-x-1/2 text-xs text-white/70">
             {viewerIndex + 1} / {photoEps.length}
           </p>
+        </div>
+      ) : null}
+
+      {/* 集级挂图灯箱：点行内缩略图放大这一张。只读浏览 —— 不进播放器、不占分集槽。 */}
+      {epImageView ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-8"
+          onClick={() => setEpImageView(null)}
+          data-testid="episode-image-viewer"
+        >
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation()
+              setEpImageView(null)
+            }}
+            className="absolute right-4 top-4 flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white hover:bg-white/20"
+            aria-label="关闭"
+          >
+            <X className="h-5 w-5" />
+          </button>
+          <img
+            src={epImageView.src}
+            alt={epImageView.title}
+            className="max-h-full max-w-full object-contain"
+            onClick={(e) => e.stopPropagation()}
+          />
         </div>
       ) : null}
 
