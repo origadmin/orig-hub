@@ -268,6 +268,7 @@
   "tg.selectGroup": "Select a group on the left",
   "tg.emptyGroup": "No channels in this group",
   "tg.historyLoading": "Loading media…",
+  "tg.feedLoadFailed": "Failed to load content. Reselect the channel or try again later",
   "tg.historyOlder": "Loading older items…",
   "tg.historyNoMore": "No more history",
   "tg.historyEmpty": "No media in this channel yet",

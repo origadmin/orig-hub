@@ -263,6 +263,7 @@
   "tg.selectGroup": "从左侧选择分组",
   "tg.emptyGroup": "该分组暂无频道",
   "tg.historyLoading": "加载媒体中…",
+  "tg.feedLoadFailed": "内容加载失败，重新选择频道或稍后重试",
   "tg.historyOlder": "正在加载更早的内容…",
   "tg.historyNoMore": "没有更多历史了",
   "tg.historyEmpty": "该频道暂无媒体内容",

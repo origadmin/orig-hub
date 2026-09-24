@@ -330,6 +330,12 @@ export function TgPanel(
 
   const [feed, setFeed] = useState<FeedItem[]>([])
   const [feedLoading, setFeedLoading] = useState(false)
+  /**
+   * 内容流加载失败的**面板内联**提示（BUG-167）：只在内容区展示、不升级为全局 toast。
+   * 全局可用性表述的唯一真相源是引擎 `tgAvailability` 横幅（与三处连接灯同源诚实）；
+   * 瞬时传输错误在这里降级为「可重试的局部失败」，绝不产生与之矛盾的「无法连接」断言。
+   */
+  const [feedError, setFeedError] = useState<string | null>(null)
   const [loadingOlder, setLoadingOlder] = useState(false)
   const [hasMore, setHasMore] = useState(false)
   /** 监控频道新内容：后台增量同步到的未展示条数（点击提示条才刷新，避免拽走滚动位置） */
@@ -459,11 +465,12 @@ export function TgPanel(
         setScanning(scanning)
         return merged.size
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e))
-        return 0
+        // BUG-167：这里不再升级为全局 toast —— 调用方分岔：挂载/扫描轮询（后台）静默
+        // （原文已由 `tgFailureMessage` 记日志）；用户主动「重新扫描订阅」才给可见反馈。
+        throw e instanceof Error ? e : new Error(String(e))
       }
     },
-    [setError],
+    [],
   )
 
   useEffect(() => {
@@ -476,20 +483,28 @@ export function TgPanel(
     // 扫描，之后一律走「重新扫描订阅」手动刷新。真正的持续监控点是**内容**，
     // 由监控频道的同步/消息流承担，与这份静态列表解耦。
     void (async () => {
-      const cached = await fetchDialogs(false)
-      // 冷启动：缓存为空 → 自动补一次后台扫描（后端 total==0 时同样会自扫，双保险）
-      if (cached === 0) void fetchDialogs(true)
+      try {
+        const cached = await fetchDialogs(false)
+        // 冷启动：缓存为空 → 自动补一次后台扫描（后端 total==0 时同样会自扫，双保险）
+        if (cached === 0) await fetchDialogs(true)
+      } catch {
+        // BUG-167：后台加载失败静默 —— 面板顶部的可用性横幅（引擎真相源）已如实表述，
+        // 瞬时传输错误不得再弹全局 toast 与三处连接灯矛盾（原文已记日志）。
+      }
     })()
     listTgMonitoredChannels()
       .then(setMonitoredList)
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-  }, [alive, tgBroken, fetchDialogs, setError])
+      .catch(() => {
+        // BUG-167：同上，后台监控列表加载失败静默，不打脸连接灯。
+      })
+  }, [alive, tgBroken, fetchDialogs])
 
   // 扫描中轮询（2.5s），直到后端扫描结束。
   useEffect(() => {
     if (!scanning) return
     const h = setTimeout(() => {
-      void fetchDialogs(false)
+      // BUG-167：后台轮询失败静默（原文已记日志），不断轮询链、不弹全局 toast。
+      void fetchDialogs(false).catch(() => {})
     }, 2500)
     return () => clearTimeout(h)
   }, [scanning, fetchDialogs, channels.length])
@@ -743,7 +758,9 @@ export function TgPanel(
         if (!cancelled) setGlobalHits(hits)
       })
       .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
+        // BUG-167：搜索是后台查询流，失败静默（结果区为空即信号）；
+        // 瞬时传输错误不升级为全局「无法连接」断言与连接灯矛盾。原文已记日志。
+        if (!cancelled) console.error('[tg] global search failed', e)
       })
       .finally(() => {
         if (!cancelled) setGlobalSearching(false)
@@ -807,6 +824,7 @@ export function TgPanel(
     let cancelled = false
     setFeedLoading(true)
     setFeed([])
+    setFeedError(null)
     setHasMore(true)
     setPendingNew(0)
     stickBottomRef.current = true
@@ -828,7 +846,10 @@ export function TgPanel(
           void applyStoredSnapshot(chatId, false, page.items)
         }
       } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
+        // BUG-167：内容流加载失败 → 面板内联提示（可重试的局部失败），
+        // 不再升级为全局 toast——可用性唯一真相源是引擎横幅与三处连接灯。
+        if (!cancelled)
+          setFeedError(e instanceof Error ? e.message : String(e))
       } finally {
         if (!cancelled) setFeedLoading(false)
       }
@@ -838,7 +859,7 @@ export function TgPanel(
     }
     // monitoredSet 身份随监控列表变化，增删监控后自动重载；
     // feedReloadTick 为提示条点击的显式刷新。
-  }, [selectedId, monitoredSet, feedReloadTick, setError, applyStoredSnapshot])
+  }, [selectedId, monitoredSet, feedReloadTick, applyStoredSnapshot])
 
   // 监控频道内容新鲜度：消息流本地满页即不回网，若没有任何主动同步动作，
   // 停留在面板里永远看不到新内容（BUG-038）。这里补上「内容即监控点」的主动轮：
@@ -931,8 +952,10 @@ export function TgPanel(
         void applyStoredSnapshot(src.chatId, false, page.items)
       }
     } catch (e) {
+      // BUG-167：滚动触发的翻页失败静默（原文已记日志）；失败后可再次滚动重试，
+      // 不弹全局 toast 与连接灯矛盾。
       prependAnchorRef.current = null
-      setError(e instanceof Error ? e.message : String(e))
+      console.error('[tg] load older failed', e)
     } finally {
       setLoadingOlder(false)
     }
@@ -1396,7 +1419,13 @@ export function TgPanel(
               variant="ghost"
               size="sm"
               className="h-7 px-2 text-[11px]"
-              onClick={() => void fetchDialogs(true)}
+              onClick={() =>
+                // BUG-167：用户主动重扫失败仍给全局反馈（这是用户在等的动作结果，
+                // 与后台静默加载不同）；后台加载路径见挂载/轮询 effect 的静默分支。
+                void fetchDialogs(true).catch((e) =>
+                  setError(e instanceof Error ? e.message : String(e)),
+                )
+              }
               disabled={!alive}
             >
               {t('tg.refresh')}
@@ -1672,6 +1701,9 @@ export function TgPanel(
 
                 {feedLoading ? (
                   <p className="py-10 text-center text-sm text-muted">{t('tg.historyLoading')}</p>
+                ) : feedError ? (
+                  /* BUG-167：内联失败提示（局部、可随重选频道消失），不升全局 toast */
+                  <p className="py-10 text-center text-sm text-muted">{t('tg.feedLoadFailed')}</p>
                 ) : feed.length === 0 ? (
                   <p className="py-10 text-center text-sm text-muted">{t('tg.historyEmpty')}</p>
                 ) : (

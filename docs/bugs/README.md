@@ -178,6 +178,7 @@
 | BUG-164 | 下载类视图顶栏无连接灯——三角落连接态指示在 `all/downloading/paused/completed` 四视图恒三缺一（`ContextBarActions` 分支从未接入 BUG-087 的统一灯）；修：抽 `ConnLight` 两分支共用 | fixed | shell |
 | BUG-165 | 进度条拖拽期每个 pointermove 都写 `currentTime` 提交 seek——未松手（未确认态）即发请求，实测 2s 拖拽 7 发 7 取消的请求风暴；修：拖拽只更新视觉 `dragRatio`，pointerup 才提交唯一一次 seek | fixed | shell |
 | BUG-166 | 「解码吃力」把数据晚到型丢帧误判为解码吞吐不足（`waiting/stalled` 不重置基线 + 判定不看缓冲健康）——无可见卡顿却常驻误导提示；修：stall 恢复重置基线 + 缓冲领先 <2s 时绝不置位，三阶段行为测试 P1 验牙/P2 恢复/P3 断供抑制 | fixed | shell |
+| BUG-167 | TG 后台加载瞬时失败走 store `setError`（error+toast 双写）升级为全局「无法连接到 Telegram」断言——与三处 `useConnState` 连接灯同屏矛盾的第二真相源；修：后台加载静默/内联（feed 失败改面板内联 `tg.feedLoadFailed`）、用户主动动作保留反馈，该文案当且仅当用户操作真实失败或引擎 `available:false` | fixed | shell |
 
 ## 历史欠账
 
