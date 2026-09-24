@@ -10,6 +10,7 @@
 //!   GET  /api/tg/dialogs             -> [Channel] 订阅频道枚举（未登录返回 401）
 //!   GET  /api/tg/messages/:chat_id?limit=100 -> [MediaItem] 频道媒体历史（未登录返回 401）
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -24,7 +25,7 @@ use serde_json::json;
 use crate::login::{ClientError, DownloadOutcome, LoginPhase, MediaRange};
 use crate::monitor;
 use crate::state::{AppState, Availability};
-use crate::store::StoredQuery;
+use crate::store::{CacheTask, StoredQuery};
 
 pub fn router(state: Arc<AppState>) -> axum::Router {
     Router::new()
@@ -827,13 +828,18 @@ async fn cached_path(st: &AppState, chat_id: i64, message_id: i64) -> Option<Str
     }
 }
 
-/// 下载单条并入库（元数据回填 + 标记已缓存）。同步端点与后台任务共用同一实现。
-async fn cache_one(
+/// 下载单条并回填缓存状态（消息元数据 upsert + 标记已缓存），**不做 media_item 入库**。
+///
+/// byte-ownership P1（设计 I1「事实先登记」）：缓存任务的条目登记已前移到字节之前
+/// （T0，见 `run_one_cache_task` 与 `IngestCtx`），任务路径只负责取字节；落盘成功后
+/// 由调用方用 `backfill_item_bytes` 专用语句回填 `file_path`（不走 COALESCE upsert）。
+/// 单条下载端点（`/api/tg/download`）仍走 [`cache_one`] 的「下载即入库」旧契约。
+async fn cache_one_bytes(
     st: &AppState,
     chat_id: i64,
     message_id: i64,
     dir: &str,
-) -> Result<(DownloadOutcome, Option<i64>), ApiError> {
+) -> Result<DownloadOutcome, ApiError> {
     // BUG-106：下载失败同样不再裸抛传输层原文。
     // 失败**必须**是失败（不能伪装成成功），但要给出可行动的原因而不是
     // `request error: dropped (cancelled)` 这种只有维护者才懂的串。
@@ -881,6 +887,18 @@ async fn cache_one(
         .store
         .mark_downloaded(chat_id, message_id, Some(&outcome.path))
         .await;
+    Ok(outcome)
+}
+
+/// 下载单条并入库（同步端点旧契约）：字节 + 缓存状态回填 + media_item 登记。
+/// 缓存任务不走这里——登记已前移（`IngestCtx`），这里只剩单条下载端点在用。
+async fn cache_one(
+    st: &AppState,
+    chat_id: i64,
+    message_id: i64,
+    dir: &str,
+) -> Result<(DownloadOutcome, Option<i64>), ApiError> {
+    let outcome = cache_one_bytes(st, chat_id, message_id, dir).await?;
     let id = import_cached_file(st, chat_id, message_id, &outcome.path).await;
     Ok((outcome, id))
 }
@@ -966,71 +984,6 @@ async fn import_cached_file(
         Ok(id) => Some(id),
         Err(e) => {
             st.push_log(&format!("cache ingest failed for {chat_id}:{message_id}: {e}"));
-            None
-        }
-    }
-}
-
-/// BUG-049 规则：图片**不需要缓存**（不落盘），最多加入媒体库作为浏览条目。
-///
-/// 按 (source,ref) 幂等；条目无本地文件（file_path=NULL），浏览字节由
-/// `/api/media/items/:id/raw` 现场代理 TG 缩略图（不持久化、不占缓存空间）。
-/// 元数据顺手入 tg_message 行，后续离线也能识别这是图片（不再 RPC）。
-async fn import_photo_item(st: &AppState, chat_id: i64, message_id: i64) -> Option<i64> {
-    let ref_key = format!("{chat_id}:{message_id}");
-    if let Ok(Some(id)) = st.store.item_id_by_ref("tg", &ref_key).await {
-        return Some(id);
-    }
-    let meta = st
-        .client
-        .message_meta(chat_id, message_id)
-        .await
-        .ok()
-        .flatten();
-    // 图片条目同样切分（与视频、与剧集同一把尺子）：标题只占首行，
-    // 其余进 description —— 图片的 caption 往往就是整部剧的简介。
-    let (caption_title, caption_desc) = meta
-        .as_ref()
-        .and_then(|m| m.caption.as_deref())
-        .map(split_caption)
-        .unwrap_or((None, None));
-    let title = caption_title.unwrap_or_else(|| format!("TG 图片 #{message_id}"));
-    let size = meta.as_ref().and_then(|m| m.size);
-    match st
-        .store
-        .upsert_media_item(
-            "tg",
-            &ref_key,
-            &title,
-            "photo",
-            None,
-            size,
-            None,
-            caption_desc.as_deref(),
-        )
-        .await
-    {
-        Ok(id) => {
-            if let Some(m) = &meta {
-                let _ = st
-                    .store
-                    .upsert_message(
-                        chat_id,
-                        message_id,
-                        m.caption.as_deref(),
-                        m.mime_type.as_deref(),
-                        m.size,
-                        m.media_type.as_deref(),
-                        m.date,
-                        m.duration,
-                        m.group_id,
-                    )
-                    .await;
-            }
-            Some(id)
-        }
-        Err(e) => {
-            st.push_log(&format!("photo import failed for {ref_key}: {e}"));
             None
         }
     }
@@ -1190,6 +1143,454 @@ pub fn spawn_cache_task(st: Arc<AppState>, task_id: i64) {
     });
 }
 
+// ---- 缓存任务的元数据登记（byte-ownership P1：事实先登记，设计 I1） ----
+
+/// 消息元数据 → 规范 kind（T0 登记与组预扫共用的同一把尺子）。
+///
+/// `media_type` 由 grammers 从 mime 派生（`video/*` → "video" 等，见
+/// `grammers::classify_media`），两列同源；v0.4.0 迁移前的历史行 `media_type`
+/// 为 NULL → 回退 mime 前缀，再不行按 `file`。与旧实现入库的 mime 兜底链一致。
+/// 扩展名分类在字节落盘后由 `backfill_item_bytes` 校正——T0 时还没有文件可判。
+fn meta_kind(media_type: Option<&str>, mime_type: Option<&str>) -> String {
+    match media_type {
+        Some("photo") | Some("video") | Some("audio") => media_type.unwrap().to_string(),
+        _ => match mime_type {
+            Some(m) if m.starts_with("video/") => "video".to_string(),
+            Some(m) if m.starts_with("image/") => "photo".to_string(),
+            Some(m) if m.starts_with("audio/") => "audio".to_string(),
+            _ => "file".to_string(),
+        },
+    }
+}
+
+/// 落盘路径的扩展名（无扩展名为空串）——`classify_ext` 的入参。
+fn path_ext(path: &str) -> String {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// 逐任务登记上下文（metadata-first ingest 的状态机）。
+///
+/// 职责：把旧实现「任务末尾一次性 `append_episodes_ranged` + 照片归属」的**最终
+/// 库状态**逐消息就地复现（等价性论证）：
+///   - 非照片条目：T0 即建剧集槽位。`append_episodes_ranged` 的占用快照/去重/
+///     墓碑每次调用都从库中重读，`next` 游标等价演进——**同序**下逐条追加与
+///     整批追加产生相同落位，故逐条登记 ≡ 任务末批量登记。
+///   - 混编组照片（BUG-168）：挂到「组内它之前最近的**非照片**条目」所在集，
+///     组首照片归首个非照片条目那一集（旧实现同一规则，目标池同为 media_pairs
+///     = 非照片条目，不限于 video）。目标由全组消息预扫确定；目标条目登记槽位
+///     的瞬间即挂（`add_episode_image` insert-or-ignore，幂等）。
+///   - photo-only 组（组内无 video）：照片各自成「浏览位」episode（BUG-044），
+///     同样吃 caption 集号区间（旧实现非混编时 media_pairs 含全部条目）。
+struct IngestCtx {
+    task_id: i64,
+    chat_id: i64,
+    /// 全组消息号（first_caption / 剧集幂等键用）。
+    task_msgs: Vec<i64>,
+    task_group: Option<i64>,
+    created_at: i64,
+    /// 组内非照片消息号（预扫）——混编组照片的归属目标全集。
+    slot_msgs: Vec<i64>,
+    /// 组内是否含 video（预扫）——区分混编组与 photo-only 组。
+    has_video: bool,
+    /// 已登记槽位的非照片条目：message_id → item_id。
+    registered: HashMap<i64, i64>,
+    /// 照片挂起表：(目标消息号, photo_msg, photo_item)，目标登记槽位时即挂。
+    pending: Vec<(i64, i64, i64)>,
+    /// (message_id, item_id) 登记序——标签归档用（与旧 `ingested` 同义同序）。
+    ingested: Vec<(i64, i64)>,
+    series: Option<i64>,
+    /// 刚 create 的剧集：首条挂不上要按旧语义回滚空壳（旧 create+append 的 n==0 分支）。
+    series_fresh: bool,
+    /// 剧集建立失败/回滚后不再重试（旧实现整批只尝试一次，逐条路径等价为一次）。
+    series_blocked: bool,
+}
+
+impl IngestCtx {
+    /// 任务开始时的预扫：确保组内每条消息的 tg_message 行就位（判型与 caption
+    /// 离线可读——剧集标题取 `first_caption` 依赖它；未监控频道此前要等下载后才
+    /// 补行，登记前移后必须在 T0 之前就位），再据 `meta_kind` 圈出归属目标池与
+    /// has_video。元数据拉取失败的消息不阻断：行缺席时该消息不进目标池，T0 登记
+    /// 退化为 file/无标题（与旧实现 meta 缺失同貌）。
+    async fn prepare(st: &Arc<AppState>, task: &CacheTask) -> Self {
+        for msg_id in &task.message_ids {
+            if matches!(st.store.get_message(task.chat_id, *msg_id).await, Ok(Some(_))) {
+                continue;
+            }
+            if let Ok(Some(m)) = st.client.message_meta(task.chat_id, *msg_id).await {
+                let _ = st
+                    .store
+                    .upsert_message(
+                        task.chat_id,
+                        *msg_id,
+                        m.caption.as_deref(),
+                        m.mime_type.as_deref(),
+                        m.size,
+                        m.media_type.as_deref(),
+                        m.date,
+                        m.duration,
+                        m.group_id,
+                    )
+                    .await;
+            }
+        }
+        let mut slot_msgs = Vec::new();
+        let mut has_video = false;
+        for msg_id in &task.message_ids {
+            let kind = match st.store.get_message(task.chat_id, *msg_id).await {
+                Ok(Some(m)) => meta_kind(m.media_type.as_deref(), m.mime_type.as_deref()),
+                _ => continue,
+            };
+            if kind != "photo" {
+                slot_msgs.push(*msg_id);
+            }
+            has_video |= kind == "video";
+        }
+        Self {
+            task_id: task.id,
+            chat_id: task.chat_id,
+            task_msgs: task.message_ids.clone(),
+            task_group: task.group_id,
+            created_at: task.created_at,
+            slot_msgs,
+            has_video,
+            registered: HashMap::new(),
+            pending: Vec::new(),
+            ingested: Vec::new(),
+            series: None,
+            series_fresh: false,
+            series_blocked: false,
+        }
+    }
+
+    /// T0 事实登记：media_item 行（`file_path=NULL` 待回填），返回 (item_id, 库中 kind)。
+    ///
+    /// kind 以**库中值**为准：重复登记（重试/幂等重跑）的旧条目保留既有 kind——
+    /// 与旧实现 `item_kinds` 取数同源；新建条目写入 T0 判定的 kind（字节未落，
+    /// 无扩展名可判）。登记失败返回 None（不阻断任务——旧实现入库失败同样只记日志）。
+    async fn register_item(
+        &self,
+        st: &Arc<AppState>,
+        msg_id: i64,
+        photo_rule: bool,
+    ) -> Option<(i64, String)> {
+        let ref_key = format!("{}:{}", self.chat_id, msg_id);
+        let row = st.store.get_message(self.chat_id, msg_id).await.ok().flatten();
+        let kind = match &row {
+            Some(m) => meta_kind(m.media_type.as_deref(), m.mime_type.as_deref()),
+            None => "file".to_string(),
+        };
+        let id = match st.store.item_id_by_ref("tg", &ref_key).await {
+            Ok(Some(id)) => id,
+            _ => {
+                // 新登记：file_path=NULL 是 T0 的核心语义（字节未落，事实先在）。
+                // 标题只取 caption 首行（split_caption），其余进 description——
+                // 与剧集、与旧 import_cached_file/import_photo_item 同一把尺子。
+                let (title, desc) = row
+                    .as_ref()
+                    .and_then(|m| m.caption.as_deref())
+                    .map(crate::media::split_caption)
+                    .unwrap_or((None, None));
+                // BUG-049 照片条目的可读兜底标题（旧 import_photo_item 同款）；
+                // 非照片维持空串（BUG-154：不拿内部文件名伪装标题）。
+                let title = match title {
+                    Some(t) => t,
+                    None if photo_rule => format!("TG 图片 #{msg_id}"),
+                    None => String::new(),
+                };
+                match st
+                    .store
+                    .upsert_media_item(
+                        "tg",
+                        &ref_key,
+                        &title,
+                        &kind,
+                        None,
+                        row.as_ref().and_then(|m| m.size),
+                        row.as_ref().and_then(|m| m.duration),
+                        desc.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(e) => {
+                        st.push_log(&format!("cache ingest failed for {ref_key}: {e}"));
+                        return None;
+                    }
+                }
+            }
+        };
+        let kind = st
+            .store
+            .item_kinds(&[id])
+            .await
+            .ok()
+            .and_then(|m| m.get(&id).cloned())
+            .unwrap_or(kind);
+        Some((id, kind))
+    }
+
+    /// T0 槽位登记：非照片条目编入剧集；混编组照片挂目标集图片位；
+    /// photo-only 组照片自成浏览位 episode。每次登记都幂等
+    /// （`append_episodes_ranged` 跳过已收录条目、墓碑照拦；挂图 insert-or-ignore）。
+    async fn register_slot(&mut self, st: &Arc<AppState>, msg_id: i64, item_id: i64, kind: &str) {
+        self.ingested.push((msg_id, item_id));
+        if kind == "photo" {
+            self.register_photo_slot(st, msg_id, item_id).await;
+            return;
+        }
+        // 非照片：一槽一位（混编/纯视频/photo-only 组同规则，旧 media_pairs 同义）。
+        let range = self.caption_range(st, msg_id).await;
+        self.append_slot(st, item_id, range).await;
+        // 目标就是我：挂起照片此刻落位（旧实现在任务末尾按消息序统一挂，
+        // 每集内 `add_episode_image` 的 sort_no 演进与此一致）。
+        let due: Vec<(i64, i64)> = self
+            .pending
+            .iter()
+            .filter(|(vm, _, _)| *vm == msg_id)
+            .map(|(_, pm, pi)| (*pm, *pi))
+            .collect();
+        if !due.is_empty() {
+            if let Some(sid) = self.series {
+                for (pm, pi) in due {
+                    self.attach_photo(st, sid, item_id, pm, pi).await;
+                }
+            }
+            self.pending.retain(|(vm, _, _)| *vm != msg_id);
+        }
+        self.registered.insert(msg_id, item_id);
+    }
+
+    /// 混编组照片归属（BUG-168 语义，与旧实现逐字节同规则）：
+    /// 组内消息序中它之前最近的**非照片**条目所在集；之前没有 → 组首照片，
+    /// 归首个非照片条目那一集（旧实现的 max-then-min 回退）。目标已登记就当场挂，
+    /// 否则入挂起表等目标登记（处理顺序即消息顺序，逐条处理时归属都能就地判定）。
+    /// 整组无 video（photo-only）→ 自成浏览位 episode（BUG-044）。
+    async fn register_photo_slot(&mut self, st: &Arc<AppState>, msg_id: i64, item_id: i64) {
+        if !self.has_video {
+            // 旧 mixed 判定 = 组内含 video 才挂图；无 video 的组照片仍是独立集
+            //（即便组里混着 file/audio——旧 media_pairs 在非混编时含全部条目）。
+            let range = self.caption_range(st, msg_id).await;
+            self.append_slot(st, item_id, range).await;
+            return;
+        }
+        let target = self
+            .slot_msgs
+            .iter()
+            .copied()
+            .filter(|m| *m < msg_id)
+            .max()
+            .or_else(|| self.slot_msgs.iter().copied().min());
+        let Some(target_msg) = target else {
+            // 组内没有任何非照片条目：不可能走到（has_video ⇒ slot_msgs 非空），
+            // 防御性兜底为自成 episode。
+            let range = self.caption_range(st, msg_id).await;
+            self.append_slot(st, item_id, range).await;
+            return;
+        };
+        match self.registered.get(&target_msg) {
+            Some(&target_item) => {
+                if let Some(sid) = self.series {
+                    self.attach_photo(st, sid, target_item, msg_id, item_id)
+                        .await;
+                }
+            }
+            None => self.pending.push((target_msg, msg_id, item_id)),
+        }
+    }
+
+    async fn attach_photo(
+        &self,
+        st: &Arc<AppState>,
+        sid: i64,
+        target_item: i64,
+        photo_msg: i64,
+        photo_item: i64,
+    ) {
+        match st.store.episode_id_of_item(sid, target_item).await {
+            Ok(Some(eid)) => {
+                if let Err(e) = st.store.add_episode_image(eid, photo_item).await {
+                    st.push_log(&format!("attach photo {photo_msg} to episode {eid}: {e}"));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => st.push_log(&format!("find episode for item {target_item}: {e}")),
+        }
+    }
+
+    /// caption 集号区间（BUG-039）：解析不出交给顺序编号。旧 `ranged_items`
+    /// 的单条版——同一条 `parse_episode_range`，区间与已占槽位冲突时由
+    /// `append_episodes_ranged` 自动回退，不会覆盖既有编排。
+    async fn caption_range(&self, st: &Arc<AppState>, msg_id: i64) -> Option<(i64, i64)> {
+        match st.store.get_message(self.chat_id, msg_id).await {
+            Ok(Some(m)) => m
+                .caption
+                .as_deref()
+                .and_then(crate::media::parse_episode_range)
+                .map(|(s, e)| (s, e.unwrap_or(s))),
+            _ => None,
+        }
+    }
+
+    /// 单条槽位追加（自动路径内核 `append_episodes_ranged`，season=1 与旧实现相同）。
+    async fn append_slot(&mut self, st: &Arc<AppState>, item_id: i64, range: Option<(i64, i64)>) {
+        let Some(sid) = self.ensure_series(st).await else {
+            return;
+        };
+        let fresh = self.series_fresh;
+        match st
+            .store
+            .append_episodes_ranged(sid, 1, &[(item_id, range)])
+            .await
+        {
+            Ok(0) if fresh => {
+                // 旧语义：新建剧集一条都没挂上 = 归档失败，回滚空壳并封锁重建
+                //（墓碑拦截的条目不会被自动路径复活——旧整批路径同一分支）。
+                self.rollback_series(st, sid, "0 episodes attached").await;
+            }
+            // Ok(0) 非新建 = 已在季内（重复登记/墓碑），幂等，与旧批量去重同义。
+            Ok(_) => {
+                if fresh {
+                    st.push_log(&format!(
+                        "cache task {}: series {sid} registered (metadata-first)",
+                        self.task_id
+                    ));
+                }
+                self.series_fresh = false;
+            }
+            Err(e) => {
+                st.push_log(&format!("cache task {}: append episodes: {e}", self.task_id));
+                if fresh {
+                    self.rollback_series(st, sid, &e.to_string()).await;
+                }
+            }
+        }
+    }
+
+    /// 幂等建立/复用任务剧集：标题（caption → 规范化，BUG-152）、幂等键
+    ///（相册 group_id 优先）、kind=series 全部与旧实现同源。
+    async fn ensure_series(&mut self, st: &Arc<AppState>) -> Option<i64> {
+        if let Some(sid) = self.series {
+            return Some(sid);
+        }
+        if self.series_blocked {
+            return None;
+        }
+        // 剧集标题与介绍来自**组内 caption**：首行标题、其余介绍（split_caption）。
+        let (title, desc) = match st
+            .store
+            .first_caption(self.chat_id, &self.task_msgs)
+            .await
+            .unwrap_or(None)
+        {
+            Some(cap) => crate::media::split_caption(&cap),
+            None => (None, None),
+        };
+        // BUG-152：剧集名由 caption 的**规范化剧集名**（去集号）决定；无 caption
+        //（或首行为空）才回退「频道名 · 日期」；剥完为空同样回退（空标题不可辨识）。
+        let title = match title {
+            Some(t) => normalized_series_name(&t),
+            None => {
+                let base = channel_title(st, self.chat_id)
+                    .await
+                    .unwrap_or_else(|| format!("TG {}", self.chat_id));
+                format!("{base} · {}", ymd_str(self.created_at as u64))
+            }
+        };
+        let title = if title.trim().is_empty() {
+            let base = channel_title(st, self.chat_id)
+                .await
+                .unwrap_or_else(|| format!("TG {}", self.chat_id));
+            format!("{base} · {}", ymd_str(self.created_at as u64))
+        } else {
+            title
+        };
+        // 幂等键优先用 TG 相册 group_id（与入队去重键 `g:{chat}:{group}` 同源）；
+        // 退化时用首条消息号（旧实现同款）。
+        let key = match self.task_group {
+            Some(g) => format!("tg:group:{}:{}", self.chat_id, g),
+            None => {
+                let first = self.task_msgs.first().copied().unwrap_or(0);
+                format!("tg:msgs:{}:{}", self.chat_id, first)
+            }
+        };
+        match st.store.find_series_by_source_key(&key).await {
+            Ok(Some(sid)) => {
+                // BUG-152：追加批次**不静默覆盖**已有标题；留痕便于诊断候选与现状差异。
+                if let Ok(Some(cur)) = st.store.get_series(sid).await {
+                    if cur.series.title != title {
+                        tracing::debug!(
+                            "BUG-152 series {sid} title kept as {:?}; batch candidate {:?} ignored \
+                             (source_key={key})",
+                            cur.series.title,
+                            title
+                        );
+                    }
+                }
+                self.series = Some(sid);
+                self.series_fresh = false;
+                Some(sid)
+            }
+            Ok(None) => {
+                // kind 恒为 `series`：剧集是任意内容的编排容器（含图片浏览位）。
+                match st
+                    .store
+                    .create_series(&title, desc.as_deref(), "series", None, Some(&key))
+                    .await
+                {
+                    Ok(sid) => {
+                        self.series = Some(sid);
+                        self.series_fresh = true;
+                        Some(sid)
+                    }
+                    Err(e) => {
+                        st.push_log(&format!("cache task {}: create series: {e}", self.task_id));
+                        self.series_blocked = true;
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                st.push_log(&format!("cache task {}: find series: {e}", self.task_id));
+                self.series_blocked = true;
+                None
+            }
+        }
+    }
+
+    /// 回滚刚建的空壳剧集：**低层** `delete_series`（不碰墓碑，BUG-126）——
+    /// 删的是刚重建出来的空壳，用户的「已摘除」记录必须留下（旧实现同款注释）。
+    async fn rollback_series(&mut self, st: &Arc<AppState>, sid: i64, why: &str) {
+        st.push_log(&format!(
+            "cache task {}: series {sid} rolled back ({why})",
+            self.task_id
+        ));
+        if let Err(e) = st.store.delete_series(sid).await {
+            st.push_log(&format!(
+                "cache task {}: rollback series {sid} failed: {e}",
+                self.task_id
+            ));
+        }
+        self.series = None;
+        self.series_fresh = false;
+        self.series_blocked = true;
+    }
+
+    /// 任务收尾：残留挂起照片如实留痕。只有目标条目 T0 登记失败才会走到这里
+    ///（正常路径目标先于照片登记并即时落位）；重试任务的登记幂等会补齐归属。
+    async fn finish(&self, st: &Arc<AppState>) {
+        for (vm, pm, _) in &self.pending {
+            st.push_log(&format!(
+                "cache task {}: photo {pm} pending on unregistered target {vm} (retry will re-attach)",
+                self.task_id
+            ));
+        }
+    }
+}
+
 /// 跑单个任务直到终态（done / failed / cancelled）。
 /// 单次自动归档的标签数上限（防个别刷屏消息带来成百上千标签）。
 const MAX_AUTO_TAGS: usize = 20;
@@ -1206,15 +1607,23 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
     ));
     let dir = resolve_cache_dir(st, None).await;
     let mut done: i64 = 0;
-    // 入库条目 (message_id, item_id)（按 message_ids 顺序）——整组缓存据此成剧，
-    // 成对记录保证 caption 集号解析的消息↔条目对位不被入库失败/去重打乱。
-    let mut ingested: Vec<(i64, i64)> = Vec::new();
+
+    // ── byte-ownership P1（设计 I1「事实先登记」）─────────────────────────────
+    // 登记从「任务终态一次性 append_episodes_ranged」前移到「逐消息取字节之前」：
+    // 任务开始处理某条消息时，先建立 media_item 行（file_path=NULL 待回填）与
+    // 剧集槽位（T0，瞬间），再取字节；落盘成功后用 `backfill_item_bytes` 专用
+    // 语句回填（不走 COALESCE upsert——MEDIA-DESIGN C3：那会粘住旧路径）。
+    // 下载失败 → 条目保留缺字节、任务 failed，登记不撤销（重试只重做字节）。
+    // 这正是「缓存→不见了→完成→出现」闪烁的根治：条目自 T0 起持续可见。
+    let mut ing = IngestCtx::prepare(st, &task).await;
     for msg_id in task.message_ids.iter().copied() {
         if !st.store.is_cache_task_active(task_id).await.unwrap_or(false) {
             st.push_log(format!(
                 "cache task {task_id}: cancelled at {done}/{}",
                 task.total
             ));
+            // 事实不回滚：已登记条目保留；未落位的挂起照片留给下次任务补齐。
+            ing.finish(st).await;
             return;
         }
         let _ = st
@@ -1222,31 +1631,8 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
             .update_cache_task_progress(task_id, done, Some(msg_id))
             .await;
         st.refresh_cache_tasks().await;
-        if let Some(path) = cached_path(st, task.chat_id, msg_id).await {
-            // 已缓存：条目可能已入库，仍要进剧集（避免整组里缺这几集）。
-            // 查不到 ref = 已落盘但从未入库（历史缓存/换库后丢失）——必须**补导入**，
-            // 否则这批条目永远进不了媒体库，整组成剧与 ③b 标签归档都会静默缺集。
-            let id = match st
-                .store
-                .item_id_by_ref("tg", &format!("{}:{}", task.chat_id, msg_id))
-                .await
-            {
-                Ok(Some(id)) => Some(id),
-                _ => import_cached_file(st, task.chat_id, msg_id, &path).await,
-            };
-            if let Some(id) = id {
-                if !ingested.iter().any(|(_, x)| *x == id) {
-                    ingested.push((msg_id, id));
-                }
-            }
-            done += 1;
-            let _ = st.store.update_cache_task_progress(task_id, done, None).await;
-            st.refresh_cache_tasks().await;
-            continue;
-        }
-        // BUG-049 规则：图片不缓存——不落盘，最多入库为浏览条目（字节由 raw 端点
-        // 现场代理 TG 缩略图）。已落盘的历史图片走上面的 cached_path 分支保留本地文件。
-        // 类型判定：tg_message 行的 media_type 优先（离线可判）；缺行才 RPC 取元数据。
+        // 类型判定（BUG-049 photo 规则分支用）：tg_message 行的 media_type 优先
+        //（预扫已保证行就位，离线可判）；缺行才 RPC 取元数据（旧实现同款兜底）。
         let media_type = match st.store.get_message(task.chat_id, msg_id).await {
             Ok(Some(m)) => m.media_type,
             _ => st
@@ -1257,25 +1643,61 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
                 .flatten()
                 .and_then(|m| m.media_type),
         };
-        if media_type.as_deref() == Some("photo") {
-            if let Some(id) = import_photo_item(st, task.chat_id, msg_id).await {
-                if !ingested.iter().any(|(_, x)| *x == id) {
-                    ingested.push((msg_id, id));
-                }
-                st.push_log(&format!(
-                    "cache task {task_id}: photo {msg_id} added to library (no cache by rule)"
-                ));
+        let photo_rule = media_type.as_deref() == Some("photo");
+
+        if let Some(path) = cached_path(st, task.chat_id, msg_id).await {
+            // 已缓存：字节在盘上。条目可能已入库，仍要进剧集（避免整组里缺这几集）；
+            // 查不到 ref = 已落盘但从未入库（历史缓存/换库后丢失）——T0 登记在此补上。
+            let registered = ing.register_item(st, msg_id, false).await;
+            if let Some((item, kind)) = &registered {
+                ing.register_slot(st, msg_id, *item, kind).await;
+            }
+            if let Some((item, _)) = &registered {
+                let ext = path_ext(&path);
+                let _ = st
+                    .store
+                    .backfill_item_bytes(*item, &path, crate::media::classify_ext(&ext))
+                    .await;
             }
             done += 1;
             let _ = st.store.update_cache_task_progress(task_id, done, None).await;
             st.refresh_cache_tasks().await;
             continue;
         }
-        match cache_one(st, task.chat_id, msg_id, &dir).await {
-            Ok((_, item_id)) => {
-                if let Some(id) = item_id {
-                    if !ingested.iter().any(|(_, x)| *x == id) {
-                        ingested.push((msg_id, id));
+        // BUG-049 规则：图片不缓存——不落盘，T0 登记为浏览条目（字节由 raw 端点
+        // 现场代理 TG 缩略图）。已落盘的历史图片走上面的 cached_path 分支保留本地文件。
+        let registered = ing.register_item(st, msg_id, photo_rule).await;
+        if let Some((item, kind)) = &registered {
+            ing.register_slot(st, msg_id, *item, kind).await;
+        }
+        if photo_rule {
+            st.push_log(&format!(
+                "cache task {task_id}: photo {msg_id} registered to library (no cache by rule)"
+            ));
+            done += 1;
+            let _ = st.store.update_cache_task_progress(task_id, done, None).await;
+            st.refresh_cache_tasks().await;
+            continue;
+        }
+        match cache_one_bytes(st, task.chat_id, msg_id, &dir).await {
+            Ok(outcome) => {
+                match &registered {
+                    Some((item, _)) => {
+                        // 字节落盘 → 专用语句回填 file_path（不走 COALESCE upsert）；
+                        // 顺手把 kind 对齐到扩展名分类（T0 时无文件可判）。
+                        let ext = path_ext(&outcome.path);
+                        let _ = st
+                            .store
+                            .backfill_item_bytes(
+                                *item,
+                                &outcome.path,
+                                crate::media::classify_ext(&ext),
+                            )
+                            .await;
+                    }
+                    None => {
+                        // T0 登记失败（DB 故障）——退回旧「下载即入库」兜底一次。
+                        import_cached_file(st, task.chat_id, msg_id, &outcome.path).await;
                     }
                 }
                 done += 1;
@@ -1290,12 +1712,16 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
                     .finish_cache_task(task_id, "failed", Some(&reason))
                     .await;
                 st.refresh_cache_tasks().await;
+                // 事实不回滚：已登记条目（含缺字节的当前条目）全部保留；
+                // 未落位的挂起照片如实留痕，重试任务幂等补齐。
+                ing.finish(st).await;
                 return;
             }
         }
     }
     let _ = st.store.finish_cache_task(task_id, "done", None).await;
-    let item_ids: Vec<i64> = ingested.iter().map(|(_, id)| *id).collect();
+    ing.finish(st).await;
+    let item_ids: Vec<i64> = ing.ingested.iter().map(|(_, id)| *id).collect();
 
     // ③b：组内 caption 的 `#标签` 收集（BUG-045：与成剧**解耦** —— 任何缓存任务
     // 都收集，不再只限 ≥2 条的组）。跨消息去重、带上限；归档目标见下方分支。
@@ -1305,240 +1731,23 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
         .await
         .unwrap_or_default();
 
-    // 剧集是**通用归档容器**（第 4 轮裁定）：判定只问「有没有内容」，不再挑 video ——
-    // 单条视频、单张图片同样成剧，因为只有剧集才有「标题 + 介绍 + 标签」的完整档案位。
-    // 图片随之成为剧集的**浏览位内容**（封面/图册）；播放序列仍在展示层排除非视频，
-    // 「播放时不许出现图片」由 `media_episode_source` 只收 video 的触发器结构性保证。
+    // 剧集是**通用归档容器**（第 4 轮裁定）：单条视频、单张图片同样成剧；图片是
+    // 剧集的**浏览位内容**；「播放时不许出现图片」由 `media_episode_source` 只收
+    // video 的触发器结构性保证。
     //
-    // BUG-168 细化：组内**同时含视频与照片**时，照片不再各占一个集号（那会挤占
-    // 视频的集数，把「第 N 集」变成图片），改挂到它之前最近的视频所在集的图片位
-    // （首个视频之前的照片归首个视频那一集）；photo-only 组保持现状（照片各自成集，
-    // 浏览位语义不变）。条目 kind 一次批量取回（`item_kinds`），不在循环里逐条判型。
+    // byte-ownership P1：成剧/槽位/照片归属已随逐消息登记**前移**到 T0（见
+    // `IngestCtx::append_slot` / `register_photo_slot` / `ensure_series`）——语义与
+    // 旧「任务末尾一次性 append_episodes_ranged + 统一挂图」的最终库状态等价：
+    // BUG-168 混编组照片归它之前最近的非照片条目所在集（组首归首个）、photo-only
+    // 组照片各自成集、caption 集号区间照旧生效；条目 kind 逐条以库中值为准。
     // 已有历史数据不做回填。
-    let ingested_kinds = st
-        .store
-        .item_kinds(&ingested.iter().map(|(_, id)| *id).collect::<Vec<_>>())
-        .await
-        .unwrap_or_default();
-    let photo_pairs: Vec<(i64, i64)> = ingested
-        .iter()
-        .filter(|(_, id)| {
-            ingested_kinds
-                .get(id)
-                .map(|k| k == "photo")
-                .unwrap_or(false)
-        })
-        .copied()
-        .collect();
-    let has_video = ingested_kinds.values().any(|k| k == "video");
-    let mixed = has_video && !photo_pairs.is_empty();
-    let media_pairs: Vec<(i64, i64)> = if mixed {
-        ingested
-            .clone()
-            .into_iter()
-            .filter(|(_, id)| {
-                ingested_kinds
-                    .get(id)
-                    .map(|k| k != "photo")
-                    .unwrap_or(true)
-            })
-            .collect()
-    } else {
-        ingested.clone()
-    };
 
-    // 整组缓存 → 自动成剧（BUG-031）：一批内容按 message_ids 顺序编为第 1..N 集。
-    //
-    // 幂等：同一组（按 chat+组键）复用同一剧集，重复缓存不会建第二部剧、
-    // 也不会把同一条目编成两集（append_episodes 已跳过已收录条目）。
-    //
-    // 门槛（第 4 轮裁定）：**只要入住了内容就成剧**。此前按「视频条数」设门槛，
-    // 导致单视频消息、纯图片组都不成剧 —— 结果它们既没有介绍也没有标签可归档，
-    // 用户看到的就是「数据没归位」。Thumbnail 判定不读内容，故此处内容无关。
-    let sid: Option<i64> = if !media_pairs.is_empty() {
-        // 剧集标题与介绍来自**组内 caption**：首行标题、其余介绍（split_caption）。
-        // 此前剧集名直接取「频道名 · 日期」，同频道多部剧集同名，真实标题被丢弃。
-        let (title, desc) = match st
-            .store
-            .first_caption(task.chat_id, &task.message_ids)
-            .await
-            .unwrap_or(None)
-        {
-            Some(cap) => split_caption(&cap),
-            None => (None, None),
-        };
-        // BUG-152：剧集名必须由 caption 的**规范化剧集名**（去集号）决定，而不是
-        // 「整批 message_ids 的第一个 caption」——后者是非确定性的：分多批入库时，
-        // 第一批到底是哪一条取决于缓存顺序，首条恰好带 `EP01` 时，整部剧的 title
-        // 就成了 `X EP01`，后续批次只是 append，标题永远钉死在那个带集号的首条上
-        // （用户看到的就是「标题多集、第一个成为多集标题、后面累加」）。
-        //
-        // `split_caption` 只切「标题行 + 正文」，集号另由 `normalized_series_name`
-        // 从标题行里剥掉（集号可能在行尾，也可能在行中 + 推广文案）。
-        let title = match title {
-            Some(t) => normalized_series_name(&t),
-            // 无 caption（或首行为空）才回退到「频道名 · 日期」：宁可有个可分辨的名字，
-            // 也不要一堆同名「未命名」。
-            None => {
-                let base = channel_title(st, task.chat_id)
-                    .await
-                    .unwrap_or_else(|| format!("TG {}", task.chat_id));
-                format!("{base} · {}", ymd_str(task.created_at as u64))
-            }
-        };
-        // 极端情形：整条标题行就是一个集号（如 `EP01`），剥完为空 —— 此时退回
-        // 频道名 · 日期，而不是写一个空剧名（空标题在 UI 上等于不可辨识）。
-        let title = if title.trim().is_empty() {
-            let base = channel_title(st, task.chat_id)
-                .await
-                .unwrap_or_else(|| format!("TG {}", task.chat_id));
-            format!("{base} · {}", ymd_str(task.created_at as u64))
-        } else {
-            title
-        };
-
-        // 幂等键优先用 TG 相册 group_id（与入队去重键 `g:{chat}:{group}` 同源）；
-        // 退化时用首条消息号——此前一律用首条消息号，同一相册若成员构成变化
-        // （翻页边界/夹带非媒体消息）会被判成两部剧。
-        let key = match task.group_id {
-            Some(g) => format!("tg:group:{}:{}", task.chat_id, g),
-            None => {
-                let first = task.message_ids.first().copied().unwrap_or(0);
-                format!("tg:msgs:{}:{}", task.chat_id, first)
-            }
-        };
-        // kind 恒为 `series`：剧集是任意内容的编排容器（含图片浏览位），
-        // 不再按组内构成派生 album/collection。
-        match st.store.find_series_by_source_key(&key).await {
-            Ok(Some(sid)) => {
-                // BUG-152：追加批次**不静默覆盖**已有标题 —— 每次 ckpt 用本批首条 caption
-                // 重算出的「候选剧集名」只是候选，若与本剧现有 title 不同，保持现有
-                // （避免标题随批次抖动），但要留痕以便诊断「为什么候选与现有不一致」。
-                if let Ok(Some(cur)) = st.store.get_series(sid).await {
-                    if cur.series.title != title {
-                        tracing::debug!(
-                            "BUG-152 series {sid} title kept as {:?}; batch candidate {:?} ignored \
-                             (source_key={key})",
-                            cur.series.title,
-                            title
-                        );
-                    }
-                }
-                match st
-                    .store
-                    .append_episodes_ranged(sid, 1, &ranged_items(st, task.chat_id, &media_pairs).await)
-                    .await
-                {
-                    Ok(n) => st.push_log(&format!(
-                        "cache task {task_id}: appended {n} episode(s) to series {sid}"
-                    )),
-                    Err(e) => st.push_log(&format!("cache task {task_id}: append episodes: {e}")),
-                }
-                Some(sid)
-            }
-            Ok(None) => {
-                match st
-                    .store
-                    .create_series(&title, desc.as_deref(), "series", None, Some(&key))
-                    .await
-                {
-                    Ok(sid) => {
-                        let appended = st
-                            .store
-                            .append_episodes_ranged(sid, 1, &ranged_items(st, task.chat_id, &media_pairs).await)
-                            .await;
-                        match appended {
-                            Ok(n) if n > 0 => {
-                                st.push_log(&format!(
-                                    "cache task {task_id}: series {sid} with {n} episode(s)"
-                                ));
-                                Some(sid)
-                            }
-                            // 新建的剧集**不可能**一条都挂不上（没有既存分集可跳过），
-                            // 故 n==0 与报错同义：归档失败。留下空剧集等于把失败伪装成成功
-                            // （用户看到一部点进去什么都没有的剧），因此回滚并如实记日志。
-                            ok => {
-                                let why = match ok {
-                                    Ok(_) => "0 episodes attached".to_string(),
-                                    Err(e) => e.to_string(),
-                                };
-                                st.push_log(&format!(
-                                    "cache task {task_id}: series {sid} rolled back ({why})"
-                                ));
-                                // 回滚用**低层** `delete_series`（不碰墓碑，BUG-126）：这里删的是
-                                // 刚重建出来的空壳，用户的「已摘除」记录必须留下 —— 若顺手清了
-                                // 墓碑，下一次同组同步就会把条目复活（用户主动删剧走
-                                // `delete_series_explicit`，那才清墓碑）。
-                                if let Err(e) = st.store.delete_series(sid).await {
-                                    st.push_log(&format!(
-                                        "cache task {task_id}: rollback series {sid} failed: {e}"
-                                    ));
-                                }
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        st.push_log(&format!("cache task {task_id}: create series: {e}"));
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                st.push_log(&format!("cache task {task_id}: find series: {e}"));
-                None
-            }
-        }
-    } else {
-        st.push_log(&format!(
-            "cache task {task_id}: nothing ingested, skip series"
-        ));
-        None
-    };
-    // BUG-168：混编组（video + photo）的照片挂到目标集的图片位（归属规则见上方
-    // media_pairs 注释）。**追加式**（`add_episode_image`，insert-or-ignore）：
-    // 重复缓存不会挂第二遍，也不得清掉用户已挂的图。挂图没有墓碑 —— 同一组重新
-    // 缓存时用户摘过的图会回来，属已知取舍（历史数据亦不回填）。
-    if mixed && !photo_pairs.is_empty() {
-        if let Some(sid) = sid {
-            let video_pairs: Vec<(i64, i64)> = media_pairs.clone();
-            for (mid, item) in &photo_pairs {
-                // 组内消息顺序中它之前最近的一个视频；前面没有视频则归首个视频。
-                let target_msg = video_pairs
-                    .iter()
-                    .map(|(m, _)| *m)
-                    .filter(|m| *m < *mid)
-                    .max()
-                    .or_else(|| video_pairs.iter().map(|(m, _)| *m).min());
-                let Some(target_msg) = target_msg else {
-                    continue;
-                };
-                let Some((_, target_item)) = video_pairs.iter().find(|(m, _)| *m == target_msg)
-                else {
-                    continue;
-                };
-                match st.store.episode_id_of_item(sid, *target_item).await {
-                    Ok(Some(eid)) => {
-                        if let Err(e) = st.store.add_episode_image(eid, *item).await {
-                            st.push_log(&format!(
-                                "cache task {task_id}: attach photo {mid} to episode {eid}: {e}"
-                            ));
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => st.push_log(&format!(
-                        "cache task {task_id}: find episode for item {target_item}: {e}"
-                    )),
-                }
-            }
-        }
-    }
     // 标签归档：剧集与条目**同时**归档（union 语义，不清空手工标签、不产生重复关联）。
     //
     // 此前是「有剧集→只写剧集，没剧集→只写条目」的二选一，于是条目卡片永远显示 0 个
     // 标签（用户看到的就是「标签被省略」）；改为两处都写，任一层视图都能看到标签。
     if !tags.is_empty() {
-        if let Some(sid) = sid {
+        if let Some(sid) = ing.series {
             match st.store.add_series_tags_by_name(sid, &tags).await {
                 Ok(n) => st.push_log(&format!(
                     "cache task {task_id}: archived {n} new tag(s) to series {sid}"
@@ -2319,29 +2528,6 @@ async fn delete_media_item(
 pub(crate) fn parse_tg_ref(r: &str) -> Option<(i64, i64)> {
     let (a, b) = r.split_once(':')?;
     Some((a.parse().ok()?, b.parse().ok()?))
-}
-
-/// 自动成剧的落位入参：`(message_id, item_id)` 成对传入（BUG-044 后只含视频），
-/// caption 解析出集号区间就声明（BUG-039 冲突2 的合集视频由此进对槽位），
-/// 解析不出交给顺序编号。
-/// 区间与已占槽位冲突时由 `append_episodes_ranged` 自动回退，不会覆盖既有编排。
-async fn ranged_items(
-    st: &Arc<AppState>,
-    chat_id: i64,
-    pairs: &[(i64, i64)],
-) -> Vec<(i64, Option<(i64, i64)>)> {
-    let mut out = Vec::with_capacity(pairs.len());
-    for (mid, item) in pairs {
-        let range = match st.store.get_message(chat_id, *mid).await {
-            Ok(Some(m)) => m
-                .caption
-                .as_deref()
-                .and_then(crate::media::parse_episode_range),
-            _ => None,
-        };
-        out.push((*item, range.map(|(s, e)| (s, e.unwrap_or(s)))));
-    }
-    out
 }
 
 /// 从 caption 的**标题行**里定位代表集号的那一段（BUG-152：剧集名 = 标题行去掉它）。
@@ -3741,6 +3927,451 @@ mod tests {
             elapsed >= std::time::Duration::from_secs(3),
             "burst=0 时稳态节流必须仍在（4 MiB @ 1 MiB/s ⇒ ~4s）；实际耗时 {elapsed:?}"
         );
+    }
+
+    // ---- byte-ownership P1：登记前移（metadata-first ingest） ----
+
+    use super::run_one_cache_task;
+
+    use std::collections::HashMap;
+
+    use crate::login::{
+        Channel, Client, ClientError, DownloadOutcome, Folder, LoginPhase,
+        MediaItem as TgMedia, MediaRange, MediaStream, SessionView, Thumbnail,
+    };
+    use crate::media::ItemQuery;
+    use crate::store::CacheTask;
+
+    const CACHE_FIXTURE_CHAT: i64 = 424242;
+    const CACHE_FIXTURE_GROUP: i64 = 9001;
+
+    /// 测试夹具客户端：固定消息元数据 + 可注入的下载失败（P1 单测用）。
+    struct CacheFixtureClient {
+        chat_id: i64,
+        msgs: HashMap<i64, TgMedia>,
+        /// 下载必失败的消息号（模拟字节获取失败）。
+        fail_downloads: Vec<i64>,
+    }
+
+    fn fixture_msg(
+        id: i64,
+        media_type: &str,
+        mime: &str,
+        caption: Option<&str>,
+        group: Option<i64>,
+    ) -> TgMedia {
+        TgMedia {
+            id,
+            caption: caption.map(str::to_string),
+            mime_type: Some(mime.to_string()),
+            size: Some(4096),
+            media_type: Some(media_type.to_string()),
+            file_name: None,
+            date: Some(1_700_000_000 + id),
+            duration: if media_type == "video" { Some(12) } else { None },
+            group_id: group,
+            has_media: true,
+        }
+    }
+
+    fn mixed_group_msgs() -> Vec<TgMedia> {
+        vec![
+            fixture_msg(1, "video", "video/mp4", Some("某剧 EP01 #tag"), Some(CACHE_FIXTURE_GROUP)),
+            fixture_msg(2, "photo", "image/jpeg", None, Some(CACHE_FIXTURE_GROUP)),
+            fixture_msg(3, "video", "video/mp4", Some("某剧 EP02"), Some(CACHE_FIXTURE_GROUP)),
+            fixture_msg(4, "photo", "image/jpeg", None, Some(CACHE_FIXTURE_GROUP)),
+        ]
+    }
+
+    #[async_trait::async_trait]
+    impl Client for CacheFixtureClient {
+        async fn start(&self, _phone: &str) -> Result<LoginPhase, ClientError> {
+            Ok(LoginPhase::CodeRequired)
+        }
+        async fn submit_code(&self, _p: &str, _c: &str) -> Result<LoginPhase, ClientError> {
+            Ok(LoginPhase::Authorized)
+        }
+        async fn submit_password(&self, _p: &str, _w: &str) -> Result<LoginPhase, ClientError> {
+            Err(ClientError::Other("no 2FA in fixture client".into()))
+        }
+        async fn view(&self) -> SessionView {
+            SessionView { phase: LoginPhase::Authorized, phone: None, user_id: None }
+        }
+        async fn dialogs(&self) -> Result<Vec<Channel>, ClientError> {
+            Ok(Vec::new())
+        }
+        async fn folders(&self) -> Result<Vec<Folder>, ClientError> {
+            Ok(Vec::new())
+        }
+        async fn messages(
+            &self,
+            _chat_id: i64,
+            _limit: u32,
+            _before_id: Option<i64>,
+        ) -> Result<Vec<TgMedia>, ClientError> {
+            Ok(Vec::new())
+        }
+        async fn thumb(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+        ) -> Result<Option<Thumbnail>, ClientError> {
+            Ok(None)
+        }
+        async fn media(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _range: Option<MediaRange>,
+        ) -> Result<MediaStream, ClientError> {
+            Err(ClientError::MediaNotFound)
+        }
+        async fn download(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+            dir: &str,
+        ) -> Result<DownloadOutcome, ClientError> {
+            if self.fail_downloads.contains(&message_id) {
+                return Err(ClientError::Other("injected download failure".into()));
+            }
+            let path = std::path::Path::new(dir).join(format!("fixture-{chat_id}-{message_id}.mp4"));
+            std::fs::write(&path, b"fixture-bytes")
+                .map_err(|e| ClientError::Other(format!("write: {e}")))?;
+            Ok(DownloadOutcome {
+                message_id,
+                path: path.to_string_lossy().into_owned(),
+                bytes: 13,
+            })
+        }
+        async fn message_meta(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+        ) -> Result<Option<TgMedia>, ClientError> {
+            if chat_id != self.chat_id {
+                return Ok(None);
+            }
+            Ok(self.msgs.get(&message_id).cloned())
+        }
+    }
+
+    async fn cache_fixture_state(
+        dir: &std::path::Path,
+        fail: Vec<i64>,
+        msgs: Vec<TgMedia>,
+    ) -> Arc<AppState> {
+        let mut by_id = HashMap::new();
+        for m in msgs {
+            by_id.insert(m.id, m);
+        }
+        let mut cfg = Config::default();
+        cfg.download_dir = dir.to_path_buf();
+        Arc::new(AppState::new(
+            Arc::new(CacheFixtureClient {
+                chat_id: CACHE_FIXTURE_CHAT,
+                msgs: by_id,
+                fail_downloads: fail,
+            }),
+            cfg,
+            Availability::Ready,
+            false,
+            Store::open(":memory:").await.expect("in-memory store must open"),
+        ))
+    }
+
+    async fn enqueue_fixture_task(st: &AppState, ids: &[i64], group: Option<i64>) -> CacheTask {
+        let key = match group {
+            Some(g) => format!("g:{CACHE_FIXTURE_CHAT}:{g}"),
+            None => format!("m:{CACHE_FIXTURE_CHAT}:{}", ids[0]),
+        };
+        st.store
+            .enqueue_cache_task(
+                CACHE_FIXTURE_CHAT,
+                group,
+                &key,
+                ids,
+                &st.config.download_dir.to_string_lossy(),
+            )
+            .await
+            .expect("enqueue must succeed")
+            .expect("task must be created")
+            .0
+    }
+
+    /// 分集结构快照：(episode_no, episode_no_end, 条目 ref, kind, has_bytes, 挂图 refs)。
+    async fn episode_snapshot(
+        st: &AppState,
+        sid: i64,
+    ) -> Vec<(i64, Option<i64>, String, String, bool, Vec<String>)> {
+        let detail = st.store.get_series(sid).await.unwrap().unwrap();
+        let mut out = Vec::new();
+        for e in detail.episodes {
+            let item = st.store.get_media_item(e.item_id).await.unwrap().unwrap();
+            let mut image_refs = Vec::new();
+            for im in &e.images {
+                let it = st.store.get_media_item(im.item_id).await.unwrap().unwrap();
+                image_refs.push(it.ref_key);
+            }
+            out.push((
+                e.episode_no,
+                e.episode_no_end,
+                item.ref_key,
+                e.kind.unwrap_or_default(),
+                e.has_bytes,
+                image_refs,
+            ));
+        }
+        out
+    }
+
+    /// P1 判据 a：字节获取失败 → 条目**已登记**（file_path=NULL、槽位仍在）、
+    /// 任务 failed——登记不回滚（设计 §2 Tf / I1；重试只重做字节）。
+    #[tokio::test]
+    async fn cache_task_failure_keeps_registered_item_without_bytes() {
+        let dir = scratch_dir("p1_fail");
+        let st = cache_fixture_state(
+            &dir,
+            vec![2],
+            vec![
+                fixture_msg(1, "video", "video/mp4", Some("某剧 EP01"), None),
+                fixture_msg(2, "video", "video/mp4", Some("某剧 EP02"), None),
+            ],
+        )
+        .await;
+        let task = enqueue_fixture_task(&st, &[1, 2], None).await;
+        run_one_cache_task(&st, task.id).await;
+
+        let t = st.store.get_cache_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, "failed", "字节失败任务必须如实 failed");
+
+        // 条目 1（成功）：字节已回填。
+        let id1 = st
+            .store
+            .item_id_by_ref("tg", "424242:1")
+            .await
+            .unwrap()
+            .expect("item 1 must be registered");
+        let it1 = st.store.get_media_item(id1).await.unwrap().unwrap();
+        assert_eq!(it1.kind, "video");
+        assert!(it1.file_path.is_some(), "成功条目必须已回填 file_path");
+
+        // 条目 2（失败）：T0 已登记、保留、缺字节。
+        let id2 = st
+            .store
+            .item_id_by_ref("tg", "424242:2")
+            .await
+            .unwrap()
+            .expect("failed item must stay registered (no rollback)");
+        let it2 = st.store.get_media_item(id2).await.unwrap().unwrap();
+        assert_eq!(it2.kind, "video");
+        assert!(it2.file_path.is_none(), "失败条目不得回填 file_path");
+
+        // 槽位在 T0 即建立（先于字节）：两条分集都在。
+        let series = st.store.list_series().await.unwrap();
+        assert_eq!(series.len(), 1, "同一任务的两条视频必须同剧");
+        let detail = st.store.get_series(series[0].id).await.unwrap().unwrap();
+        let eps: Vec<(i64, i64)> = detail.episodes.iter().map(|e| (e.episode_no, e.item_id)).collect();
+        assert_eq!(eps, vec![(1, id1), (2, id2)], "T0 槽位失败不回滚");
+    }
+
+    /// P1 判据 b：混编组逐条登记后的最终库状态与旧实现**等价**（同 item/episode
+    /// 结构）。对照组用旧实现语义直接驱动 store（消息 upsert + 带路径 upsert +
+    /// 一次性 ranged append + 末尾统一挂图），逐结构比对。
+    ///
+    /// 夹具 [视频1, 照片2, 视频3, 照片4]（同 group）：照片2 是组首 → 归首个视频
+    /// （EP01 那集）；照片4 归它之前最近的视频（EP02 那集）——BUG-168 语义。
+    #[tokio::test]
+    async fn mixed_group_incremental_registration_equals_legacy_batch() {
+        let msgs = mixed_group_msgs();
+
+        // ── 新实现：逐条登记（T0 → 字节 → 回填）──
+        let dir_new = scratch_dir("p1_equiv_new");
+        let st_new = cache_fixture_state(&dir_new, vec![], msgs.clone()).await;
+        let t = enqueue_fixture_task(&st_new, &[1, 2, 3, 4], Some(CACHE_FIXTURE_GROUP)).await;
+        run_one_cache_task(&st_new, t.id).await;
+
+        // ── 旧实现（重构前 run_one_cache_task 尾段）逐字复刻，store 直驱 ──
+        let dir_old = scratch_dir("p1_equiv_old");
+        let st_old = cache_fixture_state(&dir_old, vec![], msgs.clone()).await;
+        let sid_old = {
+            let store = &st_old.store;
+            let chat = CACHE_FIXTURE_CHAT;
+            // 旧 cache_one / import_photo_item：先补消息行（caption 等元数据）。
+            for m in &msgs {
+                let _ = store
+                    .upsert_message(
+                        chat,
+                        m.id,
+                        m.caption.as_deref(),
+                        m.mime_type.as_deref(),
+                        m.size,
+                        m.media_type.as_deref(),
+                        m.date,
+                        m.duration,
+                        m.group_id,
+                    )
+                    .await;
+            }
+            let mut ingested: Vec<(i64, i64)> = Vec::new();
+            for m in &msgs {
+                let ref_key = format!("{chat}:{}", m.id);
+                let id = if m.media_type.as_deref() == Some("photo") {
+                    store
+                        .upsert_media_item(
+                            "tg",
+                            &ref_key,
+                            &format!("TG 图片 #{}", m.id),
+                            "photo",
+                            None,
+                            m.size,
+                            None,
+                            None,
+                        )
+                        .await
+                        .unwrap()
+                } else {
+                    let path = dir_old.join(format!("fixture-{chat}-{}.mp4", m.id));
+                    // 旧实现里路径来自真实下载落盘；对照组同样写出夹具文件，
+                    // 让 has_bytes 的磁盘探测与新旧两侧同一真值。
+                    std::fs::write(&path, b"fixture-bytes").expect("fixture file must write");
+                    let (title, desc) = crate::media::split_caption(m.caption.as_deref().unwrap_or(""));
+                    store
+                        .upsert_media_item(
+                            "tg",
+                            &ref_key,
+                            &title.unwrap_or_default(),
+                            "video",
+                            Some(&path.to_string_lossy()),
+                            m.size,
+                            m.duration,
+                            desc.as_deref(),
+                        )
+                        .await
+                        .unwrap()
+                };
+                ingested.push((m.id, id));
+            }
+            // 旧尾段：kind 批量取回 → 混编判定 → media_pairs（非照片）→ ranged append。
+            let ids: Vec<i64> = ingested.iter().map(|(_, id)| *id).collect();
+            let kinds = store.item_kinds(&ids).await.unwrap();
+            let photo_pairs: Vec<(i64, i64)> = ingested
+                .iter()
+                .filter(|(_, id)| kinds.get(id).map(|k| k == "photo").unwrap_or(false))
+                .copied()
+                .collect();
+            let has_video = kinds.values().any(|k| k == "video");
+            assert!(has_video && !photo_pairs.is_empty(), "夹具必须是混编组");
+            let media_pairs: Vec<(i64, i64)> = ingested
+                .iter()
+                .filter(|(_, id)| kinds.get(id).map(|k| k != "photo").unwrap_or(true))
+                .copied()
+                .collect();
+            // 旧标题链：first_caption → split_caption → normalized_series_name。
+            let cap = store.first_caption(chat, &[1, 2, 3, 4]).await.unwrap().unwrap();
+            let (t0, d0) = crate::media::split_caption(&cap);
+            let title = normalized_series_name(&t0.unwrap());
+            let sid = store
+                .create_series(&title, d0.as_deref(), "series", None, Some("tg:group:424242:9001"))
+                .await
+                .unwrap();
+            // 旧 ranged_items：caption 集号区间。
+            let mut items = Vec::new();
+            for (mid, iid) in &media_pairs {
+                let range = store
+                    .get_message(chat, *mid)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .caption
+                    .as_deref()
+                    .and_then(crate::media::parse_episode_range)
+                    .map(|(s, e)| (s, e.unwrap_or(s)));
+                items.push((*iid, range));
+            }
+            store.append_episodes_ranged(sid, 1, &items).await.unwrap();
+            // 旧挂图：向前最近的非照片条目，组首归首个。
+            for (mid, item) in &photo_pairs {
+                let target_msg = media_pairs
+                    .iter()
+                    .map(|(m, _)| *m)
+                    .filter(|m| *m < *mid)
+                    .max()
+                    .or_else(|| media_pairs.iter().map(|(m, _)| *m).min())
+                    .unwrap();
+                let target_item = media_pairs.iter().find(|(m, _)| *m == target_msg).unwrap().1;
+                let eid = store.episode_id_of_item(sid, target_item).await.unwrap().unwrap();
+                store.add_episode_image(eid, *item).await.unwrap();
+            }
+            sid
+        };
+
+        // ── 逐结构比对 ──
+        let s_new = st_new.store.list_series().await.unwrap();
+        let s_old = st_old.store.list_series().await.unwrap();
+        assert_eq!(s_new.len(), 1, "新实现必须恰好一部剧");
+        assert_eq!(s_old.len(), 1);
+        assert_eq!(s_new[0].title, s_old[0].title, "剧集标题必须等价");
+        assert_eq!(s_new[0].kind, s_old[0].kind);
+        let d_new = st_new.store.get_series(s_new[0].id).await.unwrap().unwrap();
+        let d_old = st_old.store.get_series(sid_old).await.unwrap().unwrap();
+        assert_eq!(d_new.episodes.len(), d_old.episodes.len(), "分集数必须等价");
+        for (en, eo) in d_new.episodes.iter().zip(d_old.episodes.iter()) {
+            assert_eq!(en.episode_no, eo.episode_no, "集号必须等价");
+            assert_eq!(en.episode_no_end, eo.episode_no_end, "合集终点必须等价");
+            let rn = st_new.store.get_media_item(en.item_id).await.unwrap().unwrap();
+            let ro = st_old.store.get_media_item(eo.item_id).await.unwrap().unwrap();
+            assert_eq!(rn.ref_key, ro.ref_key, "同槽位必须是同一条 TG 消息");
+            assert_eq!(rn.kind, ro.kind, "条目 kind 必须等价");
+            assert_eq!(rn.file_path.is_some(), ro.file_path.is_some(), "字节态必须等价");
+            assert_eq!(en.has_bytes, eo.has_bytes);
+            // 挂图（浏览位）逐一比对。
+            let inew = st_new.store.list_episode_images(en.id).await.unwrap();
+            let iold = st_old.store.list_episode_images(eo.id).await.unwrap();
+            let mut refs_new = Vec::new();
+            for m in &inew {
+                refs_new.push(st_new.store.get_media_item(m.item_id).await.unwrap().unwrap().ref_key);
+            }
+            let mut refs_old = Vec::new();
+            for m in &iold {
+                refs_old.push(st_old.store.get_media_item(m.item_id).await.unwrap().unwrap().ref_key);
+            }
+            assert_eq!(refs_new, refs_old, "集 {} 的挂图必须等价", en.episode_no);
+        }
+    }
+
+    /// P1 判据 c：幂等重跑不产生重复条目/重复剧集/重复分集/重复挂图，
+    /// 且库状态与首次运行完全一致（同 ref 复用、append 跳过、挂图 insert-or-ignore）。
+    #[tokio::test]
+    async fn cache_task_rerun_is_idempotent() {
+        let msgs = mixed_group_msgs();
+        let dir = scratch_dir("p1_rerun");
+        let st = cache_fixture_state(&dir, vec![], msgs).await;
+        let t1 = enqueue_fixture_task(&st, &[1, 2, 3, 4], Some(CACHE_FIXTURE_GROUP)).await;
+        run_one_cache_task(&st, t1.id).await;
+
+        let series = st.store.list_series().await.unwrap();
+        assert_eq!(series.len(), 1);
+        let sid = series[0].id;
+        let first = episode_snapshot(&st, sid).await;
+
+        // 重跑：同组再次入队（首个任务已终态 → 新任务行），文件已缓存走幂等跳过。
+        let t2 = enqueue_fixture_task(&st, &[1, 2, 3, 4], Some(CACHE_FIXTURE_GROUP)).await;
+        run_one_cache_task(&st, t2.id).await;
+        let t2s = st.store.get_cache_task(t2.id).await.unwrap().unwrap();
+        assert_eq!(t2s.status, "done", "重跑必须成功（幂等跳过）");
+
+        let items = st
+            .store
+            .list_media_items(&ItemQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 4, "重跑不得新增条目");
+        let series2 = st.store.list_series().await.unwrap();
+        assert_eq!(series2.len(), 1, "重跑不得建第二部剧");
+        assert_eq!(series2[0].id, sid);
+        let second = episode_snapshot(&st, sid).await;
+        assert_eq!(first, second, "重跑后的库状态必须与首次运行完全一致");
     }
 }
 

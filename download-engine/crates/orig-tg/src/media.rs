@@ -1184,6 +1184,33 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// 字节回填的**专用语句**（byte-ownership P1 / MEDIA-DESIGN C3）。
+    ///
+    /// 登记前移后，任务路径的字节落盘走这里回填 `file_path`——**绝不走**
+    /// `upsert_media_item`：那边 `file_path = COALESCE(excluded.file_path, …)`，
+    /// 语义是「NULL 粘旧值」，表达不了「把字节落到这条已登记条目上」的写入。
+    /// `file_path` 在此是直写（写什么是什么），与 [`Self::set_item_file_path`] 同一纪律。
+    ///
+    /// `kind` 传 `Some` 时一并校正：T0 登记时字节尚未落盘，kind 只能来自
+    /// `media_type`/mime；落盘后扩展名分类（`classify_ext`）是旧实现入库的同一判据，
+    /// 借回填顺手对齐（如 octet-stream 的 .mp4 文档 T0 登记为 `file`，回填校正为
+    /// `video`）。None = 不碰 kind（扩展名分类不出时保持登记值）。
+    pub async fn backfill_item_bytes(
+        &self,
+        id: i64,
+        file_path: &str,
+        kind: Option<&str>,
+    ) -> libsql::Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE media_item SET file_path = ?2, kind = COALESCE(?3, kind) WHERE id = ?1",
+                params![id, file_path, kind],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
     /// 列出全部带本地字节的条目——清缓存的工作集（只动字节，不动事实）。
     pub async fn list_cached_items(&self) -> libsql::Result<Vec<CachedBytes>> {
         let mut rows = self
