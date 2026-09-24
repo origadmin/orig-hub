@@ -437,7 +437,9 @@ export function SeriesDetail(props: {
       <div className="flex min-w-0 gap-4 border-b border-border-subtle/60 p-4">
         {/* 极窄窗口下隐藏封面：按钮行的可用宽度不能低于单个按钮（否则出界裁剪） */}
         {/* Hero 海报 320×180（整页重排：原 192×112 太小，撑不起头部视觉重心） */}
-        <div className="hidden aspect-video w-80 shrink-0 overflow-hidden rounded-lg bg-surface-2 min-[720px]:block">
+        {/* self-start：父级 flex 默认 align-items:stretch 会把海报拉成与右列等高，
+            aspect-video 失效（实测 720px 窗口下 320×634）。回到顶部对齐，16:9 任意宽度成立。 */}
+        <div className="hidden aspect-video w-80 shrink-0 self-start overflow-hidden rounded-lg bg-surface-2 min-[720px]:block">
           {cover ? (
             <img
               src={cover}
@@ -530,7 +532,8 @@ export function SeriesDetail(props: {
             Hero 里常驻整段（whitespace-pre-wrap，换行照原文、不截成单行）——
             此前把它搬到聚焦区下方的「本集/全剧」合并区，结果是同一份文案在页面上
             出现两次、且割裂在两处，用户判定「不如之前的左右设计」。改回行式分集列表后，
-            介绍也一并回到 Hero 常驻位；分集列表里只保留**本集**介绍。
+            介绍也一并回到 Hero 常驻位；分集列表里只保留**本集**介绍 ——
+            且与此处逐字相同的那份（TG 抓取常见）不再重复渲染，见下方 showEpDesc。
           */}
           {editingDesc ? (
             <div className="mt-1.5 space-y-1.5">
@@ -693,6 +696,15 @@ export function SeriesDetail(props: {
                   const imgs = ep.images ?? []
                   /** 默认只露前 3 张，其余折叠 —— 一集挂十几张图时不能把整条列表撑成图片墙 */
                   const shownImgs = expandedImgRows.includes(ep.id) ? imgs : imgs.slice(0, 3)
+                  /* 本集介绍去重：TG 抓取的剧集会把整段剧集简介逐字复制进每一集
+                     （实测 series 101：单集、简介与剧集简介 120 字完全相同）。
+                     简介已在 Hero 常驻显示，行内再渲染一次就是同一段文案出现两遍 ——
+                     逐字相同才隐藏，真有独立本集介绍时照常显示。
+                     ⚠️ 只影响展示：编辑入口（episode-slot / episode-edit）始终保留，
+                     点开面板仍可读写这一集的 description 字段。 */
+                  const seriesDesc = (detail.description ?? '').trim()
+                  const epDesc = (ep.description ?? '').trim()
+                  const showEpDesc = epDesc.length > 0 && epDesc !== seriesDesc
                   return (
                     <li
                       key={ep.id}
@@ -1017,10 +1029,11 @@ export function SeriesDetail(props: {
                                 </Button>
                               </div>
                             </div>
-                          ) : ep.description ? (
-                            /* 本集介绍：整段显示（不截断）——裁成半句比占两行更糟 */
+                          ) : showEpDesc ? (
+                            /* 本集介绍：整段显示（不截断）——裁成半句比占两行更糟。
+                               与剧集简介逐字相同时不渲染（重复文案由 Hero 常驻那一份承担）。 */
                             <p className="mt-1 whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[10.5px] leading-relaxed text-muted">
-                              {ep.description}
+                              {epDesc}
                             </p>
                           ) : null}
                         </div>
