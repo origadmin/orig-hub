@@ -2,11 +2,15 @@ import { useMemo, useState } from 'react'
 import { Button } from '../ui/button'
 import {
   previewExport,
+  exportMedia,
+  ExportError,
+  type ExportBundleResult,
   type ExportPreviewResult,
   type MediaSeries,
 } from '../../api/media'
 import { useTranslation } from '../../i18n'
 import { cn } from '../../lib/utils'
+import { DirectoryPicker } from '../DirectoryPicker'
 
 /** issue 类型 → 徽标样式（颜色即语义：红=字节阻断，橙=元数据缺失） */
 const ISSUE_STYLE: Record<string, string> = {
@@ -17,8 +21,10 @@ const ISSUE_STYLE: Record<string, string> = {
 }
 
 /**
- * 导出预览（byte-ownership P5）：选剧集 → 调只读 preview 端点 → 问题清单表格。
- * 这里**没有**导出动作本体 —— 校验是「能不能导出」的事前检查，P6 才做交付。
+ * 导出预览 + 导出本体（byte-ownership P5 + P6）。
+ * - 先调只读 preview 端点列问题清单；
+ * - 全部可导出（issuesTotal===0）时，展示「导出目录」选择 + 「开始导出」按钮，
+ *   点击走 POST /api/media/export 真正交付（复制视频/图片 + 写 manifest）。
  */
 export function ExportPreviewDialog(props: {
   series: MediaSeries[]
@@ -31,6 +37,11 @@ export function ExportPreviewDialog(props: {
   const [busy, setBusy] = useState(false)
   const [result, setResult] = useState<ExportPreviewResult | null>(null)
 
+  // P6 导出动作态
+  const [targetDir, setTargetDir] = useState('')
+  const [exporting, setExporting] = useState(false)
+  const [exportResult, setExportResult] = useState<ExportBundleResult | null>(null)
+
   const toggle = (id: number) =>
     setChecked((prev) => {
       const next = new Set(prev)
@@ -41,6 +52,7 @@ export function ExportPreviewDialog(props: {
 
   const run = async () => {
     setBusy(true)
+    setExportResult(null)
     try {
       const ids = [...checked]
       // 无勾选 = 全库校验（与端点契约一致：缺省 seriesIds = 全库）
@@ -52,7 +64,47 @@ export function ExportPreviewDialog(props: {
     }
   }
 
+  const openExportDir = async (dir: string) => {
+    try {
+      const { openPath } = await import('@tauri-apps/plugin-opener')
+      await openPath(dir)
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const doExport = async () => {
+    setExporting(true)
+    try {
+      const ids = [...checked]
+      const r = await exportMedia(
+        ids.length === series.length ? undefined : ids,
+        targetDir,
+      )
+      setExportResult(r)
+    } catch (e) {
+      if (e instanceof ExportError && e.issues && e.issues.length > 0) {
+        // 完备性闸口拦截（race 安全网）：复位回问题视图，让用户先补全再导。
+        setResult({
+          series: e.issues,
+          summary: {
+            seriesTotal: e.issues.length,
+            seriesReady: 0,
+            issuesTotal: e.issues.reduce((acc, s) => acc + s.issues.length, 0),
+            byKind: {},
+          },
+        })
+        onError(t('media.exportBlockedByReadiness'))
+      } else {
+        onError(e instanceof Error ? e.message : String(e))
+      }
+    } finally {
+      setExporting(false)
+    }
+  }
+
   const allChecked = checked.size === series.length
+  const allReady = result != null && result.summary.issuesTotal === 0
   const summaryLine = useMemo(() => {
     if (!result) return ''
     const { seriesTotal, seriesReady, issuesTotal } = result.summary
@@ -117,8 +169,32 @@ export function ExportPreviewDialog(props: {
           ))}
         </div>
 
+        {/* 成功视图：导出已写入磁盘 */}
+        {exportResult && (
+          <div className="mt-3 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3" data-testid="export-result-success">
+            <p className="text-[12px] font-medium text-emerald-500">{t('media.exportSuccess')}</p>
+            <p className="mt-1 text-[11px] text-muted">
+              {t('media.exportDoneSummary', {
+                n: exportResult.seriesCount,
+                f: exportResult.filesCopied,
+              })}
+            </p>
+            <p className="mt-1 break-all font-mono text-[10px] text-muted">
+              {t('media.exportManifest', { path: exportResult.manifestPath })}
+            </p>
+            <Button
+              size="sm"
+              variant="outline"
+              className="mt-2 h-7 px-3 text-[11px]"
+              onClick={() => openExportDir(exportResult.exportDir)}
+            >
+              {t('media.exportOpenFolder')}
+            </Button>
+          </div>
+        )}
+
         {/* 结果区：汇总行 + 按剧集分组的问题清单 */}
-        {result && (
+        {result && !exportResult && (
           <div className="mt-3 min-h-0 flex-1 overflow-y-auto" data-testid="export-preview-result">
             <p className="mb-2 text-[11px] text-muted">{summaryLine}</p>
             <div className="space-y-1.5">
@@ -179,6 +255,31 @@ export function ExportPreviewDialog(props: {
                 )
               })}
             </div>
+          </div>
+        )}
+
+        {/* 导出区：全部可导出时才出现（readiness 闸门已通过） */}
+        {result && allReady && !exportResult && (
+          <div className="mt-3 rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3" data-testid="export-action">
+            <p className="text-[12px] font-medium text-fg-strong">{t('media.exportTarget')}</p>
+            <p className="mt-0.5 text-[11px] text-muted">{t('media.exportTargetHint')}</p>
+            <div className="mt-2">
+              <DirectoryPicker
+                value={targetDir}
+                onChange={setTargetDir}
+                placeholder={t('media.exportDirPlaceholder')}
+                onError={onError}
+              />
+            </div>
+            <Button
+              size="sm"
+              className="mt-2 h-7 px-3 text-[11px]"
+              disabled={exporting || targetDir.trim().length === 0}
+              onClick={doExport}
+              data-testid="export-run"
+            >
+              {exporting ? t('media.exporting') : t('media.exportStart')}
+            </Button>
           </div>
         )}
 

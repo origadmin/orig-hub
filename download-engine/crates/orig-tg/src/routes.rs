@@ -92,6 +92,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/api/media/items/:id/raw", get(media_item_raw))
         .route("/api/media/items/by-ref", get(media_item_by_ref))
         .route("/api/media/export/preview", get(export_preview))
+        .route("/api/media/export", axum::routing::post(export_media))
         .route(
             "/api/media/series",
             get(list_media_series).post(create_media_series),
@@ -2279,8 +2280,8 @@ impl IntoResponse for ApiError {
 // 与 TG 流水（/api/tg/*）职责分离：这里是用户可增删改的**资料库**。
 
 use crate::media::{
-    classify_ext, scan_dir, split_caption, EpisodeEdit, EpisodeMove, ItemPatch, ItemQuery,
-    SeriesPatch,
+    classify_ext, scan_dir, split_caption, BundleError, EpisodeEdit, EpisodeMove, ItemPatch,
+    ItemQuery, SeriesPatch,
 };
 
 /// `GET /api/media/items?kind=&q=&tagId=&seriesId=&unassigned=&sort=&limit=&offset=`
@@ -2397,6 +2398,50 @@ async fn export_preview(
             "byKind": by_kind,
         }
     })))
+}
+
+#[derive(Deserialize)]
+struct ExportMediaReq {
+    /// 缺省 = 全库（与 preview 契约一致）。
+    #[serde(rename = "seriesIds", default)]
+    series_ids: Option<Vec<i64>>,
+    /// 导出包落盘目录（必须为空或不存在，避免覆盖用户数据）。
+    #[serde(rename = "targetDir")]
+    target_dir: String,
+}
+
+/// POST /api/media/export — EE 导出本体（byte-ownership P6）。
+///
+/// - 先走 `export_bundle` 内的完备性闸口：任何 issue 存在 → 422 + issue 清单
+///   （前端据此把对话框复位到「补全问题」视图）。
+/// - 目标目录非空 → 400；DB/IO/JSON 错误 → 500 并留痕。
+/// - 导出是**复制**不是移动，库内字节保持不动。
+async fn export_media(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<ExportMediaReq>,
+) -> Result<Response, ApiError> {
+    if req.target_dir.trim().is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "targetDir is empty"));
+    }
+    let target = std::path::PathBuf::from(&req.target_dir);
+    match st.store.export_bundle(req.series_ids.as_deref(), &target).await {
+        Ok(r) => Ok(Json(json!(r)).into_response()),
+        Err(BundleError::NotReady(reports)) => {
+            // 不复用 ApiError：需要把 issue 清单一并回传，让前端复位到补全视图。
+            let body = json!({
+                "error": "export not ready: some series have missing bytes/description/image",
+                "issues": reports,
+            });
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response())
+        }
+        Err(BundleError::BadTarget(m)) => {
+            Err(ApiError::new(StatusCode::BAD_REQUEST, &m))
+        }
+        Err(other) => {
+            st.push_log(&format!("/api/media/export failed: {other}"));
+            Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &other.to_string()))
+        }
+    }
 }
 
 /// 导入请求体：批量条目（本地路径或 TG 引用）。

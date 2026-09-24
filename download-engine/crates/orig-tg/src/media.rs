@@ -1736,6 +1736,377 @@ impl Store {
         }
         Ok(reports)
     }
+}
+
+// ─────────────────────── EE 导出类型与辅助函数（模块级，byte-ownership P6） ───────────────────────
+
+    /// 导出到单集视频的元数据。
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ExportedEpisode {
+        pub episode_id: i64,
+        pub episode_no: String,
+        pub title: Option<String>,
+        pub description: Option<String>,
+        /// 视频文件在剧集目录内的相对路径（如 "S1E1-title.mp4"）。
+        pub video: String,
+        /// 图片文件在剧集目录内的相对路径列表（如 "images/S1E1-0-cover.jpg"）。
+        pub images: Vec<String>,
+    }
+
+    /// 导出到单部剧集的元数据。
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ExportedSeries {
+        pub series_id: i64,
+        pub title: String,
+        pub description: Option<String>,
+        pub kind: String,
+        pub episodes: Vec<ExportedEpisode>,
+    }
+
+    /// 导出包结果。
+    #[derive(Debug, Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ExportBundleResult {
+        pub target_dir: String,
+        pub export_dir: String,
+        pub manifest_path: String,
+        pub series_count: usize,
+        pub files_copied: usize,
+    }
+
+    /// 导出包错误。
+    #[derive(Debug)]
+    pub enum BundleError {
+        Db(libsql::Error),
+        NotReady(Vec<SeriesExportReport>),
+        Io(std::io::Error),
+        Json(serde_json::Error),
+        BadTarget(String),
+    }
+
+    impl std::fmt::Display for BundleError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                BundleError::Db(e) => write!(f, "db error: {e}"),
+                BundleError::NotReady(reports) => {
+                    let total: usize = reports.iter().map(|r| r.issues.len()).sum();
+                    write!(f, "{} series not ready, {} issue(s)", reports.len(), total)
+                }
+                BundleError::Io(e) => write!(f, "io error: {e}"),
+                BundleError::Json(e) => write!(f, "json error: {e}"),
+                BundleError::BadTarget(s) => write!(f, "bad target: {s}"),
+            }
+        }
+    }
+
+    impl std::error::Error for BundleError {}
+
+    impl From<libsql::Error> for BundleError {
+        fn from(e: libsql::Error) -> Self { BundleError::Db(e) }
+    }
+    impl From<std::io::Error> for BundleError {
+        fn from(e: std::io::Error) -> Self { BundleError::Io(e) }
+    }
+    impl From<serde_json::Error> for BundleError {
+        fn from(e: serde_json::Error) -> Self { BundleError::Json(e) }
+    }
+
+    /// 把标题/文件名转成导出用 slug（小写、非 alnum 变 '-'、去连续/首尾 '-'）。
+    fn export_slug(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut prev_hyphen = true; // 用于去掉首字符前的连字符
+        for c in s.to_lowercase().chars() {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+                out.push(c);
+                prev_hyphen = false;
+            } else if !prev_hyphen {
+                out.push('-');
+                prev_hyphen = true;
+            }
+        }
+        while out.ends_with('-') {
+            out.pop();
+        }
+        if out.is_empty() { "untitled".into() } else { out }
+    }
+
+    /// 当前 UTC 时间的 RFC3339 字符串（无需外部 time/chrono crate）。
+    fn rfc3339_now() -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let days = secs / 86400;
+        let sec_of_day = secs % 86400;
+        let hour = (sec_of_day / 3600) as i64;
+        let minute = ((sec_of_day % 3600) / 60) as i64;
+        let second = (sec_of_day % 60) as i64;
+        let (y, m, d) = ymd_from_days(days as i64);
+        format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+    }
+
+    fn ymd_from_days(days: i64) -> (i64, i64, i64) {
+        // Howard Hinnant 算法：days 为 1970-01-01 以来的天数
+        let z = days + 719468;
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let (m, y_adj) = if mp < 10 { (mp + 3, 0) } else { (mp - 9, 1) };
+        (y + y_adj, m, d)
+    }
+
+// ─────────────────────── EE 导出方法（byte-ownership P6） ───────────────────────
+impl Store {
+    /// EE 导出本体（byte-ownership P6）。
+    ///
+    /// - 先复用 `export_readiness` 强制闸口：任何 issue 存在即失败，并返回 issue 清单；
+    /// - 在 `target_dir` 下直接生成导出包（要求目录为空或不存在，避免覆盖用户数据）；
+    /// - 每个剧集一个子目录，内含 `content.json`、视频文件、`images/` 子目录；
+    /// - 根目录写 `manifest.json`（schema `orighub-export/1`）。
+    /// - 导出是**复制**不是移动，库内字节保持不动。
+    pub async fn export_bundle(
+        &self,
+        series_ids: Option<&[i64]>,
+        target_dir: &std::path::Path,
+    ) -> Result<ExportBundleResult, BundleError> {
+        // 1. 完备性闸口
+        let readiness = self.export_readiness(series_ids).await?;
+        let bad: Vec<SeriesExportReport> = readiness
+            .iter()
+            .filter(|r| !r.issues.is_empty())
+            .cloned()
+            .collect();
+        if !bad.is_empty() {
+            return Err(BundleError::NotReady(bad));
+        }
+
+        // 2. 目标目录安全：必须为空或不存在
+        if target_dir.exists() {
+            let mut entries = tokio::fs::read_dir(target_dir).await?;
+            if entries.next_entry().await?.is_some() {
+                return Err(BundleError::BadTarget(format!(
+                    "target directory is not empty: {}",
+                    target_dir.display()
+                )));
+            }
+        } else {
+            tokio::fs::create_dir_all(target_dir).await?;
+        }
+        let export_dir = target_dir.to_path_buf();
+
+        // 3. 批量查询：剧集 + 分集 + 条目 + 集级挂图
+        let mut sql = String::from(
+            "SELECT s.id, s.title, s.description, s.kind,
+                    e.id, e.season, e.episode_no, e.item_id,
+                    i.title, i.description, i.file_path, i.poster, i.kind,
+                    ii.file_path
+               FROM media_series s
+               JOIN media_episode e ON e.series_id = s.id
+               LEFT JOIN media_item i ON i.id = e.item_id
+               LEFT JOIN media_episode_image ei ON ei.episode_id = e.id
+               LEFT JOIN media_item ii ON ii.id = ei.item_id",
+        );
+        let params_vec: Vec<i64> = series_ids.unwrap_or(&[]).to_vec();
+        if !params_vec.is_empty() {
+            let placeholders = params_vec.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            sql.push_str(&format!(" WHERE s.id IN ({placeholders})"));
+        }
+        sql.push_str(" ORDER BY s.id ASC, e.season ASC, e.episode_no ASC, e.id ASC, ei.sort_no ASC");
+        let stmt = self.conn.prepare(&sql).await?;
+        let mut rows = stmt
+            .query(if params_vec.is_empty() {
+                Vec::<i64>::new()
+            } else {
+                params_vec
+            })
+            .await?;
+
+        let lib_root = self.library_root().await;
+
+        // 4. 按剧集/分集聚合，边聚边复制字节
+        let mut exported_series: Vec<ExportedSeries> = Vec::new();
+        let mut cur_series: Option<ExportedSeries> = None;
+        let mut cur_ep: Option<(i64, ExportedEpisode)> = None; // (episode_id, episode)
+        let mut files_copied: usize = 0;
+
+        while let Some(r) = rows.next().await? {
+            let series_id: i64 = r.get(0)?;
+            let series_title: String = r.get(1)?;
+            let series_description: Option<String> = r.get(2)?;
+            let series_kind: String = r.get(3)?;
+            let ep_id: i64 = r.get(4)?;
+            let season: i64 = r.get(5)?;
+            let ep_no: i64 = r.get(6)?;
+            let item_id: i64 = r.get(7)?;
+            let item_title: Option<String> = r.get(8)?;
+            let item_description: Option<String> = r.get(9)?;
+            let file_path: Option<String> = r.get(10)?;
+            let poster: Option<String> = r.get(11)?;
+            let item_kind: Option<String> = r.get(12)?;
+            let image_path: Option<String> = r.get(13)?;
+
+            // 切剧集
+            if cur_series.as_ref().map(|s| s.series_id) != Some(series_id) {
+                if let Some((_, ep)) = cur_ep.take() {
+                    cur_series.as_mut().unwrap().episodes.push(ep);
+                }
+                if let Some(s) = cur_series.take() {
+                    exported_series.push(s);
+                }
+                cur_series = Some(ExportedSeries {
+                    series_id,
+                    title: series_title.clone(),
+                    description: series_description,
+                    kind: series_kind,
+                    episodes: Vec::new(),
+                });
+            }
+            let series = cur_series.as_mut().unwrap();
+            let series_dir = export_dir.join(format!("series-{series_id}"));
+            let images_dir = series_dir.join("images");
+
+            // 切分集
+            if cur_ep.as_ref().map(|(id, _)| *id) != Some(ep_id) {
+                if let Some((_, ep)) = cur_ep.take() {
+                    series.episodes.push(ep);
+                }
+
+                // 复制视频文件
+                let ep_label = format!("S{season}E{ep_no}");
+                let title_slug = export_slug(item_title.as_deref().unwrap_or("untitled"));
+                let video_rel = match file_path.as_deref() {
+                    Some(src) => {
+                        let src_abs = crate::cache::resolve_item_path(&lib_root, src);
+                        let ext = std::path::Path::new(src)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("mp4");
+                        let file_name = format!("{ep_label}-{title_slug}.{ext}");
+                        let dst = series_dir.join(&file_name);
+                        tokio::fs::create_dir_all(&series_dir).await?;
+                        tokio::fs::copy(&src_abs, &dst).await?;
+                        files_copied += 1;
+                        file_name
+                    }
+                    None => {
+                        // readiness 已保证有字节，这里不应走到
+                        return Err(BundleError::BadTarget(format!(
+                            "episode {ep_id} has no file_path despite readiness passed"
+                        )));
+                    }
+                };
+
+                //  poster（如果是文件路径而非 data URI）作为第一张图
+                let mut episode_images: Vec<String> = Vec::new();
+                if let Some(p) = poster.as_deref() {
+                    if !p.starts_with("data:") && !p.trim().is_empty() {
+                        let src_abs = crate::cache::resolve_item_path(&lib_root, p);
+                        let ext = std::path::Path::new(p)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("jpg");
+                        let file_name = format!("{ep_label}-poster.{ext}");
+                        let dst = images_dir.join(&file_name);
+                        tokio::fs::create_dir_all(&images_dir).await?;
+                        tokio::fs::copy(&src_abs, &dst).await?;
+                        files_copied += 1;
+                        episode_images.push(format!("images/{file_name}"));
+                    }
+                }
+
+                cur_ep = Some((ep_id, ExportedEpisode {
+                    episode_id: ep_id,
+                    episode_no: ep_label,
+                    title: item_title,
+                    description: item_description,
+                    video: video_rel,
+                    images: episode_images,
+                }));
+            }
+
+            // 同分集内追加挂图
+            if let Some(p) = image_path.as_deref() {
+                let ep = &mut cur_ep.as_mut().unwrap().1;
+                let src_abs = crate::cache::resolve_item_path(&lib_root, p);
+                let ext = std::path::Path::new(p)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("jpg");
+                let n = ep.images.len();
+                let file_name = format!("{}-{}-image.{}", ep.episode_no, n, ext);
+                let dst = images_dir.join(&file_name);
+                tokio::fs::create_dir_all(&images_dir).await?;
+                tokio::fs::copy(&src_abs, &dst).await?;
+                files_copied += 1;
+                ep.images.push(format!("images/{file_name}"));
+            }
+
+            let _ = item_id; // 占位，避免未使用警告
+            let _ = item_kind;
+        }
+        if let Some((_, ep)) = cur_ep.take() {
+            cur_series.as_mut().unwrap().episodes.push(ep);
+        }
+        if let Some(s) = cur_series.take() {
+            exported_series.push(s);
+        }
+
+        // 5. 写 content.json（每部剧集）和 manifest.json（根）
+        for s in &exported_series {
+            let content_path = export_dir.join(format!("series-{}", s.series_id)).join("content.json");
+            tokio::fs::write(&content_path, serde_json::to_string_pretty(s)?).await?;
+        }
+
+        #[derive(Serialize)]
+        struct ManifestSeries {
+            id: i64,
+            title: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            description: Option<String>,
+            kind: String,
+            directory: String,
+            content_path: String,
+        }
+        #[derive(Serialize)]
+        struct Manifest {
+            schema: String,
+            exported_at: String,
+            series_count: usize,
+            series: Vec<ManifestSeries>,
+        }
+        let manifest = Manifest {
+            schema: "orighub-export/1".into(),
+            exported_at: rfc3339_now(),
+            series_count: exported_series.len(),
+            series: exported_series
+                .iter()
+                .map(|s| ManifestSeries {
+                    id: s.series_id,
+                    title: s.title.clone(),
+                    description: s.description.clone(),
+                    kind: s.kind.clone(),
+                    directory: format!("series-{}", s.series_id),
+                    content_path: format!("series-{}/content.json", s.series_id),
+                })
+                .collect(),
+        };
+        let manifest_path = export_dir.join("manifest.json");
+        tokio::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?).await?;
+
+        Ok(ExportBundleResult {
+            target_dir: target_dir.to_string_lossy().into_owned(),
+            export_dir: export_dir.to_string_lossy().into_owned(),
+            manifest_path: manifest_path.to_string_lossy().into_owned(),
+            series_count: exported_series.len(),
+            files_copied,
+        })
+    }
 
     /// 新建剧集，返回 id。`source_key` 为幂等来源键（非 TG 自动成剧时为 None，
     /// 用户手动建的剧集不参与去重；它独立于 `description`，不污染用户可见的介绍字段）。
@@ -6062,5 +6433,144 @@ mod tests {
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].title, "Ready");
         assert!(only[0].issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn export_bundle_copies_video_and_writes_manifest() {
+        let path = tmp_db("export_bundle");
+        let s = Store::open(&path).await.unwrap();
+        let lib_root =
+            std::env::temp_dir().join(format!("orig_export_bundle_lib_{}", std::process::id()));
+        std::fs::create_dir_all(&lib_root).unwrap();
+        s.set_setting("library_dir", &lib_root.to_string_lossy())
+            .await
+            .unwrap();
+
+        // 一部可导出剧集：真实非空视频 + 简介 + data-URI poster（poster 不复制）。
+        let sid = s
+            .create_series("ExportMe", Some("简介"), "series", None, None)
+            .await
+            .unwrap();
+        let rel = "chat-x/1-vid.mp4";
+        std::fs::create_dir_all(lib_root.join("chat-x")).unwrap();
+        std::fs::write(lib_root.join(rel), b"binary-video-bytes").unwrap();
+        let iid = s
+            .upsert_media_item(
+                "tg", "x:1", "My Episode", "video", Some(rel), Some(18), Some(120),
+                Some("这是介绍"),
+            )
+            .await
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE media_item SET poster = 'data:image/png;base64,AAA' WHERE id = ?1",
+                params![iid],
+            )
+            .await
+            .unwrap();
+        let _ = s.add_episode(sid, iid, 1, 1).await.unwrap();
+
+        // 目标目录（不存在）
+        let target =
+            std::env::temp_dir().join(format!("orig_export_out_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&target);
+        assert!(!target.exists());
+
+        // 全库导出
+        let r = s.export_bundle(None, &target).await.expect("readiness 通过则应成功");
+        assert_eq!(r.series_count, 1);
+        assert!(r.files_copied >= 1, "至少复制了视频文件");
+
+        // manifest.json 存在且 schema 正确
+        let manifest_path = target.join("manifest.json");
+        assert!(manifest_path.exists());
+        let manifest_txt = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(
+            manifest_txt.contains("orighub-export/1"),
+            "manifest schema 必须为 orighub-export/1"
+        );
+        assert!(manifest_txt.contains("ExportMe"));
+
+        // 剧集目录 + content.json + 视频文件
+        let series_dir = target.join(format!("series-{sid}"));
+        assert!(series_dir.exists());
+        assert!(series_dir.join("content.json").exists());
+        let has_video = std::fs::read_dir(&series_dir).unwrap().any(|e| match e {
+            Ok(e) => {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.starts_with("S1E1-") && n.ends_with(".mp4")
+            }
+            Err(_) => false,
+        });
+        assert!(has_video, "series 目录内应含 S1E1-<slug>.mp4");
+        // 库内字节不被移动：原文件仍在
+        assert!(lib_root.join(rel).exists(), "导出是复制，原文件保留");
+    }
+
+    #[tokio::test]
+    async fn export_bundle_rejects_non_empty_target_and_unready_series() {
+        let path = tmp_db("export_bundle_gate");
+        let s = Store::open(&path).await.unwrap();
+        let lib_root =
+            std::env::temp_dir().join(format!("orig_export_gate_lib_{}", std::process::id()));
+        std::fs::create_dir_all(&lib_root).unwrap();
+        s.set_setting("library_dir", &lib_root.to_string_lossy())
+            .await
+            .unwrap();
+
+        // 可导出剧集：真实非空视频 + 简介 + data-URI poster
+        let sid_ok = s
+            .create_series("Ready", None, "series", None, None)
+            .await
+            .unwrap();
+        let rel = "chat-g/1-ok.mp4";
+        std::fs::create_dir_all(lib_root.join("chat-g")).unwrap();
+        std::fs::write(lib_root.join(rel), b"ok-bytes").unwrap();
+        let i_ok = s
+            .upsert_media_item(
+                "tg", "g:1", "ok", "video", Some(rel), Some(10), Some(60), Some("d"),
+            )
+            .await
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE media_item SET poster = 'data:image/png;base64,AAA' WHERE id = ?1",
+                params![i_ok],
+            )
+            .await
+            .unwrap();
+        let _ = s.add_episode(sid_ok, i_ok, 1, 1).await.unwrap();
+
+        // 不可导出剧集：缺字节 + 缺简介 + 缺图
+        let sid_bad = s
+            .create_series("Broken", None, "series", None, None)
+            .await
+            .unwrap();
+        let i_bad = s
+            .upsert_media_item("tg", "b:1", "b", "video", None, None, Some(60), None)
+            .await
+            .unwrap();
+        let _ = s.add_episode(sid_bad, i_bad, 1, 1).await.unwrap();
+
+        let target =
+            std::env::temp_dir().join(format!("orig_export_gate_out_{}", std::process::id()));
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("preexisting.txt"), b"do not clobber").unwrap();
+
+        // 选中可导出剧集 + 非空目标目录 → BadTarget（readiness 通过，目录校验拦下）
+        let err = s.export_bundle(Some(&[sid_ok]), &target).await.unwrap_err();
+        assert!(matches!(err, BundleError::BadTarget(_)), "非空目标目录应被拒");
+        assert!(
+            target.join("preexisting.txt").exists(),
+            "不得覆盖既有文件"
+        );
+
+        // 清空后，选中不可导出剧集 → NotReady（完备性闸口）
+        std::fs::remove_dir_all(&target).unwrap();
+        let err = s.export_bundle(Some(&[sid_bad]), &target).await.unwrap_err();
+        assert!(
+            matches!(err, BundleError::NotReady(_)),
+            "不完备剧集应被闸口拦下"
+        );
     }
 }

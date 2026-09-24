@@ -326,6 +326,56 @@ export async function previewExport(seriesIds?: number[]): Promise<ExportPreview
   return request<ExportPreviewResult>(`/api/media/export/preview${qs}`)
 }
 
+/** 导出包结果（byte-ownership P6）：`POST /api/media/export` 的响应体。 */
+export interface ExportBundleResult {
+  targetDir: string
+  exportDir: string
+  manifestPath: string
+  seriesCount: number
+  filesCopied: number
+}
+
+/** 导出失败（含完备性闸口未过）：`issues` 非空时表示被 ready 校验拦下，可复位到补全视图。 */
+export class ExportError extends Error {
+  issues?: SeriesExportReport[]
+  constructor(message: string, issues?: SeriesExportReport[]) {
+    super(message)
+    this.name = 'ExportError'
+    this.issues = issues
+  }
+}
+
+/**
+ * POST /api/media/export — EE 导出本体（byte-ownership P6）。
+ * `seriesIds` 缺省 = 全库；`targetDir` 必须为空或不存在（后端校验，避免覆盖）。
+ * 完备性闸口未过 → 422 + issue 清单（通过 ExportError.issues 暴露）。
+ */
+export async function exportMedia(
+  seriesIds: number[] | undefined,
+  targetDir: string,
+): Promise<ExportBundleResult> {
+  const body: { seriesIds?: number[]; targetDir: string } = { targetDir }
+  if (seriesIds && seriesIds.length > 0) body.seriesIds = seriesIds
+  const res = await fetch(`${MEDIA_BASE}/api/media/export`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    let msg = `${res.status} ${res.statusText}`
+    let issues: SeriesExportReport[] | undefined
+    try {
+      const b = (await res.json()) as { error?: string; issues?: SeriesExportReport[] }
+      if (b?.error) msg = b.error
+      if (Array.isArray(b?.issues)) issues = b.issues
+    } catch {
+      /* 保留状态码文案 */
+    }
+    throw new ExportError(msg, issues)
+  }
+  return (await res.json()) as ExportBundleResult
+}
+
 /** 列出剧集。`tagId` 用于按标签筛剧集（TG 自动归档的 #标签 落在剧集上）。 */
 export async function listSeries(tagId?: number | null): Promise<MediaSeries[]> {
   const qs = tagId == null ? '' : `?tagId=${tagId}`
