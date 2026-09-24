@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef } from 'react'
-import { Image as ImageIcon, ListVideo } from 'lucide-react'
+import { ListVideo } from 'lucide-react'
 import type { MediaEpisode } from '../../api/media'
+import { mediaItemUrl } from '../../api/media'
 import { cn } from '../../lib/utils'
-import { fmtDuration } from '../../lib/tgmedia'
+import { coverFit, fmtDuration } from '../../lib/tgmedia'
 import { useTranslation } from '../../i18n'
 import { sortEpisodes } from '../../hooks/useSeriesDetail'
 
@@ -171,16 +172,24 @@ export function EpisodeList({
                   !enabled && 'cursor-not-allowed',
                 )}
               >
-                {/* 徽标：视频给集号，图片给类型图标 —— 一眼能分出「能播」和「只能看」 */}
+                {/* 徽标：视频给集号，图片给**真实缩略图**（64×48）。
+                    此前图片只给一个 24×24 的类型图标 —— 图标不区分是哪一张，
+                    在「找某一张图」的导航场景里等于没有信息。 */}
                 {isPhoto ? (
                   <span
                     className={cn(
-                      'mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded',
-                      active ? 'bg-accent text-white' : 'bg-surface-2 text-fg-mid',
+                      'relative mt-0.5 h-12 w-16 shrink-0 overflow-hidden rounded',
+                      active ? 'bg-accent/20 ring-1 ring-accent/60' : 'bg-surface-2',
                     )}
                     title={t('player.photoLabel')}
                   >
-                    <ImageIcon className="h-3.5 w-3.5" />
+                    <img
+                      src={ep.poster ?? mediaItemUrl(ep.itemId)}
+                      alt={ep.title || t('player.photoLabel')}
+                      loading="lazy"
+                      /* 图片完整显示、不裁切（coverFit：photo → object-contain） */
+                      className={cn('h-full w-full', coverFit(ep.kind))}
+                    />
                   </span>
                 ) : (
                   <span
