@@ -112,7 +112,7 @@ export function EpisodeEditPanel(props: {
   }
 
   return (
-    <div className="flex flex-col gap-2" data-testid="episode-expanded">
+    <div className="flex flex-col gap-2" data-testid="episode-edit-panel">
       {/* P5 / R11：改写范围说明**只在面板内**，不进行态 */}
       <p className="text-[10px] leading-relaxed text-muted">{t('media.episode.editAffectsAll')}</p>
 
