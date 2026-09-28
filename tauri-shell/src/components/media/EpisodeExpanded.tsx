@@ -108,24 +108,13 @@ export function EpisodeExpanded(props: {
         <p className="text-[11.5px] text-muted/70">{t('media.descEmptyEp')}</p>
       )}
 
-      {/* ④ 挂图区：横滚瓦片；点某张开灯箱（范围 = 本集全部挂图，R6） */}
+      {/* ④ 挂图区：横滚瓦片；点某张开灯箱（范围 = 本集全部挂图，R6）。
+          「挂图」入口**只在操作区**（§3.2）—— 同一 handler 挂两个按钮会产生
+          重复锚点，验收按 testid 计数时会翻倍。 */}
       <div className="flex flex-col gap-1.5">
-        <div className="flex items-center gap-2">
-          <span className="text-[11px] font-medium text-fg-strong">
-            {t('media.episode.imagesCount', { n: (ep.images ?? []).length })}
-          </span>
-          <button
-            type="button"
-            onClick={props.onAttachImages}
-            className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] text-muted hover:bg-surface-2 hover:text-fg-mid"
-            title={t('media.attachImages')}
-            aria-label={t('media.attachImages')}
-            data-testid="episode-attach-images"
-          >
-            <ImagePlus className="h-3 w-3" />
-            {t('media.attachImages')}
-          </button>
-        </div>
+        <span className="text-[11px] font-medium text-fg-strong">
+          {t('media.episode.imagesCount', { n: (ep.images ?? []).length })}
+        </span>
         {imgs.length > 0 ? (
           <div className="flex items-start gap-2 overflow-x-auto pb-1" data-testid="episode-images">
             {imgs.map((img, i) => (
