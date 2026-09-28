@@ -30,6 +30,18 @@ export function CoverImage(props: {
   /** 源图是否竖版（仅在加载完成后可知） */
   const [portrait, setPortrait] = useState(false)
 
+  /*
+   * 竖版兜底**必须替换** `fit`，不能追加。
+   *
+   * 曾经的写法是 `${fit} ${portrait ? 'object-contain' : ''}` —— 改判后类名里
+   * **同时**存在 `object-cover` 与 `object-contain`，而 Tailwind 样式表里
+   * `object-cover` 的声明次序在后，于是 css 层面的胜者恒是 `object-cover`：
+   * 类名看着改了，`getComputedStyle().objectFit` 仍是 'cover'，竖版图照样被横切
+   * （实测 series 101 封面 480×853 渲染 `object-fit: cover`，R-C 恒 FAIL）。
+   * 两个互斥的 `object-*` 类绝不能并存 —— 这里按判定**择一**输出。
+   */
+  const resolvedFit = portrait ? 'object-contain' : fit
+
   return (
     <img
       src={src}
@@ -40,7 +52,7 @@ export function CoverImage(props: {
         // 只在「竖版 且 当前会裁」时改判：横版与本就 contain 的图不受影响
         if (el.naturalHeight > el.naturalWidth && fit === 'object-cover') setPortrait(true)
       }}
-      className={`${className} ${fit} ${portrait ? 'object-contain' : ''}`.trim()}
+      className={`${className} ${resolvedFit}`.trim()}
     />
   )
 }
