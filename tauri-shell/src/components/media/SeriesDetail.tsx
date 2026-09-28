@@ -63,13 +63,10 @@ export function SeriesDetail(props: {
   /**
    * 单层剧集（R7 / PRD §3.4）：唯一集**默认展开**。
    *
-   * 这里用**推导**而不是「挂载时 setState」：子组件的 effect 先于父组件执行，
-   * 若由 `EpisodeBoard` 在挂载时 `onFocusChange(唯一集)`，紧随其后父组件
-   * 清理换剧状态的 effect 会把它重置回 `null` —— 单集剧集永远展不开。
-   * 唯一集是**无歧义的默认值**（没有第二集可选），直接由数据推导最稳，
-   * 也天然满足「切剧集时重算」。
-   *
-   * 多集时 `focusedEpisodeId` 保持用户选择（默认全部行态）。
+   * 用**推导**而非「挂载时 setState」：子组件 effect 先于父组件执行，
+   * 若在 `EpisodeBoard` 里 `onFocusChange(唯一集)`，会被父组件紧随其后的
+   * 换剧清态 effect 重置回 `null`，单集剧集永远展不开。唯一集是无歧义的
+   * 默认值，直接由数据推导最稳，也天然满足「切剧集时重算」。
    */
   const singleEpisode = detail.episodeCount === 1 && playEps.length === 1 ? playEps[0].id : null
   const effectiveFocusedId = focusedEpisodeId ?? singleEpisode
@@ -91,11 +88,9 @@ export function SeriesDetail(props: {
   }
 
   /**
-   * 重新缓存某一集（BUG-080）。
-   *
-   * 清缓存只删字节、留条目：这一集仍在剧集列表里，却会以「可播」的外观呈现，
-   * 点下去 raw 端点 404。这里给**支持原路取回的来源**一个入口（TG 的 `ref` 里
-   * `chat:msg` 就是下载地址）；本地导入的文件没有原路。
+   * 重新缓存某一集（BUG-080）。清缓存只删字节、留条目：这一集仍在列表里，
+   * 却以「可播」外观呈现、点下去 raw 端点 404。这里给支持原路取回的来源一个
+   * 入口（TG 的 `ref` 里 `chat:msg` 就是下载地址）；本地导入文件没有原路。
    */
   const recacheEpisode = (ep: MediaEpisode) => {
     if (!canRecacheFromSource(ep.source)) {
@@ -138,29 +133,20 @@ export function SeriesDetail(props: {
     })
   }
 
-  /** 切换主版本（显式按钮，不再隐式改数据 —— 设计 §9） */
-  const switchSource = (ep: MediaEpisode, itemId: number) => {
-    void (async () => {
-      try {
-        await switchEpisodeSource(ep.id, itemId)
-        onChanged()
-      } catch (e) {
-        onError(e instanceof Error ? e.message : String(e))
-      }
-    })()
+  /** 改数据后的统一收尾：成功则通知父层刷新，失败则走 `onError`（不静默） */
+  const applyChange = (run: () => Promise<unknown>) => {
+    void run()
+      .then(() => onChanged())
+      .catch((e: unknown) => onError(e instanceof Error ? e.message : String(e)))
   }
 
+  /** 切换主版本（显式按钮，不再隐式改数据 —— 设计 §9） */
+  const switchSource = (ep: MediaEpisode, itemId: number) =>
+    applyChange(() => switchEpisodeSource(ep.id, itemId))
+
   /** 摘除一张集级挂图：只摘关联，图片条目留在资料库 */
-  const detachImage = (epId: number, itemId: number) => {
-    void (async () => {
-      try {
-        await detachEpisodeImage(epId, itemId)
-        onChanged()
-      } catch (e) {
-        onError(e instanceof Error ? e.message : String(e))
-      }
-    })()
-  }
+  const detachImage = (epId: number, itemId: number) =>
+    applyChange(() => detachEpisodeImage(epId, itemId))
 
   const gotoItem = (ep: MediaEpisode) => {
     if (props.onGotoItem) props.onGotoItem(ep.itemId)
