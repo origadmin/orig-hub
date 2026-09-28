@@ -4,6 +4,7 @@ import type { EpisodeImageMeta, MediaEpisode, MediaSeriesDetail } from '../../ap
 import { mediaItemUrl } from '../../api/media'
 import { canRecacheFromSource, coverFit, fmtDuration, hasMediaBytes, sourceLabelKey } from '../../lib/mediaSources'
 import { episodeSlotLabel, shouldRenderEpisodeTitle } from '../../lib/episodePresentation'
+import { CoverImage } from './CoverImage'
 import { useTranslation } from '../../i18n'
 
 /**
@@ -91,19 +92,19 @@ export function EpisodeRow(props: {
             data-testid="episode-cover"
           >
             {ep.poster ? (
-              /* 封面必须走 coverFit：photo → object-contain，非 photo → object-cover */
-              <img
+              /* 封面走 coverFit（photo → contain，非 photo → cover），
+                 竖版源图由 CoverImage 按实际方向兜底改判 contain（§3.1.1）。 */
+              <CoverImage
                 src={ep.poster}
-                alt=""
-                loading="lazy"
-                className={`h-full w-full ${coverFit(ep.kind)}`}
+                fit={coverFit(ep.kind)}
+                className="h-full w-full"
               />
             ) : ep.kind === 'photo' ? (
-              <img
+              <CoverImage
                 src={mediaItemUrl(ep.itemId)}
-                alt=""
-                loading="lazy"
-                className="h-full w-full object-contain"
+                kind="photo"
+                fit="object-contain"
+                className="h-full w-full"
               />
             ) : (
               <span className="flex h-full w-full items-center justify-center text-muted">

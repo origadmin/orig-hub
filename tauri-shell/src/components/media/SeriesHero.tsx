@@ -4,6 +4,7 @@ import { Button } from '../ui/button'
 import type { MediaSeriesDetail, MediaTag } from '../../api/media'
 import { coverFit } from '../../lib/mediaSources'
 import { resolveSeriesCover } from '../../lib/episodePresentation'
+import { CoverImage } from './CoverImage'
 import { TagToken } from './TagToken'
 import { useTranslation } from '../../i18n'
 
@@ -147,11 +148,14 @@ export function SeriesHero(props: {
             data-testid="series-cover"
           >
             {cover ? (
-              // 竖版源图必须 object-contain（coverFit('photo')）—— 禁止竖版图 + 横幅容器 + cover
-              <img
+              /* 竖版源图必须 object-contain —— 禁止「竖版图 + 横幅容器 + cover」。
+                 `coverKind` 只说「能否当图片用」（video 需抽帧），不含宽高比；
+                 故除 `coverFit` 外再由 `CoverImage` 按源图实际方向兜底（§3.1.1）。 */
+              <CoverImage
                 src={cover}
                 alt={detail.title}
-                className={`h-full w-full ${coverFit(detail.coverKind)}`}
+                fit={coverFit(detail.coverKind)}
+                className="h-full w-full"
               />
             ) : (
               <span className="flex h-full w-full items-center justify-center text-muted">

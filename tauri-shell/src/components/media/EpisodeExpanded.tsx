@@ -16,6 +16,7 @@ import {
   shouldRenderEpisodeTitle,
 } from '../../lib/episodePresentation'
 import { EpisodeEditPanel } from './EpisodeEditPanel'
+import { CoverImage } from './CoverImage'
 import { useTranslation } from '../../i18n'
 
 /** 展开态挂图横滚条的最大张数（超出后靠横滚，不再展开/收起） */
@@ -73,12 +74,14 @@ export function EpisodeExpanded(props: {
       {/* ① 大封面（恒显） */}
       <div className="aspect-video w-full max-w-[480px] overflow-hidden rounded-lg bg-surface-2">
         {ep.poster ? (
-          <img src={ep.poster} alt="" className={`h-full w-full ${coverFit(ep.kind)}`} />
+          /* 竖版源图由 CoverImage 按实际方向兜底改判 contain（§3.1.1） */
+          <CoverImage src={ep.poster} fit={coverFit(ep.kind)} className="h-full w-full" />
         ) : ep.kind === 'photo' ? (
-          <img
+          <CoverImage
             src={mediaItemUrl(ep.itemId)}
-            alt=""
-            className="h-full w-full object-contain"
+            kind="photo"
+            fit="object-contain"
+            className="h-full w-full"
           />
         ) : (
           <span className="flex h-full w-full items-center justify-center text-muted">
