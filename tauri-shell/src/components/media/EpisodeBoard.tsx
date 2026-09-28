@@ -58,17 +58,11 @@ export function EpisodeBoard(props: {
   }, [detail.id])
 
   /**
-   * 单层剧集（R7）：唯一集**默认展开**。
-   * 由 `detail.id` 变化触发 —— 切剧集时重算；只在「1 集」时自动展开
-   * （多集时自动展开某一集是替用户做选择）。
+   * 单层剧集（R7）的「唯一集默认展开」**不在这里做** —— 它由容器 `SeriesDetail`
+   * 直接推导（`effectiveFocusedId`）。原因：子组件 effect 先于父组件执行，在这里
+   * 调 `onFocusChange(唯一集)` 会被父组件紧随其后的「换剧清态」effect 覆盖回
+   * `null`，单集剧集永远展不开。
    */
-  useEffect(() => {
-    if (detail.episodeCount === 1 && playEps.length === 1) {
-      onFocusChange(playEps[0].id)
-    }
-    // 只在换剧集时重算；`onFocusChange` 是容器回调，不参与依赖
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detail.id])
 
   const labelOf = (ep: MediaEpisode): string =>
     (ep.title ?? '').trim() || `#${ep.itemId}`

@@ -58,7 +58,21 @@ export function SeriesDetail(props: {
   const [selectedTagIds, setSelectedTagIds] = useState<number[]>(detail.tags.map((x) => x.id))
   const [lightbox, setLightbox] = useState<LightboxState | null>(null)
 
-  const { photoEps } = partitionEpisodes(detail)
+  const { playEps, photoEps } = partitionEpisodes(detail)
+
+  /**
+   * 单层剧集（R7 / PRD §3.4）：唯一集**默认展开**。
+   *
+   * 这里用**推导**而不是「挂载时 setState」：子组件的 effect 先于父组件执行，
+   * 若由 `EpisodeBoard` 在挂载时 `onFocusChange(唯一集)`，紧随其后父组件
+   * 清理换剧状态的 effect 会把它重置回 `null` —— 单集剧集永远展不开。
+   * 唯一集是**无歧义的默认值**（没有第二集可选），直接由数据推导最稳，
+   * 也天然满足「切剧集时重算」。
+   *
+   * 多集时 `focusedEpisodeId` 保持用户选择（默认全部行态）。
+   */
+  const singleEpisode = detail.episodeCount === 1 && playEps.length === 1 ? playEps[0].id : null
+  const effectiveFocusedId = focusedEpisodeId ?? singleEpisode
 
   // 换剧集时清空所有编辑态 —— 否则上一部剧的面板会「挂着」新剧的数据。
   useEffect(() => {
@@ -211,7 +225,7 @@ export function SeriesDetail(props: {
       <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto p-4">
         <EpisodeBoard
           detail={detail}
-          focusedEpisodeId={focusedEpisodeId}
+          focusedEpisodeId={effectiveFocusedId}
           onFocusChange={setFocusedEpisodeId}
           onPlayEpisode={playEpisode}
           onEditEpisode={(ep) => setEditingEpisodeId(ep ? ep.id : null)}
