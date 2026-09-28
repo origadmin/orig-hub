@@ -41,6 +41,8 @@ export function EpisodeExpanded(props: {
   series: MediaSeriesDetail
   onEdit: () => void
   onEditClose: () => void
+  /** 编辑保存成功：容器据此重取详情，避免页面停留在改前的旧文案 */
+  onEditSaved: () => void
   editing: boolean
   onAttachImages: () => void
   onRemoveImage: (itemId: number) => void
@@ -290,9 +292,7 @@ export function EpisodeExpanded(props: {
           ep={ep}
           series={series}
           onClose={props.onEditClose}
-          onSaved={() => {
-            props.onEditClose()
-          }}
+          onSaved={props.onEditSaved}
           onError={props.onError}
         />
       ) : null}

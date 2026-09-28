@@ -28,6 +28,13 @@ export function EpisodeBoard(props: {
   onFocusChange: (id: number | null) => void
   onPlayEpisode: (ep: MediaEpisode) => void
   onEditEpisode: (ep: MediaEpisode | null) => void
+  /**
+   * 单集编辑**保存成功后**的回调：容器据此重取详情。
+   *
+   * 面板只负责提交，不持有一份 `detail` —— 保存后若不回容器重取，页面会继续显示
+   * 旧文案（后端的改动已在库里，UI 却停在改前），正是 R2 反例「改了介绍页面不变」。
+   */
+  onEditSaved: () => void
   /** 正在编辑的集 id（展开态的编辑面板由容器的这个状态驱动） */
   editingEpisodeId: number | null
   onAttachImages: (ep: MediaEpisode) => void
@@ -159,6 +166,10 @@ export function EpisodeBoard(props: {
               editing={editingEpisodeId === ep.id}
               onEdit={() => props.onEditEpisode(ep)}
               onEditClose={() => props.onEditEpisode(null)}
+              onEditSaved={() => {
+                props.onEditEpisode(null)
+                props.onEditSaved()
+              }}
               onAttachImages={() => props.onAttachImages(ep)}
               onRemoveImage={(itemId) => props.onRemoveImage(ep, itemId)}
               onMove={(dir) => props.onMove(ep, dir)}

@@ -426,6 +426,14 @@ class Page {
 
     const loadEvent = waitUntil === 'domcontentloaded' ? 'Page.domContentEventFired' : 'Page.loadEventFired'
     const loadPromise = this.conn.waitFor(loadEvent, () => true, timeout, sessionId)
+    /*
+     * 预挂一个空 catch：导航被拒（`errorText`，如 ERR_CONNECTION_REFUSED）时下面会
+     * 直接 throw，**不会** await 这个事件等待。若不给它挂 catch，它会在超时后以
+     * unhandled rejection 崩掉进程 —— 死端口反向证伪因此拿到 exit 1 而不是它自己
+     * 判定的 exit 0，把「探针正确识别了不可达」淹没成一次崩溃。
+     * 这里只是让被放弃的等待安静结束，不改变任何成功路径的语义。
+     */
+    loadPromise.catch(() => {})
     const result = await this.conn.send('Page.navigate', { url }, { sessionId })
     if (result && result.errorText) {
       throw new Error(`CDP: navigation to ${url} failed: ${result.errorText}`)

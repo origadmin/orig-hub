@@ -215,6 +215,7 @@ export function SeriesDetail(props: {
           onFocusChange={setFocusedEpisodeId}
           onPlayEpisode={playEpisode}
           onEditEpisode={(ep) => setEditingEpisodeId(ep ? ep.id : null)}
+          onEditSaved={onChanged}
           editingEpisodeId={editingEpisodeId}
           onAttachImages={(ep) => setAttachingEpisodeId(ep.id)}
           onRemoveEpisode={props.onRemoveEpisode}
