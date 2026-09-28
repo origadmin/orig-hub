@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { ChevronDown, ChevronUp, CloudOff, Image as ImageIcon, ImagePlus, Pencil, Play, Trash2 } from 'lucide-react'
 import { Button } from '../ui/button'
 import type { EpisodeImageMeta, MediaEpisode, MediaSeriesDetail } from '../../api/media'
@@ -19,6 +20,8 @@ import { useTranslation } from '../../i18n'
 
 /** 展开态挂图横滚条的最大张数（超出后靠横滚，不再展开/收起） */
 const IMAGE_TILE_LIMIT = 24
+/** 挂图默认内联显示的张数；超出的折进「还有 N 张」切换按钮（≥ 4 张才出现） */
+const IMAGE_INLINE = 3
 
 /**
  * 单集**展开态**：这一集的全部信息位 + 全部操作。
@@ -52,7 +55,13 @@ export function EpisodeExpanded(props: {
 }) {
   const { t } = useTranslation()
   const { ep, series } = props
-  const imgs = (ep.images ?? []).slice(0, IMAGE_TILE_LIMIT)
+  const allImgs = ep.images ?? []
+  /** 默认只露前 3 张，其余折进「还有 N 张」——一集挂十几张图时不能把展开块撑成图片墙。 */
+  const [imgsExpanded, setImgsExpanded] = useState(false)
+  const imgs = (imgsExpanded ? allImgs : allImgs.slice(0, IMAGE_INLINE)).slice(
+    0,
+    IMAGE_TILE_LIMIT,
+  )
   const sources = ep.sources ?? []
   const withBytes = hasMediaBytes(ep)
   const recacheable = canRecacheFromSource(ep.source)
@@ -115,7 +124,7 @@ export function EpisodeExpanded(props: {
           </button>
         </div>
         {imgs.length > 0 ? (
-          <div className="flex gap-2 overflow-x-auto pb-1" data-testid="episode-images">
+          <div className="flex items-start gap-2 overflow-x-auto pb-1" data-testid="episode-images">
             {imgs.map((img, i) => (
               <ImageTile
                 key={img.itemId}
@@ -124,6 +133,25 @@ export function EpisodeExpanded(props: {
                 onRemove={() => props.onRemoveImage(img.itemId)}
               />
             ))}
+            {/* 折叠切换（能力 #17）：挂图 > 3 张时给一个「还有 N 张 / 收起」入口，
+                否则一集挂十几张图会把展开块撑成图片墙（节点名沿用 `episode-images-toggle`）。 */}
+            {allImgs.length > IMAGE_INLINE ? (
+              <button
+                type="button"
+                onClick={() => setImgsExpanded((v) => !v)}
+                title={
+                  imgsExpanded
+                    ? t('media.episode.imagesCollapse')
+                    : t('media.episode.imagesMore', { n: allImgs.length - IMAGE_INLINE })
+                }
+                data-testid="episode-images-toggle"
+                className="shrink-0 self-center rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid"
+              >
+                {imgsExpanded
+                  ? t('media.episode.imagesCollapse')
+                  : `+${allImgs.length - IMAGE_INLINE}`}
+              </button>
+            ) : null}
           </div>
         ) : null}
       </div>
@@ -190,7 +218,7 @@ export function EpisodeExpanded(props: {
           size="sm"
           className="h-7 px-2.5 text-[11px]"
           onClick={props.onAttachImages}
-          data-testid="episode-attach-images-btn"
+          data-testid="episode-attach-images"
         >
           <ImagePlus className="h-3 w-3" />
           {t('media.attachImages')}

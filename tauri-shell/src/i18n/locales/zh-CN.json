@@ -578,5 +578,6 @@
   "media.lightbox.prev": "上一张",
   "media.lightbox.next": "下一张",
   "media.save": "保存",
-  "media.cancel": "取消"
+  "media.cancel": "取消",
+  "media.episode.editSlot": "修改季号 / 集号"
 }

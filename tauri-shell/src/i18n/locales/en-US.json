@@ -578,5 +578,6 @@
   "media.lightbox.prev": "Previous",
   "media.lightbox.next": "Next",
   "media.save": "Save",
-  "media.cancel": "Cancel"
+  "media.cancel": "Cancel",
+  "media.episode.editSlot": "Change season / episode number"
 }

@@ -68,10 +68,18 @@ export function EpisodeRow(props: {
       />
 
       <div className="relative z-10 flex items-center gap-3">
-        {/* 集号是**位置** —— 改号在展开态的编辑面板里 */}
-        <span className="w-14 shrink-0 text-left text-[11px] font-medium text-muted">
+        {/* 集号：**位置**，同时也是槽位编辑入口（与展开态「编辑」面板同一个 handler）。
+            集号就是这一行的坐标 —— 想改「这是第几集」时，直觉上的落点就是集号本身。
+            节点名沿用现状 `episode-slot`（§13.1「节点名全部沿用」清单）。 */}
+        <button
+          type="button"
+          onClick={props.onEdit}
+          title={t('media.episode.editSlot')}
+          data-testid="episode-slot"
+          className="w-14 shrink-0 rounded px-1 py-0.5 text-left text-[11px] font-medium text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid"
+        >
           {episodeSlotLabel(ep)}
-        </span>
+        </button>
 
         {/* 指代位：有字节 = 可播；无字节 = 虚线占位 + 重新缓存。 */}
         {withBytes ? (
