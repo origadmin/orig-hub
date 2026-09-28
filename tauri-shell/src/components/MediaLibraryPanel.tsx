@@ -30,7 +30,8 @@ import type {
   MediaTag,
 } from '../api/media'
 import { MediaCard } from './media/MediaCard'
-import { SeriesCard, SeriesDetail } from './media/SeriesDetail'
+import { SeriesDetail } from './media/SeriesDetail'
+import { SeriesCard } from './media/SeriesCard'
 import { ImportDialog } from './media/ImportDialog'
 import { BulkTagDialog, TagManagerDialog } from './media/TagManagerDialog'
 import { AddToSeriesDialog, CreateSeriesDialog, MergeSeriesDialog } from './media/SeriesDialog'
@@ -1016,6 +1017,33 @@ export function MediaLibraryPanel() {
             }}
             onChanged={() => void refreshAll()}
             onError={(m) => setError(m)}
+            onCreateTag={async (name) => {
+              try {
+                const r = await createTag(name)
+                await loadMeta()
+                return r.id
+              } catch (e) {
+                setError(e instanceof Error ? e.message : String(e))
+                return null
+              }
+            }}
+            onExport={() => setExportOpen(true)}
+            onGotoItem={(itemId) => {
+              // 能力 #11（PRD §2.4）：从单集层直达该内容在媒体库里的编辑位 ——
+              // 先切回「全部内容」视图，再取条目打开 `ItemEditDialog`。
+              // 不在这里做「滚动定位到卡片」：条目可能不在当前筛选页里，
+              // 强行滚动会落在错误的位置；打开编辑面板才是用户的真实目的。
+              setView('items')
+              setDetail(null)
+              setActiveSeriesId(null)
+              void (async () => {
+                try {
+                  setEditing(await getMediaItem(itemId))
+                } catch (e) {
+                  setError(e instanceof Error ? e.message : String(e))
+                }
+              })()
+            }}
           />
         ) : view === 'series' ? (
           <div className="min-h-0 flex-1 overflow-y-auto p-3">
