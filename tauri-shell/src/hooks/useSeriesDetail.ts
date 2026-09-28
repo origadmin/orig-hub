@@ -3,13 +3,18 @@ import { getSeries, type MediaSeriesDetail } from '../api/media'
 import { cacheKey, cached, peek } from '../lib/fetchCache'
 
 /**
- * 剧集详情（含分集列表）的**单一数据源**。
+ * 剧集详情（含分集列表）的**单一数据源**，也是全应用**唯一的剧集拉取入口**。
  *
  * 为什么不是每个组件各自 `getSeries`：同一个 id 有三个消费者 ——
  * 剧集墙里点开详情（`openSeries`）、点播放时把列表扩成整部剧集（`playItems`）、
  * 播放页侧栏（本 hook）。三处各拉一次，进一次剧集 + 点一次播放就发出 5 次
  * 完全相同的请求（实测：详情 2 次 + 播放 3 次，其中 2 次来自 React 严格模式
  * 下的 effect 双调用）。去重机制见 `lib/fetchCache`。
+ *
+ * **`SeriesHero` / `EpisodeBoard` / `EpisodeRow` 一律不得自行 fetch**
+ * （设计 §2.2「数据拉取原则」）：它们只接收 `detail`，取数全在上游。
+ * 新增剧集数据的消费者时，也必须经过 `loadSeriesDetail` / `peekSeriesDetail`，
+ * 不要再写第二条 `getSeries` 调用路径。
  */
 export function loadSeriesDetail(id: number): Promise<MediaSeriesDetail> {
   return cached(cacheKey.seriesDetail(id), () => getSeries(id))
