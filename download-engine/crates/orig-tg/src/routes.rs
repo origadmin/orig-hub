@@ -1572,7 +1572,9 @@ impl IngestCtx {
                 .caption
                 .as_deref()
                 .and_then(crate::media::parse_episode_range)
-                .map(|(s, e)| (s, e.unwrap_or(s))),
+                // BUG-205：单集优先。caption 解析出的「合集终点」一律丢弃，只保留起点作为单集集号；
+                // 「合集（多集）」只能由用户在编辑面板里手动设置，自动入库绝不生成范围。
+                .map(|(s, _e)| (s, s)),
             _ => None,
         }
     }
@@ -4897,7 +4899,8 @@ mod tests {
                     .caption
                     .as_deref()
                     .and_then(crate::media::parse_episode_range)
-                    .map(|(s, e)| (s, e.unwrap_or(s)));
+                    // BUG-205：丢弃 caption 解析出的合集终点，单集优先（多集仅手动编辑）
+                    .map(|(s, _e)| (s, s));
                 items.push((*iid, range));
             }
             store.append_episodes_ranged(sid, 1, &items).await.unwrap();

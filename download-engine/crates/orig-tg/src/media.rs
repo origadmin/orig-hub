@@ -5189,6 +5189,39 @@ mod tests {
         assert_eq!(parse_episode_range(""), None);
     }
 
+    /// BUG-205 回归：自动入库（caption 集号解析）**绝不**生成合集（多集区间）。
+    /// 单集优先：caption 解析出的范围终点必须被丢弃，只保留起点作为单集集号；
+    /// 合集（多集）只能由用户在编辑面板里手动设置 `episode_no_end`。
+    /// 与 routes.rs 中两处 `parse_episode_range(...).map(|(s, _e)| (s, s))` 保持同一映射。
+    #[tokio::test]
+    async fn auto_import_never_creates_combined_episode_bug205() {
+        let s = Store::open(tmp_db("bug205_auto_single")).await.unwrap();
+        let sid = s.create_series("剧", None, "series", None, None).await.unwrap();
+        let v = s
+            .upsert_media_item("tg", "ref:bug205", "t", "video", None, None, None, None)
+            .await
+            .unwrap();
+
+        // caption 解析出合集范围（根因：此前这条被直接喂给 append_episodes_ranged → 落 episode_no_end）
+        let parsed = parse_episode_range("EP01-02 集合集");
+        assert_eq!(parsed, Some((1, Some(2))), "caption 范围解析仍生效（根因存在）");
+
+        // BUG-205 修复：自动路径丢弃终点，只留起点 → 单集（与 routes.rs 同一映射）
+        let auto_input = parsed.map(|(st, _e)| (st, st));
+
+        let n = s.append_episodes_ranged(sid, 1, &[(v, auto_input)]).await.unwrap();
+        assert_eq!(n, 1, "应成功挂一集");
+
+        let detail = s.get_series(sid).await.unwrap().unwrap();
+        assert_eq!(detail.episodes.len(), 1);
+        let ep = &detail.episodes[0];
+        assert_eq!(ep.episode_no, 1, "集号取 caption 起点");
+        assert_eq!(
+            ep.episode_no_end, None,
+            "自动入库不得生成合集（多集仅手动编辑）：episode_no_end 必须为 NULL"
+        );
+    }
+
     /// BUG-039 冲突2：带范围追加——合集落位 + 下一可用位从终点之后起算。
     #[tokio::test]
     async fn append_ranged_places_collections_and_skips_conflicts() {
