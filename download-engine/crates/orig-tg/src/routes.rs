@@ -3110,6 +3110,28 @@ async fn media_item_raw(
     serve_local_file(&p, Some(item.kind.as_str()), item.duration, &headers).await
 }
 
+/// 投递节流是否仅针对非环回（真实远端）场景的开关。
+///
+/// orig-tg 由 `config.bind` 默认固定为 `127.0.0.1`（仅本机）。环回口带宽免费、
+/// 冗余重取命中页缓存无害，故投递默认**不限速**（见 `delivery_bps` 与 BUG-199）。
+/// 仅在显式把 bind 设成非环回地址（向 LAN / 远端共享）时，才需要 BUG-033 的
+/// 抑风暴限速。该开关由 `main` 在解析 `config.bind` 后写入，未配置时按「环回」处理。
+use std::sync::OnceLock;
+static DELIVERY_LOOPBACK_ONLY: OnceLock<bool> = OnceLock::new();
+
+/// 由 `main` 在解析 `config.bind` 后调用：记录是否仅环回监听。
+///
+/// 必须是 `pub`：`main.rs` 是**独立的二进制 crate**，`pub(crate)` 对它不可见
+/// （`routes` 属 lib crate）。
+pub fn configure_delivery_loopback_only(v: bool) {
+    let _ = DELIVERY_LOOPBACK_ONLY.set(v);
+}
+
+/// 是否仅环回监听。未配置时按「是」处理——宁可本地不限速，也不在本地误节流。
+fn delivery_loopback_only() -> bool {
+    *DELIVERY_LOOPBACK_ONLY.get().unwrap_or(&true)
+}
+
 /// 投递背压：允许的播放倍率余量（目标速率 = 码率 × 本系数）。
 const DELIVERY_BUDGET_FACTOR: f64 = 6.0;
 /// `duration` 未知时的兜底速率上限（字节/秒）。
@@ -3135,28 +3157,39 @@ fn delivery_due_secs(sent_bytes: u64, bps: f64, burst_secs: f64) -> f64 {
 
 /// 目标投递速率（字节/秒）。返回 `0.0` 表示不限速。
 ///
-/// **为什么必须限速（BUG-033 实测，勿仅凭直觉删除）**：
+/// **默认不限速（BUG-199）**：orig-tg 由 `config.bind` 固定为 `127.0.0.1`（仅本机），
+/// 投递走环回口，带宽免费；Chromium 对同一大文件的 abort-and-re-request 重取命中
+/// 页缓存本就无害。此前对**每一次**投递做全局节流（`bitrate×6`、4s 突发后按速率曲线
+/// 右移），会放慢合法投递、诱发「连接太慢 → 中断重取」循环，正是
+/// 「本地播放器流畅、经 WEB 卡顿」「HLS 流畅、当前不流畅」的根因。
+/// 故环回口直接返回 `0.0`，使 WEB 投递与本地播放器同速。
+///
+/// **何时仍需限速（BUG-033，保留）**：仅当 bind 非环回（向 LAN / 远端共享）时，
+/// 冗余重取才真实占用上行带宽。此时走下方计算分支——以下为 BUG-033 的原始结论，
+/// 切勿仅凭直觉削弱：
 /// 本地千兆下服务端能以数百 MB/s 把字节灌给解码器，而解码器 1x 只消费「码率」、
 /// 2x 消费 2×码率。Chromium 读够当前 buffer 即 abort 连接、另起请求重取同一区域，
 /// 表现为「同一块数据请求无数遍」：实测 2x 播放 10s 内 **137 个请求 / 792 MiB
 /// （冗余 63x，白传 70%+）**，在 WebView2 里就是界面卡死。
-///
-/// 该行为**与投递端实现无关**，已用对照实验逐项排除：
-///   - 标准 Python Range 实现（同一文件、同一播法）同样复现 130 请求 / 51x 冗余
-///   - 块大小 1 / 4 / 8 / 32 MiB / EOF 五档：请求数 123–137，全在同一量级
-///   - 前端 `preload` = auto / metadata / none 三档：73 / 69 / 65，无杠杆
-///   - 浏览器缓存开 / 关：137 / 136，无杠杆
 /// 唯一有效的杠杆是**发送速率**：限到 6 MiB/s 后传输量 290 MiB → 19.6 MiB、
-/// 冗余 29x → **1.97x**。
+/// 冗余 29x → **1.97x**。对照实验（Python Range 实现、块大小 1/4/8/32MiB/EOF、
+/// `preload` 三档、缓存开关）均无法替代速率杠杆。
 ///
-/// 返回的速率即稳态速率 `bps`；每响应开头的 TTFB 代价由 `delivery_due_secs` 的
-/// **初始突发信用**（见 `DELIVERY_BURST_SECS`）单独消除，二者正交。
+/// 返回的稳态速率 `bps` 开头 TTFB 代价由 `delivery_due_secs` 的**初始突发信用**
+/// （见 `DELIVERY_BURST_SECS`）单独消除，二者正交。
 ///
-/// 可用 `ORIG_TG_DELIVERY_BPS` 覆盖（0 = 关闭限速，便于 A/B，无需重编）。
+/// 可用 `ORIG_TG_DELIVERY_BPS` 覆盖（0 = 关闭限速，便于 A/B，无需重编）：
+/// 非 0 值时**无视环回判定**直接启用限速，供真实远端场景手动开启 BUG-033 抑风暴。
 fn delivery_bps(total: u64, duration_secs: Option<i64>) -> f64 {
+    // 显式覆盖优先：非 0 值无视环回判定直接启用限速（真实远端场景）。
     if let Ok(v) = std::env::var("ORIG_TG_DELIVERY_BPS") {
         return v.trim().parse::<f64>().unwrap_or(0.0);
     }
+    // 环回口（仅本机）带宽免费：跳过节流，使 WEB 投递与本地播放器同速（BUG-199）。
+    if delivery_loopback_only() {
+        return 0.0;
+    }
+    // 以下为 BUG-033 抑风暴速率（仅非环回场景到达）：
     match duration_secs.filter(|d| *d > 0) {
         Some(d) => {
             let bitrate = total as f64 / d as f64; // 字节/秒
@@ -4272,14 +4305,15 @@ mod tests {
         );
     }
 
-    /// 反向回归：burst 信用不得把稳态节流关掉。
+    /// 反向回归：burst 信用不得把稳态节流关掉（BUG-033 节流路径本身仍须生效）。
     ///
-    /// 仅在本用例内设 `ORIG_TG_DELIVERY_BURST_SECS=0`（= 关闭突发信用），
-    /// 4 MiB @ 1 MiB/s 读完整体必须 >= 3.0 s（理论上 ~4 s）。
+    /// BUG-199 之后默认不限速（环回口带宽免费），故本用例**显式开启**限速：
+    /// 设 `ORIG_TG_DELIVERY_BPS=1048576`（1 MiB/s）且 `ORIG_TG_DELIVERY_BURST_SECS=0`，
+    /// 4 MiB 读完整体必须 >= 3.0 s（理论上 ~4 s）。守住「环境变量启用节流时 pacing 仍在」。
     #[tokio::test]
     async fn serve_local_file_still_throttles() {
         let _guard = DELIVERY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("ORIG_TG_DELIVERY_BPS");
+        std::env::set_var("ORIG_TG_DELIVERY_BPS", "1048576");
         std::env::set_var("ORIG_TG_DELIVERY_BURST_SECS", "0");
 
         let dir = scratch_dir("throttle");
@@ -4306,6 +4340,45 @@ mod tests {
         assert!(
             elapsed >= std::time::Duration::from_secs(3),
             "burst=0 时稳态节流必须仍在（4 MiB @ 1 MiB/s ⇒ ~4s）；实际耗时 {elapsed:?}"
+        );
+        // 无论断言结果如何都先清 env —— 它是进程级，会污染其他用例。
+        std::env::remove_var("ORIG_TG_DELIVERY_BPS");
+        std::env::remove_var("ORIG_TG_DELIVERY_BURST_SECS");
+    }
+
+    /// BUG-199 反向回归：环回口默认**不限速**。
+    ///
+    /// 不加任何 env 覆盖时，4 MiB 文件必须远快于节流（< 1 s 读完），
+    /// 确保本地 WEB 投递与本地播放器同速、不再卡顿。
+    #[tokio::test]
+    async fn serve_local_file_unthrottled_by_default() {
+        let _guard = DELIVERY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 排除外部 env 干扰：清掉 bps / burst 覆盖，走纯默认路径。
+        std::env::remove_var("ORIG_TG_DELIVERY_BPS");
+        std::env::remove_var("ORIG_TG_DELIVERY_BURST_SECS");
+
+        let dir = scratch_dir("unthrottled");
+        let f = dir.join("sample.mp4");
+        std::fs::write(&f, vec![0u8; 4 * 1024 * 1024]).expect("seed 4 MiB");
+        let path = f.to_string_lossy().into_owned();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
+
+        let t0 = std::time::Instant::now();
+        let resp = match serve_local_file(&path, Some("video"), Some(500), &headers).await {
+            Ok(r) => r,
+            Err(e) => panic!("serve must succeed, got {}: {}", e.status, e.message()),
+        };
+        let body = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+            .await
+            .expect("body must be fully readable");
+        let elapsed = t0.elapsed();
+
+        assert_eq!(body.len(), 4 * 1024 * 1024, "必须读完整体");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "环回口默认必须不限速（4 MiB 应远小于 1s 读完）；实际耗时 {elapsed:?}"
         );
     }
 

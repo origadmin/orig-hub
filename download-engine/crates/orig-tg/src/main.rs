@@ -37,6 +37,7 @@ use orig_tg::config::Config;
 use orig_tg::grammers::GrammersClient;
 use orig_tg::login::Client;
 use orig_tg::routes;
+use orig_tg::routes::configure_delivery_loopback_only;
 use orig_tg::state::{AppState, Availability};
 use orig_tg::unavailable::UnavailableClient;
 
@@ -158,6 +159,14 @@ async fn main() {
     }
 
     let config = Config::load();
+    // 投递节流按 bind 是否环回切换（BUG-199）：仅本机 → 不限速；非环回 → 启用 BUG-033 抑风暴。
+    configure_delivery_loopback_only(
+        config
+            .bind
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(true),
+    );
     let (client, availability, mock) = build_client(&config).await;
 
     // 打开存储；失败即致命退出（见 `EXIT_STORE_FAILED` 注释），不做空库兜底。
