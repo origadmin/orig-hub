@@ -5,6 +5,12 @@
 - **不再占线程、测完也不停**：原来的 `orig-daemon` 由桌面壳作为 sidecar 子进程拉起，跟着终端/外壳走，一关就停。Docker 以 `restart: unless-stopped` 常驻，容器 detach 运行，调试结束也不会死。
 - **支持远程管理下载**：守护进程现在可绑定 `0.0.0.0` 并经 Bearer token 鉴权；除桌面壳外，可用 `orig-ctl` CLI 或指向远程地址的前端管控。
 
+## 0. 前置条件
+
+- **Docker 守护进程必须运行**：`docker info` 须返回正常。若 `failed to connect to the docker API` / `daemon is running` 报错，说明 Docker Desktop（或 dockerd）未启动，先启动它再执行后续步骤。
+- **构建期需访问 crates.io**：`docker build` 在镜像内执行 `cargo build --release`，需要拉取 Rust 依赖；离线环境会卡在依赖解析。
+- **环境变量优先于 `download-engine.toml`**：容器内用 env 配置（host/token/proxy/...）始终覆盖挂载的 toml，便于纯 env 部署。
+
 ## 1. 构建镜像
 
 ```bash
@@ -49,6 +55,9 @@ docker compose up -d
 | `SURGE_DOWNLOAD_DIR` | 下载落盘目录 | `/data/downloads` |
 | `ORIG_TG_DATA` | TG 会话/库目录 | `/data/tg` |
 | `ORIG_TG_ENABLED` | 是否拉起 orig-tg 子服务 | `true` |
+| `ORIG_PROXY_MODE` | 代理模式 `system` / `custom` / `direct`，无需挂载 toml 即可让 HTTP 下载与 Telegram 走代理 | `direct` |
+| `ORIG_PROXY_URL` | 自定义代理地址，如 `socks5://127.0.0.1:7897` / `http://127.0.0.1:8080`（配合 `ORIG_PROXY_MODE=custom`） | 空 |
+| `ORIG_TG_API_ID` / `ORIG_TG_API_HASH` | Telegram 应用凭据；**真实 TG 拉流必须**，留空则只能离线/本地媒体库 | 空 |
 
 数据落在卷 `orig-hub-data`（compose）或 `-v` 挂载的 `/data`，宿主机可直读。
 
