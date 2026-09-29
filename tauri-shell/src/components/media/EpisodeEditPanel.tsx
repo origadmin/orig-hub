@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Button } from '../ui/button'
-import { patchEpisode } from '../../api/media'
+import { detachEpisodeImage, mediaItemUrl, patchEpisode } from '../../api/media'
 import type { MediaEpisode, MediaSeriesDetail } from '../../api/media'
 import { useTranslation } from '../../i18n'
 
@@ -21,10 +21,14 @@ export function EpisodeEditPanel(props: {
   series: MediaSeriesDetail
   onClose: () => void
   onSaved: () => void
+  /** 图片增删替后的刷新（只重取详情，**不**退出编辑态/不丢草稿，BUG-204） */
+  onChanged: () => void
+  /** 打开本集挂图选择器（增 / 替换；replace-all 语义），对话框仍归 SeriesDetail 容器 */
+  onPickImages: () => void
   onError: (msg: string) => void
 }) {
   const { t } = useTranslation()
-  const { ep, onClose, onSaved, onError } = props
+  const { ep, onClose, onSaved, onChanged, onPickImages, onError } = props
   /** 本集标题草稿 —— 改的是**这条内容**的标题（分集会跟着显示同一个名字） */
   const [title, setTitle] = useState(ep.title ?? '')
   const [desc, setDesc] = useState(ep.description ?? '')
@@ -37,6 +41,8 @@ export function EpisodeEditPanel(props: {
    */
   const [end, setEnd] = useState(ep.episodeNoEnd != null ? String(ep.episodeNoEnd) : '')
   const [busy, setBusy] = useState(false)
+  /** 图片摘除进行中：禁用全部 × 按钮，避免并发摘除把缩略图列表改乱（BUG-204） */
+  const [imgBusy, setImgBusy] = useState(false)
 
   /**
    * 保存本集：**标题 + 介绍 + 槽位**一次提交。
@@ -109,6 +115,23 @@ export function EpisodeEditPanel(props: {
     }
   }
 
+  /**
+   * 摘除单张已挂接图片（BUG-204）：DELETE /api/media/episodes/:id/images/:itemId。
+   * 只重取详情（`onChanged`）刷新缩略图列表，**不**退出编辑态、不丢草稿 ——
+   * 否则用户刚挂好的标题/介绍一并丢失，等于「改图必须先重填本集」。
+   */
+  const detachImage = async (itemId: number) => {
+    setImgBusy(true)
+    try {
+      await detachEpisodeImage(ep.id, itemId)
+      onChanged()
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setImgBusy(false)
+    }
+  }
+
   return (
     <div className="flex flex-col gap-2" data-testid="episode-edit-panel">
       {/* P5 / R11：改写范围说明**只在面板内**，不进行态 */}
@@ -176,6 +199,51 @@ export function EpisodeEditPanel(props: {
         rows={2}
         className="w-full resize-none rounded-md border border-border-subtle bg-surface px-2 py-1 text-[11px] text-fg-strong"
       />
+
+      {/* BUG-204：图片纳入统一编辑 —— 「编辑所有内容」名实相符。
+          增/替换 = 挂图选择器（replace-all 语义，勾选即新全集）；删 = 每张缩略图 ×。 */}
+      <span className="text-[11px] font-medium text-fg-strong">
+        {t('media.episode.sectionImages')}
+      </span>
+      {(ep.images ?? []).length === 0 ? (
+        <p className="text-[11px] text-muted/70" data-testid="episode-edit-images-empty">
+          {t('media.episode.noImagesAttached')}
+        </p>
+      ) : (
+        <div className="flex flex-wrap gap-2" data-testid="episode-edit-images">
+          {(ep.images ?? []).map((img) => (
+            <span key={img.itemId} className="relative inline-block">
+              <img
+                src={img.poster ?? mediaItemUrl(img.itemId)}
+                alt=""
+                loading="lazy"
+                className="h-14 w-20 rounded border border-border-subtle object-cover"
+              />
+              <button
+                type="button"
+                disabled={imgBusy}
+                onClick={() => void detachImage(img.itemId)}
+                aria-label={t('media.episode.detachImage')}
+                data-testid="episode-image-detach"
+                className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full border border-border-subtle bg-surface text-[11px] leading-none text-muted hover:bg-destructive/10 hover:text-destructive"
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+      <div>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-6 px-2.5 text-[11px]"
+          onClick={onPickImages}
+          data-testid="episode-images-manage"
+        >
+          {t('media.episode.editImages')}
+        </Button>
+      </div>
 
       <div className="flex gap-2">
         <Button

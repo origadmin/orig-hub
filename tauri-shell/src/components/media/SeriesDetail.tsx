@@ -522,10 +522,20 @@ export function SeriesDetail(props: {
               <div className="flex min-w-0 flex-wrap items-center gap-2">
                 <h3
                   className="min-w-0 flex-1 truncate text-[16px] font-semibold text-fg-strong"
-                  title={shouldRenderEpisodeTitle(cur, detail) ? cur.title ?? '' : episodeSlotLabel(cur)}
+                  title={editingEpisode
+                    ? episodeSlotLabel(cur)
+                    : shouldRenderEpisodeTitle(cur, detail)
+                      ? cur.title ?? ''
+                      : episodeSlotLabel(cur)}
                   data-testid="episode-focus-title"
                 >
-                  {shouldRenderEpisodeTitle(cur, detail) ? cur.title : episodeSlotLabel(cur)}
+                  {/* BUG-203：编辑态只显槽位标签 —— 标题正在下方表单里被编辑，
+                      顶部再渲染一份就是用户看到的「重叠重复 2 行」。 */}
+                  {editingEpisode
+                    ? episodeSlotLabel(cur)
+                    : shouldRenderEpisodeTitle(cur, detail)
+                      ? cur.title
+                      : episodeSlotLabel(cur)}
                 </h3>
                 {/* 单一编辑入口：标题行即编辑按钮，点一下进入本集统一编辑态
                     （标题 / 介绍 / 季号 / 集号 / 结束集号一次提交；集可以没有标题）。
@@ -558,47 +568,58 @@ export function SeriesDetail(props: {
                     series={detail}
                     onClose={closeEdit}
                     onSaved={handleEditSaved}
+                    onPickImages={() => setAttachingEpisodeId(cur.id)}
+                    onChanged={onChanged}
                     onError={onError}
                   />
                 </div>
               ) : null}
 
               {/* 本集图组 = **stacked deck 折叠跑马灯**（规范核心；只留右栏 §6.1）。
-                  点左半=上一张 / 右半=下一张；⤢ 打开灯箱（能力 R6 保留）。 */}
-              <div className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5">
-                <h4 className="text-[12px] font-semibold text-fg-strong">
-                  {t('media.episode.sectionImages')}
-                </h4>
-                {focusFrames.length > 0 ? (
-                  <div className="py-1">
-                    <Deck
-                      frames={focusFrames}
-                      w={focusPortrait ? 170 : 300}
-                      h={focusPortrait ? 302 : 169}
-                      maxW={420}
-                      peek={26}
-                      onOpenFrame={(i) => openFocusLightbox(cur, i)}
-                    />
-                  </div>
-                ) : null}
-              </div>
+                  点左半=上一张 / 右半=下一张；⤢ 打开灯箱（能力 R6 保留）。
+                  BUG-203/204：编辑态隐藏 —— 图片的增删替在编辑面板内进行
+                  （面板图片条 + 挂图选择器），同时再渲染一份跑马灯就成了与
+                  面板缩略图重复的第二处「本集图组」。 */}
+              {!editingEpisode ? (
+                <div className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5">
+                  <h4 className="text-[12px] font-semibold text-fg-strong">
+                    {t('media.episode.sectionImages')}
+                  </h4>
+                  {focusFrames.length > 0 ? (
+                    <div className="py-1">
+                      <Deck
+                        frames={focusFrames}
+                        w={focusPortrait ? 170 : 300}
+                        h={focusPortrait ? 302 : 169}
+                        maxW={420}
+                        peek={26}
+                        onOpenFrame={(i) => openFocusLightbox(cur, i)}
+                      />
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
 
-              {/* 本集介绍（R2 门控：与剧集介绍逐字相同则不重复渲染）。规范：块标题 + 编辑介绍按钮 */}
-              <div className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5">
-                <span className="text-[11px] font-medium text-fg-strong">{t('media.episode.sectionDesc')}</span>
-                {shouldRenderEpisodeDescription(cur, detail) ? (
-                  <p
-                    className="min-w-0 whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[12.5px] leading-relaxed text-muted"
-                    data-testid="episode-focus-desc"
-                  >
-                    {cur.description}
-                  </p>
-                ) : (
-                  <p className="text-[11px] text-muted/70">{t('media.descEmptyEp')}</p>
-                )}
-                {/* BUG-201：此处**不再**放第二个编辑按钮 —— 介绍与标题/槽位在同一个
-                    `episode-edit` 面板里，两个入口打开的是同一个面板。 */}
-              </div>
+              {/* 本集介绍（R2 门控：与剧集介绍逐字相同则不重复渲染）。规范：块标题 + 编辑介绍按钮
+                  BUG-203：编辑态隐藏 —— 介绍正在编辑面板的 textarea 里，正文再渲染一份
+                  就是第二处重复（与标题的 2 行重叠同根因）。 */}
+              {!editingEpisode ? (
+                <div className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5">
+                  <span className="text-[11px] font-medium text-fg-strong">{t('media.episode.sectionDesc')}</span>
+                  {shouldRenderEpisodeDescription(cur, detail) ? (
+                    <p
+                      className="min-w-0 whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[12.5px] leading-relaxed text-muted"
+                      data-testid="episode-focus-desc"
+                    >
+                      {cur.description}
+                    </p>
+                  ) : (
+                    <p className="text-[11px] text-muted/70">{t('media.descEmptyEp')}</p>
+                  )}
+                  {/* BUG-201：此处**不再**放第二个编辑按钮 —— 介绍与标题/槽位在同一个
+                      `episode-edit` 面板里，两个入口打开的是同一个面板。 */}
+                </div>
+              ) : null}
 
               {/* 来源 = 切换视频来源来播放（BUG-198）：不是信息展板。剥掉 ref / 内部 id
                   这类「这道菜怎么烧」的噪声，只留「当前播放来源 + 备用版本一键切换」。 */}
@@ -713,16 +734,20 @@ export function SeriesDetail(props: {
                   <Play className="h-3 w-3" />
                   {t('media.episode.play')}
                 </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 px-2.5 text-[11px]"
-                  onClick={() => setAttachingEpisodeId(cur.id)}
-                  data-testid="episode-attach-images"
-                >
-                  <ImagePlus className="h-3 w-3" />
-                  {t('media.attachImages')}
-                </Button>
+                {/* BUG-204：图片编辑收进统一面板（episode-images-manage），
+                    编辑态不再渲染第二个图片入口；浏览态保留原按钮。 */}
+                {!editingEpisode ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2.5 text-[11px]"
+                    onClick={() => setAttachingEpisodeId(cur.id)}
+                    data-testid="episode-attach-images"
+                  >
+                    <ImagePlus className="h-3 w-3" />
+                    {t('media.attachImages')}
+                  </Button>
+                ) : null}
                 <Button
                   variant="outline"
                   size="sm"

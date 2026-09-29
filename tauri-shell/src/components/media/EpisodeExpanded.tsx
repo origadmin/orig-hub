@@ -43,6 +43,10 @@ export function EpisodeExpanded(props: {
   onEditClose: () => void
   /** 编辑保存成功：容器据此重取详情，避免页面停留在改前的旧文案 */
   onEditSaved: () => void
+  /** 图片增删替后刷新（只重取详情，不退出编辑态；BUG-204） */
+  onChanged: () => void
+  /** 打开本集挂图选择器（增 / 替换；replace-all 语义），对话框仍归容器 */
+  onPickImages: () => void
   editing: boolean
   onAttachImages: () => void
   onRemoveImage: (itemId: number) => void
@@ -293,6 +297,8 @@ export function EpisodeExpanded(props: {
           series={series}
           onClose={props.onEditClose}
           onSaved={props.onEditSaved}
+          onChanged={props.onChanged}
+          onPickImages={props.onPickImages}
           onError={props.onError}
         />
       ) : null}

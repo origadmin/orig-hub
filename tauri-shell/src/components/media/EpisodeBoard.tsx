@@ -35,6 +35,10 @@ export function EpisodeBoard(props: {
    * 旧文案（后端的改动已在库里，UI 却停在改前），正是 R2 反例「改了介绍页面不变」。
    */
   onEditSaved: () => void
+  /** 图片增删替后刷新（只重取详情，不退出编辑态；BUG-204） */
+  onChanged: () => void
+  /** 打开本集挂图选择器（增 / 替换；replace-all 语义） */
+  onPickImages: (ep: MediaEpisode) => void
   /** 正在编辑的集 id（展开态的编辑面板由容器的这个状态驱动） */
   editingEpisodeId: number | null
   onAttachImages: (ep: MediaEpisode) => void
@@ -170,6 +174,8 @@ export function EpisodeBoard(props: {
                 props.onEditEpisode(null)
                 props.onEditSaved()
               }}
+              onChanged={() => props.onChanged()}
+              onPickImages={() => props.onPickImages(ep)}
               onAttachImages={() => props.onAttachImages(ep)}
               onRemoveImage={(itemId) => props.onRemoveImage(ep, itemId)}
               onMove={(dir) => props.onMove(ep, dir)}
