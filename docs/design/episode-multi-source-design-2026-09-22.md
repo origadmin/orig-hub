@@ -1,4 +1,19 @@
+---
+status: draft
+author: 高见远（架构师）
+date: 2026-09-22
+topic: media-episode
+module: engine+shell
+decided-by: —（§12 的 D1/D2/D3 至今未裁定）
+decided-at: —
+landed-in: 无（截至 2026-09-29 未落地：`tauri-shell/src/components/media/EpisodeExpanded.tsx:153-196` 仍是两个裸按钮）
+---
+
 # 单集多视频源（多清晰度 / 多版本）增量设计
+
+> **状态口径**（`docs/rules/doc-first.md` §2）：`draft` = 未曾裁定、未曾落地。
+> 本文 §12 的 D1/D2/D3 **至今（2026-09-29，7 天）未获裁定**；本文 §5 描述的「改动后」形态
+> **未落地**。下一会话请以本 front-matter 的状态为准，**不要**把本文当既成事实执行。
 
 - 日期：2026-09-22（v2：按实测否证修订）
 - 作者：架构师（高见远）
