@@ -526,6 +526,54 @@ export function detachEpisodeImage(
   return request(`/api/media/episodes/${episodeId}/images/${itemId}`, { method: 'DELETE' })
 }
 
+// ────────────── 集的统一挂载读模型（D1=B 第一步）──────────────
+
+/**
+ * 挂载角色。
+ *
+ * `segment`（一集拆成多个视频片段）**当前无表承载、不会产出行** ——
+ * 它在这里先占位，是为了第二步落地片段时**前端无需再改一次**。
+ */
+export type EpisodeBindingRole = 'main' | 'alternate' | 'image' | 'segment'
+
+/**
+ * 一项「集 ↔ 条目」挂载。
+ *
+ * 这是把「主条目 / 备用源 / 挂图」收敛后的**唯一**读结构：
+ * 前端不再需要知道「角色 = 哪张表」，只按 `role` 分派即可。
+ */
+export interface EpisodeBinding {
+  itemId: number
+  role: EpisodeBindingRole
+  /** 角色内排序位：`main`/`alternate` 恒 0；`image` = sort_no；`segment` = 播放序 */
+  seq: number
+  title?: string | null
+  kind?: MediaKind | null
+  /** 条目来源（'local' / 'tg'） */
+  source?: string | null
+  /**
+   * 条目来源标识（本地路径 / TG `chat:msg`）。
+   *
+   * **内部标识**：只可用于诊断或「复制坐标」这类显式动作，
+   * **不得常驻界面**（BUG-148：实现约束 ≠ 产品信息）。
+   */
+  ref?: string | null
+  poster?: string | null
+  duration?: number | null
+}
+
+/**
+ * `GET /api/media/episodes/:id/bindings` — 集的统一挂载读模型（纯只读）。
+ *
+ * 后端 UNION 现有三张表后按「主 → 备用源 → 挂图」有序返回；不搬迁任何行。
+ * 集不存在 → 404。
+ */
+export function listEpisodeBindings(
+  episodeId: number,
+): Promise<{ items: EpisodeBinding[] }> {
+  return request(`/api/media/episodes/${episodeId}/bindings`)
+}
+
 /**
  * 剧集内换位：与同季相邻的一集交换槽位。
  *

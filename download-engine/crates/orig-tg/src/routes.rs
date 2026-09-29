@@ -149,6 +149,11 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             "/api/media/episodes/:id/images/:item_id",
             axum::routing::delete(detach_episode_image),
         )
+        // 集的统一挂载读模型（D1=B 第一步）：主条目 / 备用源 / 挂图收敛成一个有序列表。
+        .route(
+            "/api/media/episodes/:id/bindings",
+            get(list_episode_bindings),
+        )
         .route("/api/media/tags", get(list_media_tags).post(create_media_tag))
         .route(
             "/api/media/tags/:id",
@@ -3801,6 +3806,34 @@ async fn detach_episode_image(
     ))
 }
 
+// ── 集的统一挂载读模型（D1=B 第一步）──────────────────────────────────────
+
+/// `GET /api/media/episodes/:id/bindings` — 集的**统一挂载读模型**（纯只读）。
+///
+/// 把主条目 / 备用源 / 挂图收敛成一个有序列表，每项带 `role`
+/// （`main` | `alternate` | `image`；`segment` 为片段占位，本步不产出行）。
+/// UNION 现有三张表，**不搬迁任何行、不碰任何写路径**。
+/// 集不存在 → 404（与 `attach_episode_images` 同一口径，不静默返回空列表）。
+async fn list_episode_bindings(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let exists = st
+        .store
+        .row_opt("SELECT 1 FROM media_episode WHERE id = ?1", params![id])
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if exists.is_none() {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "episode not found"));
+    }
+    let items = st
+        .store
+        .list_episode_bindings(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(json!({"items": items})))
+}
+
 /// `DELETE /api/media/episodes/:id` — 从剧集中移除单集（内容保留）。
 async fn delete_media_episode(
     State(st): State<Arc<AppState>>,
@@ -3926,7 +3959,9 @@ mod tests {
     use super::delete_media_item;
     use super::delivery_due_secs;
     use super::cache_tasks_payload;
+    use super::list_episode_bindings;
     use super::normalized_series_name;
+    use super::router;
     use super::serve_local_file;
     use serde_json::json;
 
@@ -3934,6 +3969,7 @@ mod tests {
 
     use axum::extract::{Path, State};
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+    use axum::response::IntoResponse;
 
     use crate::config::Config;
     use crate::state::{AppState, Availability};
@@ -4208,6 +4244,79 @@ mod tests {
         assert!(
             elapsed >= std::time::Duration::from_secs(3),
             "burst=0 时稳态节流必须仍在（4 MiB @ 1 MiB/s ⇒ ~4s）；实际耗时 {elapsed:?}"
+        );
+    }
+
+    // ---- D1=B 第一步：集的统一挂载读模型（路由层契约）----
+
+    /// `GET /api/media/episodes/:id/bindings` 的**路由层**契约。
+    ///
+    /// 为什么不能只靠 `media.rs` 的单测（BUG-156）：那只证明「读模型算得对」，
+    /// 证不了「路由挂得上、404 分得清、JSON 键名对」。这三件事只有路由层看得见：
+    ///   1. **路由表能建起来** —— axum 对冲突/重复路由在建表时即 panic；
+    ///   2. **集不存在 → 404** —— 不得静默返回空列表（那会让前端把「集没了」
+    ///      误读成「这集没挂任何东西」）；
+    ///   3. **JSON 键名契约** —— `itemId`/`role`/`seq`/`ref`，前端按它取数；
+    ///      `ref` 键必须**存在**（可为 null），否则前端 `?.` 链会静默变 undefined。
+    #[tokio::test]
+    async fn episode_bindings_route_contract() {
+        use crate::unavailable::UnavailableClient;
+
+        let store = Store::open(":memory:")
+            .await
+            .expect("in-memory store must open");
+        let st = Arc::new(AppState::new(
+            Arc::new(UnavailableClient::new("test: link down")),
+            Config::default(),
+            Availability::Unavailable("test".to_string()),
+            false,
+            store,
+        ));
+
+        // ① 路由表可建（冲突/重复注册会在这里 panic，而不是等到运行时）
+        let _ = router(st.clone());
+
+        // ② 集不存在 ⇒ 404
+        match list_episode_bindings(State(st.clone()), Path(999_999_i64)).await {
+            Ok(_) => panic!("不存在的集必须 404，不得静默返回空列表"),
+            Err(e) => assert_eq!(e.status, StatusCode::NOT_FOUND, "集不存在必须是 404"),
+        }
+
+        // ③ 存在的集 ⇒ 200 + 键名契约
+        let sid = st
+            .store
+            .create_series("剧", None, "series", None, None)
+            .await
+            .unwrap();
+        let vid = st
+            .store
+            .upsert_media_item("tg", "v:1", "主版本", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let ep = st.store.add_episode(sid, vid, 1, 1).await.unwrap();
+
+        let resp = match list_episode_bindings(State(st.clone()), Path(ep)).await {
+            Ok(r) => r.into_response(),
+            Err(e) => panic!("存在的集必须 200，实得 {}: {}", e.status, e.message()),
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body must be readable");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("must be JSON");
+        let item = &v["items"][0];
+        assert_eq!(item["role"], "main", "单来源集的第一项必须是 main");
+        assert_eq!(item["itemId"], vid, "键名必须是 itemId（camelCase 契约）");
+        assert_eq!(item["seq"], 0);
+        assert_eq!(item["title"], "主版本");
+        assert!(
+            item.get("ref").is_some(),
+            "`ref` 键必须存在（可为 null），否则前端取键会静默变 undefined"
+        );
+        assert_eq!(
+            v["items"].as_array().map(|a| a.len()),
+            Some(1),
+            "只有主条目时**恰好** 1 项 —— 界面不该据此画出两个「来源」"
         );
     }
 

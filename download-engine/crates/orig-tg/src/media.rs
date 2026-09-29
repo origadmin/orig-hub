@@ -866,6 +866,41 @@ pub struct SourceRef {
     pub kind: Option<String>,
 }
 
+/// 集级「挂载」统一读模型的一项（D1=B 第一步：统一读模型）。
+///
+/// 把「一集 ↔ 多文件」的多种角色（主条目 / 备用源 / 挂图 / 片段）收敛成**一个**结构，
+/// 每项自带 `role`。前端从此只认这一个列表，不必再知道「角色 = 哪张表」——
+/// 即把「读模型 N 路 UNION」这条债务从**前端**收回**后端一处**。
+///
+/// **本结构只是读视图**：不引入新表、不搬迁任何行（见 `list_episode_bindings`）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpisodeBinding {
+    /// 被挂载的条目 id（前端据此拼 raw/缩略地址）。
+    pub item_id: i64,
+    /// 角色：`main`（主条目）/ `alternate`（备用源）/ `image`（挂图）/
+    /// `segment`（片段，表尚未落地 —— **枚举先占位**，第二步落地时前端无需再改）。
+    pub role: String,
+    /// 角色内排序位：`main`/`alternate` 恒 0；`image` = `sort_no`；`segment` = 播放序。
+    pub seq: i64,
+    /// 条目标题（取自 `media_item`）。
+    pub title: Option<String>,
+    /// 条目类型（`video` / `photo`）。
+    pub kind: Option<String>,
+    /// 条目来源（`local` / `tg`）。
+    pub source: Option<String>,
+    /// 条目来源标识（本地路径 / TG `chat:msg`）。
+    ///
+    /// **内部标识**：供诊断与「复制坐标」这类**显式动作**使用，
+    /// **不得常驻界面**（BUG-148：实现约束 ≠ 产品信息）。
+    #[serde(rename = "ref")]
+    pub reference: Option<String>,
+    /// 缩略/封面位（`media_item.poster`）。
+    pub poster: Option<String>,
+    /// 时长秒（`media_item.duration`；图片为 None）。
+    pub duration: Option<i64>,
+}
+
 /// 剧集详情 = 元数据 + 分集列表。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2867,6 +2902,57 @@ impl Store {
                 path: r.get(1)?,
                 poster: r.get(2)?,
                 bytes: r.get(3)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 某集的**统一挂载读模型**（D1=B 第一步）。
+    ///
+    /// 把 M1（`media_episode.item_id`，主条目）/ M2（`media_episode_source`，备用源）/
+    /// M5（`media_episode_image`，挂图）合成**一个**有序列表，每项带 `role`。
+    ///
+    /// - **纯只读**：UNION 现有三张表，**不搬迁任何行、不碰任何写路径** —— 每步可停。
+    /// - `role` 枚举含 `segment`（片段）但**本步不产出行**：片段表尚未落地，
+    ///   占位是为了让第二步落地片段时**前端无需再改一次**。
+    /// - 排序：`main` → `alternate`（`created_at, id`）→ `image`（`sort_no, item_id`）。
+    ///   同一集内 `main` 至多一行，故列表稳定可复现。
+    pub async fn list_episode_bindings(
+        &self,
+        episode_id: i64,
+    ) -> libsql::Result<Vec<EpisodeBinding>> {
+        let stmt = self
+            .conn
+            .prepare(
+                "SELECT b.item_id, b.role, b.seq,
+                        i.title, i.kind, i.source, i.ref, i.poster, i.duration
+                   FROM (
+                         SELECT item_id, 'main' AS role, 0 AS seq, 0 AS ord, 0 AS tie
+                           FROM media_episode WHERE id = ?1
+                         UNION ALL
+                         SELECT item_id, 'alternate', 0, 1, created_at
+                           FROM media_episode_source WHERE episode_id = ?1
+                         UNION ALL
+                         SELECT item_id, 'image', sort_no, 2, sort_no
+                           FROM media_episode_image WHERE episode_id = ?1
+                        ) b
+                   LEFT JOIN media_item i ON i.id = b.item_id
+                  ORDER BY b.ord ASC, b.tie ASC, b.item_id ASC",
+            )
+            .await?;
+        let mut rows = stmt.query(params![episode_id]).await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(EpisodeBinding {
+                item_id: r.get(0)?,
+                role: r.get(1)?,
+                seq: r.get(2)?,
+                title: r.get(3)?,
+                kind: r.get(4)?,
+                source: r.get(5)?,
+                reference: r.get(6)?,
+                poster: r.get(7)?,
+                duration: r.get(8)?,
             });
         }
         Ok(out)
@@ -5290,6 +5376,106 @@ mod tests {
         s.detach_episode_source(ep, a).await.unwrap();
         let detail = s.get_series(sid).await.unwrap().unwrap();
         assert!(detail.episodes[0].sources.is_empty());
+    }
+
+    /// D1=B 第一步：统一挂载读模型 `list_episode_bindings`。
+    ///
+    /// 判据打在**真实读路径**上（不是「表里有几行」）：
+    ///   - 三种角色一次读全，顺序恒为 主 → 备用源 → 挂图；
+    ///   - **每个 UNION 分支都是活的** —— 逐条摘除后对应行必须消失
+    ///     （反向证伪：任一路写错/写死，下面的计数断言必失败）；
+    ///   - `segment` 枚举先占位但**不得产出行**（片段表尚未落地）；
+    ///   - 纯只读：连读三次不改任何表。
+    #[tokio::test]
+    async fn episode_bindings_unify_main_alternate_and_images() {
+        let s = Store::open(tmp_db("ep_bindings")).await.unwrap();
+        let sid = s.create_series("剧", None, "series", None, None).await.unwrap();
+        let main = s
+            .upsert_media_item("tg", "v:main", "主版本", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let alt = s
+            .upsert_media_item("tg", "v:alt", "备用版本", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let mut photos = Vec::new();
+        for i in 0..2 {
+            photos.push(
+                s.upsert_media_item(
+                    "tg",
+                    &format!("p:{i}"),
+                    &format!("图{i}"),
+                    "photo",
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+
+        let ep = s.add_episode(sid, main, 1, 1).await.unwrap();
+        assert!(s.attach_episode_source(ep, alt).await.unwrap());
+        assert_eq!(s.attach_episode_images(ep, &photos).await.unwrap(), 2);
+
+        let b = s.list_episode_bindings(ep).await.unwrap();
+        let roles: Vec<&str> = b.iter().map(|x| x.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["main", "alternate", "image", "image"],
+            "顺序必须恒为 主 → 备用源 → 挂图"
+        );
+        assert_eq!(b[0].item_id, main);
+        assert_eq!(b[1].item_id, alt);
+        assert_eq!(b[2].item_id, photos[0], "挂图按 sort_no 升序");
+        assert_eq!(b[3].item_id, photos[1]);
+        assert_eq!((b[0].seq, b[1].seq), (0, 0), "主/备用源 seq 恒 0");
+        assert_eq!((b[2].seq, b[3].seq), (0, 1), "挂图 seq = sort_no");
+        assert!(
+            !roles.contains(&"segment"),
+            "segment 只占位枚举，本步不得产出行"
+        );
+        assert_eq!(
+            b[1].title.as_deref(),
+            Some("备用版本"),
+            "必须 join media_item 带出标题（否则前端只剩 id）"
+        );
+
+        // 反向证伪 ①：主条目分支是活的 —— 换主后 main 行必须跟着换
+        s.switch_episode_source(ep, alt).await.unwrap();
+        let b = s.list_episode_bindings(ep).await.unwrap();
+        assert_eq!(
+            (b[0].role.as_str(), b[0].item_id),
+            ("main", alt),
+            "换主后 main 行必须是新主条目"
+        );
+        assert!(
+            b.iter().any(|x| x.role == "alternate" && x.item_id == main),
+            "原主条目必须降级为 alternate"
+        );
+        // 换回，恢复后续断言的前提
+        s.switch_episode_source(ep, main).await.unwrap();
+        let b = s.list_episode_bindings(ep).await.unwrap();
+        assert_eq!((b[0].role.as_str(), b[0].item_id), ("main", main));
+
+        // 反向证伪 ②：摘掉备用源 ⇒ alternate 行必须消失（证明该 UNION 分支是活的）
+        s.detach_episode_source(ep, alt).await.unwrap();
+        let b = s.list_episode_bindings(ep).await.unwrap();
+        assert_eq!(b.len(), 3, "摘源后应只剩 主 + 2 挂图");
+        assert!(
+            !b.iter().any(|x| x.role == "alternate"),
+            "摘源后不得再有 alternate 行"
+        );
+
+        // 反向证伪 ③：摘掉一张挂图 ⇒ image 行必须少一条（证明挂图分支是活的）
+        s.detach_episode_image(ep, photos[0]).await.unwrap();
+        let b = s.list_episode_bindings(ep).await.unwrap();
+        assert_eq!(b.iter().filter(|x| x.role == "image").count(), 1);
+
+        // 不存在的集 ⇒ 空列表（404 由路由层给；读模型只如实返回，不编造）
+        assert!(s.list_episode_bindings(999_999).await.unwrap().is_empty());
     }
 
     /// 回归（BUG-051 / C3 + 唯一清理链）：清缓存必须能把 `file_path` 置空，
