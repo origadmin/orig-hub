@@ -485,6 +485,7 @@
   "player.prevPhoto": "上一张",
   "player.nextPhoto": "下一张",
   "player.unsupported": "此类型不支持在应用内预览",
+  "player.compatStream": "浏览器不支持该视频编码，已切换实时转码兼容流（首次转码需要片刻，之后秒开）",
   "player.untitled": "未命名",
   "player.mixedCount": "视频 {v} · 图片 {p}",
   "media.delete": "删除",

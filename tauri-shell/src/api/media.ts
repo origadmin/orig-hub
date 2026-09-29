@@ -215,6 +215,14 @@ export function mediaItemUrl(id: number): string {
   return `${mediaBase()}/api/media/items/${id}/raw`
 }
 
+/**
+ * 内容兼容流地址（BUG-208）：浏览器解不动的编码（HEVC 等）走服务端按需实时转码
+ * H.264。首次为直播（转码即播），完成后同地址自动命中代理缓存（秒开 + Range 可拖）。
+ */
+export function mediaItemStreamUrl(id: number): string {
+  return `${mediaBase()}/api/media/items/${id}/stream`
+}
+
 // ────────────────── 内容 ──────────────────
 
 export async function listMediaItems(q: MediaListQuery = {}): Promise<MediaListResult> {

@@ -65,6 +65,11 @@ export interface VideoPlayerProps {
    * 才是「解不出来」；音频条目本来就无视频轨，不能据此停载（BUG-207）。
    */
   hasVideoTrack?: boolean
+  /**
+   * 兼容流地址（BUG-208）：视频轨判「解不出来」时自动换源到这里（服务端实时转码
+   * H.264）。缺省或兼容流也失败时回退 BUG-207 停载遮罩。
+   */
+  compatSrc?: string
 }
 
 /** 可选倍速档位（与 EE 一致） */
@@ -78,6 +83,32 @@ const CENTER_MS = 1500
 /** 自动连播倒计时秒数 */
 const COUNTDOWN_SEC = 5
 
+// ---- 兼容流记忆（BUG-208）：解码不动的原始源记入 localStorage，下次直开兼容流，
+// 免走「先试原始流 → 3s 无帧 → 再切」的弯路（也少付一次 abort-re-request 代价）。 ----
+const COMPAT_KEY = 'orighub.compatSrcs'
+
+function readCompatSet(): string[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(COMPAT_KEY) ?? '[]') as unknown
+    return Array.isArray(raw) ? raw.filter((x): x is string => typeof x === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+function rememberCompatSrc(src: string): void {
+  const set = readCompatSet()
+  if (!set.includes(src)) {
+    // 有界：只记最近 200 条，防止无限增长
+    const next = [src, ...set].slice(0, 200)
+    try {
+      localStorage.setItem(COMPAT_KEY, JSON.stringify(next))
+    } catch {
+      // localStorage 不可用（隐私模式等）：仅本次会话生效，不影响功能
+    }
+  }
+}
+
 export function VideoPlayer({
   src,
   fallbackSrc,
@@ -89,6 +120,7 @@ export function VideoPlayer({
   onEnded,
   onFatal,
   hasVideoTrack = true,
+  compatSrc,
 }: VideoPlayerProps) {
   const { t } = useTranslation()
   const {
@@ -125,31 +157,49 @@ export function VideoPlayer({
   const [fellBack, setFellBack] = useState(false)
   /** 拖拽中的视觉位置（null = 未在拖拽）：只喂条面渲染，不碰 `currentTime`（BUG-165） */
   const [dragRatio, setDragRatio] = useState<number | null>(null)
+  /** 当前实际播放源：原始流 → 视频轨解不出来时自动切兼容流（BUG-208）。
+   *  已知解不动的源（localStorage 记忆）直接从兼容流起步，不走 3s 无帧弯路。 */
+  const [activeSrc, setActiveSrc] = useState(() =>
+    compatSrc && compatSrc !== src && readCompatSet().includes(src) ? compatSrc : src,
+  )
+  const [usingCompat, setUsingCompat] = useState(activeSrc !== src)
+  const compatTriedRef = useRef(activeSrc !== src)
+  /** 已停载（退无可退）：渲染 BUG-207 的诚实失败遮罩 */
+  const [halted, setHalted] = useState(false)
 
   /** 视频轨解不出来 / 解码吃力 —— 两类 onError 抓不到的静默失败（BUG-034）。
    *  换源或改倍速都重设基线：倍速变化会改变所需解码吞吐，旧账不能算到新状态上（BUG-053）。 */
-  const decode = useDecodeHealth(videoRef, `${src}|${playbackRate}`)
+  const decode = useDecodeHealth(videoRef, `${activeSrc}|${playbackRate}`)
 
   /**
-   * 视频轨判定「解不出来」→ **立即停载**（BUG-207）。
+   * 视频轨判定「解不出来」→ **先试兼容流，退无可退才停载**（BUG-208 接棒 BUG-207）。
    *
    * 实测（媒体库 HEVC 条目 472/357，本机无硬件 HEVC）：0 帧可解，但 `preload="auto"`
    * 的 `<video>` 永远等不到可播数据，Chromium 进入「缓冲 → abort → 重取」循环 ——
-   * 20 秒内 97–137 个请求、GB 级无效 IO，且把整个页面拖卡。此时唯一正确的动作是
-   * 停止加载（pause + 摘除 src + load 中止在途请求），把无限风暴换成一次诚实的失败提示。
-   * 音频条目无视频轨属正常（`hasVideoTrack=false`），绝不触发。
+   * 20 秒内 97–137 个请求、GB 级无效 IO，且把整个页面拖卡。
+   *
+   * 处置顺序：有 `compatSrc`（服务端实时转码 H.264，全平台硬解）→ 换源重试，原始源
+   * 记入 localStorage（下次直开）；没有兼容流、或兼容流同样解不出来 → BUG-207 停载
+   * 遮罩兜底。音频条目无视频轨属正常（`hasVideoTrack=false`），绝不触发。
    */
-  const haltUnsupported = decode === 'unsupported' && hasVideoTrack
   useEffect(() => {
-    if (!haltUnsupported) return
+    if (decode !== 'unsupported' || !hasVideoTrack) return
     const v = videoRef.current
     if (!v) return
+    if (compatSrc && !compatTriedRef.current) {
+      compatTriedRef.current = true
+      rememberCompatSrc(src)
+      setActiveSrc(compatSrc)
+      setUsingCompat(true)
+      return
+    }
     v.pause()
     v.removeAttribute('src')
     v.load()
     setIsPlaying(false)
     setIsBuffering(false)
-  }, [haltUnsupported])
+    setHalted(true)
+  }, [decode, hasVideoTrack, compatSrc, src])
 
   const effectiveVolume = isMuted ? 0 : volume
 
@@ -494,7 +544,7 @@ export function VideoPlayer({
     >
       <video
         ref={videoRef}
-        src={src}
+        src={activeSrc}
         poster={poster ?? undefined}
         autoPlay={autoPlay}
         playsInline
@@ -574,8 +624,8 @@ export function VideoPlayer({
         </div>
       )}
 
-      {/* 视频轨解不出来：已停载（BUG-207），整屏告知而不是让用户对着黑屏听声音 */}
-      {haltUnsupported && (
+      {/* 视频轨解不出来且无兼容流可退：已停载（BUG-207/208），整屏告知而不是让用户对着黑屏听声音 */}
+      {halted && (
         <div
           role="alert"
           data-testid="player-unsupported-halt"
@@ -586,8 +636,18 @@ export function VideoPlayer({
         </div>
       )}
 
+      {/* 兼容流横幅（BUG-208）：原始编码浏览器解不动，已切换服务端实时转码（H.264） */}
+      {usingCompat && !fatal && !halted && (
+        <p
+          data-testid="player-compat-banner"
+          className="absolute left-1/2 top-16 z-20 -translate-x-1/2 rounded-md border border-white/20 bg-black/70 px-3 py-1.5 text-center text-xs text-white/90 backdrop-blur-sm"
+        >
+          {t('player.compatStream')}
+        </p>
+      )}
+
       {/* 解码异常提示（onError 抓不到的两类静默失败，BUG-034） */}
-      {!fatal && !haltUnsupported && decode !== 'ok' && (
+      {!fatal && !halted && decode !== 'ok' && (
         <p className="absolute bottom-20 left-1/2 z-20 max-w-[80%] -translate-x-1/2 rounded-md border border-white/20 bg-black/70 px-3 py-1.5 text-center text-xs text-white/90 backdrop-blur-sm">
           {t(decodeStateKey(decode) ?? 'tg.decodeFail')}
         </p>

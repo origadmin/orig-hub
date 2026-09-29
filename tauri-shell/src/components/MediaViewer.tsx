@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Image as ImageIcon } from 'lucide-react'
 import { Button } from './ui/button'
 import { useTranslation } from '../i18n'
+import { mediaItemStreamUrl } from '../api/media'
 import { cn } from '../lib/utils'
 import { VideoPlayer } from './media/VideoPlayer'
 import { EpisodeList } from './media/EpisodeList'
@@ -217,6 +218,8 @@ export function MediaViewer(props: {
               nextUp={nextUp}
               onPlayNext={() => nextItem && goTo(nextItem)}
               hasVideoTrack={cur.kind === 'video'}
+              // 兼容流（BUG-208）：视频条目解码不支持时自动切服务端实时转码
+              compatSrc={cur.kind === 'video' ? mediaItemStreamUrl(cur.messageId) : undefined}
             />
           ) : (
             <p className="max-w-[80%] rounded-md border border-white/20 bg-white/5 px-3 py-2 text-center text-xs text-white/85">
