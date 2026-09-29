@@ -26,6 +26,7 @@ import {
   cancelCacheTask,
 } from '../api/tg'
 import { findMediaItemIdByRef, importMediaItems } from '../api/media'
+import type { ImportEntry } from '../api/media'
 import type {
   TgCacheTask,
   TgChannel,
@@ -1268,6 +1269,43 @@ export function TgPanel(
   }
 
   /**
+   * 相册整组加入媒体库（BUG-188）。
+   *
+   * 纯图组（`cacheTargets === 0`）**没有任何需要落盘的字节** —— TG 图片由 raw 端点
+   * 现场代理，`entryState.ts` 对 `tg`+`photo` 恒返回 `cached`。所以「加入媒体库」是一次
+   * **编目**动作，必须走批量入库，而不是 `enqueueCacheTask` 的**字节传输队列**：
+   * 后者会把编目排到视频字节传输之后，让纯图组长时间停在「排队中」，而排队态是操作行
+   * 三个渲染分支里的**第一支**，会同时遮住「加入媒体库」按钮与完成态（BUG-188）。
+   *
+   * 与单图 `importPhoto` 同源：**一次**原子 POST（`importMediaItems`；产品约束禁止前端
+   * 循环单条端点），按 (source=tg, ref) 幂等；成功后同步 `photoLibRefs`，该组立即渲染
+   * 完成态，无需等重新拉取。含视频的组不经过这里，仍走 worker（见 `downloadAlbum`）。
+   */
+  const importAlbum = async (items: FeedItem[]) => {
+    if (items.length === 0) return
+    try {
+      await importMediaItems(
+        items.map(
+          (it): ImportEntry => ({
+            source: 'tg',
+            ref: `${it.chatId}:${it.messageId}`,
+            kind: 'photo',
+            title: it.caption?.trim() || undefined,
+            size: it.size ?? undefined,
+          }),
+        ),
+      )
+      setPhotoLibRefs((prev) => {
+        const next = new Set(prev)
+        for (const it of items) next.add(`${it.chatId}:${it.messageId}`)
+        return next
+      })
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  /**
    * 稳定回调（useEvent）：子气泡全部 memo 化后，回调引用必须恒定。
    * 子组件回传自己的数据（item / items / index），这里点击时再取最新闭包，
    * 既保住 memo 的浅比较，又不产生陈旧闭包。
@@ -1277,6 +1315,8 @@ export function TgPanel(
   const onBubbleOpen = useEvent((item: FeedItem) => void openDownloaded(item))
   const onBubblePreview = useEvent((item: FeedItem) => openPlayable(item, [item], 0))
   const onAlbumDownload = useEvent((items: FeedItem[]) => void downloadAlbum(items))
+  /* BUG-188：纯图组的出口 —— 编目走批量入库，不进字节传输队列 */
+  const onAlbumImport = useEvent((items: FeedItem[]) => void importAlbum(items))
   const onAlbumCancel = useEvent((items: FeedItem[]) =>
     void cancelAlbum(`a-${items[0].chatId}-${items[0].groupId}`),
   )
@@ -1827,6 +1867,7 @@ export function TgPanel(
                             photoLibRefs.has(`${x.chatId}:${x.messageId}`),
                         )}
                         onDownload={onAlbumDownload}
+                        onImportAlbum={onAlbumImport}
                         onCancel={onAlbumCancel}
                         onPreview={onAlbumPreview}
                       />
@@ -2082,6 +2123,8 @@ const AlbumBubble = memo(function AlbumBubble(props: {
   /** BUG-049：组内图片是否全部已入库（纯图组全入库后按钮收起） */
   groupInLibrary: boolean
   onDownload: (items: FeedItem[]) => void
+  /** BUG-188：整组加入媒体库 —— 纯图组走编目（批量入库），不进字节传输队列 */
+  onImportAlbum: (items: FeedItem[]) => void
   /** 取消整组缓存（进行中时操作行显示「取消」） */
   onCancel?: (items: FeedItem[]) => void
   onPreview: (index: number, items: FeedItem[]) => void
@@ -2094,6 +2137,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
     groupHasVideo,
     groupInLibrary,
     onDownload,
+    onImportAlbum,
     onCancel,
     onPreview,
   } = props
@@ -2243,13 +2287,17 @@ const AlbumBubble = memo(function AlbumBubble(props: {
           ) : !allDone ? (
             /* BUG-049：按钮语义按组构成区分 —— 含视频=「缓存」（图片由 worker 顺带入库，
                不落盘）；纯图组=「加入媒体库」。
+               BUG-188：出口同样按组构成分流 —— 纯图组（`cacheTargets === 0`）**没有需要
+               落盘的字节**，点「加入媒体库」走批量编目（`onImportAlbum`），不再排进字节
+               传输队列（后者会让纯图组停在「排队中」并遮住按钮与完成态）。含视频组仍走
+               `onDownload`（worker）。
                注：「已入库」不再单独成支 —— 纯图组已入库即 `allDone`（见上），
                统一由完成态分支呈现，**能力未减**（BUG-149）。 */
             <Button
               variant="outline"
               size="sm"
               className="ml-auto h-6 px-2 text-[10px]"
-              onClick={() => onDownload(items)}
+              onClick={() => (cacheTargets === 0 ? onImportAlbum(items) : onDownload(items))}
             >
               {!groupHasVideo
                 ? t('tg.addToLibrary')
