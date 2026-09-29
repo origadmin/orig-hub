@@ -60,6 +60,11 @@ export interface VideoPlayerProps {
   onEnded?: () => void
   /** 首选与降级均失败 */
   onFatal?: () => void
+  /**
+   * 条目是否应有视频轨（audio = false）。`videoWidth === 0` 只有在**应有视频轨**时
+   * 才是「解不出来」；音频条目本来就无视频轨，不能据此停载（BUG-207）。
+   */
+  hasVideoTrack?: boolean
 }
 
 /** 可选倍速档位（与 EE 一致） */
@@ -83,6 +88,7 @@ export function VideoPlayer({
   onPlayNext,
   onEnded,
   onFatal,
+  hasVideoTrack = true,
 }: VideoPlayerProps) {
   const { t } = useTranslation()
   const {
@@ -123,6 +129,27 @@ export function VideoPlayer({
   /** 视频轨解不出来 / 解码吃力 —— 两类 onError 抓不到的静默失败（BUG-034）。
    *  换源或改倍速都重设基线：倍速变化会改变所需解码吞吐，旧账不能算到新状态上（BUG-053）。 */
   const decode = useDecodeHealth(videoRef, `${src}|${playbackRate}`)
+
+  /**
+   * 视频轨判定「解不出来」→ **立即停载**（BUG-207）。
+   *
+   * 实测（媒体库 HEVC 条目 472/357，本机无硬件 HEVC）：0 帧可解，但 `preload="auto"`
+   * 的 `<video>` 永远等不到可播数据，Chromium 进入「缓冲 → abort → 重取」循环 ——
+   * 20 秒内 97–137 个请求、GB 级无效 IO，且把整个页面拖卡。此时唯一正确的动作是
+   * 停止加载（pause + 摘除 src + load 中止在途请求），把无限风暴换成一次诚实的失败提示。
+   * 音频条目无视频轨属正常（`hasVideoTrack=false`），绝不触发。
+   */
+  const haltUnsupported = decode === 'unsupported' && hasVideoTrack
+  useEffect(() => {
+    if (!haltUnsupported) return
+    const v = videoRef.current
+    if (!v) return
+    v.pause()
+    v.removeAttribute('src')
+    v.load()
+    setIsPlaying(false)
+    setIsBuffering(false)
+  }, [haltUnsupported])
 
   const effectiveVolume = isMuted ? 0 : volume
 
@@ -547,8 +574,20 @@ export function VideoPlayer({
         </div>
       )}
 
+      {/* 视频轨解不出来：已停载（BUG-207），整屏告知而不是让用户对着黑屏听声音 */}
+      {haltUnsupported && (
+        <div
+          role="alert"
+          data-testid="player-unsupported-halt"
+          className="absolute inset-0 z-40 flex flex-col items-center justify-center gap-3 bg-black/85 p-8"
+        >
+          <AlertTriangle className="h-12 w-12 text-danger" />
+          <p className="max-w-md text-center text-sm text-white/90">{t('tg.decodeUnsupported')}</p>
+        </div>
+      )}
+
       {/* 解码异常提示（onError 抓不到的两类静默失败，BUG-034） */}
-      {!fatal && decode !== 'ok' && (
+      {!fatal && !haltUnsupported && decode !== 'ok' && (
         <p className="absolute bottom-20 left-1/2 z-20 max-w-[80%] -translate-x-1/2 rounded-md border border-white/20 bg-black/70 px-3 py-1.5 text-center text-xs text-white/90 backdrop-blur-sm">
           {t(decodeStateKey(decode) ?? 'tg.decodeFail')}
         </p>

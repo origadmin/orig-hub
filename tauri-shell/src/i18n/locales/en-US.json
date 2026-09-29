@@ -319,7 +319,7 @@
   "tg.cancel": "Cancel",
   "tg.close": "Close",
   "tg.decodeFail": "This format (e.g. .mov/QuickTime) cannot be decoded by the browser. Open it with the system player inside the APP",
-  "tg.decodeUnsupported": "This video's video track cannot be decoded (e.g. HEVC/H.265 with no local decode support), so only the audio plays",
+  "tg.decodeUnsupported": "This video's codec cannot be decoded by the local browser (e.g. HEVC/H.265). Loading has been stopped to avoid wasted traffic; open the original file with the system player",
   "tg.decodeStrained": "Decoding is struggling: frames are being dropped. A lower playback speed will be noticeably smoother",
   "tg.save": "Save",
   "tg.setup": "Telegram Service Setup",

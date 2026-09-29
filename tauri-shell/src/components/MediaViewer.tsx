@@ -216,6 +216,7 @@ export function MediaViewer(props: {
               autoPlay
               nextUp={nextUp}
               onPlayNext={() => nextItem && goTo(nextItem)}
+              hasVideoTrack={cur.kind === 'video'}
             />
           ) : (
             <p className="max-w-[80%] rounded-md border border-white/20 bg-white/5 px-3 py-2 text-center text-xs text-white/85">
