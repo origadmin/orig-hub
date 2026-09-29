@@ -3584,31 +3584,68 @@ async fn append_media_episodes(
     Ok(Json(json!({"added": n})))
 }
 
-/// 合并请求体：把 `sourceId` 的**全部分集**并入路径上的剧集。
+/// 合并请求体：把源剧集的**全部分集**并入路径上的剧集。
+///
+/// 二选一（BUG-186 扩展）：
+///   - `{ "sourceId": 12 }`            —— 既有单源形态（剧集内页入口在用）；
+///   - `{ "sourceIds": [12, 13, 14] }` —— 新增多源形态（剧集墙多选合并）。
+///
+/// 只给 `sourceId` 等价于 `sourceIds: [sourceId]`（**既有行为逐字不变**）；
+/// 两者都不给 → 400；两者都给 → **以 `sourceIds` 为准**（不静默丢弃，日志如实反映）。
 #[derive(Deserialize)]
 struct MergeSeriesReq {
     #[serde(rename = "sourceId")]
-    source_id: i64,
+    source_id: Option<i64>,
+    #[serde(rename = "sourceIds")]
+    source_ids: Option<Vec<i64>>,
 }
 
-/// `POST /api/media/series/:id/merge` — 合并剧集（BUG-037）。
+/// `POST /api/media/series/:id/merge` — 合并剧集（BUG-037 / BUG-186）。
 ///
-/// 把 `sourceId` 的分集整体搬入 `:id` 的末尾（各季续编集号）并**删除源剧集**，
+/// 把源剧集的分集整体搬入 `:id` 的末尾（各季续编集号）并**删除源剧集**，
 /// 全程单事务。刻意的语义边界：**不做任何内容级去重** —— 文件名相同而内容不同、
 /// 同一内容多源导入、`1-2` 与 `1,2` 并存、每批都带的预告，一律原样保留；
 /// 只有「同一条目（item_id）已在目标同季」才跳过，且跳过明细随响应回传，
 /// 不让「少搬了东西」被静默掩盖。
+///
+/// BUG-186：支持**一次事务合并多个源**（`sourceIds`）。多个源要么全部成功、要么整体
+/// 回滚 —— 任一源失败（不存在 / 等于目标 / SQL 出错）都不留「并了一半」的状态。
 async fn merge_media_series(
     State(st): State<Arc<AppState>>,
     Path(id): Path<i64>,
     Json(body): Json<MergeSeriesReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if body.source_id == id {
+    // ── 解析请求体为「去重后的源 id 列表」──
+    //
+    // 契约：`sourceId` 与 `sourceIds` 二选一；都给则以 `sourceIds` 为准。
+    let both_given = body.source_id.is_some() && body.source_ids.is_some();
+    let mut sources: Vec<i64> = match (body.source_id, body.source_ids) {
+        (_, Some(ids)) => ids,
+        (Some(single), None) => vec![single],
+        (None, None) => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "sourceId 或 sourceIds 必须提供其一",
+            ));
+        }
+    };
+    // 去重（保序）：重复 id 只合并一次。
+    {
+        let mut seen = std::collections::HashSet::new();
+        sources.retain(|s| seen.insert(*s));
+    }
+    if sources.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "sourceIds 不能为空"));
+    }
+
+    // 源不得等于目标（自合并会删掉目标自身）。顺序与既有单源路径一致：先判自合并。
+    if sources.iter().any(|s| *s == id) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "sourceId 不能与目标剧集相同",
         ));
     }
+    // 目标存在性。
     let target_ok = st
         .store
         .series_exists(id)
@@ -3617,25 +3654,47 @@ async fn merge_media_series(
     if !target_ok {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "target series not found"));
     }
-    let source_ok = st
-        .store
-        .series_exists(body.source_id)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-    if !source_ok {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, "source series not found"));
+    // 每个源都必须存在（任一缺失 → 404，批量整体不执行）。
+    for &src in &sources {
+        let ok = st
+            .store
+            .series_exists(src)
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        if !ok {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "source series not found"));
+        }
     }
-    let rep = st
-        .store
-        .merge_series(id, body.source_id)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-    st.push_log(&format!(
-        "/api/media/series/{id}/merge: 并入 {} 集，跳过 {} 集（源 {} 已删除）",
-        rep.added,
-        rep.skipped.len(),
-        body.source_id
-    ));
+
+    // 单源走既有路径（可观察行为逐字不变）；多源走**同一事务**的批量路径。
+    let rep = if sources.len() == 1 {
+        st.store.merge_series(id, sources[0]).await
+    } else {
+        st.store.merge_series_batch(id, &sources).await
+    }
+    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+
+    if sources.len() == 1 && !both_given {
+        // 既有形态：日志逐字不变。
+        st.push_log(&format!(
+            "/api/media/series/{id}/merge: 并入 {} 集，跳过 {} 集（源 {} 已删除）",
+            rep.added,
+            rep.skipped.len(),
+            sources[0]
+        ));
+    } else {
+        let note = if both_given {
+            "（sourceId 被忽略，以 sourceIds 为准）"
+        } else {
+            ""
+        };
+        st.push_log(&format!(
+            "/api/media/series/{id}/merge: 并入 {} 集，跳过 {} 集（源 {:?} 已删除）{note}",
+            rep.added,
+            rep.skipped.len(),
+            sources
+        ));
+    }
     Ok(Json(json!({
         "added": rep.added,
         "skippedCount": rep.skipped.len(),
@@ -3960,9 +4019,11 @@ mod tests {
     use super::delivery_due_secs;
     use super::cache_tasks_payload;
     use super::list_episode_bindings;
+    use super::merge_media_series;
     use super::normalized_series_name;
     use super::router;
     use super::serve_local_file;
+    use super::MergeSeriesReq;
     use serde_json::json;
 
     use std::sync::Arc;
@@ -3970,6 +4031,7 @@ mod tests {
     use axum::extract::{Path, State};
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
+    use axum::Json;
 
     use crate::config::Config;
     use crate::state::{AppState, Availability};
@@ -4848,6 +4910,277 @@ mod tests {
         assert_eq!(series2[0].id, sid);
         let second = episode_snapshot(&st, sid).await;
         assert_eq!(first, second, "重跑后的库状态必须与首次运行完全一致");
+    }
+
+    // ---- BUG-186：剧集合并路由层契约（多源批量 / 单源兼容）----
+
+    /// 构造一个仅用于合并路由用例的 `AppState`（内存库）。
+    async fn merge_fixture_state() -> Arc<AppState> {
+        use crate::unavailable::UnavailableClient;
+        Arc::new(AppState::new(
+            Arc::new(UnavailableClient::new("test: merge route")),
+            Config::default(),
+            Availability::Unavailable("test".to_string()),
+            false,
+            Store::open(":memory:")
+                .await
+                .expect("in-memory store must open"),
+        ))
+    }
+
+    /// 调用 `merge_media_series` 并解构为 `(状态码, JSON)`。
+    ///
+    /// `ApiError` 未实现 `Debug`，`Ok` 侧是 `impl IntoResponse`（同样无 `Debug`），
+    /// 故不能用 `unwrap` / `expect_err`，这里手写解构。
+    async fn merge_call(
+        st: Arc<AppState>,
+        target: i64,
+        req: MergeSeriesReq,
+    ) -> Result<(StatusCode, serde_json::Value), (StatusCode, String)> {
+        match merge_media_series(State(st), Path(target), Json(req)).await {
+            Ok(resp) => {
+                let resp = resp.into_response();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .expect("body must be readable");
+                let v: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("body must be JSON");
+                Ok((status, v))
+            }
+            Err(e) => Err((e.status, e.message().to_string())),
+        }
+    }
+
+    /// 既有单源形态 `{ "sourceId": N }` 必须继续可用（剧集内页入口在用），
+    /// 且响应体形状不变（`added` / `skippedCount` / `skipped`）。
+    #[tokio::test]
+    async fn merge_route_legacy_source_id_still_works() {
+        let st = merge_fixture_state().await;
+        // 顺带证明路由表能建起来（重复/冲突路由在建表时即 panic）。
+        let _ = router(st.clone());
+
+        let target = st.store.create_series("T", None, "series", None, None).await.unwrap();
+        let src = st.store.create_series("S", None, "series", None, None).await.unwrap();
+        let item = st
+            .store
+            .upsert_media_item("tg", "s:1", "s1", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let _ = st.store.add_episode(src, item, 1, 1).await.unwrap();
+
+        let (status, v) = merge_call(
+            st.clone(),
+            target,
+            MergeSeriesReq { source_id: Some(src), source_ids: None },
+        )
+        .await
+        .expect("单源形态必须继续可用");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["added"], 1, "应并入 1 集");
+        assert_eq!(v["skippedCount"], 0, "响应体形状不变");
+        assert!(v.get("skipped").is_some(), "`skipped` 键必须存在");
+        assert!(st.store.get_series(src).await.unwrap().is_none(), "源应被删除");
+    }
+
+    /// 新增多源形态 `{ "sourceIds": [...] }`：3 个源一次事务并入目标。
+    #[tokio::test]
+    async fn merge_route_batch_merges_multiple_sources() {
+        let st = merge_fixture_state().await;
+        let target = st.store.create_series("T", None, "series", None, None).await.unwrap();
+        let mut sources = Vec::new();
+        for si in 0..3 {
+            let s = st
+                .store
+                .create_series(&format!("S{si}"), None, "series", None, None)
+                .await
+                .unwrap();
+            let item = st
+                .store
+                .upsert_media_item("tg", &format!("s{si}:1"), "x", "video", None, None, None, None)
+                .await
+                .unwrap();
+            let _ = st.store.add_episode(s, item, 1, 1).await.unwrap();
+            sources.push(s);
+        }
+
+        let (status, v) = merge_call(
+            st.clone(),
+            target,
+            MergeSeriesReq { source_id: None, source_ids: Some(sources.clone()) },
+        )
+        .await
+        .expect("多源形态必须可用");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["added"], 3, "3 个源各 1 集 → 搬入 3 集");
+        assert_eq!(v["skippedCount"], 0);
+
+        for s in &sources {
+            assert!(
+                st.store.get_series(*s).await.unwrap().is_none(),
+                "源 {s} 应被删除"
+            );
+        }
+        let after = st.store.get_series(target).await.unwrap().unwrap();
+        assert_eq!(after.episodes.len(), 3, "目标应有三条分集");
+    }
+
+    /// 路由层回滚：`sourceIds` 里混一个不存在的 id → 404，且源与目标都保持原样。
+    #[tokio::test]
+    async fn merge_route_batch_rolls_back_on_missing_source() {
+        let st = merge_fixture_state().await;
+        let target = st.store.create_series("T", None, "series", None, None).await.unwrap();
+        let s1 = st.store.create_series("S1", None, "series", None, None).await.unwrap();
+        let i1 = st
+            .store
+            .upsert_media_item("tg", "a:1", "a", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let _ = st.store.add_episode(s1, i1, 1, 1).await.unwrap();
+
+        let s1_before = st.store.get_series(s1).await.unwrap().unwrap().episodes.len();
+        let target_before = st.store.get_series(target).await.unwrap().unwrap().episodes.len();
+        assert_eq!(s1_before, 1);
+        assert_eq!(target_before, 0);
+
+        let (status, _msg) = merge_call(
+            st.clone(),
+            target,
+            MergeSeriesReq { source_id: None, source_ids: Some(vec![s1, 999_999]) },
+        )
+        .await
+        .expect_err("含不存在的源必须 404");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // 无副作用：源与目标分集数都保持原样。
+        assert_eq!(
+            st.store.get_series(s1).await.unwrap().unwrap().episodes.len(),
+            s1_before,
+            "源 S1 必须保持原样（整体回滚）"
+        );
+        assert_eq!(
+            st.store.get_series(target).await.unwrap().unwrap().episodes.len(),
+            target_before,
+            "目标必须保持原样（整体回滚）"
+        );
+    }
+
+    /// 自合并（源含目标）→ 400 且无副作用；既有单源自合并形态同样 400。
+    #[tokio::test]
+    async fn merge_route_rejects_self_merge() {
+        let st = merge_fixture_state().await;
+        let target = st.store.create_series("T", None, "series", None, None).await.unwrap();
+        let s1 = st.store.create_series("S1", None, "series", None, None).await.unwrap();
+
+        // 多源形态含目标 → 400。
+        let (status, _m) = merge_call(
+            st.clone(),
+            target,
+            MergeSeriesReq { source_id: None, source_ids: Some(vec![s1, target]) },
+        )
+        .await
+        .expect_err("源含目标必须 400");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // 既有单源形态：sourceId == 目标 → 400（逐字保留旧行为）。
+        let (status2, _m2) = merge_call(
+            st.clone(),
+            target,
+            MergeSeriesReq { source_id: Some(target), source_ids: None },
+        )
+        .await
+        .expect_err("单源自合并必须 400");
+        assert_eq!(status2, StatusCode::BAD_REQUEST);
+
+        assert!(st.store.get_series(target).await.unwrap().is_some(), "目标必须仍在");
+        assert!(st.store.get_series(s1).await.unwrap().is_some(), "源必须仍在");
+    }
+
+    /// 两者都不给 → 400；空数组 → 400。
+    #[tokio::test]
+    async fn merge_route_rejects_missing_or_empty_body() {
+        let st = merge_fixture_state().await;
+        let target = st.store.create_series("T", None, "series", None, None).await.unwrap();
+
+        let (e1, _) = merge_call(
+            st.clone(),
+            target,
+            MergeSeriesReq { source_id: None, source_ids: None },
+        )
+        .await
+        .expect_err("两者都不给必须 400");
+        assert_eq!(e1, StatusCode::BAD_REQUEST);
+
+        let (e2, _) = merge_call(
+            st.clone(),
+            target,
+            MergeSeriesReq { source_id: None, source_ids: Some(vec![]) },
+        )
+        .await
+        .expect_err("空数组必须 400");
+        assert_eq!(e2, StatusCode::BAD_REQUEST);
+    }
+
+    /// 两者都给 → 以 `sourceIds` 为准（不静默丢弃）。
+    #[tokio::test]
+    async fn merge_route_prefers_source_ids_when_both_given() {
+        let st = merge_fixture_state().await;
+        let target = st.store.create_series("T", None, "series", None, None).await.unwrap();
+        let a = st.store.create_series("A", None, "series", None, None).await.unwrap();
+        let b = st.store.create_series("B", None, "series", None, None).await.unwrap();
+        let ia = st
+            .store
+            .upsert_media_item("tg", "a:1", "a", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let ib = st
+            .store
+            .upsert_media_item("tg", "b:1", "b", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let _ = st.store.add_episode(a, ia, 1, 1).await.unwrap();
+        let _ = st.store.add_episode(b, ib, 1, 1).await.unwrap();
+
+        // sourceId=A 与 sourceIds=[B] 同时给 → 只并 B，A 不受影响。
+        let (status, v) = merge_call(
+            st.clone(),
+            target,
+            MergeSeriesReq { source_id: Some(a), source_ids: Some(vec![b]) },
+        )
+        .await
+        .expect("两者都给应成功");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["added"], 1, "只应并入 sourceIds 指定的 B");
+        assert!(st.store.get_series(b).await.unwrap().is_none(), "B 应被删除");
+        assert!(
+            st.store.get_series(a).await.unwrap().is_some(),
+            "A 必须未被合并（sourceId 被忽略）"
+        );
+    }
+
+    /// `sourceIds` 去重：重复 id 只合并一次，不报错、不重复搬。
+    #[tokio::test]
+    async fn merge_route_dedupes_repeated_source_ids() {
+        let st = merge_fixture_state().await;
+        let target = st.store.create_series("T", None, "series", None, None).await.unwrap();
+        let a = st.store.create_series("A", None, "series", None, None).await.unwrap();
+        let ia = st
+            .store
+            .upsert_media_item("tg", "a:1", "a", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let _ = st.store.add_episode(a, ia, 1, 1).await.unwrap();
+
+        let (status, v) = merge_call(
+            st.clone(),
+            target,
+            MergeSeriesReq { source_id: None, source_ids: Some(vec![a, a, a]) },
+        )
+        .await
+        .expect("重复 id 应被去重而非报错");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["added"], 1, "去重后只搬 1 集");
+        assert!(st.store.get_series(a).await.unwrap().is_none(), "源应被删除");
     }
 }
 

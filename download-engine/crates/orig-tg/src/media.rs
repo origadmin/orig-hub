@@ -2247,6 +2247,99 @@ impl Store {
         target_id: i64,
         source_id: i64,
     ) -> libsql::Result<MergeReport> {
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let outcome = self.merge_one_source_in_tx(target_id, source_id).await;
+        match outcome {
+            Ok(rep) => {
+                self.conn.execute("COMMIT", ()).await?;
+                Ok(rep)
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// 批量合并剧集（BUG-186）：把 `source_ids` 中**每一个源剧集**的全部分集搬入
+    /// `target_id`，再删除全部源剧集 —— 全程**同一个事务**，任一源失败即整体回滚。
+    ///
+    /// ## 与单源版的关系
+    ///
+    /// 两者共用内部实现 [`Store::merge_one_source_in_tx`]（在给定事务内合并**一个**源），
+    /// 故单源合并语义在两处**逐字一致**。本函数只是把该操作对多个源**串接在同一事务里**，
+    /// **绝不**循环调用会自行 `BEGIN` / `COMMIT` 的公开 [`Store::merge_series`]。
+    ///
+    /// ## 顺序即语义
+    ///
+    /// 源按传入顺序依次合并：后一个源会看到前一个源**已搬入目标**的分集，故两个源含同一
+    /// `item_id` 时，后者按既有「同季已有同一条目」规则进入 `skipped`（不重复搬入）。
+    ///
+    /// ## 前置约束与校验
+    ///
+    /// `source_ids` 由调用方保证**已去重**。若某个源等于 `target_id`，直接返回
+    /// [`libsql::Error::Misuse`]：自合并会把目标自身删掉，必须在此拦截（纵深防御 ——
+    /// 路由层已先判 400）。
+    ///
+    /// **每个源在事务内都会再确认存在**：任一源缺失即返回错误并整体回滚。单源版把
+    /// 「源不存在」当 no-op，但批量版不能 —— 否则事务外校验与提交之间的 TOCTOU 窗口会
+    /// 留下「并了一半」。
+    pub async fn merge_series_batch(
+        &self,
+        target_id: i64,
+        source_ids: &[i64],
+    ) -> libsql::Result<MergeReport> {
+        if source_ids.iter().any(|s| *s == target_id) {
+            return Err(libsql::Error::Misuse(format!(
+                "merge source must differ from target series {target_id}"
+            )));
+        }
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let outcome: libsql::Result<MergeReport> = async {
+            let mut total = MergeReport::default();
+            for &source_id in source_ids {
+                // 每个源必须在**事务内**存在 —— 任一缺失即整体回滚。
+                //
+                // 单源版把「源不存在」当作 no-op（见 `merge_series_idempotent_on_repeat`），
+                // 但批量版**必须**在此拦截：路由层虽已在事务外做过存在性校验，仍存在校验与
+                // 提交之间的 TOCTOU 窗口；在事务内再确认一次，才能保证「要么全成功、要么全
+                // 回滚」，不留「并了一半」。
+                if !self.series_exists(source_id).await? {
+                    return Err(libsql::Error::Misuse(format!(
+                        "merge source series {source_id} not found"
+                    )));
+                }
+                let rep = self.merge_one_source_in_tx(target_id, source_id).await?;
+                total.added += rep.added;
+                total.skipped.extend(rep.skipped);
+                total.sources_attached += rep.sources_attached;
+            }
+            Ok(total)
+        }
+        .await;
+        match outcome {
+            Ok(rep) => {
+                self.conn.execute("COMMIT", ()).await?;
+                Ok(rep)
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// **在调用方已开启的事务内**把 `source_id` 的全部分集并入 `target_id`，再删除源剧集。
+    ///
+    /// 调用方负责 `BEGIN IMMEDIATE` 与 `COMMIT` / `ROLLBACK`；本函数**不**自行开事务，
+    /// 因而可被 [`Store::merge_series`]（单源）与 [`Store::merge_series_batch`]（多源）复用，
+    /// 保证「一个源的合并行为」在所有路径下完全一致。失败时返回错误、**不改动任何提交状态**
+    /// —— 由调用方决定整体 `COMMIT` 还是 `ROLLBACK`。
+    async fn merge_one_source_in_tx(
+        &self,
+        target_id: i64,
+        source_id: i64,
+    ) -> libsql::Result<MergeReport> {
         // ── 读源分集（带条目标题：跳过明细要能让人认出是哪一条）──
         //
         // BUG-056：必须把 `episode_no_end` 也读出来 —— 合集「EP01-02」在源剧集里
@@ -2284,7 +2377,6 @@ impl Store {
         };
 
         let mut report = MergeReport::default();
-        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
 
         let outcome: libsql::Result<()> = async {
             // 目标各季续编起点。
@@ -2471,16 +2563,8 @@ impl Store {
         }
         .await;
 
-        match outcome {
-            Ok(()) => {
-                self.conn.execute("COMMIT", ()).await?;
-                Ok(report)
-            }
-            Err(e) => {
-                let _ = self.conn.execute("ROLLBACK", ()).await;
-                Err(e)
-            }
-        }
+        // 调用方持有事务边界：成功交给上层 `COMMIT`，失败由上层 `ROLLBACK`。
+        outcome.map(|()| report)
     }
 
     /// 删除剧集行（分集 + 标签 + 剧集）。**低层结构删除**。
@@ -6397,6 +6481,213 @@ mod tests {
         assert_eq!(e.item_id, item);
         assert_eq!(e.episode_no, 1);
         assert_eq!(e.episode_no_end, Some(2));
+    }
+
+    // ─────────────────── BUG-186：多源批量合并（同一事务）───────────────────
+
+    /// 测试辅助：把某剧集的分集拍成「可比较快照」`(item_id, season, episode_no,
+    /// episode_no_end)`（已排序）。用于断言「合并前后逐字未变」—— 比只看错误码更能证明
+    /// 「无副作用」。剧集不存在时返回 `None`。
+    async fn series_episode_snapshot(
+        s: &Store,
+        series_id: i64,
+    ) -> Option<Vec<(i64, i64, i64, Option<i64>)>> {
+        s.get_series(series_id).await.unwrap().map(|v| {
+            let mut rows: Vec<(i64, i64, i64, Option<i64>)> = v
+                .episodes
+                .iter()
+                .map(|e| (e.item_id, e.season, e.episode_no, e.episode_no_end))
+                .collect();
+            rows.sort();
+            rows
+        })
+    }
+
+    /// BUG-186 核心：批量合并 3 个源 —— 目标分集数 = 原有 + 全部源分集数，3 个源全部消失。
+    #[tokio::test]
+    async fn merge_series_batch_merges_all_sources_and_deletes_them() {
+        let path = tmp_db("merge_batch_ok");
+        let s = Store::open(&path).await.unwrap();
+        let target = s.create_series("T", None, "series", None, None).await.unwrap();
+
+        // 目标先有 1 集。
+        let t_item = s
+            .upsert_media_item("tg", "t:1", "t1", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let _ = s.add_episode(target, t_item, 1, 1).await.unwrap();
+
+        // 3 个源，各 2 集。
+        let mut sources = Vec::new();
+        for si in 0..3 {
+            let src = s
+                .create_series(&format!("S{si}"), None, "series", None, None)
+                .await
+                .unwrap();
+            for ei in 0..2 {
+                let item = s
+                    .upsert_media_item(
+                        "tg",
+                        &format!("s{si}:{ei}"),
+                        &format!("s{si}e{ei}"),
+                        "video",
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let _ = s.add_episode(src, item, 1, ei + 1).await.unwrap();
+            }
+            sources.push(src);
+        }
+
+        let report = s.merge_series_batch(target, &sources).await.unwrap();
+        assert_eq!(report.added, 6, "3 个源 × 2 集 = 6 集应全部搬入目标");
+        assert_eq!(report.skipped.len(), 0, "无重复条目，不应有跳过");
+
+        // 目标分集数 = 原有 1 + 6。
+        let after = s.get_series(target).await.unwrap().unwrap();
+        assert_eq!(after.episodes.len(), 7, "目标分集数应为 1 + 6");
+
+        // 3 个源全部消失。
+        for src in &sources {
+            assert!(
+                s.get_series(*src).await.unwrap().is_none(),
+                "源剧集 {src} 应被删除"
+            );
+        }
+    }
+
+    /// BUG-186 核心断言：批量里混一个不存在的源 → 报错后**目标与所有源逐字保持原样**。
+    ///
+    /// 本任务的关键 —— 不只断言错误码，而是断言「**无副作用**」：真比对合并前后目标与
+    /// 每个源的完整分集快照，并确认源剧集本身仍然存在。若实现是「循环调单源版」或
+    /// 「每源一个事务」，前面的源会被提前提交，本断言必 FAIL。
+    #[tokio::test]
+    async fn merge_series_batch_rolls_back_entirely_on_missing_source() {
+        let path = tmp_db("merge_batch_rollback");
+        let s = Store::open(&path).await.unwrap();
+        let target = s.create_series("T", None, "series", None, None).await.unwrap();
+        let s1 = s.create_series("S1", None, "series", None, None).await.unwrap();
+        let s2 = s.create_series("S2", None, "series", None, None).await.unwrap();
+
+        // 目标 1 集；S1、S2 各 2 集。
+        let t_item = s
+            .upsert_media_item("tg", "t:1", "t1", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let _ = s.add_episode(target, t_item, 1, 1).await.unwrap();
+        for (si, src) in [s1, s2].into_iter().enumerate() {
+            for ei in 0..2 {
+                let item = s
+                    .upsert_media_item(
+                        "tg",
+                        &format!("s{si}:{ei}"),
+                        "x",
+                        "video",
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let _ = s.add_episode(src, item, 1, ei + 1).await.unwrap();
+            }
+        }
+
+        // 合并前快照。
+        let target_before = series_episode_snapshot(&s, target).await.unwrap();
+        let s1_before = series_episode_snapshot(&s, s1).await.unwrap();
+        let s2_before = series_episode_snapshot(&s, s2).await.unwrap();
+        assert_eq!(target_before.len(), 1, "前置：目标 1 集");
+        assert_eq!(s1_before.len(), 2, "前置：S1 2 集");
+        assert_eq!(s2_before.len(), 2, "前置：S2 2 集");
+
+        // 混入一个不存在的源（999_999），批量必须整体失败。
+        let missing = 999_999_i64;
+        assert!(
+            s.get_series(missing).await.unwrap().is_none(),
+            "前置：该源确实不存在"
+        );
+        let result = s.merge_series_batch(target, &[s1, s2, missing]).await;
+        assert!(result.is_err(), "含不存在的源必须整体失败，实得 {result:?}");
+
+        // ── 无副作用断言（真比对，不只看错误码）──
+        let target_after = series_episode_snapshot(&s, target).await.unwrap();
+        let s1_after = series_episode_snapshot(&s, s1).await.unwrap();
+        let s2_after = series_episode_snapshot(&s, s2).await.unwrap();
+        assert_eq!(target_after, target_before, "目标分集必须逐字未变（整体回滚）");
+        assert_eq!(s1_after, s1_before, "源 S1 必须逐字未变（其分集未被搬走）");
+        assert_eq!(s2_after, s2_before, "源 S2 必须逐字未变（其分集未被搬走）");
+        assert!(s.get_series(s1).await.unwrap().is_some(), "S1 剧集必须仍在");
+        assert!(s.get_series(s2).await.unwrap().is_some(), "S2 剧集必须仍在");
+    }
+
+    /// BUG-186：批量里源含目标自身 → 直接报错且**无副作用**
+    /// （纵深防御；路由层已先判 400）。自合并若放行会把目标自身删掉。
+    #[tokio::test]
+    async fn merge_series_batch_rejects_self_merge_without_side_effect() {
+        let path = tmp_db("merge_batch_self");
+        let s = Store::open(&path).await.unwrap();
+        let target = s.create_series("T", None, "series", None, None).await.unwrap();
+        let src = s.create_series("S", None, "series", None, None).await.unwrap();
+
+        let t_item = s
+            .upsert_media_item("tg", "t:1", "t1", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let _ = s.add_episode(target, t_item, 1, 1).await.unwrap();
+        let s_item = s
+            .upsert_media_item("tg", "s:1", "s1", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let _ = s.add_episode(src, s_item, 1, 1).await.unwrap();
+
+        let target_before = series_episode_snapshot(&s, target).await.unwrap();
+        let src_before = series_episode_snapshot(&s, src).await.unwrap();
+
+        let result = s.merge_series_batch(target, &[src, target]).await;
+        let err = result.expect_err("源含目标必须报错，否则会把目标自身删掉");
+        assert!(
+            err.to_string().contains("must differ"),
+            "错误信息应说明源与目标不得相同，实得: {err}"
+        );
+
+        assert_eq!(
+            series_episode_snapshot(&s, target).await.unwrap(),
+            target_before,
+            "自合并被拒后目标必须逐字未变"
+        );
+        assert_eq!(
+            series_episode_snapshot(&s, src).await.unwrap(),
+            src_before,
+            "自合并被拒后源必须逐字未变"
+        );
+    }
+
+    /// BUG-186：批量单元素与单源路径等价（源被删、分集被搬）。
+    #[tokio::test]
+    async fn merge_series_batch_single_element_matches_single_source() {
+        let path = tmp_db("merge_batch_single");
+        let s = Store::open(&path).await.unwrap();
+        let target = s.create_series("T", None, "series", None, None).await.unwrap();
+        let src = s.create_series("S", None, "series", None, None).await.unwrap();
+
+        let item = s
+            .upsert_media_item("tg", "s:1", "s1", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let _ = s.add_episode(src, item, 1, 1).await.unwrap();
+
+        let report = s.merge_series_batch(target, &[src]).await.unwrap();
+        assert_eq!(report.added, 1, "单元素批量应搬入 1 集");
+        assert!(s.get_series(src).await.unwrap().is_none(), "源应被删除");
+        let after = s.get_series(target).await.unwrap().unwrap();
+        assert_eq!(after.episodes.len(), 1);
+        assert_eq!(after.episodes[0].item_id, item);
     }
 
     // ─────────────────── BUG-132：字节真值判据 ───────────────────
