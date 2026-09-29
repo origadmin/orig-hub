@@ -459,6 +459,26 @@ export async function mergeSeries(seriesId: number, sourceId: number): Promise<M
 }
 
 /**
+ * 合并**多个**剧集（BUG-186）：把 `sourceIds` 里每个源剧集的**全部分集**搬入 `targetId`
+ * 末尾（各季续编集号）并**删除**这些源剧集。
+ *
+ * 后端契约：`POST /api/media/series/:targetId/merge`，body `{ "sourceIds": [12, 13] }`。
+ * 与单源的 `mergeSeries`（`{ sourceId }`）**并存**：后者仍被剧集内页对话框使用，不得破坏。
+ *
+ * 多源在**同一事务**里全成或全滚 —— 所以前端必须**只发这一个请求**：
+ * 在前端循环调单源端点会丢掉原子性（中途失败会留下「合了一半」的中间态）。
+ */
+export async function mergeSeriesMulti(
+  targetId: number,
+  sourceIds: number[],
+): Promise<MergeResult> {
+  return request(`/api/media/series/${targetId}/merge`, {
+    method: 'POST',
+    body: JSON.stringify({ sourceIds }),
+  })
+}
+
+/**
  * 改单集：标题 / 介绍 / **槽位**（季号与集号）。
  *
  * 集号允许任意值（2、3…不必从 1 连续）；若目标槽已被同剧另一条占用，后端会**对调**

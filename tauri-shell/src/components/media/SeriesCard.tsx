@@ -14,11 +14,20 @@ export function SeriesCard(props: {
   tags: MediaTag[]
   onOpen: () => void
   onDelete: () => void
+  /**
+   * 剧集墙多选（BUG-186）：是否被选中。
+   *
+   * 与 items 视图的 `selected`（装 item id）**完全独立** —— 这是**剧集 id** 的选择集，
+   * 不共用同一状态（BUG-153/BUG-155 的既有裁定：`selected` 属 items 视图）。
+   */
+  selected?: boolean
+  /** 切换选中（点击选择框，或 Ctrl/Cmd + 点击卡片）。缺省 = 不启用选择（仅浏览）。 */
+  onSelectToggle?: (seriesId: number) => void
   /** 抽帧得到的封面回写成功（持久化到剧集，下次直接复用） */
   onCoverReady?: (seriesId: number, poster: string) => void
 }) {
   const { t } = useTranslation()
-  const { series, tags, onOpen, onDelete, onCoverReady } = props
+  const { series, tags, onOpen, onDelete, onCoverReady, selected, onSelectToggle } = props
   const [poster, setPoster] = useState<string | null>(series.poster ?? null)
   const [coverFailed, setCoverFailed] = useState(false)
 
@@ -57,11 +66,58 @@ export function SeriesCard(props: {
     if (k === 'album') return t('media.series.kindAlbum')
     return k
   }
+  const isSelected = Boolean(selected)
   return (
-    <div className="group relative flex flex-col overflow-hidden rounded-lg border border-border-subtle/60 bg-surface transition-colors hover:border-accent/50">
+    <div
+      data-testid="series-card-root"
+      data-series-id={series.id}
+      data-selected={isSelected ? 'true' : 'false'}
+      className={[
+        'group relative flex flex-col overflow-hidden rounded-lg border bg-surface transition-colors',
+        isSelected
+          ? 'border-accent ring-2 ring-accent/70'
+          : 'border-border-subtle/60 hover:border-accent/50',
+      ].join(' ')}
+    >
+      {/* 选择框（BUG-186）：**不冒泡**，点它只切选中、绝不打开详情。
+          触屏没有 Ctrl/Cmd，故选择框是触屏上唯一的选中入口；键盘可达。 */}
+      {onSelectToggle ? (
+        <button
+          type="button"
+          role="checkbox"
+          aria-checked={isSelected}
+          aria-label={t('media.seriesSelectionToggle', { title: series.title })}
+          title={t('media.seriesSelectionToggle', { title: series.title })}
+          data-testid="series-card-select"
+          data-series-id={series.id}
+          onClick={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            onSelectToggle(series.id)
+          }}
+          className={[
+            'absolute right-1 top-1 z-10 flex h-6 w-6 items-center justify-center rounded-md border text-[13px] font-semibold leading-none shadow-sm transition-colors',
+            isSelected
+              ? 'border-accent bg-accent text-white'
+              : 'border-white/70 bg-black/55 text-transparent hover:bg-black/75',
+          ].join(' ')}
+        >
+          ✓
+        </button>
+      ) : null}
       <button
         type="button"
-        onClick={onOpen}
+        onClick={(e) => {
+          // Ctrl/Cmd + 点击卡片 = 切换选中（不用长按 —— 触屏长按语义与系统手势冲突）。
+          // 不带修饰键 = 打开详情（**行为保持原样**）。
+          if ((e.ctrlKey || e.metaKey) && onSelectToggle) {
+            e.preventDefault()
+            e.stopPropagation()
+            onSelectToggle(series.id)
+            return
+          }
+          onOpen()
+        }}
         data-testid="series-card"
         data-series-id={series.id}
         className="relative block aspect-video w-full overflow-hidden bg-surface-2"

@@ -34,7 +34,7 @@ import { SeriesDetail } from './media/SeriesDetail'
 import { SeriesCard } from './media/SeriesCard'
 import { ImportDialog } from './media/ImportDialog'
 import { BulkTagDialog, TagManagerDialog } from './media/TagManagerDialog'
-import { AddToSeriesDialog, CreateSeriesDialog, MergeSeriesDialog } from './media/SeriesDialog'
+import { AddToSeriesDialog, CreateSeriesDialog, MergeSeriesDialog, MergeSeriesMultiDialog } from './media/SeriesDialog'
 import { ExportPreviewDialog } from './media/ExportPreviewDialog'
 import { ItemEditDialog } from './media/ItemEditDialog'
 import {
@@ -153,6 +153,13 @@ export function MediaLibraryPanel() {
   const [sort, setSort] = useState<'recent' | 'oldest' | 'title' | 'duration' | 'size'>('recent')
   const [unassignedOnly, setUnassignedOnly] = useState(false)
   const [selected, setSelected] = useState<Set<number>>(new Set())
+  /**
+   * 剧集墙的多选（BUG-186）：装的是**剧集 id**。
+   *
+   * **独立**于上面的 `selected`（它装 item id、属 items 视图 —— BUG-153/BUG-155 的既有裁定）。
+   * 两者互不干扰：剧集墙的选择不会撑起 items 工具栏，items 的「全选本页」也不会碰它。
+   */
+  const [selectedSeries, setSelectedSeries] = useState<Set<number>>(new Set())
   /** 剧集收 video / photo（图片是浏览位内容）——全都不是 audio/未知类型才放行。 */
   const selectedJoinable =
     selected.size > 0 &&
@@ -171,6 +178,8 @@ export function MediaLibraryPanel() {
   const [addToOpen, setAddToOpen] = useState(false)
   /** 「合并到…」对话框（把另一个剧集并入当前打开的剧集） */
   const [mergeOpen, setMergeOpen] = useState(false)
+  /** 剧集墙多选合并对话框（BUG-186）：把选中的多条剧集合并为一条 */
+  const [mergeMultiOpen, setMergeMultiOpen] = useState(false)
   const [editing, setEditing] = useState<MediaItem | null>(null)
   /**
    * 删除确认（唯一状态机，单条与批量共用）。
@@ -466,6 +475,37 @@ export function MediaLibraryPanel() {
   }, [])
   const clearSelection = () => setSelected(new Set())
 
+  // ---- 剧集墙多选（BUG-186，独立于 items 的 `selected`）----
+  /** 切换某条剧集的选中态（选择框 / Ctrl+Cmd 点击卡片都走这里）。 */
+  const toggleSeriesSelect = useCallback((id: number) => {
+    setSelectedSeries((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
+  const clearSeriesSelection = useCallback(() => setSelectedSeries(new Set()), [])
+  /**
+   * 选中的剧集**对象**，按**点击顺序**（Set 插入序）排列，并**丢弃已不在列表里的 id**
+   * （剧集被删/被标签筛掉时不残留幽灵项）。
+   *
+   * 顺序 = 点击顺序，仅用于展示；合并方向由对话框里用户**显式**选的「保留哪一条」决定，
+   * **不**由这个顺序决定（BUG-186 的核心判据）。
+   */
+  const selectedSeriesList = useMemo(() => {
+    const byId = new Map(series.map((s) => [s.id, s]))
+    return [...selectedSeries]
+      .map((id) => byId.get(id))
+      .filter((s): s is MediaSeries => Boolean(s))
+  }, [series, selectedSeries])
+  /** 剧集墙「可合并」条件：选中 **≥2** 条（N 条 = 保留其一，其余并入）。 */
+  const seriesMultiReady = selectedSeriesList.length >= 2
+  /** 离开剧集墙视图时清空剧集选择（与 items 的 scope 重置同一意图）。 */
+  useEffect(() => {
+    if (view !== 'series') setSelectedSeries((prev) => (prev.size > 0 ? new Set() : prev))
+  }, [view])
+
   const visibleIds = useMemo(() => items.map((i) => i.id), [items])
 
   /**
@@ -537,6 +577,13 @@ export function MediaLibraryPanel() {
   const doDeleteSeries = async (id: number) => {
     try {
       await deleteSeries(id)
+      // 删掉的若在剧集选择集里，一并摘掉（否则计数会多算一条幽灵剧集）。
+      setSelectedSeries((prev) => {
+        if (!prev.has(id)) return prev
+        const next = new Set(prev)
+        next.delete(id)
+        return next
+      })
       setView('series')
       setDetail(null)
       setActiveSeriesId(null)
@@ -1070,6 +1117,42 @@ export function MediaLibraryPanel() {
           />
         ) : view === 'series' ? (
           <div className="min-h-0 flex-1 overflow-y-auto p-3">
+            {/*
+             * 剧集墙动作条（BUG-186）：选中 ≥2 条剧集时出现。
+             * **新增分支** —— 与 items 视图工具栏那条（`selected`）互不干扰。
+             */}
+            {seriesMultiReady ? (
+              <div
+                data-testid="series-selection-bar"
+                className="mb-3 flex flex-wrap items-center gap-2 rounded-md border border-accent/40 bg-accent/5 px-3 py-2"
+              >
+                <span
+                  data-testid="series-selection-count"
+                  className="text-[11px] font-medium text-fg-strong"
+                >
+                  {t('media.seriesSelectionCount', { n: selectedSeriesList.length })}
+                </span>
+                <div className="ml-auto flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    className="h-7 px-2 text-[11px]"
+                    data-testid="series-merge-wall"
+                    onClick={() => setMergeMultiOpen(true)}
+                  >
+                    {t('media.seriesMergeOpen')}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2 text-[11px]"
+                    data-testid="series-selection-clear"
+                    onClick={clearSeriesSelection}
+                  >
+                    {t('media.seriesSelectionClear')}
+                  </Button>
+                </div>
+              </div>
+            ) : null}
             {series.length === 0 ? (
               <div className="flex flex-col items-center justify-center gap-3 py-20">
                 {filterActive ? (
@@ -1100,6 +1183,8 @@ export function MediaLibraryPanel() {
                     key={s.id}
                     series={s}
                     tags={tags}
+                    selected={selectedSeries.has(s.id)}
+                    onSelectToggle={toggleSeriesSelect}
                     onOpen={() => void openSeries(s.id)}
                     onDelete={() => setConfirmDelete({ kind: 'series', id: s.id })}
                     onCoverReady={(id, poster) => {
@@ -1240,6 +1325,29 @@ export function MediaLibraryPanel() {
               res.skippedCount > 0
                 ? `已把《${sourceTitle}》的 ${res.added} 集并入，${res.skippedCount} 集因已在剧中而跳过`
                 : `已把《${sourceTitle}》的 ${res.added} 集并入`,
+            )
+          }}
+          onError={(m) => setError(m)}
+        />
+      ) : null}
+
+      {mergeMultiOpen && seriesMultiReady ? (
+        <MergeSeriesMultiDialog
+          open={mergeMultiOpen}
+          series={selectedSeriesList}
+          onClose={() => setMergeMultiOpen(false)}
+          onDone={async (res, targetTitle) => {
+            // 合并成功：清空剧集选择（选中的源已被删除，留着就是幽灵项）。
+            clearSeriesSelection()
+            await refreshAll()
+            setError(
+              res.skippedCount > 0
+                ? t('media.seriesMergeMultiDoneSkip', {
+                    target: targetTitle,
+                    n: res.added,
+                    m: res.skippedCount,
+                  })
+                : t('media.seriesMergeMultiDone', { target: targetTitle, n: res.added }),
             )
           }}
           onError={(m) => setError(m)}
