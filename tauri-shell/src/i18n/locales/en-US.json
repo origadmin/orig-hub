@@ -256,6 +256,7 @@
   "tg.protectedMedia": "Protected or access denied; cannot cache. Try online playback.",
   "tg.cacheFailed": "Caching failed. Retry, or play it online instead.",
   "tg.play": "Play",
+  "tg.open": "Open",
   "tg.loadingMonitor": "Loading monitor…",
   "tg.noStored": "No stored media yet; click “Sync now” to pull new content",
   "tg.monitoredCount": "{n} monitoring",

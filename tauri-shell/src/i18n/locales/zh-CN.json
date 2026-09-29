@@ -251,6 +251,7 @@
   "tg.protectedMedia": "该内容受保护或访问被拒绝，无法缓存，可尝试在线播放",
   "tg.cacheFailed": "缓存失败，请重试或改为在线播放",
   "tg.play": "播放",
+  "tg.open": "打开",
   "tg.loadingMonitor": "加载监控中…",
   "tg.noStored": "暂无已入库媒体，点击「立即同步」拉取新内容",
   "tg.monitoredCount": "{n} 个监控中",

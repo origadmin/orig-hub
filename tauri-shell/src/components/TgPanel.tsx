@@ -1795,10 +1795,18 @@ export function TgPanel(
                       <AlbumBubble
                         key={`album-${unit[0].key}`}
                         items={unit}
-                        downloadedCount={
-                          // BUG-170：组内「已缓存」计数走单源派生（字节真值），
-                          // 不再 `x.downloaded || downloadedPaths.has(x.key)` 三源拼接。
-                          unit.filter((x) => entryStateFor(x) === 'cached').length
+                        cacheTargets={
+                          /* BUG-184：分母 = 组内**需要落盘**的条目数。TG 图片不落盘
+                             （BUG-049：raw 端点现场代理字节），把它计入会让混合相册
+                             在**没有任何缓存任务**时显示「继续 1/6」，也会让纯图组的
+                             allDone 恒真（操作行整行消失，见 BUG-185）。 */
+                          unit.filter((x) => x.type !== 'photo').length
+                        }
+                        cachedTargets={
+                          /* BUG-184：分子与分母**同源**（都只看需要落盘的条目），
+                             否则分数本身没有意义。走 BUG-170 的单源派生。 */
+                          unit.filter((x) => x.type !== 'photo' && entryStateFor(x) === 'cached')
+                            .length
                         }
                         progress={(() => {
                           // BUG-170：进度行持有——终态后快照到达前继续显示最后的
@@ -2063,8 +2071,10 @@ function PlaybackSpeed(props: { rate: number; onRate: (r: number) => void }) {
  */
 const AlbumBubble = memo(function AlbumBubble(props: {
   items: FeedItem[]
-  /** 组内已缓存条数（含本次会话下载成功的） */
-  downloadedCount: number
+  /** BUG-184：组内**需要落盘**的条目数（photo 不计 —— 它走 raw 代理，不落盘） */
+  cacheTargets: number
+  /** BUG-184：其中已缓存（字节真值 / DB 承诺）的条数。与 `cacheTargets` **同源** */
+  cachedTargets: number
   /** 整组缓存进行中的进度（BUG-181：含排队态与条目内字节） */
   progress?: AlbumProgress
   /** BUG-049：组内是否有视频 —— 决定按钮语义（缓存 vs 加入媒体库） */
@@ -2078,7 +2088,8 @@ const AlbumBubble = memo(function AlbumBubble(props: {
 }) {
   const {
     items,
-    downloadedCount,
+    cacheTargets,
+    cachedTargets,
     progress,
     groupHasVideo,
     groupInLibrary,
@@ -2087,7 +2098,13 @@ const AlbumBubble = memo(function AlbumBubble(props: {
     onPreview,
   } = props
   const { t } = useTranslation()
-  const allDone = downloadedCount >= items.length
+  /* BUG-185：完成判据必须**按组构成分叉** ——
+     · 含需落盘条目：全部落盘即完成。分母用 `cacheTargets` 而非 `items.length`，
+       否则图片会把它撑成恒真（BUG-184）；
+     · 纯图组（`cacheTargets === 0`）：没有可缓存的东西，完成 = 图片全部入库
+       （`groupInLibrary`）。此前用 `downloadedCount >= items.length` 恒真 ⇒
+       操作行整行落 null，「加入媒体库」按钮**从来不可达**。 */
+  const allDone = cacheTargets === 0 ? groupInLibrary : cachedTargets >= cacheTargets
   const caption = items.find((it) => it.caption?.trim())?.caption
   const totalSize = items.reduce((s, it) => s + (it.size ?? 0), 0)
   return (
@@ -2097,10 +2114,14 @@ const AlbumBubble = memo(function AlbumBubble(props: {
         <div className="mb-1.5 flex items-center gap-2 text-[10px]">
           <span className="font-medium text-accent">{t('tg.albumN', { n: items.length })}</span>
           {allDone ? (
-            <span className="text-success">{t('tg.downloaded')}</span>
-          ) : downloadedCount > 0 ? (
+            /* BUG-185：完成态文案按组构成取词 —— 纯图组的「完成」是入库，不是落盘 */
+            <span className="text-success">
+              {t(cacheTargets === 0 ? 'tg.inLibrary' : 'tg.downloaded')}
+            </span>
+          ) : cachedTargets > 0 ? (
             <span className="text-muted">
-              {t('tg.albumPartial', { n: downloadedCount, total: items.length })}
+              {/* BUG-184：分子分母同源（都只算需要落盘的条目） */}
+              {t('tg.albumPartial', { n: cachedTargets, total: cacheTargets })}
             </span>
           ) : null}
           <span className="ml-auto text-muted">{fmtTime(items[0].date)}</span>
@@ -2221,31 +2242,50 @@ const AlbumBubble = memo(function AlbumBubble(props: {
             </>
           ) : !allDone ? (
             /* BUG-049：按钮语义按组构成区分 —— 含视频=「缓存」（图片由 worker 顺带入库，
-               不落盘）；纯图组=「加入媒体库」，全入库后按钮收起改显「已入库」。 */
-            !groupHasVideo && groupInLibrary ? (
-              <span className="ml-auto text-[10px] text-success">{t('tg.inLibrary')}</span>
-            ) : (
+               不落盘）；纯图组=「加入媒体库」。
+               注：「已入库」不再单独成支 —— 纯图组已入库即 `allDone`（见上），
+               统一由完成态分支呈现，**能力未减**（BUG-149）。 */
+            <Button
+              variant="outline"
+              size="sm"
+              className="ml-auto h-6 px-2 text-[10px]"
+              onClick={() => onDownload(items)}
+            >
+              {!groupHasVideo
+                ? t('tg.addToLibrary')
+                : cachedTargets > 0
+                  ? /* BUG-184：分子分母同源 —— 不再把图片算进「已缓存」，
+                       混合相册在没有任务时不再显示「继续 1/6」 */
+                    `${t('tg.continue')} ${cachedTargets}/${cacheTargets}`
+                  : t('tg.download')}
+            </Button>
+          ) : (
+            /* BUG-185：完成态**不得落 null** —— 此前整行消失，用户无法区分
+               「已完成」与「这个页面不支持缓存」。给明确标识 + 可点击出口，
+               与单条完成后的「播放」按钮对称。 */
+            <div className="ml-auto flex items-center gap-2">
+              <span className="text-[10px] text-success" data-testid="album-done">
+                {t(cacheTargets === 0 ? 'tg.inLibrary' : 'tg.downloaded')}
+              </span>
               <Button
                 variant="outline"
                 size="sm"
-                className="ml-auto h-6 px-2 text-[10px]"
-                onClick={() => onDownload(items)}
+                className="h-6 px-2 text-[10px]"
+                onClick={() => onPreview(0, items)}
+                data-testid="album-open"
               >
-                {!groupHasVideo
-                  ? t('tg.addToLibrary')
-                  : downloadedCount > 0
-                    ? `${t('tg.continue')} ${downloadedCount}/${items.length}`
-                    : t('tg.download')}
+                {t(cacheTargets === 0 ? 'tg.open' : 'tg.play')}
               </Button>
-            )
-          ) : null}
+            </div>
+          )}
         </div>
       </div>
     </div>
   )
 }, (a, b) =>
   a.items === b.items &&
-  a.downloadedCount === b.downloadedCount &&
+  a.cacheTargets === b.cacheTargets &&
+  a.cachedTargets === b.cachedTargets &&
   a.progress?.done === b.progress?.done &&
   a.progress?.total === b.progress?.total &&
   a.progress?.queued === b.progress?.queued &&
