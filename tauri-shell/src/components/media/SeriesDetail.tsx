@@ -569,18 +569,8 @@ export function SeriesDetail(props: {
                 ) : (
                   <p className="text-[11px] text-muted/70">{t('media.descEmptyEp')}</p>
                 )}
-                <div className="flex">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 px-2.5 text-[11px]"
-                    onClick={openEdit}
-                    data-testid="episode-edit-desc"
-                  >
-                    <Pencil className="h-3 w-3" />
-                    {t('media.episode.editDesc')}
-                  </Button>
-                </div>
+                {/* BUG-201：此处**不再**放第二个编辑按钮 —— 介绍与标题/槽位在同一个
+                    `episode-edit` 面板里，两个入口打开的是同一个面板。 */}
               </div>
 
               {/* 来源 = 切换视频来源来播放（BUG-198）：不是信息展板。剥掉 ref / 内部 id
@@ -629,21 +619,18 @@ export function SeriesDetail(props: {
 
               {/* 编辑本集（规范：inline 编辑表单 + 保存/取消/上移/下移/移除本集） */}
               <div ref={editBlockRef} className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5">
-                <div className="flex items-center gap-2">
-                  <span className="flex-1 text-[11px] font-medium text-fg-strong">
-                    {t('media.episode.editMeta')}
-                  </span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 px-2 text-[11px]"
-                    onClick={editingEpisode ? closeEdit : openEdit}
-                    data-testid="episode-edit"
-                  >
-                    <Pencil className="h-3 w-3" />
-                    {t('media.episode.editMeta')}
-                  </Button>
-                </div>
+                {/* BUG-201：单集**只有一个**编辑入口。此前区块标题与按钮都叫「编辑本集」
+                    （文字重复），且与上一块的「编辑介绍」按钮打开同一个面板。 */}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 self-start px-2 text-[11px]"
+                  onClick={editingEpisode ? closeEdit : openEdit}
+                  data-testid="episode-edit"
+                >
+                  <Pencil className="h-3 w-3" />
+                  {t('media.episode.editMeta')}
+                </Button>
                 {editingEpisode ? (
                   <EpisodeEditPanel
                     key={`${cur.id}-${editNonce}`}
