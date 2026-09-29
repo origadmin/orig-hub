@@ -527,6 +527,20 @@ export function SeriesDetail(props: {
                 >
                   {shouldRenderEpisodeTitle(cur, detail) ? cur.title : episodeSlotLabel(cur)}
                 </h3>
+                {/* 单一编辑入口：标题行即编辑按钮，点一下进入本集统一编辑态
+                    （标题 / 介绍 / 季号 / 集号 / 结束集号一次提交；集可以没有标题）。
+                    此前入口埋在右栏底部、与标题分处两端，用户找不到改标题的入口，
+                    于是「标题不能修改」像真的一样（关联 BUG-202：编辑被「拆开」）。 */}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-6 self-start px-1.5 text-[11px]"
+                  onClick={editingEpisode ? closeEdit : openEdit}
+                  data-testid="episode-edit"
+                >
+                  <Pencil className="h-3 w-3" />
+                  {t('media.episode.editMeta')}
+                </Button>
                 <span className="shrink-0 rounded-full bg-accent/10 px-2 py-0.5 font-mono text-[10.5px] text-accent">
                   {episodeSlotLabel(cur)}
                 </span>
@@ -535,6 +549,19 @@ export function SeriesDetail(props: {
                   {cur.source ? `${t(sourceLabelKey(cur.source))} · ` : ''}#{cur.itemId}
                 </span>
               </div>
+              {/* 统一编辑面板：紧贴标题行渲染，编辑态下直接覆盖本集全部可改内容 */}
+              {editingEpisode ? (
+                <div ref={editBlockRef} className="rounded-lg border border-border-subtle/60 bg-surface-2/30 p-2.5">
+                  <EpisodeEditPanel
+                    key={`${cur.id}-${editNonce}`}
+                    ep={cur}
+                    series={detail}
+                    onClose={closeEdit}
+                    onSaved={handleEditSaved}
+                    onError={onError}
+                  />
+                </div>
+              ) : null}
 
               {/* 本集图组 = **stacked deck 折叠跑马灯**（规范核心；只留右栏 §6.1）。
                   点左半=上一张 / 右半=下一张；⤢ 打开灯箱（能力 R6 保留）。 */}
@@ -617,31 +644,8 @@ export function SeriesDetail(props: {
                 ) : null}
               </div>
 
-              {/* 编辑本集（规范：inline 编辑表单 + 保存/取消/上移/下移/移除本集） */}
-              <div ref={editBlockRef} className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5">
-                {/* BUG-201：单集**只有一个**编辑入口。此前区块标题与按钮都叫「编辑本集」
-                    （文字重复），且与上一块的「编辑介绍」按钮打开同一个面板。 */}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 self-start px-2 text-[11px]"
-                  onClick={editingEpisode ? closeEdit : openEdit}
-                  data-testid="episode-edit"
-                >
-                  <Pencil className="h-3 w-3" />
-                  {t('media.episode.editMeta')}
-                </Button>
-                {editingEpisode ? (
-                  <EpisodeEditPanel
-                    key={`${cur.id}-${editNonce}`}
-                    ep={cur}
-                    series={detail}
-                    onClose={closeEdit}
-                    onSaved={handleEditSaved}
-                    onError={onError}
-                  />
-                ) : null}
-                <div className="flex flex-wrap items-center gap-2">
+              {/* 单集结构性操作：上移 / 下移 / 移除（编辑入口已上移到标题行，见右栏头） */}
+              <div className="flex flex-wrap items-center gap-2 border-t border-border-subtle/60 pt-2.5">
                   <Button
                     variant="outline"
                     size="sm"
@@ -694,7 +698,6 @@ export function SeriesDetail(props: {
                     {t('media.remove')}
                   </Button>
                 </div>
-              </div>
 
               {/* 操作（规范 rightPane：播放本集 / 挂图(+) / 在媒体库中查看） */}
               <div className="flex flex-wrap items-center gap-2 border-t border-border-subtle/60 pt-2.5">
