@@ -1,5 +1,6 @@
-# syntax=docker/dockerfile:1
 # --- build stage ---
+# NOTE: no `# syntax=` line → use the BuildKit frontend bundled with Docker Desktop,
+# avoiding an extra pull of docker/dockerfile:1 from Docker Hub.
 FROM rust:stable-slim AS build
 WORKDIR /build
 COPY . .
