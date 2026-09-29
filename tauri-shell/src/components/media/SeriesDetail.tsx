@@ -36,7 +36,13 @@ function useImagePortrait(src: string | undefined) {
   return portrait
 }
 
-import { mediaItemUrl, switchEpisodeSource, detachEpisodeImage, moveEpisode } from '../../api/media'
+import {
+  mediaItemUrl,
+  switchEpisodeSource,
+  detachEpisodeImage,
+  detachEpisodeSource,
+  moveEpisode,
+} from '../../api/media'
 import {
   canRecacheFromSource,
   coverFit,
@@ -220,6 +226,16 @@ export function SeriesDetail(props: {
   /** 摘除一张集级挂图：只摘关联，图片条目留在资料库 */
   const detachImage = (epId: number, itemId: number) =>
     applyChange(() => detachEpisodeImage(epId, itemId))
+
+  /**
+   * 摘除一个**备用源**：只摘关联行，条目本身留在资料库（可再挂别集或当散片）。
+   *
+   * 与 `detachImage` 是**两个不同的动作**（BUG-182）：备用源走
+   * `DELETE /episodes/:id/sources/:item_id`，挂图走 `.../images/:item_id`。
+   * 两者混用会表现为「点了摘除，备用源还在、挂图却被删」。
+   */
+  const detachSource = (epId: number, itemId: number) =>
+    applyChange(() => detachEpisodeSource(epId, itemId))
 
   const gotoItem = (ep: MediaEpisode) => {
     if (props.onGotoItem) props.onGotoItem(ep.itemId)
@@ -580,7 +596,7 @@ export function SeriesDetail(props: {
                         </button>
                         <button
                           type="button"
-                          onClick={() => detachImage(cur.id, s.itemId)}
+                          onClick={() => detachSource(cur.id, s.itemId)}
                           className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-destructive hover:bg-destructive/10"
                           data-testid="episode-source-detach"
                         >
