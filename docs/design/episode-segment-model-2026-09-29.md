@@ -41,8 +41,22 @@ landed-in: 无（本文不改动任何代码）
 `POST /api/media/episodes/:id/sources`、`POST .../sources/primary`、`DELETE .../sources/:item_id`
 （`orig-tg/src/routes.rs:132-140`、`:3700-3727`）与
 `POST .../images`、`DELETE .../images/:item_id`（`:145-150`、`:3747-3782`）。**没有任何片段端点。**
-**F6**：前端 `EpisodeExpanded.tsx:153-196` 的「多源区」仍是两个裸按钮
-（`episode-source-switch` / `episode-source-detach`），**没有片段区**；`api/media.ts:125` 只有 `EpisodeSourceRef`。
+**F6**：**活**的剧集内页是 `SeriesDetail.tsx`（左右主从，由 `MediaLibraryPanel.tsx:1020` 渲染）；
+其右栏「多源/来源」区（`:542-593`）仍是**两个裸按钮**（`episode-source-switch` / `episode-source-detach`），
+**没有片段区**；`api/media.ts:125` 只有 `EpisodeSourceRef`。
+**F12（★ 前端落点纠错，2026-09-29 由 PM 许清楚指出并经我复核）**：
+`EpisodeExpanded.tsx` / `EpisodeBoard.tsx` / `EpisodeRow.tsx` / `EpisodePhotoGrid.tsx` / `SeriesHero.tsx`
+是**全仓零 importer 的孤儿实现** —— `EpisodeExpanded` 只被 `EpisodeBoard` import，而 `EpisodeBoard`
+**自身零 importer**（`grep -rn "from './EpisodeBoard'" tauri-shell/src` 无命中）。
+`SeriesDetail.tsx:88-89` 注释原话：「原手风琴形态（PRD 方案 A）由本形态取代」。
+⇒ **本设计一切前端落点必须在 `SeriesDetail.tsx`，不得落在 `EpisodeExpanded.tsx`**（否则加进死组件，验收脚本
+`verify_series_master_detail.cjs` 根本拍不到）。
+**F13（★ 复核中发现的活代码缺陷，与 BUG-149 直接相关）**：`SeriesDetail.tsx:581-588` 的「摘除」按钮
+调的是 `detachImage`（`:221-222` → `detachEpisodeImage`），**不是** `detachEpisodeSource`；
+而 `detachEpisodeSource`（`api/media.ts:502`）**全仓零调用**，`SeriesDetail.tsx:39` 的 import 清单里也**没有**它。
+⇒ 「摘除备用源」这个能力在迁入活面板时**接错了线**：点了会去摘**同 itemId 的挂图**（挂图是 photo、
+备用源是 video，itemId 不同 ⇒ 实际表现为点了没反应/摘错对象）。这是 BUG-149「重构不是删能力的授权」
+的实质违反 —— 能力在，但接错了。
 **F7**：`media_episode.item_id` 是**隐式主**（= 播放入口 = 封面来源），这一条在 2026-09-22 设计 §2.2 被再次确认为**唯一真源**。
 **F8**：**全仓不存在任何播放进度存储** —— `play_pos` / `playPos` / `watchProgress` 在 `download-engine/` 与
 `tauri-shell/src/` **零命中**（2026-09-22 设计 §D3 提议的 `play_pos_ms` 至今未落）。
@@ -51,7 +65,7 @@ landed-in: 无（本文不改动任何代码）
 （`VideoPlayer.tsx:41-47/60-64`，BUG-035 实现）。**没有片段级连播**。
 **F11**：投递唯一通路是 `/api/media/items/:id/raw` → `serve_local_file`（BUG-031/033 铁律）。
 
-### 0.2 由 F1–F11 直接推出的结论
+### 0.2 由 F1–F13 直接推出的结论
 
 1. **「一集 = N 个顺序片段」在现有 schema 中不可表达**：`media_episode` 与 `media_item` 是 `N:1`
    （一集只有一个 `item_id`）；唯一能挂多文件的两张表，一张被触发器钉成「备用版本」（无顺序），
@@ -144,7 +158,8 @@ landed-in: 无（本文不改动任何代码）
 
 > **对方案 B 的诚实说明**：B 在**长期**是对的（真正消灭特例）。但它要求在同一轮里
 > 重写 BUG-039（多源）与 BUG-168（挂图）两条**刚落地/正在落地**的能力，
-> 而 2026-09-22 那份多源设计**至今 7 天未落地**（`EpisodeExpanded.tsx:153-196` 仍是裸按钮）。
+> 而 2026-09-22 那份多源设计**至今 7 天未落地**（活的 `SeriesDetail.tsx:542-593` 仍是裸按钮 ——
+> 注意：**不是** `EpisodeExpanded.tsx:153-196`，那个是死代码，见 F12）。
 > **在一个未落地的设计之上再叠加一次重构 = 把两轮风险叠在一起。**
 > 本设计把 B 作为 **D1 的实质选项**交给决策人，不替他决定（§13 D1）。
 
@@ -312,6 +327,8 @@ segments(ep) = SELECT ... FROM media_episode_segment WHERE episode_id = ep.id OR
 | **顺序推进的状态放哪** | 上层（`SeriesDetail` / `MediaViewer`）持有 `segmentIndex`，与既有 `episodeIndex` 同层；**不进 `useStore` 的 SSE 合并路径** | BUG-026（流畅优先）：片段索引是播放期局部状态，进全局 store 会引发整面板重渲染 |
 | **进度如何记** | **本轮不落库**。全仓**不存在任何进度存储**（F8），为本需求新增 `play_pos_ms` 属于范围外扩，列为 D2 之外的独立项。整集连播的续播能力**依赖**进度存储 ⇒ **本轮只做「从头连播」，不做「跨会话续播」** | 如实承认，不画饼 |
 | **UI 呈现** | 片段区在「多源区」**之上**（片段是内容本体，源是版本替换）；每行：`seq` 徽标 + 标题 + 时长（派生）+ 有/无字节 + 「上移/下移/摘除」+ 「从此片段播放」 | §6.5 |
+| **n = 1 不渲染**（PM 裁定，采纳） | **片段数 = 1 时不渲染片段区**。现实是 n=1 占绝大多数，给所有单视频集凭空挂一块「1 个片段」= 把实现细节常驻化，违反「实现约束 ≠ 产品信息，只在用户正受阻时出现」。单片段集在主区只有「播放本集」 | §6.5 |
+| **单版本不渲染**（PM 裁定，采纳） | 「播哪个版本」在备用源 = 0 时不渲染 —— **无选择即无控件**，与 n=1 同一条产品原则 | §6.5 |
 
 > **为什么连播复用 `nextUp` 而不是新加 `onSegmentEnd`**：`nextUp` 通路（BUG-035）已经解决
 > 「播完 → 弹浮层 → 切源 → 自动播放」的全套时序与自绘控件联动；新加一个平行回调会造出
@@ -372,11 +389,17 @@ export interface EpisodeBindingRef {   // GET .../bindings
 
 ### 6.4 前端改动点
 
+> **⚠️ 落点纪律（F12）**：**一切**前端改动落在 `SeriesDetail.tsx`（活的剧集内页）。
+> `EpisodeExpanded.tsx` / `EpisodeBoard.tsx` / `EpisodeRow.tsx` / `EpisodePhotoGrid.tsx` / `SeriesHero.tsx`
+> 是**零 importer 的孤儿实现**，**严禁**往里加片段区 —— 加了等于白做（验收脚本
+> `verify_series_master_detail.cjs` 拍不到，组件根本不会被挂载）。
+> 孤儿组件本身的处置（删除 or 复活）归属 PM 的 P0 R6，本设计不越权决定。
+
 | 文件 | 改动 |
 |---|---|
 | `tauri-shell/src/api/media.ts` | 新增 `EpisodeSegmentRef` / `EpisodeBindingRef` / `attachEpisodeSegments` / `detachEpisodeSegment` / `getEpisodeBindings`；`MediaEpisode` 加 `segments` |
-| `tauri-shell/src/components/media/EpisodeExpanded.tsx` | 在「多源区」（:153-196）**上方**新增片段区：有序列表 + 上移/下移（调 replace-all）+ 摘除 + 「从此片段播放」 |
-| `tauri-shell/src/components/media/SeriesDetail.tsx` | `playEpisode`（:153-155）改为传 `segmentIndex`；连播推进 |
+| `tauri-shell/src/components/media/SeriesDetail.tsx` | ① 在既有「多源/来源」区（`:542-593`）**上方**新增片段区：有序列表 + 上移/下移（调 replace-all）+ 摘除 + 「从此片段播放」；② `n = 1` 时**不渲染**该区；③ `playEpisode`（:153-155）改为传 `segmentIndex`；④ 连播推进 |
+| `tauri-shell/src/components/media/SeriesDetail.tsx:583`（**附带修复**） | 「摘除」按钮由 `detachImage` 改回 `detachEpisodeSource`（F13）；`:39` 补 import。这是**独立于片段需求**的既有缺陷修复，但**必须**在动同一区块时一并修（否则片段区与多源区的「摘除」会继续接错线） |
 | `tauri-shell/src/components/media/VideoPlayer.tsx` | `NextUpInfo` 加 `immediate?: boolean`（:41-47）+ 倒计时分支（:60-64 附近） |
 | i18n | `media.episode.segmentsTitle` / `segmentMoveUp` / `segmentMoveDown` / `segmentDetach` / `segmentPlayFrom` |
 
@@ -475,7 +498,7 @@ classDiagram
 
 ```mermaid
 sequenceDiagram
-    participant UI as EpisodeExpanded.tsx
+    participant UI as SeriesDetail.tsx（★活面板，非 EpisodeExpanded）
     participant API as routes.rs (orig-tg)
     participant S as Store (media.rs)
     participant DB as SQLite
@@ -535,7 +558,7 @@ sequenceDiagram
 | **T01** | 数据层：新表 `media_episode_segment` + 4 个触发器 + backfill + 旧库迁移单测 | `download-engine/crates/orig-tg/src/media.rs` | — | **P0** |
 | **T02** | Store 层：`attach/detach/list/segments_or_synthetic` + `get_series` 读模型扩 `segments` + 单测 | `media.rs` | T01 | **P0** |
 | **T03** | REST API + 前端类型 | `orig-tg/src/routes.rs`、`tauri-shell/src/api/media.ts` | T02 | **P0** |
-| **T04** | 前端：片段区 + 连播 | `EpisodeExpanded.tsx`、`SeriesDetail.tsx`、`VideoPlayer.tsx`、i18n | T03 | **P0** |
+| **T04** | 前端：片段区 + 连播 + 附带修 F13 | `SeriesDetail.tsx`（**唯一活落点**，F12）、`VideoPlayer.tsx`、`api/media.ts`、i18n | T03 | **P0** |
 | **T05** | 统一绑定视图 `bindings` + 回写 BUG-130/153 | `media.rs`、`routes.rs`、`api/media.ts`、`docs/bugs/BUG-130.md` | T02（**不依赖 T03/T04**） | **P1** |
 
 ### T01 明细 —— 数据层（P0）
@@ -561,10 +584,13 @@ sequenceDiagram
 2. `api/media.ts`：`EpisodeSegmentRef` / `EpisodeBindingRef` + 3 个函数 + `MediaEpisode.segments`。
 
 ### T04 明细 —— 前端（P0）
-1. `EpisodeExpanded.tsx`：片段区（在多源区**上方**），上移/下移走 replace-all。
+1. `SeriesDetail.tsx`：在既有「多源/来源」区（`:542-593`）**上方**新增片段区（**不是** `EpisodeExpanded.tsx`，F12），
+   上移/下移走 replace-all；**`n = 1` 时不渲染该区**；「播哪个版本」在备用源 = 0 时不渲染（PM 裁定，§5.3）。
 2. `VideoPlayer.tsx`：`NextUpInfo.immediate` + 跳过倒计时分支。
 3. `SeriesDetail.tsx`：整集连播推进（§5.3），**不进 `useStore` SSE 路径**（BUG-026）。
 4. i18n 5 条文案。
+5. **附带修 F13**：`:583` 的「摘除」由 `detachImage` 改回 `detachEpisodeSource` + `:39` 补 import。
+   **单测/验收**：点「摘除」后该备用源从列表消失且**挂图不受影响**（断言 `images` 长度不变）。
 
 ### T05 明细 —— 统一绑定视图（P1）
 1. `list_episode_bindings(ep)`：合成 M1/M2/M3/M5（§6.3），`startSec/endSec` 恒 null（M4 占位）。
@@ -621,6 +647,8 @@ graph LR
 | R9 | backfill 失败阻塞启动 | T01 | 单事务 + 显式报错，**禁止回落 `:memory:`**（AGENTS.md §5） |
 | R10 | 与 2026-09-22 多源设计抢语义（把片段当版本切主） | T02 | 分表 ⇒ 结构隔离；`PrimaryPicker` 完全不碰 segment 表 |
 | R11 | `sources` 与 `segments` 在前端混用 | T03/T04 | 类型分离 + `bindings` 统一视图给 `role` 显式标注 |
+| **R12** | **片段区加进死组件**（`EpisodeExpanded.tsx` 等零 importer 孤儿）⇒ 功能做完但**永远不会被挂载**，验收脚本 `verify_series_master_detail.cjs` 拍不到，表现为「做了等于没做」 | T04 | F12 落点纪律写进 §6.4 与 T04；**单测/验收必须走活面板路径**（`MediaLibraryPanel.tsx:1020` → `SeriesDetail`） |
+| **R13** | 沿用 F13 的错线「摘除」 ⇒ 片段区摘除调成摘图 | T04 | T04 第 5 项附带修 + 断言「摘源后 `images` 长度不变」 |
 
 ---
 
@@ -632,11 +660,30 @@ graph LR
 | 隐式主 | `media_episode.item_id` | 沿用，且 = `seq=1` | **不冲突**：本设计强化它 |
 | 选主 `PrimaryPicker` | 分层选主 | **片段不参与选主** | **不冲突**：选主只扫 source 表 |
 | `primary_locked` / `quality_label` 两列 | 【改动】新增 | **本设计不新增这两列**（与本需求无关） | 不冲突；若两设计同期落地，**一次迁移覆盖全部新列**更省 |
-| 前端消费点 | `SeriesDetail.tsx` 多源面板 | `EpisodeExpanded.tsx` 片段区 | 相邻不重叠 |
+| 前端消费点 | `SeriesDetail.tsx:542-593` 多源区 | **`SeriesDetail.tsx` 同一右栏**（在多源区**上方**） | **不是**「相邻不重叠」，见下方更正 |
+
+### 12.1 更正（2026-09-29，PM 许清楚指出并经复核）
+
+> 本表「前端消费点」一行**原写「系列多源在 `SeriesDetail.tsx`、片段区在 `EpisodeExpanded.tsx`，相邻不重叠」是错的。**
+> 按 F12，`EpisodeExpanded.tsx` 是**零 importer 的孤儿**，两份设计的 UI 最终都落在
+> **同一个活面板**（`SeriesDetail.tsx` 右栏，多源区现已在 `:542-593`）上。
+> ⇒ 二者是**必须一起排布**的关系，不是各占一处。**次序已与 PM 对齐**：
+>
+> | 层 | 内容 |
+> |---|---|
+> | **主区** | 播放本集（多片段 = 整集连播）+ 「用哪个版本播」（备用源 = 0 时**不渲染**） |
+> | **次区** | **片段区**（n=1 时**不渲染**）→ 介绍 → 编辑 → 版本管理 → 挂图管理 |
+> | 溢出区 | 其余动作 |
+>
+> 该次序以 `docs/design/episode-internal-ia.md`（PM）为准；本设计只约束
+> **片段区在版本管理之前**（片段是内容本体，版本是替换选项）与**两条不渲染规则**。
 
 > **落地顺序建议**：2026-09-22 那份设计**已 draft 7 天未落地**，其 D1/D2/D3 亦未裁定。
 > 若决策人希望两件事一起做，T01 的 `migrate()` 应把两份设计的新列/新表放在**同一次提交**里，
 > 只需**一份**「旧库→新代码」迁移单测（省一次迁移、省一轮回归）。此为执行细节，工程师自决。
+
+> **附带**：T04 需一并修 F13（多源区「摘除」接错 `detachEpisodeImage`）——
+> 不修的话片段区与多源区会共用同一个错线的「摘除」处理函数。
 
 ---
 
@@ -651,13 +698,13 @@ graph LR
 - **请求**: 选 A（我的建议）、B，还是 C？
 
 **A. 新增 `media_episode_segment` 独立表（推荐）**
-- 涉及: `download-engine/crates/orig-tg/src/media.rs`（建表 + 4 触发器 + backfill）、`download-engine/crates/orig-tg/src/routes.rs`（3 新端点）、`tauri-shell/src/api/media.ts`、`tauri-shell/src/components/media/EpisodeExpanded.tsx`、`tauri-shell/src/components/media/VideoPlayer.tsx`
+- 涉及: `download-engine/crates/orig-tg/src/media.rs`（建表 + 4 触发器 + backfill）、`download-engine/crates/orig-tg/src/routes.rs`（3 新端点）、`tauri-shell/src/api/media.ts`、`tauri-shell/src/components/media/SeriesDetail.tsx`（★活落点，F12）、`tauri-shell/src/components/media/VideoPlayer.tsx`
 - 量化: 1 张新表、4 个新触发器、**0 条 ALTER**、新增 3 个端点 / 改 2 个读端点、5 个文件；1 次迁移（新表），1 份迁移单测
 - 回归风险: **低** —— 纯增量，零既有表/端点语义变更；与 BUG-039（多源）、BUG-168（挂图）两条刚落地能力零重叠
 - 后果: 片段能力可用；表数量 +1（与 `media_episode_image` 同形制，无新纪律）。可逆（删表即回到现状，数据无损失）
 
 **B. 建统一 `media_episode_binding` 一次性吸收源 + 片段 + 挂图**
-- 涉及: `download-engine/crates/orig-tg/src/media.rs`（新表 + 迁移 `media_episode_source` 与 `media_episode_image` + 重写 6 个触发器）、`download-engine/crates/orig-tg/src/routes.rs`（4 个既有端点改语义）、`tauri-shell/src/api/media.ts`、`tauri-shell/src/components/media/EpisodeExpanded.tsx`、`tauri-shell/src/components/media/SeriesDetail.tsx`
+- 涉及: `download-engine/crates/orig-tg/src/media.rs`（新表 + 迁移 `media_episode_source` 与 `media_episode_image` + 重写 6 个触发器）、`download-engine/crates/orig-tg/src/routes.rs`（4 个既有端点改语义）、`tauri-shell/src/api/media.ts`、`tauri-shell/src/components/media/SeriesDetail.tsx`（★活落点，F12）
 - 量化: 1 张新表 + 2 张表的数据搬迁、6 个触发器重写、5 个改端点、6 个文件；迁移 1 次但覆盖面 = 两条已落地能力
 - 回归风险: **高** —— 直接重动 BUG-039（多源，历史 0 行）与 BUG-168（挂图，**有真实数据**）两条刚落地能力；`video_only` 与 `photo_only` 两个语义相反的触发器并表后必须由 `role` 分支重写，且旧的 `IF NOT EXISTS` 定义不会自我失效（BUG-044 需显式 DROP）
 - 后果: 长期消灭特例（表少两张），但本轮回归面扩到挂图与多源；若 BUG-168 尚未稳定，挂图能力会一起被拖进风险区。可逆性差（数据已搬迁）
@@ -685,7 +732,7 @@ graph LR
 - **请求**: 选 A（我的建议）还是 B？
 
 **A. 给 `NextUpInfo` 加 `immediate?: boolean`，复用既有连播通路（推荐）**
-- 涉及: `tauri-shell/src/components/media/VideoPlayer.tsx`（:41-47 加字段、:60-64 附近加一处 `if`）、`tauri-shell/src/components/media/SeriesDetail.tsx`（连播推进）、`tauri-shell/src/components/media/EpisodeExpanded.tsx`（「从此片段播放」）
+- 涉及: `tauri-shell/src/components/media/VideoPlayer.tsx`（:41-47 加字段、:60-64 附近加一处 `if`）、`tauri-shell/src/components/media/SeriesDetail.tsx`（连播推进 +「从此片段播放」+ 附带修 F13，★活落点）
 - 量化: 1 个可选字段 + 1 处分支、3 个文件；播放器其余逻辑零改动
 - 回归风险: **低** —— `immediate` 默认 undefined，既有「下一集」行为逐字不变；不新增第二条连播通路
 - 后果: 片段之间直接接播（无倒计时），跨集仍是 5s 倒计时浮层。可逆（删字段即回退）
