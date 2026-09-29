@@ -3322,7 +3322,8 @@ impl Store {
             // 标题/介绍**写穿到条目** —— 分集行不持有内容文案的第二份副本。
             // 「分集改名」与「条目改名」从此是同一件事：改哪边都是改内容，
             // 于是剧集页、媒体库、播放页永远看到同一个名字与同一段介绍。
-            // 空标题与空介绍沿用在条目上的语义：标题空 = 不改，介绍空 = 显式清空。
+            // 标题与介绍**同一套双层契约**：缺省 = 不改，`null`/纯空白 = 显式清空
+            // （标题可清空见 BUG-200 —— 集可以没有标题，剧集已经有名称了）。
             let (cur_item_title, cur_item_desc): (Option<String>, Option<String>) = {
                 let row = self
                     .row_opt(
@@ -3337,8 +3338,11 @@ impl Store {
                 }
             };
             if let Some(cur_item_title) = cur_item_title {
-                let next_title = match edit.title.clone().filter(|t| !t.trim().is_empty()) {
-                    Some(v) => v,
+                // Some(Some(t)) = 改成 t；Some(None)/纯空白 = **显式清空**（`''`）；
+                // None = 不改。`media_item.title` 是 NOT NULL，故「清空」落为空串而非 NULL。
+                // （引用再 clone：`edit` 后面的槽位逻辑还要用，不能整体被 move。）
+                let next_title = match &edit.title {
+                    Some(v) => v.clone().map(|t| t.trim().to_string()).unwrap_or_default(),
                     None => cur_item_title,
                 };
                 // 介绍：Some(Some(x))=改成 x；Some(None)=显式清空；None=不改。
@@ -3876,9 +3880,15 @@ pub struct SeriesPatch {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EpisodeEdit {
-    /// 内容标题：缺省或纯空白 = 不改（与条目 PATCH 同一语义 —— 空标题不可表达）。
+    /// 内容标题：缺省 = 不改；`null` 或纯空白 = **显式清空**（集可以没有标题 ——
+    /// 剧集已经有名称了，单集不必再挂一个，见 BUG-200）。
+    ///
+    /// 此前是 `Option<String>`，注释明写「空标题不可表达」：于是用户在编辑面板里
+    /// 清空标题后保存，后端按「不改」处理，表现为「保存了但没变」。改为与 `description`
+    /// 同一的双层 Option 契约后，清空才是可表达的。
     /// 有值时**写穿到条目**，分集行不留副本。
-    pub title: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub title: Option<Option<String>>,
     /// 介绍：缺省=不改；`null`/空白=**显式清空**（与剧集介绍同一契约），同样写穿到条目。
     #[serde(default, deserialize_with = "nullable")]
     pub description: Option<Option<String>>,
@@ -6051,7 +6061,7 @@ mod tests {
 
         // 1) 分集 PATCH：标题 + 介绍一起改（前端分集编辑面板正是这样发的）
         let edit = EpisodeEdit {
-            title: Some("新标题".to_string()),
+            title: Some(Some("新标题".to_string())),
             description: Some(Some("新介绍".to_string())),
             episode_no: Some(4),
             ..Default::default()
@@ -6107,8 +6117,14 @@ mod tests {
         assert_eq!(det.episodes[0].description.as_deref(), Some("卡片填的介绍"));
     }
 
-    /// 分集 PATCH 的空值语义必须与条目 PATCH **一致**：标题空 = 不改（不可表达），
-    /// 介绍空 = 显式清空（可表达的意图）。写成两套语义正是「改了一边另一边不动」的来源。
+    /// 分集 PATCH 的空值语义：标题与介绍**同一套双层契约**
+    /// —— 缺省 = 不改；`null` / 纯空白 = 显式清空。
+    ///
+    /// 旧裁定（BUG-069）是「标题空 = 不改，空标题不可表达」，与介绍的「空 = 清空」
+    /// 是两套语义，也正是「改了一边另一边不动」的来源。BUG-200 用户裁定
+    /// 「集可以没有标题 —— 剧集已经有名称了」之后，标题的清空改为**可表达**，
+    /// 两条字段语义归一。本用例把「缺省 / 纯空白 / `null`」三种情形分别钉死，
+    /// 防止再退化回「点了保存但没变」。
     #[tokio::test]
     async fn episode_edit_empty_values_match_item_semantics() {
         let s = Store::open(tmp_db("ep_empty")).await.unwrap();
@@ -6119,16 +6135,44 @@ mod tests {
             .unwrap();
         let ep = s.add_episode(sid, iid, 1, 1).await.unwrap();
 
-        // 标题给空白 = 不改；介绍给 null = 清空
+        // 1) 标题**缺省** = 不改；介绍 `null` = 显式清空
         let edit = EpisodeEdit {
-            title: Some("   ".to_string()),
+            title: None,
             description: Some(None),
             ..Default::default()
         };
         assert!(s.update_episode(ep, &edit).await.unwrap());
         let item = s.get_media_item(iid).await.unwrap().unwrap();
-        assert_eq!(item.title, "名字", "空白标题不得抹掉旧值");
+        assert_eq!(item.title, "名字", "标题缺省必须保持原值（省略字段 = 不改）");
         assert_eq!(item.description, None, "空介绍 = 显式清空");
+
+        // 2) 纯空白 = **真的清空**（旧语义是「不改」，BUG-200 起可表达）
+        let edit = EpisodeEdit {
+            title: Some(Some("   ".to_string())),
+            ..Default::default()
+        };
+        assert!(s.update_episode(ep, &edit).await.unwrap());
+        let item = s.get_media_item(iid).await.unwrap().unwrap();
+        assert_eq!(item.title, "", "纯空白标题必须真的清空，不是「不改」");
+
+        // 3) `null` 同样清空。先经条目 PATCH 恢复非空 —— 否则上一步已是空串，
+        //    断言会平凡成立、失去意义。
+        s.update_media_item(
+            iid,
+            &ItemPatch {
+                title: Some("名字2".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let edit = EpisodeEdit {
+            title: Some(None),
+            ..Default::default()
+        };
+        assert!(s.update_episode(ep, &edit).await.unwrap());
+        let item = s.get_media_item(iid).await.unwrap().unwrap();
+        assert_eq!(item.title, "", "标题 null = 真的清空，不是「不改」");
     }
 
     /// **旧库→新代码**迁移：分集行上的内容文案并入条目，且死列被腾空。

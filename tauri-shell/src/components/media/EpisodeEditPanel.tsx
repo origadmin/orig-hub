@@ -43,8 +43,9 @@ export function EpisodeEditPanel(props: {
    *
    * 标题与介绍由后端写穿到所指向的条目 —— 分集不持有内容文案的第二份副本，
    * 所以在剧集里改完，媒体库卡片与播放页看到的就是同一个结果。
-   * 标题为空时前端直接拦下并说明：空标题会让卡片变成一张认不出的卡，
-   * 后端也会按「不改」处理（发出去只会得到「保存了但没变」的假象）。
+   * 标题**允许为空**（BUG-200）：集可以没有标题 —— 剧集已经有名称了，清空后单集层
+   * 回落到「S1E3」这类槽位标签。清空时下发 `null`（= 显式清空）：此前下发空串会被引擎
+   * 按「不改」处理，表现为「保存了但没变」。
    *
    * 集号允许任意值（2、3…不必从 1 连续）；若目标槽已被同剧另一条占用，后端对调两条的
    * 槽位 —— 所以这里不做「号是否重复」的客户端校验，那会把后端已经能正确处理的情形
@@ -58,10 +59,6 @@ export function EpisodeEditPanel(props: {
     const n = Number(no)
     if (!Number.isInteger(s) || s < 1 || !Number.isInteger(n) || n < 1) {
       onError(t('media.episode.errSlot'))
-      return
-    }
-    if (!title.trim()) {
-      onError(t('media.episode.errTitleEmpty'))
       return
     }
     /*
@@ -95,7 +92,8 @@ export function EpisodeEditPanel(props: {
     setBusy(true)
     try {
       await patchEpisode(ep.id, {
-        title: title.trim(),
+        // 留空 → `null` = 显式清空（集可以没有标题，见 BUG-200）；非空下发 trim 后的值
+        title: title.trim() || null,
         description: desc.trim() || null,
         season: s,
         episodeNo: n,
@@ -115,6 +113,12 @@ export function EpisodeEditPanel(props: {
     <div className="flex flex-col gap-2" data-testid="episode-edit-panel">
       {/* P5 / R11：改写范围说明**只在面板内**，不进行态 */}
       <p className="text-[10px] leading-relaxed text-muted">{t('media.episode.editAffectsAll')}</p>
+
+      {/* 可见标签：标题**可改可清空**这件事必须看得见（此前只有 placeholder，
+          用户据此认为「标题不能修改」，见 BUG-200） */}
+      <span className="text-[11px] font-medium text-fg-strong">
+        {t('media.episode.editTitle')}
+      </span>
 
       <textarea
         value={title}

@@ -487,7 +487,11 @@ export async function mergeSeriesMulti(
 export async function patchEpisode(
   id: number,
   patch: {
-    title?: string
+    /**
+     * 标题：`null` = **显式清空**（集可以没有标题 —— 剧集已经有名称了，见 BUG-200）。
+     * 省略字段 = 不改；空串会被引擎归一化成清空。
+     */
+    title?: string | null
     /** 介绍：`null` = 显式清空（与剧集介绍同一契约） */
     description?: string | null
     season?: number
