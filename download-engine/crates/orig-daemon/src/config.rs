@@ -83,7 +83,7 @@ pub struct Config {
     pub max_connections: u32,
     /// Bearer token；为空表示不鉴权（对齐 orig-hub：token 空则不校验）。
     pub token: Option<String>,
-    /// 监听端口（对齐 orig-hub daemon 缺省 9876）。
+    /// 监听端口（缺省 19786，见 `Default`）。
     pub port: u16,
     /// 自动分类配置（R3）。
     pub classify: ClassifyConfig,
@@ -103,7 +103,11 @@ impl Default for Config {
             download_dir: None,
             max_connections: 8,
             token: None,
-            port: 9876,
+            // 19786（原 9876）：9876 常被 Windows 划进动态保留区（9857–9956 实证），
+            // bind 恒 10013，服务起不来而现象看着像「进程自杀」（BUG-178）。
+            // 仍可被配置文件 `port` 覆盖；bind 失败时 main 还有顺延兜底，
+            // 实际端口以 `/api/config` 的 `port` 为准。
+            port: 19786,
             classify: ClassifyConfig::default(),
             proxy: orig_core::protocol::ProxyConfig::default(),
             tg_enabled: true,

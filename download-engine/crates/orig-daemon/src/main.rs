@@ -19,7 +19,32 @@ use orig_protocol_http::HttpProtocol;
 use orig_protocol_virtual::VirtualProtocol;
 
 use crate::config::Config;
-use crate::state::AppState;
+use crate::state::{select_bindable_port, write_daemon_endpoint, AppState};
+
+/// 绑定监听端口：首选配置端口，**绑不上就顺延**（BUG-178）。
+///
+/// 为什么不能 `bind(addr).unwrap()`：本机 9876 可能落在 Windows 动态保留区
+/// （`netsh int ipv4 show excludedportrange tcp`），bind 恒 `WSAEACCES` 10013。
+/// 旧实现直接 panic 退出 → daemon 起不来 → 整个 APP 没有后端；而用户看到的是
+/// 「TG 不显示 / 数据没了」，根因被埋在 panic 里。顺延后把实际端口写进端点文件
+/// 并经 `/api/config` 下发，壳与前端都读真源。
+async fn bind_with_fallback(preferred: u16) -> (tokio::net::TcpListener, u16) {
+    match tokio::net::TcpListener::bind(("127.0.0.1", preferred)).await {
+        Ok(l) => (l, preferred),
+        Err(e) => {
+            eprintln!(
+                "[daemon] bind 127.0.0.1:{preferred} failed ({e}); scanning for a bindable port"
+            );
+            match select_bindable_port(preferred).await {
+                Some(p) => match tokio::net::TcpListener::bind(("127.0.0.1", p)).await {
+                    Ok(l) => (l, p),
+                    Err(e) => panic!("bind 127.0.0.1:{p} failed after scan: {e}"),
+                },
+                None => panic!("no bindable port found starting from {preferred}"),
+            }
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -33,14 +58,34 @@ async fn main() {
     registry.register(Arc::new(HttpProtocol::new()));
 
     let (events_tx, _rx) = tokio::sync::broadcast::channel(1024);
-    let state = Arc::new(AppState::new(registry, events_tx, config.clone()));
+    // 先定端口再建 state：端口是 state 的字段，`/api/config` 与端点文件都从它取，
+    // 不允许出现「配置文件写 9876、实际监听 9878」的两套真源。
+    let (listener, port) = bind_with_fallback(config.port).await;
+    eprintln!(
+        "orig-daemon listening on http://127.0.0.1:{port}{}",
+        if port == config.port {
+            String::new()
+        } else {
+            format!(" (configured {} was unavailable)", config.port)
+        }
+    );
+    write_daemon_endpoint(port);
+    let state = Arc::new(AppState::new(port, registry, events_tx, config.clone()));
 
     // TG 可选插件：启动时按配置拉起 orig-tg 子进程（注入主配置代理）。
     if config.tg_enabled {
         match state.tg_start().await {
             Ok(_) => eprintln!("orig-tg plugin started"),
+            // BUG-177：拉起失败必须**留痕**（原因已进 `tg_last_error`，设置页可见）。
+            // 这里不退出进程：下载内核与 daemon 本身仍然可用，只是 TG 模块不显示。
             Err(e) => eprintln!("failed to start orig-tg plugin: {e}"),
         }
+    }
+    // TG 托管巡检：daemon 是 orig-tg 的唯一所有者，开启却没在服务要自愈。
+    // 与上面这一次性拉起互补 —— 后者覆盖启动瞬间，前者覆盖运行期崩溃/退出。
+    {
+        let st = state.clone();
+        tokio::spawn(async move { st.tg_supervise().await });
     }
 
     let app: Router = routes::router(state).layer(
@@ -69,10 +114,5 @@ async fn main() {
             .max_age(std::time::Duration::from_secs(3600)),
     );
 
-    let port = config.port;
-    let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
-    eprintln!("orig-daemon listening on http://{addr}");
-
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }

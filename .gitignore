@@ -1,6 +1,7 @@
 # ============ Rust（下载内核 + Tauri 壳） ============
 /target
 **/target
+**/target-*/
 **/*.rs.bk
 
 # ============ Node / 前端（Vite + React） ============

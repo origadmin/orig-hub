@@ -55,7 +55,12 @@ const TG_BASE = `http://127.0.0.1:${TG_PORT}`
 const S_MULTI = 1 // 14 集 → R1 / R5 反向
 const S_DIFFDESC = 3 // 9 集，S1E1 有独立介绍 → R2 反例夹具
 const S_SINGLE_DUP = 101 // 1 集，集标题/介绍与剧集逐字相同 → R2/R7 最佳夹具
-const S_TWO_EP = 80 // 2 集，photo 挂 1 图 / video 挂 1 图 → R6 真实挂图
+/**
+ * R6 夹具 = series 5（**5 个可播分集，其中 2 个已带挂图**）。
+ * 不用 series 80：它是 1 photo + 1 video，photo 分集按 §3.3 走宫格**不进行**，
+ * 故只有 1 个 `episode-slot`（不是缺陷，是我选错夹具）。
+ */
+const S_IMAGES = 5
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -400,36 +405,76 @@ async function main() {
         warns.push('R2 positive: no episode-edit entry found to inject a distinct description')
       } else {
         await clickTestid(page, 'episode-edit')
-        const areaUp = await waitTestidSoft(page, 'episode-desc-input', 8000)
-        const areaSel = areaUp
-          ? '[data-testid="episode-desc-input"]'
-          : 'textarea[placeholder="本集介绍…"]'
-        if (!areaUp) await waitTestidSoft(page, 'episode-end-input', 6000)
+        await waitTestidSoft(page, 'episode-edit-panel', 8000)
+        await delay(300)
+        // 通过 API 参数拿到该集真实 id（页面上的 data-ep-id 不可靠），直接在页面内写介绍。
+        // 单集介绍 textarea 在 EpisodeEditPanel 内**无 data-testid**（源码 EpisodeEditPanel.tsx:167），
+        // 其 placeholder 来自 i18n `media.descEmptyEp` = 「本集暂无介绍」。
+        // 面板内 textarea 顺序：episode-title-input 在前，介绍框在后 →
+        //   「placeholder 含『本集』且含『介绍』」的 textarea 即介绍框。
         const stamped = `QA-TL21-R2 与剧集介绍不同的独立本集介绍 ${Date.now()}`
-        const setRes = await page.evaluate(SET_CONTROLLED_VALUE, areaSel, stamped, 'textarea')
+        const setRes = await page.evaluate((val) => {
+          const area = Array.from(document.querySelectorAll('[data-testid="episode-edit-panel"] textarea'))
+            .find((t) => (t.placeholder || '').includes('本集') && (t.placeholder || '').includes('介绍'))
+          if (!area) return { ok: false, reason: 'no episode desc textarea in panel' }
+          const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set
+          setter.call(area, val)
+          area.dispatchEvent(new Event('input', { bubbles: true }))
+          return { ok: true, readback: area.value }
+        }, stamped)
         console.log('[tl21] R2 write distinct desc:', JSON.stringify(setRes && setRes.ok))
         if (!setRes || !setRes.ok) {
           warns.push(`R2 positive: could not write episode description (${JSON.stringify(setRes)})`)
         } else {
           await clickTestid(page, 'episode-save')
-          await delay(1500)
+          // 等面板关闭 = 保存成功（失败会留panel并 toast onError）
+          const closed = await (async () => {
+            try {
+              await page.waitForFunction(() => !document.querySelector('[data-testid="episode-edit-panel"]'), { timeout: 8000 })
+              return true
+            } catch (_e) { return false }
+          })()
+          await delay(1200)
           const n2 = await page.evaluate(COUNT_OCCURRENCES, stamped)
-          console.log('[tl21] R2 (distinct case) stamped desc occurrences=', n2, '(expect 1 for stamped, plus hero original => 2 distinct blocks)')
+          console.log('[tl21] R2 (distinct case) panelClosed=', closed, 'stamped desc occurrences=', n2, '(expect 1 for stamped, plus hero original => 2 distinct blocks)')
+          if (!closed) warns.push('R2 positive: episode edit panel did not close after save (save may have failed)')
           const hero2 = await page.evaluate(READ_HERO_DESC)
           const nHero = hero2 ? await page.evaluate(COUNT_OCCURRENCES, hero2.text) : -1
           console.log('[tl21] R2 (distinct case) hero desc occurrences=', nHero, '(expect 1)')
-          if (n2 !== 1) fails.push(`R2: after saving a distinct episode description it appears ${n2}x, expected 1`)
+          if (n2 !== 1) {
+            const domDump = await page.evaluate(() => {
+              const ex = document.querySelector('[data-testid="episode-expanded"]')
+              return {
+                expandedText: ex ? (ex.innerText || '').replace(/\s+/g, ' ').slice(0, 400) : null,
+                panelOpen: !!document.querySelector('[data-testid="episode-edit-panel"]'),
+              }
+            })
+            console.log('[tl21] R2 DIAG (stamped not found):', JSON.stringify(domDump))
+            fails.push(`R2: after saving a distinct episode description it appears ${n2}x, expected 1`)
+          }
           if (nHero !== 1) fails.push(`R2: after the change the hero description appears ${nHero}x, expected 1`)
           // 两段互不相同 = 页面确实出现 2 个不同介绍块
           if (hero2 && hero2.text.trim() === stamped.trim()) {
             fails.push('R2: episode description equals the series description after the change (expected distinct)')
           }
           await shot(page, 'tl21-r2-distinct.png', 'episode-expanded')
-          // 还原
+          // 还原：重新打开编辑面板 → 写回原文 → 保存
           await clickTestid(page, 'episode-edit')
-          await waitTestidSoft(page, areaSel, 8000)
+          await waitTestidSoft(page, 'episode-edit-panel', 8000)
+          await delay(300)
           const original = desc101.text
-          await page.evaluate(SET_CONTROLLED_VALUE, areaSel, original, 'textarea')
+          let backRes = await page.evaluate((val) => {
+            const area = Array.from(document.querySelectorAll('[data-testid="episode-edit-panel"] textarea'))
+              .find((t) => (t.placeholder || '').includes('本集') && (t.placeholder || '').includes('介绍'))
+            if (!area) return { ok: false, reason: 'no episode desc textarea in panel' }
+            const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set
+            setter.call(area, val)
+            area.dispatchEvent(new Event('input', { bubbles: true }))
+            return { ok: true, readback: area.value.length }
+          }, original)
+          if (!backRes || !backRes.ok) {
+            warns.push(`R2 restore: could not write back the original description (${JSON.stringify(backRes)})`)
+          }
           await clickTestid(page, 'episode-save')
           await delay(1400)
           const nBack = await page.evaluate(COUNT_OCCURRENCES, original)
@@ -544,7 +589,7 @@ async function main() {
     // 真实夹具：series 80（2 集，photo 挂 1 图 / video 挂 1 图）。
     // ★ 必须先**冷导航回到剧集墙**再进详情：跨剧直接点卡会命中上一部的残留 DOM，
     //   导致 `series-gallery`/灯箱计数假阳性（实测踩过：暖导航数到 1，冷启动为 0）。
-    await openSeriesById(page, S_TWO_EP, 2)
+    await openSeriesById(page, S_IMAGES, 2)
     const galleryNow = await page.evaluate(() => document.querySelectorAll('[data-testid="series-gallery"]').length)
     console.log('[tl21] R6 series-gallery node count:', galleryNow, '(expect 0)')
     if (galleryNow !== 0) fails.push(`R6: series-gallery is still rendered (${galleryNow} nodes); it must be removed`)
@@ -556,7 +601,7 @@ async function main() {
     // 灯箱页数：打开有挂图的那一集，点开一张图，读 lightbox-position 的 N
     const r6Real = await (async () => {
       try {
-        const res = await fetch(`${TG_BASE}/api/media/series/${S_TWO_EP}`)
+        const res = await fetch(`${TG_BASE}/api/media/series/${S_IMAGES}`)
         if (!res.ok) return { error: `HTTP ${res.status}` }
         const detail = await res.json()
         const withImg = (detail.episodes || []).find((e) => (e.images || []).length > 0)
@@ -645,7 +690,7 @@ async function main() {
  * 返回 { skipped?, fail?, detail? }；不静默通过。
  */
 async function exerciseAttachedImageScopes(page, base) {
-  let seriesId = S_TWO_EP
+  let seriesId = S_IMAGES
   let detail
   try {
     detail = await (await fetch(`${base}/api/media/series/${seriesId}`)).json()
@@ -677,12 +722,14 @@ async function exerciseAttachedImageScopes(page, base) {
   const snapshot = {}
   for (const e of [eps[0], eps[1]]) snapshot[e.id] = (e.images || []).map((i) => i.itemId)
 
-  const attach = async (epId, itemId) => {
+  // 挂图契约（见 api/media.ts attachEpisodeImages）：POST body = { itemIds: number[] }，
+  // **replace-all** 语义 —— 按 itemIds 顺序重写该集的图片位。传 { itemId } 会 422。
+  const attach = async (epId, itemIds) => {
     try {
       const r = await fetch(`${base}/api/media/episodes/${epId}/images`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ itemId }),
+        body: JSON.stringify({ itemIds }),
       })
       return r.status
     } catch (e) { return `ERR:${e.message}` }
@@ -704,14 +751,17 @@ async function exerciseAttachedImageScopes(page, base) {
   }
 
   try {
-    const sA = []
-    for (const it of aImgs) sA.push(await attach(A, it))
-    const sB = []
-    for (const it of bImgs) sB.push(await attach(B, it))
+    // replace-all：直接下发目标 itemIds 即得到精确的 3 / 2 张（不再逐张叠加）
+    const sA = await attach(A, aImgs)
+    const sB = await attach(B, bImgs)
     console.log('[tl21] R6 attach statuses A:', JSON.stringify(sA), 'B:', JSON.stringify(sB))
-    if (sA.some((s) => s !== 200 && s !== 201 && s !== 204)) {
+    if (sA !== 200 && sA !== 201 && sA !== 204) {
       await restore()
-      return { skipped: true, reason: `attach API not usable for episode A (statuses ${JSON.stringify(sA)})` }
+      return { skipped: true, reason: `attach API not usable for episode A (status ${JSON.stringify(sA)})` }
+    }
+    if (sB !== 200 && sB !== 201 && sB !== 204) {
+      await restore()
+      return { skipped: true, reason: `attach API not usable for episode B (status ${JSON.stringify(sB)})` }
     }
 
     const measure = async (epId) => {

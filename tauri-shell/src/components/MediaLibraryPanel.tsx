@@ -806,6 +806,25 @@ export function MediaLibraryPanel() {
       <div className="flex min-w-0 flex-1 flex-col">
         {/* 工具条 */}
         <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border-subtle/60 px-3 py-2">
+          {/* 详情态：返回是**页面导航** ⇒ 属工具栏作用域（v3 W mock 头部行同位）。
+              剧集实体的合并/导出/删除**不进工具栏** —— 它们落在 SeriesDetail
+              总览卡（实体表面）。工具栏恒为库级语义，全视图一致。 */}
+          {view === 'seriesDetail' && detail ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 shrink-0 px-2 text-[11px]"
+              data-testid="series-back"
+              onClick={() => {
+                setView('series')
+                setDetail(null)
+                setActiveSeriesId(null)
+                void loadSeries()
+              }}
+            >
+              ← {t('media.series.back')}
+            </Button>
+          ) : null}
           {/* BUG-131：搜索与排序只对 items 视图生效，故只在 items 视图渲染 ——
               恒渲染但恒无效，等于控件在撒谎（同排「仅未归集」早已是这种守卫写法）。 */}
           {view === 'items' ? (
@@ -916,40 +935,44 @@ export function MediaLibraryPanel() {
                     {t('media.selectAll')}
                   </Button>
                 ) : null}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 px-2 text-[11px]"
-                  onClick={() => setImportOpen(true)}
-                >
-                  ⬇ {t('media.importDir')}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 px-2 text-[11px]"
-                  onClick={() => setCreateOpen(true)}
-                >
-                  ＋ {t('media.newSeries')}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 px-2 text-[11px]"
-                  data-testid="media-export-preview"
-                  onClick={() => setExportOpen(true)}
-                >
-                  {t('media.export')}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 px-2 text-[11px]"
-                  data-testid="media-tag-manage"
-                  onClick={() => setTagMgrOpen(true)}
-                >
-                  🏷 {t('media.manageTags')}
-                </Button>
+                {/* 库级动作全视图恒渲染（工具栏 = 库级语义，与视图无关；
+                    剧集实体的合并/导出/删除在 SeriesDetail 总览卡，不进工具栏） */}
+                <>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2 text-[11px]"
+                    onClick={() => setImportOpen(true)}
+                  >
+                    ⬇ {t('media.importDir')}
+                  </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 px-2 text-[11px]"
+                      onClick={() => setCreateOpen(true)}
+                    >
+                      ＋ {t('media.newSeries')}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 px-2 text-[11px]"
+                      data-testid="media-export-preview"
+                      onClick={() => setExportOpen(true)}
+                    >
+                      {t('media.export')}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 px-2 text-[11px]"
+                      data-testid="media-tag-manage"
+                      onClick={() => setTagMgrOpen(true)}
+                    >
+                      🏷 {t('media.manageTags')}
+                    </Button>
+                </>
               </>
             )}
           </div>

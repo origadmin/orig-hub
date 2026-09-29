@@ -82,8 +82,12 @@ interface CategoryRow {
  */
 export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}) {
   const { t, language, setLanguage, supported } = useTranslation()
-  const { settings, updateSettings, daemon, setError, tgEnabled, tgRunning, setTgEnabled } =
+  const { settings, updateSettings, daemon, setError, tgService, setTgEnabled, refreshTgState } =
     useStore()
+  // 服务层（进程）与链路层（Telegram）分开（BUG-178）：开关说的是「服务在不在」，
+  // 不再掺链路状态 —— 掺了就会出现「插件：运行中」与「Telegram 不可用」同屏打架。
+  const tgEnabled = tgService.enabled
+  const tgRunning = tgService.running
   const [activeTab, setActiveTab] = useState<SettingsTab>('downloads')
   const [maxConnections, setMaxConnections] = useState(settings.maxConnections)
   const [dir, setDir] = useState(settings.downloadDirectory)
@@ -123,6 +127,11 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
   // 库根目录（byte-ownership P5）：编辑态 + 已保存值（变化才写，避免每次保存都打 PUT）
   const [libDir, setLibDir] = useState('')
   const [libDirSaved, setLibDirSaved] = useState('')
+  // 系统默认下载目录（按 OS 解析：Windows 为 C:\Users\<user>\Downloads）：用户未显式设置时
+  // 作占位/回退，杜绝写死的 ~/Downloads（Unix 风格，在 Windows 上误导）。
+  const [defaultDir, setDefaultDir] = useState('')
+  /** TG 拉起/自愈失败原因：单一真源是服务层（daemon `tg_last_error`），不另存一份 state */
+  const tgError = tgService.lastError
 
   // 缓存占用：进设置页读一次（不轮询 —— 它只在清理前后变化，轮询是白耗）
   useEffect(() => {
@@ -202,6 +211,14 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
         setLibDirSaved(c.libraryDir ?? '')
       })
       .catch(() => {})
+    // 系统默认下载目录：daemon 按 OS 解析（Windows = C:\Users\<user>\Downloads），
+    // 用作未显式设置时的占位/回退，替代写死的 ~/Downloads。
+    getConfig()
+      .then((c) => setDefaultDir(c.default_download_dir ?? ''))
+      .catch(() => {})
+    // TG 拉起失败原因（BUG-177 / BUG-178）：服务不可用时侧栏没有 TG 入口，
+    // 若这里也不说原因，用户只会以为「TG 功能没了」。走唯一刷新入口，不另拉一次 config。
+    void refreshTgState()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -449,7 +466,7 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
                     <p className="text-[11px] text-muted">{t('downloads.dirHint')}</p>
                   </div>
                   <div className="mt-2">
-                    <DirectoryPicker value={dir} onChange={setDir} placeholder={t('downloads.dirPlaceholder')} onError={setError} />
+                    <DirectoryPicker value={dir} onChange={setDir} placeholder={dir || defaultDir || t('downloads.dirPlaceholder')} onError={setError} />
                   </div>
                   <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
                     {t('downloads.dirNote')}
@@ -466,7 +483,7 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
                   </div>
                   <div className="mt-2 flex items-start gap-2">
                     <div className="min-w-0 flex-1">
-                      <DirectoryPicker value={libDir} onChange={setLibDir} placeholder={t('downloads.dirPlaceholder')} onError={setError} />
+                      <DirectoryPicker value={libDir} onChange={setLibDir} placeholder={libDir || defaultDir || t('downloads.dirPlaceholder')} onError={setError} />
                     </div>
                     <Button
                       variant="outline"
@@ -903,23 +920,46 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
                       <span
                         className={cn(
                           'text-[11px]',
-                          tgRunning ? 'text-success' : 'text-muted',
+                          // 开了却没在跑 = 拉起失败（danger），**不是**「启动中」：
+                          // 旧文案在永久失败（如端口落在系统保留区）时会一直显示「启动中」，
+                          // 把 daemon 的失职伪装成「再等等就好了」（BUG-177）。
+                          tgEnabled && !tgRunning
+                            ? 'text-danger'
+                            : tgRunning
+                              ? 'text-success'
+                              : 'text-muted',
                         )}
+                        data-testid="tg-toggle-status"
                       >
                         {tgEnabled
                           ? tgRunning
                             ? t('tg.running')
-                            : t('tg.starting')
+                            : t('tg.startFailed')
                           : t('tg.stopped')}
                       </span>
                       <Switch
                         checked={tgEnabled}
                         onChange={(v) => {
-                          setTgEnabled(v)
+                          void setTgEnabled(v).then(() => {
+                            // 回写后立刻取一次失败原因：拉起失败时用户需要当场看到为什么，
+                            // 而不是「开关打开了但 TG 没了」。
+                            void refreshTgState()
+                          })
                         }}
                       />
                     </div>
                   </div>
+
+                  {/* 失败原因可见（BUG-177）：TG 不可用时侧栏入口被摘除，
+                      这里是用户唯一能知道「为什么没有 TG」的地方。 */}
+                  {tgEnabled && !tgRunning && tgError ? (
+                    <p
+                      className="mt-2 rounded-md bg-danger/10 px-3 py-2 text-[11px] leading-relaxed text-danger"
+                      data-testid="tg-toggle-error"
+                    >
+                      {t('tg.startFailedHint', { reason: tgError })}
+                    </p>
+                  ) : null}
 
                   <div className="mt-3 flex items-center justify-between gap-4 rounded-lg bg-surface-2/40 px-3 py-2.5">
                     <div className="min-w-0">

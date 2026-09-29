@@ -122,6 +122,16 @@ pub struct AppState {
     /// 的日志 —— 环形日志被冲掉，真正的病因反而找不到了。按 key 节流，
     /// 保证「出了事一定留痕」的同时不制造日志风暴。
     log_throttle: Mutex<HashMap<String, Instant>>,
+    /// 缓存 worker 当前条目的字节进度（BUG-181）。
+    ///
+    /// 条目边界之间的下载（一条 200MB 视频可达数分钟）此前零呈现 —— `done`
+    /// 计数冻结，对用户等价于「系统死了」。现在 grammers 每 chunk 累加到这里，
+    /// 任务端点在序列化时注入 `itemBytes`/`itemBytesTotal`。原子读写，
+    /// 高频读端点不碰锁。
+    pub cache_dl: crate::login::DownloadProgress,
+    /// 正在报字节的缓存任务 id（0 = 无）。序列化方据此判断注入是否归属当前任务，
+    /// 防止「任务已切条目/已结束但旧字节仍在」的错配。
+    pub cache_dl_task: std::sync::atomic::AtomicI64,
 }
 
 impl AppState {
@@ -143,6 +153,34 @@ impl AppState {
             cache_tasks: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             cache_worker_alive: AtomicBool::new(false),
             log_throttle: Mutex::new(HashMap::new()),
+            cache_dl: crate::login::DownloadProgress::default(),
+            cache_dl_task: std::sync::atomic::AtomicI64::new(0),
+        }
+    }
+
+    /// 条目下载开始：绑定任务 id 并清零字节（总量由 client 在开流前设置）。
+    pub fn cache_dl_begin(&self, task_id: i64) {
+        self.cache_dl.reset();
+        self.cache_dl_task
+            .store(task_id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 条目下载结束（成败皆然）：解绑任务 id，序列化方随之停报。
+    pub fn cache_dl_end(&self) {
+        self.cache_dl_task
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 当前条目字节（仅当归属 `task_id` 时返回；否则 None）。
+    pub fn cache_dl_progress(&self, task_id: i64) -> Option<(u64, u64)> {
+        if self
+            .cache_dl_task
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == task_id
+        {
+            Some(self.cache_dl.load())
+        } else {
+            None
         }
     }
 

@@ -1,0 +1,36 @@
+sequenceDiagram
+    participant Main as orig-tg::main
+    participant Cfg as Config::load
+    participant Store as Store(TG库)
+    participant Lib as LibraryStore(库库)
+    participant Mig as migrate_split
+    participant Media as media.rs
+    participant TG as TG库(只读)
+
+    Main->>Cfg: load()
+    Cfg-->>Main: db_path, library_db_path
+    Main->>Store: Store::open(db_path)
+    Store-->>Main: Store{conn, db_path}
+    Main->>Lib: LibraryStore::open(library_db_path, db_path, tg_ro)
+    Lib->>Lib: 建库域表(media::migrate) + WAL
+    Lib->>TG: 打开只读连接
+    TG-->>Lib: Option<Connection>
+    Lib->>Mig: migrate_split(tg_conn, lib_conn)
+    alt 无标记且库库空
+        Mig->>TG: ATTACH src
+        Mig->>Lib: INSERT..SELECT 9 表(item 先)
+        Mig->>Lib: sqlite_sequence 校正
+        Mig->>TG: 写 mig.store_split_v1
+        Mig-->>Lib: Migrated(572)
+    else 已有标记
+        Mig-->>Lib: Skipped
+    end
+    Main->>Main: AppState{store, library}
+    Note over Media,TG: 运行期跨域读
+    Media->>Lib: tg_caption(chat, msg)
+    Lib->>TG: SELECT caption FROM media_message
+    alt tg_ro 可用
+        TG-->>Lib: Some(caption)
+    else tg_ro=None
+        Lib-->>Media: None(降级: 用 title 切分)
+    end

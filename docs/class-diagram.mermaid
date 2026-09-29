@@ -1,0 +1,50 @@
+classDiagram
+    class Store {
+        +conn: Connection
+        +db_path: PathBuf
+        +open(path) Store
+        +get_setting(key) Option~String~
+        +set_setting(key, value)
+        +config_json_library_dir(db_path) Option~PathBuf~
+        +default_library_root(db_path) PathBuf
+        +mark_stale_cache_tasks()
+        ...TG 域方法不变...
+    }
+
+    class LibraryStore {
+        +conn: Connection
+        +tg_ro: Option~Connection~
+        +db_path: PathBuf
+        +tg_db_path: PathBuf
+        +open(lib_path, tg_db_path, tg_ro) LibraryStore
+        +library_root() PathBuf
+        +get_setting(key) Option~String~
+        +set_setting(key, value)
+        +tg_caption(chat_id, message_id) Option~String~
+        +duplicate_item_file_paths(limit) Vec~FilePathCollision~
+        +migrate_split(tg_conn, lib_conn) MigrateOutcome
+    }
+
+    class Migrate {
+        +migrate(lib: &LibraryStore)  注: 不再收 &Connection (签名级切断)
+        +backfill_item_text(lib: &LibraryStore)
+        +collapse_episode_text(lib: &LibraryStore)
+    }
+
+    class AppState {
+        +client: Arc~dyn Client~
+        +store: Store
+        +library: LibraryStore
+        +config: Config
+        +availability: Availability
+    }
+
+    class Media {
+        ...media.rs 全部方法迁入 LibraryStore...
+    }
+
+    AppState --> Store : TG 域
+    AppState --> LibraryStore : 库域
+    LibraryStore ..> Store : tg_ro 只读引用 media_message.caption
+    Media ..> LibraryStore
+    Migrate ..> LibraryStore

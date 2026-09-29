@@ -177,6 +177,7 @@ impl Client for MockClient {
         chat_id: i64,
         message_id: i64,
         dir: &str,
+        progress: Option<&crate::login::DownloadProgress>,
     ) -> Result<DownloadOutcome, ClientError> {
         let dir = std::path::PathBuf::from(dir);
         tokio::fs::create_dir_all(&dir)
@@ -189,6 +190,9 @@ impl Client for MockClient {
         use tokio::io::AsyncWriteExt;
         let mut bytes: u64 = 0;
         let chunk = vec![0u8; 1024 * 1024];
+        if let Some(p) = progress {
+            p.set_total(8 * chunk.len() as u64);
+        }
         // 8 × 300ms ≈ 2.4s/条：给「刷新后仍在缓存中」留出可观察窗口。
         // 过快会让任务在刷新完成前就结束，验收只能看到终态、无法复现原缺陷场景。
         for _ in 0..8 {
@@ -196,6 +200,9 @@ impl Client for MockClient {
                 .await
                 .map_err(|e| ClientError::Other(format!("write file: {e}")))?;
             bytes += chunk.len() as u64;
+            if let Some(p) = progress {
+                p.add_bytes(chunk.len() as u64);
+            }
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
         file.flush()

@@ -15,7 +15,15 @@ use crate::config::Config;
 
 /// orig-tg 监听端口。**唯一真源**：拉起子进程时注入、聚合层拉取时引用，
 /// 两处必须同源，否则「启在 9877、拉 9876」这类分叉又会重新长出来。
-pub const TG_PORT: u16 = 9877;
+///
+/// 默认 19787（原 9877）：9877 落在 Windows 动态保留区时**没有任何监听者但 bind
+/// 恒失败**（`WSAEACCES` 10013），服务永远起不来且原因看着像「进程自杀」（BUG-178）。
+/// 仍可被子进程同名 env `ORIG_TG_PORT` 覆盖；且真起不来时 daemon 会顺延选端口，
+/// 并把实际端口经 `/api/config` 下发 —— 前端不得再各自硬编码。
+pub const TG_PORT: u16 = 19787;
+
+/// 端口顺延扫描上限（避开保留区时的候选个数）。
+const PORT_SCAN_LIMIT: u16 = 64;
 
 /// 端口探测超时。无人监听时 connect 立即 ECONNREFUSED，这里的超时只是兜底
 /// （防火墙静默丢包等极端情况不该挂住 `/api/config`）。
@@ -26,6 +34,42 @@ const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 /// 目的是让 OS 释放 9877，避免紧接着的 `tg_start` 误判「端口有人」而跳过拉起。
 /// kill 后正常退出是毫秒级；这里给足余量，超时也不阻塞调用方。
 const TG_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 拉起后等待子进程**真正开始监听**的上限。
+///
+/// 为什么必须等（BUG-177）：`spawn()` 成功 ≠ 服务可用。实测本机 orig-tg 起来后
+/// 立刻 `bind 127.0.0.1:9877 failed: os error 10013`（端口落在 Windows 保留区内）
+/// 就退了 —— 而旧实现 `spawn()` 一返回就 `Ok(true)`，于是 `/api/config` 报
+/// `tg_enabled=true` 而进程列表里根本没有 orig-tg：**「已开启但未连接」这个不该
+/// 存在的状态就是这么来的**。等不到监听者就如实报错。
+const TG_START_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// TG 托管巡检周期：daemon 是 orig-tg 的**唯一所有者**，开启却没在服务是 daemon
+/// 的失职，必须自愈而不是等用户去点开关。
+const TG_SUPERVISE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// 两次真正 spawn 之间的最小间隔：避免二进制缺失等**永久失败**下每 15s 起一个
+/// 立刻就死的进程（进程风暴）。探测本身是廉价的本机 connect，不受此限制。
+const TG_SPAWN_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// 两次「因链路断而重启」之间的最小间隔（BUG-178）。
+///
+/// 比 spawn 冷却长得多：MTProto 可能因网络抖动、Telegram 限流而短暂不可用，
+/// 每 15s 重启一次只会把服务打得更不可用。5 分钟给足「网络自己恢复」的窗口，
+/// 又远短于「用户手动重启应用」的平均耗时 —— 这正是要做自动化的理由。
+const TG_LINK_RESTART_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// orig-tg 监听端口。
+///
+/// 默认 [`TG_PORT`]；可被 `ORIG_TG_PORT` 覆盖 —— 与注入子进程的同名 env **同源**
+/// （见 [`AppState::tg_start_on`]），于是「迁移端口」只需一处 env，不会又长出
+/// 「启在 A 端口、拉 B 端口」的分叉。
+pub fn tg_port() -> u16 {
+    std::env::var("ORIG_TG_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(TG_PORT)
+}
 
 /// 探测 127.0.0.1:{port} 是否已有监听者。
 ///
@@ -44,6 +88,64 @@ pub async fn tg_port_has_listener(port: u16) -> bool {
         Ok(Ok(_stream)) => true,
         // 连不上（ECONNREFUSED）或超时 —— 都当作没有监听者。
         Ok(Err(_)) | Err(_) => false,
+    }
+}
+
+/// 该端口在本机是否**可以绑定**（不只是「现在没人监听」）。
+///
+/// 为什么必须真 bind 一次（BUG-178 的物理根因）：Windows 的 Hyper-V / WSL 会预留
+/// 一段动态端口区间（`netsh int ipv4 show excludedportrange tcp` 可见），落在区间内的
+/// 端口**没有任何监听者，但 bind 一律 `WSAEACCES`（10013）**。于是
+/// `tg_port_has_listener` 返回 false（看着空着），daemon 判定「可以拉起」，spawn 出的
+/// orig-tg 立刻 `bind failed: os error 10013` 退出 —— 服务永远起不来，而现象看着像
+/// 「进程自杀」。判据必须是「能不能绑」，不是「有没有人占」。
+pub async fn port_bindable(port: u16) -> bool {
+    match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+        Ok(l) => {
+            drop(l);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 从 `start` 起找第一个**可绑定**端口（最多扫 [`PORT_SCAN_LIMIT`] 个）。
+///
+/// 找不到返回 None：宁可如实报「本机没有可用端口」，也不要拿一个注定失败的端口
+/// 去 spawn —— 那正是「已开启但永远不在线」的由来。
+pub async fn select_bindable_port(start: u16) -> Option<u16> {
+    for offset in 0..PORT_SCAN_LIMIT {
+        let p = start.saturating_add(offset);
+        if p == 0 {
+            break;
+        }
+        if port_bindable(p).await {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// daemon 端点文件：把**实际**监听地址写给桌面壳。
+///
+/// 为什么需要它（BUG-178）：daemon 端口可能顺延（保留区），壳与前端都不得再猜
+/// 9876。写文件是唯一真源，壳读它；`/api/config` 的 `port` 是同一真源的 HTTP 面。
+pub fn daemon_endpoint_file() -> PathBuf {
+    tg_data_dir().join("daemon.endpoint")
+}
+
+/// 写出 daemon 实际端点（`127.0.0.1:<port>`）。失败只记日志：它是壳的加速器，
+/// 不是 daemon 自身可用的前提（壳会退化成端口扫描）。
+pub fn write_daemon_endpoint(port: u16) {
+    let path = daemon_endpoint_file();
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("[daemon] cannot create {}: {e}", parent.display());
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(&path, format!("127.0.0.1:{port}")) {
+        eprintln!("[daemon] cannot write {}: {e}", path.display());
     }
 }
 
@@ -78,6 +180,11 @@ pub struct DownloadTask {
 }
 
 pub struct AppState {
+    /// daemon 实际监听端口（可能与配置不同：保留区顺延，见 `main::bind_with_fallback`）。
+    ///
+    /// 桌面壳与前端一律以这里为准（`GET /api/config` 的 `port` + 端点文件），
+    /// 不得再各自硬编码 9876。
+    pub port: u16,
     pub registry: Registry,
     /// 进行中的任务：id -> DownloadTask（Arc 共享，控制句柄在 Task 内）。
     pub tasks: Mutex<HashMap<String, DownloadTask>>,
@@ -86,19 +193,68 @@ pub struct AppState {
     pub config: RwLock<Config>,
     /// orig-tg 子进程句柄（TG 可选插件）。None = 未启动 / 已退出。
     pub tg_child: Mutex<Option<Child>>,
+    /// TG 最近一次拉起/自愈失败的原因（BUG-177）。
+    ///
+    /// 入口级门控是「服务可用才显示 TG」，于是 TG 不可用时侧栏**没有** TG 入口；
+    /// 若不把原因摆在设置页，用户只会以为「功能没了」。成功拉起后清空。
+    pub tg_last_error: RwLock<Option<String>>,
+    /// 上一次真正 spawn 的时刻（巡检退避用，见 `TG_SPAWN_COOLDOWN`）。
+    pub tg_last_spawn: Mutex<Option<tokio::time::Instant>>,
+    /// 上一次因链路断而重启的时刻（巡检退避用，见 `TG_LINK_RESTART_COOLDOWN`）。
+    pub tg_last_restart: Mutex<Option<tokio::time::Instant>>,
+    /// 当前为 orig-tg 选定的端口（起点 `tg_port()`，不可绑定时顺延）。
+    ///
+    /// 为什么要在 state 里存（BUG-178）：端口不再是一个常量 —— 本机可能把默认端口
+    /// 划进保留区，daemon 必须自己换一个，并把它作为**唯一真源**下发给前端。
+    /// 存常量就等于让前端继续猜，猜错就是「服务在 19788、前端拉 19787」。
+    pub tg_port: RwLock<u16>,
     /// 出向 HTTP 客户端（`/api/activity` 聚合层拉 orig-tg 用；见 `build_http_client`）。
     pub http: reqwest::Client,
 }
 
 impl AppState {
-    pub fn new(registry: Registry, events: broadcast::Sender<SseEvent>, config: Config) -> Self {
+    pub fn new(
+        port: u16,
+        registry: Registry,
+        events: broadcast::Sender<SseEvent>,
+        config: Config,
+    ) -> Self {
         Self {
+            port,
             registry,
             tasks: Mutex::new(HashMap::new()),
             events,
             config: RwLock::new(config),
             tg_child: Mutex::new(None),
+            tg_last_error: RwLock::new(None),
+            tg_last_spawn: Mutex::new(None),
+            tg_last_restart: Mutex::new(None),
+            tg_port: RwLock::new(tg_port()),
             http: build_http_client(),
+        }
+    }
+
+    /// 当前为 orig-tg 选定的端口（唯一真源，随 `/api/config` 下发）。
+    pub fn tg_port_state(&self) -> u16 {
+        *self.tg_port.read().unwrap()
+    }
+
+    /// 为 orig-tg 选定端口：起点可用就沿用，不可用则顺延到第一个可绑定的（BUG-178）。
+    ///
+    /// 只在**拉起前**调用：探测是真 bind，不该混进读路径（`/api/config` 每调一次就
+    /// bind 一次，既慢又会与子进程抢端口）。选定结果记进 `tg_port`。
+    async fn tg_reselect_port(&self) -> u16 {
+        let cur = self.tg_port_state();
+        if port_bindable(cur).await {
+            return cur;
+        }
+        match select_bindable_port(tg_port()).await {
+            Some(next) => {
+                *self.tg_port.write().unwrap() = next;
+                next
+            }
+            // 一个都绑不上：如实留下起点，让 `tg_start_on` 去报真实错误。
+            None => cur,
         }
     }
 
@@ -131,9 +287,29 @@ impl AppState {
         tg_port_has_listener(port).await
     }
 
-    /// orig-tg 是否存活（固定 `TG_PORT`）。
+    /// orig-tg 是否存活（端口取当前选定端口 [`Self::tg_port_state`]）。
     pub async fn tg_is_running(&self) -> bool {
-        self.tg_is_running_on(TG_PORT).await
+        self.tg_is_running_on(self.tg_port_state()).await
+    }
+
+    /// 读取 TG 失败原因（只读，不清空）。
+    ///
+    /// 不做「读后即清」：`/api/config` 是被多处轮询的读端点（init / 设置页 / 开关回写），
+    /// 读一次就清会让先到的轮询把后到的展示吃掉 —— 那正是「故障偶发不可见」。
+    /// 清空的时机只有两个：拉起成功、或用户主动关闭 TG（见 [`Self::tg_start_on`] /
+    /// [`Self::tg_stop`]）。
+    pub fn tg_last_error(&self) -> Option<String> {
+        self.tg_last_error.read().unwrap().clone()
+    }
+
+    /// 清空 TG 失败原因（拉起成功 / 主动关闭时调用）。
+    fn clear_tg_last_error(&self) {
+        *self.tg_last_error.write().unwrap() = None;
+    }
+
+    /// 记一次 TG 失败原因（只记录，不吞错：错误本身仍会向上传递给调用方）。
+    fn set_tg_last_error(&self, msg: impl Into<String>) {
+        *self.tg_last_error.write().unwrap() = Some(msg.into());
     }
 
     /// 拉起 orig-tg 子进程（幂等）：注入代理与凭据（解析规则见 [`resolve_tg_env`]，
@@ -146,7 +322,7 @@ impl AppState {
         }
         let cfg = self.config.read().unwrap().clone();
         let mut cmd = tokio::process::Command::new(tg_binary_path());
-        // 端口由入参决定（生产恒为 `TG_PORT`=9877，与 daemon 9876 分离）。
+        // 端口由入参决定（起点 `TG_PORT`=19787，不可绑定时 `tg_reselect_port` 顺延）。
         // 凭据显式注入（不依赖父进程环境继承），保证 Tauri/开机重启后 real 模式仍生效；
         // `[tg]` 段为空时回退同目录 `tg/config.json`（BUG-094）。
         // 注意：orig-tg 只读 `ORIG_TG_PORT`（见 orig-tg/src/config.rs::load），
@@ -179,12 +355,149 @@ impl AppState {
         }
         let child = cmd.spawn()?;
         *self.tg_child.lock().await = Some(child);
-        Ok(true)
+        *self.tg_last_spawn.lock().await = Some(tokio::time::Instant::now());
+
+        // BUG-177：`spawn()` 成功 ≠ 服务可用。等它真的开始监听，等到才算数。
+        // 起不来（端口被占用 / 落在系统保留区 / 二进制缺陷）就**如实报错**并把原因
+        // 记进 `tg_last_error` —— 绝不留一个「已开启但未连接」的幽灵状态。
+        let deadline = tokio::time::Instant::now() + TG_START_WAIT_TIMEOUT;
+        loop {
+            if tg_port_has_listener(port).await {
+                self.clear_tg_last_error();
+                return Ok(true);
+            }
+            // 子进程已经退出（bind 失败等）→ 立刻判定失败，不必空等到超时。
+            if !self.tg_managed_alive().await {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // 走到这里 = 拉起来了但没有服务。回收句柄，避免下一次 `tg_is_running_on`
+        // 因句柄存在而误判（句柄存在 → 直接 return true 而不探端口）。
+        let mut g = self.tg_child.lock().await;
+        if let Some(c) = g.as_mut() {
+            let _ = c.kill().await;
+            let _ = tokio::time::timeout(TG_STOP_WAIT_TIMEOUT, c.wait()).await;
+        }
+        *g = None;
+        // 区分两种「起不来」：端口根本绑不上（保留区 / 被占）vs 起来了但没监听。
+        // 混成一句「exited without listening」会把「本机这个端口不可用」伪装成
+        // 「orig-tg 自己崩了」，排查方向直接错。
+        let msg = if port_bindable(port).await {
+            format!("orig-tg exited without listening on 127.0.0.1:{port}")
+        } else {
+            format!(
+                "port 127.0.0.1:{port} is not bindable on this host (reserved by the OS or already in use); \
+                 daemon will pick another port on the next attempt"
+            )
+        };
+        self.set_tg_last_error(&msg);
+        Err(std::io::Error::new(std::io::ErrorKind::Other, msg))
     }
 
-    /// 拉起 orig-tg 子进程（固定 `TG_PORT`）。
+    /// 拉起 orig-tg 子进程（端口在拉起前重新选定，见 [`Self::tg_reselect_port`]）。
     pub async fn tg_start(&self) -> std::io::Result<bool> {
-        self.tg_start_on(TG_PORT).await
+        let port = self.tg_reselect_port().await;
+        self.tg_start_on(port).await
+    }
+
+    /// 重启 orig-tg（**唯一执行者语义**：凭证变更 / 链路恢复都走这里）。
+    ///
+    /// 为什么要有它（BUG-178）：orig-tg 只在启动时连一次 Telegram，凭证补齐或网络
+    /// 修好后必须重启才能生效。以前这个动作散在两处 —— 桌面壳 `ensure_tg`
+    /// （`kill_port_owner` 硬杀 9877）与前端「重试连接」按钮 —— 于是 TG 进程有
+    /// **两个主人**，互相杀。现在只留这一个入口：先停托管实例，再按当前选定端口拉起。
+    pub async fn tg_restart(&self) -> std::io::Result<bool> {
+        self.tg_stop().await;
+        self.tg_start().await
+    }
+
+    /// TG 托管巡检（BUG-177）：daemon 是 orig-tg 的**唯一所有者**，
+    /// 「开关开着但服务不在」是 daemon 的失职，必须自愈，而不是留给用户去点开关。
+    ///
+    /// 频率与退避：`TG_SUPERVISE_INTERVAL` 只做廉价的本机 connect 探测；
+    /// 真正 spawn 受 `TG_SPAWN_COOLDOWN` 限制 —— 二进制缺失这类**永久失败**
+    /// 不该变成每 15s 拉起一个立刻就死的进程。
+    pub async fn tg_supervise(self: &Arc<Self>) {
+        loop {
+            tokio::time::sleep(TG_SUPERVISE_INTERVAL).await;
+            let enabled = self.config.read().unwrap().tg_enabled;
+            if !enabled {
+                continue;
+            }
+            // 进程不在 → 拉起（短冷却）。
+            if !self.tg_is_running().await {
+                let can_spawn = {
+                    let last = self.tg_last_spawn.lock().await;
+                    match *last {
+                        Some(t) => t.elapsed() >= TG_SPAWN_COOLDOWN,
+                        None => true,
+                    }
+                };
+                if !can_spawn {
+                    continue;
+                }
+                match self.tg_start().await {
+                    Ok(true) => eprintln!("[tg] supervise: orig-tg recovered"),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("[tg] supervise: failed to start orig-tg: {e}"),
+                }
+                continue;
+            }
+            // 进程在，但**链路断了** → 重启（长冷却）。
+            //
+            // 为什么必须由 daemon 做（BUG-178）：orig-tg 只在启动时连一次 Telegram，
+            // 连不上就永远停在不可用态。以前这个动作是界面上的「重试连接」按钮 +
+            // 桌面壳 `ensure_tg` 两条手动路径 —— 用户修好网络还得替系统点一下，
+            // 那是把 daemon 的失职外包给用户。现在巡检自己收尾。
+            if self.tg_link_healthy().await {
+                continue;
+            }
+            let can_restart = {
+                let last = self.tg_last_restart.lock().await;
+                match *last {
+                    Some(t) => t.elapsed() >= TG_LINK_RESTART_COOLDOWN,
+                    None => true,
+                }
+            };
+            if !can_restart {
+                continue;
+            }
+            eprintln!("[tg] supervise: telegram link is down, restarting orig-tg");
+            *self.tg_last_restart.lock().await = Some(tokio::time::Instant::now());
+            match self.tg_restart().await {
+                Ok(true) => eprintln!("[tg] supervise: orig-tg restarted"),
+                Ok(false) => {}
+                Err(e) => eprintln!("[tg] supervise: failed to restart orig-tg: {e}"),
+            }
+        }
+    }
+
+    /// Telegram 链路是否健康（进程在跑时的**第二层**巡检，BUG-178）。
+    ///
+    /// 判据分三种，混淆它们就会误重启：
+    ///   - `available=true` → 健康；
+    ///   - 不可用但**没配凭证** → 也算健康（那是待用户去配置的**待办**，重启一百次也修不好，
+    ///     重启只会让配置页刚填完就被顶掉）；
+    ///   - 不可用且已配凭证 → 真断了，需要重启才能重连。
+    /// HTTP 本身失败（进程在但已半死）同样按「要重启」处理。
+    async fn tg_link_healthy(&self) -> bool {
+        let url = format!("http://127.0.0.1:{}/api/tg/session", self.tg_port_state());
+        let Ok(resp) = self.http.get(&url).send().await else {
+            return false;
+        };
+        // 走 `text()` + `serde_json`：daemon 不依赖 reqwest 的 `json` feature。
+        let Ok(body) = resp.text().await else {
+            return false;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+            return false;
+        };
+        tg_link_healthy_from(&v)
     }
 
     /// 终止 orig-tg 子进程并清空句柄（幂等）。
@@ -206,7 +519,27 @@ impl AppState {
             let _ = tokio::time::timeout(TG_STOP_WAIT_TIMEOUT, c.wait()).await;
         }
         *g = None;
+        // 主动关闭 = 用户意图，先前的失败原因不再相关（否则关掉再开还挂着旧错）。
+        self.clear_tg_last_error();
     }
+}
+
+/// 由 `/api/tg/session` 的响应判定链路是否健康（纯函数，便于单测）。
+///
+/// 三种情况必须分开，混淆就会误重启（BUG-178）：
+///   - `available=true` → 健康；
+///   - 不可用但**没配凭证** → 健康（待用户去配置的**待办**；重启一百次也修不好，
+///     还会把刚填完凭证、正要走登录流程的实例顶掉）；
+///   - 不可用且已配凭证 → 真断了，必须重启才可能重连。
+fn tg_link_healthy_from(v: &serde_json::Value) -> bool {
+    if v.get("available").and_then(|x| x.as_bool()).unwrap_or(false) {
+        return true;
+    }
+    let configured = v
+        .get("api_configured")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false);
+    !configured
 }
 
 /// 拉起 orig-tg 时要注入的三个可选环境变量。
@@ -308,8 +641,11 @@ pub fn resolve_tg_env(cfg: &Config, data_dir: &Path) -> TgLaunchEnv {
     }
 }
 
-/// 定位稳定数据目录：Windows 用 `%LocalAppData%\OrigHub`，否则 `$XDG_DATA_HOME` 或
-/// `~/.local/share/orighub`。TG 会话/监控库统一落到该目录，与启动 CWD 无关。
+/// 定位稳定数据目录：桌面壳的真实数据在 `%APPDATA%\com.origadmin.orighub`（Tauri `app_data_dir()`），
+/// 引擎旧默认回落 `%LOCALAPPDATA%\OrigHub` 只是个**空壳库**（store.db ~0.5MB，无真实条目）。
+/// 若默认回落到空壳库，会出现「布局渲染正常、媒体库数据为空/异常」——正是用户报告的
+/// 「静态布局通过、实际没有修复」。故未设 `ORIG_TG_DATA` 时**优先选真正含库数据**的目录，
+/// 保证任何启动路径（桌面壳 / 调试 / 直接跑二进制）都落到同一份真实数据，落实「调试=生产同源」。
 pub fn tg_data_dir() -> PathBuf {
     if let Ok(d) = std::env::var("ORIG_TG_DATA") {
         if !d.is_empty() {
@@ -317,9 +653,23 @@ pub fn tg_data_dir() -> PathBuf {
         }
     }
     if cfg!(windows) {
-        if let Ok(app) = std::env::var("LOCALAPPDATA") {
-            if !app.is_empty() {
-                return PathBuf::from(app).join("OrigHub");
+        // 候选目录：桌面壳真实目录优先于旧默认空壳库；最终选**含库数据**的那个。
+        let candidates: Vec<PathBuf> = vec![
+            std::env::var("APPDATA").ok().map(|a| PathBuf::from(a).join("com.origadmin.orighub")),
+            std::env::var("LOCALAPPDATA").ok().map(|l| PathBuf::from(l).join("OrigHub")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        for c in &candidates {
+            if c.join("tg").join("store.db").exists() {
+                return c.clone();
+            }
+        }
+        // 都没有真实数据：保持旧默认（首次冷启动在此建库，行为不变）
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            if !local.is_empty() {
+                return PathBuf::from(local).join("OrigHub");
             }
         }
     } else if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
@@ -364,7 +714,7 @@ mod tests {
     /// 构造一份最小 AppState（无托管子进程、默认配置）。
     fn test_state() -> AppState {
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
-        AppState::new(Registry::new(), tx, Config::default())
+        AppState::new(0, Registry::new(), tx, Config::default())
     }
 
     /// 借内核分配一个**当前空闲**的端口号（bind 后立刻释放）。
@@ -393,6 +743,52 @@ mod tests {
         std::env::remove_var("ORIG_TG_DATA");
     }
 
+    /// 默认（无 `ORIG_TG_DATA`）必须落到**真正含库数据**的目录，
+    /// 而不是盲目回落到空壳 `%LOCALAPPDATA%\OrigHub`。这是「静态布局通过、实际没修复」
+    /// 的根因修复的回归护栏：引擎旧默认回落到空壳库，媒体库布局渲染正常但数据为空/异常。
+    #[test]
+    #[cfg(windows)]
+    fn tg_data_dir_prefers_dir_with_data() {
+        let base = std::env::temp_dir().join(format!("orighub-pref-{}-{}", std::process::id(), "x"));
+        let real = base.join("appdata").join("com.origadmin.orighub");
+        let legacy = base.join("local").join("OrigHub");
+        std::fs::create_dir_all(real.join("tg")).unwrap();
+        std::fs::create_dir_all(legacy.join("tg")).unwrap();
+        // 仅 real 含 store.db → 应被优先选中，legacy 即使存在也不该被选中
+        std::fs::write(real.join("tg").join("store.db"), b"x").unwrap();
+
+        let prev_orig = std::env::var("ORIG_TG_DATA").ok();
+        let prev_app = std::env::var("APPDATA").ok();
+        let prev_local = std::env::var("LOCALAPPDATA").ok();
+        std::env::remove_var("ORIG_TG_DATA");
+        std::env::set_var("APPDATA", base.join("appdata"));
+        std::env::set_var("LOCALAPPDATA", base.join("local"));
+
+        let dir = tg_data_dir();
+
+        if let Some(v) = prev_orig {
+            std::env::set_var("ORIG_TG_DATA", v);
+        } else {
+            std::env::remove_var("ORIG_TG_DATA");
+        }
+        if let Some(v) = prev_app {
+            std::env::set_var("APPDATA", v);
+        } else {
+            std::env::remove_var("APPDATA");
+        }
+        if let Some(v) = prev_local {
+            std::env::set_var("LOCALAPPDATA", v);
+        } else {
+            std::env::remove_var("LOCALAPPDATA");
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            dir, real,
+            "default resolution must prefer the dir that holds store.db, not the empty legacy dir"
+        );
+    }
+
     #[tokio::test]
     async fn port_probe_detects_listener() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -410,6 +806,64 @@ mod tests {
             !tg_port_has_listener(port).await,
             "空闲端口不应被判为有监听者（否则会误判成 TG 已启动）"
         );
+    }
+
+    /// BUG-178：选端口必须**真能绑**，不能只看「有没有人监听」。
+    ///
+    /// 有牙：把起点端口占住，若实现直接返回起点（旧行为），返回值就是被占端口 → FAIL。
+    #[tokio::test]
+    async fn select_bindable_port_skips_occupied_port() {
+        let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = taken.local_addr().unwrap().port();
+
+        let picked = select_bindable_port(port).await.expect("应当能找到可绑定端口");
+        assert_ne!(
+            picked, port,
+            "起点端口被占用时必须顺延（修前恒返回起点 → 子进程 bind 失败）"
+        );
+        assert!(
+            port_bindable(picked).await,
+            "选出的端口必须真的可绑定：{picked}"
+        );
+    }
+
+    /// BUG-178：拉起前重选端口要落地到 state（`/api/config` 的 `tg_port` 读它）。
+    ///
+    /// 有牙：起点被占时若 `tg_reselect_port` 不换端口，`tg_port_state()` 仍是被占端口。
+    #[tokio::test]
+    async fn reselect_port_moves_off_unbindable_start() {
+        let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = taken.local_addr().unwrap().port();
+        // 起点从被占端口开始（`tg_port()` 读该 env）。
+        std::env::set_var("ORIG_TG_PORT", port.to_string());
+
+        let st = test_state();
+        assert_eq!(st.tg_port_state(), port, "前置条件：初始端口取 env 起点");
+        let picked = st.tg_reselect_port().await;
+        assert_ne!(picked, port, "起点不可绑定时必须顺延");
+        assert_eq!(st.tg_port_state(), picked, "选定结果必须落进 state（真源）");
+
+        std::env::remove_var("ORIG_TG_PORT");
+    }
+
+    /// BUG-178：链路巡检的判据必须把「没配凭证」与「真断了」分开。
+    ///
+    /// 有牙：若实现只看 `available`，第一种（未配置）也会被判成不健康 → 用户每 5 分钟
+    /// 被重启一次，配置页刚填的凭证永远走不完登录。
+    #[test]
+    fn link_health_distinguishes_missing_credentials_from_real_outage() {
+        let unconfigured = serde_json::json!({"available": false, "api_configured": false});
+        assert!(
+            tg_link_healthy_from(&unconfigured),
+            "未配置凭证是待办不是故障：不该触发自动重启"
+        );
+        let down = serde_json::json!({"available": false, "api_configured": true});
+        assert!(
+            !tg_link_healthy_from(&down),
+            "已配凭证却连不上 = 真故障，必须重启才可能恢复"
+        );
+        let ok = serde_json::json!({"available": true, "api_configured": true});
+        assert!(tg_link_healthy_from(&ok), "可用时不该重启");
     }
 
     /// BUG-091 的实测矛盾态：9877 确实在跑（外部/遗留实例），但本进程没有子进程句柄，

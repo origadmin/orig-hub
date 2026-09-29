@@ -179,6 +179,14 @@ async fn session(State(st): State<Arc<AppState>>) -> impl IntoResponse {
         "user_id": view.user_id,
         "available": st.availability.is_ready(),
         "reason": st.availability.reason(),
+        // BUG-178：凭证是否已配置。
+        //
+        // 缺这个字段时，「没配凭证」与「Telegram 连不上」被压成同一个
+        // `available=false`，前端只能一律渲染「Telegram 不可用」—— 于是**待用户完成的
+        // 动作**（去设置页填 api_id/api_hash、登录）被说成了故障，而设置页同时显示
+        // 「Telegram 插件：运行中」，两处自相矛盾。有了它，前端才能把二者分开：
+        // 未配置 → 引导配置；已配置连不上 → 如实报链路故障 + 由 daemon 自愈。
+        "api_configured": st.config.api_id.is_some() && st.config.api_hash.is_some(),
     }))
 }
 
@@ -344,29 +352,46 @@ struct DialogsQuery {
 /// - 缓存为空（首启）或 `refresh=1` 时，后台 spawn 一次**全量** `client.dialogs()`
 ///   逐条 upsert；扫描期间 `scanning=true`，前端轮询直到翻为 false；
 /// - 返回 `{items,total,hasMore,scanning}`。refresh 不清缓存（旧数据先顶着，避免闪烁）。
+///
+/// BUG-179：客户端不可用（离线模式 / MTProto 断开）**不再拒绝服务本地缓存**。
+/// `dialog_cache` 本身就是历史已授权会话的落库结果 —— 「连不上 Telegram」
+/// 是链路状态，不是「本地没有数据」；旧逻辑把两者压成同一个 503，
+/// 用户在调试模式下看着 516 条本地频道缓存却什么都拿不到。
+/// 客户端不可用时：跳过鉴权与实时 folder 修正、不触发扫描，纯服务缓存；
+/// 缓存也为空时才如实报 503（附可用性原因，可行动）。
 async fn dialogs(State(st): State<Arc<AppState>>, Query(q): Query<DialogsQuery>) -> Result<impl IntoResponse, ApiError> {
-    ensure_authorized(&st).await?;
-    let limit = q.limit.clamp(1, 200);
-    let offset = q.offset.max(0);
-
-    let total = st
+    let client_ready = st.availability.is_ready();
+    let mut total = st
         .store
         .count_dialogs()
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
 
-    // 首启无缓存，或显式刷新：触发后台全量扫描（内部自行去重，不会并发重复跑）。
-    if total == 0 || q.refresh != 0 {
-        spawn_dialog_scan(st.clone());
+    if !client_ready {
+        if total == 0 {
+            // 本地没有可服务的缓存、客户端又不可用：如实报原因，绝不伪装成空列表。
+            let reason = st
+                .availability
+                .reason()
+                .unwrap_or("telegram client unavailable");
+            return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, reason));
+        }
+    } else {
+        ensure_authorized(&st).await?;
+        // 首启无缓存，或显式刷新：触发后台全量扫描（内部自行去重，不会并发重复跑）。
+        if total == 0 || q.refresh != 0 {
+            spawn_dialog_scan(st.clone());
+        }
     }
 
     let mut items = st
         .store
-        .read_dialogs(offset, limit)
+        .read_dialogs(q.offset.max(0), q.limit.clamp(1, 200))
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     // folder 实时修正（BUG-017）：dialog_cache.folder 覆盖不全（历史扫描缺列），
     // 以 TG 实时 DialogFilter 的 channel_ids 映射为准覆盖；读取失败时静默保留旧值。
+    // 客户端不可用时 `folders()` 自然 Err → 走既有降级路径，本地 folder 原样返回。
     if let Ok(folders) = st.client.folders().await {
         let mut map: std::collections::HashMap<i64, &str> = std::collections::HashMap::new();
         for f in folders.iter() {
@@ -380,12 +405,14 @@ async fn dialogs(State(st): State<Arc<AppState>>, Query(q): Query<DialogsQuery>)
             }
         }
     }
-    let total = st
-        .store
-        .count_dialogs()
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-    let has_more = total > offset + limit as i64;
+    if client_ready {
+        total = st
+            .store
+            .count_dialogs()
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    }
+    let has_more = total > q.offset.max(0) + (q.limit.clamp(1, 200)) as i64;
     Ok(Json(json!({
         "items": items,
         "total": total,
@@ -880,18 +907,31 @@ async fn cached_path(st: &AppState, chat_id: i64, message_id: i64) -> Option<Str
 /// （T0，见 `run_one_cache_task` 与 `IngestCtx`），任务路径只负责取字节；落盘成功后
 /// 由调用方用 `backfill_item_bytes` 专用语句回填 `file_path`（不走 COALESCE upsert）。
 /// 单条下载端点（`/api/tg/download`）仍走 [`cache_one`] 的「下载即入库」旧契约。
+///
+/// `task_id`（BUG-181）：Some 时把条目内字节进度挂到该任务（`cache_dl_begin/end`），
+/// 任务端点序列化时注入 `itemBytes`/`itemBytesTotal`；单条端点传 None 不报。
 async fn cache_one_bytes(
     st: &AppState,
+    task_id: Option<i64>,
     chat_id: i64,
     message_id: i64,
     dir: &str,
 ) -> Result<DownloadOutcome, ApiError> {
-    // BUG-106：下载失败同样不再裸抛传输层原文。
-    // 失败**必须**是失败（不能伪装成成功），但要给出可行动的原因而不是
-    // `request error: dropped (cancelled)` 这种只有维护者才懂的串。
-    let outcome = match st.client.download(chat_id, message_id, dir).await {
+    // 条目内字节进度（BUG-181）：begin 清零并绑定任务；end 在成败两路都解绑，
+    // 保证「任务已切条目」后不会把旧字节报给新条目。
+    if let Some(id) = task_id {
+        st.cache_dl_begin(id);
+    }
+    let outcome = match st
+        .client
+        .download(chat_id, message_id, dir, Some(&st.cache_dl))
+        .await
+    {
         Ok(o) => o,
         Err(e) => {
+            if task_id.is_some() {
+                st.cache_dl_end();
+            }
             let reason = e.to_string();
             let hint = if st.client.link_alive() {
                 "download failed"
@@ -907,6 +947,9 @@ async fn cache_one_bytes(
             ));
         }
     };
+    if task_id.is_some() {
+        st.cache_dl_end();
+    }
     // 缓存状态入库（BUG-016 根因：此前从未标记，列表永远显示未缓存）。
     // 元数据回填（D1 根因）：mark_downloaded 的兜底 upsert 只写 downloaded/file_path，
     // 未监控频道的行缺 type/mime/size/date/duration/group_id → 缓存库显 📄、聚合失效。
@@ -944,7 +987,7 @@ async fn cache_one(
     message_id: i64,
     dir: &str,
 ) -> Result<(DownloadOutcome, Option<i64>), ApiError> {
-    let outcome = cache_one_bytes(st, chat_id, message_id, dir).await?;
+    let outcome = cache_one_bytes(st, None, chat_id, message_id, dir).await?;
     let id = import_cached_file(st, chat_id, message_id, &outcome.path).await;
     Ok((outcome, id))
 }
@@ -1086,14 +1129,37 @@ async fn enqueue_cache_task(
     Ok(Json(task))
 }
 
+/// BUG-181：任务 JSON 注入条目内字节进度（仅 `running` 且字节归属当前任务时）。
+///
+/// `total == 0`（条目刚起步、总量未可知）不注入，前端按「无字节进度」渲染，
+/// 避免 `0/0` 这类空洞分母出现。
+fn task_with_progress(st: &AppState, t: &CacheTask) -> serde_json::Value {
+    let mut v = serde_json::to_value(t).unwrap_or(serde_json::Value::Null);
+    if v.is_object() && t.status == "running" {
+        if let Some((bytes, total)) = st.cache_dl_progress(t.id) {
+            if total > 0 {
+                v["itemBytes"] = json!(bytes);
+                v["itemBytesTotal"] = json!(total);
+            }
+        }
+    }
+    v
+}
+
 /// GET /api/tg/cache/tasks — 返回**当前唯一**任务（设计裁定：不论多少缓存在排队，
-/// 这个端点只返回一个结果）。选取顺序：running → 最老 queued → 最近一条已结束
+/// 这个端点只呈现**一个**进度）。选取顺序：running → 最老 queued → 最近一条已结束
 /// （供前端收尾展示与失败提示）；队列为空且无历史时 `task: null`。
+///
+/// `queued`（BUG-181）：排队任务的**覆盖摘要**（id/chat/groupId/messageIds/total，
+/// 不带进度——单飞呈现不变）。此前排队任务在该端点完全不可见：用户入队第二组时
+/// 前端下 1 拍就被 running 任务覆盖回「未缓存」，呈现为「无法添加」。现在入队
+/// 即有「排队中」反馈，仍是同一请求、同一事实源，不新增派生轮询。
 ///
 /// **读路径 O(1)**：服务内存快照，不碰 SQLite。快照由每个 DB 写点同步刷新，
 /// 与 worker 的写永远一致（见 `AppState::refresh_cache_tasks`）。
 /// 这是前端 1s 轮询的高频端点——读走内存是流畅度的底线。
-async fn list_cache_tasks(State(st): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+/// 任务端点响应体（`list_cache_tasks` 的内核，测试直接驱动）。
+async fn cache_tasks_payload(st: &AppState) -> serde_json::Value {
     let tasks = st.cache_tasks_snapshot().await;
     // 单飞模型下快照里至多一个 running（+ 若干 queued）；按端点契约选出一个呈现。
     let task = tasks
@@ -1102,7 +1168,28 @@ async fn list_cache_tasks(State(st): State<Arc<AppState>>) -> Result<impl IntoRe
         .or_else(|| tasks.iter().find(|t| t.status == "queued"))
         .or_else(|| tasks.first())
         .cloned();
-    Ok(Json(json!({ "task": task })))
+    let queued: Vec<serde_json::Value> = tasks
+        .iter()
+        .filter(|t| t.status == "queued")
+        .take(20)
+        .map(|t| {
+            json!({
+                "id": t.id,
+                "chatId": t.chat_id,
+                "groupId": t.group_id,
+                "messageIds": t.message_ids,
+                "total": t.total,
+            })
+        })
+        .collect();
+    json!({
+        "task": task.as_ref().map(|t| task_with_progress(st, t)),
+        "queued": queued,
+    })
+}
+
+async fn list_cache_tasks(State(st): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(cache_tasks_payload(&st).await))
 }
 
 /// GET /api/tg/cache/tasks/all — 全量任务列表 + 各状态计数（缓存管理面板）。
@@ -1113,6 +1200,10 @@ async fn list_all_cache_tasks(State(st): State<Arc<AppState>>) -> Result<impl In
         .list_cache_tasks(500)
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let tasks: Vec<serde_json::Value> = tasks
+        .iter()
+        .map(|t| task_with_progress(&st, t))
+        .collect();
     let mut counts = serde_json::Map::new();
     for s in ["queued", "running", "done", "failed", "cancelled", "interrupted"] {
         counts.insert(s.to_string(), json!(0));
@@ -1134,7 +1225,7 @@ async fn cache_task_by_id(
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
     match st.store.get_cache_task(id).await {
-        Ok(Some(t)) => Ok(Json(t)),
+        Ok(Some(t)) => Ok(Json(task_with_progress(&st, &t))),
         Ok(None) => Err(ApiError::new(StatusCode::NOT_FOUND, "cache task not found")),
         Err(e) => Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
     }
@@ -1730,7 +1821,7 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
             st.refresh_cache_tasks().await;
             continue;
         }
-        match cache_one_bytes(st, task.chat_id, msg_id, &dir).await {
+        match cache_one_bytes(st, Some(task_id), task.chat_id, msg_id, &dir).await {
             Ok(outcome) => {
                 match &registered {
                     Some((item, _)) => {
@@ -3834,8 +3925,10 @@ async fn scan_media_dir(
 mod tests {
     use super::delete_media_item;
     use super::delivery_due_secs;
+    use super::cache_tasks_payload;
     use super::normalized_series_name;
     use super::serve_local_file;
+    use serde_json::json;
 
     use std::sync::Arc;
 
@@ -4220,6 +4313,7 @@ mod tests {
             chat_id: i64,
             message_id: i64,
             dir: &str,
+            _progress: Option<&crate::login::DownloadProgress>,
         ) -> Result<DownloadOutcome, ClientError> {
             if self.fail_downloads.contains(&message_id) {
                 return Err(ClientError::Other("injected download failure".into()));
@@ -4286,6 +4380,90 @@ mod tests {
             .expect("enqueue must succeed")
             .expect("task must be created")
             .0
+    }
+
+    /// BUG-181 判据 a：任务 1 在跑时入队任务 2，`/api/tg/cache/tasks` 必须同时给出
+    /// running 的 `task` 与排队任务的 `queued` 覆盖摘要——入队即有反馈，不再无声消失。
+    #[tokio::test]
+    async fn queued_task_is_visible_in_tasks_endpoint() {
+        let dir = scratch_dir("bug181_queued_visible");
+        let st = cache_fixture_state(
+            &dir,
+            vec![],
+            vec![
+                fixture_msg(1, "video", "video/mp4", Some("EP01"), None),
+                fixture_msg(2, "video", "video/mp4", Some("EP02"), None),
+                fixture_msg(3, "video", "video/mp4", Some("EP03"), None),
+            ],
+        )
+        .await;
+        let task_a = enqueue_fixture_task(&st, &[1, 2], None).await;
+        let _task_b = enqueue_fixture_task(&st, &[3], None).await;
+        // 任务 A 置 running（模拟 worker 在跑），快照刷新。
+        let _ = st.store.mark_cache_task_running(task_a.id).await;
+        st.refresh_cache_tasks().await;
+
+        let resp = cache_tasks_payload(&st).await;
+        let task = resp.get("task").cloned().expect("task field present");
+        assert_eq!(
+            task.get("id").and_then(|v| v.as_i64()),
+            Some(task_a.id),
+            "呈现的任务必须是 running 的任务 A"
+        );
+        let queued = resp
+            .get("queued")
+            .and_then(|v| v.as_array())
+            .expect("queued array present");
+        assert!(
+            queued
+                .iter()
+                .any(|q| q.get("messageIds").and_then(|m| m.as_array())
+                    .map(|m| m.contains(&json!(3)))
+                    .unwrap_or(false)),
+            "排队任务 B（msg 3）必须出现在 queued 覆盖摘要里，实际: {queued:?}"
+        );
+    }
+
+    /// BUG-181 判据 b：running 任务的条目内字节进度注入 `itemBytes`/`itemBytesTotal`；
+    /// 条目结束（end 解绑）后不再注入——旧字节不得错配给新状态。
+    #[tokio::test]
+    async fn item_byte_progress_is_injected_only_while_owned() {
+        let dir = scratch_dir("bug181_progress");
+        let st = cache_fixture_state(
+            &dir,
+            vec![],
+            vec![fixture_msg(1, "video", "video/mp4", Some("EP01"), None)],
+        )
+        .await;
+        let task = enqueue_fixture_task(&st, &[1], None).await;
+        let _ = st.store.mark_cache_task_running(task.id).await;
+        st.refresh_cache_tasks().await;
+
+        // 模拟 worker 下载中：绑定任务 + 字节 40/100。
+        st.cache_dl_begin(task.id);
+        st.cache_dl.set_total(100);
+        st.cache_dl.add_bytes(40);
+        let resp = cache_tasks_payload(&st).await;
+        let task_json = resp.get("task").cloned().expect("task field present");
+        assert_eq!(
+            task_json.get("itemBytes").and_then(|v| v.as_u64()),
+            Some(40),
+            "条目内字节必须注入"
+        );
+        assert_eq!(
+            task_json.get("itemBytesTotal").and_then(|v| v.as_u64()),
+            Some(100),
+            "条目内总量必须注入"
+        );
+
+        // 解绑后（条目结束）：不再注入。
+        st.cache_dl_end();
+        let resp = cache_tasks_payload(&st).await;
+        let task_json = resp.get("task").cloned().expect("task field present");
+        assert!(
+            task_json.get("itemBytes").is_none(),
+            "解绑后不得再注入 itemBytes"
+        );
     }
 
     /// 分集结构快照：(episode_no, episode_no_end, 条目 ref, kind, has_bytes, 挂图 refs)。

@@ -18,7 +18,7 @@ import { useTgSearch } from '../store/tgSearch'
  */
 export const TgGlobalSearch = memo(function TgGlobalSearch() {
   const { t } = useTranslation()
-  const ready = useStore((s) => resolveTgFeatureReady(s.tgEnabled, s.tgAvailability))
+  const ready = useStore((s) => resolveTgFeatureReady(s.tgService))
   const input = useTgSearch((s) => s.input)
   const setInput = useTgSearch((s) => s.setInput)
   const committed = useTgSearch((s) => s.committed)

@@ -75,27 +75,22 @@ export const selectConnected = (s: RootState): boolean => s.connected
 export const selectDaemonAlive = (s: RootState): boolean => s.daemon?.alive === true
 
 /**
- * TG 入口级门控的**单一判据**（BUG-094 / BUG-097；2026-09-23 修订以修复回归）。
+ * TG 入口级门控的**单一判据**（BUG-094 / BUG-097 / BUG-177 / BUG-178）。
  *
- * 入口是否显示**只由开关决定**：`tgEnabled` 为真即显示。
+ * 设计（2026-09-29 拍板）：**「TG 服务可用？否 → 不显示 TG」**。这里的「服务」
+ * 是 **orig-tg 进程**，由 daemon 独占托管 —— 判据因此只问 daemon：
  *
- * 历史实现会在 `tgAvailability.status === 'unreachable'` 时把入口一起藏掉，
- * 但那恰恰是最该让用户看见的状态——orig-tg 进程没起来，用户需要点进面板去
- * 「设置 → 账号」启动 / 重试。藏掉入口等于把唯一的自救路径也切断，与 BUG-094/097
- * 的本意（「入口常驻，让用户能进去修」）自相矛盾，正是本次回归的根因。
+ *   - `enabled && running` → 显示。
+ *   - 其余一切 → 不显示。留一个「已开启但未连接」的入口，等于把 daemon 的失职
+ *     包装成一种合法的产品状态，用户只会反复怀疑「是不是数据丢了」（BUG-177）。
  *
- * `unavailable`（进程活着、连不上 Telegram）与 `unreachable`（连进程都够不到）
- * **都不再隐藏入口**；两种故障态的修复横幅与「启动 / 重试」出口由 `AccountsPanel`
- * / `TgPanel` 在面板内渲染。可用性只用于面板内的状态展示，不再参与入口级门控。
+ * **链路层（Telegram 侧）不参与门控**（BUG-178）：没配凭证、没登录都是**待用户完成的
+ * 动作**，藏掉入口就永远完不成。以前判据里掺了链路探测，于是同一时刻出现
+ * 「设置页：插件运行中」与「面板：Telegram 不可用」并存 —— 两个真源各说各话。
  *
- * 注意（设计决策，非静默改写）：`tgAvailability` 形参保留以维持调用方签名稳定，
- * 入口级门控不再依据它分支。此处刻意与 `TgCacheEntry` 的 `unreachable` 隐藏逻辑
- * 区分——缓存入口需要真实服务才能查看，而导航入口是用户进入修复面板的唯一入口。
+ * 自救路径在**设置页**（TG 卡片常驻可见），失败原因由 daemon 的 `tg_last_error`
+ * 摆在开关旁；拉起/重启/kill 全部由 daemon 执行，不留手动运维入口。
  */
-export function resolveTgFeatureReady(
-  tgEnabled: boolean,
-  tgAvailability: RootState['tgAvailability'],
-): boolean {
-  void tgAvailability
-  return tgEnabled
+export function resolveTgFeatureReady(tgService: RootState['tgService']): boolean {
+  return tgService.enabled && tgService.running
 }

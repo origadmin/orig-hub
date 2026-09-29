@@ -121,6 +121,33 @@
   「抹掉历史手动选择」风险实测为零）。
 - **处置**：撤下。若对「自动改主」本身有异议，按 §3.4 的请求句单独提。
 
+### ✓ TG 缓存落盘根：已决 —— 统一为通用下载目录（A）+ 可删区判据多根兼容
+
+- **结论**：**A（统一为通用下载目录）+ 多根兼容前置**。
+  依据不是「哪个方案更好」，而是**兼容性与冲突面** —— 两个方案都能解决「缓存落哪」，
+  但实测数据与既有设计把答案唯一确定下来：
+  1. **设计与 A 同向、与 B 相抵**：`telegram-cache-storage-redesign.md` §3.5 / §9 D3
+     与 `blob-store-design.md` C1 均以 `<download_dir>` 为根；
+     B 同时违反这两条 + `BUG-173` 的 `download_dir` 归属定案（归**下载引擎域**）。
+  2. **双根裂缝已经存在（实测）**：在产库 `%APPDATA%/com.origadmin.orighub/tg/store.db`
+     的 37 条 `source=tg` 条目分属**两个根**（`%AppData%/…/tg/downloads` ~36 条，
+     `C://Users//godcong//Downloads//` ≥1 条），且**全为绝对路径**。
+  3. **真正的阻塞点是判据，不是选哪个根**：`inside_dir`（`cache.rs:217-231`）是**单根**判据，
+     而 5 个调用点用了**三种口径**（`cache.rs:292`/`:790` 单根；`:425`/`:431`/`:1075`、
+     `routes.rs:2678` 双根）——「谁拥有这段字节」没有单一真源。
+     ⇒ 无论选哪个根，**判据都必须改造**；这一条比 A/B 之争更根本。
+
+- **落地施工图**：`docs/design/cache-root-unification-2026-09-28.md`
+  （R1–R5 结论 + C1–C6 施工项 + C1-A…C6-B 判据，每条含反向证伪）。
+- **处置**：本项从「待拍板」**撤下**。若对结论有异议，应按缺陷流程立 BUG 或按决策流程重开，
+  不得当决策项重复回抛（`decision-spec.md` §四）。
+
+- **落地证据**（实测，换机可核）：
+  - 在产库指纹：`media_item` 137 / `media_message` 3014 / `media_episode` 46；
+    对照 repo 根 `tg_store.db` 三表全 0（空壳）。
+  - `source` 分布：`local` 94 / `tg` 43（37 条有路径）。
+  - `inside_dir` 五调用点：`cache.rs:292`、`:425`、`:431`、`:790`、`:1075`、`routes.rs:2678-2679`（行号已逐一实测核对）。
+
 ---
 
 ## 三、可开工、不需等决策
@@ -157,3 +184,5 @@
 | 架构复盘（含离线优先定案与两处更正） | `docs/review/media-tg-review-2026-09-22.md` |
 | 单集多源 + 主版本增量设计 | `docs/design/episode-multi-source-design-2026-09-22.md` |
 | 媒体库管理 PRD（8 维取证 + 需求池 R1-R14） | `docs/design/media-library-management-prd-2026-09-22.md` |
+| **缓存落盘根统一 + 判据多根兼容施工图（D3 落地）** | `docs/design/cache-root-unification-2026-09-28.md` |
+| 待拍板决策清单（本文件，含 D3 已决存档） | `docs/review/pending-decisions-2026-09-22.md` |

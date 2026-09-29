@@ -6,6 +6,7 @@ import type {
   TgMediaItem,
   TgMessagePage,
   TgMonitoredChannel,
+  TgQueuedTask,
   TgSession,
   TgStoredItem,
   TgStoredMessage,
@@ -13,13 +14,27 @@ import type {
 import { t } from '../i18n'
 import { classifyTgReason, logTgReason } from '../lib/tgReason'
 
-/** orig-tg 默认端口（与 Rust 侧 orig-tg 监听端口一致，独立于 daemon 的 9876） */
-export const TG_PORT = 9877
+/** orig-tg 起始端口（与 Rust 侧 orig-tg 默认端口一致；仅作**初值**） */
+export const TG_PORT = 19787
 
-/** 开发模式下 orig-tg 可能不在 9877（可被环境变量覆盖，仅用于本地调试） */
-const port = Number(import.meta.env.VITE_TG_PORT ?? TG_PORT)
+/**
+ * orig-tg **实际**端口的初值。
+ *
+ * 为什么不是常量（BUG-178）：端口由 daemon 决定 —— 它可能迁移，也可能因保留区
+ * 顺延。前端曾经各写一份 9877（这里一份、桌面壳一份），daemon 换端口后两边一起错，
+ * 表现为「服务在跑、前端说不可用」。真源是 `GET /api/config` 的 `tg_port`。
+ */
+let tgPort = Number(import.meta.env.VITE_TG_PORT ?? TG_PORT)
 
-export const TG_BASE = `http://127.0.0.1:${port}`
+/** 用 daemon 下发的真源端口覆盖初值（幂等） */
+export function setTgPort(port: number) {
+  if (Number.isFinite(port) && port > 0 && port !== tgPort) tgPort = port
+}
+
+/** orig-tg 基址（**每次现算**：端口可能在运行期被 daemon 改写） */
+export function tgBase(): string {
+  return `http://127.0.0.1:${tgPort}`
+}
 
 /** 从响应体取服务端给的 `error` 字段（本服务统一 `{"error": "..."}` 形状）。 */
 function extractErrorField(body: string): string | null {
@@ -68,7 +83,7 @@ export function tgFailureMessage(status: number, statusText: string, body: strin
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let res: Response
   try {
-    res = await fetch(`${TG_BASE}${path}`, {
+    res = await fetch(`${tgBase()}${path}`, {
       headers: { 'Content-Type': 'application/json' },
       ...init,
     })
@@ -275,13 +290,13 @@ export function downloadTgMessage(
 /** GET /api/tg/file/{chat}/{msg} — 媒体在线流（照片→JPEG；视频→Range）。
  * 供 <img>/<video> 直接引用实现点看/点放，不预下载、不过度缓存。 */
 export function tgFileUrl(chatId: number | string, messageId: number | string): string {
-  return `${TG_BASE}/api/tg/file/${encodeURIComponent(String(chatId))}/${encodeURIComponent(String(messageId))}`
+  return `${tgBase()}/api/tg/file/${encodeURIComponent(String(chatId))}/${encodeURIComponent(String(messageId))}`
 }
 
 /** GET /api/tg/thumb/{chat}/{msg} — 轻量缩略图（<=480px JPEG，列表海报专用）。
  *  后端优先返回 TL 内嵌 Cached 缩略图（秒回）；无缩略图时该 URL 返回 404。 */
 export function tgThumbUrl(chatId: number | string, messageId: number | string): string {
-  return `${TG_BASE}/api/tg/thumb/${encodeURIComponent(String(chatId))}/${encodeURIComponent(String(messageId))}`
+  return `${tgBase()}/api/tg/thumb/${encodeURIComponent(String(chatId))}/${encodeURIComponent(String(messageId))}`
 }
 
 /** GET /api/tg/config — 运行时配置（缓存下载目录、库根等） */
@@ -311,7 +326,7 @@ export async function setTgLibraryDir(libraryDir: string): Promise<{ libraryDir:
 /** GET /api/tg/local/{chat}/{msg} — 已缓存文件的本地流（支持 Range，不回源 TG）。
  *  供 <video> 直接引用；未缓存/文件缺失时返回 404，前端降级在线流。 */
 export function tgLocalFileUrl(chatId: number | string, messageId: number | string): string {
-  return `${TG_BASE}/api/tg/local/${encodeURIComponent(String(chatId))}/${encodeURIComponent(String(messageId))}`
+  return `${tgBase()}/api/tg/local/${encodeURIComponent(String(chatId))}/${encodeURIComponent(String(messageId))}`
 }
 
 /** GET /api/tg/stored?q=&type=&downloaded=1&beforeId=&limit= — 缓存库跨频道聚合视图（新→旧） */
@@ -367,10 +382,16 @@ export async function listTgDownloaded(
 // 刷新/切页即消失（「缓存状态完全丢失」的根因）。这里只负责入队 + 读状态。
 
 /** GET /api/tg/cache/tasks — 返回**当前唯一**任务（后端单飞：running → 最老 queued →
- *  最近一条已结束；无任务时 null）。挂载时调用即恢复进度，1s 轮询也走这里。 */
-export async function getCacheTask(): Promise<TgCacheTask | null> {
-  const res = await request<{ task?: TgCacheTask | null }>('/api/tg/cache/tasks')
-  return res.task ?? null
+ *  最近一条已结束；无任务时 null）与排队任务覆盖摘要 `queued`（BUG-181）。
+ *  挂载时调用即恢复进度，轮询也走这里。 */
+export async function getCacheTask(): Promise<{
+  task: TgCacheTask | null
+  queued: TgQueuedTask[]
+}> {
+  const res = await request<{ task?: TgCacheTask | null; queued?: TgQueuedTask[] }>(
+    '/api/tg/cache/tasks',
+  )
+  return { task: res.task ?? null, queued: res.queued ?? [] }
 }
 
 /**

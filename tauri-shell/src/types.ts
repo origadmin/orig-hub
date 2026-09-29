@@ -119,12 +119,19 @@ export interface TgSession {
   phone?: string | null
   user_id?: number | null
   /**
-   * TG 依赖是否可用。`false` 表示 orig-tg 连不上 Telegram（凭证缺失或 MTProto 失败），
+   * Telegram 链路是否可用。`false` 表示 orig-tg 连不上 Telegram（凭证缺失或 MTProto 失败），
    * 此时 `reason` 给出原因 —— 注意这**不是**「未登录」，二者必须分开显示。
    */
   available?: boolean
   /** 不可用原因（`available === false` 时非空）。 */
   reason?: string | null
+  /**
+   * MTProto 凭证（api_id/api_hash）是否已配置（BUG-178）。
+   *
+   * 没有它时，「没配凭证」与「Telegram 连不上」被压成同一个 `available=false`，
+   * 前端只能一律喊「Telegram 不可用」—— 于是**待用户完成的动作**被说成了故障。
+   */
+  api_configured?: boolean
 }
 
 /**
@@ -136,6 +143,46 @@ export interface TgSession {
  *
  * 后两态都**不**清空绑定态：不知道 ≠ 没登录（BUG-023 的界面根因）。
  */
+/**
+ * TG **服务层**状态（orig-tg 进程）：唯一真源是 daemon `/api/config`。
+ *
+ * 与链路层（Telegram 侧）严格分开（BUG-178）：以前两者共用一个 `available` 词，
+ * 于是「设置页说插件可用且开启」与「面板里到处说 Telegram 不可用」同时为真 —— 它们
+ * 本来就在说两件事。进程层只回答「服务在不在」，进程不在 = 模块不显示。
+ */
+export interface TgServiceState {
+  /** 用户开关（持久化在 download-engine.toml） */
+  enabled: boolean
+  /** 进程是否真的在服务（daemon 探活，不是前端猜的） */
+  running: boolean
+  /** daemon 下发的实际端口（真源；可能因保留区顺延） */
+  port: number | null
+  /** 最近一次拉起/自愈失败的原因（null = 最近一次成功） */
+  lastError: string | null
+}
+
+/**
+ * TG **链路层**状态（Telegram 侧）：真源是 orig-tg `/api/tg/session`。
+ *
+ * - `needs_config` / `needs_login`：**待用户完成的动作**，不是故障 ——
+ *   绝不能再渲染成「Telegram 不可用」（BUG-178 的直接观感问题）。
+ * - `link_down`：真故障（已配凭证但连不上），如实报原因，重启由 daemon 负责。
+ * - `unknown`：服务不在或还没探测到，链路无从谈起。
+ */
+export type TgLinkState =
+  | 'ready'
+  | 'needs_config'
+  | 'needs_login'
+  | 'link_down'
+  | 'unknown'
+
+export interface TgLinkInfo {
+  state: TgLinkState
+  /** 仅 `link_down` / `needs_config` 带原因（供诊断，不直接喂给用户） */
+  reason: string | null
+}
+
+/** @deprecated 由 `TgServiceState` + `TgLinkInfo` 两层取代（BUG-178）。 */
 export type TgAvailability =
   | { status: 'ok' }
   | { status: 'unavailable'; reason: string | null }
@@ -242,6 +289,26 @@ export interface TgCacheTask {
   error?: string
   createdAt: number
   updatedAt: number
+  /**
+   * 条目内字节进度（BUG-181，仅 running 且归属当前任务时有值）：
+   * 一条 200MB 视频下载数分钟，此前 `done` 在条目边界才更新，UI 全程冻结。
+   */
+  itemBytes?: number
+  itemBytesTotal?: number
+}
+
+/**
+ * 排队任务覆盖摘要（BUG-181，GET /api/tg/cache/tasks 的 `queued` 数组项）。
+ * 单飞呈现仍是「一个进度」：排队任务不带进度，只带覆盖集合，前端据此把
+ * 排队条目呈现为「排队中」——此前排队任务在该端点完全不可见，用户入队
+ * 第二组时呈现为「无法添加」。
+ */
+export interface TgQueuedTask {
+  id: number
+  chatId: number
+  groupId?: number
+  messageIds: number[]
+  total: number
 }
 
 /** orig-tg 运行诊断快照（GET /api/tg/diag） */

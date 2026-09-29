@@ -113,7 +113,12 @@ function check(name, ok, detail) {
     const card = page.locator(`[data-testid="series-card"][data-series-id="${series.id}"]`).first()
     await card.waitFor({ timeout: 15000 })
     await card.click()
-    await page.locator('[data-testid="series-title-edit"]').first().waitFor({ timeout: 15000 })
+    // 2026-09-28 重排：独立「改名」铅笔 `series-title-edit` 已移除，能力并入 `series-edit` 面板。
+    // 就绪信号改用 `series-edit`（编辑入口），旧名由 layoutCompat 兜底但不再依赖它。
+    await page
+      .locator('[data-testid="series-edit"], [data-testid="series-title-edit"]')
+      .first()
+      .waitFor({ timeout: 15000 })
     await sleep(1200)
     await page.screenshot({ path: path.join(OUT, '01_series_detail.png') })
     check('⓪ 已进入剧集详情', true, `series#${series.id}`)

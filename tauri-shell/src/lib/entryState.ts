@@ -17,7 +17,8 @@
  * 1. tg 图片（BUG-049 代理语义）：raw 端点现场代理 TG 缩略图字节 → **即时点亮**，
  *    永远 `cached`，没有「缺字节」态；
  * 2. 字节真值 `present` → `cached`（磁盘事实是唯一「能播」判据，BUG-132）；
- * 3. 任务活跃（queued/running，且覆盖该条目）→ `caching`（新事实压过一切旧态）；
+ * 3. 任务活跃（queued/running，且覆盖该条目）→ `queued` / `caching`（新事实压过
+ *    一切旧态；queued 是排队——本轮跑不到它，呈现上与正在下载分开，BUG-181）；
  * 4. 字节真值 `missing` → 任务失败 = `failed`（条目在 + 流水线 failed），否则
  *    `bytesMissing`（禁播 + 可重试缓存，复用 bytesPresence 三态）；
  * 5. 事实静默（真值源没说这条）+ `factPending`（任务刚终态、快照未回）→ **持有旧态
@@ -32,6 +33,8 @@
 export type EntryState =
   /** 登记在库、字节未就绪（T0；与「缺字节」同渲染：⬇/可重试） */
   | 'registered'
+  /** 在单飞队列中排队（BUG-181：入队即有反馈，此前排队任务对条目零呈现） */
+  | 'queued'
   /** 缓存任务进行中（转圈） */
   | 'caching'
   /** 字节在盘，可播（▶） */
@@ -94,6 +97,9 @@ export function deriveEntryState(input: EntryStateInput): EntryState {
   // 2) 磁盘字节真值：唯一「能播」判据（BUG-132）。
   if (bytesPresence === 'present') return 'cached'
   // 3) 任务活跃：新事实压过一切旧态（重跑已缓存条目时不倒退）。
+  //    queued 与 running 分开呈现（BUG-181）：排队条目显示「排队中」，
+  //    不与正在下载的「缓存中」混为一谈——但同属活跃，同样压过旧态。
+  if (taskStatus === 'queued') return 'queued'
   if (isActiveTask(taskStatus)) return 'caching'
   // 4) 真值明确缺失：失败 = 条目在 + 流水线 failed；其余 = 缺字节可重试。
   if (bytesPresence === 'missing') {

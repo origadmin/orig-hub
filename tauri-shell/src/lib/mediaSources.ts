@@ -13,7 +13,8 @@
  * 不得再碰 `lib/tgmedia`（即使只是通用格式化工具，也已在本文件 re-export，统一从这里取）。
  */
 import { clearCacheItem, enqueueCacheTask, tgDiag } from '../api/tg'
-import { ensureDaemon, ensureTg } from '../api/tauri'
+import { ensureDaemon } from '../api/tauri'
+import { restartTgService } from '../api/daemon'
 import { getLibraryStats } from '../api/media'
 import {
   coverFit,
@@ -71,8 +72,14 @@ const tgAdapter: SourceAdapter = {
       return false
     }
   },
+  /**
+   * 「确保来源可用」= **请 daemon 重启它托管的 orig-tg**（BUG-178）。
+   *
+   * 以前这里调桌面壳的 `ensureTg()` 自己 spawn 进程，与 daemon 形成两个主人。
+   * 现在前端只发请求、daemon 执行。
+   */
   async ensureAvailable() {
-    await ensureTg()
+    await restartTgService()
   },
   parseRef(ref) {
     return parseTgRef(ref)

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { Stepper } from './ui/stepper'
@@ -9,6 +9,7 @@ import {
 } from './InterfacePickerDialog'
 import { Switch } from './ui/switch'
 import { useStore } from '../store/useStore'
+import { getConfig } from '../api/daemon'
 import { filenameFromUrl, cn } from '../lib/utils'
 
 interface Props {
@@ -37,6 +38,16 @@ export function AddDownloadDialog({ open, onClose }: Props) {
   // 本次下载代理：direct=用全局配置 / custom=指定代理
   const [proxyMode, setProxyMode] = useState<'global' | 'custom'>('global')
   const [proxyUrl, setProxyUrl] = useState('')
+  // 系统默认下载目录（按 OS 解析：Windows 为 C:\Users\<user>\Downloads）：未显式指定保存目录时作占位/回退。
+  const [defaultDir, setDefaultDir] = useState('')
+
+  // 打开时拉一次系统默认下载目录（按 OS 解析，替代写死的 ~/Downloads）。
+  useEffect(() => {
+    if (!open) return
+    getConfig()
+      .then((c) => setDefaultDir(c.default_download_dir ?? ''))
+      .catch(() => {})
+  }, [open])
 
   if (!open) return null
 
@@ -153,7 +164,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
             <DirectoryPicker
               value={outputPath}
               onChange={setOutputPath}
-              placeholder="留空使用默认下载目录"
+              placeholder={outputPath || defaultDir || '留空使用默认下载目录'}
               onError={setError}
             />
           </div>

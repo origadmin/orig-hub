@@ -523,7 +523,13 @@ impl Client for GrammersClient {
         Ok(fetched)
     }
 
-    async fn download(&self, chat_id: i64, message_id: i64, dir: &str) -> Result<DownloadOutcome, ClientError> {
+    async fn download(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        dir: &str,
+        progress: Option<&crate::login::DownloadProgress>,
+    ) -> Result<DownloadOutcome, ClientError> {
         // PeerRef 走缓存（dialogs 扫描后已填充）。
         let peer = self.resolve_peer(chat_id).await
             .map_err(|_| ClientError::MediaNotFound)?;
@@ -578,16 +584,48 @@ impl Client for GrammersClient {
             _ => None,
         };
         let mut body = parallel_range_stream(self.inner.clone(), media, 0, 0, total);
+        // BUG-181：总量在开流前就可知 → 先报，让 UI 从第一拍起就有分母。
+        if let Some(p) = progress {
+            if let Some(t) = total {
+                p.set_total(t);
+            }
+        }
         let mut out = PartFile::create(&dir, &filename)
             .await
             .map_err(|e| ClientError::Other(format!("create file: {e}")))?;
         let mut bytes: u64 = 0;
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.map_err(|e| ClientError::Other(format!("download stream: {e}")))?;
-            out.write_all(&chunk)
-                .await
-                .map_err(|e| ClientError::Other(format!("write file: {e}")))?;
-            bytes += chunk.len() as u64;
+        // 空闲停滞看门狗（单飞 worker 的生死线）：TCP 半死（代理断流/DC 停滞）时
+        // range 流的 `next()` 永不返回，缓存 worker 卡死在条目内 ⇒ 单飞队列永久饿死
+        // （「添加一个后,后续无法添加」根因），且协作式取消只在条目间隙生效，
+        // 卡在条目内时连取消都失灵。判据是「无字节间隔」而非总时长——大文件慢速
+        // 是合法的；任何非空 chunk 都重置计时。超时即报错：任务失败 → worker 接续
+        // 队列，取消也随之恢复有效（循环必然终止）。
+        const STALL_IDLE: std::time::Duration = std::time::Duration::from_secs(90);
+        loop {
+            match tokio::time::timeout(STALL_IDLE, body.next()).await {
+                Ok(Some(chunk)) => {
+                    let chunk =
+                        chunk.map_err(|e| ClientError::Other(format!("download stream: {e}")))?;
+                    out.write_all(&chunk)
+                        .await
+                        .map_err(|e| ClientError::Other(format!("write file: {e}")))?;
+                    if !chunk.is_empty() {
+                        bytes += chunk.len() as u64;
+                        // BUG-181：按 chunk 报字节（写盘成功才计，保证「UI 字节」≤ 落盘事实）。
+                        if let Some(p) = progress {
+                            p.add_bytes(chunk.len() as u64);
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    return Err(ClientError::Other(format!(
+                        "download stalled: no bytes for {}s (chat {chat_id} msg {message_id}); \
+                         connection presumed dead, aborted to unblock the cache queue",
+                        STALL_IDLE.as_secs()
+                    )));
+                }
+            }
         }
         out.persist(&path)
             .await

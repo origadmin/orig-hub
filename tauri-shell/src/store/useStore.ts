@@ -6,7 +6,9 @@ import type {
   DownloadStatus,
   LanguageValue,
   TgAccount,
-  TgAvailability,
+  TgLinkInfo,
+  TgServiceState,
+  TgSession,
 } from '../types'
 import {
   DAEMON_PORT,
@@ -16,10 +18,12 @@ import {
   listDownloads,
   listInterfaces,
   removeDownload as apiRemoveDownload,
+  restartTgService as apiRestartTg,
   saveTgConfig,
+  setDaemonPort,
   subscribeEvents,
 } from '../api/daemon'
-import { getTgSession } from '../api/tg'
+import { getTgSession, setTgPort } from '../api/tg'
 import { logTgReason } from '../lib/tgReason'
 import type { AddDownloadRequest, ViewerItem } from '../types'
 
@@ -38,13 +42,37 @@ const TG_PROBE_DELAY_MS = 1500
  */
 let tgProbeCancel: (() => void) | null = null
 
+/** TG 服务层 / 链路层的等值短路签名（BUG-097 + BUG-178） */
+function tgServiceKey(a: TgServiceState): string {
+  return `${a.enabled}|${a.running}|${a.port ?? ''}|${a.lastError ?? ''}`
+}
+
+function tgLinkKey(a: TgLinkInfo): string {
+  return `${a.state}|${a.reason ?? ''}`
+}
+
 /**
- * TG 可用性签名（BUG-097 等值短路用）：
- * 事件驱动刷新可能高频触发，签名未变就不 setState，避免无谓重渲染（AGENTS.md §5）。
+ * 由 orig-tg 会话推导**链路层**状态（BUG-178）。
+ *
+ * 分层是这次的核心：以前「没配凭证」与「Telegram 连不上」都塌成一个
+ * `available=false`，前端只能一律喊「Telegram 不可用」—— 于是**待用户完成的动作**
+ * （去设置页填凭证、登录）被渲染成了故障，而设置页同时显示「插件：运行中」，
+ * 两处互相打架。现在：
+ *   - 没配凭证 → `needs_config`（引导去配置，不是故障）
+ *   - 已配未登录 → `needs_login`（引导去登录）
+ *   - 已配但连不上 → `link_down`（**这才是**故障，重启由 daemon 负责）
  */
-function tgAvailabilityKey(a: TgAvailability | null): string {
-  if (!a) return 'null'
-  return a.status === 'unavailable' ? `unavailable:${a.reason ?? ''}` : a.status
+export function resolveTgLink(session: TgSession | null | undefined): TgLinkInfo {
+  if (!session) return { state: 'unknown', reason: null }
+  if (session.api_configured !== true) {
+    return { state: 'needs_config', reason: session.reason ?? null }
+  }
+  if (session.available !== true) {
+    return { state: 'link_down', reason: session.reason ?? null }
+  }
+  return session.phase === 'Authorized'
+    ? { state: 'ready', reason: null }
+    : { state: 'needs_login', reason: null }
 }
 
 /**
@@ -164,12 +192,26 @@ interface DownloadState {
   pendingMediaFocus: string | null
   setPendingMediaFocus: (ref: string | null) => void
 
-  /** TG 可选插件开关（daemon [tg] enabled）；false 时侧边栏隐藏 TG 模块 */
-  tgEnabled: boolean
-  /** orig-tg 子服务是否实际在运行（daemon 探活） */
-  tgRunning: boolean
-  /** 启停 TG 插件：写 daemon（运行时生效+持久化），同步 tgEnabled/tgRunning */
+  /**
+   * TG **服务层**状态（orig-tg 进程）：真源是 daemon `/api/config`（BUG-178）。
+   *
+   * 「服务在不在」只由 daemon 回答 —— 前端不再自己探测 orig-tg 端口：那是把
+   * 「daemon 的托管职责」偷换成「前端的猜测」，猜错就出现「设置页说运行中、
+   * 面板说不可用」这种自相矛盾。
+   */
+  tgService: TgServiceState
+  /** TG **链路层**状态（Telegram 侧）：真源是 orig-tg `/api/tg/session` */
+  tgLink: TgLinkInfo
+  /** 启停 TG 插件：写 daemon（运行时生效+持久化），同步服务层状态 */
   setTgEnabled: (enabled: boolean) => Promise<boolean>
+  /**
+   * 请 daemon 重启它托管的 orig-tg（**不是**前端拉进程）。
+   *
+   * 凭证保存 / 网络修好后必须重启才生效（orig-tg 只在启动时连一次 Telegram）。
+   * 以前这个动作是桌面壳 `ensure_tg` 与前端「重试连接」两个手动入口，TG 进程因此
+   * 有两个主人、互相 kill；现在只留这一个：前端发请求，daemon 执行。
+   */
+  restartTg: () => Promise<boolean>
   /**
    * 缓存管理（「入库流水线」）面板开关。
    *
@@ -181,22 +223,14 @@ interface DownloadState {
 
   /** 账号绑定中心状态（当前仅 Telegram，后续可扩展其他账号） */
   accounts: AccountsState
-  /**
-   * TG 可用性探测结果（null = 尚未探测）。
-   *
-   * 与 `accounts.tg.bound` 正交：`bound` 说的是「有没有登录会话」，
-   * 这里说的是「依赖本身能不能用」。区分二者才能不把连接故障显示成「登录丢了」。
-   */
-  tgAvailability: TgAvailability | null
   loadAccounts: () => void
   /** 更新某个账户的绑定态（持久化到 localStorage） */
   setTgAccount: (patch: Partial<TgAccount>) => void
-  /** 校准 TG 绑定态：向 orig-tg 查询会话 phase==='Authorized'（失败分类留痕，不吞错） */
-  refreshTgSession: () => Promise<void>
   /**
-   * 刷新 TG 状态（**BUG-097 的唯一刷新入口**）：`tgEnabled`/`tgRunning` 来自 daemon
-   * `/api/config`，`tgAvailability`/`bound` 来自 orig-tg `/api/tg/session`。
-   * 两者都等值短路，失败分类留痕。
+   * 刷新 TG 状态（**唯一刷新入口**，BUG-097 / BUG-178）：
+   * 服务层来自 daemon `/api/config`，链路层来自 orig-tg `/api/tg/session`。
+   * 先问服务层，**服务不在就不问链路层**（问了也只是连不上，反而把「服务不在」
+   * 误报成「链路故障」）。两层都等值短路，失败分类留痕。
    */
   refreshTgState: () => Promise<void>
   /**
@@ -243,13 +277,12 @@ export const useStore = create<DownloadState>((set, get) => ({
   categories: [],
   categoryFilter: null,
   pendingMediaFocus: null,
-  // 入口级门控（resolveTgFeatureReady）只由 `tgEnabled` 决定；`tgEnabled` 仅在
-  // `getConfig()` 成功（daemon 可达且插件开启）时被置 true。故 daemon 不可达 /
-  // 插件关闭时入口保持隐藏——不可用就不展示（不呈现死按钮，违反设计）。
-  tgEnabled: false,
-  tgRunning: false,
+  // 入口级门控（`resolveTgFeatureReady`）只由服务层决定：开关开着 **且** daemon 说
+  // 进程在服务才显示。daemon 不可达 / 插件关闭 / 拉起失败时入口保持隐藏 ——
+  // 不可用就不展示（不呈现死按钮，违反设计）。
+  tgService: { enabled: false, running: false, port: null, lastError: null },
+  tgLink: { state: 'unknown', reason: null },
   accounts: loadAccounts(),
-  tgAvailability: null,
 
   init: async () => {
     // 0. system 主题实时跟随系统配色
@@ -314,10 +347,18 @@ export const useStore = create<DownloadState>((set, get) => ({
     try {
       const cfg = await getConfig()
       const cats = Array.from(new Set(Object.values(cfg.classify_rules))).sort()
+      // 端口以 daemon 为准（可能顺延）：拿到即刻校准两个 base，之后的请求才不会
+      // 打到一个不存在（或属于别人）的端口上（BUG-178）。
+      if (typeof cfg.port === 'number') setDaemonPort(cfg.port)
+      if (typeof cfg.tg_port === 'number') setTgPort(cfg.tg_port)
       set({
         categories: cats,
-        tgEnabled: cfg.tg_enabled,
-        tgRunning: cfg.tg_running,
+        tgService: {
+          enabled: cfg.tg_enabled,
+          running: cfg.tg_running,
+          port: cfg.tg_port ?? null,
+          lastError: cfg.tg_last_error ?? null,
+        },
       })
     } catch (e) {
       // 配置不可达：分类暂不列出（菜单退化）。失败**分类留痕**，不静默吞掉（BUG-097）；
@@ -498,13 +539,43 @@ export const useStore = create<DownloadState>((set, get) => ({
   tgCacheManagerOpen: false,
   setTgCacheManagerOpen: (v) => set({ tgCacheManagerOpen: v }),
 
-  /** 启停 TG 插件：写 daemon（拉起/终止 orig-tg 子服务），成功同步开关与运行态 */
+  /** 启停 TG 插件：写 daemon（拉起/终止 orig-tg 子服务），成功同步服务层状态 */
   setTgEnabled: async (enabled) => {
     try {
       const res = await saveTgConfig({ enabled })
-      set({ tgEnabled: res.tg_enabled, tgRunning: res.tg_running })
+      if (typeof res.tg_port === 'number') setTgPort(res.tg_port)
+      set({
+        tgService: {
+          enabled: res.tg_enabled,
+          running: res.tg_running,
+          port: res.tg_port ?? get().tgService.port,
+          lastError: res.tg_last_error ?? null,
+        },
+      })
       return true
     } catch (e) {
+      set({ toast: e instanceof Error ? e.message : String(e) })
+      return false
+    }
+  },
+
+  /** 请 daemon 重启它托管的 orig-tg（前端不碰进程；BUG-178） */
+  restartTg: async () => {
+    try {
+      const res = await apiRestartTg()
+      if (typeof res.tg_port === 'number') setTgPort(res.tg_port)
+      set({
+        tgService: {
+          enabled: res.tg_enabled,
+          running: res.tg_running,
+          port: res.tg_port ?? get().tgService.port,
+          lastError: res.tg_last_error ?? null,
+        },
+      })
+      return res.tg_running
+    } catch (e) {
+      // 原文只进日志：Rust/HTTP 报文不进界面
+      logTgReason(e instanceof Error ? e.message : String(e), 'tg-restart')
       set({ toast: e instanceof Error ? e.message : String(e) })
       return false
     }
@@ -523,40 +594,55 @@ export const useStore = create<DownloadState>((set, get) => ({
       return { accounts }
     }),
 
-  refreshTgSession: async () => {
-    // 以 /session 的 phase 为唯一权威（不轮询，仅在启动/登录完成/进入 TG 界面时调用）。
-    //
-    // 「不可用/不可达」与「未登录」必须分开（BUG-023）：
-    //   旧逻辑把「连不上 orig-tg」直接当成「未绑定」，于是依赖故障在界面上表现成
-    //   「登录丢了」，用户会去重登，而真因是服务连不上。现在分成三态，故障**可见**：
-    //     - ok：可用，按 phase 推导 bound
-    //     - unavailable：orig-tg 活着但连不上 Telegram（后端给出原因），保留上次 bound
-    //     - unreachable：连 orig-tg 进程都够不到，保留上次 bound
-    //   后两种都**不清空**登录态——因为「不知道」不等于「没登录」。
-    //
-    // 等值短路（BUG-097）：事件驱动刷新可能高频触发，签名未变不 setState。
-    const applyAvailability = (next: TgAvailability) => {
-      if (tgAvailabilityKey(get().tgAvailability) !== tgAvailabilityKey(next)) {
-        set({ tgAvailability: next })
-      }
+  /**
+   * 刷新 TG 状态（**唯一刷新入口**，BUG-097 / BUG-178）。
+   *
+   * 顺序是设计的一部分：**先问服务层（daemon），它说进程不在就直接停**。
+   * 反过来的代价正是 BUG-178 的现象 —— 链路层在自己探测 orig-tg、探不到就喊
+   * 「Telegram 不可用」，而服务层（daemon）同时说「运行中」，两处互相打架。
+   *
+   * 失败一律**分类留痕**（logTgReason），绝不 `.catch(() => {})` 静默吞掉（BUG-090 / BUG-097）。
+   */
+  refreshTgState: async () => {
+    const applyLink = (next: TgLinkInfo) => {
+      if (tgLinkKey(get().tgLink) !== tgLinkKey(next)) set({ tgLink: next })
     }
-    let session
+    let cfg
+    try {
+      cfg = await getConfig()
+    } catch (e) {
+      // daemon 不可达：服务层保持上次值（「不知道」不等于「停了」），原文只进日志
+      logTgReason(e instanceof Error ? e.message : String(e), 'tg-config')
+      return
+    }
+    // 端口真源：daemon 可能顺延，两个 base 都必须跟着它走。
+    if (typeof cfg.port === 'number') setDaemonPort(cfg.port)
+    if (typeof cfg.tg_port === 'number') setTgPort(cfg.tg_port)
+    const svc: TgServiceState = {
+      enabled: cfg.tg_enabled,
+      running: cfg.tg_running,
+      port: cfg.tg_port ?? null,
+      lastError: cfg.tg_last_error ?? null,
+    }
+    if (tgServiceKey(get().tgService) !== tgServiceKey(svc)) set({ tgService: svc })
+
+    // 服务不在 → 链路无从谈起。这里**不**再去连 orig-tg：连也只是失败，
+    // 还会把「服务没起来」渲染成「Telegram 连不上」，方向就错了。
+    if (!svc.enabled || !svc.running) {
+      applyLink({ state: 'unknown', reason: null })
+      return
+    }
+
+    let session: TgSession | null = null
     try {
       session = await getTgSession()
     } catch (e) {
-      // 后台可用性探测失败（orig-tg 未运行 / 离线调试）：仅记录状态，不弹红色错误 toast——
-      // 网页调试阶段 orig-tg 本就可能离线，弹「503 / fetch failed」会让调试环境变成错误环境。
-      // 状态仍可见（侧栏据此隐藏 TG），故障并未被掩盖。
-      // 失败**分类留痕**（原文只进日志），不静默吞掉（BUG-090 / BUG-097）。
+      // 失败**分类留痕**（原文只进日志），不静默吞掉。
       logTgReason(e instanceof Error ? e.message : String(e), 'tg-session')
-      applyAvailability({ status: 'unreachable' })
+      applyLink({ state: 'unknown', reason: null })
       return
     }
-    if (session?.available === false) {
-      applyAvailability({ status: 'unavailable', reason: session.reason ?? null })
-      return
-    }
-    applyAvailability({ status: 'ok' })
+    applyLink(resolveTgLink(session))
     const tg = get().accounts.tg
     if (!session?.phase) return
     const bound = session.phase === 'Authorized'
@@ -570,35 +656,11 @@ export const useStore = create<DownloadState>((set, get) => ({
   },
 
   /**
-   * 刷新 TG 状态（**BUG-097 的唯一刷新入口**）。
-   *
-   * 两个状态各有真源，这里合并刷新：
-   *   - `tgEnabled` / `tgRunning` ← daemon `/api/config`（插件开关 + 子服务探活）；
-   *   - `tgAvailability` / `bound` ← orig-tg `/api/tg/session`（refreshTgSession）。
-   * 两者都**等值短路**：签名未变不 setState，避免事件驱动的重复刷新造成重渲染。
-   * 失败一律**分类留痕**（logTgReason），绝不 `.catch(() => {})` 静默吞掉（BUG-090 / BUG-097）。
-   */
-  refreshTgState: async () => {
-    try {
-      const cfg = await getConfig()
-      set((s) =>
-        s.tgEnabled === cfg.tg_enabled && s.tgRunning === cfg.tg_running
-          ? s
-          : { tgEnabled: cfg.tg_enabled, tgRunning: cfg.tg_running },
-      )
-    } catch (e) {
-      // daemon 不可达：运行态保持上次值（「不知道」不等于「停了」），原文只进日志
-      logTgReason(e instanceof Error ? e.message : String(e), 'tg-config')
-    }
-    await get().refreshTgSession()
-  },
-
-  /**
    * 启动期 / 开关翻转后的**有界退避探测**（BUG-097 P0-2）。
    *
    * 从 MainLayout 原「开关翻转 → 最多 5×1.5s」逻辑抽出，让启动阶段也复用：
-   * orig-tg 冷启动首次 MTProto 握手实测约 4s，一次探测定终身会让
-   * `tgRunning`/`tgAvailability` 永久冻结在 `false`/`unreachable`。
+   * orig-tg 冷启动首次 MTProto 握手实测约 4s，一次探测定终身会让服务层永久冻结在
+   * `running=false`（BUG-178 里就表现为「开关开着但 TG 永远不显示」）。
    *
    * **不是轮询**（AGENTS.md §5 轮询三律）：次数有界（≤5）、退避触发、就绪即停；
    * 每次刷新都等值短路，故不会造成高频重渲染。
@@ -614,8 +676,10 @@ export const useStore = create<DownloadState>((set, get) => ({
     const probe = () => {
       void get().refreshTgState().then(() => {
         if (cancelled) return
-        const st = get().tgAvailability
-        if ((st === null || st.status !== 'ok') && ++attempts < TG_PROBE_MAX_ATTEMPTS) {
+        // 就绪判据是**服务层**（进程在不在），不是链路层：链路还要等 MTProto 握手，
+        // 拿它当判据会让「服务已就绪、正在连 Telegram」被误判成没起来。
+        const svc = get().tgService
+        if (!(svc.enabled && svc.running) && ++attempts < TG_PROBE_MAX_ATTEMPTS) {
           timer = setTimeout(probe, TG_PROBE_DELAY_MS)
         }
       })

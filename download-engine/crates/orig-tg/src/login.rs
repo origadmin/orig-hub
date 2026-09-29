@@ -140,6 +140,40 @@ pub struct MediaStream {
     pub body: Pin<Box<dyn Stream<Item = Result<Vec<u8>, std::io::Error>> + Send>>,
 }
 
+/// 下载字节进度句柄（BUG-181）：`download()` 实现方在每个非空 chunk 落盘前累加
+/// `bytes`、在总量可知时设置 `total`。调用方（缓存 worker）把它接到 AppState 的
+/// 原子上，任务端点序列化时注入 `itemBytes`/`itemBytesTotal` —— 条目内的下载
+/// 不再是 UI 上的冻结态（一条 200MB 视频以 0.7MB/s 下载约 5 分钟，此前该窗口
+/// 内 `done` 计数纹丝不动，对用户完全等价于「系统死了」）。
+///
+/// 字段全是 `Arc<AtomicU64>`：句柄可 Clone 进 worker 与序列化方，无锁累加。
+#[derive(Clone, Default)]
+pub struct DownloadProgress {
+    pub bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl DownloadProgress {
+    pub fn set_total(&self, total: u64) {
+        self.total
+            .store(total, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn add_bytes(&self, n: u64) {
+        self.bytes
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn reset(&self) {
+        self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.total.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn load(&self) -> (u64, u64) {
+        (
+            self.bytes.load(std::sync::atomic::Ordering::Relaxed),
+            self.total.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
 /// 客户端抽象：路由层只依赖此 trait，具体实现可替换。
 #[async_trait::async_trait]
 pub trait Client: Send + Sync {
@@ -190,7 +224,16 @@ pub trait Client: Send + Sync {
         range: Option<MediaRange>,
     ) -> Result<MediaStream, ClientError>;
     /// 将指定会话中某条媒体消息下载到 `dir`，返回落盘结果。
-    async fn download(&self, chat_id: i64, message_id: i64, dir: &str) -> Result<DownloadOutcome, ClientError>;
+    ///
+    /// `progress`（BUG-181）：`Some` 时实现方须按 chunk 累加字节并设置总量；
+    /// `None`（在线投递等非缓存路径）不报进度。实现方**不得**因 progress 为 None 失败。
+    async fn download(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        dir: &str,
+        progress: Option<&DownloadProgress>,
+    ) -> Result<DownloadOutcome, ClientError>;
     /// 获取单条消息的媒体元数据（下载后回填入库用）。
     ///
     /// 消息不存在、拉取失败或非媒体消息时返回 `Ok(None)`，调用方回退为仅标记 downloaded。
@@ -283,7 +326,13 @@ mod tests {
         async fn media(&self, _chat_id: i64, _message_id: i64, _range: Option<MediaRange>) -> Result<MediaStream, ClientError> {
             Err(ClientError::MediaNotFound)
         }
-        async fn download(&self, _chat_id: i64, _message_id: i64, _dir: &str) -> Result<DownloadOutcome, ClientError> {
+        async fn download(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _dir: &str,
+            _progress: Option<&DownloadProgress>,
+        ) -> Result<DownloadOutcome, ClientError> {
             Err(ClientError::MediaNotFound)
         }
         async fn message_meta(

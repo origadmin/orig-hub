@@ -36,7 +36,10 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1".to_string(),
-            port: 9877,
+            // 19787（原 9877）：9877 常被 Windows 划进动态保留区，bind 恒 10013，
+            // 服务起不来而现象看着像「进程自杀」（BUG-178）。仍可被 `ORIG_TG_PORT` 覆盖；
+            // 且 daemon 会在拉起前换端口，实际端口以 daemon `/api/config` 为准。
+            port: 19787,
             api_id: None,
             api_hash: None,
             session_path: PathBuf::from("./tg.session"),
@@ -115,7 +118,7 @@ mod tests {
 
     #[test]
     fn defaults_listen_independently_from_daemon() {
-        assert_eq!(Config::default().port, 9877);
+        assert_eq!(Config::default().port, 19787);
         assert_eq!(Config::default().bind, "127.0.0.1");
     }
 

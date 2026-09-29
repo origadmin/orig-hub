@@ -19,7 +19,7 @@ import { CONN_DOT, CONN_LABEL, useConnState } from '../store/connState'
 import { useEvent } from '../hooks/useEvent'
 import { useTranslation } from '../i18n'
 import { ensureDaemon, daemonStatus } from '../api/tauri'
-import { health } from '../api/daemon'
+import { health, setDaemonPort } from '../api/daemon'
 import { cn } from '../lib/utils'
 
 export function MainLayout() {
@@ -33,18 +33,18 @@ export function MainLayout() {
   // BUG-134: 状态栏下载速度改读全局选择器，与全局速度文案同源（不再用 active.reduce 自算一套）
   const activeSpeedLabel = useStore(selectActiveSpeedLabel)
   const hasActiveSpeed = useStore(selectHasActiveSpeed)
-  const { downloads, init, setDaemon, setDaemonAlive, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, viewer, setViewerIndex, closeViewer, tgEnabled, tgAvailability, refreshTgState, probeTg } = useStore()
+  const { downloads, init, setDaemon, setDaemonAlive, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, viewer, setViewerIndex, closeViewer, tgService, refreshTgState, probeTg } = useStore()
 
   /**
    * TG 入口级门控（用户裁定：常规 TG 开关控制整个 TG 内容）：
-   *  开关关 OR orig-tg 进程不可达 → 侧栏 TG 导航整体隐藏；
-   *  面板级故障卡只作保底回退。`tgAvailability === null` 为探测未返回的瞬态，
-   *  按 ready 处理避免首帧闪烁（探测毫秒级，init() 挂载即触发）。
+   *  开关关 OR daemon 说 orig-tg 没在服务 → 侧栏 TG 导航整体隐藏。
    *
-   *  判据**唯一来源**是 `store/selectors.ts::resolveTgFeatureReady`（BUG-087 / BUG-097）：
-   *  Sidebar 经 `tgReady` prop、AccountsPanel 直接调用，都读同一处，不再各写一份。
+   *  判据**唯一来源**是 `store/selectors.ts::resolveTgFeatureReady`（BUG-087 / BUG-097 / BUG-178）：
+   *  Sidebar 经 `tgReady` prop、AccountsPanel 直接调用，都读同一处，不再各写一份；
+   *  且它只问**服务层**（daemon 托管），不再掺链路探测 —— 掺了就会出现
+   *  「设置页说运行中、面板说不可用」的自相矛盾。
    */
-  const tgFeatureReady = resolveTgFeatureReady(tgEnabled, tgAvailability)
+  const tgFeatureReady = resolveTgFeatureReady(tgService)
 
   useEffect(() => {
     init()
@@ -60,7 +60,11 @@ export function MainLayout() {
      */
     ensureDaemon()
       .then(() => daemonStatus())
-      .then(setDaemon)
+      .then((d) => {
+        // daemon 实际端口（可能顺延）：先校准 base，再让后续请求打到真服务上（BUG-178）。
+        if (typeof d?.port === 'number') setDaemonPort(d.port)
+        setDaemon(d)
+      })
       .catch(() => {
         health()
           .then(() => setDaemonAlive(true))
@@ -82,20 +86,22 @@ export function MainLayout() {
   // 而 `unavailable`（连不上 Telegram）正是必须让用户留下来修的状态。
   useEffect(() => {
     if (view !== 'tg') return
-    const serviceDown = tgAvailability !== null && tgAvailability.status === 'unreachable'
-    if (!tgEnabled || serviceDown) setView('all')
-  }, [tgEnabled, tgAvailability, view])
+    // 判据与侧栏门控**同一处**（`resolveTgFeatureReady`），不再另写一份
+    // `status === 'unreachable'` —— 两份判据迟早分叉，分叉就会出现
+    // 「入口还在、进来却被弹走」或反过来（BUG-177）。
+    if (!tgFeatureReady) setView('all')
+  }, [tgFeatureReady, view])
 
   // TG 开关变化 / 启动期重探测（BUG-097）：退避探测已抽成 store 的 `probeTg` 复用 ——
   // 开启侧 daemon 拉起 orig-tg 需要时间，最多重试 5 次、就绪即停；关闭侧探一次即可
   // （必为不可达，TG 入口随之摘除）。这是**有界探测**，不是常驻轮询。
   useEffect(() => {
-    if (!tgEnabled) {
+    if (!tgService.enabled) {
       void refreshTgState()
       return
     }
     return probeTg()
-  }, [tgEnabled, refreshTgState, probeTg])
+  }, [tgService.enabled, refreshTgState, probeTg])
 
   // 全局错误 toast：按钮/操作失败时的用户可见反馈（自动消失）
   useEffect(() => {

@@ -14,7 +14,8 @@ import { useStore } from '../store/useStore'
 export const TgCacheEntry = memo(function TgCacheEntry() {
   const { t } = useTranslation()
   const up = useStore(
-    (s) => s.tgAvailability === null || s.tgAvailability.status !== 'unreachable',
+    // 服务层判据（BUG-178）：进程在不在只由 daemon 回答，前端不再自己探 orig-tg。
+    (s) => s.tgService.running,
   )
   const open = useStore((s) => s.setTgCacheManagerOpen)
 

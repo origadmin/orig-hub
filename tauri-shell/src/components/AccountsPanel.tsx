@@ -6,7 +6,6 @@ import { cn } from '../lib/utils'
 import { useStore } from '../store/useStore'
 import { useTranslation } from '../i18n'
 import { classifyTgReason, logTgReason } from '../lib/tgReason'
-import { useTgRetry } from '../lib/tgRetry'
 import { resolveTgFeatureReady } from '../store/selectors'
 import { getTgSession, startTgLogin, submitTgCode, tgDiag, tgLogs } from '../api/tg'
 import type { TgDiag, TgSession } from '../types'
@@ -34,31 +33,31 @@ function normalizeE164(countryCode: string, national: string): string {
  */
 export function AccountsPanel() {
   const { t } = useTranslation()
-  const { accounts, setTgAccount, setError, refreshTgState, tgAvailability, tgEnabled } = useStore()
+  const { accounts, setTgAccount, setError, refreshTgState, tgService, tgLink } = useStore()
   const tg = accounts.tg
   /**
-   * TG 依赖是否处于故障态（不可用/不可达）。
+   * 只有**链路真断了**才算故障（BUG-178）。
    *
-   * 故障时必须**明确告知原因**并挡住登录动作：否则用户点「登录 → 发送验证码」只会
-   * 拿到一个失败，然后把「连不上 Telegram」误判成自己的账号问题（BUG-023 的现场）。
+   * 以前 `available=false` 一个值同时表示「没配凭证」「没登录」「连不上」，于是
+   * 「去填个凭证」这种待办被渲染成红色故障 —— 用户在设置页看到「插件：运行中」、
+   * 回到这里又看到「Telegram 不可用」，两处互相打架。现在：
+   *   - `link_down`：真故障 → 报原因 + 挡住登录动作（否则发码必然失败，
+   *     用户会把「连不上」误判成自己的账号问题，BUG-023 的现场）。
+   *   - `needs_config` / `needs_login`：**待办**，引导去做，不当故障。
+   *   - 服务层没起来：也说清楚，但那是 daemon 的自愈范围，不归用户修。
    */
-  const tgBroken = tgAvailability !== null && tgAvailability.status !== 'ok'
+  const tgBroken = tgLink.state === 'link_down'
+  const needsConfig = tgLink.state === 'needs_config'
+  const serviceDown = !tgService.running
 
   /**
-   * 入口级门控：判据唯一来源 `store/selectors.ts::resolveTgFeatureReady`（BUG-087 / BUG-097），
-   * 与 `MainLayout`（经 `tgReady` 传给 `Sidebar`）同读一处，不再各写一份。
-   *
-   * `unavailable`（进程活着、连不上 Telegram）**必须继续显示绑定卡**：
-   * 那正是用户需要看到失败原因并重新配置（改代理 / 重登）的时刻，
-   * 把入口一起藏掉，TG 面板里的出口就成了一条死路。
+   * 入口级门控：判据唯一来源 `store/selectors.ts::resolveTgFeatureReady`
+   * （BUG-087 / BUG-097 / BUG-178）。只问服务层（daemon 托管），链路状态不参与 ——
+   * 未配置凭证 / 未登录都必须让人进得来，否则永远做不完这些动作。
    */
-  const tgFeatureReady = resolveTgFeatureReady(tgEnabled, tgAvailability)
+  const tgFeatureReady = resolveTgFeatureReady(tgService)
   /** 故障原因（分类降级后的 i18n 键，绝不直出后端原文 —— BUG-088） */
-  const bannerReasonKey = classifyTgReason(
-    tgAvailability !== null && tgAvailability.status === 'unavailable'
-      ? tgAvailability.reason
-      : null,
-  )
+  const bannerReasonKey = classifyTgReason(tgBroken ? tgLink.reason : null)
 
   // 挂载时刷新一次登录态（事件驱动，非轮询）：后端会话已 Authorized（含持久化加载的会话）
   // 则自动恢复为「已绑定」。`refreshTgState` 等值短路——只在状态签名变化时才写 store；
@@ -66,12 +65,6 @@ export function AccountsPanel() {
   useEffect(() => {
     void refreshTgState()
   }, [refreshTgState])
-
-  /**
-   * 「重试连接」出口（BUG-094）：与 TgPanel 引导区共用 `useTgRetry`，
-   * 同一份判定与同一套文案。故障态下登录被禁用，这里就是用户唯一的自救入口。
-   */
-  const { busy: retrying, noteKey: retryNoteKey, retry: retryTg } = useTgRetry()
 
   // 登录流程本地状态
   const [step, setStep] = useState<LoginStep>('idle')
@@ -95,14 +88,9 @@ export function AccountsPanel() {
    * tsc 查不出，只有真跑起来才炸）。
    */
   useEffect(() => {
-    logTgReason(
-      tgAvailability !== null && tgAvailability.status === 'unavailable'
-        ? tgAvailability.reason
-        : null,
-      'accounts-banner',
-    )
+    logTgReason(tgLink.reason, 'accounts-banner')
     logTgReason(diag?.unavailable_reason ?? null, 'accounts-diag')
-  }, [tgAvailability, diag])
+  }, [tgLink, diag])
   const [diagBusy, setDiagBusy] = useState(false)
   const [diagErr, setDiagErr] = useState('')
 
@@ -201,33 +189,40 @@ export function AccountsPanel() {
 
         <div className="h-px bg-border-subtle/60" />
 
-        {/* TG 依赖故障横幅：把「连不上 Telegram」与「未登录」分开显示。
-            此前二者在界面上无从区分，故障被读成登录丢失。 */}
-        {tgBroken && tgAvailability && (
-          <div className="rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger">
-            <p className="font-medium">
-              {tgAvailability.status === 'unreachable'
-                ? t('accounts.tgUnreachable')
-                : t('accounts.tgUnavailable')}
+        {/*
+          TG 状态横幅（BUG-178）：**服务层**与**链路层**分开说，且只有真故障才用故障色。
+          以前「没配凭证 / 没登录 / 连不上」共用一个 `available=false`，一律渲染成
+          「Telegram 不可用」—— 待办被说成故障，而设置页同时显示「插件：运行中」。
+        */}
+        {serviceDown || needsConfig || tgBroken ? (
+          <div
+            className={cn(
+              'rounded-md border px-3 py-2 text-[11px]',
+              tgBroken || serviceDown
+                ? 'border-danger/30 bg-danger/10 text-danger'
+                : 'border-warn/30 bg-warn/10 text-warn',
+            )}
+            data-testid="tg-accounts-banner"
+          >
+            <p className="font-medium" data-testid="tg-accounts-banner-title">
+              {serviceDown
+                ? t('tg.serviceDown')
+                : needsConfig
+                  ? t('tg.needsConfig')
+                  : t('tg.linkDown')}
             </p>
             <p className="mt-0.5 opacity-90">
-              {tgAvailability.status === 'unreachable'
-                ? t('accounts.tgUnreachableHint')
-                : t('accounts.tgUnavailableHint')}
+              {serviceDown
+                ? t('tg.serviceDownHint')
+                : needsConfig
+                  ? t('tg.needsConfigHint')
+                  : t('tg.linkDownHint')}
             </p>
-            {tgAvailability.status === 'unavailable' && tgAvailability.reason && (
-              <p className="mt-1 text-[10px] leading-relaxed opacity-80">
-                {t(bannerReasonKey)}
-              </p>
-            )}
-            {/* 重连结果必须可见：绝不能静默吞掉（BUG-090） */}
-            {retryNoteKey && (
-              <p className="mt-1 text-[10px] leading-relaxed opacity-90">
-                {t(retryNoteKey)}
-              </p>
-            )}
+            {tgBroken && tgLink.reason ? (
+              <p className="mt-1 text-[10px] leading-relaxed opacity-80">{t(bannerReasonKey)}</p>
+            ) : null}
           </div>
-        )}
+        ) : null}
 
         {tg.bound ? (
           <div className="flex justify-end">
@@ -238,22 +233,17 @@ export function AccountsPanel() {
         ) : step === 'idle' ? (
           <div className="flex justify-end gap-2">
             {/*
-              故障态才给重连入口：orig-tg 只在启动时连一次、失败不自愈，
-              用户修好代理后需要它把服务拉回可用（`ensure_tg` 的 kill + respawn）。
-              正常态（ok）下没有可重连的东西，不显示。
+              **没有「重试连接」按钮**（BUG-178）：重启 / kill 是 daemon 的职责，
+              不是留给用户的手动项 —— daemon 巡检发现链路断了会自己重启 orig-tg，
+              凭证保存后也会自动重启。把系统的失职做成按钮，只会让用户以为要靠他修。
             */}
-            {tgBroken && (
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={retrying}
-                onClick={() => void retryTg()}
-              >
-                {retrying ? t('tg.retrying') : t('tg.retry')}
-              </Button>
-            )}
-            {/* 故障时禁止进入登录流程：发码必然失败，让用户走到一半再报错是误导。 */}
-            <Button size="sm" disabled={tgBroken} onClick={() => setStep('phone')}>
+            {/* 故障 / 未配凭证 / 服务未起时禁止进入登录流程：发码必然失败，
+                让用户走到一半再报错是误导。 */}
+            <Button
+              size="sm"
+              disabled={tgBroken || needsConfig || serviceDown}
+              onClick={() => setStep('phone')}
+            >
               {t('accounts.login')}
             </Button>
           </div>

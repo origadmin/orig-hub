@@ -15,19 +15,40 @@ use tauri_plugin_shell::ShellExt;
 
 /// 侧边进程名（与 tauri.conf.json externalBin 对应）。
 const DAEMON_BIN: &str = "orig-daemon";
-/// daemon 默认监听端口。
-const DAEMON_PORT: u16 = 9876;
+/// daemon **起始**监听端口（不是"一定在这个端口"）。
+///
+/// 19786（原 9876）：9876 常被 Windows 划进动态保留区，bind 恒 `WSAEACCES`(10013)，
+/// daemon 起不来 → 整个 APP 没有后端，而现象看着像「TG 不显示 / 数据没了」（BUG-178）。
+/// daemon 自己会在 bind 失败时顺延，并把实际端口写进端点文件 / 经 `/api/config` 下发；
+/// 这里只作为扫描起点与兜底。
+const DAEMON_PORT: u16 = 19786;
+/// 端口扫描上限（与 daemon 侧 `PORT_SCAN_LIMIT` 同序）。
+const PORT_SCAN_LIMIT: u16 = 64;
 
 struct DaemonState {
     /// 由本外壳拉起的 daemon 子进程句柄（复用已运行实例时为 None）。
     child: Mutex<Option<CommandChild>>,
 }
 
-/// 检查 daemon 是否真正可用：TCP 能连上且 GET /health 返回 200。
+/// daemon 端点文件（daemon 把自己实际监听地址写在这里）。
+///
+/// 为什么不以常量端口为准（BUG-178）：端口可能顺延，壳若继续认 9876 就会连到一个
+/// 不存在（或属于别人）的服务上。写文件是唯一真源，扫端口只是它缺失时的兜底。
+fn daemon_endpoint_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    app.path().app_data_dir().ok().map(|d| d.join("daemon.endpoint"))
+}
+
+/// 读端点文件里的端口。
+fn read_daemon_endpoint(app: &tauri::AppHandle) -> Option<u16> {
+    let text = std::fs::read_to_string(daemon_endpoint_path(app)?).ok()?;
+    text.rsplit(':').next()?.trim().parse::<u16>().ok()
+}
+
+/// 检查指定端口上的 daemon 是否真正可用：TCP 能连上且 GET /health 返回 200。
 /// 只做端口连通性检查会漏掉"进程活着但 handler 已坏"的情况（前端 Failed to fetch）。
-fn daemon_alive() -> bool {
+fn daemon_alive_on(port: u16) -> bool {
     let Ok(mut stream) = TcpStream::connect_timeout(
-        &format!("127.0.0.1:{DAEMON_PORT}").parse().unwrap(),
+        &format!("127.0.0.1:{port}").parse().unwrap(),
         Duration::from_millis(300),
     ) else {
         return false;
@@ -39,7 +60,7 @@ fn daemon_alive() -> bool {
         .set_write_timeout(Some(Duration::from_millis(800)))
         .ok();
     // 最小 HTTP/1.1 GET /health，不引入额外依赖
-    let req = format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{DAEMON_PORT}\r\nConnection: close\r\n\r\n");
+    let req = format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     if stream.write_all(req.as_bytes()).is_err() {
         return false;
     }
@@ -53,6 +74,69 @@ fn daemon_alive() -> bool {
     }
     let head = String::from_utf8_lossy(&buf[..n]);
     head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+}
+
+/// 端口上是否有人监听（connect 探测，不含健康检查）。
+fn port_busy(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}").parse().unwrap(),
+        Duration::from_millis(300),
+    )
+    .is_ok()
+}
+
+/// 解析 daemon 实际端口：端点文件优先（真源），否则从起始端口扫一个活着的。
+fn resolve_daemon_port(app: &tauri::AppHandle) -> u16 {
+    if let Some(p) = read_daemon_endpoint(app) {
+        if daemon_alive_on(p) {
+            return p;
+        }
+    }
+    for offset in 0..PORT_SCAN_LIMIT {
+        let p = DAEMON_PORT.saturating_add(offset);
+        if p == 0 {
+            break;
+        }
+        if daemon_alive_on(p) {
+            return p;
+        }
+    }
+    // 没有活着的：以端点文件（可能是上一次的）或起始端口作为"将要监听"的期望值。
+    read_daemon_endpoint(app).unwrap_or(DAEMON_PORT)
+}
+
+/// 等端口真正释放（kill 之后）。
+fn wait_port_free(port: u16) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if !port_busy(port) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// 最小 HTTP POST（JSON 空体）：用于通知 daemon 重启它托管的 orig-tg。
+///
+/// 不引入 HTTP 客户端依赖：这里只需要一次本机回环调用。
+fn http_post(path: &str, port: u16) -> Result<String, String> {
+    let mut stream = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}").parse().unwrap(),
+        Duration::from_millis(500),
+    )
+    .map_err(|e| format!("connect daemon: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(3000)))
+        .map_err(|e| e.to_string())?;
+    let body = "{}";
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    let mut out = String::new();
+    stream.read_to_string(&mut out).map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 /// daemon 侧 TG 数据目录（BUG-094）。
@@ -76,7 +160,9 @@ fn daemon_tg_data_dir(app: &tauri::AppHandle) -> Option<String> {
 }
 
 /// 用 Tauri sidecar 拉起 daemon（阻塞直到端口就绪或超时）。
-fn spawn_daemon(app: &tauri::AppHandle) -> Result<CommandChild, String> {
+///
+/// 返回 `(子进程句柄, 实际端口)`：端口由 daemon 自己写在端点文件里，壳不猜。
+fn spawn_daemon(app: &tauri::AppHandle) -> Result<(CommandChild, u16), String> {
     let sidecar = app
         .shell()
         .sidecar(DAEMON_BIN)
@@ -90,11 +176,22 @@ fn spawn_daemon(app: &tauri::AppHandle) -> Result<CommandChild, String> {
         .spawn()
         .map_err(|e| format!("sidecar spawn failed: {e}"))?;
 
-    // 等待端口就绪（最多 5s）
+    // 等待就绪（最多 5s）：端点文件里的端口优先，其次扫起始段。
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if daemon_alive() {
-            return Ok(child);
+        if let Some(p) = read_daemon_endpoint(app) {
+            if daemon_alive_on(p) {
+                return Ok((child, p));
+            }
+        }
+        for offset in 0..PORT_SCAN_LIMIT {
+            let p = DAEMON_PORT.saturating_add(offset);
+            if p == 0 {
+                break;
+            }
+            if daemon_alive_on(p) {
+                return Ok((child, p));
+            }
         }
         std::thread::sleep(Duration::from_millis(100));
         // 消费子进程输出，避免管道阻塞
@@ -103,14 +200,15 @@ fn spawn_daemon(app: &tauri::AppHandle) -> Result<CommandChild, String> {
     Err("daemon did not become ready within 5s".into())
 }
 
-/// 前端查询：daemon 是否存活 + 端口。
+/// 前端查询：daemon 是否存活 + **实际**端口。
 #[tauri::command]
-fn daemon_status(state: tauri::State<'_, DaemonState>) -> serde_json::Value {
-    let alive = daemon_alive();
+fn daemon_status(app: tauri::AppHandle, state: tauri::State<'_, DaemonState>) -> serde_json::Value {
+    let port = resolve_daemon_port(&app);
+    let alive = daemon_alive_on(port);
     let owned = state.child.lock().unwrap().is_some();
     serde_json::json!({
         "alive": alive,
-        "port": DAEMON_PORT,
+        "port": port,
         "managed": owned,
     })
 }
@@ -121,58 +219,40 @@ fn daemon_status(state: tauri::State<'_, DaemonState>) -> serde_json::Value {
 #[tauri::command]
 fn ensure_daemon(app: tauri::AppHandle, state: tauri::State<'_, DaemonState>) -> Result<serde_json::Value, String> {
     eprintln!("[ensure_daemon] called");
-    let alive = daemon_alive();
+    // 端口以 daemon 自己写下的为准（可能顺延），不是常量。
+    let port = resolve_daemon_port(&app);
+    let alive = daemon_alive_on(port);
     let mut need_kill = false;
     if alive {
-        // 仅当 9876 上的监听进程确为本外壳对应的 orig-daemon 时才复用；
+        // 仅当该端口上的监听进程确为本外壳对应的 orig-daemon 时才复用；
         // 否则（如改名前残留的旧 surge-daemon）杀掉并重新拉起，避免“还是旧的”。
-        if port_owner_is_daemon() {
-            eprintln!("[ensure_daemon] alive=true, reusing our daemon");
-            return Ok(serde_json::json!({"started": false, "reason": "already-running"}));
+        if port_owner_is_daemon_on(port) {
+            eprintln!("[ensure_daemon] alive=true on {port}, reusing our daemon");
+            return Ok(serde_json::json!({"started": false, "reason": "already-running", "port": port}));
         }
         eprintln!("[ensure_daemon] alive=true but owner mismatch, will kill stale");
         need_kill = true;
-    } else {
-        eprintln!("[ensure_daemon] alive=false, checking port");
-        // 端口被占但 health 不可用 → 杀掉旧 daemon（无论是否由本外壳托管）
-        let port_busy = TcpStream::connect_timeout(
-            &format!("127.0.0.1:{DAEMON_PORT}").parse().unwrap(),
-            Duration::from_millis(300),
-        )
-        .is_ok();
-        if port_busy {
-            eprintln!("[ensure_daemon] port busy, will kill owner");
-            need_kill = true;
-        }
+    } else if port_busy(port) {
+        // 端口被占但 health 不可用 → 杀掉占用者（无论是否由本外壳托管）
+        eprintln!("[ensure_daemon] port {port} busy but unhealthy, will kill owner");
+        need_kill = true;
     }
     if need_kill {
         eprintln!("[ensure_daemon] killing port owner");
-        kill_port_owner(DAEMON_PORT);
-        // 等端口释放
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while std::time::Instant::now() < deadline {
-            if TcpStream::connect_timeout(
-                &format!("127.0.0.1:{DAEMON_PORT}").parse().unwrap(),
-                Duration::from_millis(200),
-            )
-            .is_err()
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        kill_port_owner(port);
         // 无论是否释放都继续尝试拉起；若没杀掉则 spawn 会失败报错
+        wait_port_free(port);
     }
     eprintln!("[ensure_daemon] spawning daemon");
-    let child = spawn_daemon(&app)?;
-    eprintln!("[ensure_daemon] daemon spawned ok");
+    let (child, actual) = spawn_daemon(&app)?;
+    eprintln!("[ensure_daemon] daemon spawned ok on {actual}");
     *state.child.lock().unwrap() = Some(child);
-    Ok(serde_json::json!({"started": true, "port": DAEMON_PORT}))
+    Ok(serde_json::json!({"started": true, "port": actual}))
 }
 
-/// 返回 9876 上的监听进程是否确为本外壳对应的 orig-daemon（按可执行文件名判断）。
+/// 返回指定端口上的监听进程是否确为本外壳对应的 orig-daemon（按可执行文件名判断）。
 /// 用于避免复用改名前残留的旧 daemon（如 surge-daemon）。
-fn port_owner_is_daemon() -> bool {
+fn port_owner_is_daemon_on(port: u16) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -185,7 +265,7 @@ fn port_owner_is_daemon() -> bool {
             .and_then(|o| {
                 let text = String::from_utf8_lossy(&o.stdout);
                 text.lines()
-                    .find(|l| l.contains("LISTENING") && l.contains(&format!(":{DAEMON_PORT}")))
+                    .find(|l| l.contains("LISTENING") && l.contains(&format!(":{port}")))
                     .and_then(|l| l.split_whitespace().last())
                     .and_then(|s| s.parse::<u32>().ok())
             });
@@ -215,7 +295,7 @@ fn port_owner_is_daemon() -> bool {
     {
         use std::process::Command;
         let out = Command::new("lsof")
-            .args(["-ti", &format!("tcp:{DAEMON_PORT}")])
+            .args(["-ti", &format!("tcp:{port}")])
             .output()
             .ok();
         if let Some(o) = out {
@@ -298,70 +378,6 @@ fn stop_daemon(state: tauri::State<'_, DaemonState>) -> Result<(), String> {
 // session/store/下载目录固定在 appDataDir/tg/ 下。
 // ---------------------------------------------------------------------------
 
-/// 侧边进程名（与 tauri.conf.json externalBin 对应）。
-const TG_BIN: &str = "orig-tg";
-/// orig-tg 默认监听端口。
-const TG_PORT: u16 = 9877;
-
-struct TgState {
-    /// 由本外壳拉起的 orig-tg 子进程句柄（复用已运行实例时为 None）。
-    child: Mutex<Option<CommandChild>>,
-}
-
-/// 检查 orig-tg 是否真正可用：TCP 连上且 GET /health 返回 200。
-fn tg_alive() -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(
-        &format!("127.0.0.1:{TG_PORT}").parse().unwrap(),
-        Duration::from_millis(300),
-    ) else {
-        return false;
-    };
-    stream.set_read_timeout(Some(Duration::from_millis(800))).ok();
-    stream.set_write_timeout(Some(Duration::from_millis(800))).ok();
-    let req = format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{TG_PORT}\r\nConnection: close\r\n\r\n");
-    if stream.write_all(req.as_bytes()).is_err() {
-        return false;
-    }
-    let mut buf = [0u8; 512];
-    let n = match stream.read(&mut buf) {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
-    if n == 0 {
-        return false;
-    }
-    let head = String::from_utf8_lossy(&buf[..n]);
-    head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
-}
-
-/// 检查 9877 上的服务是否为「可用且非合成」的实例。
-///
-/// 契约（orig-tg `/api/tg/diag`）：`available` + `mode` + `mock`。
-/// 端口活着但 `available=false`（无凭证 / MTProto 连不上）或 `mock=true` 的实例一律视为无效，
-/// 需要杀掉重拉 —— 否则用户会在一个「假装可用」的客户端上走登录，验证码永远收不到。
-fn tg_service_real() -> bool {
-    let Ok(mut stream) = TcpStream::connect_timeout(
-        &format!("127.0.0.1:{TG_PORT}").parse().unwrap(),
-        Duration::from_millis(300),
-    ) else {
-        return false;
-    };
-    stream.set_read_timeout(Some(Duration::from_millis(1500))).ok();
-    stream.set_write_timeout(Some(Duration::from_millis(800))).ok();
-    let req = format!("GET /api/tg/diag HTTP/1.1\r\nHost: 127.0.0.1:{TG_PORT}\r\nConnection: close\r\n\r\n");
-    if stream.write_all(req.as_bytes()).is_err() {
-        return false;
-    }
-    let mut buf = Vec::new();
-    let _ = stream.read_to_end(&mut buf);
-    let text = String::from_utf8_lossy(&buf);
-    // BUG-023 后语义：`api_mode:"real"` 字符串已不存在，改用可用性契约判定。
-    // mock=true 也判为无效 —— 合成实例绝不能被桌面壳当成可服务实例接受。
-    let available = text.contains("\"available\":true") || text.contains("\"available\": true");
-    let mock = text.contains("\"mock\":true") || text.contains("\"mock\": true");
-    available && !mock
-}
-
 /// orig-tg 启动配置（APP 数据目录内，UI 配置一次）。
 #[derive(serde::Serialize, serde::Deserialize)]
 struct TgLaunchConfig {
@@ -403,73 +419,18 @@ fn write_tg_config(app: &tauri::AppHandle, cfg: &TgLaunchConfig) -> Result<(), S
     std::fs::write(path, text).map_err(|e| e.to_string())
 }
 
-/// 拉起 orig-tg sidecar（凭证/路径全部注入 env），阻塞直到 health 就绪。
-fn spawn_tg(app: &tauri::AppHandle) -> Result<CommandChild, String> {
-    let cfg = read_tg_config(app)?.ok_or("not-configured")?;
-    if cfg.api_id.trim().is_empty() || cfg.api_hash.trim().is_empty() {
-        return Err("not-configured".into());
-    }
-    let data = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("tg");
-    std::fs::create_dir_all(&data).map_err(|e| e.to_string())?;
-    let dl_dir = data.join("downloads");
-    std::fs::create_dir_all(&dl_dir).map_err(|e| e.to_string())?;
-
-    let sidecar = app
-        .shell()
-        .sidecar(TG_BIN)
-        .map_err(|e| format!("sidecar resolve failed: {e}"))?;
-    let (mut rx, child) = sidecar
-        .env("ORIG_TG_API_ID", cfg.api_id.trim())
-        .env("ORIG_TG_API_HASH", cfg.api_hash.trim())
-        .env(
-            "ORIG_TG_SESSION",
-            data.join("session.session").to_string_lossy().to_string(),
-        )
-        .env(
-            "ORIG_TG_DB",
-            data.join("store.db").to_string_lossy().to_string(),
-        )
-        .env(
-            "ORIG_TG_DOWNLOAD_DIR",
-            dl_dir.to_string_lossy().to_string(),
-        )
-        .env("ORIG_TG_PROXY", cfg.proxy.trim())
-        .spawn()
-        .map_err(|e| format!("sidecar spawn failed: {e}"))?;
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
-    while std::time::Instant::now() < deadline {
-        // 必须是「可用且非合成」才算就绪：凭证非法/网络不通时 orig-tg 会以
-        // unavailable 态运行（诚实报 503），若只等 health 会假成功，
-        // 用户将在不可用实例上走登录，验证码永远收不到。
-        if tg_alive() && tg_service_real() {
-            return Ok(child);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        let _ = rx.try_recv();
-    }
-    Err("orig-tg did not become ready (available, non-mock) within 8s".into())
-}
-
-/// 前端查询：orig-tg 是否存活 + 端口 + 是否本壳托管。
-#[tauri::command]
-fn tg_status(state: tauri::State<'_, TgState>) -> serde_json::Value {
-    serde_json::json!({
-        "alive": tg_alive(),
-        "port": TG_PORT,
-        "managed": state.child.lock().unwrap().is_some(),
-    })
-}
-
-/// 前端命令：保存配置并（重）启动 orig-tg。
+/// 前端命令：保存 Telegram 凭证（api_id / api_hash / 代理）。
+///
+/// **桌面壳不再自己拉起或杀死 orig-tg**（BUG-178）：进程生命周期归 daemon 独占 ——
+/// 两个主人会互相 kill（壳的 `kill_port_owner` 曾直接杀掉 daemon 拉起的实例），
+/// 而「谁去重启它」也就成了留给用户点的按钮，那是把系统的失职外包给用户。
+///
+/// 这里只做两件事：写 `tg/config.json`，然后请 daemon 重启它托管的实例
+/// （凭证只在 orig-tg **启动时**读取，不重启等于改了个寂寞）。daemon 不在跑时
+/// 只写文件 —— 它下次启动自然会带上新凭证。
 #[tauri::command]
 fn tg_save_config(
     app: tauri::AppHandle,
-    state: tauri::State<'_, TgState>,
     api_id: String,
     api_hash: String,
     proxy: String,
@@ -485,60 +446,22 @@ fn tg_save_config(
             proxy: if proxy.trim().is_empty() { default_tg_proxy() } else { proxy.trim().into() },
         },
     )?;
-    // 先停掉由本壳托管的实例与端口残留，再以新配置拉起。
-    if let Some(child) = state.child.lock().unwrap().take() {
-        let _ = child.kill();
+    let port = resolve_daemon_port(&app);
+    if !daemon_alive_on(port) {
+        return Ok(serde_json::json!({ "saved": true, "restarted": false, "reason": "daemon-not-running" }));
     }
-    kill_port_owner(TG_PORT);
-    std::thread::sleep(Duration::from_millis(300));
-    let child = spawn_tg(&app)?;
-    *state.child.lock().unwrap() = Some(child);
-    Ok(serde_json::json!({ "started": true, "port": TG_PORT }))
-}
-
-/// 确保 orig-tg 运行（幂等）。未配置返回 Err("not-configured")。
-///
-/// 与 `#[tauri::command]` 外壳分离，好让 `setup` 阶段也能直接调用（BUG-094）。
-///
-/// **「已健康则跳过」的判断已具备**：`tg_alive() && tg_service_real()` 时直接返回
-/// `already-running`，不会 kill + respawn —— 因此在 `setup` 里调用是安全的，
-/// 不会顶掉一个已经 `Authorized` 的实例。
-fn ensure_tg_inner(app: &tauri::AppHandle, state: &TgState) -> Result<serde_json::Value, String> {
-    if tg_alive() {
-        if tg_service_real() {
-            return Ok(serde_json::json!({ "started": false, "reason": "already-running" }));
+    match http_post("/api/tg/restart", port) {
+        Ok(resp) => {
+            let status = resp.lines().next().unwrap_or("").trim().to_string();
+            // 409 = 插件未启用：凭证已存，启用开关时会带上。
+            Ok(serde_json::json!({ "saved": true, "restarted": true, "daemon": status }))
         }
-        // 端口活着但不可用/为合成实例（无凭证、连不上 TG 的残留等）→ 杀掉重拉，
-        // 避免 APP 在不可用实例上走登录（验证码永远收不到）。
-        eprintln!("[ensure_tg] alive but unavailable/mock, killing stale and respawning");
-        kill_port_owner(TG_PORT);
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while std::time::Instant::now() < deadline {
-            if TcpStream::connect_timeout(
-                &format!("127.0.0.1:{TG_PORT}").parse().unwrap(),
-                Duration::from_millis(200),
-            )
-            .is_err()
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    } else {
-        // 端口残留（health 都不通的旧进程等）一律清掉，由壳统一托管。
-        kill_port_owner(TG_PORT);
+        Err(e) => Ok(serde_json::json!({ "saved": true, "restarted": false, "reason": e })),
     }
-    let child = spawn_tg(app)?;
-    *state.child.lock().unwrap() = Some(child);
-    Ok(serde_json::json!({ "started": true, "port": TG_PORT }))
 }
 
-/// 前端命令：确保 orig-tg 运行（幂等）。未配置返回 Err("not-configured")。
-#[tauri::command]
-fn ensure_tg(app: tauri::AppHandle, state: tauri::State<'_, TgState>) -> Result<serde_json::Value, String> {
-    ensure_tg_inner(&app, &state)
-}
-
+，好让 `setup` 阶段也能直接调用（BUG-094）。
+///
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -556,9 +479,6 @@ pub fn run() {
             }),
         )
         .manage(DaemonState {
-            child: Mutex::new(None),
-        })
-        .manage(TgState {
             child: Mutex::new(None),
         })
         .setup(|app| {
@@ -586,33 +506,13 @@ pub fn run() {
                 .build(app)?;
             let _ = _tray;
 
-            // BUG-094 保命阀：壳启动时就把「正确实例」拉起来。
-            //
-            // 不这么做的话，唯一正确路径 `spawn_tg` 只在 `ensure_tg` / `tg_save_config`
-            // 里被调到，而前端 `ensureTg()` 又挂在「`tgHealth()` 失败」上 —— daemon 拉起的
-            // 无凭据实例 `/health` 恒 200，于是前端永不触发、TG 面板（nav-tg 已被过滤）
-            // 也进不去，用户彻底无法自救。这里在 setup 阶段主动补一次。
-            //
-            // 放后台线程：`spawn_tg` 最长阻塞 8s 等就绪，不能在 setup 里同步阻塞出窗。
-            // `ensure_tg_inner` 自带「已健康则跳过」，不会 kill 掉正常在跑的实例；
-            // 未配置（config.json 缺失）时返回 Err，这里只记一行日志、不影响启动。
-            let handle = app.handle().clone();
-            std::thread::spawn(move || {
-                let state = handle.state::<TgState>();
-                match ensure_tg_inner(&handle, &state) {
-                    Ok(v) => eprintln!("[setup] ensure_tg: {v}"),
-                    Err(e) => eprintln!("[setup] ensure_tg skipped: {e}"),
-                }
-            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             daemon_status,
             ensure_daemon,
             stop_daemon,
-            tg_status,
-            tg_save_config,
-            ensure_tg
+            tg_save_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

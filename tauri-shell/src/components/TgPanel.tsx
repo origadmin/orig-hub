@@ -31,16 +31,16 @@ import type {
   TgChannel,
   TgMediaItem,
   TgMonitoredChannel,
+  TgQueuedTask,
   TgStoredMessage,
 } from '../types'
-import { ensureTg, tgSaveConfig } from '../api/tauri'
+import { tgSaveConfig } from '../api/tauri'
 import { CacheManagerDialog } from './CacheManagerDialog'
 import { useStore } from '../store/useStore'
 import { useTgSearch } from '../store/tgSearch'
 import { classifyTgReason, describeTgFailure, logTgReason } from '../lib/tgReason'
 import { deriveEntryState } from '../lib/entryState'
 import type { EntryState } from '../lib/entryState'
-import { useTgRetry } from '../lib/tgRetry'
 import {
   ALBUM_MAX_TILES,
   albumGridClass,
@@ -58,6 +58,20 @@ const UNGROUPED = '__ungrouped__'
 const ALL_KEY = '__all__'
 /** 右栏媒体历史每页条数 */
 const PAGE_SIZE = 30
+
+/**
+ * 相册级缓存进度（BUG-181 扩展）：
+ * - `queued`：该组在单飞队列中排队（本轮跑不到它，呈现「排队中」而非「缓存中」）；
+ * - `itemBytes/itemBytesTotal`：当前条目内字节进度（一条 200MB 视频下载数分钟，
+ *   仅靠 `done` 计数会全程冻结，对用户等价于「系统死了」）。
+ */
+interface AlbumProgress {
+  done: number
+  total: number
+  queued?: boolean
+  itemBytes?: number
+  itemBytesTotal?: number
+}
 
 /**
  * 稳定事件回调（useEvent 模式）收敛到 `hooks/useEvent.ts` 的**唯一实现**，本文件改为导入。
@@ -266,38 +280,25 @@ export function TgPanel(
   } = {},
 ) {
   const { t } = useTranslation()
-  const { setError, openViewer, tgAvailability, accounts, refreshTgState } = useStore()
+  const { setError, openViewer, tgService, tgLink, accounts, refreshTgState } = useStore()
   /**
-   * TG 依赖故障（不可用/不可达）：直接以「不可用 + 原因」取代面板内容。
+   * 链路真断了才叫故障（BUG-178）。
    *
-   * 面板里的每一次拉取都依赖 TG 连接，故障时展示一个空列表会让人以为「频道没了」；
-   * 明确说出原因，才能把「连不上 Telegram」与「没有内容」区分开（BUG-023）。
+   * 分层是这次的核心：以前「没配凭证 / 没登录 / 连不上」塌成一个 `available=false`，
+   * 面板一律渲染「Telegram 不可用」，而设置页同时显示「插件：运行中」—— 两个真源各说各话。
+   * 现在只有 `link_down` 走故障卡；`needs_config` / `needs_login` 是**待办**，给引导。
    */
-  const tgBroken = tgAvailability !== null && tgAvailability.status !== 'ok'
-  /** 调试期离线短路（orig-tg 以 ORIG_TG_OFFLINE=1 启动，跳过 MTProto 连接）：
-   *   预期态，不是故障。渲染成中性「调试模式」面板而非红色错误框，否则网页调试阶段
-   *   一打开 TG 就满屏红错，等于没有调试环境。 */
-  const tgDebugOffline =
-    tgAvailability?.status === 'unavailable' &&
-    /offline debug mode/.test(tgAvailability.reason ?? '')
-  /**
-   * orig-tg 服务是否在跑（进程可达）。
-   *
-   * `unavailable` 的语义是「进程活着、连不上 Telegram」—— 它仍算服务在跑，
-   * 而且正是最需要留在这里修（改代理 / 重新登录）的状态。
-   */
-  const tgServiceUp = tgAvailability === null || tgAvailability.status !== 'unreachable'
+  const tgBroken = tgLink.state === 'link_down'
+  /** 服务层：进程是否在跑（daemon 说了算，前端不再自己探端口） */
+  const tgServiceUp = tgService.running
   /**
    * 未绑定态（BUG-094）：服务在跑，但没有可用登录会话。
    * 此时渲染引导区而不是频道列表 —— 频道列表在没有会话时必然是空的，
    * 空列表会把「没登录 / 连不上」伪装成「没有内容」。
    */
-  const tgUnbound = tgServiceUp && !accounts.tg.bound
+  const tgUnbound = tgServiceUp && !accounts.tg.bound && tgLink.state !== 'needs_config'
   /** 后端原文（仅用于日志与分类），绝不直接渲染 */
-  const rawReason =
-    tgAvailability !== null && tgAvailability.status === 'unavailable'
-      ? tgAvailability.reason
-      : null
+  const rawReason = tgBroken ? tgLink.reason : null
   const showReason = Boolean(rawReason && rawReason.trim())
   /** 分类降级后的 i18n 键（BUG-088） */
   const reasonKey = classifyTgReason(rawReason)
@@ -314,11 +315,13 @@ export function TgPanel(
   }, [refreshTgState])
 
   /**
-   * 「重试连接」出口（BUG-094）：orig-tg 只在启动时连一次，失败后不会自愈，
-   * 所以未授权/不可用时必须给用户一个显式重连入口 —— 否则就算他把代理修好了，
-   * 服务也永远停在不可用态（除了重启应用无路可走）。
+   * **没有「重试连接」按钮**（BUG-178）。
+   *
+   * orig-tg 只在启动时连一次 Telegram，所以「连不上」确实需要重启才能恢复 ——
+   * 但那是 **daemon 的职责**：巡检发现链路断了会自己重启，凭证保存后也会自动重启。
+   * 以前把这个动作做成按钮挂在界面上（壳 `ensure_tg` + 前端「重试连接」两条路径），
+   * 结果是 TG 进程有两个主人、互相 kill，而用户还得替系统干活。现在一条都不留。
    */
-  const { busy: retrying, noteKey: retryNoteKey, retry: retryTg } = useTgRetry()
   const [alive, setAlive] = useState(false)
   const [channels, setChannels] = useState<TgChannel[]>([])
   const [scanning, setScanning] = useState(false)
@@ -336,7 +339,7 @@ export function TgPanel(
   const [feedLoading, setFeedLoading] = useState(false)
   /**
    * 内容流加载失败的**面板内联**提示（BUG-167）：只在内容区展示、不升级为全局 toast。
-   * 全局可用性表述的唯一真相源是引擎 `tgAvailability` 横幅（与三处连接灯同源诚实）；
+   * 全局可用性表述的唯一真相源是**链路层** `tgLink`（服务层由 daemon 托管，与三处连接灯同源诚实）；
    * 瞬时传输错误在这里降级为「可重试的局部失败」，绝不产生与之矛盾的「无法连接」断言。
    */
   const [feedError, setFeedError] = useState<string | null>(null)
@@ -387,7 +390,9 @@ export function TgPanel(
    * 「既无进度也无已缓存」的空洞（跨源 intermediate 态，禁止）。进度在此持有，
    * 由条目派生状态驱动清除（全部离开 caching 才释放）。
    */
-  const albumProgressHoldRef = useRef(new Map<string, { done: number; total: number }>())
+  const albumProgressHoldRef = useRef(
+    new Map<string, AlbumProgress>(),
+  )
   /**
    * 图片入库状态（BUG-049 规则：图片不缓存，最多加入媒体库）：
    * 已入库图片的 ref 集合（`<chatId>:<messageId>`）。feed 变化时对未见过的图片
@@ -404,6 +409,12 @@ export function TgPanel(
    */
   /** 当前唯一缓存任务（后端单飞：任意时刻至多一个在呈现；设计裁定「task 只返回一个结果」） */
   const [cacheTask, setCacheTask] = useState<TgCacheTask | null>(null)
+  /**
+   * 排队任务覆盖摘要（BUG-181）：单飞端点此前对排队任务零呈现——用户入队第二组时
+   * 下一拍就被 running 任务覆盖回「未缓存」，看起来「无法添加」。排队组据此点亮
+   * 「排队中」。与 cacheTask 同一请求、同一事实源，不新增轮询。
+   */
+  const [queuedTasks, setQueuedTasks] = useState<TgQueuedTask[]>([])
   /** 缓存管理面板开关（BUG-029：缓存任务的可观测面——数量/进度/状态）。
    *  入口在上下文栏，故开关提到 store（跨子树共享）。 */
   const cacheManagerOpen = useStore((s) => s.tgCacheManagerOpen)
@@ -425,40 +436,44 @@ export function TgPanel(
   /** 当前 feed 的数据源（loadOlder 闭包内读取，避免陈旧闭包） */
   const feedSourceRef = useRef<{ chatId: number; monitored: boolean } | null>(null)
 
-  // ---- 服务探活：APP 模式由 Tauri 壳托管拉起；未配置凭证时出配置卡 ----
+  /*
+   * 服务探活（BUG-178）：**只观察，不拉起**。
+   *
+   * 以前这里在探活失败时自己调 `ensureTg()` 去 spawn orig-tg —— 于是 TG 进程有了
+   * 两个主人（daemon 一个、桌面壳一个），互相 kill，状态随之乱跳。现在进程生命周期
+   * 归 daemon 独占：这里只回答「现在通不通」，不通就出配置/引导卡，拉起由 daemon 的
+   * 启动拉起与巡检自愈负责。
+   */
   useEffect(() => {
-    const isTauri = '__TAURI_INTERNALS__' in window
     tgHealth()
       .then(() => setAlive(true))
-      .catch(async () => {
-        if (!isTauri) {
-          setAlive(false)
-          return
-        }
-        try {
-          await ensureTg()
-          setAlive(true)
-        } catch {
-          setAlive(false)
-          // 未配置（壳返回 not-configured）或拉起失败 → 显示 APP 内配置表单
-          setNeedConfig(true)
-        }
+      .catch(() => {
+        setAlive(false)
+        // 未配置凭证 → 出 APP 内配置表单；服务没起来 → 交给 daemon 自愈，这里不代劳。
+        if (tgLink.state === 'needs_config') setNeedConfig(true)
       })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  /** 保存 Telegram 配置并启动服务（壳负责持久化 + 拉起 sidecar） */
+  /**
+   * 保存 Telegram 配置：壳写 `tg/config.json` 并请 daemon 重启 orig-tg。
+   *
+   * 前端不碰进程（BUG-178）—— 凭证只在 orig-tg 启动时读取，重启这一步由 daemon 执行。
+   */
   const saveSetup = useCallback(async () => {
     setSavingCfg(true)
     try {
       await tgSaveConfig(cfgId.trim(), cfgHash.trim(), cfgProxy.trim())
       setNeedConfig(false)
+      // 重启后状态由 daemon 重报：走唯一刷新入口，不在这里猜结果。
+      await refreshTgState()
       setAlive(true)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setSavingCfg(false)
     }
-  }, [cfgId, cfgHash, cfgProxy, setError])
+  }, [cfgId, cfgHash, cfgProxy, setError, refreshTgState])
 
   // ---- 订阅频道：缓存优先；refresh=true 触发后台全量扫描（不清缓存） ----
   const fetchDialogs = useCallback(
@@ -646,13 +661,37 @@ export function TgPanel(
    * 演进史，集合本身删除以免出现第二套「缓存中」判据。
    */
 
-  /** 整组缓存进度（键与渲染处一致：`a-{chatId}-{groupId}`；单飞下至多一项） */
+  /** 整组缓存进度（键与渲染处一致：`a-{chatId}-{groupId}`；单飞下至多一项 running + 若干排队）
+   *  BUG-181：排队组以 `queued:true` 进表（呈现「排队中」）；running 组带条目内字节。 */
   const albumProgress = useMemo(() => {
-    const m = new Map<string, { done: number; total: number }>()
+    const m = new Map<string, AlbumProgress>()
     if (activeTask && activeTask.groupId !== undefined && activeTask.groupId !== null) {
       m.set(`a-${activeTask.chatId}-${activeTask.groupId}`, {
         done: activeTask.done,
         total: activeTask.total,
+        itemBytes: activeTask.itemBytes,
+        itemBytesTotal: activeTask.itemBytesTotal,
+      })
+    }
+    for (const q of queuedTasks) {
+      if (q.groupId === undefined || q.groupId === null) continue
+      const k = `a-${q.chatId}-${q.groupId}`
+      if (!m.has(k)) m.set(k, { done: 0, total: q.total, queued: true })
+    }
+    return m
+  }, [activeTask, queuedTasks])
+
+  /** 单条任务的条目内字节（BUG-181）：单条 running 时把字节映射到它的消息号上 */
+  const singleProgress = useMemo(() => {
+    const m = new Map<number, { itemBytes?: number; itemBytesTotal?: number }>()
+    if (
+      activeTask &&
+      activeTask.status === 'running' &&
+      activeTask.messageIds.length === 1
+    ) {
+      m.set(activeTask.messageIds[0], {
+        itemBytes: activeTask.itemBytes,
+        itemBytesTotal: activeTask.itemBytesTotal,
       })
     }
     return m
@@ -669,10 +708,17 @@ export function TgPanel(
    */
   const entryStateFor = useCallback(
     (item: FeedItem): EntryState => {
-      const taskStatus =
-        cacheTask && cacheTask.chatId === item.chatId && cacheTask.messageIds.includes(item.messageId)
+      const taskStatus = cacheTask &&
+        cacheTask.chatId === item.chatId &&
+        cacheTask.messageIds.includes(item.messageId)
           ? cacheTask.status
-          : null
+          : // BUG-181：不在当前任务里时看排队覆盖——入队第二组的下一拍即点亮
+            // 「排队中」，不再被打回「未缓存」（呈现为「无法添加」的根因）。
+            queuedTasks.some(
+              (q) => q.chatId === item.chatId && q.messageIds.includes(item.messageId),
+            )
+            ? 'queued'
+            : null
       const prev = entryStateHoldRef.current.get(item.key) ?? null
       const next = deriveEntryState({
         bytesPresence: downloadedPaths.has(item.key) ? 'present' : undefined,
@@ -686,24 +732,28 @@ export function TgPanel(
       entryStateHoldRef.current.set(item.key, next)
       return next
     },
-    [cacheTask, downloadedPaths],
+    [cacheTask, queuedTasks, downloadedPaths],
   )
 
   /**
-   * 轮询签名：id/status/done/currentId/error 任一变化才算「状态真的变了」。
-   * 快照返回新对象但内容没变（下载一条要几秒，1s 轮询绝大多数是空转）时
-   * **直接跳过 setState**——零重渲染。这是流畅度规则「等值短路」的落点。
+   * 轮询签名：id/status/done/currentId/itemBytes/queued/error 任一变化才算
+   * 「状态真的变了」（BUG-181：itemBytes 进了签名，长条目下载期间每拍都触发
+   * 重渲染，字节进度才可见）。快照返回新对象但内容没变（下载一条要几秒，
+   * 5s 轮询绝大多数是空转）时**直接跳过 setState**——零重渲染。
+   * 这是流畅度规则「等值短路」的落点。
    */
   const cacheTasksSigRef = useRef('')
   const refreshCacheTasks = useCallback(async () => {
     try {
-      const task = await getCacheTask()
+      const { task, queued } = await getCacheTask()
+      const queuedSig = queued.map((q) => q.id).join(',')
       const sig = task
-        ? `${task.id}:${task.status}:${task.done}:${task.currentId ?? ''}:${task.error ?? ''}`
+        ? `${task.id}:${task.status}:${task.done}:${task.currentId ?? ''}:${task.itemBytes ?? ''}:${task.error ?? ''}:${queuedSig}`
         : ''
       if (sig === cacheTasksSigRef.current) return
       cacheTasksSigRef.current = sig
       setCacheTask(task)
+      setQueuedTasks(queued)
     } catch {
       // 任务查询失败不影响浏览；下次轮询/操作会重试
     }
@@ -1168,12 +1218,15 @@ export function TgPanel(
     }
   }
 
-  /** 取消整组缓存：取消服务端任务（worker 在下一条目间隙退出）。 */
+  /** 取消整组缓存：取消服务端任务（worker 在下一条目间隙退出；排队任务直接出队）。 */
   const cancelAlbum = async (key: string) => {
-    // 单飞模型：当前任务就是该组时才可取消（其它组在排队，无进度可取消）。
-    if (!activeTask || `a-${activeTask.chatId}-${activeTask.groupId}` !== key) return
+    // 单飞模型：当前任务或任一排队任务覆盖该组时都可取消（BUG-181：排队前也可撤）。
+    const target =
+      (activeTask && `a-${activeTask.chatId}-${activeTask.groupId}` === key ? activeTask : null) ??
+      queuedTasks.find((q) => `a-${q.chatId}-${q.groupId}` === key)
+    if (!target) return
     try {
-      await cancelCacheTask(activeTask.id)
+      await cancelCacheTask(target.id)
       await refreshCacheTasks()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -1249,25 +1302,7 @@ export function TgPanel(
         （`TgCacheEntry`，与连接态/速度同处一行），本行整条删除，不留空 div 占位。
       */}
       <div className="flex min-h-0 flex-1">
-      {tgDebugOffline && tgAvailability ? (
-        /* 调试期离线：预期态，中性呈现，不报警 */
-        <div className="flex flex-1 items-center justify-center p-6">
-          <div className="w-full max-w-md rounded-lg border border-border-subtle bg-surface/60 p-5">
-            <h3 className="text-[14px] font-semibold text-foreground">
-              {t('tg.debugOfflineTitle')}
-            </h3>
-            <p className="mt-1 text-[11px] leading-relaxed text-muted">
-              {t('tg.debugOfflineHint')}
-            </p>
-            {/* 原文不进 DOM（BUG-088）：与其余各处同走 `classifyTgReason` */}
-            {tgAvailability.reason && (
-              <p className="mt-3 rounded-md bg-background px-2 py-1.5 text-[10px] leading-relaxed text-muted">
-                {t(classifyTgReason(tgAvailability.reason))}
-              </p>
-            )}
-          </div>
-        </div>
-      ) : tgUnbound ? (
+      {tgUnbound ? (
         /*
          * 未绑定引导区（BUG-094）：入口已按「服务可用即显示」放行，这里必须说清
          * 「没登录 / 为什么连不上」并给出可行动出口 —— 否则点进来是一个空面板，
@@ -1292,16 +1327,11 @@ export function TgPanel(
                 {t(reasonKey)}
               </p>
             )}
+            {/*
+              只留「去绑定」一个出口：**没有重连按钮**（BUG-178）。
+              重启服务是 daemon 的职责，不是用户的手动项。
+            */}
             <div className="mt-5 flex gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8 flex-1 text-xs"
-                disabled={retrying}
-                onClick={() => void retryTg()}
-              >
-                {retrying ? t('tg.retrying') : t('tg.retry')}
-              </Button>
               <Button
                 size="sm"
                 className="h-8 flex-1 text-xs"
@@ -1310,28 +1340,18 @@ export function TgPanel(
                 {t('tg.unboundAction')}
               </Button>
             </div>
-            {/* 失败必须可见（绝不静默吞掉，BUG-090 的教训） */}
-            {retryNoteKey && (
-              <p className="mt-2 rounded-md bg-background px-2 py-1.5 text-[11px] leading-relaxed text-fg-mid">
-                {t(retryNoteKey)}
-              </p>
-            )}
           </div>
         </div>
-      ) : tgBroken && tgAvailability ? (
-        /* 依赖故障：说明「为什么用不了」，而不是给一个空列表 */
-        <div className="flex flex-1 items-center justify-center p-6">
+      ) : tgBroken ? (
+        /* 链路故障：说明「为什么用不了」，而不是给一个空列表 */
+        <div className="flex flex-1 items-center justify-center p-6" data-testid="tg-panel-broken">
           <div className="w-full max-w-md rounded-lg border border-danger/30 bg-danger/10 p-5">
-            <h3 className="text-[14px] font-semibold text-danger">
-              {tgAvailability.status === 'unreachable'
-                ? t('accounts.tgUnreachable')
-                : t('accounts.tgUnavailable')}
+            <h3 className="text-[14px] font-semibold text-danger" data-testid="tg-panel-broken-title">
+              {t('tg.linkDown')}
             </h3>
             <p className="mt-1 text-[11px] leading-relaxed text-danger/90">
               {/* 面板内不自带「连接诊断」，故用面板专属文案（不指向账号页才有的区块） */}
-              {tgAvailability.status === 'unreachable'
-                ? t('tg.unreachableHint')
-                : t('tg.unavailableHint')}
+              {t('tg.linkDownHint')}
             </p>
             {/* 原文不进 DOM（BUG-088）：只渲染分类降级后的中文文案 */}
             {showReason && (
@@ -1765,6 +1785,7 @@ export function TgPanel(
                         state={entryStateFor(unit[0])}
                         downloadedPath={downloadedPaths.get(unit[0].key)}
                         photoInLibrary={photoLibRefs.has(`${unit[0].chatId}:${unit[0].messageId}`)}
+                        progress={singleProgress.get(unit[0].messageId)}
                         onDownload={onBubbleDownload}
                         onImportPhoto={onBubbleImportPhoto}
                         onOpenDownloaded={onBubbleOpen}
@@ -1875,6 +1896,8 @@ const MessageBubble = memo(function MessageBubble(props: {
   downloadedPath?: string
   /** BUG-049：图片已入库（图片不缓存，入库即终态） */
   photoInLibrary: boolean
+  /** 条目内字节进度（BUG-181）：单条任务下载中时展示 `已传/总量`，避免长下载全程冻结 */
+  progress?: { itemBytes?: number; itemBytesTotal?: number }
   onDownload: (item: FeedItem) => void
   onImportPhoto: (item: FeedItem) => void
   onOpenDownloaded: (item: FeedItem) => void
@@ -1885,6 +1908,7 @@ const MessageBubble = memo(function MessageBubble(props: {
     state,
     downloadedPath,
     photoInLibrary,
+    progress,
     onDownload,
     onImportPhoto,
     onOpenDownloaded,
@@ -1893,6 +1917,7 @@ const MessageBubble = memo(function MessageBubble(props: {
   const { t } = useTranslation()
   const cached = state === 'cached'
   const caching = state === 'caching'
+  const queued = state === 'queued'
   return (
     <div className="flex flex-col">
       <div className="max-w-[88%] rounded-2xl rounded-tl-md border border-border-subtle bg-surface p-2.5 shadow-sm">
@@ -1901,7 +1926,7 @@ const MessageBubble = memo(function MessageBubble(props: {
           <VideoBlock
             item={m}
             downloaded={cached}
-            downloading={caching}
+            downloading={caching || queued}
             onDownload={() => onDownload(m)}
           />
         )}
@@ -1925,6 +1950,12 @@ const MessageBubble = memo(function MessageBubble(props: {
         <div className="mt-1.5 flex items-center gap-2">
           <span className="font-mono text-[9px] text-muted">#{m.messageId}</span>
           {m.size ? <span className="text-[10px] text-muted">{fmtSize(m.size)}</span> : null}
+          {/* 条目内字节（BUG-181）：下载中时 `已传/总量` 是唯一活着的证据 */}
+          {caching && progress?.itemBytesTotal ? (
+            <span className="text-[10px] text-accent" data-testid="bubble-item-bytes">
+              {fmtSize(progress.itemBytes ?? 0)}/{fmtSize(progress.itemBytesTotal)}
+            </span>
+          ) : null}
           {/* 呈现状态角标（BUG-170 单源派生）：已缓存 / 缺字节 / 失败 三态如实呈现 */}
           {cached && <Chip tone="success">{t('tg.downloaded')}</Chip>}
           {state === 'bytesMissing' && <Chip tone="warn">{t('tg.bytesMissing')}</Chip>}
@@ -1952,15 +1983,18 @@ const MessageBubble = memo(function MessageBubble(props: {
               variant="secondary"
               size="sm"
               className="h-6 px-2 text-[10px]"
-              disabled={caching}
+              disabled={caching || queued}
               onClick={() => onDownload(m)}
             >
-              {/* 缺字节/失败 = 条目在、字节未就绪 → 动词是「重试缓存」（BUG-170 语义定稿） */}
+              {/* 缺字节/失败 = 条目在、字节未就绪 → 动词是「重试缓存」（BUG-170 语义定稿）；
+                  排队中（BUG-181）= 在单飞队列等待，禁用按钮防止重复入队误导。 */}
               {caching
                 ? t('tg.caching')
-                : state === 'bytesMissing' || state === 'failed'
-                  ? t('tg.retryCache')
-                  : t('tg.download')}
+                : queued
+                  ? t('tg.queued')
+                  : state === 'bytesMissing' || state === 'failed'
+                    ? t('tg.retryCache')
+                    : t('tg.download')}
             </Button>
           )}
         </div>
@@ -2031,8 +2065,8 @@ const AlbumBubble = memo(function AlbumBubble(props: {
   items: FeedItem[]
   /** 组内已缓存条数（含本次会话下载成功的） */
   downloadedCount: number
-  /** 整组缓存进行中的进度 */
-  progress?: { done: number; total: number }
+  /** 整组缓存进行中的进度（BUG-181：含排队态与条目内字节） */
+  progress?: AlbumProgress
   /** BUG-049：组内是否有视频 —— 决定按钮语义（缓存 vs 加入媒体库） */
   groupHasVideo: boolean
   /** BUG-049：组内图片是否全部已入库（纯图组全入库后按钮收起） */
@@ -2160,9 +2194,20 @@ const AlbumBubble = memo(function AlbumBubble(props: {
           <span className="text-[10px] text-muted">{fmtSize(totalSize)}</span>
           {progress ? (
             <>
-              <span className="ml-auto text-[10px] text-muted">
-                {t('tg.cachingProgress', { n: progress.done, total: progress.total })}
-              </span>
+              {progress.queued ? (
+                /* BUG-181：排队组——本轮还没轮到它，如实呈现「排队中」而非假装在缓存 */
+                <span className="ml-auto text-[10px] text-muted" data-testid="album-queued">
+                  {t('tg.queued')}
+                </span>
+              ) : (
+                <span className="ml-auto text-[10px] text-muted" data-testid="album-progress">
+                  {t('tg.cachingProgress', { n: progress.done, total: progress.total })}
+                  {/* 条目内字节（BUG-181）：长条目下载期间 done 冻结，字节是唯一活着的证据 */}
+                  {progress.itemBytesTotal
+                    ? ` · ${fmtSize(progress.itemBytes ?? 0)}/${fmtSize(progress.itemBytesTotal)}`
+                    : ''}
+                </span>
+              )}
               {onCancel && (
                 <Button
                   variant="outline"
@@ -2203,6 +2248,9 @@ const AlbumBubble = memo(function AlbumBubble(props: {
   a.downloadedCount === b.downloadedCount &&
   a.progress?.done === b.progress?.done &&
   a.progress?.total === b.progress?.total &&
+  a.progress?.queued === b.progress?.queued &&
+  a.progress?.itemBytes === b.progress?.itemBytes &&
+  a.progress?.itemBytesTotal === b.progress?.itemBytesTotal &&
   a.groupHasVideo === b.groupHasVideo &&
   a.groupInLibrary === b.groupInLibrary,
 )

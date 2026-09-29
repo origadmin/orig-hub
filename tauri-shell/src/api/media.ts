@@ -5,10 +5,11 @@
  * 内容（item）、剧集（series/episode）、标签（tag）。
  */
 
-import { TG_BASE } from './tg'
+import { tgBase } from './tg'
 
 /** 媒体资料库与 TG 服务同进程同端口（orig-tg 9877） */
-const MEDIA_BASE = TG_BASE
+/** 媒体库基址：每次现算 —— TG 端口由 daemon 下发，可能在运行期变化（BUG-178） */
+const mediaBase = () => tgBase()
 
 /** 媒体类型 */
 export type MediaKind = 'video' | 'photo' | 'audio' | 'file'
@@ -192,7 +193,7 @@ export interface MediaListQuery {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${MEDIA_BASE}${path}`, {
+  const res = await fetch(`${mediaBase()}${path}`, {
     ...init,
     headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
   })
@@ -211,7 +212,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 /** 内容原始文件流地址（支持 Range，可直接喂 <video>/<img>） */
 export function mediaItemUrl(id: number): string {
-  return `${MEDIA_BASE}/api/media/items/${id}/raw`
+  return `${mediaBase()}/api/media/items/${id}/raw`
 }
 
 // ────────────────── 内容 ──────────────────
@@ -356,7 +357,7 @@ export async function exportMedia(
 ): Promise<ExportBundleResult> {
   const body: { seriesIds?: number[]; targetDir: string } = { targetDir }
   if (seriesIds && seriesIds.length > 0) body.seriesIds = seriesIds
-  const res = await fetch(`${MEDIA_BASE}/api/media/export`, {
+  const res = await fetch(`${mediaBase()}/api/media/export`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),

@@ -472,7 +472,14 @@ async fn get_config(State(st): State<Arc<AppState>>) -> axum::Json<serde_json::V
         .map(|(k, v)| (k, serde_json::Value::String(v)))
         .collect();
     axum::Json(serde_json::json!({
+        // daemon 实际监听端口（可能与配置端口不同：保留区顺延，BUG-178）。
+        // 前端与桌面壳一律读它，不得各自硬编码 9876。
+        "port": st.port,
         "download_dir": cfg.download_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        // 系统默认下载目录（Windows = SHGetKnownFolderPath(FOLDERID_Downloads)，
+        // 如 C:\Users\<user>\Downloads）。前端在用户未显式设置时用它作占位/回退，
+        // 不再写死 ~/Downloads（Unix 风格，在 Windows 上误导，BUG-回归：多次反馈「显示为 Linux 路径」）。
+        "default_download_dir": orig_core::paths::default_download_dir().to_string_lossy().into_owned(),
         "max_connections": cfg.max_connections,
         "classify_enabled": cfg.classify.enabled,
         "classify_rules": rules,
@@ -486,6 +493,12 @@ async fn get_config(State(st): State<Arc<AppState>>) -> axum::Json<serde_json::V
         },
         "tg_enabled": cfg.tg_enabled,
         "tg_running": tg_running,
+        // orig-tg 实际监听端口（BUG-177 / BUG-178）：前端不得再各自猜 9877 —— 端口可被
+        // `ORIG_TG_PORT` 迁移，也可能因保留区顺延，daemon 是唯一真源。
+        "tg_port": st.tg_port_state(),
+        // 拉起/自愈失败的原因（null = 最近一次成功）。入口级门控「服务可用才显示 TG」
+        // 会让 TG 不可用时侧栏没有入口，原因必须在设置页可见，否则用户只会以为功能没了。
+        "tg_last_error": st.tg_last_error(),
     }))
 }
 
@@ -690,6 +703,39 @@ async fn put_config_tg(
         "ok": true,
         "tg_enabled": req.enabled,
         "tg_running": running,
+        "tg_port": st.tg_port_state(),
+        "tg_last_error": st.tg_last_error(),
+    })))
+}
+
+/// POST /api/tg/restart — 重启 orig-tg（**daemon 是唯一执行者**）。
+///
+/// 为什么单独开一个端点（BUG-178）：orig-tg 只在启动时连一次 Telegram，凭证补齐 /
+/// 网络修好后**必须重启**才生效。以前这个动作散在桌面壳 `ensure_tg` 与前端
+/// 「重试连接」两处，TG 进程因此有两个主人、互相 kill。现在只有这一个入口：
+/// 凭证保存 / 链路恢复 / 用户点「重新连接」都归一到这里，由 daemon 独占执行。
+async fn post_tg_restart(
+    State(st): State<Arc<AppState>>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let enabled = st.config.read().unwrap().tg_enabled;
+    if !enabled {
+        return Err((
+            StatusCode::CONFLICT,
+            "tg plugin is disabled; enable it before restarting".into(),
+        ));
+    }
+    let running = st.tg_restart().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("restart orig-tg: {e}"),
+        )
+    })?;
+    Ok(axum::Json(serde_json::json!({
+        "ok": true,
+        "tg_enabled": enabled,
+        "tg_running": running,
+        "tg_port": st.tg_port_state(),
+        "tg_last_error": st.tg_last_error(),
     })))
 }
 
@@ -836,6 +882,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/api/config/proxy", axum::routing::put(put_config_proxy))
         .route("/api/proxy/verify", axum::routing::post(post_proxy_verify))
         .route("/api/config/tg", axum::routing::put(put_config_tg))
+        .route("/api/tg/restart", axum::routing::post(post_tg_restart))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

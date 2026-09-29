@@ -15,11 +15,16 @@
  *      集级挂图缩略图 `episode-image-open` 与剧集图册 `series-gallery`）；
  *   3. 聚焦模式残留为 0：`episode-switcher` / `episode-focus` / `desc-section` /
  *      `desc-tab-ep` / `desc-tab-series`（含前缀扫描），同时断言 `episode-slot` > 0 自证扫的是活页面；
- *   4. 剧集介绍整页只出现一次且常驻 Hero：正文 innerText 里出现次数 === 1，
- *      且该元素在文档顺序上早于「第 N 季」标题（compareDocumentPosition）；
- *   5. 按季分组：「第 1 季」标题存在且早于第一个 `episode-slot`；
+ *   4. 剧集介绍整页只出现一次且常驻 Hero：正文 innerText 里出现次数 === 1；
+ *      至首个分集行（compareDocumentPosition）—— **2026-09-28 重排后改口径**：
+ *      `showSeasonHeaders = seasonCount > 1 && episodeCount > 1`，单季剧集不再渲染
+ *      「第 N 季」分组头（design §13.2 回归点 1），故「早于第 N 季」不再成立，
+ *      改锚 **首个 `episode-slot`**（分集区起点，同样能证明介绍在 Hero 而非分集区）；
+ *   5. 按季分组（**条件断言，2026-09-28 改**）：「第 N 季」分组头只在 `seasonCount > 1`
+ *      时渲染。series 1 seasonCount=1 → 这次**断言「无分组头」**；多季剧集才断言
+ *      「分组头存在且早于第一个 `episode-slot`」；
  *   6. 集级挂图仍可达：`episode-images` 缩略图 > 0，点 `episode-image-open` 出
- *      `episode-image-viewer`，再关掉；
+ *      `lightbox`（旧名 `episode-image-viewer` 由 layoutCompat 别名兜底），再关掉；
  *   7. 窄视口无横向溢出：主滚动容器 scrollWidth === clientWidth，且行内封面仍 ≥150px 宽。
  *      720px 是任务书点名的宽度，但 `src-tauri/tauri.conf.json` 的 `minWidth` = 900 ——
  *      桌面壳最小窗口就是 900px，720 在真实产品里**不可达**。故 720 只实测打印（溢出则记为
@@ -50,6 +55,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('path')
 const cdp = require('./lib/cdp.cjs')
+const { installTestidAliases, FIND_POSTER_CONTAINER } = require('./lib/layoutCompat.cjs')
 
 const APP_PORT = Number(process.env.APP_PORT || 5180)
 const APP_URL = `http://127.0.0.1:${APP_PORT}/`
@@ -74,7 +80,10 @@ const SERIES_DESC_SINGLE = 80
  */
 const SERIES_DESC_DIFF = 3
 /** 行内「本集介绍」textarea（无 testid，只能按 placeholder 定位） */
-const EP_DESC_TA = 'textarea[placeholder="本集介绍…"]'
+// 单集介绍 textarea 在 EpisodeEditPanel 内**无 data-testid**（EpisodeEditPanel.tsx:167），
+// placeholder 来自 i18n `media.descEmptyEp` = 「本集暂无介绍」。旧写法 `[placeholder="本集介绍…"]`
+// 是早期文案，现已不存在 —— 保留会导致「面板打不开」的假 FAIL。用 CSS 属性包含匹配定位。
+const EP_DESC_TA = '[data-testid="episode-edit-panel"] textarea[placeholder*="本集"][placeholder*="介绍"]'
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -132,6 +141,27 @@ async function setViewport(page, width, height) {
     { sessionId: page.sessionId },
   )
   await delay(700)
+}
+
+/**
+ * 展开「有挂图的那一集」。
+ *
+ * 2026-09-28 重排后，集级挂图缩略图只在**展开态**下渲染（PRD R1：手风琴恒 ≤ 1）。
+ * 逐集点 `episode-slot`，直到出现 `episode-image-open`；全部点完仍无则如实返回 false。
+ * 不能假定「第一集就是有图的那集」——photo 分集会先被折成宫格瓦片。
+ */
+async function expandEpisodeWithImages(page) {
+  const n = await page.evaluate(() => document.querySelectorAll('[data-testid="episode-slot"]').length)
+  for (let i = 0; i < n; i++) {
+    await page.evaluate((idx) => {
+      const s = document.querySelectorAll('[data-testid="episode-slot"]')[idx]
+      if (s) s.click()
+    }, i)
+    await delay(650)
+    const has = await page.evaluate(() => !!document.querySelector('[data-testid="episode-image-open"]'))
+    if (has) return true
+  }
+  return false
 }
 
 /**
@@ -216,6 +246,7 @@ async function shot(page, name, testid) {
 
 async function gotoMediaLibrary(page) {
   await page.goto(APP_URL, { waitForRoot: true, settleMs: 1500 })
+  await installTestidAliases(page) // §13.1：旧 testid 名原样返回（series-gallery* 除外）
   await waitTestid(page, 'nav-media', 15000)
   await clickTestid(page, 'nav-media')
   await page.waitForFunction(
@@ -268,41 +299,87 @@ const COUNT_OCCURRENCES = (needleRaw) => {
   return count
 }
 
-/** Hero 常驻介绍：与「编辑/添加介绍」按钮同属一个 flex 行的 <p> */
+/**
+ * Hero 常驻介绍文本。
+ *
+ * 2026-09-28 重排：介绍正文改成带 `data-testid="series-description"` 的 <p>（SeriesHero.tsx）。
+ * 旧写法「取 `series-desc-edit` 按钮父级里的 <p>」现在会命中编辑按钮所在的 flex 行，
+ * 而那行里已不再直接含介绍正文（正文提级为独立节点），必然返回 null。
+ * 优先按 testid 取；`series-desc-edit` 仍存在（编辑入口进面板），保留为兜底。
+ */
 const READ_HERO_DESC = () => {
+  const p = document.querySelector('[data-testid="series-description"]')
+  if (p) {
+    const text = (p.textContent || '').trim()
+    if (text) return { text, head: text.slice(0, 40) }
+  }
   const btn = document.querySelector('[data-testid="series-desc-edit"]')
-  if (!btn || !btn.parentElement) return null
-  const p = btn.parentElement.querySelector('p')
-  if (!p) return null
-  const text = (p.textContent || '').trim()
-  if (!text) return null
-  return { text, head: text.slice(0, 40) }
+  if (btn && btn.parentElement) {
+    const fallback = btn.parentElement.querySelector('p')
+    if (fallback) {
+      const text = (fallback.textContent || '').trim()
+      if (text) return { text, head: text.slice(0, 40) }
+    }
+  }
+  return null
 }
 
 /**
- * 每一行的「本集介绍」渲染情况。
+ * 每一行的「本集介绍」渲染情况（**展开态**下）。
  *
- * 行内介绍 <p> 没有 testid，按它的排版类名 `whitespace-pre-wrap` 定位（行内其余
- * <p> 分别是标题 `truncate` 与副行 `text-[10px]`，不会误命中）。回传 `descs` 计数：
- * 623ba93 之后，与剧集介绍逐字相同的那一集必须**不渲染**介绍 <p>（descs === 0），
- * 真有独立介绍的那一集必须渲染（descs === 1）。
+ * 2026-09-28 重排：本集介绍 <p> 从「行内常驻」移入**展开态块**（EpisodeExpanded ③）。
+ * 手风琴恒 ≤ 1 展开，且 React 的状态更新是异步的 —— 点击后必须**等一拍**才能读 DOM。
+ * 故这里拆成「页面内点击」+「Node 侧等待」+「页面内读取」三步，逐行处理。
+ *
+ * 展开块渲染在该行 li 内，介绍 <p> 无 testid，按排版类名 `whitespace-pre-wrap` 定位。
+ * 回传每行 descs：与剧集介绍逐字相同的集展开后为 0（渲染「本集暂无介绍」提示）；
+ * 真有独立介绍的集为 1。
  */
-const READ_ROW_DESCS = () => {
-  const slots = Array.from(document.querySelectorAll('[data-testid="episode-slot"]'))
-  return slots.map((slot, i) => {
-    const li = slot.closest('li')
-    const ps = li
-      ? Array.from(li.querySelectorAll('p')).filter((p) =>
-          String(p.className).includes('whitespace-pre-wrap'),
-        )
-      : []
-    return {
-      row: i,
-      slot: (slot.textContent || '').trim(),
-      descs: ps.length,
-      text: ps.length ? (ps[0].textContent || '').trim() : null,
-    }
-  })
+const CLICK_SLOT = (i) => {
+  const s = document.querySelectorAll('[data-testid="episode-slot"]')[i]
+  if (s) s.click()
+  return !!s
+}
+const READ_EXPANDED_ROW = (i) => {
+  const slot = document.querySelectorAll('[data-testid="episode-slot"]')[i]
+  // 2026-09-28 重排：行容器是 `<div data-testid="episode-row-{id}">`（无 <li>）；
+  // 展开块是它的父 wrapper（`<div key={ep.id}>`）里的兄弟节点，故从 wrapper 里找介绍 <p>。
+  const rowEl = slot ? slot.closest('[data-testid^="episode-row-"]') : null
+  const wrapper = rowEl ? rowEl.parentElement : null
+  const ps = wrapper
+    ? Array.from(wrapper.querySelectorAll('p')).filter((p) => String(p.className).includes('whitespace-pre-wrap'))
+    : []
+  return {
+    row: i,
+    slot: slot ? (slot.textContent || '').trim() : null,
+    descs: ps.length,
+    text: ps.length ? (ps[0].textContent || '').trim() : null,
+  }
+}
+
+async function readRowDescs(page) {
+  const n = await page.evaluate(() => document.querySelectorAll('[data-testid="episode-slot"]').length)
+  const out = []
+  for (let i = 0; i < n; i++) {
+    await page.evaluate(CLICK_SLOT, i)
+    await delay(650) // 等 React 重渲染出展开块
+    out.push(await page.evaluate(READ_EXPANDED_ROW, i))
+    await page.evaluate(CLICK_SLOT, i) // 收起，保证手风琴恒 ≤ 1
+    await delay(300)
+  }
+  // 收尾自证：读完后不应残留任何展开块，否则后续「点开某行」会被手风琴自动收起而误判
+  for (let guard = 0; guard < n; guard++) {
+    const stillOpen = await page.evaluate(() => document.querySelectorAll('[data-testid="episode-expanded"]').length)
+    if (!stillOpen) break
+    await page.evaluate(() => {
+      const open = document.querySelector('[data-testid="episode-expanded"]')
+      const wrapper = open ? open.parentElement : null
+      const slot = wrapper ? wrapper.querySelector('[data-testid="episode-slot"]') : null
+      if (slot) slot.click()
+    })
+    await delay(350)
+  }
+  return out
 }
 
 /**
@@ -322,16 +399,35 @@ const SET_TEXTAREA_VALUE = (selector, value) => {
   return { ok: true, readback: el.value }
 }
 
-/** 点某一行的 episode-edit（面板是行内展开的，必须点中目标行，不能取全局第一个） */
-const CLICK_ROW_EDIT = (row) => {
-  const slots = Array.from(document.querySelectorAll('[data-testid="episode-slot"]'))
-  const slot = slots[row]
+/**
+ * 点某一行的 episode-edit。
+ *
+ * 2026-09-28 重排：`episode-edit` 从「行内常驻」移入**展开态操作区**（PRD R1/§13.1）。
+ * 故必须先点该行的 `episode-slot` 把它展开，**等 React 重渲染**，再点展开块里的
+ * `episode-edit`。展开块渲染在该行 `li` 内（EpisodeBoard.tsx）。
+ */
+const CLICK_SLOT_AT = (row) => {
+  const slot = document.querySelectorAll('[data-testid="episode-slot"]')[row]
   if (!slot) return { ok: false, reason: `no episode-slot at row ${row}` }
-  const li = slot.closest('li')
-  const btn = li ? li.querySelector('[data-testid="episode-edit"]') : null
-  if (!btn) return { ok: false, reason: `no episode-edit inside row ${row}` }
-  btn.click()
+  slot.click()
   return { ok: true, slot: (slot.textContent || '').trim() }
+}
+const CLICK_EDIT_IN_ROW = (row) => {
+  // 2026-09-28 重排：分集行不再是 <li>，而是 `<div data-testid="episode-row-{id}">`；
+  // 展开块是该行 wrapper（`<div key={ep.id}>`）的兄弟。故用 `episode-row-*` 定位 wrapper。
+  const slot = document.querySelectorAll('[data-testid="episode-slot"]')[row]
+  const wrapper = slot ? slot.closest('[data-testid^="episode-row-"]')?.parentElement : null
+  const btn = wrapper ? wrapper.querySelector('[data-testid="episode-edit"]') : null
+  if (!btn) return { ok: false, reason: `no episode-edit inside row ${row} (after expand)` }
+  btn.click()
+  return { ok: true }
+}
+async function clickRowEdit(page, row) {
+  const c = await page.evaluate(CLICK_SLOT_AT, row)
+  if (!c.ok) return c
+  await delay(650) // 等展开块渲染
+  const e = await page.evaluate(CLICK_EDIT_IN_ROW, row)
+  return e.ok ? { ok: true, slot: c.slot } : e
 }
 
 /** 与页面内 COUNT_OCCURRENCES 同一套归一化规则（innerText 的换行不参与比较） */
@@ -446,29 +542,53 @@ async function main() {
       if (n !== 0) fails.push(`focus-mode remnant prefix still rendered: ${p}* x${n}`)
     }
 
-    // ── 5) 按季分组：「第 1 季」早于第一个分集行 ───────────────────────────
-    const season = await page.evaluate(() => {
+    // ── 5) 按季分组（条件断言，2026-09-28 重排后）──────────────────────────
+    // 分组头门控 = showSeasonHeaders = seasonCount > 1 && episodeCount > 1（design §3.2）。
+    // series 1 的 seasonCount=1（实测）→ **不得**渲染分组头；多季剧集才查存在且早于首行。
+    const seasonGate = await page.evaluate(() => {
       const hs = Array.from(document.querySelectorAll('h4'))
-      const head = hs.find((h) => /^第\s*\d+\s*季$/.test((h.textContent || '').trim()))
+      const heads = hs
+        .map((h) => (h.textContent || '').trim())
+        .filter((t) => /第\s*\d+\s*季/.test(t))
       const firstSlot = document.querySelector('[data-testid="episode-slot"]')
-      if (!head || !firstSlot) return null
-      const following = !!(head.compareDocumentPosition(firstSlot) & Node.DOCUMENT_POSITION_FOLLOWING)
-      return {
-        heading: (head.textContent || '').trim(),
-        headings: hs.map((h) => (h.textContent || '').trim()).filter((t) => /第\s*\d+\s*季/.test(t)),
-        headingBeforeFirstRow: following,
+      const headEl = hs.find((h) => /^第\s*\d+\s*季$/.test((h.textContent || '').trim()))
+      const following =
+        headEl && firstSlot
+          ? !!(headEl.compareDocumentPosition(firstSlot) & Node.DOCUMENT_POSITION_FOLLOWING)
+          : null
+      // seasonCount 由 Hero 元信息行「N 季」读（只信后端聚合字段）
+      let seasonCount = null
+      for (const p of Array.from(document.querySelectorAll('p'))) {
+        const t = (p.textContent || '').trim()
+        const m = t.match(/(\d+)\s*季/)
+        if (m && t.includes('集') && t.length < 80) {
+          seasonCount = Number(m[1])
+          break
+        }
       }
+      return { heads, headEl: headEl ? (headEl.textContent || '').trim() : null, following, seasonCount }
     })
-    console.log('[rows] season grouping:', JSON.stringify(season))
-    if (!season) {
-      fails.push('no "第 N 季" season heading rendered')
-    } else {
-      if (!/第\s*1\s*季/.test(season.heading)) {
-        fails.push(`first season heading is not 第 1 季: ${JSON.stringify(season.heading)}`)
+    console.log('[rows] season grouping (gated):', JSON.stringify(seasonGate))
+    if (seasonGate.seasonCount === null) {
+      fails.push('could not read the "N 季" meta line in the hero (season gating unknown)')
+    } else if (seasonGate.seasonCount > 1) {
+      // 多季：分组头必须存在且早于首行
+      if (!seasonGate.headEl) fails.push('multi-season series renders no "第 N 季" season heading')
+      if (!/第\s*1\s*季/.test(seasonGate.headEl || '')) {
+        fails.push(`first season heading is not 第 1 季: ${JSON.stringify(seasonGate.headEl)}`)
       }
-      if (!season.headingBeforeFirstRow) {
+      if (seasonGate.following !== true) {
         fails.push('season heading does not precede the first episode row')
       }
+    } else {
+      // 单季：**不得**有分组头（design §13.2 回归点 1 / PRD §3.4）
+      if (seasonGate.heads.length !== 0) {
+        fails.push(
+          `single-season series still renders season heading(s): ${JSON.stringify(seasonGate.heads)} ` +
+            '(showSeasonHeaders gate = seasonCount > 1 && episodeCount > 1)',
+        )
+      }
+      console.log('[rows] single-season series: season heading absent as designed')
     }
 
     await scrollListTop(page)
@@ -479,14 +599,15 @@ async function main() {
     const narrowProbe = async (w) => {
       await setViewport(page, w, 900)
       const box = await page.evaluate(FIND_LIST_CONTAINER)
-      const rest = await page.evaluate(() => {
+      const rest = await page.evaluate((findPoster) => {
+        const FIND_POSTER_CONTAINER = new Function(`return (${findPoster})`)()
         const cov = document.querySelector('[data-testid="episode-cover"]')
         const r = cov ? cov.getBoundingClientRect() : null
-        // Hero 海报（w-80 + aspect-video）：窄窗口下 flex 拉伸会把 aspect-ratio 打掉
-        const hd = Array.from(document.querySelectorAll('div')).find((d) =>
-          /aspect-video w-80/.test(String(d.className)),
-        )
-        const hr = hd ? hd.getBoundingClientRect() : null
+        // Hero 海报：按**语义**定位（容器有 aspect-ratio）而非旧类名。
+        // 旧类名 `aspect-video w-80` 在本次重排中已改为 `aspect-video w-full max-w-[320px]`
+        // （SeriesHero.tsx），按类名找必然 -1 —— 这是任务 A 记录的高危点之一。
+        const poster = FIND_POSTER_CONTAINER()[0] || null
+        const hr = poster && poster.w > 0 ? { width: poster.w, height: poster.h } : null
         const cb = document.querySelector('[data-testid="episode-slot"]')
         let sc = cb ? cb.parentElement : null
         while (sc) {
@@ -519,7 +640,7 @@ async function main() {
           clippedSample: clipped.slice(0, 3),
           clippedTally,
         }
-      })
+      }, String(FIND_POSTER_CONTAINER))
       console.log(`[rows] narrow ${w}px container:`, JSON.stringify(box))
       console.log(`[rows] narrow ${w}px:`, JSON.stringify(rest))
       return { w, box, rest }
@@ -541,14 +662,21 @@ async function main() {
         )
       }
     }
-    // D1-1（复测 623ba93 的 self-start）：海报在 720/820/900 三个宽度上都必须保持 320×180
+    // D1-1：海报在 720px 上**记录实测**；但 720px < 壳声明的最小宽度 900px（tauri.conf.json
+    // minWidth=900），产品中不可达 —— 故此处只 WARNING，硬断言放在 900/820（可达宽度）上。
+    // 重排后海报容器为 `w-full max-w-[320px]`：空间足够时 320×180（比例仍 16:9），
+    // 空间不足时按容器收缩（288×162 = 16:9），这是预期行为而非缺陷。
     const poster720ok = n720.rest.posterW === 320 && n720.rest.posterH === 180
     console.log(
-      `[rows] D1-1 hero poster @720px: ${n720.rest.posterW}x${n720.rest.posterH} (expect 320x180) ->`,
+      `[rows] D1-1 hero poster @720px: ${n720.rest.posterW}x${n720.rest.posterH} (ideal 320x180, ratio ${n720.rest.posterH > 0 ? (n720.rest.posterW / n720.rest.posterH).toFixed(3) : 'n/a'}) ->`,
       poster720ok,
     )
     if (!poster720ok) {
-      fails.push(`hero poster is not 320x180 at 720px: ${n720.rest.posterW}x${n720.rest.posterH}`)
+      warns.push(
+        `hero poster is ${n720.rest.posterW}x${n720.rest.posterH} at 720px (ideal 320x180). ` +
+          '720px is below the shell minimum width 900, so this is out of the supported range; ' +
+          'aspect ratio is preserved (>=16/9) and the poster stays visible.',
+      )
     }
     // D1-2（复测上一轮记录的裁剪）：720px 下被裁掉的是哪些元素、各多少个
     const removeClipped720 = (n720.rest.clippedTally || {})['episode-remove'] || 0
@@ -608,6 +736,10 @@ async function main() {
 
     // ══ 6) 集级挂图（series 80）══════════════════════════════════════════════
     await openSeriesById(page, SERIES_IMAGES)
+    // 2026-09-28 重排：挂图缩略图只在**展开态**渲染（PRD R1 手风琴）。
+    // series 80 = ep399(photo，成宫格瓦片) + ep400(video，有 1 挂图)。
+    // 故必须先展开 ep400 才能看到 `episode-images` / `episode-image-open`。
+    await expandEpisodeWithImages(page)
     const imgStrip = await page.evaluate(() => {
       const boxes = Array.from(document.querySelectorAll('[data-testid="episode-images"]'))
       return {
@@ -639,22 +771,28 @@ async function main() {
     if (!(containHits > 0)) {
       fails.push(`no photo render with object-fit:contain: ${JSON.stringify(imgStrip.sizes)}`)
     }
-    const galleryFit = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('[data-testid="series-gallery"] img')).map(
-        (im) => getComputedStyle(im).objectFit,
-      ),
-    )
-    console.log('[rows] series gallery img object-fit:', JSON.stringify(galleryFit))
-    if (galleryFit.length && !galleryFit.includes('contain')) {
-      fails.push(`series gallery photo not object-contain: ${JSON.stringify(galleryFit)}`)
+    // 2026-09-28 重排：全剧层「图册平铺行」`series-gallery` 已移除（PRD §3.3 / R6）。
+    // 本条不是「改口径」，而是断言**它确实没了**；photo 分集改由 `episode-photo-grid` 宫格承载。
+    const galleryGone = await page.evaluate(() => ({
+      gallery: document.querySelectorAll('[data-testid="series-gallery"]').length,
+      photoGrid: document.querySelectorAll('[data-testid="episode-photo-grid"]').length,
+      photoTile: document.querySelectorAll('[data-testid^="episode-photo-tile"]').length,
+    }))
+    console.log('[rows] series-gallery removal check:', JSON.stringify(galleryGone))
+    if (galleryGone.gallery !== 0) {
+      fails.push(
+        `series-gallery is supposed to be REMOVED (PRD R6) but ${galleryGone.gallery} node(s) still exist`,
+      )
     }
     await shot(page, 'rows-images.png', 'episode-images')
 
-    // 点缩略图 → 灯箱 → 关闭
+    // 点缩略图 → 灯箱 → 关闭（灯箱统一为 `lightbox`；旧名 episode-image-viewer 由 compat 兜底）
     await clickTestid(page, 'episode-image-open')
-    const viewerUp = await waitTestidSoft(page, 'episode-image-viewer', 6000)
+    const viewerUp = await waitTestidSoft(page, 'lightbox', 6000) || (await waitTestidSoft(page, 'episode-image-viewer', 1500))
     const viewer = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="episode-image-viewer"]')
+      const el =
+        document.querySelector('[data-testid="lightbox"]') ||
+        document.querySelector('[data-testid="episode-image-viewer"]')
       if (!el) return null
       const im = el.querySelector('img')
       const r = im ? im.getBoundingClientRect() : null
@@ -664,18 +802,25 @@ async function main() {
         h: r ? Math.round(r.height) : -1,
       }
     })
-    console.log('[rows] episode-image-viewer opened:', viewerUp, JSON.stringify(viewer))
-    if (!viewerUp) fails.push('clicking episode-image-open did not open episode-image-viewer')
+    console.log('[rows] lightbox opened:', viewerUp, JSON.stringify(viewer))
+    if (!viewerUp) fails.push('clicking episode-image-open did not open the lightbox')
     await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="episode-image-viewer"]')
+      const el =
+        document.querySelector('[data-testid="lightbox"]') ||
+        document.querySelector('[data-testid="episode-image-viewer"]')
       if (el) el.click()
     })
-    const viewerDown = await page.waitForFunction(
-      () => !document.querySelector('[data-testid="episode-image-viewer"]'),
-      { timeout: 6000 },
-    ).then(() => true).catch(() => false)
-    console.log('[rows] episode-image-viewer closed:', viewerDown)
-    if (!viewerDown) fails.push('episode-image-viewer did not close on backdrop click')
+    const viewerDown = await page
+      .waitForFunction(
+        () =>
+          !document.querySelector('[data-testid="lightbox"]') &&
+          !document.querySelector('[data-testid="episode-image-viewer"]'),
+        { timeout: 6000 },
+      )
+      .then(() => true)
+      .catch(() => false)
+    console.log('[rows] lightbox closed:', viewerDown)
+    if (!viewerDown) fails.push('lightbox did not close on backdrop click')
 
     // ══ 4) 剧集介绍整页只出现一次 + 常驻 Hero ════════════════════════════════
     // 主验对象 series 80：介绍 119 字，且其可播分集（video）的集介绍为空，
@@ -692,24 +837,26 @@ async function main() {
         fails.push(`series description rendered ${n} times (expected exactly 1): ${JSON.stringify(desc80.head)}`)
       }
       // 分集行都包在按季 <section> 里；Hero 在任何 section 之外 —— 用这个判定「在不在 Hero」
+      // 2026-09-28：单季剧集不再有「第 N 季」分组头，锚点改为**首个 episode-slot**（分集区起点）。
+      // 2026-09-28：Hero 本身现在是 `<section data-testid="series-hero">`（SeriesHero.tsx:66），
+      // 故「closest('section') 非空 = 不在 Hero」的旧口径会误判。改为自证：
+      //   ① 介绍在首个 episode-slot **之前**；② 介绍在 `series-hero` 之内。
       const pos = await page.evaluate(() => {
-        const btn = document.querySelector('[data-testid="series-desc-edit"]')
-        const p = btn && btn.parentElement ? btn.parentElement.querySelector('p') : null
-        const head = Array.from(document.querySelectorAll('h4')).find((h) =>
-          /第\s*\d+\s*季/.test((h.textContent || '').trim()),
-        )
-        if (!p || !head) return null
+        const p = document.querySelector('[data-testid="series-description"]')
+        const firstSlot = document.querySelector('[data-testid="episode-slot"]')
+        const hero = document.querySelector('[data-testid="series-hero"]')
+        if (!p || !firstSlot) return null
         return {
-          descBeforeSeason: !!(p.compareDocumentPosition(head) & Node.DOCUMENT_POSITION_FOLLOWING),
-          inSeasonSection: !!p.closest('section'),
+          descBeforeSeason: !!(p.compareDocumentPosition(firstSlot) & Node.DOCUMENT_POSITION_FOLLOWING),
+          inHero: hero ? hero.contains(p) : false,
         }
       })
       console.log('[rows] series 80 desc position:', JSON.stringify(pos))
       if (!pos || !pos.descBeforeSeason) {
-        fails.push(`series description is not inside the hero (before 第 N 季): ${JSON.stringify(pos)}`)
+        fails.push(`series description is not inside the hero (before the first episode row): ${JSON.stringify(pos)}`)
       }
-      if (pos && pos.inSeasonSection) {
-        fails.push('series description sits inside a season <section>, not the hero')
+      if (pos && !pos.inHero) {
+        fails.push('series description does not live inside the series-hero section')
       }
     }
 
@@ -725,14 +872,11 @@ async function main() {
       const n101 = await page.evaluate(COUNT_OCCURRENCES, desc101.text)
       console.log('[rows] description occurrences in page innerText (series 101):', n101, '| len:', desc101.text.length)
       const pos101 = await page.evaluate(() => {
-        const btn = document.querySelector('[data-testid="series-desc-edit"]')
-        const p = btn && btn.parentElement ? btn.parentElement.querySelector('p') : null
-        const head = Array.from(document.querySelectorAll('h4')).find((h) =>
-          /第\s*\d+\s*季/.test((h.textContent || '').trim()),
-        )
-        if (!p || !head) return null
+        const p = document.querySelector('[data-testid="series-description"]')
+        const firstSlot = document.querySelector('[data-testid="episode-slot"]')
+        if (!p || !firstSlot) return null
         return {
-          descBeforeSeason: !!(p.compareDocumentPosition(head) & Node.DOCUMENT_POSITION_FOLLOWING),
+          descBeforeSeason: !!(p.compareDocumentPosition(firstSlot) & Node.DOCUMENT_POSITION_FOLLOWING),
           heroLines: (p.textContent || '').split('\n').length,
         }
       })
@@ -754,11 +898,34 @@ async function main() {
         )
       }
       // 反例的配套取证：行内不该再有介绍 <p>，但编辑入口必须还在
-      const rows101 = await page.evaluate(READ_ROW_DESCS)
-      const entries101 = await page.evaluate(() => ({
-        slot: document.querySelectorAll('[data-testid="episode-slot"]').length,
-        edit: document.querySelectorAll('[data-testid="episode-edit"]').length,
-      }))
+      const rows101 = await readRowDescs(page)
+      // 重排后 `episode-edit` 只在**展开态**出现（手风琴恒 ≤ 1），故全局计数在任意时刻
+      // 最多 1 个「可见入口」；不能按「每行一个常驻按钮」的老口径数。改为自证
+      // 「每种分层入口各存在」：Hero 的 series-edit + 展开态的 episode-edit。
+      const clickForEntries = await page.evaluate(() => {
+        // 只展开唯一那一集（`readRowDescs` 已收尾收起，这里点开即得确定态）。
+        const slot = document.querySelector('[data-testid="episode-slot"]')
+        if (slot) slot.click()
+        return { __clicked: !!slot }
+      })
+      await delay(700)
+      const entries101b = await page.evaluate(() => {
+        const slot = document.querySelector('[data-testid="episode-slot"]')
+        const rowEl = slot ? slot.closest('[data-testid^="episode-row-"]') : null
+        const wrapper = rowEl ? rowEl.parentElement : null
+        // `episode-edit` 是**恒在**的行内入口（EpisodeRow.tsx:217-226，R3：去重只影响展示，
+        // 编辑入口不受门控），展开态操作区里另有一个 —— 故同一 wrapper 内 2 个属正常。
+        // 断言「入口存在」即可，不锁死具体个数。
+        return {
+          slot: document.querySelectorAll('[data-testid="episode-slot"]').length,
+          editInRow: rowEl ? rowEl.querySelectorAll('[data-testid="episode-edit"]').length : 0,
+          editInExpanded: wrapper ? wrapper.querySelectorAll('[data-testid="episode-edit"]').length : 0,
+          expandedCount: document.querySelectorAll('[data-testid="episode-expanded"]').length,
+          seriesEdit: document.querySelectorAll('[data-testid="series-edit"]').length,
+        }
+      })
+      void clickForEntries
+      const entries101 = entries101b
       const rowDesc101 = rows101.reduce((acc, r) => acc + r.descs, 0)
       console.log(
         '[rows] D2 series 101 rows:',
@@ -772,9 +939,9 @@ async function main() {
             'byte-identical to the series description (should be hidden by showEpDesc)',
         )
       }
-      if (entries101.slot !== 1 || entries101.edit !== 1) {
+      if (entries101.slot !== 1 || entries101.editInRow < 1 || entries101.editInExpanded < 1 || entries101.seriesEdit < 1) {
         fails.push(
-          `series 101: episode edit entry lost — episode-slot=${entries101.slot}, episode-edit=${entries101.edit} (expect 1/1)`,
+          `series 101: edit entry lost — episode-slot=${entries101.slot}, editInRow=${entries101.editInRow}, editInExpanded=${entries101.editInExpanded}, series-edit=${entries101.seriesEdit} (expect 1/>=1/>=1/>=1)`,
         )
       }
       if (pos101 && !(pos101.heroLines > 1)) {
@@ -800,7 +967,7 @@ async function main() {
     }
 
     // 9a) 活数据正例：series 3 的 S1E1（ep 131）自带 291 字本集介绍，与 484 字剧集介绍逐字不同
-    const rowsLive = await page.evaluate(READ_ROW_DESCS)
+    const rowsLive = await readRowDescs(page)
     console.log(
       '[rows] D3 series 3 row descriptions (live data):',
       JSON.stringify(
@@ -831,6 +998,10 @@ async function main() {
       if (normText(r0.text) === normText(heroDiff.text)) {
         fails.push('series 3: the row description equals the series description (expected them to differ)')
       }
+      // `innerText` 只含**可见**文本：行收起时展开块不在 innerText 里，直接计数必然 0。
+      // 故先把该行展开，再计数（PRD R1 手风琴 —— 同一时刻只有它展开）。
+      await page.evaluate(CLICK_SLOT_AT, r0.row)
+      await delay(700)
       const nLive = await page.evaluate(COUNT_OCCURRENCES, r0.text)
       console.log('[rows] D3 dedup positive (live): row desc occurrences in innerText =', nLive, '(expect 1)')
       if (nLive !== 1) {
@@ -841,7 +1012,7 @@ async function main() {
     // 9b) 经 UI 现场造一条：episode-edit → 面板里写一条与剧集介绍不同的本集介绍 → 保存。
     //     同时验证 623ba93 的承诺：「只影响展示，编辑入口始终保留」。
     const uiRow = liveDistinct.length ? liveDistinct[0].row : 0
-    const opened = await page.evaluate(CLICK_ROW_EDIT, uiRow)
+    const opened = await clickRowEdit(page, uiRow)
     console.log('[rows] D3 UI episode-edit click:', JSON.stringify(opened))
     if (!opened.ok) {
       fails.push(`could not open the episode edit panel from the UI: ${JSON.stringify(opened)}`)
@@ -886,7 +1057,7 @@ async function main() {
       await clickTestid(page, 'episode-save')
       const panelClosed = await waitSelectorGone(page, EP_DESC_TA, 10000)
       await delay(700)
-      const rowsSaved = await page.evaluate(READ_ROW_DESCS)
+      const rowsSaved = await readRowDescs(page)
       const rSaved = rowsSaved[uiRow]
       console.log('[rows] D3 UI panel closed after 保存:', panelClosed)
       console.log(
@@ -913,6 +1084,9 @@ async function main() {
         if (heroDiff && normText(rSaved.text) === normText(heroDiff.text)) {
           fails.push('row description equals the hero description (the positive case must differ)')
         }
+        // innerText 只含可见文本：readRowDescs 读完后行已收起，必须重新展开再计数。
+        await page.evaluate(CLICK_SLOT_AT, uiRow)
+        await delay(700)
         const nStamped = await page.evaluate(COUNT_OCCURRENCES, stamped)
         console.log('[rows] D3 dedup positive (UI-created): saved text occurrences in innerText =', nStamped, '(expect 1)')
         if (nStamped !== 1) {
@@ -923,14 +1097,14 @@ async function main() {
 
       // 还原：探针不得在资料库里留下测试文案。原值取面板预填值，改回后再断言一次。
       const original = prefilled.value
-      const reopened = await page.evaluate(CLICK_ROW_EDIT, uiRow)
+      const reopened = await clickRowEdit(page, uiRow)
       const panelUp2 = await waitSelectorSoft(page, EP_DESC_TA, 8000)
       await page.evaluate(SET_TEXTAREA_VALUE, EP_DESC_TA, original)
       const readback2 = await page.evaluate((sel) => String(document.querySelector(sel).value || ''), EP_DESC_TA)
       await clickTestid(page, 'episode-save')
       await waitSelectorGone(page, EP_DESC_TA, 10000)
       await delay(700)
-      const rowsRestored = await page.evaluate(READ_ROW_DESCS)
+      const rowsRestored = await readRowDescs(page)
       const rRestored = rowsRestored[uiRow]
       const restored = Boolean(rRestored && normText(rRestored.text) === normText(original))
       console.log(

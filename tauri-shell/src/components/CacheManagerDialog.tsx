@@ -197,6 +197,7 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
   const ENTRY_LABEL_KEY: Record<string, string> = {
     cached: 'tg.statusDone',
     caching: 'tg.statusRunning',
+    queued: 'tg.statusQueued',
     failed: 'tg.statusFailed',
     // cancelled 在任务机里是独立态（有专门的分组与文案），呈现层保留它：
     registered: task.status === 'cancelled' ? 'tg.statusCancelled' : 'tg.statusQueued',

@@ -107,6 +107,7 @@ impl Client for UnavailableClient {
         _chat_id: i64,
         _message_id: i64,
         _dir: &str,
+        _progress: Option<&crate::login::DownloadProgress>,
     ) -> Result<DownloadOutcome, ClientError> {
         Err(self.err())
     }
@@ -138,7 +139,7 @@ mod tests {
         assert!(c.messages(1, 10, None).await.is_err());
         assert!(c.thumb(1, 1).await.is_err());
         assert!(c.media(1, 1, None).await.is_err());
-        assert!(c.download(1, 1, ".").await.is_err());
+        assert!(c.download(1, 1, ".", None).await.is_err());
         assert!(c.message_meta(1, 1).await.is_err());
 
         // 错误必须是 Unavailable（→ 503），而不是别的语义（如 401 未登录）。

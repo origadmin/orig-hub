@@ -4,18 +4,31 @@ import type {
   NetworkInterface,
 } from '../types'
 
-/** orig-daemon 默认端口（与 Rust 侧 DAEMON_PORT 一致） */
-export const DAEMON_PORT = 9876
+/** orig-daemon 起始端口（与 Rust 侧 DAEMON_PORT 一致；仅作**初值**） */
+export const DAEMON_PORT = 19786
 
-/** 开发模式下 daemon 可能不在 9876（可被环境变量覆盖） */
-const port = Number(
-  import.meta.env.VITE_DAEMON_PORT ?? DAEMON_PORT,
-)
+/**
+ * daemon **实际**端口的初值。
+ *
+ * 为什么不再是常量（BUG-178）：daemon 落在 Windows 动态保留区时会自己顺延端口，
+ * 硬编码 9876 就会连到一个不存在（或属于别人）的服务上。真源只有两个 ——
+ * 桌面壳给的 `daemon_status().port`，或 daemon 自己回的 `/api/config` 的 `port`；
+ * 这里的值只是首次请求之前的占位，随后立即被真源覆盖。
+ */
+let daemonPort = Number(import.meta.env.VITE_DAEMON_PORT ?? DAEMON_PORT)
 
-export const DAEMON_BASE = `http://127.0.0.1:${port}`
+/** 用真源端口覆盖初值（桌面壳 / `/api/config` 各调一次，幂等） */
+export function setDaemonPort(port: number) {
+  if (Number.isFinite(port) && port > 0 && port !== daemonPort) daemonPort = port
+}
+
+/** daemon 基址（**每次现算**：端口可能在运行期被真源改写） */
+export function daemonBase(): string {
+  return `http://127.0.0.1:${daemonPort}`
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${DAEMON_BASE}${path}`, {
+  const res = await fetch(`${daemonBase()}${path}`, {
     headers: { 'Content-Type': 'application/json' },
     ...init,
   })
@@ -81,7 +94,11 @@ export function removeDownload(id: string): Promise<void> {
 
 /** daemon 配置（GET /api/config） */
 export interface DaemonConfig {
+  /** daemon 实际监听端口（可能与起始端口不同：保留区顺延，BUG-178）。真源。 */
+  port?: number
   download_dir: string | null
+  /** 系统默认下载目录（按 OS 解析：Windows 为 C:\Users\<user>\Downloads，非 ~/Downloads）。前端未显式设置时作占位/回退。 */
+  default_download_dir: string
   max_connections: number
   classify_enabled: boolean
   /** 扩展名（小写，无点）→ 分类目录名（已合并内置默认 + 用户自定义） */
@@ -95,6 +112,13 @@ export interface DaemonConfig {
   tg_enabled: boolean
   /** orig-tg 子服务是否实际在运行（daemon 探活） */
   tg_running: boolean
+  /** orig-tg 实际监听端口（daemon 是唯一真源；可被 ORIG_TG_PORT 迁移，前端不得再猜 9877） */
+  tg_port?: number
+  /**
+   * 最近一次拉起/自愈失败的原因（null = 最近一次成功）。
+   * 服务不可用时侧栏没有 TG 入口，原因必须摆在设置页开关旁，否则用户只会以为功能没了。
+   */
+  tg_last_error?: string | null
 }
 
 /** 代理配置（HTTP 下载） */
@@ -144,11 +168,34 @@ export function saveClassifyConfig(req: {
 /** PUT /api/config/tg — 启停 TG 可选插件（运行时生效 + 持久化；同时拉起/终止 orig-tg 子服务） */
 export function saveTgConfig(req: {
   enabled: boolean
-}): Promise<{ ok: boolean; tg_enabled: boolean; tg_running: boolean }> {
+}): Promise<{
+  ok: boolean
+  tg_enabled: boolean
+  tg_running: boolean
+  tg_port?: number
+  tg_last_error?: string | null
+}> {
   return request('/api/config/tg', {
     method: 'PUT',
     body: JSON.stringify(req),
   })
+}
+
+/**
+ * POST /api/tg/restart — 请 daemon 重启它托管的 orig-tg（**daemon 是唯一执行者**）。
+ *
+ * 为什么前端还要留这个口（BUG-178）：凭证保存 / 网络修好后必须重启 orig-tg 才生效
+ * （它只在启动时连一次 Telegram）。但动作是 daemon 执行的 —— 前端只是**请求**，
+ * 不再自己 spawn/kill 进程，也不再让用户去点「启动服务」。
+ */
+export function restartTgService(): Promise<{
+  ok: boolean
+  tg_enabled: boolean
+  tg_running: boolean
+  tg_port?: number
+  tg_last_error?: string | null
+}> {
+  return request('/api/tg/restart', { method: 'POST', body: '{}' })
 }
 
 /** GET /health */
@@ -183,7 +230,7 @@ export function subscribeEvents(
 
   const connect = () => {
     if (closed) return
-    es = new EventSource(`${DAEMON_BASE}/api/events`)
+    es = new EventSource(`${daemonBase()}/api/events`)
     es.onopen = () => {
       retryMs = 1000
       onOpen?.()
