@@ -409,10 +409,23 @@ impl Client for GrammersClient {
         let mut out = Vec::new();
         for f in filters {
             // 普通自定义文件夹 Filter 与共享聊天列表 Chatlist 都对用户可见，统一接受。
-            let (id, title, peers) = match f {
-                tl::enums::DialogFilter::Filter(filter) => (filter.id, filter.title, filter.include_peers),
+            //
+            // BUG-195：`DialogFilter` 的成员是**两个**独立字段 ——
+            // `pinned_peers`（文件夹内置顶的）与 `include_peers`（其余成员）。
+            // 只读 `include_peers` 会把置顶成员整个丢掉（实测 MyTop 应为 24 却只读到 20，
+            // 差的正是 4 个 pinned）。两者都要取，且要去重（同一 peer 可能两处都在）。
+            let (id, title, peers, pinned_len) = match f {
+                tl::enums::DialogFilter::Filter(filter) => {
+                    let pinned_len = filter.pinned_peers.len();
+                    let mut peers = filter.pinned_peers;
+                    peers.extend(filter.include_peers);
+                    (filter.id, filter.title, peers, pinned_len)
+                }
                 tl::enums::DialogFilter::Chatlist(filter) => {
-                    (filter.id, filter.title, filter.include_peers)
+                    let pinned_len = filter.pinned_peers.len();
+                    let mut peers = filter.pinned_peers;
+                    peers.extend(filter.include_peers);
+                    (filter.id, filter.title, peers, pinned_len)
                 }
                 tl::enums::DialogFilter::Default => continue,
             };
@@ -420,9 +433,18 @@ impl Client for GrammersClient {
                 tl::enums::TextWithEntities::Entities(t) => t.text,
             };
             // 统一转换为 Bot API 对话 id（与 dialogs 的 id 同空间，否则映射永不命中）。
-            let ids: Vec<i64> = peers.iter().filter_map(input_peer_bot_api_id).collect();
+            // 去重：置顶成员可能同时出现在 `include_peers` 里，重复会污染后续对账。
+            let mut seen = std::collections::HashSet::new();
+            let mut ids: Vec<i64> = Vec::new();
+            for p in peers.iter() {
+                if let Some(v) = input_peer_bot_api_id(p) {
+                    if seen.insert(v) {
+                        ids.push(v)
+                    }
+                }
+            }
             eprintln!(
-                "[tg] folder id={id} title={title:?} include={} mapped={}",
+                "[tg] folder id={id} title={title:?} pinned={pinned_len} peers={} mapped={}",
                 peers.len(),
                 ids.len()
             );
