@@ -583,28 +583,19 @@ export function SeriesDetail(props: {
                 </div>
               </div>
 
-              {/* 多源 / 来源（规范 rightPane：主版本 + 来源 + ref；备用源保留切主/摘除） */}
+              {/* 来源 = 切换视频来源来播放（BUG-198）：不是信息展板。剥掉 ref / 内部 id
+                  这类「这道菜怎么烧」的噪声，只留「当前播放来源 + 备用版本一键切换」。 */}
               <div className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5">
                 <span className="text-[11px] font-medium text-fg-strong">{t('media.episode.sourcesTitle')}</span>
+                {/* 主版本 = 当前播放来源（来源只标 TG/local 这种「哪道菜」，不标 ref 路径） */}
                 <div className="flex items-center gap-2 rounded border border-accent/40 bg-accent/5 px-2 py-1 text-[11px]">
                   <span className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[10px] text-accent">
                     {t('media.episode.sourcePrimary')}
                   </span>
                   <span className="min-w-0 flex-1 truncate text-fg-strong">{cur.title || `#${cur.itemId}`}</span>
-                  <span className="shrink-0 text-[10px] text-muted">#{cur.itemId}</span>
-                </div>
-                <div className="flex items-center gap-2 rounded border border-border-subtle/70 px-2 py-1 text-[11px]">
-                  <span className="shrink-0 rounded bg-surface-2 px-1.5 py-0.5 text-[10px] text-fg-mid">
-                    {t('media.episode.sourcesTitle')}
-                  </span>
-                  <span className="min-w-0 flex-1 truncate text-fg-mid">
+                  <span className="shrink-0 text-[10px] text-muted">
                     {cur.source ? t(sourceLabelKey(cur.source)) : 'local'}
                   </span>
-                  {cur.ref ? (
-                    <span className="min-w-0 flex-1 truncate text-[10px] text-muted" title={cur.ref}>
-                      {cur.ref}
-                    </span>
-                  ) : null}
                 </div>
                 {(cur.sources ?? []).length > 0 ? (
                   <ul className="flex flex-col gap-1">

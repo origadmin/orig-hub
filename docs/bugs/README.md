@@ -223,3 +223,4 @@ bash scripts/install-hooks.sh    # 安装 pre-commit 与 commit-msg（钩子不�
 | BUG-195 | 分组成员只读 `include_peers` 丢弃 `pinned_peers`：文件夹内置顶频道整批丢失（MyTop 应 24 实 20）；修：`folders()` 合并 `pinned_peers`+`include_peers` 并保序去重；`GET /api/tg/folders` 实测 MyTop 20→24、`dialogs` 中 `folder=="MyTop"` 同步 24 | fixed | engine |
 | BUG-196 | 分组频道列表筛选框无 × 清空、pin 频道未置顶：补 `tg-group-search-clear` 按钮；`groupChannels` 按 `folders` 的 `channelIds`(pin 顺序) 置顶排序 | fixed | shell |
 | BUG-197 | 剧集内页默认进入编辑态（`<EpisodeEditPanel>` 无条件渲染）：补 `editingEpisode` 默认 false 门控；「编辑本集」「编辑介绍」点击 toggle `openEdit/closeEdit`；保存后回浏览态 | fixed | shell |
+| BUG-198 | 剧集内「来源」是信息展板而非播放来源切换器：删 `cur.ref`/路径与内部 `#itemId` 噪声、两条近同徽章行合并；保留「切主/摘除/播放」不删能力 | fixed | shell |
