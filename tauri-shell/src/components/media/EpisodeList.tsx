@@ -155,7 +155,7 @@ export function EpisodeList({
             const label =
               ep.title ||
               (isPhoto ? t('player.photoEp', { n: seq?.pos ?? 1 }) : '') ||
-              `#${ep.itemId}`
+              t('player.untitled')
             return (
               <button
                 key={ep.id}

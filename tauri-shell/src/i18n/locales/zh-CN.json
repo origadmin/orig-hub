@@ -485,6 +485,7 @@
   "player.prevPhoto": "上一张",
   "player.nextPhoto": "下一张",
   "player.unsupported": "此类型不支持在应用内预览",
+  "player.untitled": "未命名",
   "player.mixedCount": "视频 {v} · 图片 {p}",
   "media.delete": "删除",
   "media.confirmRemoveOne": "从资料库删除这条内容",

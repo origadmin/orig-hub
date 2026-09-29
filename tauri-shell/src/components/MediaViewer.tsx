@@ -113,9 +113,9 @@ export function MediaViewer(props: {
   }
   const isSelectable = (itemId: number) => items.some((it) => it.messageId === itemId)
 
-  const nextUp = nextItem
+  const       nextUp = nextItem
     ? {
-        title: nextItem.caption?.trim() || `#${nextItem.messageId}`,
+        title: nextItem.caption?.trim() || t('player.untitled'),
         poster: nextItem.poster,
         episodeNo:
           nextItem.episodeNo ??
@@ -163,7 +163,7 @@ export function MediaViewer(props: {
           className="min-w-0 flex-1 truncate text-[12px] text-muted"
           data-testid="viewer-title"
         >
-          {title || cur.caption?.trim() || `#${cur.messageId}`}
+          {title || cur.caption?.trim() || t('player.untitled')}
         </span>
         {positionText && (
           <span
@@ -301,7 +301,7 @@ export function MediaViewer(props: {
                 onClick={() => goTo(it)}
                 aria-current={on ? 'true' : undefined}
                 aria-label={t('player.photoPos', { n: i + 1, total: group.length })}
-                title={it.caption?.trim() || `#${it.messageId}`}
+                title={it.caption?.trim() || t('player.untitled')}
                 data-testid="photo-strip-item"
                 className={cn(
                   'relative h-12 w-12 shrink-0 overflow-hidden rounded border transition-all',
