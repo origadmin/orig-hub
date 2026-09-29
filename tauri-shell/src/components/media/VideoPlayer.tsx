@@ -72,8 +72,9 @@ export interface VideoPlayerProps {
   compatSrc?: string
 }
 
-/** 可选倍速档位（与 EE 一致） */
-const RATES = [0.5, 0.75, 1, 1.25, 1.5, 2]
+/** 可选倍速档位（与 EE 一致；3x/4x 为 BUG-209 新增——用户要求高倍速审看，
+ *  转码档已加 fpsmax 30，30fps 内容在 4x 时恰达显示器刷新上限） */
+const RATES = [0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4]
 /** 快退/快进步长（秒） */
 const SKIP_SEC = 10
 /** 播放中控件自动隐藏延时 */
