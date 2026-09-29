@@ -1099,16 +1099,19 @@ export function MediaLibraryPanel() {
             }}
             onExport={() => setExportOpen(true)}
             onGotoItem={(itemId) => {
-              // 能力 #11（PRD §2.4）：从单集层直达该内容在媒体库里的编辑位 ——
-              // 先切回「全部内容」视图，再取条目打开 `ItemEditDialog`。
-              // 不在这里做「滚动定位到卡片」：条目可能不在当前筛选页里，
-              // 强行滚动会落在错误的位置；打开编辑面板才是用户的真实目的。
-              setView('items')
-              setDetail(null)
-              setActiveSeriesId(null)
+              // BUG-191：按钮文案是「在媒体库中查看该内容」（`media.episode.gotoItem`），
+              // 行为就必须是**查看** —— 原实现 `setEditing(...)` 打开的是 `ItemEditDialog`
+              // 编辑面板，文案与行为两条真源分叉，用户点「查看」得到的是编辑界面。
+              //
+              // 编辑能力不因此丢失：分集另有 `episode-edit` / `episode-slot` 编辑入口
+              // （见 BUG-171 索引行），「查看」与「编辑」不再挤在同一个按钮上。
+              //
+              // 这里不做「切视图 + 滚动定位到卡片」：条目可能不在当前筛选页里，强行滚动
+              // 会落在错误的位置；直接打开查看器才是「查看该内容」的准确实现。
               void (async () => {
                 try {
-                  setEditing(await getMediaItem(itemId))
+                  const item = await getMediaItem(itemId)
+                  openViewer({ items: [toViewerItem(item)], index: 0, title: item.title })
                 } catch (e) {
                   setError(e instanceof Error ? e.message : String(e))
                 }
