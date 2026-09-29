@@ -120,6 +120,12 @@ export function SeriesDetail(props: {
 
   const [focusedEpisodeId, setFocusedEpisodeId] = useState<number | null>(null)
   const [editingSeries, setEditingSeries] = useState(false)
+  /**
+   * 单集内联编辑面板的开关（BUG-197）。**默认 false**：剧集内页是浏览/播放主战场，
+   * 编辑是显式二次动作。打开方式见 `openEdit`；关闭走面板内自带的「保存/取消」按钮
+   * （面板内 onSaved/onClose 已包好 toggle）。与 `editingSeries`/`editingTags` 同款门控。
+   */
+  const [editingEpisode, setEditingEpisode] = useState(false)
   const [editNonce, setEditNonce] = useState(0)
   /** 选集列表折叠（规范 §6 左栏 picker 头含「收起」） */
   const [pickerCollapsed, setPickerCollapsed] = useState(false)
@@ -148,6 +154,7 @@ export function SeriesDetail(props: {
   useEffect(() => {
     setFocusedEpisodeId(null)
     setEditingSeries(false)
+    setEditingEpisode(false)
     setEditNonce(0)
     setAttachingEpisodeId(null)
     setEditingTags(false)
@@ -240,6 +247,27 @@ export function SeriesDetail(props: {
   const gotoItem = (ep: MediaEpisode) => {
     if (props.onGotoItem) props.onGotoItem(ep.itemId)
     else onError(t('media.episode.recacheQueued'))
+  }
+
+  /**
+   * 打开本集编辑面板（BUG-197）。已打开时幂等；新打开会把视口滚到表单位置。
+   * 不动 `editNonce`：表单内部草稿在挂载时一次性初始化，幂等打开复用同一实例即可。
+   */
+  const openEdit = () => {
+    if (editingEpisode) return
+    setEditingEpisode(true)
+    // 等 React 把面板挂上去再滚——否则 `editBlockRef.current` 还指着空节点
+    setTimeout(() => editBlockRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0)
+  }
+  /** 关闭本集编辑面板（不改数据）：把 nonce +1 让下次打开时草稿从头来 */
+  const closeEdit = () => {
+    setEditNonce((v) => v + 1)
+    setEditingEpisode(false)
+  }
+  /** 保存成功 → 容器重取详情 + 退出编辑态回到浏览态 */
+  const handleEditSaved = () => {
+    onChanged()
+    setEditingEpisode(false)
   }
 
   const attachingEp = attachingEpisodeId == null
@@ -546,7 +574,7 @@ export function SeriesDetail(props: {
                     variant="outline"
                     size="sm"
                     className="h-7 px-2.5 text-[11px]"
-                    onClick={() => editBlockRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                    onClick={openEdit}
                     data-testid="episode-edit-desc"
                   >
                     <Pencil className="h-3 w-3" />
@@ -618,21 +646,23 @@ export function SeriesDetail(props: {
                     variant="outline"
                     size="sm"
                     className="h-7 px-2 text-[11px]"
-                    onClick={() => editBlockRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                    onClick={editingEpisode ? closeEdit : openEdit}
                     data-testid="episode-edit"
                   >
                     <Pencil className="h-3 w-3" />
                     {t('media.episode.editMeta')}
                   </Button>
                 </div>
-                <EpisodeEditPanel
-                  key={`${cur.id}-${editNonce}`}
-                  ep={cur}
-                  series={detail}
-                  onClose={() => setEditNonce((v) => v + 1)}
-                  onSaved={onChanged}
-                  onError={onError}
-                />
+                {editingEpisode ? (
+                  <EpisodeEditPanel
+                    key={`${cur.id}-${editNonce}`}
+                    ep={cur}
+                    series={detail}
+                    onClose={closeEdit}
+                    onSaved={handleEditSaved}
+                    onError={onError}
+                  />
+                ) : null}
                 <div className="flex flex-wrap items-center gap-2">
                   <Button
                     variant="outline"
