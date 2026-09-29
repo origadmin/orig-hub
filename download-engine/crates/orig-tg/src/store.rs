@@ -797,6 +797,12 @@ impl Store {
     ///
     /// 返回 `(任务, 是否本次新建)`：只有新建时才允许起 worker，复用时 worker 已在跑。
     /// 返回 `None` 仅出现在极端并发下（撞唯一索引后既读不到活跃行），调用方按内部错误处理。
+    ///
+    /// BUG-189：用 `INSERT ... RETURNING id` 把「插入」与「取新 id」合并在**同一条语句**里。
+    /// 旧写法「先 INSERT、再单独 `SELECT last_insert_rowid()`」存在连接级竞态 ——
+    /// `last_insert_rowid()` 是**连接级且不区分表**的值，Store 用单一共享连接，并发交错时
+    /// 会返回他人（甚至别的表）的 rowid（同 `media::create_series`/`create_tag` 的根因）。
+    /// RETURNING 由 SQLite 在**同一语句内**返回本行 id，从根本上消除该窗口。
     pub async fn enqueue_cache_task(
         &self,
         chat_id: i64,
@@ -812,12 +818,15 @@ impl Store {
         let items = serde_json::to_string(message_ids).unwrap_or_else(|_| "[]".to_string());
         let ts = now();
         // `cache_task_active_uniq`（partial unique）兜底并发：撞索引说明别人已插成功，回读即可。
+        // BUG-189：插入与取 id 必须在**同一条语句**内完成（`RETURNING id`）—— 拆成两句时，共享
+        // 单连接下两句之间的 `.await` 让出点会让 `last_insert_rowid()` 返回他人 rowid（实测 16 路
+        // 并发拿到 14 个不同 id，8 与 16 各重复一次，见本文件回归测试）。
         let inserted = self
-            .conn
-            .execute(
+            .row_opt(
                 "INSERT INTO cache_task \
                    (chat_id, group_id, item_key, items, total, done, status, dir, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 'queued', ?6, ?7, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 'queued', ?6, ?7, ?7)
+                 RETURNING id",
                 params![
                     chat_id,
                     group_id,
@@ -830,11 +839,12 @@ impl Store {
             )
             .await;
         match inserted {
-            Ok(_) => {
-                let id = self.conn.last_insert_rowid();
+            Ok(Some(r)) => {
+                let id: i64 = r.get(0)?;
                 Ok(self.get_cache_task(id).await?.map(|t| (t, true)))
             }
-            Err(_) => Ok(self.active_cache_task(item_key).await?.map(|t| (t, false))),
+            // 撞唯一索引 / 插入报错 / 极端并发下既读不到行：回读同 key 的活跃任务复用。
+            _ => Ok(self.active_cache_task(item_key).await?.map(|t| (t, false))),
         }
     }
 
@@ -1759,5 +1769,66 @@ mod tests {
         assert!(tables.contains(&"media_message"));
         // 唯一路径仍未被误报。
         assert!(!dups.iter().any(|d| d.path.contains("unique-a")));
+    }
+
+    /// 回归（BUG-189 第三处）：`enqueue_cache_task` 的「插入」与「取 id」必须在**同一条 SQL**
+    /// 内完成。旧写法「先 INSERT、再单独 `SELECT last_insert_rowid()`」在共享单连接下，两句之间
+    /// 的 `.await` 让出点会让并发请求交错，`last_insert_rowid()` 返回**他人的 rowid**，于是
+    /// `get_cache_task(别人的 id)` 读到别人的行 —— 返回行的 `item_key` 与请求 key 不符。
+    ///
+    /// 本测试调用**真实** `enqueue_cache_task`（不绕过生产链）：16 路并发、各用不同 key，断言
+    /// 「id 两两唯一」「返回行 item_key == 请求 key」「库中恰好 16 行」。旧代码下第 2 条断言会失败
+    /// （这正是「拿到别人 id」的可观测证据）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn enqueue_cache_task_concurrent_ids_are_isolated() {
+        const N: usize = 16;
+        let s = std::sync::Arc::new(store("enqueue_race").await);
+        // 所有任务在 barrier 对齐后**同时**发起，最大化「INSERT 与取 id 之间」的交错概率。
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(N));
+
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let s = std::sync::Arc::clone(&s);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                let key = format!("race:{i}");
+                barrier.wait().await;
+                let (t, created) = s
+                    .enqueue_cache_task(1, None, &key, &[i as i64 + 1], "D:/dl")
+                    .await
+                    .unwrap()
+                    .expect("并发入队不得返回 None");
+                (key, t, created)
+            }));
+        }
+
+        let mut results = Vec::with_capacity(N);
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+
+        // 1) 16 次新建必须拿到 16 个两两不同的 id。
+        let mut ids: Vec<i64> = results.iter().map(|(_, t, _)| t.id).collect();
+        ids.sort_unstable();
+        let mut uniq = ids.clone();
+        uniq.dedup();
+        assert_eq!(uniq.len(), N, "16 次新建必须拿到 16 个不同 id，实际: {ids:?}");
+
+        // 2) 每次返回行的 item_key 必须等于自己请求的 key —— 这才是真正抓住「拿到别人 id」的断言
+        //    （旧代码下 get_cache_task(别人的 id) 会返回别人的行，key 就对不上）。
+        for (key, t, _) in &results {
+            assert_eq!(
+                &t.item_key, key,
+                "返回行 item_key 与请求 key 不符（拿到他人 id 的信号）: 请求 {key}, 实得 {}",
+                t.item_key
+            );
+        }
+
+        // 3) 库中恰好 16 行。
+        assert_eq!(
+            s.list_cache_tasks(100).await.unwrap().len(),
+            N,
+            "并发 16 个不同 key 应恰好落 16 行"
+        );
     }
 }
