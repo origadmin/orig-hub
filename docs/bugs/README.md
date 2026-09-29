@@ -224,3 +224,6 @@ bash scripts/install-hooks.sh    # 安装 pre-commit 与 commit-msg（钩子不�
 | BUG-196 | 分组频道列表筛选框无 × 清空、pin 频道未置顶：补 `tg-group-search-clear` 按钮；`groupChannels` 按 `folders` 的 `channelIds`(pin 顺序) 置顶排序 | fixed | shell |
 | BUG-197 | 剧集内页默认进入编辑态（`<EpisodeEditPanel>` 无条件渲染）：补 `editingEpisode` 默认 false 门控；「编辑本集」「编辑介绍」点击 toggle `openEdit/closeEdit`；保存后回浏览态 | fixed | shell |
 | BUG-198 | 剧集内「来源」是信息展板而非播放来源切换器：删 `cur.ref`/路径与内部 `#itemId` 噪声、两条近同徽章行合并；保留「切主/摘除/播放」不删能力 | fixed | shell |
+| BUG-199 | 播放卡顿（本地播放器流畅而 WEB 卡死、HLS 流畅而当前不流畅）：根因是环回口上的全局投递节流，delivery_bps 按码率乘 6 限速、4 秒突发后逐块 pacing，把合法投递一起放慢并诱发 Chromium 中断重取；orig-tg 由 config.bind 固定 127.0.0.1 故带宽免费；修：环回返回 0 不限速，非环回保留 BUG-033 抑风暴，ORIG_TG_DELIVERY_BPS 可强制开启 | fixed | engine |
+| BUG-200 | 集不能没有标题：EpisodeEdit.title 是单层 Option 致「空标题不可表达」，update_episode 把空串当不改、前端还硬拦 errTitleEmpty，清空后表现为「保存了但没变」；用户裁定「集可以没有标题，剧集已有名称」；修：title 改双层 Option 加 nullable（缺省不改、null 清空，因 media_item.title 为 NOT NULL 故落空串）、前端删硬拦并下发 null、标题框补可见标签；BUG-069 旧裁定变更已历史锚定 | fixed | engine+shell |
+| BUG-201 | 单集两个编辑入口：「本集介绍」块的 episode-edit-desc 与「编辑本集」块的 episode-edit 打开的是同一个 EpisodeEditPanel，且区块标题与按钮文字重复；设计文档定档「两个入口合一」；修：删重复入口与重复区块标题，只留 episode-edit，能力与 data-testid 全部沿用 | fixed | shell |
