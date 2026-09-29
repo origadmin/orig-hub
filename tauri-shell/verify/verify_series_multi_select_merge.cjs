@@ -668,10 +668,35 @@ async function main() {
 
     // ── 页面健康 ─────────────────────────────────────────────────────
     const pageErrs = page.pageErrors().slice(0, 5)
-    const consoleErrs = page.consoleErrors().filter((e) => !/favicon\.ico/.test(e)).slice(0, 5)
+    // 夹具 item id 白名单：本次运行自造的本地假路径条目（API 造不出真实 TG 上传）。
+    const fixtureItemIds = new Set(created.items)
+    const allConsoleErrs = page.consoleErrors()
+    const nonFavicon = allConsoleErrs.filter((e) => !/favicon\.ico/.test(e))
+    // 夹具假路径导致的 /raw 404：单列为「夹具产物」，不算产品错误，但如实打印。
+    // **只认本次自造的那几个 item id** —— 绝不写成「忽略所有 /raw 404」。
+    const fixtureRaw404 = nonFavicon.filter((e) => {
+      const m = /\/api\/media\/items\/(\d+)\/raw/.exec(e)
+      return m && fixtureItemIds.has(Number(m[1]))
+    })
+    const otherErrs = nonFavicon.filter((e) => !fixtureRaw404.includes(e))
     if (pageErrs.length) console.log('[series-multi-merge] page errors:', JSON.stringify(pageErrs))
+    console.log(
+      `[series-multi-merge] console.errors total=${allConsoleErrs.length} nonFavicon=${nonFavicon.length} fixtureRaw404=${fixtureRaw404.length} other=${otherErrs.length}`,
+    )
+    if (fixtureRaw404.length) {
+      console.log(
+        `[series-multi-merge] NOTE: ${fixtureRaw404.length} 个 404 来自夹具假路径（items ${JSON.stringify([...fixtureItemIds])} 的 /raw），非产品错误`,
+      )
+    }
+    if (otherErrs.length) console.log('[series-multi-merge] other console errors:', JSON.stringify(otherErrs))
     check('页面无未捕获异常（非白屏）', pageErrs.length === 0, pageErrs.length ? JSON.stringify(pageErrs) : 'none')
-    check('页面无 console.error（favicon 除外）', consoleErrs.length === 0, consoleErrs.length ? JSON.stringify(consoleErrs) : 'none')
+    check(
+      '页面无 console.error（favicon 与夹具假路径 /raw 404 除外）',
+      otherErrs.length === 0,
+      otherErrs.length
+        ? JSON.stringify(otherErrs.slice(0, 5))
+        : `none (fixtureRaw404=${fixtureRaw404.length} excluded)`,
+    )
 
     // ── 反向证伪还原（dump 之前，好让「还原」本身也进断言清单）─────────────
     if (REVERT_ON && backups != null) {
