@@ -6,7 +6,7 @@ topic: media-episode
 module: engine+shell
 decided-by: —（§12 的 D1/D2/D3 至今未裁定）
 decided-at: —
-landed-in: 无（截至 2026-09-29 未落地：`tauri-shell/src/components/media/EpisodeExpanded.tsx:153-196` 仍是两个裸按钮）
+landed-in: 无（截至 2026-09-29 未落地：活的 `tauri-shell/src/components/media/SeriesDetail.tsx:542-593` 仍是两个裸按钮、无质量信息、无锁定态 —— 与本文 §5.1「改动后」形态完全不符。注：`EpisodeExpanded.tsx:153-196` 同形态，但它是**零 importer 的孤儿代码**，不能作为落地判据）
 ---
 
 # 单集多视频源（多清晰度 / 多版本）增量设计
@@ -14,6 +14,10 @@ landed-in: 无（截至 2026-09-29 未落地：`tauri-shell/src/components/media
 > **状态口径**（`docs/rules/doc-first.md` §2）：`draft` = 未曾裁定、未曾落地。
 > 本文 §12 的 D1/D2/D3 **至今（2026-09-29，7 天）未获裁定**；本文 §5 描述的「改动后」形态
 > **未落地**。下一会话请以本 front-matter 的状态为准，**不要**把本文当既成事实执行。
+>
+> **⚠️ 落地判据更正（2026-09-29）**：本文 §0.1 F7「前端唯一消费点 `SeriesDetail.tsx:696-713`」
+> 的行号已随重构变化，**现为 `:542-593`**；而 `EpisodeExpanded.tsx` 一类组件是**零 importer 的孤儿**，
+> **不得**作为「是否落地」的判据。判活死一律查 importer：`grep -rn "from './X'" tauri-shell/src`。
 
 - 日期：2026-09-22（v2：按实测否证修订）
 - 作者：架构师（高见远）

@@ -31,7 +31,8 @@ landed-in: 无（scripts/check-docs.py 尚未创建，见 §8）
 | E3 | `docs/overview.md` 是**某一次交付的交付记录**（标题「本轮交付：编辑器报错归因 + 门禁失效修复 + BUG-156 库定位纠错」），**不是文档地图** | `head -1 docs/overview.md` |
 | E4 | 24 篇里 **13 篇完全没有状态字段**；有状态的 11 篇用了 **≥10 种互不一致的自然语言措辞** | 逐篇 `head -8`，见 §7.1 清单 |
 | E5 | 唯一使用可解析词 `draft` 的只有 2 篇（`media-library-layout-design` / `media-library-layout-prd`） | 同上 |
-| E6 | `episode-multi-source-design-2026-09-22.md`（806 行，含 T01–T05 与 D1/D2/D3）**无状态标记**；7 天后**仍未落地** —— `EpisodeExpanded.tsx:153-196` 仍是两个裸按钮 | 已复核 |
+| E6 | `episode-multi-source-design-2026-09-22.md`（806 行，含 T01–T05 与 D1/D2/D3）**无状态标记**；7 天后**仍未落地** —— 活的 `SeriesDetail.tsx:542-593` 仍是两个裸按钮（无质量信息、无锁定态），与那份设计 §5.1 描述的「改动后」形态完全不符 | 已复核 |
+| E14 | **「未落地」的判据本身会踩坑**：`EpisodeExpanded.tsx` / `EpisodeBoard.tsx` / `EpisodeRow.tsx` / `EpisodePhotoGrid.tsx` / `SeriesHero.tsx` 是**零 importer 的孤儿**，拿它当证据会得出「有代码但没落地」的**误导性**结论。判组件死活必须查 importer（`grep -rn "from './X'" tauri-shell/src` 无命中 = 死） | 已复核（2026-09-29 由 PM 许清楚指出） |
 | E7 | `scripts/check-decisions.py` 只扫 `docs/review/` 下文件名含 `decision`/`待拍板` 的 md —— **设计文档内嵌的 `### D<n>.` 从不被检查** | `check-decisions.py`: `REVIEW = docs/review`，文件名过滤 |
 | E8 | 该脚本只校验决策项的**格式**（六段九条），**不校验状态/是否已裁定** | 同上，无 status 相关判据 |
 | E9 | `AGENTS.md` §7 有 7 个门禁，**无一**检查「设计文档是否被跟进」 | `AGENTS.md` §7 表格 |
@@ -79,7 +80,7 @@ landed-in: 无（scripts/check-docs.py 尚未创建，见 §8）
 
 | 文档 | 主题 | 模块 | 状态 | 日期 | 已落地 | 落地证据（commit / 代码位置） |
 |---|---|---|---|---|---|---|
-| `docs/design/episode-multi-source-design-2026-09-22.md` | media-episode | engine+shell | draft | 2026-09-22 | 否 | 无（`EpisodeExpanded.tsx:153-196` 仍为裸按钮） |
+| `docs/design/episode-multi-source-design-2026-09-22.md` | media-episode | engine+shell | draft | 2026-09-22 | 否 | 无（`SeriesDetail.tsx:542-593` 仍为裸按钮；`EpisodeExpanded.tsx` 是死代码，不作判据） |
 | `docs/design/episode-segment-model-2026-09-29.md` | media-episode | engine+shell | draft | 2026-09-29 | 否 | 无 |
 
 ## 顶层文档
@@ -213,6 +214,7 @@ BUG-082 的「追加节 + 历史锚定 + **不改写正文**」是本规范在**
 | **C3** | 索引双向一致 | `docs/README.md` 的行集合 ≠ `docs/design/*.md` ∪ 顶层白名单；或某行状态 ≠ 该文件 front-matter 状态 | FAIL |
 | **C4** | 必读集不漂移 | `AGENTS.md` §0 的清单 ≠ `docs/README.md`「开工前必读」清单（逐行比较） | FAIL |
 | **C5** | 待拍板项可拍板 | 复用 `scripts/check-decisions.py` 的解析器，对**所有** `docs/design/*.md` 中的 `### D<n>.` 块跑六段九条（**修补 E7 的盲区**：现在只扫 `docs/review/`） | FAIL（对 `RULE_FROM` 之后的文档） |
+| **C6** | **证据不得指向死代码**（E14） | `landed-in` / 现状取证里出现 `tauri-shell/src/components/**/*.tsx` 的路径，而该文件在 `tauri-shell/src` 内**零 importer**（`grep -rn "from '<同名>'"` 无命中） | FAIL |
 
 **宽容策略（必须，否则一上来就把 CI 锁死）**：
 
@@ -241,6 +243,7 @@ python scripts/check-docs.py --fix                 # 自动生成/刷新 docs/RE
 | V4 | 造 `status: bogus` | C1a FAIL |
 | V5 | 构造一个只含 `CREATE TABLE` 的 diff、无任何 `docs/` 改动 | C2 FAIL |
 | V6 | 造 `status: implemented` + 文档里有未标「已裁定」的 `### D1.` | C1e FAIL |
+| V8 | 在 `landed-in` 里写一个**零 importer 的孤儿组件**路径（如 `EpisodeExpanded.tsx`） | C6 FAIL |
 | V7 | **合法全量**：每篇都有合法 front-matter + README 双向一致 + 无陈旧 decided + 免检改动 | **必须零报错，退出码 0** |
 
 > 与 `scripts/verify_decision_spec.py` / `verify_light_tier.py` 同一形制：**每个反例各自独立跑、各自必须 FAIL，
@@ -356,7 +359,7 @@ python scripts/check-docs.py --fix                 # 自动生成/刷新 docs/RE
 ### 7.3 已完成的示范样板
 
 - `docs/design/episode-multi-source-design-2026-09-22.md` 已补 front-matter：
-  `status: draft` + `decided-by/decided-at: —` + `landed-in: 无（未落地，EpisodeExpanded.tsx:153-196 仍为裸按钮）`。
+  `status: draft` + `decided-by/decided-at: —` + `landed-in: 无（未落地，活的 `SeriesDetail.tsx:542-593` 仍为裸按钮）`。
   ⇒ **这份 806 行、7 天前写好的设计，从此对新 Session 有确定答案：草稿、未裁定、未落地。**
 
 ---
@@ -382,7 +385,7 @@ python scripts/check-docs.py --fix                 # 自动生成/刷新 docs/RE
 ### D1. 「先文档后代码」的强制级别：CI 阻断，还是只告警？
 
 - **问题**: §3 的门槛（新增表/列、新增 REST 端点、新增能力入口、改既有裁定）命中却无设计文档同行时 —— CI **直接失败阻断**，还是**只告警不阻断**？
-- **现状与代价**: 现状**没有任何判据**（E9/E10）—— `AGENTS.md` §7 的 7 个门禁无一检查「设计文档是否被跟进」。实测后果：`episode-multi-source-design-2026-09-22.md`（806 行、含 T01–T05）写好 7 天，`EpisodeExpanded.tsx:153-196` 仍是两个裸按钮，**设计文档与代码之间没有任何约束力**（E6）。不定 ⇒ 本规范的 C2 判据无法定级，S3 无法开工。
+- **现状与代价**: 现状**没有任何判据**（E9/E10）—— `AGENTS.md` §7 的 7 个门禁无一检查「设计文档是否被跟进」。实测后果：`episode-multi-source-design-2026-09-22.md`（806 行、含 T01–T05）写好 7 天，活的 `SeriesDetail.tsx:542-593` 仍是两个裸按钮，**设计文档与代码之间没有任何约束力**（E6）。不定 ⇒ 本规范的 C2 判据无法定级，S3 无法开工。
 - **设计锚点**: `docs/rules/doc-first.md` §3.1（门槛）/ §4.1（C2）/ §4.4（接入）
   - 冲突: 无。但注意 **`AGENTS.md` §7 记过的病** —— 「pre-commit 曾无条件 `exec` 一个从未入库的脚本 → 恒 exit 127 把所有提交锁死」。故 C2 **必须**有 `--base` 与免检白名单（§3.2），否则会把正常提交锁死。
 - **请求**: 选 A（我的建议）还是 B？
