@@ -10,6 +10,7 @@ import { decodeStateKey, useDecodeHealth } from '../lib/decodeHealth'
 import {
   tgHealth,
   listTgDialogs,
+  listTgFolders,
   listTgMonitoredChannels,
   addTgMonitoredChannel,
   removeTgMonitoredChannel,
@@ -30,6 +31,7 @@ import type { ImportEntry } from '../api/media'
 import type {
   TgCacheTask,
   TgChannel,
+  TgFolder,
   TgMediaItem,
   TgMonitoredChannel,
   TgQueuedTask,
@@ -325,6 +327,8 @@ export function TgPanel(
    */
   const [alive, setAlive] = useState(false)
   const [channels, setChannels] = useState<TgChannel[]>([])
+  /** 用户自定义分组（含 channelIds = Telegram pin 顺序，用于组内 pin 置顶排序） */
+  const [folders, setFolders] = useState<TgFolder[]>([])
   const [scanning, setScanning] = useState(false)
   const [monitoredList, setMonitoredList] = useState<TgMonitoredChannel[]>([])
   /** 第二列当前显示的分组（分组模式键；null = 内容模式：显示选中监控频道的内容） */
@@ -532,6 +536,12 @@ export function TgPanel(
       .catch(() => {
         // BUG-167：同上，后台监控列表加载失败静默，不打脸连接灯。
       })
+    // 自定义分组（含 pin 顺序）：驱动组内频道 pin 置顶排序（BUG-196 缺陷②）。
+    listTgFolders()
+      .then(setFolders)
+      .catch(() => {
+        // BUG-167：后台分组加载失败静默，不打脸连接灯。
+      })
   }, [alive, tgBroken, fetchDialogs])
 
   // 扫描中轮询（2.5s），直到后端扫描结束。
@@ -589,12 +599,27 @@ export function TgPanel(
         : groupMode === UNGROUPED
           ? channels.filter((c) => !c.folder)
           : channels.filter((c) => c.folder === groupMode.slice(2))
+    // 组内 pin 置顶：folder.channelIds 即 Telegram 的 pin 顺序（BUG-196 缺陷②）。
+    // 仅自定义分组（f:<title>）内成立；全部/未分组模式不按 pin 排序（语义本就只在分组内）。
+    let ordered = base
+    if (groupMode.startsWith('f:')) {
+      const folderTitle = groupMode.slice(2)
+      const folder = folders.find((f) => f.title === folderTitle)
+      const order = folder ? new Map(folder.channelIds.map((id, idx) => [id, idx])) : null
+      if (order && order.size > 0) {
+        ordered = [...base].sort((a, b) => {
+          const ai = order.has(a.id) ? (order.get(a.id) as number) : Number.MAX_SAFE_INTEGER
+          const bi = order.has(b.id) ? (order.get(b.id) as number) : Number.MAX_SAFE_INTEGER
+          return ai - bi // 同序（都未 pin）保持原相对顺序（稳定排序）
+        })
+      }
+    }
     const q = search.trim().toLowerCase()
-    if (q === '') return base
-    return base.filter(
+    if (q === '') return ordered
+    return ordered.filter(
       (c) => c.title.toLowerCase().includes(q) || (c.username ?? '').toLowerCase().includes(q),
     )
-  }, [groupMode, channels, search])
+  }, [groupMode, channels, search, folders])
 
   const activeGroup = useMemo(
     () => (groupMode === null ? undefined : groupSections.find((s) => s.key === groupMode)),
@@ -1698,12 +1723,25 @@ export function TgPanel(
               >
                 {t('tg.channelSearchScope')}
               </span>
-              <Input
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder={t('tg.searchPlaceholder')}
-                className="h-8 text-xs"
-              />
+              <div className="relative">
+                <Input
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder={t('tg.searchPlaceholder')}
+                  className="h-8 pr-7 text-xs"
+                />
+                {search ? (
+                  <button
+                    type="button"
+                    onClick={() => setSearch('')}
+                    aria-label={t('tg.globalSearchClear')}
+                    data-testid="tg-group-search-clear"
+                    className="absolute right-1 top-1/2 -translate-y-1/2 rounded px-1 text-[11px] text-muted hover:bg-surface-2 hover:text-fg-strong"
+                  >
+                    x
+                  </button>
+                ) : null}
+              </div>
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
               {groupChannels.length === 0 ? (
