@@ -2145,6 +2145,13 @@ impl Store {
 
     /// 新建剧集，返回 id。`source_key` 为幂等来源键（非 TG 自动成剧时为 None，
     /// 用户手动建的剧集不参与去重；它独立于 `description`，不污染用户可见的介绍字段）。
+    ///
+    /// BUG-189：用 `INSERT ... RETURNING id` 把「插入」与「取新 id」合并在**同一条语句**里。
+    /// 旧写法「先 INSERT、再单独 `SELECT last_insert_rowid()`」存在连接级竞态 ——
+    /// `last_insert_rowid()` 是**连接级且不区分表**的值，Store 用单一共享连接，并发交错时
+    /// 会返回他人（甚至别的表）的 rowid（实测 16 路并发有 6 路拿到重复 id），进而让「按回包
+    /// id 记录、随后 DELETE 或当合并源」的调用方**误删真实数据**（真实剧集 108 即因此被删）。
+    /// RETURNING 由 SQLite 在**同一语句内**返回本行 id，从根本上消除该窗口。
     pub async fn create_series(
         &self,
         title: &str,
@@ -2154,10 +2161,11 @@ impl Store {
         source_key: Option<&str>,
     ) -> libsql::Result<i64> {
         let t = now_secs();
-        self.conn
-            .execute(
+        let row = self
+            .row_opt(
                 "INSERT INTO media_series (title, description, kind, year, source_key, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 RETURNING id",
                 params![
                     title.to_string(),
                     description.map(str::to_string),
@@ -2167,9 +2175,6 @@ impl Store {
                     t
                 ],
             )
-            .await?;
-        let row = self
-            .row_opt("SELECT last_insert_rowid()", ())
             .await?;
         match row {
             Some(r) => r.get(0),
@@ -3559,6 +3564,10 @@ impl Store {
     }
 
     /// 新建标签（重名返回已存在的 id，便于前端幂等调用）。
+    ///
+    /// BUG-189：同 `create_series` —— 用 `INSERT ... RETURNING id` 取新 id，避免
+    /// 「先 INSERT、再单独 `SELECT last_insert_rowid()`」的连接级竞态（共享连接下并发交错
+    /// 会返回他人/他表的 rowid，导致前端把标签挂到错误 id 上）。
     pub async fn create_tag(&self, name: &str, color: Option<&str>) -> libsql::Result<i64> {
         let row = self
             .row_opt(
@@ -3569,13 +3578,12 @@ impl Store {
         if let Some(r) = row {
             return r.get(0);
         }
-        self.conn
-            .execute(
-                "INSERT INTO media_tag (name, color) VALUES (?1, ?2)",
+        let row = self
+            .row_opt(
+                "INSERT INTO media_tag (name, color) VALUES (?1, ?2) RETURNING id",
                 params![name.to_string(), color.map(str::to_string)],
             )
             .await?;
-        let row = self.row_opt("SELECT last_insert_rowid()", ()).await?;
         match row {
             Some(r) => r.get(0),
             None => Ok(0),
@@ -6688,6 +6696,98 @@ mod tests {
         let after = s.get_series(target).await.unwrap().unwrap();
         assert_eq!(after.episodes.len(), 1);
         assert_eq!(after.episodes[0].item_id, item);
+    }
+
+    // ─────────────────── BUG-189：`create_*` 并发取 id 竞态 ───────────────────
+
+    /// BUG-189 回归：并发 `create_series` 必须各自返回**唯一且正确**的 id。
+    ///
+    /// 缺陷原形：`INSERT` 之后单独 `SELECT last_insert_rowid()` —— 该值是**连接级且不分表**
+    /// 的，Store 用单一共享连接，并发交错会返回他人（甚至别的表）的 rowid。实测 16 路并发有
+    /// 6 路拿到重复 id；调用方若按回包 id 记录随后 DELETE / 当合并源，就会误删真实数据
+    /// （真实剧集 108 即因此被删）。
+    ///
+    /// 断言三件事：① 回包 id **两两唯一**；② 每个回包 id 都能查到对应行；③ 库中恰好 N 行。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn create_series_ids_are_unique_under_concurrency() {
+        let path = tmp_db("bug189_create_series_concurrency");
+        let store = std::sync::Arc::new(Store::open(&path).await.unwrap());
+        let n = 16usize;
+
+        // 全部任务在同一 barrier 上对齐后再一起发起，制造真并发（不是错峰串行）。
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(n));
+        let mut handles = Vec::with_capacity(n);
+        for i in 0..n {
+            let s = store.clone();
+            let b = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                b.wait().await;
+                s.create_series(&format!("C{i}"), None, "series", None, None)
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut ids = Vec::with_capacity(n);
+        for h in handles {
+            ids.push(h.await.unwrap());
+        }
+
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(
+            uniq.len(),
+            ids.len(),
+            "并发 create_series 回包 id 必须两两唯一，实得 {ids:?}"
+        );
+        for id in &ids {
+            assert!(
+                store.series_exists(*id).await.unwrap(),
+                "回包 id {id} 必须能查到对应行"
+            );
+        }
+        assert_eq!(
+            store.list_series().await.unwrap().len(),
+            n,
+            "库中应恰好 N 行（每次调用都真的插入了）"
+        );
+    }
+
+    /// BUG-189 回归：并发 `create_tag`（**不同名**）必须返回唯一且正确的 id。
+    /// （同名并发不属本用例范围：`media_tag.name` UNIQUE，其幂等语义另行处理。）
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn create_tag_ids_are_unique_under_concurrency() {
+        let path = tmp_db("bug189_create_tag_concurrency");
+        let store = std::sync::Arc::new(Store::open(&path).await.unwrap());
+        let n = 16usize;
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(n));
+        let mut handles = Vec::with_capacity(n);
+        for i in 0..n {
+            let s = store.clone();
+            let b = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                b.wait().await;
+                s.create_tag(&format!("tag{i}"), None).await.unwrap()
+            }));
+        }
+        let mut ids = Vec::with_capacity(n);
+        for h in handles {
+            ids.push(h.await.unwrap());
+        }
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(
+            uniq.len(),
+            ids.len(),
+            "并发 create_tag 回包 id 必须两两唯一，实得 {ids:?}"
+        );
+        assert_eq!(
+            store.list_tags().await.unwrap().len(),
+            n,
+            "库中应恰好 N 个标签"
+        );
     }
 
     // ─────────────────── BUG-132：字节真值判据 ───────────────────
