@@ -10,10 +10,10 @@ services:
     ports:
       - "19786:19786"
     environment:
-      # 监听所有网卡，接受远程管理连接（配合 SURGE_TOKEN 鉴权）。
+      # 监听所有网卡，接受远程管理连接（docker -p 映射要求进程绑 0.0.0.0）。
       ORIG_DAEMON_HOST: "0.0.0.0"
-      # 网络暴露必须带 token；未设置则 daemon 拒绝启动（安全护栏）。
-      SURGE_TOKEN: "${ORIG_HUB_TOKEN:-change-me-before-prod}"
+      # 可选：设置后所有接口需 Bearer 鉴权。本地/私网部署留空即可直接管理。
+      # SURGE_TOKEN: "${ORIG_HUB_TOKEN:-}"
       # 允许跨域访问的管理端源（逗号分隔）。例如远程前端/网页控制台。
       ORIG_CORS_ORIGINS: "${ORIG_HUB_CORS:-http://localhost:5180}"
       SURGE_DOWNLOAD_DIR: "/data/downloads"

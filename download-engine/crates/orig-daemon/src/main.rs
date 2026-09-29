@@ -99,15 +99,15 @@ async fn main() {
 
     let config = Config::load();
 
-    // 远程/容器部署安全护栏：绑定到非回环地址时**必须**配置 token，否则拒绝启动，
-    // 避免把未鉴权的下载内核暴露到网络（一个 0.0.0.0 误配就裸奔）。
+    // 绑定到非回环地址（容器/远程部署常见）时，若未配置 token 仅告警不阻断：
+    // 本地 docker / 私网部署通常不需要鉴权，强制 token 反而阻碍启动。
+    // 若要公网暴露，请设置 SURGE_TOKEN（或 ORIG_DAEMON_TOKEN）。
     if is_non_loopback(&config.host) && config.token.is_none() {
         eprintln!(
-            "[daemon] refusing to bind {}: a network-exposed daemon requires SURGE_TOKEN \
-             (or ORIG_DAEMON_TOKEN). Set it before starting.",
+            "[daemon] WARNING: binding {} without a token; anyone on the network can manage \
+             downloads. Set SURGE_TOKEN to require Bearer auth.",
             config.host
         );
-        std::process::exit(1);
     }
 
     let registry = Registry::new();
