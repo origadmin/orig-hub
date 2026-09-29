@@ -81,20 +81,32 @@ async fn auth_middleware(
 ) -> Result<Response, StatusCode> {
     let token = state.config.read().unwrap().token.clone();
     if let Some(token) = token {
-        let auth = req
+        let header_ok = req
             .headers()
             .get(AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let ok = auth
-            .strip_prefix("Bearer ")
+            .and_then(|a| a.strip_prefix("Bearer "))
             .map(|t| t == token)
             .unwrap_or(false);
-        if !ok {
+        // 浏览器 EventSource 无法带自定义头，SSE 经 `?token=` 透传鉴权。
+        let query_ok = query_token_matches(req.uri().query(), &token);
+        if !header_ok && !query_ok {
             return Err(StatusCode::UNAUTHORIZED);
         }
     }
     Ok(next.run(req).await)
+}
+
+/// 从查询串中匹配 `?token=<secret>`（仅用于 SSE 等不能带 Authorization 头的场景）。
+fn query_token_matches(query: Option<&str>, token: &str) -> bool {
+    let Some(q) = query else { return false };
+    for pair in q.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k == "token" && v == token {
+            return true;
+        }
+    }
+    false
 }
 
 // ---- 路由处理 ----

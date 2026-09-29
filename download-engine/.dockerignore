@@ -1,0 +1,15 @@
+target
+target-*
+node_modules
+dist
+dist_*
+.git
+.gitignore
+*.db
+*.session
+verify_shots
+**/target
+**/node_modules
+# 排除仓库内嵌套的 download-engine.toml（含 [proxy] mode=direct），
+# 避免被 COPY 进镜像；运行时由 env（ORIG_PROXY_MODE 等）驱动配置。
+download-engine.toml

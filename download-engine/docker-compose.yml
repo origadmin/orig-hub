@@ -1,0 +1,34 @@
+services:
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: orig-hub-engine:local
+    container_name: orig-hub-engine
+    # 关键：容器常驻、崩溃/重启后自动拉起 —— 告别「手动启动占线程、测完就停」。
+    restart: unless-stopped
+    ports:
+      - "19786:19786"
+    environment:
+      # 监听所有网卡，接受远程管理连接（配合 SURGE_TOKEN 鉴权）。
+      ORIG_DAEMON_HOST: "0.0.0.0"
+      # 网络暴露必须带 token；未设置则 daemon 拒绝启动（安全护栏）。
+      SURGE_TOKEN: "${ORIG_HUB_TOKEN:-change-me-before-prod}"
+      # 允许跨域访问的管理端源（逗号分隔）。例如远程前端/网页控制台。
+      ORIG_CORS_ORIGINS: "${ORIG_HUB_CORS:-http://localhost:5180}"
+      SURGE_DOWNLOAD_DIR: "/data/downloads"
+      ORIG_TG_DATA: "/data/tg"
+      ORIG_TG_ENABLED: "true"
+      # --- 可选：代理（无需挂载 toml 即可让 HTTP 下载与 Telegram 走代理）---
+      # ORIG_PROXY_MODE: "custom"          # system | custom | direct
+      # ORIG_PROXY_URL: "socks5://127.0.0.1:7897"
+      # --- 可选：Telegram API 凭据（真实 TG 拉流必须；留空则只能离线/本地媒体库）---
+      # ORIG_TG_API_ID: "1234567"
+      # ORIG_TG_API_HASH: "your_api_hash"
+    volumes:
+      - orig-hub-data:/data
+      # 可选：挂载自定义 download-engine.toml（WORKDIR=/data 下自动读取）
+      # - ./download-engine.toml:/data/download-engine.toml:ro
+
+volumes:
+  orig-hub-data:

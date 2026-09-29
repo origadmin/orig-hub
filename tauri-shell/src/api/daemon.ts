@@ -15,6 +15,10 @@ export const DAEMON_PORT = 19786
  * 桌面壳给的 `daemon_status().port`，或 daemon 自己回的 `/api/config` 的 `port`；
  * 这里的值只是首次请求之前的占位，随后立即被真源覆盖。
  */
+const remoteDaemonUrl = (import.meta.env.VITE_DAEMON_URL as string | undefined)
+  ?.trim()
+  .replace(/\/+$/, '')
+
 let daemonPort = Number(import.meta.env.VITE_DAEMON_PORT ?? DAEMON_PORT)
 
 /** 用真源端口覆盖初值（桌面壳 / `/api/config` 各调一次，幂等） */
@@ -22,8 +26,11 @@ export function setDaemonPort(port: number) {
   if (Number.isFinite(port) && port > 0 && port !== daemonPort) daemonPort = port
 }
 
-/** daemon 基址（**每次现算**：端口可能在运行期被真源改写） */
+/** daemon 基址（**每次现算**）。
+ * - 设了 `VITE_DAEMON_URL` → 指向远程守护进程（容器/另一台机器），即远程管理模式。
+ * - 否则回退桌面端 `http://127.0.0.1:<port>`。 */
 export function daemonBase(): string {
+  if (remoteDaemonUrl) return remoteDaemonUrl
   return `http://127.0.0.1:${daemonPort}`
 }
 

@@ -85,6 +85,10 @@ pub struct Config {
     pub token: Option<String>,
     /// 监听端口（缺省 19786，见 `Default`）。
     pub port: u16,
+    /// 监听地址（缺省 127.0.0.1；容器/远程部署设 0.0.0.0 以接受外部连接）。
+    pub host: String,
+    /// 允许的 CORS 源（逗号/空格分隔；为空则回退桌面端默认白名单）。
+    pub cors_origins: Vec<String>,
     /// 自动分类配置（R3）。
     pub classify: ClassifyConfig,
     /// HTTP 下载代理配置（默认直连）。
@@ -108,6 +112,8 @@ impl Default for Config {
             // 仍可被配置文件 `port` 覆盖；bind 失败时 main 还有顺延兜底，
             // 实际端口以 `/api/config` 的 `port` 为准。
             port: 19786,
+            host: "127.0.0.1".to_string(),
+            cors_origins: Vec::new(),
             classify: ClassifyConfig::default(),
             proxy: orig_core::protocol::ProxyConfig::default(),
             tg_enabled: true,
@@ -191,29 +197,8 @@ impl Config {
     pub fn load_from(path: &str) -> Self {
         let mut cfg = Config::default();
 
-        if let Ok(d) = std::env::var("SURGE_DOWNLOAD_DIR") {
-            if !d.is_empty() {
-                // Expand a user-typed leading `~` up front so no later consumer
-                // ever sees a literal tilde (BUG-071).
-                cfg.download_dir = Some(orig_core::paths::expand_tilde(&d));
-            }
-        }
-        if let Ok(m) = std::env::var("SURGE_MAX_CONNECTIONS") {
-            if let Ok(v) = m.parse() {
-                cfg.max_connections = v;
-            }
-        }
-        if let Ok(t) = std::env::var("SURGE_TOKEN") {
-            if !t.is_empty() {
-                cfg.token = Some(t);
-            }
-        }
-        if let Ok(p) = std::env::var("PORT") {
-            if let Ok(v) = p.parse() {
-                cfg.port = v;
-            }
-        }
-
+        // 注：环境变量覆盖统一在 toml 解析之后应用（见函数末尾），
+        // 保证容器/远程部署的 env 始终优先于挂载的 download-engine.toml。
         if let Ok(txt) = std::fs::read_to_string(path) {
             let parser = TomlParser::parse(&txt);
 
@@ -231,6 +216,14 @@ impl Config {
                     "token" if !v.is_empty() => cfg.token = Some(v.clone()),
                     "port" => {
                         if let Ok(n) = v.parse() { cfg.port = n; }
+                    }
+                    "host" if !v.is_empty() => cfg.host = v.clone(),
+                    "cors_origins" if !v.is_empty() => {
+                        cfg.cors_origins = v
+                            .split([',', ' '])
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
                     }
                     _ => {}
                 }
@@ -283,6 +276,64 @@ impl Config {
                 }
             }
         }
+
+        // 环境变量覆盖（在 toml 之后）：容器/远程部署用 env 始终优先于挂载的 toml。
+        if let Ok(d) = std::env::var("SURGE_DOWNLOAD_DIR") {
+            if !d.is_empty() {
+                cfg.download_dir = Some(orig_core::paths::expand_tilde(&d));
+            }
+        }
+        if let Ok(m) = std::env::var("SURGE_MAX_CONNECTIONS") {
+            if let Ok(v) = m.parse() {
+                cfg.max_connections = v;
+            }
+        }
+        if let Ok(t) = std::env::var("SURGE_TOKEN") {
+            if !t.is_empty() {
+                cfg.token = Some(t);
+            }
+        }
+        if let Ok(p) = std::env::var("PORT") {
+            if let Ok(v) = p.parse() {
+                cfg.port = v;
+            }
+        }
+        // 监听地址：容器/远程部署用 ORIG_DAEMON_HOST（或 SURGE_HOST 别名）覆盖默认 127.0.0.1。
+        if let Ok(h) = std::env::var("ORIG_DAEMON_HOST").or_else(|_| std::env::var("SURGE_HOST")) {
+            if !h.is_empty() {
+                cfg.host = h;
+            }
+        }
+        // 允许的 CORS 源（逗号/空格分隔）；为空则保持桌面端默认白名单。
+        if let Ok(c) = std::env::var("ORIG_CORS_ORIGINS") {
+            let parts: Vec<String> = c
+                .split([',', ' '])
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !parts.is_empty() {
+                cfg.cors_origins = parts;
+            }
+        }
+        // TG 可选插件开关（与 toml [tg] enabled 等效，便于容器/无界面部署关闭）。
+        if let Ok(v) = std::env::var("ORIG_TG_ENABLED") {
+            cfg.tg_enabled = v == "true" || v == "1";
+        }
+        // 代理：容器/无界面部署用 ORIG_PROXY_MODE / ORIG_PROXY_URL 覆盖 toml [proxy]，
+        // 无需挂载配置文件即可让 HTTP 下载与 Telegram 走代理。
+        if let Ok(m) = std::env::var("ORIG_PROXY_MODE") {
+            cfg.proxy.mode = match m.as_str() {
+                "system" => orig_core::protocol::ProxyMode::System,
+                "custom" => orig_core::protocol::ProxyMode::Custom,
+                _ => orig_core::protocol::ProxyMode::Direct,
+            };
+        }
+        if let Ok(u) = std::env::var("ORIG_PROXY_URL") {
+            if !u.is_empty() {
+                cfg.proxy.url = Some(u);
+            }
+        }
+
         cfg
     }
 
