@@ -716,6 +716,20 @@ impl Store {
         base.join("library")
     }
 
+    /// 转码代理目录：`<TG 数据目录>/proxies`。
+    ///
+    /// 与库根同级但**刻意不进库**（BUG-208）：代理是可再生的派生缓存（源件删了
+    /// 随时能重转），媒体库是唯一内容仓，派生物混进去会破坏「1 份存档」的计数
+    /// 与清理语义（清理链让位于 library bytes 的裁定也不应被代理字节干扰）。
+    pub fn proxy_dir(&self) -> PathBuf {
+        let base = self
+            .db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        base.join("proxies")
+    }
+
     /// 读 config.json 的 `libraryDir`（缺文件/缺键/解析失败 → None，不阻断）。
     pub fn config_json_library_dir(db_path: &Path) -> Option<PathBuf> {
         let base = db_path

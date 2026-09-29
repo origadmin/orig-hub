@@ -11,6 +11,8 @@
 //!   GET  /api/tg/messages/:chat_id?limit=100 -> [MediaItem] 频道媒体历史（未登录返回 401）
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -21,6 +23,8 @@ use axum::{Json, Router};
 use libsql::params;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::io::AsyncReadExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::login::{ClientError, DownloadOutcome, LoginPhase, MediaRange};
 use crate::monitor;
@@ -90,6 +94,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         )
         .route("/api/media/items/:id/tags", axum::routing::put(set_media_item_tags))
         .route("/api/media/items/:id/raw", get(media_item_raw))
+        // BUG-208：浏览器无硬件 HEVC 时的兼容流（按需实时转码 H.264 + 代理缓存）。
+        .route("/api/media/items/:id/stream", get(media_item_stream))
         .route("/api/media/items/by-ref", get(media_item_by_ref))
         .route("/api/media/export/preview", get(export_preview))
         .route("/api/media/export", axum::routing::post(export_media))
@@ -3112,6 +3118,380 @@ async fn media_item_raw(
     serve_local_file(&p, Some(item.kind.as_str()), item.duration, &headers).await
 }
 
+// ---- 兼容流（BUG-208）：浏览器解不动的编码（实测整类 HEVC）按需转码 ----
+
+/// 在途转码表（单飞）：item id → 完成信号。同一物理文件**绝不并起两个 ffmpeg**
+/// （后到者在 watch 上等完成再吃代理，否则又是一场请求风暴的温床）。
+type TranscodeDone = tokio::sync::watch::Receiver<bool>;
+static TRANSCODE_INFLIGHT: std::sync::OnceLock<std::sync::Mutex<HashMap<i64, TranscodeDone>>> =
+    std::sync::OnceLock::new();
+
+fn transcode_inflight() -> &'static std::sync::Mutex<HashMap<i64, TranscodeDone>> {
+    TRANSCODE_INFLIGHT.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// ffmpeg 可执行文件名（平台差异只在这一个常量）。
+const FFMPEG_EXE: &str = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+
+/// ffmpeg 解析链（BUG-208，首个命中为准）：
+///   1. env `ORIG_FFMPEG_PATH`（显式指定，最高优先）；
+///   2. sidecar 同目录（打包布局）；
+///   3. `<TG 数据目录>/bin/`；
+///   4. `<应用 bin 目录>`（`%LocalAppData%\OrigHub\bin`，dev 与生产通吃的安装位）；
+///   5. `<TG 数据目录>/../bin/`（生产布局 `%LocalAppData%\OrigHub\{tg,bin}`）；
+///   6. `PATH`。
+/// 找不到返回 None——调用方把「装 ffmpeg 的可行动指引」放进 501 响应，
+/// 前端保留 BUG-207 停载遮罩兜底，绝不静默降级。
+fn resolve_ffmpeg_path(tg_data_dir: &std::path::Path) -> Option<PathBuf> {
+    let explicit = std::env::var("ORIG_FFMPEG_PATH").ok();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(std::path::Path::to_path_buf));
+    let app_bin = std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(|v| std::path::Path::new(&v).join("OrigHub").join("bin"));
+    let path_var = std::env::var("PATH").ok();
+    resolve_ffmpeg_from(
+        explicit.as_deref(),
+        exe_dir.as_deref(),
+        tg_data_dir,
+        app_bin.as_deref(),
+        path_var.as_deref(),
+    )
+}
+
+/// 纯函数版解析链（便于单测）：不读 env、不做副作用，只 stat 文件。
+fn resolve_ffmpeg_from(
+    explicit: Option<&str>,
+    exe_dir: Option<&std::path::Path>,
+    tg_data_dir: &std::path::Path,
+    app_bin: Option<&std::path::Path>,
+    path_var: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(v) = explicit {
+        let p = orig_core::paths::expand_tilde(v.trim());
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Some(d) = exe_dir {
+        cands.push(d.join(FFMPEG_EXE));
+    }
+    cands.push(tg_data_dir.join("bin").join(FFMPEG_EXE));
+    if let Some(ab) = app_bin {
+        cands.push(ab.join(FFMPEG_EXE));
+    }
+    if let Some(parent) = tg_data_dir.parent() {
+        cands.push(parent.join("bin").join(FFMPEG_EXE));
+    }
+    for p in cands {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Some(pv) = path_var {
+        for dir in std::env::split_paths(pv) {
+            let p = dir.join(FFMPEG_EXE);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// `GET /api/media/items/:id/stream` — 兼容流（BUG-208）。
+///
+/// 背景：库内重量级条目（>8Mbps 共 9 条）实测整类 HEVC，Chromium 只认硬件 HEVC
+/// 而本机没有 → 0 帧解码 + `preload=auto` 的 abort-and-re-request 风暴
+/// （BUG-207 仪表化证据：20s 97–137 请求、GB 级无效 IO）。本地播放器能播是因为
+/// 自带软件解码；**任何投递算法都变不出解码能力**，唯一结构性出路是转成
+/// 浏览器必解的 H.264（兼容性碾压：全平台硬解）。
+///
+/// 行为（三态）：
+///   1. **代理命中**（`<TG 数据目录>/proxies/<id>.mp4` 已存在）→ 直接
+///      `serve_local_file`（Range / ETag / MIME / 背压一处定义，不重造），
+///      响应头 `x-orig-stream: proxy`。
+///   2. **转码在途** → 挂在 watch 上等完成再服务代理（单飞），头 `x-orig-stream: proxy`。
+///   3. **冷启动** → spawn ffmpeg 实时转 **fMP4**（`frag_keyframe+empty_moov`，
+///      浏览器无需等整片转完即可开播），stdout 一边泵给响应、一边 tee 落 `.part`，
+///      成功后原子改名成正式代理；客户端断开 → 杀 ffmpeg + 清 `.part`。
+///      头 `x-orig-stream: live`。
+///
+/// 失败语义：ffmpeg 不存在 → 501；转码中途失败 → 流提前终止（浏览器走 onError
+/// → 致命遮罩），`.part` 清除不留垃圾。代理目录在 TG 数据目录下（**不进库**：
+/// 派生缓存混进唯一内容仓会破坏「1 份存档」的计数语义）。
+async fn media_item_stream(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let item = st
+        .store
+        .get_media_item(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "media item not found"))?;
+    // 与 /raw 相同的路径闸门（cache::resolve_item_path：绝对原样 / 相对 join 库根）。
+    let src = match item.file_path.clone() {
+        Some(p) => {
+            let lib_root = st.store.library_root().await;
+            crate::cache::resolve_item_path(&lib_root, &p)
+        }
+        None => return Err(ApiError::new(StatusCode::NOT_FOUND, "item has no local file")),
+    };
+    if tokio::fs::metadata(&src).await.is_err() {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "source file missing"));
+    }
+    let proxy_dir = st.store.proxy_dir();
+    let final_p = proxy_dir.join(format!("{id}.mp4"));
+    let part_p = proxy_dir.join(format!("{id}.mp4.part"));
+
+    // 1) 代理命中：完整文件走既有投递契约。
+    if tokio::fs::metadata(&final_p).await.is_ok() {
+        let mut res = serve_local_file(
+            final_p.to_string_lossy().as_ref(),
+            Some("video"),
+            item.duration,
+            &headers,
+        )
+        .await?;
+        res.headers_mut()
+            .insert("x-orig-stream", HeaderValue::from_static("proxy"));
+        return Ok(res);
+    }
+
+    // ffmpeg 不存在应在占坑**之前**判定——否则 501 早退会把在途表弄脏（占坑无 pump）。
+    let ffmpeg = resolve_ffmpeg_path(&proxy_dir).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "ffmpeg not available; install it (set ORIG_FFMPEG_PATH, or place ffmpeg.exe at %LocalAppData%\\OrigHub\\bin\\ffmpeg.exe) to enable compatibility streams",
+        )
+    })?;
+
+    // 2)/3) 单飞占坑：抢到 = 冷启动；没抢到 = 在途等待。
+    enum Role {
+        Start(tokio::sync::watch::Sender<bool>),
+        Wait(TranscodeDone),
+    }
+    let role = {
+        let mut m = transcode_inflight().lock().expect("transcode map poisoned");
+        match m.get(&id) {
+            Some(rx) => Role::Wait(rx.clone()),
+            None => {
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                m.insert(id, rx);
+                Role::Start(tx)
+            }
+        }
+    };
+
+    match role {
+        Role::Wait(rx) => {
+            // 在途等待：完成（或发送端消失=任务以任意方式结束）后代理应已就位。
+            let mut rx = rx;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(600), async move {
+                while !*rx.borrow_and_update() {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+            if tokio::fs::metadata(&final_p).await.is_ok() {
+                let mut res = serve_local_file(
+                    final_p.to_string_lossy().as_ref(),
+                    Some("video"),
+                    item.duration,
+                    &headers,
+                )
+                .await?;
+                res.headers_mut()
+                    .insert("x-orig-stream", HeaderValue::from_static("proxy"));
+                return Ok(res);
+            }
+            Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transcode in flight but proxy not ready; retry later",
+            ))
+        }
+        Role::Start(tx) => {
+            let (resp_tx, resp_rx) =
+                tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
+            tokio::spawn(transcode_pump(ffmpeg, src, part_p, final_p, id, tx, resp_tx));
+            let body = axum::body::Body::from_stream(ReceiverStream::new(resp_rx));
+            let mut res = Response::new(body);
+            res.headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
+            res.headers_mut()
+                .insert("x-orig-stream", HeaderValue::from_static("live"));
+            Ok(res)
+        }
+    }
+}
+
+/// 兼容流转码泵（BUG-208）：ffmpeg stdout →（响应通道 + `.part` 落盘）双写。
+///
+/// 成功（exit 0 且客户端未中途断开）→ `.part` 原子改名成正式代理；
+/// 客户端断开 / 转码失败 → 清 `.part` 不留垃圾。出口统一：出表 + 唤醒等待者。
+async fn transcode_pump(
+    ffmpeg: PathBuf,
+    src: PathBuf,
+    part_p: PathBuf,
+    final_p: PathBuf,
+    id: i64,
+    done_tx: tokio::sync::watch::Sender<bool>,
+    resp_tx: tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
+) {
+    let finish = |completed: bool| {
+        // 出表 + 唤醒等待者（drop done_tx 兜底：panic 路径也会关闭 watch）。
+        transcode_inflight()
+            .lock()
+            .expect("transcode map poisoned")
+            .remove(&id);
+        let _ = done_tx.send(completed);
+    };
+
+    if let Some(parent) = part_p.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            tracing::error!(target: "orig_tg::transcode", "item {id}: create proxy dir failed: {e}");
+            finish(false);
+            return;
+        }
+    }
+
+    let mut command = tokio::process::Command::new(&ffmpeg);
+    command.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        &src.to_string_lossy(),
+        // 首条视频轨 + 首条音轨（无音轨不报错）；字幕/封面轨一律丢弃
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        // H.264：全平台硬解兼容目标（veryfast 在本机实测可 3x+ 实时，播放追得上）
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        // fMP4：空 moov 前置 → 浏览器不等整片转完即可开播
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+        "pipe:1",
+    ]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // 响应通道断开时 drop child 会自动杀进程（kill_on_drop）
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW：sidecar 无控制台，防止每次转码弹黑窗
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(target: "orig_tg::transcode", "item {id}: spawn ffmpeg failed: {e}");
+            finish(false);
+            return;
+        }
+    };
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    // stderr 必须持续排干（管道写满会卡死 ffmpeg），失败原因落日志
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut s = stderr;
+            let mut buf = Vec::new();
+            // 有界读取：stderr 只需要最后的错误摘要
+            let _ = tokio::io::AsyncReadExt::take(&mut s, 8 * 1024)
+                .read_to_end(&mut buf)
+                .await;
+            let msg = String::from_utf8_lossy(&buf);
+            if !msg.trim().is_empty() {
+                tracing::warn!(target: "orig_tg::transcode", "ffmpeg stderr: {}", msg.trim());
+            }
+        });
+    }
+    let mut file = match tokio::fs::File::create(&part_p).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(target: "orig_tg::transcode", "item {id}: create .part failed: {e}");
+            finish(false);
+            return;
+        }
+    };
+
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut client_gone = false;
+    loop {
+        match stdout.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                use tokio::io::AsyncWriteExt;
+                if file.write_all(&buf[..n]).await.is_err() {
+                    // 落盘失败不影响直播给客户端（例如磁盘满时至少本次能看完）
+                    tracing::warn!(target: "orig_tg::transcode", "item {id}: write .part failed; proxy will be skipped");
+                }
+                if resp_tx
+                    .send(Ok(axum::body::Bytes::copy_from_slice(&buf[..n])))
+                    .await
+                    .is_err()
+                {
+                    // 接收端消失 = 客户端断开（关播放器/切集）→ 杀 ffmpeg 止损
+                    client_gone = true;
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::error!(target: "orig_tg::transcode", "item {id}: read ffmpeg stdout failed: {e}");
+                break;
+            }
+        }
+    }
+
+    let mut completed = false;
+    if client_gone {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        let _ = tokio::fs::remove_file(&part_p).await;
+    } else {
+        drop(stdout); // 关闭管道让 ffmpeg 收到 EOF、自然退出
+        match child.wait().await {
+            Ok(s) if s.success() => {
+                if tokio::fs::rename(&part_p, &final_p).await.is_ok() {
+                    completed = true;
+                    tracing::info!(target: "orig_tg::transcode", "item {id}: proxy ready at {}", final_p.display());
+                }
+            }
+            Ok(s) => {
+                tracing::warn!(target: "orig_tg::transcode", "item {id}: transcode failed: {s}");
+                let _ = tokio::fs::remove_file(&part_p).await;
+            }
+            Err(e) => {
+                tracing::error!(target: "orig_tg::transcode", "item {id}: wait ffmpeg failed: {e}");
+                let _ = tokio::fs::remove_file(&part_p).await;
+            }
+        }
+    }
+    finish(completed);
+}
+
 /// 投递节流是否仅针对非环回（真实远端）场景的开关。
 ///
 /// orig-tg 由 `config.bind` 默认固定为 `127.0.0.1`（仅本机）。环回口带宽免费、
@@ -4056,9 +4436,70 @@ mod tests {
     use super::list_episode_bindings;
     use super::merge_media_series;
     use super::normalized_series_name;
+    use super::resolve_ffmpeg_from;
     use super::router;
     use super::serve_local_file;
     use super::MergeSeriesReq;
+
+    /// BUG-208：ffmpeg 解析链的优先级与落空语义。
+    /// 显式路径（存在才认）→ 数据目录自有 bin → 数据目录兄弟 bin → PATH → None。
+    #[test]
+    fn resolve_ffmpeg_prefers_explicit_then_data_dir_bins() {
+        let base =
+            std::env::temp_dir().join(format!("orig_ffmpeg_probe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // 1) 数据目录自有 bin 命中（显式路径不存在时落到这里）
+        let data1 = base.join("tg1");
+        let bin1 = data1.join("bin");
+        std::fs::create_dir_all(&bin1).unwrap();
+        let fake = bin1.join(super::FFMPEG_EXE);
+        std::fs::write(&fake, b"stub").unwrap();
+        let hit =
+            resolve_ffmpeg_from(Some("Z:/definitely/missing/ffmpeg"), None, &data1, None, None);
+        assert_eq!(hit.as_deref(), Some(fake.as_path()));
+
+        // 2) 自有 bin 缺失 → 应用 bin 目录（%LocalAppData%\OrigHub\bin，dev/生产通吃）命中
+        let data2 = base.join("tg2");
+        std::fs::create_dir_all(&data2).unwrap();
+        let app_bin = base.join("OrigHub-bin");
+        std::fs::create_dir_all(&app_bin).unwrap();
+        let app_exe = app_bin.join(super::FFMPEG_EXE);
+        std::fs::write(&app_exe, b"stub").unwrap();
+        let hit2 = resolve_ffmpeg_from(None, None, &data2, Some(&app_bin), None);
+        assert_eq!(hit2.as_deref(), Some(app_exe.as_path()));
+
+        // 3) 应用 bin 也缺 → 兄弟 bin（生产布局 <data>/../bin）命中
+        let data3 = base.join("tg3");
+        std::fs::create_dir_all(&data3).unwrap();
+        let sibling_bin = base.join("bin");
+        std::fs::create_dir_all(&sibling_bin).unwrap();
+        let sibling = sibling_bin.join(super::FFMPEG_EXE);
+        std::fs::write(&sibling, b"stub").unwrap();
+        let hit3 = resolve_ffmpeg_from(None, None, &data3, None, None);
+        assert_eq!(hit3.as_deref(), Some(sibling.as_path()));
+
+        // 4) 全部落空 → None（不假装能转码，501 留给调用方）。
+        //    注意：data4 必须挂在**隔离的父目录**下——上面的 base/bin 已存在，
+        //    会作为「兄弟 bin」被命中（这正是解析链的正确行为）。
+        let root2 = base.join("iso");
+        let data4 = root2.join("tg4");
+        std::fs::create_dir_all(&data4).unwrap();
+        assert_eq!(resolve_ffmpeg_from(None, None, &data4, None, None), None);
+
+        // 5) PATH 候选兜底
+        let hit5 = resolve_ffmpeg_from(
+            None,
+            None,
+            &data4,
+            None,
+            Some(sibling_bin.to_str().unwrap()),
+        );
+        assert_eq!(hit5.as_deref(), Some(sibling.as_path()));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     use serde_json::json;
 
     use std::sync::Arc;
