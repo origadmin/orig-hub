@@ -92,6 +92,12 @@ const OUT = path.resolve(
 const ITEM = Number(process.env.PROBE_ITEM || 607)
 /** 每个条件的采样窗口（秒）——要求 ≥60s。 */
 const WINDOW_SEC = Number(process.env.STALL_WINDOW_SEC || 60)
+/**
+ * 候选乙（投递风暴）实测：`2x` 播放下 `/api/media/items/<id>/raw` 的请求数/字节。
+ * 参照 `routes.rs:3548-3560` 注释记录的「2x 播放 10s = 137 请求 / 792 MiB」。
+ */
+const RAW_STORM_SEC = Number(process.env.RAW_STORM_SEC || 10)
+const RAW_STORM_RATE = Number(process.env.RAW_STORM_RATE || 2)
 /** 5s 节拍对齐直方图：桶宽与桶数（20 × 250ms = 5000ms）。 */
 const BUCKET_MS = 250
 const BUCKET_COUNT = 20
@@ -411,6 +417,7 @@ function createNetworkCollector(page, tgOrigin) {
       status: null,
       fromCache: false,
       failed: false,
+      bytes: 0,
     })
   })
   const settle = (requestId, patch) => {
@@ -428,10 +435,11 @@ function createNetworkCollector(page, tgOrigin) {
     rec.fromCache = Boolean(resp.fromDiskCache || resp.fromServiceWorker)
   })
   page.conn.on('Network.loadingFinished', (p) => {
-    settle(p.requestId, { tEnd: Number(p.timestamp || 0) })
+    // encodedDataLength = 该请求实际传输字节（含分块），用于候选乙「投递风暴」的字节实测。
+    settle(p.requestId, { tEnd: Number(p.timestamp || 0), bytes: Number(p.encodedDataLength || 0) })
   })
   page.conn.on('Network.loadingFailed', (p) => {
-    settle(p.requestId, { tEnd: Number(p.timestamp || 0), failed: true })
+    settle(p.requestId, { tEnd: Number(p.timestamp || 0), failed: true, bytes: 0 })
   })
 
   return {
@@ -522,8 +530,10 @@ function concurrencyAnalysis(net, playingItem) {
     pollRequestCount: polls.length,
     playerRequestCount: playerReqs.length,
     playerRawCount: playerRaw.length,
+    playerRawBytes: playerRaw.reduce((a, r) => a + Number(r.bytes || 0), 0),
     feedPosterRequestCount: feedPoster.length,
     thumbRequestCount: thumbs.length,
+    totalBytes: reqs.reduce((a, r) => a + Number(r.bytes || 0), 0),
     maxConcurrentAfterPoll: afterPoll.length ? Math.max(...afterPoll) : 0,
     sampleUrls: reqs.slice(0, 12).map((r) => r.url.replace(net.tgOrigin, '')),
   }
@@ -851,6 +861,16 @@ function summarizeCondition(key, w) {
     // 网络维度（连接池争抢）
     net: w.netAnalysis || null,
     netVerdict: w.netAnalysis ? networkVerdict(w.netAnalysis) : null,
+    // 候选乙：/api/media/items/<id>/raw 投递风暴
+    rawReqCount: w.netAnalysis ? w.netAnalysis.playerRawCount : null,
+    rawReqPerSec:
+      w.netAnalysis && w.wallSecs > 0
+        ? Number((w.netAnalysis.playerRawCount / w.wallSecs).toFixed(2))
+        : null,
+    rawBytes: w.netAnalysis ? w.netAnalysis.playerRawBytes : null,
+    rawMiB: w.netAnalysis
+      ? Number((w.netAnalysis.playerRawBytes / (1024 * 1024)).toFixed(2))
+      : null,
     ltErr: w.ltErr,
   }
 }
@@ -891,6 +911,7 @@ function logCondition(r) {
       ` | net[tgReq ${r.net ? r.net.tgRequestCount : '-'} maxConc ${r.net ? r.net.maxConcurrent : '-'}` +
       ` player ${r.net ? r.net.playerRequestCount : '-'} feedPoster ${r.net ? r.net.feedPosterRequestCount : '-'}` +
       ` poll ${r.net ? r.net.pollRequestCount : '-'} afterPoll ${r.net ? r.net.maxConcurrentAfterPoll : '-'}]` +
+      ` | raw ${r.rawReqCount == null ? '-' : r.rawReqCount} reqs (${r.rawReqPerSec == null ? '-' : r.rawReqPerSec}/s, ${r.rawMiB == null ? '-' : r.rawMiB} MiB)` +
       ` => connPool ${r.netVerdict ? r.netVerdict.verdict : '-'}`,
   )
 }
@@ -1079,6 +1100,32 @@ async function main() {
       console.log('[stall] condition C NOT COVERABLE: 库内无活跃缓存任务')
     }
 
+    // ---- 条件 D：候选乙 —— 2x 播放下的 /raw 投递风暴实测（与缓存任务无关，始终可跑）----
+    {
+      console.log(
+        `\n[stall] ===== condition D (candidate-B: ${RAW_STORM_RATE}x raw storm, ${RAW_STORM_SEC}s) =====`,
+      )
+      const stormRate = await page.evaluate((rate) => {
+        const v = document.querySelector('[data-testid="media-viewer"] video')
+        if (!v) return null
+        v.playbackRate = rate
+        return v.playbackRate
+      }, RAW_STORM_RATE)
+      await delay(1600) // 解码器预热（对齐 decodeHealth WARMUP）
+      const w = await measureWindowWithNet(page, RAW_STORM_SEC, netEnabled ? netCollector : null, ITEM)
+      const r = summarizeCondition('D', w)
+      r.stormRate = stormRate
+      results.conditions.D = r
+      logCondition(r)
+      await shot(page, `40_conditionD_raw_storm_${RAW_STORM_RATE}x.png`)
+      // 恢复 1x（恢复现场）
+      await page.evaluate(() => {
+        const v = document.querySelector('[data-testid="media-viewer"] video')
+        if (v) v.playbackRate = 1
+      })
+      await delay(300)
+    }
+
     // ---- 页面错误 ----
     const pageErrors = page.pageErrors().slice(0, 20)
     const consoleErrors = page.consoleErrors().slice(0, 20)
@@ -1133,10 +1180,15 @@ async function main() {
     lines.push(
       '| 条件 | longtask 次数 | 最长 longtask(ms) | 相位聚集 | 聚集桶 | 轮询次数 | 轮询中位(ms) | 紧随轮询≤' +
         ALIGN_WINDOW_MS +
-        'ms | 5s对齐(合并) | daemon活跃 | 到origin请求 | 最大并发 | feed抽帧 | 5s后并发 | 连接池判 | rVFC 最大间隔(ms) | 掉帧% | buffered 最小(s) |',
+        'ms | 5s对齐(合并) | daemon活跃 | 到origin请求 | 最大并发 | feed抽帧 | 5s后并发 | 连接池判 | rVFC 最大间隔(ms) | 掉帧% | buffered 最小(s) | raw请求数 | raw MiB |',
     )
-    lines.push('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
-    const label = { A: 'A 基线(无任务)', B: 'B 缓存中', C: 'C 缓存中+面板' }
+    lines.push('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
+    const label = {
+      A: 'A 基线(无任务)',
+      B: 'B 缓存中',
+      C: 'C 缓存中+面板',
+      D: `D ${RAW_STORM_RATE}x raw风暴`,
+    }
     for (const k of condKeys) {
       const r = results.conditions[k]
       const dd = r.daemonDownloads || {}
@@ -1151,7 +1203,8 @@ async function main() {
           `${n.feedPosterRequestCount == null ? '-' : n.feedPosterRequestCount} | ` +
           `${n.maxConcurrentAfterPoll == null ? '-' : n.maxConcurrentAfterPoll} | ` +
           `${r.netVerdict ? r.netVerdict.verdict : '-'} | ` +
-          `${r.rvfcMaxGapMs} | ${r.droppedPct == null ? '-' : r.droppedPct + '%'} | ${r.bufferedAheadMin} |`,
+          `${r.rvfcMaxGapMs} | ${r.droppedPct == null ? '-' : r.droppedPct + '%'} | ${r.bufferedAheadMin} | ` +
+          `${r.rawReqCount == null ? '-' : r.rawReqCount} | ${r.rawMiB == null ? '-' : r.rawMiB} |`,
       )
     }
     lines.push('')
