@@ -3120,14 +3120,79 @@ async fn media_item_raw(
 
 // ---- 兼容流（BUG-208）：浏览器解不动的编码（实测整类 HEVC）按需转码 ----
 
-/// 在途转码表（单飞）：item id → 完成信号。同一物理文件**绝不并起两个 ffmpeg**
-/// （后到者在 watch 上等完成再吃代理，否则又是一场请求风暴的温床）。
-type TranscodeDone = tokio::sync::watch::Receiver<bool>;
-static TRANSCODE_INFLIGHT: std::sync::OnceLock<std::sync::Mutex<HashMap<i64, TranscodeDone>>> =
-    std::sync::OnceLock::new();
+/// Transcode variant: None is the legacy compatibility proxy; Some is a speed FRC variant.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct TranscodeKey {
+    item_id: i64,
+    speed_hundredths: Option<u16>,
+}
 
-fn transcode_inflight() -> &'static std::sync::Mutex<HashMap<i64, TranscodeDone>> {
+type TranscodeDone = tokio::sync::watch::Receiver<bool>;
+static TRANSCODE_INFLIGHT: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<TranscodeKey, TranscodeDone>>,
+> = std::sync::OnceLock::new();
+
+fn transcode_inflight() -> &'static std::sync::Mutex<HashMap<TranscodeKey, TranscodeDone>> {
     TRANSCODE_INFLIGHT.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Only accept declared player rates; never interpolate arbitrary input into FFmpeg filters.
+fn parse_stream_speed(speed: Option<&str>) -> Result<Option<u16>, ApiError> {
+    match speed {
+        None | Some("1") => Ok(None),
+        Some("0.5") => Ok(Some(50)),
+        Some("0.75") => Ok(Some(75)),
+        Some("1.25") => Ok(Some(125)),
+        Some("1.5") => Ok(Some(150)),
+        Some("2") => Ok(Some(200)),
+        Some("3") => Ok(Some(300)),
+        Some("4") => Ok(Some(400)),
+        Some(_) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "unsupported stream speed; use one of 0.5, 0.75, 1.25, 1.5, 2, 3, 4",
+        )),
+    }
+}
+
+fn speed_value(speed_hundredths: u16) -> f64 {
+    f64::from(speed_hundredths) / 100.0
+}
+
+fn transformed_duration(duration_secs: Option<i64>, speed_hundredths: Option<u16>) -> Option<i64> {
+    match (duration_secs, speed_hundredths) {
+        (Some(duration), Some(speed)) if duration > 0 => {
+            Some(((duration as f64 / speed_value(speed)).round() as i64).max(1))
+        }
+        (duration, _) => duration,
+    }
+}
+
+fn speed_video_filter(speed_hundredths: u16) -> String {
+    format!("setpts=(PTS-STARTPTS)/{:.2},fps=30", speed_value(speed_hundredths))
+}
+
+/// Keep every atempo stage in FFmpeg's supported [0.5, 2.0] range.
+fn atempo_filter(speed_hundredths: u16) -> String {
+    let mut remaining = speed_value(speed_hundredths);
+    let mut filters = Vec::new();
+    while remaining > 2.0 {
+        filters.push("atempo=2.0".to_string());
+        remaining /= 2.0;
+    }
+    while remaining < 0.5 {
+        filters.push("atempo=0.5".to_string());
+        remaining /= 0.5;
+    }
+    filters.push(format!("atempo={remaining:.2}"));
+    format!("asetpts=PTS-STARTPTS,{}", filters.join(","))
+}
+
+fn stream_mode_header(speed_hundredths: Option<u16>, fallback: &'static str) -> HeaderValue {
+    match speed_hundredths {
+        Some(speed) => HeaderValue::from_str(&format!("decimate={}", speed_value(speed)))
+            .unwrap_or_else(|_| HeaderValue::from_static(fallback)),
+        None => HeaderValue::from_static(fallback),
+    }
 }
 
 /// ffmpeg 可执行文件名（平台差异只在这一个常量）。
@@ -3201,7 +3266,7 @@ fn resolve_ffmpeg_from(
     None
 }
 
-/// `GET /api/media/items/:id/stream` — 兼容流（BUG-208）。
+/// `GET /api/media/items/:id/stream[?speed=S]` — H.264 compatibility/FRC stream (BUG-208/223).
 ///
 /// 背景：库内重量级条目（>8Mbps 共 9 条）实测整类 HEVC，Chromium 只认硬件 HEVC
 /// 而本机没有 → 0 帧解码 + `preload=auto` 的 abort-and-re-request 风暴
@@ -3210,10 +3275,9 @@ fn resolve_ffmpeg_from(
 /// 浏览器必解的 H.264（兼容性碾压：全平台硬解）。
 ///
 /// 行为（三态）：
-///   1. **代理命中**（`<TG 数据目录>/proxies/<id>.mp4` 已存在）→ 直接
-///      `serve_local_file`（Range / ETag / MIME / 背压一处定义，不重造），
-///      响应头 `x-orig-stream: proxy`。
-///   2. **转码在途** → 挂在 watch 上等完成再服务代理（单飞），头 `x-orig-stream: proxy`。
+///   1. **代理命中**（`<id>.mp4` 或 `<id>-speed-<百分之一倍速>.mp4` 已存在）→ 直接
+///      `serve_local_file`（Range / ETag / MIME / 背压一处定义，不重造）；FRC 响应头标记 `decimate=S`。
+///   2. **同一变体转码在途** → 挂在 watch 上等完成再服务代理（单飞），不同速度有独立缓存/任务键。
 ///   3. **冷启动** → spawn ffmpeg 实时转 **fMP4**（`frag_keyframe+empty_moov`，
 ///      浏览器无需等整片转完即可开播），stdout 一边泵给响应、一边 tee 落 `.part`，
 ///      成功后原子改名成正式代理；客户端断开 → 杀 ffmpeg + 清 `.part`。
@@ -3225,8 +3289,10 @@ fn resolve_ffmpeg_from(
 async fn media_item_stream(
     State(st): State<Arc<AppState>>,
     Path(id): Path<i64>,
+    Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    let speed_hundredths = parse_stream_speed(query.get("speed").map(String::as_str))?;
     let item = st
         .store
         .get_media_item(id)
@@ -3245,20 +3311,25 @@ async fn media_item_stream(
         return Err(ApiError::new(StatusCode::NOT_FOUND, "source file missing"));
     }
     let proxy_dir = st.store.proxy_dir();
-    let final_p = proxy_dir.join(format!("{id}.mp4"));
-    let part_p = proxy_dir.join(format!("{id}.mp4.part"));
+    let key = TranscodeKey { item_id: id, speed_hundredths };
+    let variant = speed_hundredths
+        .map(|speed| format!("{id}-speed-{speed}.mp4"))
+        .unwrap_or_else(|| format!("{id}.mp4"));
+    let final_p = proxy_dir.join(&variant);
+    let part_p = proxy_dir.join(format!("{variant}.part"));
+    let stream_duration = transformed_duration(item.duration, speed_hundredths);
 
     // 1) 代理命中：完整文件走既有投递契约。
     if tokio::fs::metadata(&final_p).await.is_ok() {
         let mut res = serve_local_file(
             final_p.to_string_lossy().as_ref(),
             Some("video"),
-            item.duration,
+            stream_duration,
             &headers,
         )
         .await?;
         res.headers_mut()
-            .insert("x-orig-stream", HeaderValue::from_static("proxy"));
+            .insert("x-orig-stream", stream_mode_header(speed_hundredths, "proxy"));
         return Ok(res);
     }
 
@@ -3277,11 +3348,11 @@ async fn media_item_stream(
     }
     let role = {
         let mut m = transcode_inflight().lock().expect("transcode map poisoned");
-        match m.get(&id) {
+        match m.get(&key) {
             Some(rx) => Role::Wait(rx.clone()),
             None => {
                 let (tx, rx) = tokio::sync::watch::channel(false);
-                m.insert(id, rx);
+                m.insert(key, rx);
                 Role::Start(tx)
             }
         }
@@ -3303,12 +3374,12 @@ async fn media_item_stream(
                 let mut res = serve_local_file(
                     final_p.to_string_lossy().as_ref(),
                     Some("video"),
-                    item.duration,
+                    stream_duration,
                     &headers,
                 )
                 .await?;
                 res.headers_mut()
-                    .insert("x-orig-stream", HeaderValue::from_static("proxy"));
+                    .insert("x-orig-stream", stream_mode_header(speed_hundredths, "proxy"));
                 return Ok(res);
             }
             Err(ApiError::new(
@@ -3319,13 +3390,22 @@ async fn media_item_stream(
         Role::Start(tx) => {
             let (resp_tx, resp_rx) =
                 tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
-            tokio::spawn(transcode_pump(ffmpeg, src, part_p, final_p, id, tx, resp_tx));
+            tokio::spawn(transcode_pump(
+                ffmpeg,
+                src,
+                part_p,
+                final_p,
+                key,
+                speed_hundredths,
+                tx,
+                resp_tx,
+            ));
             let body = axum::body::Body::from_stream(ReceiverStream::new(resp_rx));
             let mut res = Response::new(body);
             res.headers_mut()
                 .insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
             res.headers_mut()
-                .insert("x-orig-stream", HeaderValue::from_static("live"));
+                .insert("x-orig-stream", stream_mode_header(speed_hundredths, "live"));
             Ok(res)
         }
     }
@@ -3340,16 +3420,18 @@ async fn transcode_pump(
     src: PathBuf,
     part_p: PathBuf,
     final_p: PathBuf,
-    id: i64,
+    key: TranscodeKey,
+    speed_hundredths: Option<u16>,
     done_tx: tokio::sync::watch::Sender<bool>,
     resp_tx: tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
 ) {
+    let id = key.item_id;
     let finish = |completed: bool| {
         // 出表 + 唤醒等待者（drop done_tx 兜底：panic 路径也会关闭 watch）。
         transcode_inflight()
             .lock()
             .expect("transcode map poisoned")
-            .remove(&id);
+            .remove(&key);
         let _ = done_tx.send(completed);
     };
 
@@ -3373,7 +3455,24 @@ async fn transcode_pump(
         "0:v:0",
         "-map",
         "0:a:0?",
-        // H.264：全平台硬解兼容目标（veryfast 在本机实测可 3x+ 实时，播放追得上）
+    ]);
+    if let Some(speed) = speed_hundredths {
+        // Retimestamp then sample CFR 30fps; supports fractional speed, VFR and any source fps.
+        //
+        // BUG-223：**不传 `-r 30`**。`fps=30` 滤镜已把输出重采样为 CFR 30，
+        // 而下面无条件带的 `-fpsmax 30` 与 `-r` 在同一条流上互斥
+        // （ffmpeg: "Only one of -fpsmax and -r can be set for a stream."），
+        // 两者同时出现会让 ffmpeg **拒绝打开输出文件** → 整条 FRC 流 0 字节，
+        // 浏览器端表现为「切了倍速就再也出不了画面」。判据①②的实测都建立在
+        // 只带`-r 30`（判据①脚本）或只带 `-fpsmax 30`（本函数）的单一上限上。
+        command
+            .arg("-vf")
+            .arg(speed_video_filter(speed))
+            .arg("-af")
+            .arg(atempo_filter(speed));
+    }
+    command.args([
+        // H.264：全平台硬解兼容目标（veryfast 在本机实测可实时转码）。
         "-c:v",
         "libx264",
         "-preset",
@@ -3382,9 +3481,7 @@ async fn transcode_pump(
         "23",
         "-pix_fmt",
         "yuv420p",
-        // BUG-209 A/B 实测：60fps 源在 2x 倍速需 120fps 呈现，超过显示器刷新率（~60Hz）
-        // 即按比例跳帧（2x 丢 33%）；帧率上限 30 后 2x 丢帧为 0、4x 才到呈现上限。
-        // -fpsmax 只在源超过上限时丢帧（24fps 源不复制帧），解码/体积同步减半。
+        // 兼容代理与 FRC 变体均限制输出视频最高 30fps。
         "-fpsmax",
         "30",
         "-c:a",
@@ -3453,14 +3550,18 @@ async fn transcode_pump(
                     // 落盘失败不影响直播给客户端（例如磁盘满时至少本次能看完）
                     tracing::warn!(target: "orig_tg::transcode", "item {id}: write .part failed; proxy will be skipped");
                 }
-                if resp_tx
-                    .send(Ok(axum::body::Bytes::copy_from_slice(&buf[..n])))
-                    .await
-                    .is_err()
+                if !client_gone
+                    && resp_tx
+                        .send(Ok(axum::body::Bytes::copy_from_slice(&buf[..n])))
+                        .await
+                        .is_err()
                 {
-                    // 接收端消失 = 客户端断开（关播放器/切集）→ 杀 ffmpeg 止损
+                    // Legacy compatibility requests cancel immediately. FRC variants keep
+                    // transcoding to a seekable speed-specific proxy after client disconnect.
                     client_gone = true;
-                    break;
+                    if speed_hundredths.is_none() {
+                        break;
+                    }
                 }
             }
             Err(e) => {
@@ -3471,7 +3572,7 @@ async fn transcode_pump(
     }
 
     let mut completed = false;
-    if client_gone {
+    if client_gone && speed_hundredths.is_none() {
         let _ = child.kill().await;
         let _ = child.wait().await;
         let _ = tokio::fs::remove_file(&part_p).await;
@@ -4441,10 +4542,36 @@ mod tests {
     use super::list_episode_bindings;
     use super::merge_media_series;
     use super::normalized_series_name;
+    use super::parse_stream_speed;
     use super::resolve_ffmpeg_from;
+    use super::speed_video_filter;
+    use super::atempo_filter;
+    use super::transformed_duration;
     use super::router;
     use super::serve_local_file;
     use super::MergeSeriesReq;
+
+    #[test]
+    fn stream_speed_profiles_are_whitelisted_and_build_cfr_filters() {
+        assert!(matches!(parse_stream_speed(None), Ok(None)));
+        assert!(matches!(parse_stream_speed(Some("1")), Ok(None)));
+        assert!(matches!(parse_stream_speed(Some("0.5")), Ok(Some(50))));
+        assert!(matches!(parse_stream_speed(Some("0.75")), Ok(Some(75))));
+        assert!(matches!(parse_stream_speed(Some("1.25")), Ok(Some(125))));
+        assert!(matches!(parse_stream_speed(Some("2")), Ok(Some(200))));
+        assert!(parse_stream_speed(Some("2.5")).is_err());
+        assert!(parse_stream_speed(Some("2;evil")).is_err());
+
+        assert_eq!(transformed_duration(Some(120), Some(50)), Some(240));
+        assert_eq!(transformed_duration(Some(120), Some(200)), Some(60));
+        assert_eq!(transformed_duration(Some(120), None), Some(120));
+        assert_eq!(speed_video_filter(50), "setpts=(PTS-STARTPTS)/0.50,fps=30");
+        assert_eq!(speed_video_filter(200), "setpts=(PTS-STARTPTS)/2.00,fps=30");
+        assert_eq!(atempo_filter(50), "asetpts=PTS-STARTPTS,atempo=0.50");
+        assert_eq!(atempo_filter(200), "asetpts=PTS-STARTPTS,atempo=2.00");
+        assert_eq!(atempo_filter(300), "asetpts=PTS-STARTPTS,atempo=2.0,atempo=1.50");
+        assert_eq!(atempo_filter(400), "asetpts=PTS-STARTPTS,atempo=2.0,atempo=2.00");
+    }
 
     /// BUG-208：ffmpeg 解析链的优先级与落空语义。
     /// 显式路径（存在才认）→ 数据目录自有 bin → 数据目录兄弟 bin → PATH → None。

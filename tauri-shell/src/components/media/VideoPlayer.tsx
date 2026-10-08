@@ -15,7 +15,11 @@ import {
 import { cn } from '../../lib/utils'
 import { fmtDuration } from '../../lib/tgmedia'
 import { useTranslation } from '../../i18n'
-import { decodeStateKey, useDecodeHealth } from '../../lib/decodeHealth'
+import {
+  decodeStateKey,
+  MEDIA_ERR_SRC_NOT_SUPPORTED,
+  useDecodeHealth,
+} from '../../lib/decodeHealth'
 import { usePlayerSettings } from '../../hooks/usePlayerSettings'
 
 /**
@@ -79,6 +83,14 @@ export interface VideoPlayerProps {
 /** 可选倍速档位（与 EE 一致；3x/4x 为 BUG-209 新增——用户要求高倍速审看，
  *  转码档已加 fpsmax 30，30fps 内容在 4x 时恰达显示器刷新上限） */
 const RATES = [0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4]
+
+/** Build the server-side FRC URL for a non-1x rate. */
+function streamUrlAtRate(src: string, rate: number): string {
+  const url = new URL(src, window.location.href)
+  url.searchParams.set('speed', String(rate))
+  return url.toString()
+}
+
 /** 快退/快进步长（秒） */
 const SKIP_SEC = 10
 /** 播放中控件自动隐藏延时 */
@@ -91,29 +103,39 @@ const CENTER_MS = 1500
 const COUNTDOWN_SEC = 5
 
 // ---- 兼容流记忆（BUG-208）：解码不动的原始源记入 localStorage，下次直开兼容流，
-// 免走「先试原始流 → 3s 无帧 → 再切」的弯路（也少付一次 abort-re-request 代价）。 ----
+// 免走「先试原始流 → 无帧 → 再切」的弯路（也少付一次 abort-re-request 代价）。 ----
+//
+// BUG-224：**记忆机制已停用**（`readCompatSet` 恒返回空并顺手清 key）。
+//
+// 它的前提是「这些源本机解不动，只有服务端转码能救」。实测该前提不成立：
+// 媒体库 138 个视频里 30 个是 HEVC/hvc1，但本机 Chromium 经 Media Foundation
+// **能解** —— `items/415/raw`(720p HEVC) 首帧 0.63s、`items/673/raw`(1080p HEVC)
+// 首帧 0.92s，videoWidth 分别为 720 / 1920（`verify/_probe_bug224_decode.cjs`）。
+//
+// 记忆带来的代价远大于省下的几秒：
+//   1. 一次误判 = 该文件**此后每次**都直开兼容流；兼容流每次冷启动实时转码
+//      （实测首字节 2.44s、1.05 MB/s，143MB 源要转 136s），比直接播原源慢一个量级；
+//   2. 没有清除入口（只能手写 `localStorage.removeItem`），用户无法自愈；
+//   3. 兼容流是 live fMP4、不支持 Range，暂停 / seek / 切速都会断流 → 报错。
+//
+// 判定侧的根本修正见 `lib/decodeHealth.ts` 的 `zeroFrameVerdict`：
+// 「还没解出第一帧」不再等同于「解不了」。真正的解不了，仍由
+// `MEDIA_ERR_SRC_NOT_SUPPORTED` 或 12s 预算耗尽来判定。
 const COMPAT_KEY = 'orighub.compatSrcs'
 
 function readCompatSet(): string[] {
+  // BUG-224：读即清空。旧 key 可能仍存着历史误判条目，继续尊重它等于继续把
+  // 「本机明明能播」的文件钉在慢转码上。
   try {
-    const raw = JSON.parse(localStorage.getItem(COMPAT_KEY) ?? '[]') as unknown
-    return Array.isArray(raw) ? raw.filter((x): x is string => typeof x === 'string') : []
+    localStorage.removeItem(COMPAT_KEY)
   } catch {
-    return []
+    // 隐私模式等场景没有 localStorage，仅本次会话生效，不影响功能
   }
+  return []
 }
 
-function rememberCompatSrc(src: string): void {
-  const set = readCompatSet()
-  if (!set.includes(src)) {
-    // 有界：只记最近 200 条，防止无限增长
-    const next = [src, ...set].slice(0, 200)
-    try {
-      localStorage.setItem(COMPAT_KEY, JSON.stringify(next))
-    } catch {
-      // localStorage 不可用（隐私模式等）：仅本次会话生效，不影响功能
-    }
-  }
+function rememberCompatSrc(_src: string): void {
+  // BUG-224：不再写入。理由见上方。
 }
 
 /**
@@ -130,15 +152,15 @@ function rememberCompatSrc(src: string): void {
  * React 的 characterData 写入本就与之等频（1 次/秒），无需再降到 DOM 层。
  * 进度条（更高频、需要条宽）走 `PlayerProgressBar` 的 ref + 直接写 DOM。
  */
-function useMediaClock(videoRef: React.RefObject<HTMLVideoElement | null>) {
+function useMediaClock(videoRef: React.RefObject<HTMLVideoElement | null>, timeScale = 1) {
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
 
   useEffect(() => {
     const v = videoRef.current
     if (!v) return
-    const onTime = () => setCurrentTime(v.currentTime)
-    const onDur = () => setDuration(Number.isFinite(v.duration) ? v.duration : 0)
+    const onTime = () => setCurrentTime(v.currentTime * timeScale)
+    const onDur = () => setDuration((Number.isFinite(v.duration) ? v.duration : 0) * timeScale)
     v.addEventListener('timeupdate', onTime)
     // seeked：`skip()` 直接写 `v.currentTime` 后即时刷新（不必等下一个 timeupdate）
     v.addEventListener('seeked', onTime)
@@ -153,14 +175,20 @@ function useMediaClock(videoRef: React.RefObject<HTMLVideoElement | null>) {
       v.removeEventListener('loadedmetadata', onDur)
       v.removeEventListener('durationchange', onDur)
     }
-  }, [videoRef])
+  }, [videoRef, timeScale])
 
   return { currentTime, duration }
 }
 
 /** 时间文案叶子（BUG-216）：只订阅播放时钟，不牵动父组件重渲染。 */
-function PlayerTimeText({ videoRef }: { videoRef: React.RefObject<HTMLVideoElement | null> }) {
-  const { currentTime, duration } = useMediaClock(videoRef)
+function PlayerTimeText({
+  videoRef,
+  timeScale = 1,
+}: {
+  videoRef: React.RefObject<HTMLVideoElement | null>
+  timeScale?: number
+}) {
+  const { currentTime, duration } = useMediaClock(videoRef, timeScale)
   return (
     <span className="min-w-[92px] pl-1 text-xs font-medium tabular-nums text-white/90 md:text-sm">
       {fmtDuration(Math.floor(currentTime)) || '0:00'} / {fmtDuration(Math.floor(duration)) || '--:--'}
@@ -189,6 +217,8 @@ interface PlayerProgressBarProps {
    * `write()` 直写更新），但被裁成 1px，不再参与可见的布局/绘制/合成。
    */
   compact?: boolean
+  /** The transformed stream's media clock is compressed by the selected content speed. */
+  timeScale?: number
 }
 
 /**
@@ -203,7 +233,7 @@ interface PlayerProgressBarProps {
  * 即时跟手，**不写 `currentTime`** —— 每次写 `currentTime` 都会中止旧请求再发一个新
  * Range 请求，实测 2s 拖拽 7 发 7 取消）；只有 `pointerup` 才提交唯一一次 `seekToRatio`。
  */
-function PlayerProgressBar({ videoRef, barHover, onBarHoverChange, compact = false }: PlayerProgressBarProps) {
+function PlayerProgressBar({ videoRef, barHover, onBarHoverChange, compact = false, timeScale = 1 }: PlayerProgressBarProps) {
   const { t } = useTranslation()
   const barRef = useRef<HTMLDivElement>(null)
   const playedRef = useRef<HTMLDivElement>(null)
@@ -233,10 +263,10 @@ function PlayerProgressBar({ videoRef, barHover, onBarHoverChange, compact = fal
       // 只要 slider 还在，aria 就必须继续更新（AT 可达是硬约束）。
       if (!v || !slider) return
       const played = playedRef.current
-      const dur = Number.isFinite(v.duration) ? v.duration : 0
+      const dur = (Number.isFinite(v.duration) ? v.duration : 0) * timeScale
       const now = performance.now()
       const ratio = dragRatioRef.current
-      const shown = ratio !== null && dur > 0 ? ratio * dur : v.currentTime
+      const shown = ratio !== null && dur > 0 ? ratio * dur : v.currentTime * timeScale
 
       // 播放段：墙钟节流 + 只在值变化时写（compact 态无可见条面，跳过）
       if (played && (force || now - lastBarMs.current >= BAR_WRITE_MS)) {
@@ -258,7 +288,7 @@ function PlayerProgressBar({ videoRef, barHover, onBarHoverChange, compact = fal
       const buffered = bufferedRef.current
       if (buffered && dur > 0 && (force || now - lastBufferedMs.current >= BUFFERED_WRITE_MS)) {
         const b = v.buffered
-        const bp = b.length > 0 ? Math.max(0, Math.min(100, (b.end(b.length - 1) / dur) * 100)) : 0
+        const bp = b.length > 0 ? Math.max(0, Math.min(100, (b.end(b.length - 1) / (Number.isFinite(v.duration) ? v.duration : 0)) * 100)) : 0
         if (force || Math.abs(bp - lastBufferedPct.current) >= BUFFERED_DELTA_PCT) {
           lastBufferedMs.current = now
           lastBufferedPct.current = bp
@@ -266,7 +296,7 @@ function PlayerProgressBar({ videoRef, barHover, onBarHoverChange, compact = fal
         }
       }
     },
-    [videoRef],
+    [videoRef, timeScale],
   )
 
   useEffect(() => {
@@ -491,19 +521,70 @@ export function VideoPlayer({
   const [showCountdown, setShowCountdown] = useState(false)
   const [fatal, setFatal] = useState(false)
   const [fellBack, setFellBack] = useState(false)
-  /** 当前实际播放源：原始流 → 视频轨解不出来时自动切兼容流（BUG-208）。
-   *  已知解不动的源（localStorage 记忆）直接从兼容流起步，不走 3s 无帧弯路。 */
-  const [activeSrc, setActiveSrc] = useState(() =>
-    compatSrc && compatSrc !== src && readCompatSet().includes(src) ? compatSrc : src,
+  /** Known unsupported sources start from the H.264 compatibility proxy; non-1x starts on its FRC variant. */
+  const [rememberedCompat] = useState(
+    () => Boolean(compatSrc && compatSrc !== src && readCompatSet().includes(src)),
   )
-  const [usingCompat, setUsingCompat] = useState(activeSrc !== src)
-  const compatTriedRef = useRef(activeSrc !== src)
+  const initialFrc = Boolean(compatSrc && compatSrc !== src && playbackRate !== 1)
+  const activeSrcAtMountRef = useRef(
+    initialFrc
+      ? streamUrlAtRate(compatSrc!, playbackRate)
+      : rememberedCompat
+        ? compatSrc!
+        : src,
+  )
+  const [activeSrc, setActiveSrc] = useState(activeSrcAtMountRef.current)
+  const [usingCompat, setUsingCompat] = useState(rememberedCompat)
+  const compatTriedRef = useRef(initialFrc || rememberedCompat)
+  const baseCompatRef = useRef(rememberedCompat)
+  const originalSrcRef = useRef(src)
+  const compatSrcRef = useRef(compatSrc)
+  const hasVideoTrackRef = useRef(hasVideoTrack)
+  useEffect(() => {
+    originalSrcRef.current = src
+    compatSrcRef.current = compatSrc
+    hasVideoTrackRef.current = hasVideoTrack
+  }, [compatSrc, hasVideoTrack, src])
+  /** Rate-transcoded streams use a compressed media timeline; scale back to source-content seconds. */
+  const activeContentSpeedRef = useRef(initialFrc ? playbackRate : 1)
+  const pendingRateSwitchRef = useRef<{ contentTime: number; wasPlaying: boolean } | null>(null)
   /** 已停载（退无可退）：渲染 BUG-207 的诚实失败遮罩 */
   const [halted, setHalted] = useState(false)
 
   /** 视频轨解不出来 / 解码吃力 —— 两类 onError 抓不到的静默失败（BUG-034）。
    *  换源或改倍速都重设基线：倍速变化会改变所需解码吞吐，旧账不能算到新状态上（BUG-053）。 */
   const decode = useDecodeHealth(videoRef, `${activeSrc}|${playbackRate}`)
+
+  // Keep the selected playback rate, but let the server transcode every non-1x rate to
+  // a 30fps stream. Preserve source-content position/play state across the URL switch.
+  useEffect(() => {
+    const compat = compatSrcRef.current
+    const original = originalSrcRef.current
+    if (!compat || !hasVideoTrackRef.current) return
+    if (decode === 'unsupported' && !compatTriedRef.current) return
+    if (baseCompatRef.current && playbackRate === 1 && activeSrc === original) {
+      baseCompatRef.current = false
+    }
+    const rateSrc = playbackRate === 1 ? null : streamUrlAtRate(compat, playbackRate)
+    const targetSrc = rateSrc ?? (baseCompatRef.current ? compat : original)
+    const targetContentSpeed = rateSrc ? playbackRate : 1
+    if (targetSrc === activeSrc) {
+      activeContentSpeedRef.current = targetContentSpeed
+      setUsingCompat(Boolean(baseCompatRef.current && targetSrc === compat))
+      return
+    }
+
+    const v = videoRef.current
+    const wasPlaying = v ? (!v.paused || (Boolean(autoPlay) && v.readyState === 0)) : Boolean(autoPlay)
+    pendingRateSwitchRef.current = {
+      contentTime: v ? v.currentTime * activeContentSpeedRef.current : 0,
+      wasPlaying,
+    }
+    activeContentSpeedRef.current = targetContentSpeed
+    if (rateSrc) compatTriedRef.current = true
+    setActiveSrc(targetSrc)
+    setUsingCompat(Boolean(!rateSrc && baseCompatRef.current && targetSrc === compat))
+  }, [activeSrc, autoPlay, decode, playbackRate])
 
   /**
    * 视频轨判定「解不出来」→ **先试兼容流，退无可退才停载**（BUG-208 接棒 BUG-207）。
@@ -522,6 +603,7 @@ export function VideoPlayer({
     if (!v) return
     if (compatSrc && !compatTriedRef.current) {
       compatTriedRef.current = true
+      baseCompatRef.current = true
       rememberCompatSrc(src)
       setActiveSrc(compatSrc)
       setUsingCompat(true)
@@ -543,8 +625,8 @@ export function VideoPlayer({
     if (!v) return
     v.volume = volume
     v.muted = isMuted
-    v.playbackRate = playbackRate
-  }, [volume, isMuted, playbackRate])
+    v.playbackRate = compatSrc && hasVideoTrack ? 1 : playbackRate
+  }, [volume, isMuted, playbackRate, activeSrc, compatSrc, hasVideoTrack])
 
   useEffect(() => {
     applyPrefs()
@@ -594,8 +676,10 @@ export function VideoPlayer({
     // 倒计时浮层挂着时，任意播放操作视为取消自动连播
     setShowCountdown(false)
     if (v.paused) {
+      if (pendingRateSwitchRef.current) pendingRateSwitchRef.current.wasPlaying = true
       void v.play().catch(() => {})
     } else {
+      if (pendingRateSwitchRef.current) pendingRateSwitchRef.current.wasPlaying = false
       v.pause()
     }
     pokeControls()
@@ -606,7 +690,8 @@ export function VideoPlayer({
       const v = videoRef.current
       if (!v) return
       const d = Number.isFinite(v.duration) ? v.duration : durationRef.current
-      const next = Math.max(0, Math.min(d || 0, v.currentTime + sec))
+      const mediaDelta = sec / activeContentSpeedRef.current
+      const next = Math.max(0, Math.min(d || 0, v.currentTime + mediaDelta))
       // 写 `currentTime` 会触发 `seeked` / `timeupdate`，叶子组件（BUG-216）据此即时刷新条面与时间文案
       v.currentTime = next
       pokeControls()
@@ -663,8 +748,6 @@ export function VideoPlayer({
 
   const changeRate = useCallback(
     (rate: number) => {
-      const v = videoRef.current
-      if (v) v.playbackRate = rate
       setPlaybackRate(rate)
       setSpeedOpen(false)
     },
@@ -676,7 +759,16 @@ export function VideoPlayer({
     const v = videoRef.current
     if (!v) return
     durationRef.current = Number.isFinite(v.duration) ? v.duration : 0
+    const pending = pendingRateSwitchRef.current
+    if (pending) {
+      pendingRateSwitchRef.current = null
+      const speed = activeContentSpeedRef.current
+      const targetTime = speed === 1 ? pending.contentTime : pending.contentTime / speed
+      v.currentTime = Math.max(0, Math.min(durationRef.current, targetTime))
+    }
     applyPrefs()
+    if (pending?.wasPlaying) void v.play().catch(() => {})
+    else if (pending) v.pause()
   }, [applyPrefs])
 
   const onError = useCallback(() => {
@@ -690,9 +782,38 @@ export function VideoPlayer({
       void v.play().catch(() => {})
       return
     }
+    /*
+     * BUG-224：浏览器**明确**说「这个源不支持」时，先去服务端兼容流再判终态。
+     *
+     * 原来这条直接进终态，于是用户看到「浏览器无法解码该格式（如 .mov/QuickTime），
+     * 请在 APP 内用系统播放器打开」——而 APP 里并没有这个入口，服务端那条明明能救的
+     * 兼容流也压根没被试过。实测复现：媒体库条目 395（MPEG-TS 伪装成 .mp4，
+     * ffprobe format_name=mpegts）在 Edge 里 1.5s 内报 `error.code=4`，
+     * 直接 fatal，兼容流一次都没请求。
+     *
+     * 为什么之前没走到兼容流：`decodeHealth` 的 unsupported 判据要求
+     * `readyState >= 2`，而浏览器直接拒绝的源 `readyState` 永远是 0 ——
+     * 「最该被救的那一类」恰好是判据唯一看不见的那一类。
+     * 现在改成由 `onError` 亲自接手：`MEDIA_ERR_SRC_NOT_SUPPORTED` 与零帧判定
+     * 是同一个事实的两个来源（浏览器明说 vs 预算耗尽），必须汇到同一条处置。
+     */
+    if (v.error && v.error.code === MEDIA_ERR_SRC_NOT_SUPPORTED) {
+      const compat = compatSrcRef.current
+      if (compat && !compatTriedRef.current && hasVideoTrackRef.current) {
+        compatTriedRef.current = true
+        baseCompatRef.current = true
+        setFellBack(true)
+        setActiveSrc(compat)
+        setUsingCompat(true)
+        applyPrefs()
+        v.load()
+        void v.play().catch(() => {})
+        return
+      }
+    }
     setFatal(true)
     onFatal?.()
-  }, [fallbackSrc, fellBack, onFatal])
+  }, [fallbackSrc, fellBack, onFatal, applyPrefs])
 
   // ---------- 自动连播 ----------
   const onVideoEnded = useCallback(() => {
@@ -801,7 +922,9 @@ export function VideoPlayer({
         ref={videoRef}
         src={activeSrc}
         poster={poster ?? undefined}
-        autoPlay={autoPlay}
+        autoPlay={autoPlay && (!pendingRateSwitchRef.current || pendingRateSwitchRef.current.wasPlaying)}
+        data-playback-mode={activeContentSpeedRef.current === 1 ? 'native' : 'frc'}
+        data-content-speed={activeContentSpeedRef.current}
         playsInline
         preload="auto"
         /* 必须 h-full w-full + object-contain：max-h/max-w 只能缩小不能放大，
@@ -993,7 +1116,13 @@ export function VideoPlayer({
           保住 `role="slider"` 与 aria-valuemin/valuemax/valuenow（无障碍树仍可达、
           仍由 `write()` 直写更新），但不参与可见的布局 / 绘制 / 合成。 */}
       {!chromeMounted && (
-        <PlayerProgressBar videoRef={videoRef} barHover={barHover} onBarHoverChange={setBarHover} compact />
+        <PlayerProgressBar
+          videoRef={videoRef}
+          barHover={barHover}
+          onBarHoverChange={setBarHover}
+          compact
+          timeScale={activeContentSpeedRef.current}
+        />
       )}
 
       {/* 控件层 */}
@@ -1011,7 +1140,12 @@ export function VideoPlayer({
         <div className="pointer-events-auto relative px-3 pb-3 pt-14 md:px-4 md:pb-4">
           {/* 进度条（BUG-216：状态在叶子组件内，父组件不因 timeupdate 重渲染） */}
           {chromeMounted && (
-            <PlayerProgressBar videoRef={videoRef} barHover={barHover} onBarHoverChange={setBarHover} />
+            <PlayerProgressBar
+              videoRef={videoRef}
+              barHover={barHover}
+              onBarHoverChange={setBarHover}
+              timeScale={activeContentSpeedRef.current}
+            />
           )}
 
           {/* 按钮组 */}
@@ -1102,7 +1236,7 @@ export function VideoPlayer({
               </div>
 
               {/* 时间（BUG-216：状态在叶子组件内） */}
-              <PlayerTimeText videoRef={videoRef} />
+              <PlayerTimeText videoRef={videoRef} timeScale={activeContentSpeedRef.current} />
             </div>
 
             <div className="flex items-center gap-1 md:gap-2">
