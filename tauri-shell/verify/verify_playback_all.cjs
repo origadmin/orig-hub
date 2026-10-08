@@ -19,12 +19,21 @@
  *
  *   [0/7] 环境与自证    探活 5180/19787 · 打印 headful UA（自证非 HeadlessChrome）· 确认落在 TG 视图
  *   [1/7] BUG-212 C1    ${ITEM}@2x 呈现丢帧 > 0 期间「解码吃力」提示**不出现**（误报消除）
- *   [2/7] BUG-212 C2    ${ITEM}@1x 丢帧 0% 且提示**不出现**（干净基线）
- *   [3/7] BUG-212 C3    ${ITEM_HEVC}@4x 呈现丢帧显著时提示**不出现**（误报消除）
- *   [4/7] BUG-212 C4    **运行时注入**「管线饿死」⇒ 提示**必须出现**（反向证伪，证明判据是活的）；自动还原
- *   [5/7] BUG-212 C5    **运行时注入** videoWidth=0 ⇒ BUG-207 停载遮罩出现（回归）；自动还原
- *   [6/7] 缓存卡顿对齐   自造「缓存中」条件 · 60s 窗口 longtask 直方图 + poll-anchored 判定 + rVFC/质量/缓冲
- *   [7/7] 输出总表       落盘 playback_all.json / playback_all.md · 计算退出码
+ *   [2/7] BUG-212 C3    ${ITEM_HEVC}@4x 呈现丢帧显著时提示**不出现**（误报消除）
+ *   [3/7] BUG-212 C4    **运行时注入**「管线饿死」⇒ 提示**必须出现**（反向证伪，证明判据是活的）；自动还原
+ *   [4/7] BUG-212 C5    **运行时注入** videoWidth=0 ⇒ BUG-207 停载遮罩出现（回归）；自动还原
+ *   [5/7] 缓存配对 W1   ${ITEM}@2x **无**缓存任务（基线）· 60s 窗口 longtask/poll/rVFC/>500ms 缺口
+ *   [6/7] 缓存配对 W2   ${ITEM}@2x **有**活跃缓存任务（保活·零间隙·覆盖度自检 ≥10 拍）· 同口径窗口
+ *   [7/7] 输出总表       W1 vs W2 配对判据（提前认下）· 落盘 playback_all.json / playback_all.md · 退出码
+ *
+ * ## 为什么没有 1x 测量（产品决策）
+ *
+ *   产品决策人原话：「不需要检查 1x 正常播放。检查异常倍速。正常的为什么要检查？」——
+ *   607@1x 已有独立实测结论（丢帧 0%、有效倍速 1.0、提示不出现、缓冲领先 30+ 秒），
+ *   不是空白，重跑是重复劳动。故本脚本**不设任何以 1x 正常播放为对象的测量**：
+ *   - 误报消除只测 **异常倍速**（C1 = 2x、C3 = 4x）；
+ *   - 反向证伪（C4/C5）也固定在 **2x** 上做（注入为倍速无关的打桩，effRate 恒 ≈ scale）；
+ *   - 缓存对齐固定在 **2x** 做同倍速配对（W1/W2）。
  *
  * ## 硬约束（与 team-lead 约定）
  *
@@ -32,7 +41,7 @@
  *     headless，故必须显式传）。启动后打印一次 `navigator.userAgent` 自证 headful 并写入产物。
  *   - **所有阶段复用同一 page**；需要重载时用 `page.navigate`/`page.goto`，**绝不新起浏览器**。
  *   - `finally` 关闭浏览器；结束后不残留游离进程（不误杀其它 msedge）。
- *   - **不改 `tauri-shell/src/` 或 `download-engine/`**：阶段 4/5 仅**运行时原型打桩**且**自动还原**，
+ *   - **不改 `tauri-shell/src/` 或 `download-engine/`**：阶段 3/4 仅**运行时原型打桩**且**自动还原**，
  *     并以 `sha256` + `git status --porcelain` 自证工作区未被污染。
  *   - 环境不可达（5180 / 19787 探活失败）⇒ 只做自检、如实报告「未运行」，退出码 2，**不伪造数字**。
  *
@@ -44,8 +53,9 @@
  * ## 环境变量
  *
  *   APP_PORT / APP_URL / TG_URL / OUT / PROBE_ITEM / PROBE_ITEM_HEVC /
- *   CLEAN_WINDOW_SEC / STRAIN_WINDOW_SEC / INJECT_SEC / RECOVER_SEC / STALL_WINDOW_SEC /
- *   STALL_CHAT_ID / STALL_AHEAD / STALL_TICK_MS。浏览器 EDGE_PATH / CHROME_PATH 可覆盖。
+ *   STRAIN_WINDOW_SEC / INJECT_SEC / RECOVER_SEC / STALL_WINDOW_SEC / GAP_CRITICAL_MS /
+ *   MIN_POLLS_COVERAGE / STALL_CHAT_ID / STALL_BATCH_SIZE / STALL_AHEAD / STALL_TICK_MS /
+ *   STALL_RATE。浏览器 EDGE_PATH / CHROME_PATH 可覆盖。
  */
 
 const fs = require('node:fs')
@@ -82,9 +92,7 @@ const ITEM = Number(process.env.PROBE_ITEM || 607)
 /** 高倍速夹具：472 = HEVC 720p 60fps。 */
 const ITEM_HEVC = Number(process.env.PROBE_ITEM_HEVC || 472)
 
-/** 1x 干净窗口（秒）。 */
-const CLEAN_WINDOW_SEC = Number(process.env.CLEAN_WINDOW_SEC || 10)
-/** 倍速窗口（秒）。 */
+/** 倍速窗口（秒）——2x/4x 误报检测。 */
 const STRAIN_WINDOW_SEC = Number(process.env.STRAIN_WINDOW_SEC || 12)
 /** 注入持续时间（秒）——须 ≥3s。 */
 const INJECT_SEC = Number(process.env.INJECT_SEC || 6)
@@ -105,24 +113,47 @@ const SAMPLE_MS = 500
 const FRAME_WAIT_MS = 90000
 const HALT_WAIT_MS = 60000
 
-// ---- 缓存卡顿（阶段 6）----
-/** 「缓存中」测量窗口（秒）——要求 ≥60s。 */
-const STALL_WINDOW_SEC = Number(process.env.STALL_WINDOW_SEC || 60)
+// ---- 缓存卡顿：同倍速配对窗口 W1（无缓存）/ W2（有缓存）----
+/**
+ * **1x 已被产品决策人明确排除**（原话：「不需要检查 1x 正常播放。检查异常倍速。正常的为什么
+ * 要检查？」）：607@1x 已有独立实测结论（丢帧 0%、有效倍速 1.0、提示不出现、缓冲领先 30+ 秒），
+ * 不是空白，重跑是重复劳动。故本脚本**不设任何以 1x 为对象的测量**；缓存对齐也固定在
+ * **2x（异常倍速）**上做。
+ */
+/** 每个配对窗口时长（秒）——要求 ≥60s。 */
+const WINDOW_SEC = Number(process.env.STALL_WINDOW_SEC || 60)
+/** 「卡顿」一等指标阈值：rVFC 间隔 > 该值计为一个「呈现缺口（gap）」。 */
+const GAP_CRITICAL_MS = Number(process.env.GAP_CRITICAL_MS || 500)
 /** 5s 相位直方图：桶宽与桶数（20 × 250ms = 5000ms）。 */
 const BUCKET_MS = 250
 const BUCKET_COUNT = 20
-/** rVFC 间隔 > 该值视为「掉帧缺口」。 */
-const GAP_MS = 50
 /** longtask 落在轮询后 ≤ 该窗内即视为「紧随 5s 节拍」（poll-anchored 判据）。 */
 const ALIGN_WINDOW_MS = 800
+/** W2 覆盖度下限：窗口内轮询拍数必须 ≥ 该值，否则标「未覆盖（coverage insufficient）」。 */
+const MIN_POLLS_COVERAGE = Number(process.env.MIN_POLLS_COVERAGE || 10)
 /** 受控缓存批次所属频道（team-lead 指定）。 */
 const STALL_CHAT_ID = Number(process.env.STALL_CHAT_ID || -1001341930464)
-const BATCH_SIZE = Number(process.env.STALL_BATCH_SIZE || 20)
-/** 目标「领先批次」：running(1) + queued 少于该值即续排，撑满窗口。 */
-const DESIRED_AHEAD = Number(process.env.STALL_AHEAD || 3)
+/**
+ * 续排批次大小（条/批）。取 10（而非 20）：配合「按体积降序取池」让每批都装**大文件**，
+ * 单批下载耗时长 ⇒ 整段窗口内缓存任务持续活跃（覆盖度达标），同时避免一次排队过多。
+ */
+const BATCH_SIZE = Number(process.env.STALL_BATCH_SIZE || 10)
+/** 目标「领先批次」：running(1) + queued 少于该值即续排，撑满窗口（零间隙保活）。 */
+const DESIRED_AHEAD = Number(process.env.STALL_AHEAD || 4)
 const MIN_BYTES = 5 * 1024 * 1024
-const MAX_BYTES = 40 * 1024 * 1024
-const KEEPALIVE_TICK_MS = Number(process.env.STALL_TICK_MS || 2000)
+/**
+ * 续排取池的体积上限 = 100MB（而非 40MB）。
+ *
+ * 为什么放宽：本机实测下载速率 ≈ 14MB/s；若池只含 5–40MB 小文件，一批 20 条约 145MB，
+ * 仅 ~10s 就下完 ⇒ 60s 窗口才过 1/4 任务即终态、面板 5s 轮询停摆（上次实测覆盖度不达标）。
+ * 放宽到 100MB 后，可用池从 48 条 → 93 条（≈3.5GB），且**按体积降序**取池 ⇒ 首批即装
+ * 最大的 ~100MB 文件，单批下载 ≳60s，足以撑满窗口。BATCH1 不受影响（仍为 team-lead 指定）。
+ */
+const MAX_BYTES = Number(process.env.STALL_MAX_BYTES || 100 * 1024 * 1024)
+/** 保活 tick 周期（毫秒）——越短越能杜绝「任务终态 → 面板轮询停摆」的空档。 */
+const KEEPALIVE_TICK_MS = Number(process.env.STALL_TICK_MS || 1000)
+/** 配对窗口所用的异常倍速（缓存对齐实验固定 2x）。 */
+const STALL_RATE = Number(process.env.STALL_RATE || 2)
 
 /**
  * team-lead 指定的受控首批（精确使用，不增不减）：
@@ -136,11 +167,11 @@ const BATCH1 = [
 /** 每个阶段的硬超时（毫秒）——超时即如实记 FAIL 并继续，绝不卡死。 */
 const STAGE_TIMEOUT = {
   C1: 100000,
-  C2: 100000,
   C3: 130000,
   C4: 100000,
   C5: 130000,
-  STALL: 180000,
+  W1: 110000,
+  W2: 180000,
 }
 
 /** 注入自证要监控的源文件（不得改动）。 */
@@ -607,9 +638,9 @@ async function installNoticeProbe(page, markers) {
  */
 async function installStallProbe(page) {
   await page.evaluate(() => {
-    if (window.__stall && window.__stall.__v === 1) return true
+    if (window.__stall && window.__stall.__v === 2) return true
     const S = {
-      __v: 1,
+      __v: 2,
       lt: [],
       ltErr: null,
       obs: null,
@@ -699,6 +730,69 @@ async function installStallProbe(page) {
           frames: q ? q.totalVideoFrames : null,
           dropped: q ? q.droppedVideoFrames : null,
         }
+      },
+
+      /*
+       * 250ms 逐拍轨迹 + waiting/stalled 事件计数。用途：一旦出现 >GAP_CRITICAL_MS 的
+       * rVFC 呈现缺口（用户/历史实测在 607@2x 上抓到过 2066ms 空档），就能用缺口邻域的
+       * currentTime/playbackRate/丢帧增量/buffered 领先/readyState/waiting-stalled 直接判定
+       * 是**呈现侧**（时间轴照走、无 waiting）还是**投递侧**（缓冲被抽干、waiting/stalled 频发）。
+       */
+      samples: [],
+      sampleId: null,
+      ev: { waiting: 0, stalled: 0, playing: 0, ratechange: 0, seeked: 0 },
+      _sampleBound: null,
+      _sampleList: null,
+      startSamples(v) {
+        this.samples = []
+        this.ev = { waiting: 0, stalled: 0, playing: 0, ratechange: 0, seeked: 0 }
+        this.unbindSampleEvents()
+        if (v) {
+          const self = this
+          this._sampleList = ['waiting', 'stalled', 'playing', 'ratechange', 'seeked'].map((n) => {
+            const f = () => {
+              self.ev[n] = (self.ev[n] || 0) + 1
+            }
+            v.addEventListener(n, f)
+            return [n, f]
+          })
+          this._sampleBound = v
+        }
+        if (this.sampleId != null) return
+        this.sampleId = window.setInterval(() => {
+          const el = document.querySelector('[data-testid="media-viewer"] video')
+          if (!el) return
+          const q = el.getVideoPlaybackQuality ? el.getVideoPlaybackQuality() : null
+          const b = el.buffered
+          let ahead = null
+          if (b && b.length) ahead = b.end(b.length - 1) - el.currentTime
+          this.samples.push({
+            t: performance.now(),
+            ct: Number(el.currentTime.toFixed(3)),
+            rate: el.playbackRate,
+            paused: el.paused,
+            seeking: el.seeking,
+            rs: el.readyState,
+            dropped: q ? q.droppedVideoFrames : null,
+            frames: q ? q.totalVideoFrames : null,
+            ahead: ahead == null ? null : Number(ahead.toFixed(2)),
+          })
+        }, 250)
+      },
+      unbindSampleEvents() {
+        if (this._sampleBound && this._sampleList) {
+          for (const [n, f] of this._sampleList) this._sampleBound.removeEventListener(n, f)
+        }
+        this._sampleBound = null
+        this._sampleList = null
+      },
+      stopSamples() {
+        if (this.sampleId != null) {
+          window.clearInterval(this.sampleId)
+          this.sampleId = null
+        }
+        this.unbindSampleEvents()
+        return { samples: this.samples.slice(), ev: this.ev }
       },
     }
     S.install()
@@ -869,11 +963,14 @@ async function setRateDirect(page, rate) {
 }
 
 /**
- * 保证播放器在场且以 **1x** 播放：viewer 不在（或被关闭）则重开条目；强制
- * `playbackRate=1` + muted + play。
+ * 保证播放器在场并以指定倍速播放：viewer 不在（或被关闭）则重开条目；强制
+ * `playbackRate=rate` + muted + play。
+ * @param {object} page CDP Page
+ * @param {number} item 条目 id
+ * @param {number} [rate] 目标倍速（默认 STALL_RATE=2；本脚本不测 1x 正常播放）
  * @returns {Promise<{wasPresent:boolean, present:boolean, rate:number|null}>}
  */
-async function ensurePlaying(page, item) {
+async function ensurePlaying(page, item, rate = STALL_RATE) {
   const wasPresent = await page.evaluate(
     () => !!document.querySelector('[data-testid="media-viewer"] video'),
   )
@@ -881,14 +978,14 @@ async function ensurePlaying(page, item) {
     await openItem(page, item)
     await waitFramed(page)
   }
-  const info = await page.evaluate(() => {
+  const info = await page.evaluate((r) => {
     const v = document.querySelector('[data-testid="media-viewer"] video')
     if (!v) return { present: false, rate: null }
-    v.playbackRate = 1
+    v.playbackRate = r
     v.muted = true
     void v.play().catch(() => {})
     return { present: true, rate: v.playbackRate }
-  })
+  }, rate)
   return { wasPresent, present: info.present, rate: info.rate }
 }
 
@@ -1234,29 +1331,76 @@ function pollAnchoredAnalysis(lt, polls, alignWindowMs = ALIGN_WINDOW_MS) {
   return { pollCount: ts.length, matched, within, withinRatio: ratio, alignWindowMs, delays }
 }
 
-/** 计算 rVFC 间隔序列，并把每个 longtask 与「其覆盖区间内的 rVFC 缺口（>GAP_MS）」关联。 */
-function frameGapAnalysis(lt, rvfc) {
+/**
+ * rVFC 间隔 → 「卡顿」一等指标：>thresholdMs 的**呈现缺口**（个数 + 最长 + 逐缺口邻域轨迹）。
+ * 同时把每个 longtask 与「其覆盖区间内的缺口」关联（ltWithGap）。
+ *
+ * 为什么要逐缺口留证：历史独立实测曾在 607@2x 上抓到 2066ms 呈现空档（当时缓冲还有 26s）。
+ * 一旦复现，缺口邻域的 `ct/rate/dropped/ahead/rs/paused` 就能直接判定是**呈现侧**
+ * （时间轴照走、无 waiting）还是**投递侧**（缓冲被抽干、waiting/stalled 频发）。
+ * @param {Array<number>} rvfc rVFC 时间戳（performance.now）
+ * @param {Array<object>} samples 250ms 逐拍轨迹
+ * @param {Array<object>} lt longtask 列表
+ * @param {number} thresholdMs 缺口阈值（默认 GAP_CRITICAL_MS）
+ * @returns {object}
+ */
+function gapAnalysis(rvfc, samples, lt, thresholdMs = GAP_CRITICAL_MS) {
   const sorted = rvfc.slice().sort((a, b) => a - b)
   const intervals = []
   for (let i = 1; i < sorted.length; i++) intervals.push(sorted[i] - sorted[i - 1])
   const maxGap = intervals.length ? Math.max(...intervals) : 0
-  const gapCount = intervals.filter((g) => g > GAP_MS).length
+  const gaps = []
+  for (let i = 1; i < sorted.length; i++) {
+    const d = sorted[i] - sorted[i - 1]
+    if (d > thresholdMs) {
+      const from = sorted[i - 1]
+      const to = sorted[i]
+      const trace = (samples || [])
+        .filter((s) => s.t >= from - 300 && s.t <= to + 300)
+        .map((s) => ({
+          dtMs: Number((s.t - from).toFixed(0)),
+          ct: s.ct,
+          rate: s.rate,
+          dropped: s.dropped,
+          ahead: s.ahead,
+          rs: s.rs,
+          paused: s.paused,
+        }))
+      gaps.push({ from: Number(from.toFixed(1)), to: Number(to.toFixed(1)), durMs: Number(d.toFixed(1)), trace })
+    }
+  }
+  const sortedIntervals = intervals.slice().sort((a, b) => a - b)
+  const p95 =
+    sortedIntervals.length
+      ? sortedIntervals[Math.min(sortedIntervals.length - 1, Math.round(0.95 * (sortedIntervals.length - 1)))]
+      : null
   let ltWithGap = 0
-  for (const e of lt) {
+  for (const e of lt || []) {
     const lo = e.start
-    const hi = e.start + e.dur + GAP_MS
+    const hi = e.start + e.dur + thresholdMs
     let hit = false
     for (let i = 1; i < sorted.length; i++) {
       const a = sorted[i - 1]
       const b = sorted[i]
-      if (b >= lo && a <= hi && b - a > GAP_MS) {
+      if (b >= lo && a <= hi && b - a > thresholdMs) {
         hit = true
         break
       }
     }
     if (hit) ltWithGap += 1
   }
-  return { intervals, maxGap: Number(maxGap.toFixed(1)), gapCount, ltWithGap, ltTotal: lt.length }
+  return {
+    intervals,
+    maxGapMs: Number(maxGap.toFixed(1)),
+    meanGapMs: intervals.length
+      ? Number((intervals.reduce((a, b) => a + b, 0) / intervals.length).toFixed(2))
+      : null,
+    p95GapMs: p95 == null ? null : Number(p95.toFixed(1)),
+    gapCount: gaps.length,
+    gaps: gaps.slice(0, 20),
+    ltWithGap,
+    ltTotal: (lt || []).length,
+  }
 }
 
 /** 计算「呈现帧率 / 丢帧%」，来自 getVideoPlaybackQuality 前后差。 */
@@ -1293,19 +1437,25 @@ async function probeDaemonDownloads(page) {
 function summarizeStallWindow(w) {
   const lt = w.lt || []
   const polls = w.polls || []
+  const samples = w.samples || []
   const hist = phaseHistogram(lt)
   const cadence = pollCadence(polls)
   const anchored = pollAnchoredAnalysis(lt, polls, ALIGN_WINDOW_MS)
-  const gap = frameGapAnalysis(lt, w.rvfc || [])
+  const gap = gapAnalysis(w.rvfc || [], samples, lt, GAP_CRITICAL_MS)
   const q = qualityStats(w.snap0, w.snap1, w.wallSecs)
   const maxLt = lt.length ? Number(Math.max(...lt.map((e) => e.dur)).toFixed(1)) : 0
-  const aheadMin =
-    w.snap1 && w.snap1.hasVideo && typeof w.snap1.ahead === 'number'
+  const aheadVals = samples.map((s) => s.ahead).filter((a) => a != null)
+  const aheadMin = aheadVals.length
+    ? Number(Math.min(...aheadVals).toFixed(2))
+    : w.snap1 && w.snap1.hasVideo && typeof w.snap1.ahead === 'number'
       ? Number(w.snap1.ahead.toFixed(2))
       : null
   const anchoredAligned =
     anchored.pollCount >= 2 && anchored.withinRatio != null && anchored.withinRatio >= 0.5
+  const coverage = w.coverage || null
+  const covered = coverage ? coverage.ok : true
   return {
+    mode: w.mode || 'unknown',
     wallSecs: w.wallSecs,
     rvfcSupported: w.rvfcOk,
     longtaskCount: lt.length,
@@ -1325,14 +1475,19 @@ function summarizeStallWindow(w) {
     alignedDelays: anchored.delays,
     alignedWith5s: hist.clustered || anchoredAligned,
     rvfcFrames: (w.rvfc || []).length,
-    rvfcMaxGapMs: gap.maxGap,
+    rvfcMaxGapMs: gap.maxGapMs,
+    rvfcMeanGapMs: gap.meanGapMs,
+    rvfcP95GapMs: gap.p95GapMs,
     rvfcGapCount: gap.gapCount,
+    rvfcGaps: gap.gaps,
     ltWithGap: gap.ltWithGap,
     ltTotal: gap.ltTotal,
     droppedDelta: q.droppedDelta,
     droppedPct: q.droppedPct,
     presentedFps: q.presentedFps,
     bufferedAheadMin: aheadMin,
+    waitingCount: w.ev ? w.ev.waiting : null,
+    stalledCount: w.ev ? w.ev.stalled : null,
     path: w.snap1 && w.snap1.path ? w.snap1.path : 'n/a',
     currentSrc: w.snap1 ? w.snap1.src || '' : '',
     net: w.netAnalysis || null,
@@ -1341,6 +1496,8 @@ function summarizeStallWindow(w) {
     endPlaybackRate: w.snap1 && w.snap1.hasVideo ? w.snap1.playbackRate : null,
     endVisibility: w.snap1 && w.snap1.hasVideo ? w.snap1.visibilityState : null,
     endCurrentTime: w.snap1 && w.snap1.hasVideo ? Number(w.snap1.currentTime.toFixed(2)) : null,
+    coverage,
+    covered,
     ltErr: w.ltErr,
   }
 }
@@ -1349,12 +1506,18 @@ function summarizeStallWindow(w) {
 // 缓存任务保活驱动（吸收原 _b_keepalive.cjs 的逻辑）
 // ---------------------------------------------------------------------------
 
-/** 从 `GET /api/tg/stored` 拉一批 5–40MB、未缓存、未用过的 id。 */
+/**
+ * 从 `GET /api/tg/stored` 拉一批 5–MAX_BYTES、未缓存、未用过的 id，**按体积降序**返回。
+ *
+ * 降序的意义：续排时优先装最大的文件 ⇒ 单批下载耗时长 ⇒ 整段 60s 窗口内缓存任务持续活跃，
+ * 面板 5s 轮询不因「任务秒变终态」而停摆（覆盖度达标）。
+ */
 async function loadPool(usedIds) {
   const { json } = await httpJson('GET', `${TG}/api/tg/stored?type=video&downloaded=0&limit=300`)
   const items = (json && json.items) || []
   return items
     .filter((i) => i && typeof i.size === 'number' && i.size >= MIN_BYTES && i.size <= MAX_BYTES)
+    .sort((a, b) => (b.size || 0) - (a.size || 0))
     .map((i) => i.messageId)
     .filter((id) => !usedIds.has(id))
 }
@@ -1371,6 +1534,7 @@ function createCacheKeepalive() {
   let batch1Used = false
   let pool = null
   let poolCursor = 0
+  let last = { status: null, ahead: 0 }
 
   async function tick() {
     const { status, json } = await httpJson('GET', `${TG}/api/tg/cache/tasks`)
@@ -1378,12 +1542,8 @@ function createCacheKeepalive() {
     const queued = (json && json.queued) || []
     const running = task && (task.status === 'running' || task.status === 'queued')
     const ahead = (running ? 1 : 0) + queued.length
-    timeline.push({
-      t: Date.now(),
-      http: status,
-      status: task ? task.status : 'none',
-      ahead,
-    })
+    last = { status: task ? task.status : 'none', ahead }
+    timeline.push({ t: Date.now(), http: status, status: last.status, ahead })
     if (ahead >= DESIRED_AHEAD) return
     let ids
     if (!batch1Used) {
@@ -1415,11 +1575,23 @@ function createCacheKeepalive() {
       taskIds.push(res.json.id)
       timeline.push({ t: Date.now(), action: 'ENQUEUE', id: res.json.id, n: ids.length, status: res.json.status })
     } else {
-      timeline.push({ t: Date.now(), action: 'ENQUEUE_FAILED', http: res.status })
+      timeline.push({ t: Date.now(), action: 'ENQUEUE_FAILED', http: res.status, body: res.json })
     }
   }
 
-  return { tick, taskIds, timeline }
+  /**
+   * 预排队：连续 tick 直到「领先批次数」达到目标（或池耗尽）。
+   * 用于**面板重挂载前先垫满队列** —— 否则任务可能瞬间终态、面板轮询停摆、窗口失去覆盖。
+   */
+  async function prefill(maxRounds = 12) {
+    for (let i = 0; i < maxRounds; i++) {
+      await tick()
+      if (last.ahead >= DESIRED_AHEAD) break
+    }
+    return last
+  }
+
+  return { tick, prefill, taskIds, timeline, status: () => last }
 }
 
 /**
@@ -1432,7 +1604,7 @@ function createCacheKeepalive() {
  * @param {object} keepalive createCacheKeepalive 的返回
  * @returns {Promise<object>}
  */
-async function measureStallWindow(page, seconds, collector, playingItem, keepalive) {
+async function measureStallWindow(page, seconds, collector, playingItem, keepalive, mode) {
   if (collector) collector.reset()
   const started = await page.evaluate(() => {
     const S = window.__stall
@@ -1442,16 +1614,19 @@ async function measureStallWindow(page, seconds, collector, playingItem, keepali
     S.polls.length = 0
     const v = document.querySelector('[data-testid="media-viewer"] video')
     const rvfcOk = S.startRvfc(v)
+    S.startSamples(v)
     return { ok: true, rvfcOk, snap0: S.snapshot(), ltErr: S.ltErr }
   })
 
   const t0 = Date.now()
   const deadline = t0 + seconds * 1000
   while (Date.now() < deadline) {
-    try {
-      await keepalive.tick()
-    } catch (_e) {
-      /* 单次 tick 失败不影响窗口 */
+    if (keepalive) {
+      try {
+        await keepalive.tick()
+      } catch (_e) {
+        /* 单次 tick 失败不影响窗口 */
+      }
     }
     const remaining = deadline - Date.now()
     if (remaining > 0) await delay(Math.min(KEEPALIVE_TICK_MS, remaining))
@@ -1462,10 +1637,20 @@ async function measureStallWindow(page, seconds, collector, playingItem, keepali
     const S = window.__stall
     const v = document.querySelector('[data-testid="media-viewer"] video')
     const rvfc = S.stopRvfc(v)
-    return { lt: S.lt.slice(), rvfc, polls: S.polls.slice(), snap1: S.snapshot(), ltErr: S.ltErr }
+    const samp = S.stopSamples()
+    return {
+      lt: S.lt.slice(),
+      rvfc,
+      polls: S.polls.slice(),
+      snap1: S.snapshot(),
+      samples: samp.samples,
+      ev: samp.ev,
+      ltErr: S.ltErr,
+    }
   })
 
   const w = {
+    mode: mode || (keepalive ? 'with-cache' : 'no-cache'),
     wallSecs: Number(wallSecs.toFixed(2)),
     rvfcOk: started.rvfcOk,
     ltErr: out.ltErr || started.ltErr || null,
@@ -1474,6 +1659,8 @@ async function measureStallWindow(page, seconds, collector, playingItem, keepali
     lt: out.lt,
     rvfc: out.rvfc,
     polls: out.polls || [],
+    samples: out.samples || [],
+    ev: out.ev || null,
   }
   if (collector) {
     const net = collector.snapshot()
@@ -1671,28 +1858,12 @@ async function stageC1(page) {
   }
 }
 
-/** [2/7] BUG-212 C2：${ITEM}@1x 干净。 */
-async function stageC2(page) {
-  await closeViewer(page)
-  await openItem(page, ITEM)
-  const framed = await waitFramed(page)
-  await setRateDirect(page, 1)
-  await delay(WARMUP_MS)
-  const w = await runNoticeWindow(page, CLEAN_WINDOW_SEC)
-  const s = summarizeNoticeWindow(w)
-  results.phases.C2 = s
-  await shot(page, `C2_item${ITEM}_1x.png`)
+/*
+ * 注：原「C2 = ${ITEM}@1x 干净基线」阶段已**整段删除**（产品决策：不检查 1x 正常播放）。
+ * 1x 的健康结论已有独立实测（见文件头「为什么没有 1x 测量」），此处不再重复测量。
+ */
 
-  const cleanNoNotice = !s.noticePresent
-  const zeroDrop = s.droppedDelta === 0
-  const verdict = framed && cleanNoNotice && zeroDrop ? 'PASS' : 'FAIL'
-  const detail = `丢帧 ${s.droppedPct}%（Δ${s.droppedDelta}）提示${s.noticePresent ? '出现' : '未出现'}`
-  check(`C2 ${ITEM}@1x 提示不出现（干净基线）`, framed && cleanNoNotice, detail)
-  check(`C2 ${ITEM}@1x 丢帧为 0%`, zeroDrop, `droppedDelta=${s.droppedDelta}`)
-  return { verdict, detail, metrics: { framed, droppedPct: s.droppedPct, droppedDelta: s.droppedDelta, noticePresent: s.noticePresent } }
-}
-
-/** [3/7] BUG-212 C3：${ITEM_HEVC}@4x 不误报。 */
+/** [2/7] BUG-212 C3：${ITEM_HEVC}@4x 不误报。 */
 async function stageC3(page) {
   await closeViewer(page)
   await openItem(page, ITEM_HEVC)
@@ -1731,12 +1902,13 @@ async function stageC3(page) {
   }
 }
 
-/** [4/7] BUG-212 C4：反向证伪（注入「管线饿死」⇒ 提示必须出现；还原后撤销）。 */
+/** [3/7] BUG-212 C4：反向证伪（注入「管线饿死」⇒ 提示必须出现；还原后撤销）。 */
 async function stageC4(page) {
   await closeViewer(page)
   await openItem(page, ITEM)
   await waitFramed(page)
-  await setRateDirect(page, 1)
+  // 固定在异常倍速 2x 上做（注入为倍速无关打桩，effRate 恒 ≈ STARVE_SCALE；不测 1x）。
+  await setRateDirect(page, STALL_RATE)
   await delay(WARMUP_MS)
 
   const pre = await domState(page)
@@ -1802,12 +1974,13 @@ async function stageC4(page) {
   }
 }
 
-/** [5/7] BUG-212 C5：unsupported 回归（注入 videoWidth=0 ⇒ 停载遮罩出现；还原）。 */
+/** [4/7] BUG-212 C5：unsupported 回归（注入 videoWidth=0 ⇒ 停载遮罩出现；还原）。 */
 async function stageC5(page) {
   await closeViewer(page)
   await openItem(page, ITEM)
   await waitFramed(page)
-  await setRateDirect(page, 1)
+  // 固定在异常倍速 2x 上做（videoWidth 打桩与倍速无关；不测 1x）。
+  await setRateDirect(page, STALL_RATE)
   await delay(600)
 
   const pre = await domState(page)
@@ -1841,50 +2014,194 @@ async function stageC5(page) {
 }
 
 /**
- * [6/7] 缓存卡顿与 5s 节拍对齐。
- * 自造「缓存中」条件（POST BATCH1 + keepalive 续排），60s 窗口观测 longtask/poll/rVFC/质量/缓冲。
+ * 安装缓存卡顿探针并做前置自检（W1/W2 共用；幂等）。
+ * @param {object} page CDP Page
+ * @param {boolean} withDaemonCheck 是否顺带做 daemon 混杂控制断言（仅 W2 需要）
+ * @returns {Promise<{ltSupported:boolean}>}
  */
-async function stageStall(page, collector) {
+/** longtask 可用性只断言一次（W1 首次安装探针时），避免 W2 重复一条同名列。 */
+let ltCheckEmitted = false
+
+async function prepStallProbe(page, withDaemonCheck) {
   // 留在 TG 视图（切到媒体库会卸载 TgPanel，5s 轮询消失）
   const tgNow = await page.evaluate(() => !!document.querySelector('[data-testid="tg-panel-root"]'))
   if (!tgNow) {
     const re = await enterTgPanel(page)
     console.log(`   · 重新进入 TG 面板：ok=${re.ok}`)
   }
-
   // 安装 longtask/rVFC/fetch 打桩探针（须在入队前装好，才能记录 5s 轮询真实刻度）
   await installStallProbe(page)
-  const ltSupported = await page.evaluate(() => !window.__stall.ltErr)
-  check('PerformanceObserver longtask 可用', ltSupported, String(await page.evaluate(() => window.__stall.ltErr)))
+  const ltErr = await page.evaluate(() => window.__stall.ltErr)
+  const ltSupported = !ltErr
+  if (!ltCheckEmitted) {
+    ltCheckEmitted = true
+    check('PerformanceObserver longtask 可用', ltSupported, String(ltErr))
+  }
+  if (withDaemonCheck) {
+    // 混杂控制：纯 TG 缓存要求 daemon 下载活跃数为 0（否则卡顿可能来自 daemon 而非缓存轮询）
+    const daemonAtStart = await probeDaemonDownloads(page)
+    console.log(`   · daemon 下载（混杂控制）：active=${daemonAtStart.active}`)
+    check('纯 TG 缓存前提：无活跃 daemon 下载', daemonAtStart.active === 0, `active=${daemonAtStart.active}`)
+  }
+  return { ltSupported }
+}
 
-  // 混杂控制：纯 TG 缓存要求 daemon 下载活跃数为 0
-  const daemonAtStart = await probeDaemonDownloads(page)
-  console.log(`   · daemon 下载（混杂控制）：active=${daemonAtStart.active}`)
-  check('纯 TG 缓存前提：无活跃 daemon 下载', daemonAtStart.active === 0, `active=${daemonAtStart.active}`)
+/**
+ * W2 覆盖度自检：窗口内 5s 轮询拍数 ≥ MIN_POLLS_COVERAGE，且窗口**起止两端**缓存任务均非终态。
+ * 任一不满足 ⇒ 标「未覆盖（coverage insufficient）」，**绝不据此下结论**。
+ * @param {object} s summarizeStallWindow 结果
+ * @param {object|null} taskStart 窗口起端 `GET /api/tg/cache/tasks` 的 task
+ * @param {object|null} taskEnd 窗口末端同接口的 task
+ * @returns {object}
+ */
+function w2Coverage(s, taskStart, taskEnd) {
+  const isActive = (t) => !!t && (t.status === 'running' || t.status === 'queued')
+  const polls = s.pollCount
+  const pollsOk = polls >= MIN_POLLS_COVERAGE
+  const startOk = isActive(taskStart)
+  const endOk = isActive(taskEnd)
+  const ok = pollsOk && startOk && endOk
+  const reasons = []
+  if (!pollsOk) reasons.push(`轮询 ${polls} < ${MIN_POLLS_COVERAGE}`)
+  if (!startOk) reasons.push(`窗口起端任务非活跃（${taskStart ? taskStart.status : 'none'}）`)
+  if (!endOk) reasons.push(`窗口末端任务非活跃（${taskEnd ? taskEnd.status : 'none'}）`)
+  return {
+    polls,
+    minPolls: MIN_POLLS_COVERAGE,
+    pollsOk,
+    startOk,
+    endOk,
+    ok,
+    reasons,
+    startStatus: taskStart ? taskStart.status : null,
+    endStatus: taskEnd ? taskEnd.status : null,
+  }
+}
+
+/**
+ * W1 vs W2 配对判据（**提前认下，照此判**）：
+ *   - 同倍速 2x、同一夹具 ${ITEM}；**唯一变量** = 窗口内是否有活跃缓存任务（⇒ TgPanel 5s 轮询）。
+ *   - 一等指标：>GAP_CRITICAL_MS 的 rVFC **呈现缺口**个数；辅以丢帧%。
+ *   - W2 缺口/丢帧显著劣于 W1 ⇒ 缓存是卡顿主因（FAIL）。
+ *   - 两者无显著差异 ⇒ 缓存不是卡顿主因（PASS）。
+ * 「显著劣」的判定（避免噪声）：缺口数 Δ ≥ 2，或 W1 为 0 而 W2 ≥ 1，或丢帧% Δ ≥ 3。
+ * @param {object} w1 summarizeStallWindow(W1)
+ * @param {object} w2 summarizeStallWindow(W2)
+ * @returns {object}
+ */
+function compareWindows(w1, w2) {
+  const gapDelta = (w2.rvfcGapCount || 0) - (w1.rvfcGapCount || 0)
+  const dropDelta =
+    w1.droppedPct != null && w2.droppedPct != null
+      ? Number((w2.droppedPct - w1.droppedPct).toFixed(1))
+      : null
+  const ltDelta = (w2.longtaskCount || 0) - (w1.longtaskCount || 0)
+  const w2Worse =
+    gapDelta >= 2 ||
+    ((w2.rvfcGapCount || 0) >= 1 && (w1.rvfcGapCount || 0) === 0) ||
+    (dropDelta != null && dropDelta >= 3)
+  const summary =
+    `>${GAP_CRITICAL_MS}ms 缺口 W1=${w1.rvfcGapCount}/W2=${w2.rvfcGapCount}（Δ${gapDelta}，最长 W1=${w1.rvfcMaxGapMs}ms/W2=${w2.rvfcMaxGapMs}ms）；` +
+    `丢帧 W1=${w1.droppedPct}%/W2=${w2.droppedPct}%（Δ${dropDelta == null ? 'n/a' : dropDelta + '%'}）；` +
+    `longtask W1=${w1.longtaskCount}/W2=${w2.longtaskCount}（Δ${ltDelta}）`
+  return { gapDelta, dropDelta, ltDelta, w2Worse, verdict: w2Worse ? 'FAIL' : 'PASS', summary }
+}
+
+/** 打一行统一的窗口摘要（W1/W2 共用）。 */
+function logWindow(tag, s) {
+  console.log(
+    `   · ${tag} 窗口：longtask ${s.longtaskCount}（max ${s.longtaskMaxMs}ms）| 轮询 ${s.pollCount}（中位 ${s.pollMedianMs}ms）|` +
+      ` >${GAP_CRITICAL_MS}ms 缺口 ${s.rvfcGapCount}（最长 ${s.rvfcMaxGapMs}ms）|` +
+      ` 紧随轮询≤${ALIGN_WINDOW_MS}ms ${s.alignedWithin}/${s.longtaskCount}（ratio ${s.alignedRatio}）|` +
+      ` 相位聚集=${s.phaseClustered} | 丢帧 ${s.droppedPct}% | bufferedMin ${s.bufferedAheadMin}s | path ${s.path}`,
+  )
+}
+
+/**
+ * [5/7] 缓存配对 **W1（基线）**：${ITEM}@2x，**无**缓存任务。
+ *
+ * 唯一变量对照的基准窗口：与 W2 同夹具同倍速，但没有活跃缓存任务 ⇒ TgPanel 5s 轮询不跑。
+ * 采集 longtask / rVFC（含 >500ms 呈现缺口 + 逐缺口轨迹）/ 质量 / 缓冲 / 网络。
+ */
+async function stageW1(page, collector) {
+  await prepStallProbe(page, false)
+
+  await closeViewer(page)
+  await openItem(page, ITEM)
+  const framed = await waitFramed(page)
+  const set2 = await setRateDirect(page, STALL_RATE)
+  await delay(WARMUP_MS)
+  const play = await ensurePlaying(page, ITEM, STALL_RATE)
+  console.log(`   · W1 播放器：framed=${framed} present=${play.present} rate=${play.rate}`)
+  check(`W1 ${ITEM}@${STALL_RATE}x 打开并出帧`, framed && play.present, `framed=${framed} rate=${play.rate}`)
+  check(`W1 倍速生效（playbackRate=${STALL_RATE}）`, set2.ok === true, `actual=${set2.actual}`)
+
+  // 无缓存任务（keepalive=null）——基线窗口
+  const stopFront = keepFront(page)
+  const w = await measureStallWindow(page, WINDOW_SEC, collector, ITEM, null, 'no-cache')
+  stopFront()
+  const s = summarizeStallWindow(w)
+  results.phases.W1 = s
+  await shot(page, `W1_item${ITEM}_${STALL_RATE}x_nocache.png`)
+  logWindow('W1', s)
+
+  const pass = s.playbackValid && framed
+  check('W1 播放有效（窗口末端视频在场且未结束）', pass, `valid=${s.playbackValid} framed=${framed}`)
+  return {
+    verdict: pass ? 'PASS' : 'FAIL',
+    detail: `基线（无缓存）：缺口 ${s.rvfcGapCount}（最长 ${s.rvfcMaxGapMs}ms），丢帧 ${s.droppedPct}%，longtask ${s.longtaskCount}，轮询 ${s.pollCount}`,
+    metrics: {
+      longtaskCount: s.longtaskCount,
+      longtaskMaxMs: s.longtaskMaxMs,
+      pollCount: s.pollCount,
+      pollMedianMs: s.pollMedianMs,
+      rvfcGapCount: s.rvfcGapCount,
+      rvfcMaxGapMs: s.rvfcMaxGapMs,
+      rvfcP95GapMs: s.rvfcP95GapMs,
+      droppedPct: s.droppedPct,
+      presentedFps: s.presentedFps,
+      bufferedAheadMin: s.bufferedAheadMin,
+      netVerdict: s.netVerdict,
+    },
+  }
+}
+
+/**
+ * [6/7] 缓存配对 **W2（处理）**：${ITEM}@2x，**有**活跃缓存任务（保活 · 零间隙 · 覆盖度自检）。
+ *
+ * 自造「缓存中」条件（POST BATCH1 + keepalive 续排），重挂载 TgPanel 启动 5s 轮询，同口径 60s
+ * 窗口观测，并与 W1 做**同倍速配对**判定（判据提前认下，见 compareWindows）。
+ * 覆盖度不达标（轮询 < MIN_POLLS_COVERAGE 或起止任务非活跃）⇒ 标「未覆盖」，不下结论。
+ */
+async function stageW2(page, collector) {
+  await prepStallProbe(page, true)
 
   // 入队前缓存占用
   const statsBefore = await httpJson('GET', `${TG}/api/cache/stats`)
   results.cacheStats.before = statsBefore.json || null
   console.log(`   · 缓存占用（前）：${JSON.stringify(statsBefore.json)}`)
 
-  // ---- 自造「缓存中」：入队 BATCH1，立即断言非终态；若秒变 done 则续排直到撑满窗口 ----
+  // ---- 自造「缓存中」：prefill 续排直到领先批次数达标（零间隙保活）----
   const ka = createCacheKeepalive()
+  const pre = await ka.prefill(12)
   let activeNow = false
   let initialStatus = null
   for (let i = 0; i < 6 && !activeNow; i++) {
-    await ka.tick()
-    await delay(600)
     const g = await httpJson('GET', `${TG}/api/tg/cache/tasks`)
     const t = g.json && g.json.task
     initialStatus = t ? t.status : null
     activeNow = initialStatus === 'running' || initialStatus === 'queued'
-    console.log(`   · 入队尝试 #${i + 1}：task.status=${initialStatus} active=${activeNow}`)
+    console.log(`   · 入队确认 #${i + 1}：task.status=${initialStatus} active=${activeNow} ahead=${ka.status().ahead}`)
+    if (!activeNow) {
+      await ka.tick()
+      await delay(600)
+    }
   }
-  check('「缓存中」条件已造出（task.status 非终态）', activeNow, `status=${initialStatus}`)
+  check('「缓存中」条件已造出（task.status 非终态）', activeNow, `status=${initialStatus} ahead=${pre.ahead}`)
   console.log(`   · 已入队任务 id：${JSON.stringify(ka.taskIds)}`)
 
   /*
-   * 关键（本次实测踩到的坑）：TgPanel 的 5s 轮询**只在它自己知道有活跃任务时**才跑。
+   * 关键（实测踩到的坑）：TgPanel 的 5s 轮询**只在它自己知道有活跃任务时**才跑。
    * 我们是带外（Node HTTP）入队的，面板本地态不会自动刷新 ⇒ 若面板在「无任务」时挂载，
    * interval 永不启动（polls=0），实验失效。故**重挂载** TgPanel（切走再切回），让挂载期
    * `refreshCacheTasks()` 看到活跃任务 → interval 启动。实验结束仍在 TG 视图。
@@ -1896,27 +2213,35 @@ async function stageStall(page, collector) {
   )
   check('TgPanel 5s 轮询已启动（fetch 打桩记录到轮询）', pollStarted >= 1, `polls=${pollStarted}`)
 
-  // 打开长条目 607 并以 1x 播放（面板保持挂载：viewer 是覆盖层，与 TgPanel 是兄弟）
+  // 打开长条目 607 并以 2x 播放（面板保持挂载：viewer 是覆盖层，与 TgPanel 是兄弟）
   await openItem(page, ITEM)
   const framed = await waitFramed(page)
-  const play = await ensurePlaying(page, ITEM)
-  console.log(`   · 播放器：framed=${framed} present=${play.present} rate=${play.rate}`)
-  check(`长条目 ${ITEM} 打开并出帧`, framed && play.present, `framed=${framed} rate=${play.rate}`)
+  const play = await ensurePlaying(page, ITEM, STALL_RATE)
+  console.log(`   · W2 播放器：framed=${framed} present=${play.present} rate=${play.rate}`)
+  check(`W2 ${ITEM}@${STALL_RATE}x 打开并出帧`, framed && play.present, `framed=${framed} rate=${play.rate}`)
+
+  // 窗口起端任务态（覆盖度自检要件之一）
+  const gStart = await httpJson('GET', `${TG}/api/tg/cache/tasks`)
+  const taskStart = (gStart.json && gStart.json.task) || null
 
   // 60s 窗口（keepalive 在窗口内持续续排）
   const stopFront = keepFront(page)
-  const w = await measureStallWindow(page, STALL_WINDOW_SEC, collector, ITEM, ka)
+  const w = await measureStallWindow(page, WINDOW_SEC, collector, ITEM, ka, 'with-cache')
   stopFront()
+
+  // 窗口末端任务态（覆盖度自检要件之二）
+  const gEnd = await httpJson('GET', `${TG}/api/tg/cache/tasks`)
+  const taskEnd = (gEnd.json && gEnd.json.task) || null
+
   const s = summarizeStallWindow(w)
-  results.phases.stall = s
+  const coverage = w2Coverage(s, taskStart, taskEnd)
+  s.coverage = coverage
+  s.covered = coverage.ok
+  results.phases.W2 = s
   results.keepaliveTimeline = ka.timeline
-  await shot(page, '60_cache_stall_window.png')
-  console.log(
-    `   · 窗口：longtask ${s.longtaskCount}（max ${s.longtaskMaxMs}ms）| 轮询 ${s.pollCount}（中位 ${s.pollMedianMs}ms）|` +
-      ` 紧随轮询≤${ALIGN_WINDOW_MS}ms ${s.alignedWithin}/${s.longtaskCount}（ratio ${s.alignedRatio}）|` +
-      ` 相位聚集=${s.phaseClustered}（桶#${s.phaseMaxBucket} ${s.phaseSpan}）| rVFC maxGap ${s.rvfcMaxGapMs}ms |` +
-      ` 丢帧 ${s.droppedPct}% | bufferedMin ${s.bufferedAheadMin}s | path ${s.path}`,
-  )
+  await shot(page, `W2_item${ITEM}_${STALL_RATE}x_cache.png`)
+  logWindow('W2', s)
+  console.log(`   · W2 覆盖度：${JSON.stringify(coverage)}`)
 
   // 收尾：取消所有本次入队任务 + 取收尾后缓存占用
   for (const id of ka.taskIds) {
@@ -1929,24 +2254,31 @@ async function stageStall(page, collector) {
   results.cacheStats.after = statsAfter.json || null
   console.log(`   · 缓存占用（后）：${JSON.stringify(statsAfter.json)}`)
 
-  // 判据（提前认下，照此判）
-  const ltCount = s.longtaskCount
+  check(
+    `W2 覆盖度达标（轮询 ≥${MIN_POLLS_COVERAGE} 且起止任务非活跃=否）`,
+    coverage.ok,
+    `polls=${coverage.polls} start=${coverage.startStatus} end=${coverage.endStatus} reasons=${JSON.stringify(coverage.reasons)}`,
+  )
+
+  const w1 = results.phases.W1
   let verdict
   let detail
-  if (ltCount === 0) {
-    verdict = 'PASS'
-    detail = `长任务 0 ⇒ 前端不构成可测阻塞（轮询 ${s.pollCount} 次，中位 ${s.pollMedianMs}ms）`
-  } else if (s.alignedRatio != null && s.alignedRatio >= 0.5 && s.phaseClustered) {
-    verdict = 'FAIL'
-    detail = `前端 5s 重渲染坐实：longtask ${s.alignedWithin}/${ltCount} 紧随轮询（ratio ${s.alignedRatio}）且相位聚集`
-  } else if (s.alignedRatio != null && s.alignedRatio >= 0.5) {
-    verdict = 'FAIL'
-    detail = `longtask ${s.alignedWithin}/${ltCount} 紧随轮询（ratio ${s.alignedRatio}，≥0.5）⇒ 与 5s 节拍对齐`
+  let compare = null
+  if (!coverage.ok) {
+    verdict = 'NOT-COVERABLE'
+    detail = `未覆盖（coverage insufficient）：${coverage.reasons.join('；')}`
+  } else if (!w1) {
+    verdict = 'NOT-COVERABLE'
+    detail = '未覆盖（coverage insufficient）：缺少 W1 基线，无法配对'
   } else {
-    verdict = 'PASS'
-    detail = `longtask 与 5s 轮询不对齐（ratio ${s.alignedRatio}，相位聚集=${s.phaseClustered}）⇒ 不是 5s 节拍问题`
+    compare = compareWindows(w1, w2SummaryForCompare(s))
+    verdict = compare.verdict
+    detail =
+      verdict === 'FAIL'
+        ? `W2 显著劣于 W1 ⇒ 缓存（5s 轮询）是卡顿主因：${compare.summary}`
+        : `W1 与 W2 无显著差异 ⇒ 缓存（5s 轮询）不是卡顿主因：${compare.summary}`
+    check('W1 vs W2 配对判定（同倍速 2x，唯一变量=缓存任务）', true, compare.summary)
   }
-  check('缓存卡顿 5s 节拍对齐判定', true, detail)
   return {
     verdict,
     detail,
@@ -1955,12 +2287,28 @@ async function stageStall(page, collector) {
       longtaskMaxMs: s.longtaskMaxMs,
       pollCount: s.pollCount,
       pollMedianMs: s.pollMedianMs,
+      rvfcGapCount: s.rvfcGapCount,
+      rvfcMaxGapMs: s.rvfcMaxGapMs,
+      rvfcP95GapMs: s.rvfcP95GapMs,
+      droppedPct: s.droppedPct,
+      presentedFps: s.presentedFps,
+      bufferedAheadMin: s.bufferedAheadMin,
       alignedRatio: s.alignedRatio,
       phaseClustered: s.phaseClustered,
-      droppedPct: s.droppedPct,
-      bufferedAheadMin: s.bufferedAheadMin,
+      coverage,
+      compare,
       netVerdict: s.netVerdict,
     },
+  }
+}
+
+/** compareWindows 只关心几个标量；这里做一次浅拷贝以固定口径。 */
+function w2SummaryForCompare(s) {
+  return {
+    rvfcGapCount: s.rvfcGapCount,
+    rvfcMaxGapMs: s.rvfcMaxGapMs,
+    droppedPct: s.droppedPct,
+    longtaskCount: s.longtaskCount,
   }
 }
 
@@ -1994,11 +2342,11 @@ function buildMarkdown(r) {
     const m = s.metrics || {}
     let key = ''
     if (s.idx === 1) key = `丢帧 ${m.droppedPct}%，提示${m.noticePresent ? '出现' : '未出现'}`
-    else if (s.idx === 2) key = `丢帧 ${m.droppedPct}%（Δ${m.droppedDelta}），提示${m.noticePresent ? '出现' : '未出现'}`
-    else if (s.idx === 3) key = `丢帧 ${m.droppedPct}%，videoWidth=${m.videoWidth}，提示${m.noticePresent ? '出现' : '未出现'}`
-    else if (s.idx === 4) key = `注入后提示=${m.noticeAfterInject}（真阳性=${m.sustainedStarve}），还原后提示末拍=${m.noticeAfterRecover}（撤销于≈${m.recoverClearedAtSec}s）`
-    else if (s.idx === 5) key = `停载遮罩=${m.haltAppeared}，还原后 vwPatched=${m.vwPatchedAfterRevert}`
-    else if (s.idx === 6) key = `longtask ${m.longtaskCount}，轮询 ${m.pollCount}（中位 ${m.pollMedianMs}ms），紧随比例 ${m.alignedRatio}，相位聚集=${m.phaseClustered}`
+    else if (s.idx === 2) key = `丢帧 ${m.droppedPct}%，videoWidth=${m.videoWidth}，提示${m.noticePresent ? '出现' : '未出现'}`
+    else if (s.idx === 3) key = `注入后提示=${m.noticeAfterInject}（真阳性=${m.sustainedStarve}），还原后提示末拍=${m.noticeAfterRecover}（撤销于≈${m.recoverClearedAtSec}s）`
+    else if (s.idx === 4) key = `停载遮罩=${m.haltAppeared}，还原后 vwPatched=${m.vwPatchedAfterRevert}`
+    else if (s.idx === 5) key = `无缓存基线：>${GAP_CRITICAL_MS}ms 缺口 ${m.rvfcGapCount}（最长 ${m.rvfcMaxGapMs}ms），丢帧 ${m.droppedPct}%，longtask ${m.longtaskCount}`
+    else if (s.idx === 6) key = `有缓存：>${GAP_CRITICAL_MS}ms 缺口 ${m.rvfcGapCount}（最长 ${m.rvfcMaxGapMs}ms），丢帧 ${m.droppedPct}%，轮询 ${m.pollCount}（中位 ${m.pollMedianMs}ms）`
     else if (s.idx === 0) key = `5180=${m.fe} 19787=${m.be} headful=${m.headful}`
     else key = ''
     L.push(`| [${s.idx}/7] ${s.title} | ${s.title} | ${s.verdict} | ${key} | ${covered(s.verdict)} |`)
@@ -2012,24 +2360,61 @@ function buildMarkdown(r) {
     L.push(`| ${c.name} | ${c.pass ? 'PASS' : 'FAIL'} | ${String(c.detail).replace(/\|/g, '\\|')} |`)
   }
   L.push('')
-  L.push('## 缓存卡顿（阶段 6）细节')
+  L.push(`## 缓存配对 W1 vs W2 细节（同倍速 ${STALL_RATE}x，唯一变量=是否有活跃缓存任务）`)
   L.push('')
-  if (r.phases.stall) {
-    const s = r.phases.stall
-    L.push(`- 窗口时长：${s.wallSecs}s（轮询 ${s.pollCount} 次，中位间隔 ${s.pollMedianMs}ms）`)
-    L.push(`- longtask：${s.longtaskCount} 个（最长 ${s.longtaskMaxMs}ms，合计 ${s.longtaskTotalMs}ms）`)
-    L.push(`- 相位直方图（startTime mod 5000ms，20×250ms）：${JSON.stringify(s.phaseBuckets)}`)
-    L.push(`- 相位聚集：${s.phaseClustered}（峰值桶 #${s.phaseMaxBucket} ${s.phaseSpan}，n=${s.phaseMaxCount}）`)
+  const renderWin = (name, s) => {
+    if (!s) {
+      L.push(`### ${name}：未产出数据（未覆盖）`)
+      return
+    }
+    L.push(`### ${name}（${s.mode}，${s.wallSecs}s）`)
+    L.push(`- 轮询：${s.pollCount} 次，中位间隔 ${s.pollMedianMs}ms（kinds=${JSON.stringify(s.pollKinds)}）`)
+    L.push(
+      `- longtask：${s.longtaskCount} 个（最长 ${s.longtaskMaxMs}ms，合计 ${s.longtaskTotalMs}ms）；相位聚集=${s.phaseClustered}（峰值桶 #${s.phaseMaxBucket} ${s.phaseSpan}）`,
+    )
     L.push(`- 紧随轮询 ≤${ALIGN_WINDOW_MS}ms：${s.alignedWithin}/${s.longtaskCount}（ratio ${s.alignedRatio}）`)
-    L.push(`- rVFC：${s.rvfcFrames} 帧，最大间隔 ${s.rvfcMaxGapMs}ms，缺口数 ${s.rvfcGapCount}，longtask 含缺口 ${s.ltWithGap}/${s.ltTotal}`)
+    L.push(
+      `- **>${GAP_CRITICAL_MS}ms 呈现缺口：${s.rvfcGapCount} 个，最长 ${s.rvfcMaxGapMs}ms，p95 ${s.rvfcP95GapMs}ms**（rVFC ${s.rvfcFrames} 帧，均值 ${s.rvfcMeanGapMs}ms）`,
+    )
     L.push(`- 掉帧：${s.droppedDelta}（${s.droppedPct}%），呈现 ${s.presentedFps}fps，buffered 最小 ${s.bufferedAheadMin}s`)
-    L.push(`- 网络：${s.net ? JSON.stringify({ tgReq: s.net.tgRequestCount, maxConcurrent: s.net.maxConcurrent, player: s.net.playerRequestCount, feedPoster: s.net.feedPosterRequestCount, afterPoll: s.net.maxConcurrentAfterPoll }) : '-'}`)
+    L.push(`- waiting/stalled 事件：${s.waitingCount}/${s.stalledCount}；path ${s.path}；visibility ${s.endVisibility}`)
+    if (s.coverage) {
+      L.push(
+        `- 覆盖度：${s.coverage.ok ? '达标' : '**未达标（coverage insufficient）**'}（polls=${s.coverage.polls}≥${s.coverage.minPolls}? ${s.coverage.pollsOk}；起端=${s.coverage.startStatus} 末端=${s.coverage.endStatus}；${JSON.stringify(s.coverage.reasons)}）`,
+      )
+    }
+    L.push(
+      `- 网络：${s.net ? JSON.stringify({ tgReq: s.net.tgRequestCount, maxConcurrent: s.net.maxConcurrent, playerRaw: s.net.playerRawCount, feedPoster: s.net.feedPosterRequestCount, afterPoll: s.net.maxConcurrentAfterPoll }) : '-'}`,
+    )
     L.push(`- 连接池判定：${s.netVerdict ? s.netVerdict.verdict + ' — ' + s.netVerdict.reason : '-'}`)
+    if (s.rvfcGaps && s.rvfcGaps.length) {
+      L.push(`- **逐缺口证据**（>${GAP_CRITICAL_MS}ms，前 ${s.rvfcGaps.length} 个；trace = 250ms 轨迹 [t偏移,currentTime,rate,drop,buffered,readyState,paused]）：`)
+      for (const g of s.rvfcGaps) {
+        const tr = (g.trace || []).map((x) => [x.dtMs, x.ct, x.rate, x.dropped, x.ahead, x.rs, x.paused])
+        L.push(`  - ${g.durMs}ms（${g.from} → ${g.to}）；trace=${JSON.stringify(tr)}`)
+      }
+    }
+  }
+  renderWin('W1 基线（无缓存任务）', r.phases.W1)
+  L.push('')
+  renderWin('W2 处理（有活跃缓存任务）', r.phases.W2)
+  L.push('')
+  if (r.phases.W1 && r.phases.W2) {
+    const w1 = r.phases.W1
+    const w2 = r.phases.W2
+    if (w2.coverage && !w2.coverage.ok) {
+      L.push(`- **配对判定**：未覆盖（coverage insufficient）—— ${w2.coverage.reasons.join('；')}，不下结论。`)
+    } else {
+      const c = compareWindows(w1, w2)
+      L.push(
+        `- **配对判定**：${c.verdict === 'FAIL' ? '缓存（5s 轮询）是卡顿主因' : '缓存（5s 轮询）不是卡顿主因'} —— ${c.summary}`,
+      )
+    }
   } else {
-    L.push('- 阶段 6 未产出数据（未覆盖）。')
+    L.push('- 配对判定：未覆盖（缺 W1 或 W2 数据）。')
   }
   L.push('')
-  L.push('## 缓存磁盘增量（阶段 6）')
+  L.push('## 缓存磁盘增量（W2）')
   L.push('')
   const b = r.cacheStats.before
   const a = r.cacheStats.after
@@ -2066,7 +2451,7 @@ async function main() {
   console.log('='.repeat(78))
   console.log('播放验收 · 单脚本 · 单浏览器 · 一次跑完')
   console.log(`前端 ${APP_URL} · 后端 ${TG} · 产物 ${OUT}`)
-  console.log(`阶段：环境自证 → C1/C2/C3（误报消除）→ C4/C5（反向证伪）→ 缓存卡顿 5s 对齐 → 总表`)
+  console.log(`阶段：环境自证 → C1/C3（误报消除，异常倍速）→ C4/C5（反向证伪）→ 缓存配对 W1/W2（同倍速 2x）→ 总表`)
   console.log('='.repeat(78))
 
   // 环境探活（提前一档：不可达只自检、如实报告、退出码 2）
@@ -2151,20 +2536,20 @@ async function main() {
     // ---- [1/7] C1 ----
     await runStage(1, `BUG-212 C1：${ITEM}@2x 提示检测`, () => stageC1(page), STAGE_TIMEOUT.C1)
 
-    // ---- [2/7] C2 ----
-    await runStage(2, `BUG-212 C2：${ITEM}@1x 干净基线`, () => stageC2(page), STAGE_TIMEOUT.C2)
+    // ---- [2/7] C3 ----
+    await runStage(2, `BUG-212 C3：${ITEM_HEVC}@4x 提示检测`, () => stageC3(page), STAGE_TIMEOUT.C3)
 
-    // ---- [3/7] C3 ----
-    await runStage(3, `BUG-212 C3：${ITEM_HEVC}@4x 提示检测`, () => stageC3(page), STAGE_TIMEOUT.C3)
+    // ---- [3/7] C4 ----
+    await runStage(3, `BUG-212 C4：注入「管线饿死」反向证伪`, () => stageC4(page), STAGE_TIMEOUT.C4)
 
-    // ---- [4/7] C4 ----
-    await runStage(4, `BUG-212 C4：注入「管线饿死」反向证伪`, () => stageC4(page), STAGE_TIMEOUT.C4)
+    // ---- [4/7] C5 ----
+    await runStage(4, `BUG-212 C5：注入 videoWidth=0 回归`, () => stageC5(page), STAGE_TIMEOUT.C5)
 
-    // ---- [5/7] C5 ----
-    await runStage(5, `BUG-212 C5：注入 videoWidth=0 回归`, () => stageC5(page), STAGE_TIMEOUT.C5)
+    // ---- [5/7] 缓存配对 W1（基线：无缓存任务）----
+    await runStage(5, `缓存配对 W1：${ITEM}@${STALL_RATE}x 无缓存（基线，${WINDOW_SEC}s）`, () => stageW1(page, collector), STAGE_TIMEOUT.W1)
 
-    // ---- [6/7] 缓存卡顿 5s 对齐 ----
-    await runStage(6, `缓存卡顿：5s 节拍对齐（${STALL_WINDOW_SEC}s 窗口）`, () => stageStall(page, collector), STAGE_TIMEOUT.STALL)
+    // ---- [6/7] 缓存配对 W2（处理：有活跃缓存任务）----
+    await runStage(6, `缓存配对 W2：${ITEM}@${STALL_RATE}x 有缓存（保活，${WINDOW_SEC}s）`, () => stageW2(page, collector), STAGE_TIMEOUT.W2)
 
     // 页面错误
     results.pageErrors = page.pageErrors().slice(0, 20)
