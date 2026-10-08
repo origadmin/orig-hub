@@ -111,6 +111,12 @@ const ALIGN_WINDOW_MS = 800
  * 张截图并继续跑完流程，**绝不因一张诊断图中断整轮实测与产物落盘**。
  */
 const SHOT_TIMEOUT_MS = Number(process.env.STALL_SHOT_TIMEOUT_MS || 15000)
+/**
+ * 条件取舍开关（验收侧按需）：B 为唯一决定性判据。磁盘/时间紧张时只跑扎实 B。
+ *   STALL_SKIP_C=1 跳过「缓存中 + 面板开」；STALL_SKIP_D=1 跳过「2x raw 风暴」。
+ */
+const SKIP_C = process.env.STALL_SKIP_C === '1'
+const SKIP_D = process.env.STALL_SKIP_D === '1'
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -941,6 +947,21 @@ async function shot(page, name) {
   console.log(`[stall] shot ${name} -> ${f} (${size} bytes)`)
 }
 
+/**
+ * 把标签提到最前并**周期性重申**，防止 headful 窗口被遮挡/最小化导致
+ * `visibilityState` 翻 `hidden`、renderer 被后台化而把 rVFC/掉帧等**次判据**降频失真
+ * （主判据 longtask 不受遮挡影响：setInterval 未被节流则 5s 轮询照跑、同步重渲染照执行）。
+ * @returns {Function} stop 函数
+ */
+function keepFront(page, periodMs = 8000) {
+  const bring = () => {
+    page.conn.send('Page.bringToFront', {}, { sessionId: page.sessionId }).catch(() => {})
+  }
+  bring()
+  const h = setInterval(bring, periodMs)
+  return () => clearInterval(h)
+}
+
 /** 打印一行条件的结论。 */
 function logCondition(r) {
   console.log(
@@ -1109,14 +1130,28 @@ async function main() {
     // ---- 条件 B：缓存中（活跃任务在场）----
     if (hasActive) {
       console.log(`\n[stall] ===== condition B (caching, active task) =====`)
+      // 窗口前后各查一次任务态与 daemon 活跃数（判「窗口是否全程处于缓存中」及是否被污染）
+      const taskBefore = await probeActiveTask(page)
       const ddB = await probeDaemonDownloads(page)
       const playB = await ensurePlaying(page, ITEM)
+      const stopFront = keepFront(page)
       const w = await measureWindowWithNet(page, WINDOW_SEC, netEnabled ? netCollector : null, ITEM)
+      stopFront()
+      const taskAfter = await probeActiveTask(page)
+      const ddB2 = await probeDaemonDownloads(page)
       const r = summarizeCondition('B', w)
       r.daemonDownloads = ddB
+      r.daemonDownloadsAfter = ddB2
+      r.taskBefore = taskBefore
+      r.taskAfter = taskAfter
       r.playback = playB
       results.conditions.B = r
       logCondition(r)
+      console.log(
+        `[stall] B task before=${taskBefore.status}/${taskBefore.task ? taskBefore.task.done + '/' + taskBefore.task.total : '-'}` +
+          ` after=${taskAfter.status}/${taskAfter.task ? taskAfter.task.done + '/' + taskAfter.task.total : '-'}` +
+          ` | daemon before=${ddB.active} after=${ddB2.active}`,
+      )
       await shot(page, '20_conditionB_caching.png')
     } else {
       results.notCoverable.B = '库内无活跃缓存任务 ⇒ 无法覆盖「缓存中」条件'
@@ -1124,7 +1159,7 @@ async function main() {
     }
 
     // ---- 条件 C：缓存中 + 缓存管理面板打开 ----
-    if (hasActive) {
+    if (hasActive && !SKIP_C) {
       console.log(`\n[stall] ===== condition C (caching + cache manager open) =====`)
       const opened = await page.evaluate(() => {
         try {
@@ -1157,12 +1192,17 @@ async function main() {
       })
       await delay(400)
     } else {
-      results.notCoverable.C = '库内无活跃缓存任务 ⇒ 无法覆盖「缓存中 + 面板」条件'
-      console.log('[stall] condition C NOT COVERABLE: 库内无活跃缓存任务')
+      if (SKIP_C) {
+        results.notCoverable.C = 'STALL_SKIP_C=1 ⇒ 本次刻意跳过（B 优先，节省磁盘/时间）'
+        console.log('[stall] condition C SKIPPED (STALL_SKIP_C=1)')
+      } else {
+        results.notCoverable.C = '库内无活跃缓存任务 ⇒ 无法覆盖「缓存中 + 面板」条件'
+        console.log('[stall] condition C NOT COVERABLE: 库内无活跃缓存任务')
+      }
     }
 
     // ---- 条件 D：候选乙 —— 2x 播放下的 /raw 投递风暴实测（与缓存任务无关，始终可跑）----
-    {
+    if (!SKIP_D) {
       console.log(
         `\n[stall] ===== condition D (candidate-B: ${RAW_STORM_RATE}x raw storm, ${RAW_STORM_SEC}s) =====`,
       )
