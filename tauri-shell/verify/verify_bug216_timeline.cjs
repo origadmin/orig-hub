@@ -301,22 +301,31 @@ async function main() {
     )
 
     // ---------- 5. 时间文案随播放推进 ----------
-    const t0 = await page.evaluate(() => {
-      const v = document.querySelector('[data-testid="media-viewer"] video')
-      const spans = Array.from(document.querySelectorAll('[data-testid="media-viewer"] span'))
-      const timeSpan = spans.find((s) => /\/ /.test(s.textContent) && /\d/.test(s.textContent))
-      return { ct: v.currentTime, text: timeSpan ? timeSpan.textContent.trim() : null }
+    // BUG-217：播放中控件 3s 后会自动隐藏，而隐藏态控件层已被**真正移出 DOM**，
+    // 时间文案随之不可查询。故先用真实 mousemove 把控件唤出再断言（不是弱化断言：
+    // 仍要求文案存在且推进）。两次采样间隔 < HIDE_MS(3000)，中途再唤一次。
+    const center = await page.evaluate(() => {
+      const c = document.querySelector('[data-testid="media-viewer"]')
+      const r = c.getBoundingClientRect()
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 }
     })
-    await delay(2500)
-    const t1 = await page.evaluate(() => {
-      const v = document.querySelector('[data-testid="media-viewer"] video')
-      const spans = Array.from(document.querySelectorAll('[data-testid="media-viewer"] span'))
-      const timeSpan = spans.find((s) => /\/ /.test(s.textContent) && /\d/.test(s.textContent))
-      return { ct: v.currentTime, text: timeSpan ? timeSpan.textContent.trim() : null }
-    })
+    const readTimeText = () =>
+      page.evaluate(() => {
+        const v = document.querySelector('[data-testid="media-viewer"] video')
+        const spans = Array.from(document.querySelectorAll('[data-testid="media-viewer"] span'))
+        const timeSpan = spans.find((s) => /\/ /.test(s.textContent) && /\d/.test(s.textContent))
+        return { ct: v.currentTime, text: timeSpan ? timeSpan.textContent.trim() : null }
+      })
+    await mouse(page, 'mouseMoved', center.x, center.y)
+    await delay(200)
+    const t0 = await readTimeText()
+    await delay(1200)
+    await mouse(page, 'mouseMoved', center.x, center.y)
+    await delay(200)
+    const t1 = await readTimeText()
     check(
       '时间文案随播放推进（叶子组件仍在更新）',
-      t1.text !== null && t1.text !== t0.text && t1.ct > t0.ct,
+      t0.text !== null && t1.text !== null && t1.text !== t0.text && t1.ct > t0.ct,
       `text "${t0.text}" -> "${t1.text}"，currentTime ${t0.ct.toFixed(2)} -> ${t1.ct.toFixed(2)}`,
     )
 

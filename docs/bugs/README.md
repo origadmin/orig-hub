@@ -242,3 +242,4 @@ bash scripts/install-hooks.sh    # 安装 pre-commit 与 commit-msg（钩子不�
 | BUG-214 | 剧集墙多选只有「合并/清空」缺基础批量操作（批量删除必须补），选择条固定顶部随滚动丢失 | open | shell |
 | BUG-215 | 图片灯箱顶部两按钮（关闭/摘除）被自绘标题栏裁切：fixed inset-0 锚视口而内容框从标题栏 y=40 起 | open | shell |
 | BUG-216 | 播放器 timeupdate 触发整棵控件树重渲染（DOM 变更 24.5/32.6 次/秒）：进度条/缓冲段/时间文案下沉叶子组件 + 条宽 ref 直写 + 墙钟节流；验收 = 降到 3.9/5.8 次/秒（≤6）、回归 9/9 PASS | fixed | shell |
+| BUG-217 | 播放器控件层隐藏态仍参与合成（`showControls=false` 时整层 `opacity-0` 控件仍在布局/绘制/合成，拖慢 2x/4x 上屏节拍；覆盖层/合成上下文假设已证伪）：淡出后整层移出 DOM + sr-only 进度条保 AT 可达；隐藏态回到裸 video 水平（2x 59.4/17.1/6、4x 58.9/17.3/10） | fixed | shell |

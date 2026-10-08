@@ -83,6 +83,8 @@ const RATES = [0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4]
 const SKIP_SEC = 10
 /** 播放中控件自动隐藏延时 */
 const HIDE_MS = 3000
+/** 控件层淡出时长（与 Tailwind `duration-300` 对齐）：淡出结束后才把控件层移出合成（BUG-217）。 */
+const CONTROLS_FADE_MS = 300
 /** 居中点击反馈图标停留时长 */
 const CENTER_MS = 1500
 /** 自动连播倒计时秒数 */
@@ -181,6 +183,12 @@ interface PlayerProgressBarProps {
   /** 悬停态由父组件持有（`pokeControls` 依赖它决定是否自动隐藏），此处只读+回调 */
   barHover: boolean
   onBarHoverChange: (hover: boolean) => void
+  /**
+   * BUG-217：控件层隐藏（`showControls=false`）时进度条退化为 **sr-only** 节点——
+   * 仍带 `role="slider"` / `aria-valuemin/valuemax/valuenow`（无障碍树仍可达，仍由
+   * `write()` 直写更新），但被裁成 1px，不再参与可见的布局/绘制/合成。
+   */
+  compact?: boolean
 }
 
 /**
@@ -195,7 +203,7 @@ interface PlayerProgressBarProps {
  * 即时跟手，**不写 `currentTime`** —— 每次写 `currentTime` 都会中止旧请求再发一个新
  * Range 请求，实测 2s 拖拽 7 发 7 取消）；只有 `pointerup` 才提交唯一一次 `seekToRatio`。
  */
-function PlayerProgressBar({ videoRef, barHover, onBarHoverChange }: PlayerProgressBarProps) {
+function PlayerProgressBar({ videoRef, barHover, onBarHoverChange, compact = false }: PlayerProgressBarProps) {
   const { t } = useTranslation()
   const barRef = useRef<HTMLDivElement>(null)
   const playedRef = useRef<HTMLDivElement>(null)
@@ -220,16 +228,18 @@ function PlayerProgressBar({ videoRef, barHover, onBarHoverChange }: PlayerProgr
   const write = useCallback(
     (force: boolean) => {
       const v = videoRef.current
-      const played = playedRef.current
       const slider = barRef.current
-      if (!v || !played || !slider) return
+      // BUG-217：compact（sr-only）态没有可见条面，`played`/`buffered` 为 null；
+      // 只要 slider 还在，aria 就必须继续更新（AT 可达是硬约束）。
+      if (!v || !slider) return
+      const played = playedRef.current
       const dur = Number.isFinite(v.duration) ? v.duration : 0
       const now = performance.now()
       const ratio = dragRatioRef.current
       const shown = ratio !== null && dur > 0 ? ratio * dur : v.currentTime
 
-      // 播放段：墙钟节流 + 只在值变化时写
-      if (force || now - lastBarMs.current >= BAR_WRITE_MS) {
+      // 播放段：墙钟节流 + 只在值变化时写（compact 态无可见条面，跳过）
+      if (played && (force || now - lastBarMs.current >= BAR_WRITE_MS)) {
         lastBarMs.current = now
         const pct = dur > 0 ? Math.min(100, (shown / dur) * 100) : 0
         played.style.width = `${pct}%`
@@ -279,6 +289,11 @@ function PlayerProgressBar({ videoRef, barHover, onBarHoverChange }: PlayerProgr
       v.removeEventListener('durationchange', onSeek)
     }
   }, [videoRef, write])
+
+  // 控件显隐切换（compact 变化）后立即重同步一次，避免条面 / aria 短暂停留旧值
+  useEffect(() => {
+    write(true)
+  }, [compact, write])
 
   const seekRatioFromClientX = useCallback((clientX: number) => {
     const el = barRef.current
@@ -341,6 +356,24 @@ function PlayerProgressBar({ videoRef, barHover, onBarHoverChange }: PlayerProgr
     },
     [seekToRatio, write, onBarHoverChange],
   )
+
+  // BUG-217：隐藏态只留一个 sr-only 节点——保住 `role="slider"` 与 aria-valuemin/
+  // valuemax/valuenow（无障碍树仍可达、仍由 `write()` 直写更新），但不参与可见的
+  // 布局 / 绘制 / 合成。
+  if (compact) {
+    return (
+      <div
+        ref={barRef}
+        role="slider"
+        tabIndex={0}
+        aria-label={t('player.progress')}
+        aria-valuemin={0}
+        aria-valuemax={0}
+        aria-valuenow={0}
+        className="sr-only"
+      />
+    )
+  }
 
   return (
     <div
@@ -418,6 +451,36 @@ export function VideoPlayer({
   const [isPlaying, setIsPlaying] = useState(false)
   const [isBuffering, setIsBuffering] = useState(false)
   const [showControls, setShowControls] = useState(true)
+  /** 控件层是否应可见（播放中且未唤起控件时为 false）。 */
+  const controlsVisible = showControls || !isPlaying
+  /**
+   * BUG-217：控件层是否仍参与布局 / 绘制 / 合成。
+   *
+   * 隐藏时**不能只 `opacity-0`**：实测（同页同文件 1440×807，2x/4x，3 轮中位）
+   * app@2x 上屏 55.6fps、rVFC 间隔 p95=33ms、>25ms 的帧 43；把控件层真正移出后
+   * 回到 58.7/17.2/12（≈ 裸 `<video>` 对照 59.2/17.1/6）。代价来自「按钮行 / 渐变
+   * 遮罩仍参与布局 + 绘制 + 合成」，与透明度无关（只 `opacity:0` 且去掉过渡仅
+   * 57.0/24.3/28）。
+   *
+   * 保留 300ms 淡出手感：先让 `opacity` 过渡到 0，**淡出结束**（`CONTROLS_FADE_MS`）
+   * 后才把装饰性 chrome 移出（`hidden`）、进度条转 sr-only；`controlsVisible` 变回
+   * true 时立即恢复，保证淡入平滑（父层始终 `display:block`，故 opacity 过渡可跑）。
+   */
+  const [chromeMounted, setChromeMounted] = useState(true)
+  const [chromeShown, setChromeShown] = useState(true)
+  useEffect(() => {
+    if (controlsVisible) {
+      // 显示：先挂载（display 恢复、opacity=0），下一帧再置 opacity=1，让 300ms 淡入能跑
+      // （若与 display 同帧置 1，浏览器不会播放过渡）。
+      setChromeMounted(true)
+      const show = window.setTimeout(() => setChromeShown(true), 20)
+      return () => window.clearTimeout(show)
+    }
+    // 隐藏：先淡出（opacity=0），**淡出结束**（CONTROLS_FADE_MS）后才把整层移出 DOM。
+    setChromeShown(false)
+    const hide = window.setTimeout(() => setChromeMounted(false), CONTROLS_FADE_MS)
+    return () => window.clearTimeout(hide)
+  }, [controlsVisible])
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [barHover, setBarHover] = useState(false)
   const [volOpen, setVolOpen] = useState(false)
@@ -926,20 +989,30 @@ export function VideoPlayer({
         </div>
       )}
 
+      {/* 控件层隐藏态（BUG-217）：整层移出 DOM / 合成，只留一个 sr-only 进度条——
+          保住 `role="slider"` 与 aria-valuemin/valuemax/valuenow（无障碍树仍可达、
+          仍由 `write()` 直写更新），但不参与可见的布局 / 绘制 / 合成。 */}
+      {!chromeMounted && (
+        <PlayerProgressBar videoRef={videoRef} barHover={barHover} onBarHoverChange={setBarHover} compact />
+      )}
+
       {/* 控件层 */}
       <div
         role="toolbar"
         aria-label={t('player.controls')}
         className={cn(
           'pointer-events-none absolute inset-0 z-10 flex flex-col justify-end transition-opacity duration-300',
-          showControls || !isPlaying ? 'opacity-100' : 'opacity-0',
+          chromeShown ? 'opacity-100' : 'opacity-0',
+          !chromeMounted && 'hidden',
         )}
       >
         <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/80 via-black/15 to-transparent" />
 
         <div className="pointer-events-auto relative px-3 pb-3 pt-14 md:px-4 md:pb-4">
           {/* 进度条（BUG-216：状态在叶子组件内，父组件不因 timeupdate 重渲染） */}
-          <PlayerProgressBar videoRef={videoRef} barHover={barHover} onBarHoverChange={setBarHover} />
+          {chromeMounted && (
+            <PlayerProgressBar videoRef={videoRef} barHover={barHover} onBarHoverChange={setBarHover} />
+          )}
 
           {/* 按钮组 */}
           <div className="flex items-center justify-between gap-2">
