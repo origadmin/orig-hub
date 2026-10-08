@@ -58,8 +58,56 @@ const MIN_SAMPLED_FRAMES = 4
  * 可避免把调度抖动误判为饿死，而真饿死时该比值通常远低于 0.9，仍能稳定命中。
  */
 const EFF_RATE_MIN = 0.9
-/** 元数据就绪后多久仍无画面尺寸，判定为视频轨不可解 */
-const NO_FRAME_MS = 3000
+/**
+ * BUG-224：零帧预算从 3000ms 放宽到 12000ms。
+ *
+ * 旧值 3000ms 是拍脑袋的「三秒还没画面大概没戏」，实测证明它会误杀**本机能放**的文件：
+ * 本机 Chromium 经 Media Foundation 能解 HEVC，实测首帧
+ * `items/415/raw`(720p HEVC) = **0.63s**、`items/673/raw`(1080p HEVC) = **0.92s**；
+ * 但 BUG-208 的服务端 H.264 兼容流（冷启动实时转码）首帧 **2.67s–2.89s**，
+ * 与 3000ms 只差 0.11–0.33s —— 机器稍忙、或代理未命中需冷启动转码，就必然越界。
+ * 越界后果不是「提示一下」，而是 `VideoPlayer` 切流 → 再判 → **停载**，
+ * 于是「原本能放」的文件变成「点开只有一句浏览器无法解码该格式」。
+ *
+ * 取 12000ms：既容得下转码启动与并发抖动，又不会让真解不了的场景无限等
+ * （真解不了最终仍会判死，只是多等 9 秒）。
+ */
+const NO_FRAME_MS = 12000
+/** `HTMLMediaElement.error` 中「源不被支持」的码（HTML 规范 MEDIA_ERR_SRC_NOT_SUPPORTED）。 */
+export const MEDIA_ERR_SRC_NOT_SUPPORTED = 4
+
+/**
+ * BUG-224：零帧判定的**唯一**裁决点（导出为纯函数以便独立断言）。
+ *
+ * 判据的原理性修正：**「还没解出第一帧」不等于「解不了」**。零帧只说明解码器
+ * 还没吐出画面（冷启动、转码排队、主线程被占、码率大），把它直接等同于
+ * 「浏览器不支持这个编码」就是把**事实**当成了**推断**，而 BUG-208 会顺着这个
+ * 推断把用户从「本机明明能播的原始流」切走并停载。
+ *
+ * 只有两种情况才算「解不出来」：
+ * 1. 媒体元素**明确报错** `MEDIA_ERR_SRC_NOT_SUPPORTED` —— 浏览器自己下的定论；
+ * 2. 元数据已就绪、零帧持续超过预算 —— 排除了「还没开始解」的可能。
+ */
+export function zeroFrameVerdict(input: {
+  readyState: number
+  videoWidth: number
+  mediaErrorCode: number | null
+  zeroFrameSince: number
+  now: number
+  budgetMs?: number
+}): { unsupported: boolean; reason: 'playing' | 'metadata-pending' | 'media-error' | 'budget-exhausted' } {
+  const { readyState, videoWidth, mediaErrorCode, zeroFrameSince, now } = input
+  const budgetMs = input.budgetMs ?? NO_FRAME_MS
+  // 已经有画面尺寸 = 解码器在工作（即使只出了 1 帧），永远不判死。
+  if (videoWidth > 0) return { unsupported: false, reason: 'playing' }
+  // 浏览器明确说「不支持这个源」—— 这是事实，不是推断。
+  if (mediaErrorCode === MEDIA_ERR_SRC_NOT_SUPPORTED) return { unsupported: true, reason: 'media-error' }
+  // 元数据都没就绪，谈不上解不出来。
+  if (readyState < 2) return { unsupported: false, reason: 'metadata-pending' }
+  // 元数据已就绪却零帧：只有在预算耗尽后才认定解不出来。
+  if (now - zeroFrameSince > budgetMs) return { unsupported: true, reason: 'budget-exhausted' }
+  return { unsupported: false, reason: 'metadata-pending' }
+}
 /** 起播 / 跳转 / 改速后的静默期：解码器预热与首帧填充 */
 const WARMUP_MS = 1500
 /**
@@ -165,10 +213,19 @@ export function useDecodeHealth(
       const dt = now - lastAt
       lastAt = now
 
-      // 情况 1：元数据已就绪却没有画面尺寸 → 视频轨解不出来
+      // 情况 1：元数据已就绪却没有画面尺寸 → 视频轨解不出来。
+      // 裁决全在 `zeroFrameVerdict`（BUG-224）：媒体元素明确报
+      // MEDIA_ERR_SRC_NOT_SUPPORTED 立即判死；否则零帧只扣预算，预算用尽才判死。
       if (el.readyState >= 2 && el.videoWidth === 0) {
         if (!zeroFrameSince) zeroFrameSince = now
-        else if (now - zeroFrameSince > NO_FRAME_MS) setState('unsupported')
+        const verdict = zeroFrameVerdict({
+          readyState: el.readyState,
+          videoWidth: el.videoWidth,
+          mediaErrorCode: el.error ? el.error.code : null,
+          zeroFrameSince,
+          now,
+        })
+        if (verdict.unsupported) setState('unsupported')
         return
       }
       // 画面尺寸出现（元数据晚到 / 换源）→ 不应停留在 unsupported

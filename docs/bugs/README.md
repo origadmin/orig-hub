@@ -248,4 +248,5 @@ bash scripts/install-hooks.sh    # 安装 pre-commit 与 commit-msg（钩子不�
 | BUG-220 | 入库流水线只显示频道不显示内容，无法知道入库的是什么 | open | shell |
 | BUG-221 | 入库流水线看不到进度：单条大文件全程 0%、卡死与正常下载不可分辨 | open | shell |
 | BUG-222 | 回收临时文件选择模型混乱：分档按钮静默丢弃「按频道选定」，单频道时频道 chips 消失 | open | shell |
-| BUG-223 | 高倍速(≥3x)卡顿：服务端均匀抽帧替代 playbackRate 强制高帧率（帧率转换 FRC） | open | engine+shell |
+| BUG-223 | 非 1x 倍速卡顿：服务端 30fps FRC 降低浏览器解码负载 | in_progress | engine+shell |
+| BUG-224 | 浏览器报「无法解码该格式」：最该被救的 MPEG-TS 恰好判据看不见；零帧 3s 预算与转码启动赛跑 + localStorage 永久记忆 | fixed | shell |
