@@ -62,6 +62,21 @@ const EFF_RATE_MIN = 0.9
 const NO_FRAME_MS = 3000
 /** 起播 / 跳转 / 改速后的静默期：解码器预热与首帧填充 */
 const WARMUP_MS = 1500
+/**
+ * BUG-212 已知边界（**未处理**，如实登记）：
+ *
+ * 现象——`waiting` / `stalled` 也走 `rebase()`，而 `rebase()` 会重设时间轴基线
+ * （`lastTime`）并进入 `WARMUP_MS` 预热。若某场景下「饿死」表现为 `waiting` / `stalled`
+ * 的高频间歇（相邻 stall 间隔 < `WARMUP_MS`），则每次 stall 都会重置有效倍速基线并重新
+ * 预热 ⇒ 主判据可能长期凑不满 `STRAIN_STREAK` 拍而**不报**（属**漏报**，非误报）。
+ *
+ * 为什么当前不触发——已实测 2x / 4x 下 `waiting` / `stalled` 均为 0（4x 丢帧 75.3% 时
+ * 亦然），该路径在我们真正关心的倍速场景里根本不进入，故不会掩盖主判据。
+ *
+ * 为什么当前不修——修复需要把「重置丢帧基线」与「重置时间轴基线」拆开（stall 时不清
+ * `lastTime`、不预热主判据），而这会触碰 BUG-166 对 `waiting` / `stalled` 重设基线的
+ * 既有裁定。若将来出现「高频间歇 stall」的场景，需连同 BUG-166 一起重新裁定。
+ */
 /** 这些事件上丢帧计数与时间轴会跳变，必须重设基线，否则旧账会被算成新样本 */
 const REBASE_EVENTS = [
   'loadedmetadata',
