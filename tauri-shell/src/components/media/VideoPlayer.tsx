@@ -37,6 +37,10 @@ import { usePlayerSettings } from '../../hooks/usePlayerSettings'
  *
  * 快捷键（刻意避开 ←/→，那是 MediaViewer 的「上一个/下一个媒体项」）：
  *   Space / K 播放暂停   J / L 快退·快进 10s   ↑ / ↓ 音量   M 静音   F 全屏   P 画中画
+ *
+ * BUG-216：进度条 / 缓冲段 / 时间文案这三块随媒体时间推进的 UI 被下沉到
+ * `PlayerProgressBar` 与 `PlayerTimeText` 两个叶子组件，顶层组件**不再**因
+ * `timeupdate` 重渲染。详见 `usePlaybackClock` 的注释。
  */
 export interface NextUpInfo {
   title: string
@@ -110,6 +114,275 @@ function rememberCompatSrc(src: string): void {
   }
 }
 
+/**
+ * 播放时钟（仅**时间文案**用，BUG-216）：把「随时间推进」的状态隔离在叶子组件里。
+ *
+ * 为什么抽成 hook 并由叶子组件持有：
+ * 时间文案随媒体时间推进。若把这个 state 放在 `VideoPlayer` 顶层，每次 `timeupdate`
+ * （约 3.8 次/秒，与倍速无关）都会重渲染**整棵控件树**（含 8 项倍速菜单、音量、
+ * 全屏、PiP 等）。实测（同页同文件 1440×807，2x/4x）：顶层持有时间状态时上屏
+ * 55.9/55.7fps、rVFC 间隔 p95=33ms、>25ms 的帧 42/38、DOM 变更 24.5/32.6 次/秒；
+ * 把状态下沉到只画这一小块的叶子组件后，父组件不再因时间推进而重渲染。
+ *
+ * 这里只保留**文本**需要的 `currentTime` / `duration`：文案每秒才变一次，
+ * React 的 characterData 写入本就与之等频（1 次/秒），无需再降到 DOM 层。
+ * 进度条（更高频、需要条宽）走 `PlayerProgressBar` 的 ref + 直接写 DOM。
+ */
+function useMediaClock(videoRef: React.RefObject<HTMLVideoElement | null>) {
+  const [currentTime, setCurrentTime] = useState(0)
+  const [duration, setDuration] = useState(0)
+
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return
+    const onTime = () => setCurrentTime(v.currentTime)
+    const onDur = () => setDuration(Number.isFinite(v.duration) ? v.duration : 0)
+    v.addEventListener('timeupdate', onTime)
+    // seeked：`skip()` 直接写 `v.currentTime` 后即时刷新（不必等下一个 timeupdate）
+    v.addEventListener('seeked', onTime)
+    v.addEventListener('loadedmetadata', onDur)
+    v.addEventListener('durationchange', onDur)
+    // 监听器挂载前可能已有元数据：立即同步一次
+    onTime()
+    onDur()
+    return () => {
+      v.removeEventListener('timeupdate', onTime)
+      v.removeEventListener('seeked', onTime)
+      v.removeEventListener('loadedmetadata', onDur)
+      v.removeEventListener('durationchange', onDur)
+    }
+  }, [videoRef])
+
+  return { currentTime, duration }
+}
+
+/** 时间文案叶子（BUG-216）：只订阅播放时钟，不牵动父组件重渲染。 */
+function PlayerTimeText({ videoRef }: { videoRef: React.RefObject<HTMLVideoElement | null> }) {
+  const { currentTime, duration } = useMediaClock(videoRef)
+  return (
+    <span className="min-w-[92px] pl-1 text-xs font-medium tabular-nums text-white/90 md:text-sm">
+      {fmtDuration(Math.floor(currentTime)) || '0:00'} / {fmtDuration(Math.floor(duration)) || '--:--'}
+    </span>
+  )
+}
+
+/** 播放段最小写入间隔（毫秒）：视觉平滑与 DOM 写入次数的折中。
+ *  0.7s 一拍 ⇒ 每拍条宽移动 (0.7s × 倍速 / 时长) × 条宽；对 20 分钟条目、4x 约 3px，
+ *  仍在肉眼可辨阈值附近，却把「每个 timeupdate 都写 DOM」降到 ~1.4 次/秒（BUG-216）。 */
+const BAR_WRITE_MS = 700
+/** aria-valuenow 更新间隔（毫秒）：与视觉节流解耦，辅助技术交互时仍能取到值。 */
+const ARIA_WRITE_MS = 5000
+/** 已缓冲段最小写入间隔（毫秒）与最小变化量（%）：缓冲会持续增长，不去重会持续刷 DOM。 */
+const BUFFERED_WRITE_MS = 1500
+const BUFFERED_DELTA_PCT = 2
+
+interface PlayerProgressBarProps {
+  videoRef: React.RefObject<HTMLVideoElement | null>
+  /** 悬停态由父组件持有（`pokeControls` 依赖它决定是否自动隐藏），此处只读+回调 */
+  barHover: boolean
+  onBarHoverChange: (hover: boolean) => void
+}
+
+/**
+ * 进度条叶子（BUG-216）：承载缓冲段、播放段与拖拽。
+ *
+ * **时间推进完全不经 React state**：`timeupdate` / `progress` / `seeked` 触发的是
+ * 「合并到一帧内、且按墙钟节流」的 DOM 直写（`el.style.width` / `setAttribute`）。
+ * 这样既不让父组件重渲染，也不让本组件每秒重渲染几十次 —— 实测 DOM 变更从
+ * 24.5/32.6 次/秒降到个位数（见 BUG-216）。
+ *
+ * 拖拽语义（BUG-165）**原样保留**：按下与移动只更新 `dragRatioRef`（视觉位置，条面
+ * 即时跟手，**不写 `currentTime`** —— 每次写 `currentTime` 都会中止旧请求再发一个新
+ * Range 请求，实测 2s 拖拽 7 发 7 取消）；只有 `pointerup` 才提交唯一一次 `seekToRatio`。
+ */
+function PlayerProgressBar({ videoRef, barHover, onBarHoverChange }: PlayerProgressBarProps) {
+  const { t } = useTranslation()
+  const barRef = useRef<HTMLDivElement>(null)
+  const playedRef = useRef<HTMLDivElement>(null)
+  const bufferedRef = useRef<HTMLDivElement>(null)
+  /** 拖拽中的视觉位置（null = 未在拖拽）：只喂条面渲染，不碰 `currentTime`（BUG-165） */
+  const dragRatioRef = useRef<number | null>(null)
+  const lastBarMs = useRef(0)
+  const lastAriaMs = useRef(0)
+  const lastBufferedMs = useRef(0)
+  const lastBufferedPct = useRef(-1)
+
+  /** 把当前播放位置 / 缓冲 / aria 直接写进 DOM（不经 React state）。
+   *  `force=true` 用于离散事件（seek / 拖拽 / 元数据）即时刷新，不受节流限制。 */
+  /**
+   * 直接写（**刻意不用 rAF**）。
+   *
+   * 曾试过把写入合并到 `requestAnimationFrame`，实测反而把上屏节拍打坏：
+   * 同一条件下 app@2x 从 presented 55.7 掉到 51.5、rVFC 间隔 >25ms 的帧从 42 涨到 84
+   * （`_probe_render_churn.cjs`）。原因是 rAF 回调与视频呈现同帧竞争，回调里的
+   * 样式写入会推迟该帧的合成。改为在事件回调里同步写、靠墙钟节流降频即可。
+   */
+  const write = useCallback(
+    (force: boolean) => {
+      const v = videoRef.current
+      const played = playedRef.current
+      const slider = barRef.current
+      if (!v || !played || !slider) return
+      const dur = Number.isFinite(v.duration) ? v.duration : 0
+      const now = performance.now()
+      const ratio = dragRatioRef.current
+      const shown = ratio !== null && dur > 0 ? ratio * dur : v.currentTime
+
+      // 播放段：墙钟节流 + 只在值变化时写
+      if (force || now - lastBarMs.current >= BAR_WRITE_MS) {
+        lastBarMs.current = now
+        const pct = dur > 0 ? Math.min(100, (shown / dur) * 100) : 0
+        played.style.width = `${pct}%`
+      }
+
+      // aria：与视觉节流解耦，低频更新（拖拽/seek 时 force 即时）
+      if (force || now - lastAriaMs.current >= ARIA_WRITE_MS) {
+        lastAriaMs.current = now
+        const maxSec = String(Math.floor(dur))
+        const nowSec = String(Math.floor(shown))
+        if (slider.getAttribute('aria-valuemax') !== maxSec) slider.setAttribute('aria-valuemax', maxSec)
+        if (slider.getAttribute('aria-valuenow') !== nowSec) slider.setAttribute('aria-valuenow', nowSec)
+      }
+
+      // 已缓冲段：低频 + 显著变化才写（本地文件缓冲会持续增长，不去重会持续刷 DOM）
+      const buffered = bufferedRef.current
+      if (buffered && dur > 0 && (force || now - lastBufferedMs.current >= BUFFERED_WRITE_MS)) {
+        const b = v.buffered
+        const bp = b.length > 0 ? Math.max(0, Math.min(100, (b.end(b.length - 1) / dur) * 100)) : 0
+        if (force || Math.abs(bp - lastBufferedPct.current) >= BUFFERED_DELTA_PCT) {
+          lastBufferedMs.current = now
+          lastBufferedPct.current = bp
+          buffered.style.width = `${bp}%`
+        }
+      }
+    },
+    [videoRef],
+  )
+
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return
+    const onTick = () => write(false)
+    const onSeek = () => write(true)
+    v.addEventListener('timeupdate', onTick)
+    v.addEventListener('progress', onTick)
+    v.addEventListener('seeked', onSeek)
+    v.addEventListener('loadedmetadata', onSeek)
+    v.addEventListener('durationchange', onSeek)
+    // 监听器挂载前可能已有元数据 / 进度：立即同步一次
+    write(true)
+    return () => {
+      v.removeEventListener('timeupdate', onTick)
+      v.removeEventListener('progress', onTick)
+      v.removeEventListener('seeked', onSeek)
+      v.removeEventListener('loadedmetadata', onSeek)
+      v.removeEventListener('durationchange', onSeek)
+    }
+  }, [videoRef, write])
+
+  const seekRatioFromClientX = useCallback((clientX: number) => {
+    const el = barRef.current
+    if (!el) return null
+    const rect = el.getBoundingClientRect()
+    if (rect.width <= 0) return null
+    return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width))
+  }, [])
+
+  const seekToRatio = useCallback(
+    (ratio: number) => {
+      const v = videoRef.current
+      if (!v) return
+      const dur = Number.isFinite(v.duration) ? v.duration : 0
+      if (!dur) return
+      v.currentTime = ratio * dur
+      write(true)
+    },
+    [videoRef, write],
+  )
+
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      e.preventDefault()
+      const ratio = seekRatioFromClientX(e.clientX)
+      if (ratio === null) return
+      // 拖拽期**不提交 seek**（BUG-165）：松手前是未确认态，只记录视觉位置，
+      // 条面即时跟手；真正提交在 pointerup。
+      dragRatioRef.current = ratio
+      write(true)
+      const el = e.currentTarget
+      el.setPointerCapture(e.pointerId)
+      onBarHoverChange(true)
+    },
+    [seekRatioFromClientX, write, onBarHoverChange],
+  )
+
+  const onPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!e.currentTarget.hasPointerCapture(e.pointerId)) return
+      const ratio = seekRatioFromClientX(e.clientX)
+      if (ratio === null) return
+      dragRatioRef.current = ratio
+      write(true) // 拖拽跟手：立即写，不等节流
+    },
+    [seekRatioFromClientX, write],
+  )
+
+  const onPointerUp = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId)
+      }
+      onBarHoverChange(false)
+      const ratio = dragRatioRef.current
+      dragRatioRef.current = null
+      // 松手 = 确认位：此刻才提交唯一一次 seek（BUG-165）。
+      if (ratio !== null) seekToRatio(ratio)
+      else write(true)
+    },
+    [seekToRatio, write, onBarHoverChange],
+  )
+
+  return (
+    <div
+      ref={barRef}
+      role="slider"
+      tabIndex={0}
+      aria-label={t('player.progress')}
+      aria-valuemin={0}
+      /* aria-valuemax / aria-valuenow 的**实际值**由 `write()` 直接写 DOM（BUG-216）；
+         这里保留常量初值只为「属性始终存在」（BUG-149 的可访问性契约），
+         React 只在初值变化时写入，故不会覆盖 `write()` 的直写结果。 */
+      aria-valuemax={0}
+      aria-valuenow={0}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+      onMouseEnter={() => onBarHoverChange(true)}
+      onMouseLeave={() => onBarHoverChange(false)}
+      className={cn(
+        'relative mb-3 cursor-pointer touch-none transition-all',
+        barHover ? 'h-2.5' : 'h-1.5',
+      )}
+    >
+      <div className="absolute inset-0 overflow-hidden rounded-full bg-white/25">
+        {/* 条宽由 `write()` 直写（BUG-216）；JSX 初值 '0%' 只避免首帧闪满 */}
+        <div ref={bufferedRef} className="h-full rounded-full bg-white/45" style={{ width: '0%' }} />
+      </div>
+      <div className="absolute inset-0 flex items-center">
+        <div ref={playedRef} className="relative h-full rounded-full bg-accent" style={{ width: '0%' }}>
+          <div
+            className={cn(
+              'absolute right-0 top-1/2 h-3.5 w-3.5 -translate-y-1/2 translate-x-1/2 rounded-full border-2 border-white bg-accent shadow-lg transition-opacity',
+              barHover ? 'opacity-100' : 'opacity-0',
+            )}
+          />
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export function VideoPlayer({
   src,
   fallbackSrc,
@@ -136,14 +409,13 @@ export function VideoPlayer({
 
   const containerRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
-  const barRef = useRef<HTMLDivElement>(null)
   const hideTimer = useRef<number | null>(null)
   const centerTimer = useRef<number | null>(null)
+  /** 时长快照（BUG-216）：仅供 `skip()` 在 `v.duration` 不可用时兜底，
+   *  用 ref 而非 state —— 它不参与渲染，不该触发重渲染。 */
+  const durationRef = useRef(0)
 
   const [isPlaying, setIsPlaying] = useState(false)
-  const [currentTime, setCurrentTime] = useState(0)
-  const [duration, setDuration] = useState(0)
-  const [buffered, setBuffered] = useState(0)
   const [isBuffering, setIsBuffering] = useState(false)
   const [showControls, setShowControls] = useState(true)
   const [isFullscreen, setIsFullscreen] = useState(false)
@@ -156,8 +428,6 @@ export function VideoPlayer({
   const [showCountdown, setShowCountdown] = useState(false)
   const [fatal, setFatal] = useState(false)
   const [fellBack, setFellBack] = useState(false)
-  /** 拖拽中的视觉位置（null = 未在拖拽）：只喂条面渲染，不碰 `currentTime`（BUG-165） */
-  const [dragRatio, setDragRatio] = useState<number | null>(null)
   /** 当前实际播放源：原始流 → 视频轨解不出来时自动切兼容流（BUG-208）。
    *  已知解不动的源（localStorage 记忆）直接从兼容流起步，不走 3s 无帧弯路。 */
   const [activeSrc, setActiveSrc] = useState(() =>
@@ -272,13 +542,13 @@ export function VideoPlayer({
     (sec: number) => {
       const v = videoRef.current
       if (!v) return
-      const d = Number.isFinite(v.duration) ? v.duration : duration
+      const d = Number.isFinite(v.duration) ? v.duration : durationRef.current
       const next = Math.max(0, Math.min(d || 0, v.currentTime + sec))
+      // 写 `currentTime` 会触发 `seeked` / `timeupdate`，叶子组件（BUG-216）据此即时刷新条面与时间文案
       v.currentTime = next
-      setCurrentTime(next)
       pokeControls()
     },
-    [duration, pokeControls],
+    [pokeControls],
   )
 
   const toggleMute = useCallback(() => {
@@ -338,87 +608,13 @@ export function VideoPlayer({
     [setPlaybackRate],
   )
 
-  // ---------- 进度条：指针拖拽（pointer capture，拖出条外也跟手） ----------
-  const seekRatioFromClientX = useCallback((clientX: number) => {
-    const el = barRef.current
-    if (!el) return null
-    const rect = el.getBoundingClientRect()
-    if (rect.width <= 0) return null
-    return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width))
-  }, [])
-
-  const seekToRatio = useCallback(
-    (ratio: number) => {
-      const v = videoRef.current
-      const d = Number.isFinite(v?.duration ?? NaN) ? (v as HTMLVideoElement).duration : duration
-      if (!v || !d) return
-      const t2 = ratio * d
-      v.currentTime = t2
-      setCurrentTime(t2)
-    },
-    [duration],
-  )
-
-  const onBarPointerDown = useCallback(
-    (e: React.PointerEvent<HTMLDivElement>) => {
-      e.preventDefault()
-      const ratio = seekRatioFromClientX(e.clientX)
-      if (ratio === null) return
-      // 拖拽期**不提交 seek**（BUG-165）：松手前是未确认态，而每次写 `currentTime`
-      // 都会中止旧请求、再发一个新 Range 请求（实测 2s 拖拽 7 发 7 取消）。
-      // 这里只记录视觉位置，条面即时跟手；真正提交在 pointerup。
-      setDragRatio(ratio)
-      const el = e.currentTarget
-      el.setPointerCapture(e.pointerId)
-      setBarHover(true)
-    },
-    [seekRatioFromClientX],
-  )
-
-  const onBarPointerMove = useCallback(
-    (e: React.PointerEvent<HTMLDivElement>) => {
-      if (!e.currentTarget.hasPointerCapture(e.pointerId)) return
-      const ratio = seekRatioFromClientX(e.clientX)
-      if (ratio === null) return
-      setDragRatio(ratio)
-    },
-    [seekRatioFromClientX],
-  )
-
-  const onBarPointerUp = useCallback(
-    (e: React.PointerEvent<HTMLDivElement>) => {
-      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-        e.currentTarget.releasePointerCapture(e.pointerId)
-      }
-      setBarHover(false)
-      // 松手 = 确认位：此刻才提交唯一一次 seek（BUG-165）。
-      if (dragRatio !== null) seekToRatio(dragRatio)
-      setDragRatio(null)
-    },
-    [dragRatio, seekToRatio],
-  )
-
   // ---------- 媒体事件 ----------
   const onLoadedMetadata = useCallback(() => {
     const v = videoRef.current
     if (!v) return
-    setDuration(Number.isFinite(v.duration) ? v.duration : 0)
+    durationRef.current = Number.isFinite(v.duration) ? v.duration : 0
     applyPrefs()
   }, [applyPrefs])
-
-  const readBuffered = useCallback(() => {
-    const v = videoRef.current
-    if (!v || !v.duration || !Number.isFinite(v.duration)) return
-    const b = v.buffered
-    if (b.length > 0) setBuffered(Math.min(1, b.end(b.length - 1) / v.duration))
-  }, [])
-
-  const onTimeUpdate = useCallback(() => {
-    const v = videoRef.current
-    if (!v) return
-    setCurrentTime(v.currentTime)
-    readBuffered()
-  }, [readBuffered])
 
   const onError = useCallback(() => {
     const v = videoRef.current
@@ -521,11 +717,6 @@ export function VideoPlayer({
     return () => document.removeEventListener('keydown', onKey)
   }, [flashCenter, togglePlay, skip, changeVolume, effectiveVolume, toggleMute, toggleFullscreen, togglePiP])
 
-  // 拖拽中条面跟手显示拖拽位置（不写 currentTime）；松手后回到真实播放位置
-  const shownSec = dragRatio !== null && duration > 0 ? dragRatio * duration : currentTime
-  const playedPct = duration > 0 ? Math.min(100, (shownSec / duration) * 100) : 0
-  const bufferedPct = Math.max(0, Math.min(100, buffered * 100))
-
   return (
     <div
       ref={containerRef}
@@ -557,8 +748,6 @@ export function VideoPlayer({
         className="h-full w-full bg-black object-contain"
         onClick={togglePlay}
         onLoadedMetadata={onLoadedMetadata}
-        onTimeUpdate={onTimeUpdate}
-        onProgress={readBuffered}
         onPlay={() => {
           setIsPlaying(true)
           setIsBuffering(false)
@@ -749,43 +938,8 @@ export function VideoPlayer({
         <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/80 via-black/15 to-transparent" />
 
         <div className="pointer-events-auto relative px-3 pb-3 pt-14 md:px-4 md:pb-4">
-          {/* 进度条 */}
-          <div
-            ref={barRef}
-            role="slider"
-            tabIndex={0}
-            aria-label={t('player.progress')}
-            aria-valuemin={0}
-            aria-valuemax={Math.floor(duration)}
-            aria-valuenow={Math.floor(shownSec)}
-            onPointerDown={onBarPointerDown}
-            onPointerMove={onBarPointerMove}
-            onPointerUp={onBarPointerUp}
-            onPointerCancel={onBarPointerUp}
-            onMouseEnter={() => setBarHover(true)}
-            onMouseLeave={() => setBarHover(false)}
-            className={cn(
-              'relative mb-3 cursor-pointer touch-none transition-all',
-              barHover ? 'h-2.5' : 'h-1.5',
-            )}
-          >
-            <div className="absolute inset-0 overflow-hidden rounded-full bg-white/25">
-              <div className="h-full rounded-full bg-white/45" style={{ width: `${bufferedPct}%` }} />
-            </div>
-            <div className="absolute inset-0 flex items-center">
-              <div
-                className="relative h-full rounded-full bg-accent"
-                style={{ width: `${playedPct}%` }}
-              >
-                <div
-                  className={cn(
-                    'absolute right-0 top-1/2 h-3.5 w-3.5 -translate-y-1/2 translate-x-1/2 rounded-full border-2 border-white bg-accent shadow-lg transition-opacity',
-                    barHover ? 'opacity-100' : 'opacity-0',
-                  )}
-                />
-              </div>
-            </div>
-          </div>
+          {/* 进度条（BUG-216：状态在叶子组件内，父组件不因 timeupdate 重渲染） */}
+          <PlayerProgressBar videoRef={videoRef} barHover={barHover} onBarHoverChange={setBarHover} />
 
           {/* 按钮组 */}
           <div className="flex items-center justify-between gap-2">
@@ -874,10 +1028,8 @@ export function VideoPlayer({
                 </div>
               </div>
 
-              {/* 时间 */}
-              <span className="min-w-[92px] pl-1 text-xs font-medium tabular-nums text-white/90 md:text-sm">
-                {fmtDuration(Math.floor(shownSec)) || '0:00'} / {fmtDuration(Math.floor(duration)) || '--:--'}
-              </span>
+              {/* 时间（BUG-216：状态在叶子组件内） */}
+              <PlayerTimeText videoRef={videoRef} />
             </div>
 
             <div className="flex items-center gap-1 md:gap-2">
