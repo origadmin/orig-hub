@@ -71,6 +71,12 @@ import { CoverImage } from './CoverImage'
 import { Button } from '../ui/button'
 import { useTranslation } from '../../i18n'
 
+/**
+ * 剧集介绍折叠阈值（像素）：超过该高度才给「展开 / 收起」（照抄 `SeriesHero.tsx` 的
+ * `DESC_CLAMP_PX`，R4 口径一致 —— 短介绍挂一个折叠按钮是噪音）。
+ */
+const DESC_CLAMP_PX = 64
+
 /** 统一的灯箱状态（设计 §2.3）：items 的范围**收敛到传入数组**（R6） */
 interface LightboxState {
   items: LightboxItem[]
@@ -92,9 +98,13 @@ interface LightboxState {
  *   - **标题单行省略**（§6.2：标题控制宽度一行显示，超出处理）。
  *
  * 原手风琴形态（PRD 方案 A「两区一态」）由本形态取代；`EpisodeBoard` /
- * `EpisodeExpanded` / `SeriesHero` 上的**全部能力**（编辑 / 挂图 / 多源 / 上移下移 /
- * 移除 / 播放 / 前往条目 / 重缓存 / 灯箱 / 标签 / 合并 / 删除 / 导出）逐一迁入，
- * **能力零删减**（BUG-149：重构不是删能力的授权）。所有对话框的状态仍归本容器。
+ * `EpisodeExpanded` / `SeriesHero` 上的能力（编辑 / 挂图 / 多源 / 上移下移 /
+ * 移除 / 播放 / 前往条目 / 重缓存 / 灯箱 / 标签 / 合并 / 删除 / 导出）逐一迁入。
+ *
+ * **注意（BUG-183）**：迁移清单曾**漏列「剧集介绍」**，导致该能力（`SeriesHero` 的
+ * 剧集介绍展示 + 展开/收起 + 编辑入口）在重构后一度缺失，BUG-183 已补回。
+ * ⇒ **按清单逐项核对会漏项** —— 核对须以组件实际能力为准，不能只看清单是否勾完。
+ * 所有对话框的状态仍归本容器。
  */
 export function SeriesDetail(props: {
   detail: MediaSeriesDetail
@@ -135,6 +145,14 @@ export function SeriesDetail(props: {
   const [editingTags, setEditingTags] = useState(false)
   const [selectedTagIds, setSelectedTagIds] = useState<number[]>(detail.tags.map((x) => x.id))
   const [lightbox, setLightbox] = useState<LightboxState | null>(null)
+  /**
+   * 剧集介绍展示位（BUG-183）：`SeriesHero` 的「介绍展示 + 展开/收起 + 编辑入口」
+   * 在重构迁入本组件时漏搬，此处补回。`descOverflowing` 只在介绍真的超过折叠阈值时
+   * 才给「展开 / 收起」（与 `SeriesHero` 同款：短介绍挂按钮是噪音）。
+   */
+  const descRef = useRef<HTMLParagraphElement>(null)
+  const [descOverflowing, setDescOverflowing] = useState(false)
+  const [descExpanded, setDescExpanded] = useState(false)
 
   const { playEps, photoEps } = partitionEpisodes(detail)
 
@@ -160,7 +178,14 @@ export function SeriesDetail(props: {
     setEditingTags(false)
     setSelectedTagIds(detail.tags.map((x) => x.id))
     setLightbox(null)
+    setDescExpanded(false)
   }, [detail.id])
+
+  /** 介绍是否超折叠阈值 —— 只在 `detail.description` 变化时重测（与 `SeriesHero` 同款）。 */
+  useEffect(() => {
+    const el = descRef.current
+    setDescOverflowing(el != null && el.scrollHeight > DESC_CLAMP_PX + 4)
+  }, [detail.description])
 
   /** 播放下标必须相对 `detail.episodes`（父层 `episodesToItems` 用的是全量序列） */
   const playEpisode = (ep: MediaEpisode) => {
@@ -390,6 +415,60 @@ export function SeriesDetail(props: {
               ))}
             </div>
           ) : null}
+
+          {/*
+            剧集介绍展示位（BUG-183 补回）：`SeriesHero` 曾承载「剧集介绍展示 + 展开/收起
+            + 编辑入口」，重构迁入 `SeriesDetail` 时**漏搬**（迁移清单本身漏列了「剧集介绍」，
+            故按清单核对永远核不出来）。设计文档 V7 定档：位置「在标签之后、动作之前」。
+            非空恒渲染（**绝不用首集介绍 `cur.description` 兜底**）；空态给可编辑空位。
+          */}
+          <div className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5">
+            <span className="text-[11px] font-medium text-fg-strong">{t('media.series.editDesc')}</span>
+            {detail.description ? (
+              <div className="flex items-start gap-1.5">
+                <p
+                  ref={descRef}
+                  style={!descExpanded ? { maxHeight: DESC_CLAMP_PX, overflow: 'hidden' } : undefined}
+                  className="min-w-0 flex-1 whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[12.5px] leading-relaxed text-muted"
+                  data-testid="series-description"
+                >
+                  {detail.description}
+                </p>
+                <div className="flex shrink-0 flex-col items-start gap-1">
+                  {descOverflowing ? (
+                    <button
+                      type="button"
+                      onClick={() => setDescExpanded((v) => !v)}
+                      className="rounded px-1.5 py-0.5 text-[10.5px] text-accent hover:bg-accent/10"
+                      data-testid="series-desc-toggle"
+                    >
+                      {descExpanded ? t('media.series.descShowLess') : t('media.series.descShowMore')}
+                    </button>
+                  ) : null}
+                  {/* 编辑入口进 `SeriesEditPanel`（介绍与标题/类型/年份/标签一次提交） */}
+                  <button
+                    type="button"
+                    onClick={() => setEditingSeries(true)}
+                    className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] text-muted hover:bg-surface-2 hover:text-fg-mid"
+                    title={t('media.editSeriesDesc')}
+                    data-testid="series-desc-edit"
+                  >
+                    <Pencil className="h-3 w-3" /> {t('media.series.editMeta')}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              /* 介绍空态：可编辑空位（R4 判据）—— 不出现首集介绍文本 */
+              <button
+                type="button"
+                onClick={() => setEditingSeries(true)}
+                className="self-start rounded px-1.5 py-0.5 text-[10.5px] text-accent hover:bg-accent/10"
+                data-testid="series-desc-edit"
+              >
+                {t('media.addSeriesDesc')}
+              </button>
+            )}
+          </div>
 
           {/* 总览操作（规范 v3 leftPane：编辑剧集 + 标签，置于总览块内）。
               合并/导出/删除是**本剧集实体**的操作 ⇒ 必须落在实体表面（此卡），
