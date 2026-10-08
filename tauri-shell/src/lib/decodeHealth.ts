@@ -11,10 +11,14 @@ import { useEffect, useState } from 'react'
  *    只有 `videoWidth === 0` 且一帧都不上屏。用户面对黑屏 + 走动的控制条，
  *    app 却什么都不提示。
  *
- * 2. `strained` —— 解码吞吐跟不上（高分辨率/高码率 + 倍速播放）。
- *    现象是 `readyState` 恒为 4、缓冲也充足，但 `droppedVideoFrames` 持续增长，
- *    画面丢帧/跳帧。数据供给一切正常，所以凭缓冲指标永远看不出来，
- *    用户感知就是「莫名卡」。
+ * 2. `strained` —— 播放管线被饿死：**时间轴推进慢于请求的倍速**（真解码 / 投递跟不上）。
+ *    主判据是**有效倍速** `ΔcurrentTime / (Δt × playbackRate)`；`readyState` 恒为 4、
+ *    缓冲也充足时凭这些指标都看不出来，用户感知就是「莫名卡」。
+ *
+ *    （BUG-212 修订：`droppedVideoFrames` 增长**不是**解码不足的信号——倍速下呈现需求
+ *    = 源帧率 × 倍速，超出刷新率时按比例丢帧是物理必然，与解码能力无关；丢帧只会
+ *    影响上屏、不会让 `currentTime` 变慢，因此丢帧速率**不再**单独作为 `strained` 判据，
+ *    仅在 1x 且缓冲充足时作为副判据保留，见 BUG-034 原意。）
  *
  * ---
  * BUG-053 修订：**「不论卡不卡都提示解码吃力」**
@@ -27,29 +31,38 @@ import { useEffect, useState } from 'react'
  *
  * 现在改为**带迟滞的实时状态**：
  *
- * - **可恢复**：连续 `CALM_STREAK` 个采样点不再丢帧 -> 撤销提示（迟滞，避免闪烁）。
+ * - **可恢复**：连续 `CALM_STREAK` 个采样点不再判为吃力 -> 撤销提示（迟滞，避免闪烁）。
  * - **预热静默期**：起播 / 跳转 / 改速后 `WARMUP_MS` 内只跟基线、不判定
- *   （解码器预热与首帧填充期的丢帧不代表吞吐不足）。
- * - **事件重设基线**：暂停/跳转期间计数会累积，恢复时不能把旧账算成新丢帧。
- * - **样本量下限**：采样窗内解码帧太少（卡缓冲 / 刚起播）时不判定。
+ *   （解码器预热与首帧填充期的丢帧 / 时间轴爬升不代表吞吐不足）。
+ * - **事件重设基线**：暂停/跳转期间计数与时间轴会跳变，恢复时不能把旧账算成新样本。
+ * - **样本量下限**：采样窗内解码帧太少（卡缓冲 / 刚起播）时不足以估计丢帧速率。
  * - 画面尺寸出现后同样撤销 `unsupported`（元数据晚到、换源后不应误报）。
  */
 export type DecodeState = 'ok' | 'strained' | 'unsupported'
 
 const SAMPLE_MS = 500
-/** 连续多少个采样点丢帧才算吃力（4 × 500ms = 2s） */
+/** 连续多少个采样点判为吃力才算吃力（4 × 500ms = 2s） */
 const STRAIN_STREAK = 4
 /** 连续多少个采样点恢复正常才撤销提示（4 × 500ms = 2s） */
 const CALM_STREAK = 4
-/** 丢帧速率阈值：每秒丢超过 3 帧算吃力 */
+/** 丢帧速率阈值：每秒丢超过 3 帧算吃力（**仅 1x 副判据使用**，见 BUG-212） */
 const DROP_PER_SEC = 3
-/** 采样窗内解码帧少于此数时不判定（卡缓冲 / 刚起播的噪声样本） */
+/** 采样窗内解码帧少于此数时不足以估计丢帧速率（卡缓冲 / 刚起播的噪声样本） */
 const MIN_SAMPLED_FRAMES = 4
+/**
+ * 有效倍速下限（BUG-212 主判据）：采样窗内「实际时间轴推进速度 / 期望推进速度」
+ * 低于此值，即判定播放管线被饿死（真解码 / 投递不足）。
+ *
+ * 取 0.9 而非贴着 1.0：`currentTime` 采样、`performance.now()` 计时与 500ms 定时器
+ * 都有毫秒级调度抖动，健康播放时该比值实测 ≈1.0 但会在 0.97–1.0 间浮动；留 10% 余量
+ * 可避免把调度抖动误判为饿死，而真饿死时该比值通常远低于 0.9，仍能稳定命中。
+ */
+const EFF_RATE_MIN = 0.9
 /** 元数据就绪后多久仍无画面尺寸，判定为视频轨不可解 */
 const NO_FRAME_MS = 3000
 /** 起播 / 跳转 / 改速后的静默期：解码器预热与首帧填充 */
 const WARMUP_MS = 1500
-/** 这些事件上丢帧计数会跳变，必须重设基线，否则旧账会被算成新丢帧 */
+/** 这些事件上丢帧计数与时间轴会跳变，必须重设基线，否则旧账会被算成新样本 */
 const REBASE_EVENTS = [
   'loadedmetadata',
   'loadeddata',
@@ -63,10 +76,14 @@ const REBASE_EVENTS = [
   'stalled',
 ]
 /**
- * 判定「解码吃力」要求的数据供给下限（BUG-166）：缓冲领先播放位置不足此值时，
- * 丢帧是**数据晚到**（供给被同管道的其他流量抢走 / 在线流节流），不是解码吞吐不足——
- * 此时弹「调低播放速度会明显更流畅」是误导（用户实测：无可见卡顿却常驻提示）。
- * 供给不足期间只跟基线不判定；供给充足（≥2s 领先）仍持续丢帧才允许置位。
+ * 判定「解码吃力」**丢帧副判据**要求的数据供给下限（BUG-166）：缓冲领先播放位置不足
+ * 此值时，丢帧是**数据晚到**（供给被同管道的其他流量抢走 / 在线流节流），不是解码吞吐
+ * 不足——此时弹「调低播放速度会明显更流畅」是误导（用户实测：无可见卡顿却常驻提示）。
+ *
+ * BUG-212 修订：该豁免**只作用于丢帧副判据**，不再作用于「有效倍速」主判据。因为
+ * `effRate < 1`（时间轴推进慢于请求倍速）本身就是「供给 / 管线跟不上」的**正面证据**，
+ * 而非需要被排除的噪声；若在此处整体早退，主判据恰好在「真被饿死、缓冲自然不足」
+ * 这一最该生效的场景永远无法触发。
  */
 const DATA_AHEAD_MIN = 2.0
 
@@ -87,6 +104,8 @@ export function useDecodeHealth(
     let lastDrop = 0
     let lastTotal = 0
     let lastAt = performance.now()
+    /** 上一拍的 `currentTime`，用于测「有效倍速」（BUG-212） */
+    let lastTime = 0
     let strainStreak = 0
     let calmStreak = 0
     let zeroFrameSince = 0
@@ -99,6 +118,8 @@ export function useDecodeHealth(
       const q = qualityOf(el)
       lastDrop = q ? q.droppedVideoFrames : 0
       lastTotal = q ? q.totalVideoFrames : 0
+      // BUG-212：seeking 会跳变 currentTime，不重设会把跳变算成时间轴推进。
+      lastTime = el.currentTime
       lastAt = performance.now()
       strainStreak = 0
       calmStreak = 0
@@ -139,33 +160,52 @@ export function useDecodeHealth(
       zeroFrameSince = 0
       setState((prev) => (prev === 'unsupported' ? 'ok' : prev))
 
-      // 情况 2：丢帧速率持续偏高 → 解码吞吐不足
-      // seeking/paused 期间计数会跳变，跳过这两态避免误报
+      // 情况 2：播放管线是否跟不上（时间轴推进 / 丢帧）。
+      // seeking/paused 期间计数与时间轴会跳变，跳过这两态避免误报。
       const q = qualityOf(el)
-      if (!q || el.seeking || el.paused || el.readyState < 2) return
+      if (!q || el.seeking || el.paused || el.readyState < 2) {
+        // 暂停/跳转：时间轴冻结或跳变，只跟住基线，不作为推进速度样本
+        lastTime = el.currentTime
+        return
+      }
       if (now < warmupUntil) {
         // 预热期：只跟住基线，不判定
         lastDrop = q.droppedVideoFrames
         lastTotal = q.totalVideoFrames
+        lastTime = el.currentTime
         return
       }
       const delta = q.droppedVideoFrames - lastDrop
       const sampled = q.totalVideoFrames - lastTotal
       lastDrop = q.droppedVideoFrames
       lastTotal = q.totalVideoFrames
-      // 采样窗内几乎没解出帧（卡缓冲 / 刚起播）：样本不足以判定
-      if (dt <= 0 || sampled < MIN_SAMPLED_FRAMES) return
-      // 数据供给不足（BUG-166）：此刻的丢帧是帧晚到被弃，不是解码吞吐不足。
-      // 只跟基线、清空连击，绝不在这种状态置位「解码吃力」。
+      // 有效倍速（BUG-212 主判据）：本窗内时间轴实际推进 / 期望推进。
+      // 丢帧只影响上屏、不改变 currentTime 的推进，故倍速下丢帧不会污染该比值。
+      const advanced = el.currentTime - lastTime
+      lastTime = el.currentTime
+      if (dt <= 0) return
+      const rate = el.playbackRate
+      const effRate = advanced / (dt / 1000) / Math.max(rate, 0.01)
+
+      // 主判据：管线是否被饿死（时间轴推进慢于请求倍速）。
+      // 不受供给下限豁免——effRate < 1 本身就是「供给 / 管线跟不上」的正面证据。
+      const effStarving = effRate < EFF_RATE_MIN
+
+      // 数据供给下限（BUG-166）：缓冲领先不足时的丢帧是「帧晚到被弃」。
+      // 该豁免**只作用于副判据**，不豁免主判据（见 DATA_AHEAD_MIN 注释）。
       const b = el.buffered
       const aheadSec = b.length ? b.end(b.length - 1) - el.currentTime : 0
-      if (aheadSec < DATA_AHEAD_MIN) {
-        strainStreak = 0
-        calmStreak = 0
-        return
-      }
+      const supplyShort = aheadSec < DATA_AHEAD_MIN
 
-      const severe = delta / (dt / 1000) > DROP_PER_SEC
+      // 副判据（仅 1x，保留 BUG-034 原语义）：有足够缓冲却持续丢帧 ⇒ 确实解不动。
+      // 倍速 > 1 时呈现需求 = 源帧率 × 倍速，丢帧是刷新率物理上限，不得单独触发提示。
+      const dropSevere =
+        rate <= 1.01 &&
+        !supplyShort &&
+        sampled >= MIN_SAMPLED_FRAMES &&
+        delta / (dt / 1000) > DROP_PER_SEC
+
+      const severe = effStarving || dropSevere
       if (severe) {
         strainStreak += 1
         calmStreak = 0
