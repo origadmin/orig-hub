@@ -600,6 +600,22 @@ export function SeriesDetail(props: {
                 </div>
               ) : null}
 
+              {/* ▶ 播放本集 = 右栏**唯一实心主按钮**（设计 `episode-internal-ia-v2` §4.2：
+                  「▶ 播放本集 ← 唯一实心主按钮，独占一行，位置随集不变」）。
+                  播放是高频主任务，前置于浏览主战场：紧跟本集图组 Deck 之后、本集介绍
+                  之前 —— 位置由结构固定，不随介绍长度 / 挂图数量漂移。此前它被埋在右栏
+                  底部「操作」区、与三个描边按钮同尺寸，主任务被降格为并列操作（BUG-210）。 */}
+              <Button
+                className="h-9 w-full gap-1.5 text-[13px]"
+                disabled={!hasMediaBytes(cur)}
+                onClick={() => playEpisode(cur)}
+                title={hasMediaBytes(cur) ? t('media.episode.play') : t('media.fileMissingHint')}
+                data-testid="episode-play"
+              >
+                <Play className="h-3 w-3" />
+                {t('media.episode.play')}
+              </Button>
+
               {/* 本集介绍（R2 门控：与剧集介绍逐字相同则不重复渲染）。规范：块标题 + 编辑介绍按钮
                   BUG-203：编辑态隐藏 —— 介绍正在编辑面板的 textarea 里，正文再渲染一份
                   就是第二处重复（与标题的 2 行重叠同根因）。 */}
@@ -622,48 +638,54 @@ export function SeriesDetail(props: {
               ) : null}
 
               {/* 来源 = 切换视频来源来播放（BUG-198）：不是信息展板。剥掉 ref / 内部 id
-                  这类「这道菜怎么烧」的噪声，只留「当前播放来源 + 备用版本一键切换」。 */}
-              <div className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5">
-                <span className="text-[11px] font-medium text-fg-strong">{t('media.episode.sourcesTitle')}</span>
-                {/* 主版本 = 当前播放来源（来源只标 TG/local 这种「哪道菜」，不标 ref 路径） */}
-                <div className="flex items-center gap-2 rounded border border-accent/40 bg-accent/5 px-2 py-1 text-[11px]">
-                  <span className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[10px] text-accent">
-                    {t('media.episode.sourcePrimary')}
-                  </span>
-                  <span className="min-w-0 flex-1 truncate text-fg-strong">{cur.title || `#${cur.itemId}`}</span>
-                  <span className="shrink-0 text-[10px] text-muted">
-                    {cur.source ? t(sourceLabelKey(cur.source)) : 'local'}
-                  </span>
+                  这类「这道菜怎么烧」的噪声，只留「当前播放来源 + 备用版本一键切换」。
+                  设计 `episode-internal-ia-v2` §5 S4：「无备用源 ⇒ 来源区整块不渲染」
+                  （原则「无选择即无控件」）—— 无备用源时本块在 DOM 中**完全不存在**，
+                  而非 hidden/opacity-0。「正在从哪播」已由标题行 meta 的 source 徽标承载，
+                  故门控不丢失信息（BUG-210）。 */}
+              {(cur.sources ?? []).length > 0 ? (
+                <div className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5">
+                  <span className="text-[11px] font-medium text-fg-strong">{t('media.episode.sourcesTitle')}</span>
+                  {/* 主版本 = 当前播放来源（来源只标 TG/local 这种「哪道菜」，不标 ref 路径） */}
+                  <div className="flex items-center gap-2 rounded border border-accent/40 bg-accent/5 px-2 py-1 text-[11px]">
+                    <span className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[10px] text-accent">
+                      {t('media.episode.sourcePrimary')}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-fg-strong">{cur.title || `#${cur.itemId}`}</span>
+                    <span className="shrink-0 text-[10px] text-muted">
+                      {cur.source ? t(sourceLabelKey(cur.source)) : 'local'}
+                    </span>
+                  </div>
+                  {(cur.sources ?? []).length > 0 ? (
+                    <ul className="flex flex-col gap-1">
+                      {(cur.sources ?? []).map((s) => (
+                        <li
+                          key={s.itemId}
+                          className="flex items-center gap-2 rounded border border-border-subtle/70 px-2 py-1 text-[11px]"
+                        >
+                          <span className="min-w-0 flex-1 truncate text-fg-mid">{s.title || `#${s.itemId}`}</span>
+                          <button
+                            type="button"
+                            onClick={() => switchSource(cur, s.itemId)}
+                            className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-muted hover:bg-surface-2 hover:text-fg-mid"
+                            data-testid="episode-source-switch"
+                          >
+                            {t('media.episode.switchPrimary')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => detachSource(cur.id, s.itemId)}
+                            className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-destructive hover:bg-destructive/10"
+                            data-testid="episode-source-detach"
+                          >
+                            {t('media.episode.detachSource')}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
                 </div>
-                {(cur.sources ?? []).length > 0 ? (
-                  <ul className="flex flex-col gap-1">
-                    {(cur.sources ?? []).map((s) => (
-                      <li
-                        key={s.itemId}
-                        className="flex items-center gap-2 rounded border border-border-subtle/70 px-2 py-1 text-[11px]"
-                      >
-                        <span className="min-w-0 flex-1 truncate text-fg-mid">{s.title || `#${s.itemId}`}</span>
-                        <button
-                          type="button"
-                          onClick={() => switchSource(cur, s.itemId)}
-                          className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-muted hover:bg-surface-2 hover:text-fg-mid"
-                          data-testid="episode-source-switch"
-                        >
-                          {t('media.episode.switchPrimary')}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => detachSource(cur.id, s.itemId)}
-                          className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-destructive hover:bg-destructive/10"
-                          data-testid="episode-source-detach"
-                        >
-                          {t('media.episode.detachSource')}
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                ) : null}
-              </div>
+              ) : null}
 
               {/* 单集结构性操作：上移 / 下移 / 移除（编辑入口已上移到标题行，见右栏头） */}
               <div className="flex flex-wrap items-center gap-2 border-t border-border-subtle/60 pt-2.5">
@@ -712,28 +734,18 @@ export function SeriesDetail(props: {
                     size="sm"
                     className="h-7 px-2.5 text-[11px] text-destructive"
                     onClick={() => props.onRemoveEpisode(cur)}
-                    title={t('media.episode.removeFromSeries')}
+                    title={t('media.remove')}
                     data-testid="episode-remove"
                   >
                     <Trash2 className="h-3 w-3" />
-                    {t('media.remove')}
+                    {t('media.episode.removeFromSeries')}
                   </Button>
                 </div>
 
-              {/* 操作（规范 rightPane：播放本集 / 挂图(+) / 在媒体库中查看） */}
+              {/* 操作（规范 rightPane：挂图(+) / 在媒体库中查看 / 重缓存）。
+                  ▶ 播放本集已上移为右栏唯一实心主按钮（见图组之后），此处不再重复。 */}
               <div className="flex flex-wrap items-center gap-2 border-t border-border-subtle/60 pt-2.5">
                 <span className="text-[11px] font-medium text-fg-strong">{t('media.episode.actions')}</span>
-                <Button
-                  size="sm"
-                  className="h-7 px-2.5 text-[11px]"
-                  disabled={!hasMediaBytes(cur)}
-                  onClick={() => playEpisode(cur)}
-                  title={hasMediaBytes(cur) ? t('media.episode.play') : t('media.fileMissingHint')}
-                  data-testid="episode-play"
-                >
-                  <Play className="h-3 w-3" />
-                  {t('media.episode.play')}
-                </Button>
                 {/* BUG-204：图片编辑收进统一面板（episode-images-manage），
                     编辑态不再渲染第二个图片入口；浏览态保留原按钮。 */}
                 {!editingEpisode ? (
