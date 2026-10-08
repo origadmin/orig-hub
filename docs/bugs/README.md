@@ -238,3 +238,4 @@ bash scripts/install-hooks.sh    # 安装 pre-commit 与 commit-msg（钩子不�
 | BUG-210 | 剧集内页主任务错位：播放（episode-play）被埋在右栏「操作」末行、与三个描边按钮同尺寸，无备用源时「来源」块仍整块渲染；修：播放上移为本集图组之后、介绍之前的整行宽唯一实心主按钮（h-9 w-full），「来源」块用 (cur.sources ?? []).length > 0 门控（无备用源时 DOM 中不渲染），能力与 data-testid 全沿用 | fixed | shell |
 | BUG-211 | 分集移除按钮文案与真实动作相反：可见文案「移出资料库」但动作仅解除归属、内容保留在资料库；修：episode-remove 可见文案改 media.episode.removeFromSeries（从剧集中移除（内容保留在资料库））、title 改 media.remove，data-testid/onClick 不变，i18n 键已存在未新增 | fixed | shell |
 | BUG-212 | 倍速下「解码吃力」提示误报（归因错误）：判据 decodeHealth.ts:168 用 droppedVideoFrames 增量、无倍速感知，把「源帧率×倍速 超 60Hz 刷新率」的呈现丢帧当成解码不足（实测 30fps 源 607/598 在 2x 丢 10–23%、4x 丢 ~53%，1x 干净；投递/解码无异常，totalVideoFrames 恰=30×倍速）；正解判据=有效倍速 ΔcurrentTime/(Δt×playbackRate)<1；修：改判据为有效倍速、呈现丢帧不得单独触发、文案改可行动；open，验收判据预先声明 | open | shell |
+| BUG-213 | 验收封装 launch() 恒 headless：意图 headful 的取证脚本静默跑在无 GPU 的 headless 下 | fixed | shell |

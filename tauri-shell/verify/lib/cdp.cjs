@@ -646,7 +646,27 @@ class Browser {
 }
 
 /**
- * Launch a resident headless Edge/Chrome and connect to its DevTools endpoint.
+ * Launch a resident Edge/Chrome and connect to its DevTools endpoint.
+ *
+ * ## headless vs headful matters for measurement (BUG-213)
+ *
+ * `headless` defaults to `true` when omitted; all existing callers rely on that
+ * default and it must not change.
+ *
+ * The distinction is **not** cosmetic for this project. As documented in
+ * `tauri-shell/verify/verify_rate_real_display.cjs:9-19` (the BUG-209 second-round
+ * forensics), a **headless** browser runs software compositing: `rAF` /
+ * `requestVideoFrameCallback` are pinned to a fake ~60Hz ceiling and, for HEVC
+ * entries, `videoWidth` is reported as `0` even while frames decode. Any metric
+ * derived from those signals (dropped-frame rate, presented-frame rate, rVFC
+ * cadence) is therefore **distorted** under headless.
+ *
+ * WARNING: a script whose verdict depends on dropped-frame rate, presented-frame
+ * rate, or `requestVideoFrameCallback` **MUST** pass `{ headless: false }` to get
+ * real-GPU compositing; otherwise its numbers are meaningless. Scripts that only
+ * assert DOM/structural facts may keep the default. (Historically,
+ * `verify_rate_real_display.cjs` had to write its own `launchHeadful()` to work
+ * around this — that workaround is now unnecessary, see BUG-213.)
  *
  * @param {object} options `{ executable, port, readyTimeoutMs, args, headless }`
  * @returns {Promise<Browser>}
@@ -659,11 +679,15 @@ async function launch(options = {}) {
   const userDataDir = options.userDataDir || fs.mkdtempSync(path.join(os.tmpdir(), 'orighub-cdp-'))
 
   const args = [
-    headless ? '--headless=new' : '--headless',
+    // BUG-213: headless-only flags are added *only* when headless is true. The
+    // old code used `headless ? '--headless=new' : '--headless'`, so `headless:
+    // false` still produced a `--headless` browser, and `--disable-gpu` was
+    // always passed. Both are now gated on the same condition so that a headful
+    // request really gets a window and real GPU compositing.
+    ...(headless ? ['--headless=new', '--disable-gpu'] : []),
     `--remote-debugging-port=${port}`,
     '--remote-allow-origins=*',
     '--no-proxy-server',
-    '--disable-gpu',
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-extensions',
