@@ -105,6 +105,12 @@ const BUCKET_COUNT = 20
 const GAP_MS = 50
 /** longtask 落在轮询后 ≤ 该窗内即视为「紧随 5s 节拍」（poll-anchored 判据）。 */
 const ALIGN_WINDOW_MS = 800
+/**
+ * 截图自保护超时。`cdp.screenshot()` 内部硬编码 60s 超时；高负载（如 2x raw 风暴）
+ * 下 `Page.captureScreenshot` 可能长时间无响应。此处加一道更短的护栏：超时即跳过该
+ * 张截图并继续跑完流程，**绝不因一张诊断图中断整轮实测与产物落盘**。
+ */
+const SHOT_TIMEOUT_MS = Number(process.env.STALL_SHOT_TIMEOUT_MS || 15000)
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -244,7 +250,9 @@ async function installProbe(page) {
           readyState: v.readyState,
           networkState: v.networkState,
           paused: v.paused,
+          ended: v.ended,
           playbackRate: v.playbackRate,
+          visibilityState: document.visibilityState,
           ahead,
           frames: q ? q.totalVideoFrames : null,
           dropped: q ? q.droppedVideoFrames : null,
@@ -279,19 +287,10 @@ async function enterTgPanel(page) {
     const btn = document.querySelector('[data-testid="nav-tg"]')
     if (btn) btn.click()
   })
-  // TgPanel 挂载信号：缓存管理入口 / 面板根节点出现
+  // TgPanel 挂载信号：根节点 `data-testid="tg-panel-root"`（TgPanel.tsx:1362，唯一稳定锚点）
   const mounted = await page
     .waitForFunction(
-      () => {
-        // TgPanel 挂载后必然渲染出「频道/媒体」双栏骨架；用 media-viewer 之外的稳定锚点判定。
-        // 这里用面板内的缓存管理按钮或 feed 容器存在来判定，二者任一即可。
-        return (
-          !!document.querySelector('[data-testid="tg-cache-manager-open"]') ||
-          !!document.querySelector('[data-testid="cache-manager"]') ||
-          document.body.innerText.includes('缓存管理') ||
-          !!document.querySelector('[data-testid="nav-tg"][aria-current="page"]')
-        )
-      },
+      () => !!document.querySelector('[data-testid="tg-panel-root"]'),
       { timeout: 15000, intervalMs: 250 },
     )
     .then(() => true)
@@ -356,6 +355,31 @@ async function waitFramed(page, timeoutMs = 90000) {
     )
     .then(() => true)
     .catch(() => false)
+}
+
+/**
+ * 保证播放器在场且以 **1x** 播放：viewer 不在（或被关闭）则重开条目；强制
+ * `playbackRate=1`（消除持久化倍速/竞速变量）+ muted + play。
+ * 返回「调用前是否已在场」，供有效性判定。
+ * @returns {Promise<{wasPresent:boolean, present:boolean, rate:number|null}>}
+ */
+async function ensurePlaying(page, item) {
+  const wasPresent = await page.evaluate(
+    () => !!document.querySelector('[data-testid="media-viewer"] video'),
+  )
+  if (!wasPresent) {
+    await openItem(page, item)
+    await waitFramed(page)
+  }
+  const info = await page.evaluate(() => {
+    const v = document.querySelector('[data-testid="media-viewer"] video')
+    if (!v) return { present: false, rate: null }
+    v.playbackRate = 1
+    v.muted = true
+    void v.play().catch(() => {})
+    return { present: true, rate: v.playbackRate }
+  })
+  return { wasPresent, present: info.present, rate: info.rate }
 }
 
 // ---------------------------------------------------------------------------
@@ -871,6 +895,11 @@ function summarizeCondition(key, w) {
     rawMiB: w.netAnalysis
       ? Number((w.netAnalysis.playerRawBytes / (1024 * 1024)).toFixed(2))
       : null,
+    // 有效性：窗口结束时播放器仍须在场且未播完（否则该条件的播放类指标不可信）
+    playbackValid: !!(w.snap1 && w.snap1.hasVideo) && !(w.snap1 && w.snap1.ended),
+    endPlaybackRate: w.snap1 && w.snap1.hasVideo ? w.snap1.playbackRate : null,
+    endVisibility: w.snap1 && w.snap1.hasVideo ? w.snap1.visibilityState : null,
+    endCurrentTime: w.snap1 && w.snap1.hasVideo ? Number(w.snap1.currentTime.toFixed(2)) : null,
     ltErr: w.ltErr,
   }
 }
@@ -887,7 +916,22 @@ function check(name, pass, detail) {
 
 async function shot(page, name) {
   const f = path.join(OUT, name)
-  await page.screenshot(f, { fullPage: true })
+  // 自保护：截图失败/超时不得中断整轮实测（否则产物不落盘，前功尽弃）。
+  const p = page.screenshot(f, { fullPage: true })
+  p.catch(() => {
+    /* 底层 CDP 命令稍后仍可能 reject（60s 硬超时）；此处吞掉，避免 unhandledRejection */
+  })
+  let timedOut = false
+  try {
+    await Promise.race([p, delay(SHOT_TIMEOUT_MS).then(() => (timedOut = true))])
+  } catch (e) {
+    console.log(`[stall] shot ${name} SKIPPED (screenshot failed: ${e && e.message ? e.message : e})`)
+    return
+  }
+  if (timedOut) {
+    console.log(`[stall] shot ${name} SKIPPED (screenshot timed out after ${SHOT_TIMEOUT_MS}ms)`)
+    return
+  }
   let size = -1
   try {
     size = fs.statSync(f).size
@@ -912,6 +956,7 @@ function logCondition(r) {
       ` player ${r.net ? r.net.playerRequestCount : '-'} feedPoster ${r.net ? r.net.feedPosterRequestCount : '-'}` +
       ` poll ${r.net ? r.net.pollRequestCount : '-'} afterPoll ${r.net ? r.net.maxConcurrentAfterPoll : '-'}]` +
       ` | raw ${r.rawReqCount == null ? '-' : r.rawReqCount} reqs (${r.rawReqPerSec == null ? '-' : r.rawReqPerSec}/s, ${r.rawMiB == null ? '-' : r.rawMiB} MiB)` +
+      ` | playbackValid=${r.playbackValid} endRate=${r.endPlaybackRate} endVis=${r.endVisibility} endT=${r.endCurrentTime}` +
       ` => connPool ${r.netVerdict ? r.netVerdict.verdict : '-'}`,
   )
 }
@@ -934,12 +979,22 @@ async function main() {
   try {
     // headful（BUG-213 已修 cdp.cjs）：次判据 droppedPct/presentedFps/rVFC 需要真实 GPU 合成，
     // headless 会把 rAF/rVFC 钉在 ~60Hz 而失真。主判据（longtask + poll-anchored 5s 对齐）两态皆有效。
-    browser = await cdp.launch({ headless: false })
+    // 附加防节流开关：headful 窗口被遮挡后 renderer 会被后台化（实测 ~10s 后 visibilityState→hidden），
+    // rAF/rVFC 随之降频；这些开关让渲染器保持前台，rVFC/掉帧数据才可信。
+    browser = await cdp.launch({
+      headless: false,
+      args: [
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--disable-background-timer-throttling',
+      ],
+    })
   } catch (e) {
     console.error(`[stall] ENV: browser launch failed: ${e && e.message ? e.message : e}`)
     process.exit(2)
   }
 
+  let results = null
   try {
     const page = await browser.newPage()
     try {
@@ -1017,7 +1072,7 @@ async function main() {
     check(`长条目 ${ITEM} 打开并出帧`, framed && snap && snap.hasVideo, JSON.stringify(snap && { path: snap.path, vw: snap.vw, vh: snap.vh, readyState: snap.readyState }))
     await shot(page, `01_item_${ITEM}_opened.png`)
 
-    const results = {
+    results = {
       item: ITEM,
       windowSec: WINDOW_SEC,
       bucketMs: BUCKET_MS,
@@ -1038,9 +1093,11 @@ async function main() {
     if (!hasActive) {
       console.log(`\n[stall] ===== condition A (baseline, no active task) =====`)
       const ddA = await probeDaemonDownloads(page)
+      const playA = await ensurePlaying(page, ITEM)
       const w = await measureWindowWithNet(page, WINDOW_SEC, netEnabled ? netCollector : null, ITEM)
       const r = summarizeCondition('A', w)
       r.daemonDownloads = ddA
+      r.playback = playA
       results.conditions.A = r
       logCondition(r)
       await shot(page, '10_conditionA_baseline.png')
@@ -1053,9 +1110,11 @@ async function main() {
     if (hasActive) {
       console.log(`\n[stall] ===== condition B (caching, active task) =====`)
       const ddB = await probeDaemonDownloads(page)
+      const playB = await ensurePlaying(page, ITEM)
       const w = await measureWindowWithNet(page, WINDOW_SEC, netEnabled ? netCollector : null, ITEM)
       const r = summarizeCondition('B', w)
       r.daemonDownloads = ddB
+      r.playback = playB
       results.conditions.B = r
       logCondition(r)
       await shot(page, '20_conditionB_caching.png')
@@ -1080,9 +1139,11 @@ async function main() {
       const panelOpen = await page.evaluate(() => !!document.querySelector('[data-testid="cache-manager"]'))
       console.log(`[stall] cache manager open=${opened} panelPresent=${panelOpen}`)
       const ddC = await probeDaemonDownloads(page)
+      const playC = await ensurePlaying(page, ITEM)
       const w = await measureWindowWithNet(page, WINDOW_SEC, netEnabled ? netCollector : null, ITEM)
       const r = summarizeCondition('C', w)
       r.daemonDownloads = ddC
+      r.playback = playC
       results.conditions.C = r
       logCondition(r)
       await shot(page, '30_conditionC_manager_open.png')
@@ -1105,6 +1166,7 @@ async function main() {
       console.log(
         `\n[stall] ===== condition D (candidate-B: ${RAW_STORM_RATE}x raw storm, ${RAW_STORM_SEC}s) =====`,
       )
+      const playD = await ensurePlaying(page, ITEM)
       const stormRate = await page.evaluate((rate) => {
         const v = document.querySelector('[data-testid="media-viewer"] video')
         if (!v) return null
@@ -1115,6 +1177,7 @@ async function main() {
       const w = await measureWindowWithNet(page, RAW_STORM_SEC, netEnabled ? netCollector : null, ITEM)
       const r = summarizeCondition('D', w)
       r.stormRate = stormRate
+      r.playback = playD
       results.conditions.D = r
       logCondition(r)
       await shot(page, `40_conditionD_raw_storm_${RAW_STORM_RATE}x.png`)
@@ -1180,9 +1243,9 @@ async function main() {
     lines.push(
       '| 条件 | longtask 次数 | 最长 longtask(ms) | 相位聚集 | 聚集桶 | 轮询次数 | 轮询中位(ms) | 紧随轮询≤' +
         ALIGN_WINDOW_MS +
-        'ms | 5s对齐(合并) | daemon活跃 | 到origin请求 | 最大并发 | feed抽帧 | 5s后并发 | 连接池判 | rVFC 最大间隔(ms) | 掉帧% | buffered 最小(s) | raw请求数 | raw MiB |',
+        'ms | 5s对齐(合并) | daemon活跃 | 到origin请求 | 最大并发 | feed抽帧 | 5s后并发 | 连接池判 | rVFC 最大间隔(ms) | 掉帧% | buffered 最小(s) | raw请求数 | raw MiB | 播放有效 |',
     )
-    lines.push('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
+    lines.push('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|')
     const label = {
       A: 'A 基线(无任务)',
       B: 'B 缓存中',
@@ -1204,7 +1267,7 @@ async function main() {
           `${n.maxConcurrentAfterPoll == null ? '-' : n.maxConcurrentAfterPoll} | ` +
           `${r.netVerdict ? r.netVerdict.verdict : '-'} | ` +
           `${r.rvfcMaxGapMs} | ${r.droppedPct == null ? '-' : r.droppedPct + '%'} | ${r.bufferedAheadMin} | ` +
-          `${r.rawReqCount == null ? '-' : r.rawReqCount} | ${r.rawMiB == null ? '-' : r.rawMiB} |`,
+          `${r.rawReqCount == null ? '-' : r.rawReqCount} | ${r.rawMiB == null ? '-' : r.rawMiB} | ${r.playbackValid ? '是' : '否'} |`,
       )
     }
     lines.push('')
@@ -1238,6 +1301,17 @@ async function main() {
     console.log(`[stall] artifacts in ${OUT}`)
   } catch (e) {
     console.error('[stall] ERROR', e && e.stack ? e.stack : e)
+    // 兜底：即使中途异常，也把已采集到的条件数据落盘（partial），避免整轮实测白跑。
+    if (results) {
+      try {
+        results.partial = true
+        results.error = String(e && e.message ? e.message : e)
+        fs.writeFileSync(path.join(OUT, 'cache_stall.partial.json'), JSON.stringify(results, null, 2))
+        console.error('[stall] wrote partial artifact: cache_stall.partial.json')
+      } catch (_e) {
+        /* ignore */
+      }
+    }
     process.exitCode = 1
   } finally {
     await browser.close().catch(() => {})
