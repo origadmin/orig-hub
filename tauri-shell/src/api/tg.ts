@@ -453,6 +453,42 @@ export async function deleteCacheTasksByIds(
 }
 
 /**
+ * POST /api/cache/tasks/retry?ids=1,2,3 — 批量重试**终态**任务（BUG-249）。
+ *
+ * 与单条 `retryCacheTask(id)` 共享同一状态机内核（后端 `retry_task_kernel` 循环调用，
+ * 见 `cache.rs` 的 `batch_task_action`），但**契约不同**：单条返回复位后的
+ * `TgCacheTask`，批量返回 `{"ok":true,"ids":[<生效的 id>…]}`。
+ *
+ * 后端只接受 `failed`/`cancelled`/`interrupted`；请求里**只要有一条状态不合法**
+ * 即**整请求 422**（body `{"error":…,"invalid":[…]}`），合法的那几条**不会被部分执行**。
+ * 因此调用方**必须先只发「可重试的子集」**（见 `CacheManagerDialog` 批量动作条的
+ * `retryableSelected`），不能把整份选中集原样丢给后端去筛。
+ */
+export async function retryCacheTasks(
+  ids: number[],
+): Promise<{ ok: boolean; ids: number[] }> {
+  if (ids.length === 0) throw new Error('没有可重试的记录')
+  return request(`/api/cache/tasks/retry?ids=${encodeURIComponent(ids.join(','))}`, {
+    method: 'POST',
+  })
+}
+
+/**
+ * POST /api/cache/tasks/cancel?ids=1,2,3 — 批量取消**活跃**任务（BUG-249）。
+ *
+ * 契约与 `retryCacheTasks` 同构：只接受 `queued`/`running`，含终态即整请求 422；
+ * 成功返回 `{"ok":true,"ids":[…]}`。同样**只发可取消的子集**。
+ */
+export async function cancelCacheTasks(
+  ids: number[],
+): Promise<{ ok: boolean; ids: number[] }> {
+  if (ids.length === 0) throw new Error('没有可取消的记录')
+  return request(`/api/cache/tasks/cancel?ids=${encodeURIComponent(ids.join(','))}`, {
+    method: 'POST',
+  })
+}
+
+/**
  * DELETE /api/cache/tasks?scope=all|success|failed — 批量清除任务记录。
  *
  * 动词只有一个（清除），范围走参数：三档互斥且并集为全集，所以不需要「清空全部」

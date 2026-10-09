@@ -12,11 +12,13 @@ import { useEvent } from '../hooks/useEvent'
 import { findMediaItemIdByRef, getMediaItem, mediaItemUrl } from '../api/media'
 import {
   cancelCacheTask,
+  cancelCacheTasks,
   deleteCacheTask,
   deleteCacheTasksByIds,
   listAllCacheTasks,
   listTgDialogs,
   retryCacheTask,
+  retryCacheTasks,
 } from '../api/tg'
 import type { TgCacheTask, TgChannel, ViewerItem } from '../types'
 
@@ -714,6 +716,23 @@ export function CacheManagerDialog(props: {
   }
 
   /**
+   * 批量重试（BUG-249）：**只发可重试的子集**（见 `retryableSelected` 的契约说明）。
+   *
+   * 重试是按 id 复位**同一行**（任务不消失），所以动作完成后**保留选中**——
+   * 用户可以接着看它们转成 queued；这也与 `removeMany`（删了就得退出选中）相反。
+   */
+  const batchRetry = useEvent(() => {
+    if (retryableSelected.length === 0) return
+    void act(() => retryCacheTasks(retryableSelected))
+  })
+
+  /** 批量取消（BUG-249）：**只发可取消的子集**（活跃态）；终态不在其中，不被改动。 */
+  const batchCancel = useEvent(() => {
+    if (cancellableSelected.length === 0) return
+    void act(() => cancelCacheTasks(cancellableSelected))
+  })
+
+  /**
    * 「去媒体库查看」：一次入库的终点是媒体库里的成品，出口就该通向成品。
    *
    * 走 by-ref（`source="tg"`、`ref="{chat}:{msg}"`），不按 chat 全量筛 —— 后端
@@ -818,6 +837,29 @@ export function CacheManagerDialog(props: {
     [visible, selected],
   )
   const allVisibleSelected = visible.length > 0 && selectedIds.length === visible.length
+
+  /**
+   * 选中集里**各自能动的那一部分**（BUG-249 的核心，不是可选的优化）。
+   *
+   * 批量端点**整请求校验**：请求里只要夹带一条状态不合法的记录就 422 全拒
+   * （后端 `batch_task_action`，合法的那几条也不执行）。所以界面不能把「已选 N 条」
+   * 原样发给端点 —— 必须先算出「可重试 x / 可取消 y」，**只发这 x / y**。
+   *
+   * 同时这也兑现了「不静默跳过」：落差（N−x / N−y）直接摊在动作条上，用户看得见
+   * 「12 条里有 3 条本次不受影响」，而不是点了没反应还以为全动了。
+   */
+  const selectedTasks = useMemo(
+    () => visible.filter((x) => selected.has(x.id)),
+    [visible, selected],
+  )
+  const retryableSelected = useMemo(
+    () => selectedTasks.filter((x) => RETRYABLE.has(x.status)).map((x) => x.id),
+    [selectedTasks],
+  )
+  const cancellableSelected = useMemo(
+    () => selectedTasks.filter((x) => ACTIVE_STATUS.has(x.status)).map((x) => x.id),
+    [selectedTasks],
+  )
 
   const onToggleSelect = useEvent((task: TgCacheTask) => {
     setSelected((prev) => {
@@ -994,13 +1036,71 @@ export function CacheManagerDialog(props: {
                   {t('tg.cacheSelectedCount', { n: selectedIds.length })}
                 </span>
                 <span className="min-w-0 flex-1" />
+              </div>
+            ) : null}
+
+            {/* 批量动作条（BUG-249）：**选中才出现**。三种动作各只对「适用的子集」生效，
+                并把「选中 N 条 / 可重试 x / 可取消 y」如实摊开 —— 只发 x / y，剩下
+                N−x 条本次不受影响，绝不明发全量让后端 422、也绝不静默跳过。 */}
+            {selectedIds.length > 0 ? (
+              <div
+                className="mt-2 flex flex-wrap items-center gap-2 rounded-md border border-accent/40 bg-accent/5 px-2.5 py-2 text-[11px] text-fg-muted"
+                data-testid="cache-batch-bar"
+              >
+                <span
+                  className="shrink-0 font-medium text-fg-strong"
+                  data-testid="cache-batch-counts"
+                >
+                  {t('tg.cacheBatchCounts', {
+                    n: selectedIds.length,
+                    retry: retryableSelected.length,
+                    cancel: cancellableSelected.length,
+                  })}
+                </span>
+                <span className="min-w-0 flex-1" />
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  disabled={busy || retryableSelected.length === 0}
+                  title={
+                    retryableSelected.length < selectedIds.length
+                      ? t('tg.cacheBatchRetryHint', {
+                          hit: retryableSelected.length,
+                          miss: selectedIds.length - retryableSelected.length,
+                        })
+                      : undefined
+                  }
+                  onClick={batchRetry}
+                  data-testid="cache-batch-retry"
+                >
+                  {t('tg.cacheBatchRetry', { n: retryableSelected.length })}
+                </Button>
                 <Button
                   variant="ghost"
                   size="sm"
                   className="h-7 px-2 text-[11px]"
-                  disabled={busy || selectedIds.length === 0}
+                  disabled={busy || cancellableSelected.length === 0}
+                  title={
+                    cancellableSelected.length < selectedIds.length
+                      ? t('tg.cacheBatchCancelHint', {
+                          hit: cancellableSelected.length,
+                          miss: selectedIds.length - cancellableSelected.length,
+                        })
+                      : undefined
+                  }
+                  onClick={batchCancel}
+                  data-testid="cache-batch-cancel"
+                >
+                  {t('tg.cacheBatchCancel', { n: cancellableSelected.length })}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-[11px] text-destructive hover:text-destructive"
+                  disabled={busy}
                   onClick={() => setConfirm({ kind: 'batch', ids: selectedIds })}
-                  data-testid="cache-delete-selected"
+                  data-testid="cache-batch-delete"
                 >
                   {t('tg.cacheDeleteSelected', { n: selectedIds.length })}
                 </Button>
