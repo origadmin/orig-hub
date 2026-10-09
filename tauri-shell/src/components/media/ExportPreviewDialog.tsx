@@ -27,13 +27,25 @@ const ISSUE_STYLE: Record<string, string> = {
  *   点击走 POST /api/media/export 真正交付（复制视频/图片 + 写 manifest）。
  */
 export function ExportPreviewDialog(props: {
+  /**
+   * 导出候选 = **全库剧集**（不是某一子集）。
+   *
+   * BUG-214：剧集墙的「批量导出」只预勾选选中集，**不**收窄候选 —— 因为下面
+   * `run()` / `doExport()` 里 `ids.length === series.length ? undefined : ids` 是
+   * 「全选 ⇔ 全库」短路；一旦把 `series` 换成子集，「子集恰好全勾」就会被当成
+   * 「导出全库」，是危险的语义错误。
+   */
   series: MediaSeries[]
+  /** 预勾选的剧集 id（BUG-214 批量导出入口）；缺省 = 全选（既有行为） */
+  preselect?: number[]
   onClose: () => void
   onError: (msg: string) => void
 }) {
-  const { series, onClose, onError } = props
+  const { series, preselect, onClose, onError } = props
   const { t } = useTranslation()
-  const [checked, setChecked] = useState<Set<number>>(() => new Set(series.map((s) => s.id)))
+  const [checked, setChecked] = useState<Set<number>>(
+    () => new Set(preselect && preselect.length > 0 ? preselect : series.map((s) => s.id)),
+  )
   const [busy, setBusy] = useState(false)
   const [result, setResult] = useState<ExportPreviewResult | null>(null)
 

@@ -23,8 +23,11 @@
  *      （前端**禁止**循环调单源端点）。
  *
  * 反向证伪（断言不许假绿）：
- *   - `ORIG_VERIFY_REVERT=nomulti`：把剧集墙的「可合并」判据注回缺失态（动作条永不出现）
+ *   - `ORIG_VERIFY_REVERT=nomulti`：把剧集墙的「动作条可见」判据注回缺失态（动作条永不出现）
  *     → 断言 A（动作条出现）**必须转红**，exit 2。
+ *     注：BUG-214 起动作条可见判据是 `seriesBulkReady`（选中 ≥1），合并能力判据
+ *     `seriesMultiReady`（选中 ≥2）只是按钮的 enabled 条件 —— 注入点随之上移到
+ *     可见判据，否则「动作条永不出现」这层证伪会失效（注入后动作条照旧在）。
  *   - `ORIG_VERIFY_REVERT=ordertarget`：把合并目标改成「第一个被点的」（顺序决定）
  *     → 断言 C（保留的是第 2 条）**必须转红**，exit 2。
  *   注入后等 Vite 重新编译再跑同一套断言；跑完**无论成败都在 finally 还原**并用 `sha256` 自证。
@@ -86,9 +89,16 @@ const ZH = require(path.resolve(__dirname, '..', 'src', 'i18n', 'locales', 'zh-C
 const EN = require(path.resolve(__dirname, '..', 'src', 'i18n', 'locales', 'en-US.json'))
 
 // ── 反向证伪锚点（源文件里**唯一**的字符串） ──────────────────────────────
-/** 动作条可合并判据（MediaLibraryPanel.tsx）。 */
-const NOMULTI_OLD = 'const seriesMultiReady = selectedSeriesList.length >= 2'
-const NOMULTI_NEW = 'const seriesMultiReady = false'
+/**
+ * 动作条**可见**判据（MediaLibraryPanel.tsx）。
+ *
+ * BUG-214 前可见判据与「可合并」是同一条（`seriesMultiReady`，≥2）；BUG-214 把
+ * 可见性放宽到 ≥1（`seriesBulkReady`），故注入点随之改到可见判据上，否则注入后
+ * 动作条仍会出现、A2 仍是绿的（证伪失效）。合并按钮的 disabled 已由 A2 之外的
+ * 判据覆盖（`series-merge-wall` 存在 + `disabled` 状态）。
+ */
+const NOMULTI_OLD = 'const seriesBulkReady = selectedSeriesList.length > 0'
+const NOMULTI_NEW = 'const seriesBulkReady = false'
 /** 合并目标解析（SeriesDialog.tsx）：显式选择 vs 顺序决定。 */
 const ORDER_OLD = 'const target = series.find((s) => s.id === targetId) ?? null'
 const ORDER_NEW = 'const target = series[0] ?? null'
@@ -393,7 +403,7 @@ async function main() {
         ? await waitForServedMarker(
             '/src/components/MediaLibraryPanel.tsx',
             NOMULTI_NEW,
-            'seriesMultiReady = selectedSeriesList.length',
+            'seriesBulkReady = selectedSeriesList.length',
           )
         : await waitForServedMarker(
             '/src/components/media/SeriesDialog.tsx',

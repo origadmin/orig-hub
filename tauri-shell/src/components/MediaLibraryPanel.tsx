@@ -18,6 +18,7 @@ import {
   patchMediaItem,
   patchSeries,
   setItemTags,
+  setSeriesTags,
 } from '../api/media'
 import { loadSeriesDetail, isSeriesNotFound } from '../hooks/useSeriesDetail'
 import { cacheKey, cached, invalidateCache } from '../lib/fetchCache'
@@ -173,7 +174,18 @@ export function MediaLibraryPanel() {
   const [tagMgrOpen, setTagMgrOpen] = useState(false)
   // 导出预览（P5）：只读完备性校验，不做导出本体（P6）
   const [exportOpen, setExportOpen] = useState(false)
+  /**
+   * 剧集批量导出的**预勾选**（BUG-214）。
+   *
+   * `null` = 不预勾选（对话框自选全库，既有行为）；数组 = 只勾这几条。
+   * **不能**把传入的 `series` 换成选中子集来「实现」预勾选 —— 对话框里
+   * `ids.length === series.length ? undefined : ids` 是「全选 ⇔ 全库」短路，
+   * 换成子集会让「子集全选」被误判成全库导出（危险的语义错误）。
+   */
+  const [exportPreselect, setExportPreselect] = useState<number[] | null>(null)
   const [bulkTagOpen, setBulkTagOpen] = useState(false)
+  /** 剧集墙批量打标对话框（BUG-214 P1）：与 items 的 `bulkTagOpen` 并列，互不干扰。 */
+  const [bulkSeriesTagOpen, setBulkSeriesTagOpen] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
   const [addToOpen, setAddToOpen] = useState(false)
   /** 「合并到…」对话框（把另一个剧集并入当前打开的剧集） */
@@ -501,6 +513,15 @@ export function MediaLibraryPanel() {
   }, [series, selectedSeries])
   /** 剧集墙「可合并」条件：选中 **≥2** 条（N 条 = 保留其一，其余并入）。 */
   const seriesMultiReady = selectedSeriesList.length >= 2
+  /**
+   * 剧集墙动作条可见条件（BUG-214）：选中 **≥1** 条即出现。
+   *
+   * 与 `seriesMultiReady` 分开是因为两者语义不同：合并需要 ≥2（一条没法合并），
+   * 而删除 / 打标 / 导出对 1 条同样成立 —— 旧实现拿「可合并」当动作条开关，
+   * 于是选中 1 条时连删除都点不到（用户复报原话：「批量不应该只有合并，删除，
+   * 等等其他基础功能也必须支持」）。合并按钮在 <2 时 disabled 并给出原因。
+   */
+  const seriesBulkReady = selectedSeriesList.length > 0
   /** 离开剧集墙视图时清空剧集选择（与 items 的 scope 重置同一意图）。 */
   useEffect(() => {
     if (view !== 'series') setSelectedSeries((prev) => (prev.size > 0 ? new Set() : prev))
@@ -574,16 +595,19 @@ export function MediaLibraryPanel() {
     }
   }
 
-  const doDeleteSeries = async (id: number) => {
+  /**
+   * 删除指定剧集 —— 单条与批量的**唯一执行路径**（BUG-214）。
+   *
+   * 与 `doDeleteItems` 同一模式：单条不再是「大小为 1 的另一种流程」，
+   * 只是同一路径的一种目标集来源（这里是 `[id]`）。剧集域端点当前是**单数**的，
+   * 故循环调用；批量端点若日后落地，只改这一处。
+   */
+  const doDeleteSeriesMany = async (ids: number[]) => {
+    if (ids.length === 0) return
     try {
-      await deleteSeries(id)
-      // 删掉的若在剧集选择集里，一并摘掉（否则计数会多算一条幽灵剧集）。
-      setSelectedSeries((prev) => {
-        if (!prev.has(id)) return prev
-        const next = new Set(prev)
-        next.delete(id)
-        return next
-      })
+      for (const id of ids) await deleteSeries(id)
+      // 选中的源已被删除，留着就是幽灵项（计数会多算）。
+      clearSeriesSelection()
       setView('series')
       setDetail(null)
       setActiveSeriesId(null)
@@ -638,6 +662,35 @@ export function MediaLibraryPanel() {
   const confirmGroupedCount = items.filter(
     (i) => confirmTargetIds.includes(i.id) && i.seriesTitle,
   ).length
+
+  /**
+   * 剧集删除确认的目标集（BUG-214）：`ids`（批量/工具栏）与 `id`（详情卡逐条）**同一路径**。
+   */
+  const confirmSeriesIds = useMemo(
+    () =>
+      confirmDelete?.kind === 'series'
+        ? (confirmDelete.ids ?? (confirmDelete.id !== undefined ? [confirmDelete.id] : []))
+        : [],
+    [confirmDelete],
+  )
+
+  /**
+   * 删除确认里要列出的剧集清单（BUG-214）：**必须列出将删剧名与集数**。
+   *
+   * 剧名从「墙上的列表 / 当前选中集 / 详情」三处按 id 查 —— 详情卡逐条删除时
+   * 该剧集可能已被标签筛掉而不在 `series` 里，只认一个来源就会渲染出光秃秃的 `#id`。
+   * 三处都没有（数据早被删掉的极端情况）时如实退成 `#id`，不编造标题。
+   */
+  const confirmSeriesRows = useMemo(() => {
+    const byId = new Map<number, { id: number; title: string; episodeCount: number }>()
+    const put = (s: MediaSeries) => {
+      if (!byId.has(s.id)) byId.set(s.id, { id: s.id, title: s.title, episodeCount: s.episodeCount })
+    }
+    for (const s of series) put(s)
+    for (const s of selectedSeriesList) put(s)
+    if (detail) put(detail)
+    return confirmSeriesIds.map((id) => byId.get(id) ?? { id, title: `#${id}`, episodeCount: 0 })
+  }, [confirmSeriesIds, series, selectedSeriesList, detail])
 
   // 空态必须区分「库真的空」（引导导入）与「筛选无结果」（引导清筛选）——
   // 把后者渲染成"资料库是空的 + 导入目录"会误导用户以为数据丢了。
@@ -850,7 +903,9 @@ export function MediaLibraryPanel() {
       </aside>
 
       {/* ───────── 主区 ───────── */}
-      <div className="flex min-w-0 flex-1 flex-col">
+      {/* `relative` 是动作条（BUG-214）的定位锚：动作条 `absolute bottom-4` 相对**内容区**
+          （不是视口），故不会被 .fixed 的祖先 transform/backdrop 影响定位。 */}
+      <div className="relative flex min-w-0 flex-1 flex-col">
         {/* 工具条 */}
         <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border-subtle/60 px-3 py-2">
           {/* 详情态：返回是**页面导航** ⇒ 属工具栏作用域（v3 W mock 头部行同位）。
@@ -1119,43 +1174,15 @@ export function MediaLibraryPanel() {
             }}
           />
         ) : view === 'series' ? (
-          <div className="min-h-0 flex-1 overflow-y-auto p-3">
+          <div
+            data-testid="series-wall-scroll"
+            className="min-h-0 flex-1 overflow-y-auto p-3"
+          >
             {/*
-             * 剧集墙动作条（BUG-186）：选中 ≥2 条剧集时出现。
-             * **新增分支** —— 与 items 视图工具栏那条（`selected`）互不干扰。
+             * 剧集墙动作条**已移出这里**（BUG-214）：它原先挂在滚动容器内的普通流顶部，
+             * 勾选视口外/下方的卡片后向上浏览时就随内容滚出视野，动作不可达。
+             * 现在浮在内容区底部（见下方 `series-selection-bar`）。
              */}
-            {seriesMultiReady ? (
-              <div
-                data-testid="series-selection-bar"
-                className="mb-3 flex flex-wrap items-center gap-2 rounded-md border border-accent/40 bg-accent/5 px-3 py-2"
-              >
-                <span
-                  data-testid="series-selection-count"
-                  className="text-[11px] font-medium text-fg-strong"
-                >
-                  {t('media.seriesSelectionCount', { n: selectedSeriesList.length })}
-                </span>
-                <div className="ml-auto flex items-center gap-2">
-                  <Button
-                    size="sm"
-                    className="h-7 px-2 text-[11px]"
-                    data-testid="series-merge-wall"
-                    onClick={() => setMergeMultiOpen(true)}
-                  >
-                    {t('media.seriesMergeOpen')}
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 px-2 text-[11px]"
-                    data-testid="series-selection-clear"
-                    onClick={clearSeriesSelection}
-                  >
-                    {t('media.seriesSelectionClear')}
-                  </Button>
-                </div>
-              </div>
-            ) : null}
             {series.length === 0 ? (
               <div className="flex flex-col items-center justify-center gap-3 py-20">
                 {filterActive ? (
@@ -1235,6 +1262,81 @@ export function MediaLibraryPanel() {
             </div>
           </>
         )}
+
+        {/*
+         * 剧集墙批量动作条（BUG-214）：选中 **≥1** 条即出现，浮在内容区**底部**。
+         *
+         * - 为什么 absolute 而不是 fixed：fixed 会被祖先的 transform / backdrop-filter
+         *   影响定位（本仓有过这类踩坑），absolute 相对 `.relative` 主区稳定可靠；
+         * - 为什么在底部而不是顶部：批量动作发生在「选完之后」，视线焦点就在网格里，
+         *   顶部 sticky 还会常驻占一行、挤压网格高度（BUG-214 修复方向已定档）；
+         * - z-30 < 弹窗 z-50：动作条永远不会盖住对话框，也不与遮罩抢层级。
+         */}
+        {view === 'series' && seriesBulkReady ? (
+          <div
+            data-testid="series-selection-bar"
+            className="absolute bottom-4 left-1/2 z-30 flex -translate-x-1/2 flex-wrap items-center gap-2 rounded-full border border-accent/40 bg-surface/95 px-3 py-2 shadow-lg backdrop-blur-md"
+          >
+            <span
+              data-testid="series-selection-count"
+              className="text-[11px] font-medium text-fg-strong"
+            >
+              {t('media.seriesSelectionCount', { n: selectedSeriesList.length })}
+            </span>
+            <Button
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              data-testid="series-merge-wall"
+              disabled={!seriesMultiReady}
+              title={seriesMultiReady ? undefined : t('media.series.bulkMergeDisabled')}
+              onClick={() => setMergeMultiOpen(true)}
+            >
+              {t('media.seriesMergeOpen')}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              data-testid="series-bulk-tag"
+              onClick={() => setBulkSeriesTagOpen(true)}
+            >
+              {t('media.series.bulkTag')}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              data-testid="series-bulk-export"
+              onClick={() => {
+                // 只预勾选选中集，**不**把 `series` 换成子集（见 `exportPreselect` 注释）。
+                setExportPreselect(selectedSeriesList.map((s) => s.id))
+                setExportOpen(true)
+              }}
+            >
+              {t('media.series.bulkExport')}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[11px] text-destructive"
+              data-testid="series-bulk-remove"
+              onClick={() =>
+                setConfirmDelete({ kind: 'series', ids: selectedSeriesList.map((s) => s.id) })
+              }
+            >
+              {t('media.series.bulkRemove')}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              data-testid="series-selection-clear"
+              onClick={clearSeriesSelection}
+            >
+              {t('media.seriesSelectionClear')}
+            </Button>
+          </div>
+        ) : null}
       </div>
 
       {/* ───────── 弹窗 ───────── */}
@@ -1282,6 +1384,31 @@ export function MediaLibraryPanel() {
         />
       ) : null}
 
+      {bulkSeriesTagOpen ? (
+        // 剧集批量打标（BUG-214 P1）：与 items 侧同一组件，仅 `scope="series"` 换文案口径。
+        <BulkTagDialog
+          count={selectedSeriesList.length}
+          tags={tags}
+          scope="series"
+          onClose={() => setBulkSeriesTagOpen(false)}
+          onCreate={async (name) => {
+            try {
+              const r = await createTag(name)
+              await loadMeta()
+              return r.id
+            } catch (e) {
+              setError(e instanceof Error ? e.message : String(e))
+              return null
+            }
+          }}
+          onApply={async (tagIds) => {
+            for (const s of selectedSeriesList) await setSeriesTags(s.id, tagIds)
+            clearSeriesSelection()
+            await refreshAll()
+          }}
+        />
+      ) : null}
+
       {createOpen ? (
         <CreateSeriesDialog
           onClose={() => setCreateOpen(false)}
@@ -1308,8 +1435,14 @@ export function MediaLibraryPanel() {
 
       {exportOpen ? (
         <ExportPreviewDialog
+          // `series` 恒为**全库候选**：预勾选只影响 `checked` 初值，
+          // 绝不把候选换成选中子集（否则「子集全选」会被误判成全库导出）。
           series={series}
-          onClose={() => setExportOpen(false)}
+          preselect={exportPreselect ?? undefined}
+          onClose={() => {
+            setExportOpen(false)
+            setExportPreselect(null)
+          }}
           onError={(m) => setError(m)}
         />
       ) : null}
@@ -1391,13 +1524,46 @@ export function MediaLibraryPanel() {
                 ? confirmTargetIds.length === 1
                   ? t('media.confirmRemoveOne')
                   : t('media.confirmRemoveItems')
-                : t('media.confirmDeleteSeries')}
+                : confirmSeriesIds.length >= 2
+                  ? t('media.seriesConfirmBulkTitle', { n: confirmSeriesIds.length })
+                  : t('media.confirmDeleteSeries')}
             </h4>
             <p className="mt-1.5 text-[11.5px] leading-relaxed text-muted">
               {confirmDelete.kind === 'items'
                 ? t('media.confirmRemoveItemsHint', { n: confirmTargetIds.length })
-                : t('media.confirmDeleteSeriesHint')}
+                : confirmSeriesIds.length >= 2
+                  ? t('media.seriesConfirmBulkHint')
+                  : t('media.confirmDeleteSeriesHint')}
             </p>
+            {/* 批量删剧集必须**列出将删剧名与集数**：确认框只说「删 3 个剧集」时，
+                用户无从核对删的是哪三个（BUG-214 修复方向：两步确认 + 明示影响面）。 */}
+            {confirmDelete.kind === 'series' ? (
+              <>
+                <div
+                  data-testid="series-confirm-delete-list"
+                  className="mt-2 max-h-40 space-y-0.5 overflow-y-auto rounded-md border border-border-subtle bg-surface-2/40 p-1.5"
+                >
+                  {confirmSeriesRows.map((s) => (
+                    <div
+                      key={s.id}
+                      data-testid="series-confirm-delete-item"
+                      className="truncate px-1.5 py-0.5 text-[11px] text-fg-strong"
+                    >
+                      《{s.title}》 · {t('media.episodeCount', { n: s.episodeCount })}
+                    </div>
+                  ))}
+                </div>
+                {/* 口径要点：删剧集 ≠ 删内容。这条**两态都渲染** —— 单条删除同样容易被
+                    误以为「把内容也删了」，而事实是条目与已下载文件都保留
+                    （AGENTS.md §5「删除联动（单向）」）。 */}
+                <p
+                  data-testid="series-confirm-keep-items"
+                  className="mt-1.5 text-[11.5px] leading-relaxed text-emerald-600 dark:text-emerald-400"
+                >
+                  {t('media.seriesConfirmKeepItemsHint')}
+                </p>
+              </>
+            ) : null}
             {/* 归属告知：删到最后一条会让剧集变空，这是用户看不见的隐性状态 */}
             {confirmDelete.kind === 'items' && confirmGroupedCount > 0 ? (
               <p
@@ -1423,8 +1589,10 @@ export function MediaLibraryPanel() {
                 onClick={async () => {
                   const k = confirmDelete
                   setConfirmDelete(null)
+                  // 单条与批量走**同一条**执行路径（BUG-214）：
+                  // 目标集只是「从哪来的」不同，执行链不该有两份。
                   if (k.kind === 'items') await doDeleteItems(k.ids ?? [...selected])
-                  else if (k.id !== undefined) await doDeleteSeries(k.id)
+                  else await doDeleteSeriesMany(k.ids ?? (k.id !== undefined ? [k.id] : []))
                 }}
                 data-testid="media-confirm-yes"
               >

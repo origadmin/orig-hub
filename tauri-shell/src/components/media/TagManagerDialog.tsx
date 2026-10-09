@@ -3,6 +3,7 @@ import { Button } from '../ui/button'
 import { Input } from '../ui/input'
 import { createTag, deleteTag, patchTag } from '../../api/media'
 import type { MediaTag } from '../../api/media'
+import { useTranslation } from '../../i18n'
 
 /** 归一化查询词：允许用户输入 `#短剧`，去掉前导 `#` 再匹配 */
 function normalizeQuery(raw: string): string {
@@ -147,18 +148,26 @@ export function TagPicker(props: {
 /**
  * 批量打标签：对选中的多条内容**覆盖式**重设标签集合。
  * 覆盖语义由后端 `set_item_tags` 保证（先清后写），界面上明确提示避免误以为追加。
+ *
+ * `scope`（BUG-214）：同一组件服务 items 与剧集墙两处。目标不同则**文案口径**不同 ——
+ * 对剧集说「为 N 项内容设置标签」是把剧集当内容，用户无从判断标签落在哪一层。
+ * 默认 `'items'` 保持 items 侧现状不变。
  */
 export function BulkTagDialog(props: {
   count: number
   tags: MediaTag[]
+  /** 批量目标：内容条目 / 剧集（决定标题与提示的文案口径） */
+  scope?: 'items' | 'series'
   onClose: () => void
   onApply: (tagIds: number[]) => Promise<void>
   /** 就地新建标签（转发给 TagPicker，使批量打标签时也能顺手建一个） */
   onCreate?: (name: string) => Promise<number | null>
 }) {
-  const { count, tags, onClose, onApply, onCreate } = props
+  const { count, tags, scope = 'items', onClose, onApply, onCreate } = props
+  const { t } = useTranslation()
   const [selected, setSelected] = useState<number[]>([])
   const [busy, setBusy] = useState(false)
+  const isSeries = scope === 'series'
 
   return (
     <div
@@ -169,9 +178,13 @@ export function BulkTagDialog(props: {
         className="w-full max-w-md rounded-lg border border-border-subtle bg-surface p-4 shadow-lg"
         onClick={(e) => e.stopPropagation()}
       >
-        <h4 className="text-[13px] font-semibold text-fg-strong">为 {count} 项内容设置标签</h4>
+        <h4 className="text-[13px] font-semibold text-fg-strong">
+          {isSeries
+            ? t('media.seriesBulkTagTitle', { n: count })
+            : t('media.bulkTagTitle', { n: count })}
+        </h4>
         <p className="mt-1 text-[11px] text-muted">
-          所选内容现有的标签会被<b>替换</b>为下面勾选的结果。
+          {isSeries ? t('media.seriesBulkTagHint') : t('media.bulkTagHint')}
         </p>
         <div className="mt-3">
           <TagPicker
