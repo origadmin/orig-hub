@@ -139,6 +139,20 @@ function MediaCardBase(props: {
   const boxRef = useRef<HTMLDivElement | null>(null)
   const startedRef = useRef(false)
 
+  /**
+   * 有没有字节（BUG-080）。
+   *
+   * 清缓存只删字节、留条目 —— 没有这个判断，清完缓存的卡片与正常内容**长得一样**，
+   * 点下去 raw 端点 404、静默播不了。有没有字节是事实态，展示层必须如实呈现。
+   *
+   * BUG-250：这个判据必须在**封面生成之前**就成立。封面生成（video 抽帧 /
+   * photo 缩略图）会向 `/api/media/items/:id/raw` 发请求，而该端点对无字节条目
+   * 必然失败（video 实测 404）。此前 `playable` 只在渲染期（`{playable ? … : 占位}`）
+   * 生效，两个 effect 漏判 ⇒「无字节不发请求」的意图在渲染之前就被打破，
+   * 打开媒体库主页即刷 404。
+   */
+  const playable = hasMediaBytes(item)
+
   // 换条目时重置本地封面状态
   useEffect(() => {
     setPoster(item.poster ?? null)
@@ -150,6 +164,8 @@ function MediaCardBase(props: {
   useEffect(() => {
     if (poster || genFailed) return
     if (item.kind !== 'video') return
+    // BUG-250：无字节条目不发抽帧请求（/raw 对 video+missing 实测 404）
+    if (!playable) return
     const el = boxRef.current
     if (!el || typeof IntersectionObserver === 'undefined') return
 
@@ -183,12 +199,15 @@ function MediaCardBase(props: {
     return () => io.disconnect()
     // onPosterReady 每次渲染都变，故意不进依赖，否则观察器反复重建
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [item.id, item.kind, poster, genFailed])
+  }, [item.id, item.kind, poster, genFailed, playable])
 
   /** 图片类：生成统一缩略图（原图可能很大，直接进网格浪费解码） */
   useEffect(() => {
     if (poster || genFailed) return
     if (item.kind !== 'photo') return
+    // BUG-250：无字节条目不发缩略图请求（photo+missing 的 /raw 走现场代理，
+    // 虽返回 200，但对「已清缓存/已丢失」的条目请求它同样是无效流量）
+    if (!playable) return
     let alive = true
     generateImageThumb(mediaItemUrl(item.id), 480)
       .then((u) => {
@@ -204,18 +223,11 @@ function MediaCardBase(props: {
       alive = false
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [item.id, item.kind, poster, genFailed])
+  }, [item.id, item.kind, poster, genFailed, playable])
 
   const thumbSrc =
-    poster ?? (item.kind === 'photo' ? mediaItemUrl(item.id) : null)
+    playable && item.kind === 'photo' ? poster ?? mediaItemUrl(item.id) : poster
 
-  /**
-   * 有没有字节（BUG-080）。
-   *
-   * 清缓存只删字节、留条目 —— 没有这个判断，清完缓存的卡片与正常内容**长得一样**，
-   * 点下去 raw 端点 404、静默播不了。有没有字节是事实态，展示层必须如实呈现。
-   */
-  const playable = hasMediaBytes(item)
   const recacheable = !playable && Boolean(onRecache)
 
   /** 悬浮图标按类型取（BUG-123），未知类型退回中性「打开」 */

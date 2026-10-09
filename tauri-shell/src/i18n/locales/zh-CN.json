@@ -538,6 +538,8 @@
   "media.series.kindCollection": "合集",
   "media.series.kindAlbum": "图集",
   "media.series.seasonCount": "{n} 季",
+  "media.series.videoCount": "视频 {n}",
+  "media.series.photoCount": "图片 {n}",
   "media.series.open": "查看",
   "media.series.editMeta": "编辑",
   "media.series.editTitle": "剧集名称",

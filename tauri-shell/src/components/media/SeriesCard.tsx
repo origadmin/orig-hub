@@ -40,6 +40,15 @@ export function SeriesCard(props: {
   useEffect(() => {
     if (poster || coverFailed) return
     if (series.coverKind !== 'video' || !series.coverItemId) return
+    /*
+     * BUG-250：封面条目**没有字节**时不抽帧。
+     *
+     * 抽帧会向 `/api/media/items/:id/raw` 发请求，而该端点对无字节条目必然失败
+     * （video 实测 404）—— 主页每张这样的剧集卡都会在控制台刷一次错误，
+     * 而结果注定是 `coverFailed`。老后端不下发 `coverHasBytes`（undefined），
+     * 此时按既有行为继续抽帧，不做静默改变。
+     */
+    if (series.coverHasBytes === false) return
     let alive = true
     generateVideoPoster(mediaItemUrl(series.coverItemId), 1, 480)
       .then((p) => {
@@ -54,7 +63,7 @@ export function SeriesCard(props: {
       alive = false
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [series.id, series.coverKind, series.coverItemId, poster, coverFailed])
+  }, [series.id, series.coverKind, series.coverItemId, series.coverHasBytes, poster, coverFailed])
 
   // 封面走**单点回退链**（R12）：与 `SeriesHero` 同一函数，不再各写一遍。
   // 本地抽帧结果（poster state）优先于 resolver —— 它是刚算出来的、必然有效。
@@ -157,6 +166,15 @@ export function SeriesCard(props: {
           {t('media.series.seasonCount', { n: series.seasonCount })} ·{' '}
           {t('media.episodeCount', { n: series.episodeCount })}
         </p>
+        {/* BUG-250：内容构成（有没有视频 / 有没有图片）必须在主页可见 ——
+            0 也如实显示，用户不该为了确认「这部剧里有没有图片」而逐个点进去。
+            老后端不下发这两个字段时不渲染（不编造 0）。 */}
+        {series.videoCount != null || series.photoCount != null ? (
+          <p className="text-[10px] text-muted" data-testid="series-content-kinds">
+            {t('media.series.videoCount', { n: series.videoCount ?? 0 })} ·{' '}
+            {t('media.series.photoCount', { n: series.photoCount ?? 0 })}
+          </p>
+        ) : null}
         {series.tags.length > 0 ? (
           <p className="flex flex-wrap gap-x-1 gap-y-0.5 pt-0.5">
             {series.tags.map((tag) => (

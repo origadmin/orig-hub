@@ -75,6 +75,19 @@ export interface MediaSeries {
   updatedAt: number
   episodeCount: number
   seasonCount: number
+  /**
+   * 剧集内容构成（BUG-250）：主页剧集卡要能体现「有没有视频 / 有没有图片」。
+   * 后端 `SeriesView.video_count/photo_count`；0 是有效读数（真的没有），
+   * 与「字段缺失（老后端）」语义不同 —— 缺失时前端不得编造 0。
+   */
+  videoCount?: number
+  photoCount?: number
+  /**
+   * 封面条目是否已有字节（BUG-250）。false ⇒ 不要对 video 封面抽帧
+   * （`/raw` 对无字节条目必然失败，实测 404）。老后端不下发该字段时按 true 处理，
+   * 保持既有行为不变。
+   */
+  coverHasBytes?: boolean
   tags: MediaTag[]
 }
 

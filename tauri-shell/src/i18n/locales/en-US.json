@@ -538,6 +538,8 @@
   "media.series.kindCollection": "Collection",
   "media.series.kindAlbum": "Album",
   "media.series.seasonCount": "{n} seasons",
+  "media.series.videoCount": "{n} videos",
+  "media.series.photoCount": "{n} photos",
   "media.series.open": "View",
   "media.series.editMeta": "Edit",
   "media.series.editTitle": "Series title",
