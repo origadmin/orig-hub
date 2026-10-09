@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Serialize;
@@ -47,9 +48,15 @@ pub fn router() -> Router<Arc<AppState>> {
         // —— 记录面（任务时间线）——
         .route("/api/cache/tasks", delete(clear_tasks))
         .route("/api/cache/tasks/:id", delete(delete_task))
-        // 重试是同一条记录的**状态复位**（不是新动词）：复用既有 handler，
-        // 不另开 `/api/cache/tasks/retry` —— 那条路会让「每个场景一个端点」重新长出来。
+        // 重试是同一条记录的**状态复位**（不是新动词）：复用既有 handler。
         .route("/api/cache/tasks/:id/retry", post(retry_task))
+        // BUG-249：单条之外的**批量**动作（面板上几十条 failed 逐条点不动）。
+        // 仍然遵守「一个动词一个端点，差异走参数」：`?ids=1,2,3` 是参数，
+        // 不是「又一个场景又一个端点」——批量与单条最终调**同一个状态迁移内核**。
+        // 路由顺序：matchit 静态段优先于参数段，故 `/api/cache/tasks/retry` 不会被
+        // `/api/cache/tasks/:id`（仅 DELETE）吃掉；两者的方法也不冲突。
+        .route("/api/cache/tasks/retry", post(retry_tasks))
+        .route("/api/cache/tasks/cancel", post(cancel_tasks))
 }
 
 /// 生效的下载目录（运行期设置覆盖 env 默认值）——缓存字节的**唯一可删区**。
@@ -919,16 +926,14 @@ async fn delete_task(
     Ok(Json(json!({"ok": true})))
 }
 
-/// `POST /api/cache/tasks/:id/retry` — **原任务重试**（BUG-078）。
+/// 单条**重试**的状态迁移内核（唯一真源）。
 ///
-/// 与「重试=重新入队」的区别：旧前端 `retry` 调 `enqueueCacheTask`，后端只对**活跃**
-/// 任务幂等复用，终态任务会 `INSERT` 新行——于是列表里出现「一条失败 + 一条新 queued」，
-/// 用户看到的就是「重试新建任务」。这里按 id 复位终态行（同一条、进度从 0 重跑），
-/// 列表里仍是同一个 id，不再增生记录。
-async fn retry_task(
-    State(st): State<Arc<AppState>>,
-    AxumPath(id): AxumPath<i64>,
-) -> Result<Json<CacheTask>, ApiError> {
+/// 单条端点 `POST /api/cache/tasks/:id/retry` 与批量端点 `POST /api/cache/tasks/retry?ids=`
+/// 都调它——批量循环调用同一个内核，**绝不另写一份状态机**（AGENTS.md §2）。
+pub(crate) async fn retry_task_kernel(
+    st: &Arc<AppState>,
+    id: i64,
+) -> Result<CacheTask, ApiError> {
     let Some(task) = st
         .store
         .retry_cache_task(id)
@@ -938,9 +943,173 @@ async fn retry_task(
         return Err(ApiError::new(StatusCode::NOT_FOUND, "cache task not found"));
     };
     st.refresh_cache_tasks().await;
+    // 复位后的任务交回**同一个** worker 入口（见文件头 import 注释）。
     spawn_cache_task(st.clone(), task.id);
     st.push_log(&format!("/api/cache/tasks/{id}: retried (same id)"));
-    Ok(Json(task))
+    Ok(task)
+}
+
+/// 单条**取消**的状态迁移内核（唯一真源）。
+///
+/// 调用方：`DELETE /api/tg/cache/tasks/:id`（`routes::cancel_cache_task_route`）与
+/// 批量端点 `POST /api/cache/tasks/cancel?ids=`。
+/// 返回 `false` = 该 id 不存在，或它不是活跃任务（已结束，没有可取消的动作）。
+pub(crate) async fn cancel_task_kernel(st: &Arc<AppState>, id: i64) -> Result<bool, ApiError> {
+    let hit = st
+        .store
+        .cancel_cache_task(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if !hit {
+        return Ok(false);
+    }
+    st.refresh_cache_tasks().await;
+    st.push_log(format!("/api/cache/tasks/{id}: cancel requested"));
+    Ok(true)
+}
+
+/// `POST /api/cache/tasks/:id/retry` — **原任务重试**（BUG-078）。
+///
+/// 与「重试=重新入队」的区别：旧前端 `retry` 调 `enqueueCacheTask`，后端只对**活跃**
+/// 任务幂等复用，终态任务会 `INSERT` 新行——于是列表里出现「一条失败 + 一条新 queued」，
+/// 用户看到的就是「重试新建任务」。这里按 id 复位终态行（同一条、进度从 0 重跑），
+/// 列表里仍是同一个 id，不再增生记录。状态迁移在 [`retry_task_kernel`]。
+async fn retry_task(
+    State(st): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Json<CacheTask>, ApiError> {
+    Ok(Json(retry_task_kernel(&st, id).await?))
+}
+
+/// 批量动作的状态门（**批量语义比单条更严**，见各自端点的注释）。
+///
+/// - `Retry`：只有终态能被复位。`done` **不在内**——它没有「重跑」的语义，
+///   要重下得走「重新入队」；把它混进批量重试会让一次误点重下若干已完成的成品。
+/// - `Cancel`：只有活跃态可取消；终态没有可取消的动作，含终态的整请求 422。
+const RETRYABLE_STATES: [&str; 3] = ["failed", "cancelled", "interrupted"];
+const CANCELLABLE_STATES: [&str; 2] = ["queued", "running"];
+
+/// 批量动作的种类（决定状态门与内核，避免把校验写成两遍）。
+#[derive(Clone, Copy)]
+enum TaskBatchAction {
+    Retry,
+    Cancel,
+}
+
+impl TaskBatchAction {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    fn allowed(self) -> &'static [&'static str] {
+        match self {
+            Self::Retry => &RETRYABLE_STATES,
+            Self::Cancel => &CANCELLABLE_STATES,
+        }
+    }
+
+    /// 真正动手：状态迁移一律走**单条内核**，批量不另写一份。
+    async fn apply(self, st: &Arc<AppState>, id: i64) -> Result<(), ApiError> {
+        match self {
+            Self::Retry => retry_task_kernel(st, id).await.map(|_| ()),
+            Self::Cancel => cancel_task_kernel(st, id).await.map(|_| ()),
+        }
+    }
+}
+
+/// `POST /api/cache/tasks/retry?ids=1,2,3` — 批量重试终态任务（BUG-249）。
+async fn retry_tasks(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    batch_task_action(&st, &q, TaskBatchAction::Retry).await
+}
+
+/// `POST /api/cache/tasks/cancel?ids=1,2,3` — 批量取消活跃任务（BUG-249）。
+async fn cancel_tasks(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    batch_task_action(&st, &q, TaskBatchAction::Cancel).await
+}
+
+/// 批量状态迁移的**唯一实现**：先整体校验，再整体执行。
+///
+/// 契约（用户裁定）：
+///   - `ids` 缺失 / 空 / 非数字 / 非正数 ⇒ **422**，绝不静默 no-op；
+///   - 请求里只要有**一条**状态不合法 ⇒ 整请求 **422**（body 含 `error` 与 `invalid`），
+///     合法的那几条**不得被部分执行**——半执行会让「批量重试」变成薛定谔的操作，
+///     用户从列表里数不出到底动了几条；
+///   - 成功 ⇒ `{"ok": true, "ids": [<生效的 id>…]}`，顺序与请求一致；
+///   - 请求里读不到的 id（越界）**不是非法**：沿用批量删除（`clear_tasks?ids=`）的口径，
+///     它既不动手、也不报错，只是不出现在返回的 `ids` 里。
+///
+/// 预检只走 `get_cache_task` 逐条读状态（批量 N ≤ 1000，面板勾选量级），
+/// 不引入任何**高频读**路径的 DB 查询。
+async fn batch_task_action(
+    st: &Arc<AppState>,
+    q: &std::collections::HashMap<String, String>,
+    action: TaskBatchAction,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    let ids = match batch_ids(q) {
+        Ok(v) => v,
+        Err(e) => return Err(e.into_response()),
+    };
+    let mut invalid: Vec<i64> = Vec::new();
+    let mut targets: Vec<i64> = Vec::new();
+    for id in &ids {
+        let task = match st.store.get_cache_task(*id).await {
+            Ok(t) => t,
+            Err(e) => {
+                return Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+                    .into_response())
+            }
+        };
+        match task {
+            None => {}
+            Some(t) if action.allowed().contains(&t.status.as_str()) => targets.push(*id),
+            Some(_) => invalid.push(*id),
+        }
+    }
+    if !invalid.is_empty() {
+        let body = Json(json!({
+            "error": format!(
+                "{} only applies to task(s) in state {}; invalid ids: {:?}",
+                action.verb(),
+                action.allowed().join("|"),
+                invalid,
+            ),
+            "invalid": invalid,
+        }));
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, body).into_response());
+    }
+    for id in &targets {
+        if let Err(e) = action.apply(st, *id).await {
+            return Err(e.into_response());
+        }
+    }
+    Ok(Json(json!({"ok": true, "ids": targets})))
+}
+
+/// 批量端点的 `?ids=` 取值：缺失/空 ⇒ 422（不得静默 no-op）。
+fn batch_ids(q: &std::collections::HashMap<String, String>) -> Result<Vec<i64>, ApiError> {
+    let Some(raw) = q.get("ids") else {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ids is required: expected ?ids=1,2,3",
+        ));
+    };
+    let ids = parse_id_list(raw)?;
+    if ids.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ids provided but empty: nothing selected",
+        ));
+    }
+    Ok(ids)
 }
 
 /// `DELETE /api/cache/tasks?scope=all|success|failed` 或 `?ids=1,2,3`
@@ -1003,12 +1172,15 @@ pub async fn clear_tasks(
     }})))
 }
 
-/// 解析 `?ids=1,2,3`。
+/// 解析 `?ids=1,2,3`（**有序**、去重、空白容忍）。
 ///
 /// 非法项**直接 422，不静默跳过** —— 默默忽略只会让「删除所选」少删几条，
 /// 而界面显示成功，是最难查的一类不一致。重复项去重（勾选集合天然唯一，
 /// 但参数是外部输入）。
-fn parse_ids(raw: &str) -> Result<Vec<i64>, ApiError> {
+///
+/// 保序是给批量动作端点用的（BUG-249 契约：返回的 `ids` 与请求顺序一致）；
+/// 既有 DELETE 端点要的是集合语义，由 [`parse_ids`] 在其上再做一次排序。
+fn parse_id_list(raw: &str) -> Result<Vec<i64>, ApiError> {
     const MAX: usize = 1000;
     let mut out: Vec<i64> = Vec::new();
     for part in raw.split(',') {
@@ -1028,16 +1200,23 @@ fn parse_ids(raw: &str) -> Result<Vec<i64>, ApiError> {
                 "ids must be positive integers",
             ));
         }
-        out.push(id);
+        if !out.contains(&id) {
+            out.push(id);
+        }
     }
-    out.sort_unstable();
-    out.dedup();
     if out.len() > MAX {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             &format!("too many ids (max {MAX})"),
         ));
     }
+    Ok(out)
+}
+
+/// [`parse_id_list`] 的**集合**视图：去重 + 升序（批量删除端点的既有语义，一字未改）。
+fn parse_ids(raw: &str) -> Result<Vec<i64>, ApiError> {
+    let mut out = parse_id_list(raw)?;
+    out.sort_unstable();
     Ok(out)
 }
 
@@ -1398,5 +1577,191 @@ mod tests {
         assert_eq!(housed.absolute_path, src.to_string_lossy());
         assert!(src.exists(), "降级 = 文件留原位");
         assert!(st.logs.recent(20).iter().any(|l| l.contains("house_bytes")), "降级必须留痕");
+    }
+
+    // ── BUG-249：批量 retry / cancel（一动词一端点，差异走参数） ─────────────
+
+    /// 造一条指定状态的任务（终态要先转 running —— `finish_cache_task` 只对活跃态生效）。
+    async fn seeded_task(st: &Arc<AppState>, key: &str, status: &str) -> i64 {
+        let (task, _created) = st
+            .store
+            .enqueue_cache_task(7, None, key, &[11], "D:/dl")
+            .await
+            .expect("enqueue must succeed")
+            .expect("task must be created");
+        match status {
+            "queued" => {}
+            "running" => {
+                st.store.mark_cache_task_running(task.id).await.unwrap();
+            }
+            terminal => {
+                // done / failed / cancelled / interrupted 都要先从活跃态退出。
+                st.store.mark_cache_task_running(task.id).await.unwrap();
+                if terminal == "cancelled" {
+                    assert!(st.store.cancel_cache_task(task.id).await.unwrap());
+                } else {
+                    st.store.finish_cache_task(task.id, terminal, None).await.unwrap();
+                }
+            }
+        }
+        let got = st.store.get_cache_task(task.id).await.unwrap().unwrap();
+        assert_eq!(got.status, status, "夹具任务状态必须是 {status}");
+        task.id
+    }
+
+    async fn status_of(st: &AppState, id: i64) -> String {
+        st.store.get_cache_task(id).await.unwrap().unwrap().status
+    }
+
+    /// 调批量端点并解构为 `(状态码, JSON)`（`ApiError`/`Response` 都没有 Debug）。
+    async fn batch_call(
+        st: Arc<AppState>,
+        retry: bool,
+        ids: Option<&str>,
+    ) -> Result<(StatusCode, serde_json::Value), (StatusCode, serde_json::Value)> {
+        let mut q = std::collections::HashMap::new();
+        if let Some(v) = ids {
+            q.insert("ids".to_string(), v.to_string());
+        }
+        let res = if retry {
+            retry_tasks(State(st), Query(q)).await
+        } else {
+            cancel_tasks(State(st), Query(q)).await
+        };
+        match res {
+            Ok(Json(v)) => Ok((StatusCode::OK, v)),
+            Err(resp) => {
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .expect("body must be readable");
+                Err((status, serde_json::from_slice(&bytes).expect("body must be JSON")))
+            }
+        }
+    }
+
+    /// 批量重试：终态集整体复位为 `queued`，返回的 `ids` 与请求**顺序一致**。
+    #[tokio::test]
+    async fn batch_retry_resets_every_terminal_task() {
+        let st = state().await;
+        // 占住单飞门禁：重试会把任务交回 worker，这里要的是「复位」这一步本身。
+        assert!(st.claim_cache_worker(), "门禁初始必须空闲");
+        let failed = seeded_task(&st, "m:7:1", "failed").await;
+        let cancelled = seeded_task(&st, "m:7:2", "cancelled").await;
+        let interrupted = seeded_task(&st, "m:7:3", "interrupted").await;
+
+        // 故意乱序（并可含重复项）：返回必须**保序**、去重。
+        let request = format!("{interrupted},{failed},{cancelled},{failed}");
+        let (status, v) = batch_call(st.clone(), true, Some(&request))
+            .await
+            .expect("终态批量重试必须成功");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["ok"], true);
+        assert_eq!(
+            v["ids"],
+            json!([interrupted, failed, cancelled]),
+            "ids 必须与请求同序、去重，且不夹带别的 id"
+        );
+        for id in [failed, cancelled, interrupted] {
+            assert_eq!(status_of(&st, id).await, "queued", "任务 {id} 必须复位为排队");
+        }
+    }
+
+    /// 混合请求（含一条非终态）⇒ 整请求 422 + `invalid` 恰为那一条，
+    /// 且**合法的那条也不许被部分执行**（半执行让用户数不出动了几条）。
+    #[tokio::test]
+    async fn batch_retry_rejects_the_whole_request_when_any_id_is_not_terminal() {
+        let st = state().await;
+        assert!(st.claim_cache_worker());
+        let failed = seeded_task(&st, "m:7:11", "failed").await;
+        let running = seeded_task(&st, "m:7:12", "running").await;
+
+        let (status, v) = batch_call(st.clone(), true, Some(&format!("{failed},{running}")))
+            .await
+            .expect_err("含 running 必须整请求 422");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(v["invalid"], json!([running]), "invalid 必须恰为不合法的那条");
+        assert!(
+            v["error"].as_str().is_some_and(|s| !s.is_empty()),
+            "422 body 必须带人类可读的 error，实得 {v}"
+        );
+        // 真实形态留痕（`cargo test ... -- --nocapture` 可见）：契约要求 error + invalid 同在。
+        println!("BUG-249 422 body (mixed retry): {v}");
+        assert_eq!(status_of(&st, failed).await, "failed", "合法的那条也不得被部分执行");
+        assert_eq!(status_of(&st, running).await, "running", "活跃任务不得被打断");
+    }
+
+    /// `ids` 缺失 / 空 ⇒ 422（不得静默 no-op）。
+    #[tokio::test]
+    async fn batch_actions_reject_missing_or_empty_ids() {
+        let st = state().await;
+        for retry in [true, false] {
+            let (status, v) = batch_call(st.clone(), retry, None)
+                .await
+                .expect_err("缺 ids 必须 422");
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(v["error"].as_str().is_some_and(|s| !s.is_empty()), "缺 ids 的 422 必须带 error");
+
+            let (status, v) = batch_call(st.clone(), retry, Some(""))
+                .await
+                .expect_err("空 ids 必须 422");
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(v["error"].as_str().is_some_and(|s| !s.is_empty()), "空 ids 的 422 必须带 error");
+
+            let (status, _v) = batch_call(st.clone(), retry, Some("1,x"))
+                .await
+                .expect_err("非数字 id 必须 422");
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "非法 id 不得被静默跳过");
+        }
+    }
+
+    /// 批量取消：活跃态生效；含终态（这里用 `done`）⇒ 整请求 422；
+    /// 越界 id 沿用批量删除口径（不报错、不进 `ids`）。
+    #[tokio::test]
+    async fn batch_cancel_takes_active_tasks_and_rejects_done() {
+        let st = state().await;
+        assert!(st.claim_cache_worker());
+        let queued = seeded_task(&st, "m:7:21", "queued").await;
+        let done = seeded_task(&st, "m:7:22", "done").await;
+
+        let (status, v) = batch_call(st.clone(), false, Some(&format!("{queued},{done}")))
+            .await
+            .expect_err("含 done 必须整请求 422");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(v["invalid"], json!([done]));
+        assert_eq!(status_of(&st, queued).await, "queued", "整请求失败 ⇒ 活跃任务不得被取消");
+
+        // 合法集合：生效并回同一 id；越界 id（不存在）静默跳过，不进返回。
+        let ghost = 999_999_i64;
+        let (status, v) = batch_call(st.clone(), false, Some(&format!("{ghost},{queued}")))
+            .await
+            .expect("合法批量取消必须成功");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["ids"], json!([queued]), "越界 id 不生效也不报错（沿用批量删除口径）");
+        assert_eq!(status_of(&st, queued).await, "cancelled");
+    }
+
+    /// 单条端点与批量端点共用同一内核：单条 retry 也把终态复位成 `queued`。
+    #[tokio::test]
+    async fn single_retry_route_shares_the_batch_kernel() {        let st = state().await;
+        assert!(st.claim_cache_worker());
+        let failed = seeded_task(&st, "m:7:31", "failed").await;
+        let task = retry_task(State(st.clone()), AxumPath(failed))
+            .await
+            .expect("单条重试必须成功")
+            .0;
+        assert_eq!(task.id, failed, "单条重试复用同一 id（BUG-078）");
+        assert_eq!(status_of(&st, failed).await, "queued");
+    }
+
+    /// 路由表能建起来：`/api/cache/tasks/retry`（静态段）与 `/api/cache/tasks/:id`
+    /// （参数段，仅 DELETE）不得互相吃掉 —— axum/matchit 的路由冲突是**建表时 panic**，
+    /// 这行断言是它的唯一守卫（BUG-249 的静态段注册顺序要求）。
+    #[tokio::test]
+    async fn cache_router_registers_batch_paths_without_conflict() {
+        let st = state().await;
+        // 整个应用路由（含 merge）也必须建得起来：冲突会在这里立刻 panic。
+        let _ = crate::routes::router(st);
+        let _ = router();
     }
 }
