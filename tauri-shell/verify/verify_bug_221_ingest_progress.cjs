@@ -73,14 +73,14 @@ function check(name, pass, detail) {
   console.log(`[verify] ${pass ? 'PASS' : 'FAIL'} - ${name}${detail ? ' :: ' + detail : ''}`)
 }
 
-/** 读行内四个读数（+ 反空跑用的行状态）。 */
+/** 读行内四个读数（+ 反空跑用的行状态）。只看 running 那一行（合成数据里有两行）。 */
 function readRow(page) {
   return page.evaluate(() => {
     const txt = (id) => {
       const el = document.querySelector(`[data-testid="${id}"]`)
       return el ? String(el.textContent || '').trim() : null
     }
-    const rowEl = document.querySelector('[data-testid="cache-task-row"]')
+    const rowEl = document.querySelector('[data-testid="cache-task-row"][data-status="running"]')
     const raw = txt('cache-task-bytes-pct')
     const num = raw === null ? null : Number(String(raw).replace('%', ''))
     return {
@@ -96,6 +96,24 @@ function readRow(page) {
       feedCalls: window.__bug221Feed ? window.__bug221Feed.calls : -1,
       feedBytes: window.__bug221Feed ? window.__bug221Feed.bytes : -1,
     }
+  })
+}
+
+/**
+ * BUG-220 回退判据用：读两行的标题（行首 `span.truncate` 的内容）。
+ *
+ * - `titled` = running 行（合成数据给了 `title`）：必须**原样**以它开头，且不得被 `#` 污染；
+ * - `untitled` = done 行（`title: null`、`messageIds: [1234]`）：必须带上 `#1234`
+ *   且**不等于**纯频道名。
+ */
+function readTitles(page) {
+  return page.evaluate(() => {
+    const titleOf = (status) => {
+      const row = document.querySelector(`[data-testid="cache-task-row"][data-status="${status}"]`)
+      const span = row ? row.querySelector('span.truncate') : null
+      return span ? String(span.textContent || '').replace(/\s+/g, ' ').trim() : null
+    }
+    return { titled: titleOf('running'), untitled: titleOf('done') }
   })
 }
 
@@ -155,7 +173,21 @@ async function installFeed(page) {
           progressBytesTotal: FEED.total,
           progressAt: at,
         }
-        const body = JSON.stringify({ tasks: [task], counts: { running: 1 } })
+        // BUG-220 回退判据用：**没有 caption**（title 为 null）的任务 —— 老实现
+        // 在这里退化成纯频道名，一排同频道的行长得一模一样。
+        const untitled = {
+          id: 99002,
+          chatId: -1000000000001,
+          itemKey: 'm:-1000000000001:1234',
+          messageIds: [1234],
+          total: 1,
+          done: 1,
+          status: 'done',
+          createdAt: Math.floor(now / 1000) - 600,
+          updatedAt: Math.floor(now / 1000) - 300,
+          title: null,
+        }
+        const body = JSON.stringify({ tasks: [task, untitled], counts: { running: 1, done: 1 } })
         return Promise.resolve(
           new Response(body, { status: 200, headers: { 'content-type': 'application/json' } }),
         )
@@ -219,6 +251,26 @@ async function main() {
       `rows=${first.rows} status=${first.status}`)
     check('0b: 受控数据源被真实消费（面板确实在轮询它）', first.feedCalls > 0,
       `feedCalls=${first.feedCalls} feedBytes=${first.feedBytes}`)
+
+    // ── BUG-220 剩余缺口：无标题行的回退必须可辨认（带消息号）──
+    const BARE_CHANNEL = '频道 -1000000000001'
+    const MSG_TAG = '#1234'
+    await page.waitForFunction(
+      () => document.querySelectorAll('[data-testid="cache-task-row"]').length >= 2,
+      { timeout: WAIT_MS },
+    )
+    const titles = await readTitles(page)
+    console.log('[verify] row titles:', JSON.stringify(titles))
+    check('5a: 无标题行回退带消息号且不等于纯频道名',
+      typeof titles.untitled === 'string' &&
+        titles.untitled.includes(MSG_TAG) &&
+        !titles.untitled.startsWith(`${BARE_CHANNEL} ·`),
+      `untitled=${JSON.stringify(titles.untitled)} 纯频道形态应为 ${JSON.stringify(BARE_CHANNEL + ' · 单条 · 1 条')}`)
+    check('5b: 有标题行原样呈现（不被 # 污染）',
+      typeof titles.titled === 'string' &&
+        titles.titled.startsWith('BUG-221 验收合成任务') &&
+        !titles.titled.includes('#'),
+      `titled=${JSON.stringify(titles.titled)}`)
 
     // ── 判据 ①：字节百分比是具体数字，且随采样单调增长 ──
     await page.waitForFunction(

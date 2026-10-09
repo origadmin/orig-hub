@@ -788,8 +788,24 @@ export function CacheManagerDialog(props: {
    * v1 的错误修法（已被用户裁定「获取逻辑完全错了」）：壳按媒体库条目 by-ref 反查。
    * 那套只覆盖已出成品的任务（failed/queued 必然空白），还把「服务端一次 SQL」
    * 换成「每行一次 HTTP + 渲染期补数据」——数据早已在本地，是获取路径选错了层。
+   *
+   * 回退链末端（BUG-220 的剩余缺口）：**拿不到标题时也必须可辨认**。
+   * 消息本身没有 caption（与 BUG-246 的「缺行」是两回事）时 `task.title` 为 null，
+   * 此前整行退化成纯频道名 —— 同一频道的一排行长得一模一样，用户仍然分不出
+   * 哪行是哪批，正是 BUG-220 原文「无法知道具体的入库内容是什么」。现在末端拼上
+   * 该任务的首个消息号 `#<msg>`（消息号是数据不是文案，故不新增 i18n 键）。
    */
-  const ingestTitleOf = useCallback((task: TgCacheTask): string | null => task.title ?? null, [])
+  const ingestTitleOf = useCallback(
+    (task: TgCacheTask): string => {
+      const content = task.title?.trim()
+      if (content) return content
+      const head = titleOf(task.chatId) ?? `频道 ${task.chatId}`
+      // `messageIds` 为空的极端情况：退回频道链本身 —— 绝不渲染出空串或裸 `#`。
+      const first = task.messageIds[0]
+      return first == null ? head : `${head} #${first}`
+    },
+    [titleOf],
+  )
 
   /**
    * 当前筛选内被勾中的 id（BUG-149）。
@@ -1033,7 +1049,7 @@ export function CacheManagerDialog(props: {
             <IngestTaskRow
               key={task.id}
               task={task}
-              title={ingestTitleOf(task) ?? titleOf(task.chatId) ?? `频道 ${task.chatId}`}
+              title={ingestTitleOf(task)}
               now={nowMs}
               busy={busy}
               confirming={confirm?.kind === 'one' && confirm.id === task.id}
@@ -1083,7 +1099,7 @@ export function CacheManagerDialog(props: {
                   <IngestTaskRow
                     key={task.id}
                     task={task}
-                    title={ingestTitleOf(task) ?? titleOf(task.chatId) ?? `频道 ${task.chatId}`}
+                    title={ingestTitleOf(task)}
                     now={nowMs}
                     busy={busy}
                     confirming={confirm?.kind === 'one' && confirm.id === task.id}
