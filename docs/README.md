@@ -104,7 +104,7 @@
 | `product-direction-and-ffmpeg-2026-10-09.md` | governance | docs | draft | 2026-10-09 | 否 | 无（任务表 `PD-T01`~`PD-T05` 均未开工，见该文 §4.2；`decided-by: —`） |
 
 > **本节与 §3.1~§3.5 的列不同是刻意的**：§3.1~§3.5（30 行）是补标前建的旧表（4 列，`主题` 列写的是自由描述），
-> 尚未授权统一；**自 2026-10-09 起，本文所有新建/新改的表（§3.6、§六）一律用 `doc-first.md` §1.2 的 7 列模板**
+> 尚未授权统一；**自 2026-10-09 起，本文所有新建/新改的表（§3.6、§四、§六）一律用 `doc-first.md` §1.2 的 7 列模板**
 > （`主题`/`模块` 取 §1.1 的受控枚举）。存量 §3.1~§3.5 待 `doc-first.md` §7 的补标授权后一次性统一
 > （避免一次改动 30 行引发与并行会话的冲突）。
 >
@@ -115,12 +115,13 @@
 
 ## 四、规则（`docs/rules/`）
 
-| 文档 | 主题 | 状态 |
-|---|---|---|
-| `code-constraints.md` | AGENTS.md §5 各条规则的**依据**（为什么 + 实测数据） | 未标注 |
-| `bug-registry.md` | 缺陷登记规格 / 索引行规格 / 门禁行为 / 建档要点 | 未标注 |
-| `decision-spec.md` | 待拍板项的强制结构（六段 + 9 条硬性要求） | 未标注 |
-| `doc-first.md` | 先文档后代码 + 文档可继承规范（**含门禁判据，尚未接入 CI**） | draft |
+| 文档 | 主题 | 模块 | 状态 | 日期 | 已落地 | 落地证据（commit / 代码位置） |
+|---|---|---|---|---|---|---|
+| `code-constraints.md` | governance | docs | 未标注 | — | 否 | 无 |
+| `bug-registry.md` | governance | docs | 未标注 | — | 否 | 无 |
+| `decision-spec.md` | governance | docs | 未标注 | — | 否 | 无 |
+| `doc-first.md` | governance | docs | draft | 2026-09-29 | 否 | 无（`scripts/check-docs.py` 尚未创建，见该文 §8） |
+| `gate-scope.md` | governance | docs | draft | 2026-10-09 | 否 | 工具侧已落地：`scripts/check-bugs.py` 的 `--changed` / `--base`（见该文 §3）；规则侧待主理人确认 |
 
 ---
 

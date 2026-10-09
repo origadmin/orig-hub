@@ -23,7 +23,10 @@
 历史期的旧登记不追加强制章节（RULE_FROM 之前只告警），因为事后补写的「证据」
 本身就是伪造 —— 规则从升级点起生效，历史如实标注。
 
-用法：python scripts/check-bugs.py [--quiet]
+用法：python scripts/check-bugs.py [--quiet] [--changed] [--base <ref>]
+  --changed: **按变更范围跑**（默认取暂存区 `git diff --cached --name-only`）——
+             变更集里没有 `docs/bugs/**`、也没有本脚本自身时直接 SKIP 退出 0。
+  --base:    与 --changed 同义，只是变更集取 `<ref>...HEAD`（CI 用）。
 退出码：0 通过；1 有违反。
 """
 from __future__ import annotations
@@ -111,6 +114,52 @@ warnings: list[str] = []
 # CI 不加该参数，保留全量输出。
 QUIET = "--quiet" in sys.argv[1:]
 
+# ---- 变更作用域（2026-10-09 新增）------------------------------------------------
+# 为什么要它：本门禁是**全量扫描**（逐条档案 spawn 子进程），实测 399 秒。
+# 但它只可能被「缺陷档」的改动破坏 —— 改一份 `docs/design/*.md` 却要跑 6 分半钟的
+# 缺陷门禁，属于**作用域外**。实测代价：一次纯文档改动被拖了 6 分 39 秒。
+# 故提供 `--changed` / `--base`：**变更集不在作用域内就 SKIP**，让「误跑」的代价归零。
+# 默认（不带参数）行为**不变**，仍是全量 —— CI 与人工全量核对继续可用。
+CHANGED = "--changed" in sys.argv[1:]
+BASE = None
+if "--base" in sys.argv[1:]:
+    _i = sys.argv.index("--base")
+    if _i + 1 < len(sys.argv):
+        BASE = sys.argv[_i + 1]
+
+# 作用域 = 「哪些路径的变更可能让本门禁失败」。改这里必须同步 `docs/rules/gate-scope.md`。
+SCOPE_PREFIXES = ("docs/bugs/",)
+SCOPE_FILES = ("scripts/check-bugs.py",)
+
+
+def changed_paths() -> list[str] | None:
+    """变更文件清单。取不到（无 git / 非仓库）时返回 None = 不裁剪，退回全量。"""
+    args = ["git", "diff", "--name-only"]
+    args += [f"{BASE}...HEAD"] if BASE else ["--cached"]
+    try:
+        r = subprocess.run(args, cwd=ROOT, capture_output=True, text=True)
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return None
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def out_of_scope() -> bool:
+    """变更集是否完全落在作用域外（⇒ 应 SKIP）。"""
+    paths = changed_paths()
+    if paths is None:
+        print("check-bugs: 取不到变更清单（无 git？）—— 退回全量扫描")
+        return False
+    if not paths:
+        print("check-bugs: SKIP - 变更集为空（无暂存改动）")
+        return True
+    if any(p.startswith(SCOPE_PREFIXES) or p in SCOPE_FILES for p in paths):
+        return False
+    scope = "、".join(SCOPE_PREFIXES + SCOPE_FILES)
+    print(f"check-bugs: SKIP - 变更集 {len(paths)} 个文件均不在作用域（{scope}）")
+    return True
+
 
 def err(m: str) -> None:
     errors.append(m)
@@ -165,6 +214,9 @@ def git_ignores(rel: str) -> bool:
 
 
 def main() -> int:
+    if (CHANGED or BASE) and out_of_scope():
+        return 0
+
     if not os.path.isdir(BUGS):
         err("docs/bugs/ 不存在")
         return 1

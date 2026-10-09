@@ -134,6 +134,15 @@
 - 任一必需依赖缺失即**失败**，不顺延、不静默跳过。历史教训：pre-commit 曾无条件 `exec` 一个从未入库的
   脚本 → 恒 exit 127 把所有提交锁死；随后改成「缺了就跳过」，污染门禁又长期空转（根目录因此积了残留）。
 - CI 与本地钩子调用同一批脚本，CI 是最后一道闸（本地可被 `--no-verify` 绕过）。
+- **门禁按变更范围选择（唯一判据 = `docs/rules/gate-scope.md` §1 对照表）**：
+  跑门禁前必须能说出「本次变更的哪条路径落在它的作用域里」，**说不出就是不跑**。
+  **变更集全部落在免检白名单（`docs/**`、`*.md`、`**/locales/**`、`*.css`、`*/verify/**`、`scripts/**`）
+  ⇒ 不跑任何门禁。** 工具侧：`check-bugs.py --changed` 在变更集不含 `docs/bugs/**` 时直接 SKIP ——
+  实测把一次纯文档改动从 **399 s 降到约 3 s**（≈ Python 解释器启动开销，不进入扫描）。
+- **实测订正（上表「本地钩子」列写的是「应有」行为，非实测）**：实装钩子正文只有
+  `exec sh ".../scripts/check-pollution.sh"`（`framework/.git/modules/orig-hub/hooks/pre-commit`），
+  **不跑** check-bugs / check-decisions（BUG-187）。故在钩子修好前，**只有这两类改动**必须手工补跑：
+  `docs/bugs/**` → `check-bugs.py`；含决策块 `### D…` 的 `docs/**` → `check-decisions.py`。**其余改动不必。**
 
 ## 8. 汇报与决策约定（待拍板项必须可处置）
 
