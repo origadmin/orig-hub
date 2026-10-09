@@ -498,7 +498,6 @@
   "player.prevPhoto": "Previous photo",
   "player.nextPhoto": "Next photo",
   "player.unsupported": "This type cannot be previewed in the app",
-  "player.compatStream": "Codec not supported by the browser — switched to the live transcode stream (first play takes a moment; instant afterwards)",
   "player.untitled": "Untitled",
   "player.mixedCount": "{v} videos · {p} photos",
   "media.delete": "Delete",

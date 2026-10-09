@@ -11,15 +11,29 @@
  * （`/api/media/items/:id/stream`，orig-tg 用 ffmpeg 按需实时转 H.264 fMP4，
  * 代理完成后同地址秒开），退无可退才停载。
  *
+ * ## 前提作废（BUG-230 / BUG-245）
+ *
+ * 本脚本诞生于「原始流优先、解不动才切兼容流」的年代，两条判据因此失效：
+ *
+ * - **横幅判据作废**：`player-compat-banner` 已随 BUG-245 删除。转码是常态实现
+ *   路径而非异常，常驻横幅把「能播」播报成「出问题了」。A/B 阶段的横幅断言
+ *   一并删除，改以 `video.src` 走 `/stream` 作为等价（且更本质的）判据。
+ * - **`/raw` 起步判据作废**：BUG-230「stream-first」后播放器**挂载即 `/stream`**，
+ *   不再存在「先 `/raw` 再切换」的两段式路径。C 阶段原判据 `src.includes('/raw')`
+ *   改为 `/stream`；A 阶段「切换点」退化为「挂载点」。
+ *
+ * 保留本脚本的理由：它仍是「HEVC 条目能出帧 / 可解码条目不误伤」的回归防线，
+ * 只是判据要跟着实现走，不能抱着已删的 DOM 断言。
+ *
  * ## 判据（全部通过才算修复）
  *
- * 1. 打开 HEVC 条目 472：兼容流横幅（`player-compat-banner`）在 20s 内出现。
- * 2. 切换后 90s 内视频真正出帧：videoWidth > 0 且 totalVideoFrames 持续增长
+ * 1. 打开 HEVC 条目 472：20s 内挂在 `/stream`（stream-first，无 `/raw` 阶段）。
+ * 2. 挂载后 90s 内视频真正出帧：videoWidth > 0 且 totalVideoFrames 持续增长
  *    （转码即播，fMP4 无需等整片转完）。
- * 3. 切换后 10s 窗口内 `/stream` 请求 ≤ 3（单飞生效，新端点无 BUG-033 式风暴）。
- * 4. 切换后 `/raw` 请求停止增长（旧源已弃）。
+ * 3. 挂载后 10s 窗口内 `/stream` 请求 ≤ 3（单飞生效，新端点无 BUG-033 式风暴）。
+ * 4. 挂载后 `/raw` 请求不增长（旧源已弃）。
  * 5. 刷新记忆：localStorage 记住了解不动的源，重开同一条目直接从 `/stream` 起步。
- * 6. 回归：可解码条目 598 正常出帧，绝不切兼容流。
+ * 6. 回归：可解码条目 598 正常出帧，不停载。
  * 7. 全程无页面错误。
  *
  * 用法：先起开发态服务（`python scripts/dev_services.py` + vite dev 5180），
@@ -93,29 +107,35 @@ async function main() {
     await page.goto(APP_URL, { waitForRoot: true, settleMs: 1500 })
     console.log('[verify] navigated to', APP_URL)
     await page.waitForFunction(() => !!window.__origStore, { timeout: 15000 })
-    // 干净起点：清掉历史记忆，确保 A 阶段走完整的「先原始流 → 切兼容流」路径
+    // 干净起点：清掉历史记忆（BUG-230 起已是 stream-first，不存在「先 /raw 再切换」，
+    // 这里只为让 A 阶段不受上一次运行的 localStorage 记忆影响）。
     await page.evaluate(() => localStorage.removeItem('orighub.compatSrcs'))
 
-    // ---- A：HEVC 条目 → 自动切兼容流并出帧 ----
+    // ---- A：HEVC 条目 → 挂在兼容流（/stream）并出帧 ----
+    // 横幅判据已随 BUG-245 删除：转码是常态路径，不再有「已切换」这条 UI 播报。
+    // 等价判据 = video.src 走 /stream（BUG-230 起挂载即是，无需等待切换）。
     await openItem(page, HEVC_ITEM)
-    const banner = await page
-      .waitForFunction(() => !!document.querySelector('[data-testid="player-compat-banner"]'), { timeout: 20000 })
+    const onStream = await page
+      .waitForFunction(() => {
+        const v = document.querySelector('[data-testid="media-viewer"] video')
+        return !!v && String(v.src).includes('/stream')
+      }, { timeout: 20000 })
       .then(() => true)
       .catch(() => false)
-    console.log('[verify] compat banner present =', banner)
-    check('A: compat banner appears for HEVC item (auto-switch)', banner, `item=${HEVC_ITEM}`)
-    if (!banner) {
-      await shot(page, 'A-no-banner.png')
+    console.log('[verify] mounted on /stream =', onStream)
+    check('A: HEVC item mounts on /stream (stream-first)', onStream, `item=${HEVC_ITEM}`)
+    if (!onStream) {
+      await shot(page, 'A-not-on-stream.png')
     }
 
-    // 切换点：/raw 停止增长 + /stream 无风暴
+    // 挂载点：/raw 不增长 + /stream 无风暴
     await page.evaluate(() => { window.__switchAt = performance.now() })
     const c1 = await reqCounts(page)
     await delay(10000)
     const c2 = await reqCounts(page)
     console.log('[verify] request counts: before', JSON.stringify(c1), 'after 10s', JSON.stringify(c2))
     check('A: /stream requests stay bounded (single-flight, no storm)', c2.stream <= 3, `stream reqs=${c2.stream}`)
-    check('A: /raw requests stop growing after switch', c2.raw <= c1.raw + 1, `raw ${c1.raw} -> ${c2.raw}`)
+    check('A: /raw requests never grow (raw source abandoned)', c2.raw <= c1.raw + 1, `raw ${c1.raw} -> ${c2.raw}`)
 
     // 出帧：fMP4 直播态下 videoWidth>0 且 totalVideoFrames 持续增长
     const framed = await page
@@ -153,16 +173,17 @@ async function main() {
     await delay(2000)
     const mem = await page.evaluate(() => {
       const v = document.querySelector('[data-testid="media-viewer"] video')
-      const bannerNow = !!document.querySelector('[data-testid="player-compat-banner"]')
-      return { src: v ? v.src : null, bannerNow }
+      // 横幅断言已删（BUG-245）；改看是否直接挂 /stream，与 A 阶段同一把尺子。
+      const haltNow = !!document.querySelector('[data-testid="player-unsupported-halt"]')
+      return { src: v ? v.src : null, haltNow }
     })
     console.log('[verify] memory reopen:', JSON.stringify(mem))
     await page.evaluate(() => window.__origStore.getState().closeViewer())
     await delay(300)
     check('B: remembered item opens directly on /stream', mem.src && mem.src.includes('/stream'), `src=${mem.src}`)
-    check('B: compat banner shows immediately on remembered item', mem.bannerNow, `banner=${mem.bannerNow}`)
+    check('B: remembered item is not halted', mem.haltNow === false, `halt=${mem.haltNow}`)
 
-    // ---- C：可解码条目回归 → 正常播放，绝不切兼容流 ----
+    // ---- C：可解码条目回归 → 正常播放，不停载 ----
     await openItem(page, OK_ITEM)
     await delay(6000)
     const okState = await page.evaluate(() => {
@@ -173,18 +194,19 @@ async function main() {
         vw: v.videoWidth, vh: v.videoHeight,
         frames: q ? q.totalVideoFrames : -1,
         src: v.src,
-        banner: !!document.querySelector('[data-testid="player-compat-banner"]'),
         halt: !!document.querySelector('[data-testid="player-unsupported-halt"]'),
       }
     })
     console.log('[verify] C decodable item state:', JSON.stringify(okState))
     await shot(page, 'C-decodable-no-compat.png')
-    check('C: decodable item presents frames on raw source (no compat switch)',
-      okState && okState.frames > 0 && okState.vw > 0 && String(okState.src).includes('/raw'),
+    // BUG-230「stream-first」后所有条目都从 /stream 起步（不再有 /raw 阶段），
+    // 原 `src.includes('/raw')` 判据作废；可解码条目的回归判据 = 正常出帧 + 不停载。
+    check('C: decodable item presents frames on /stream (no halt)',
+      okState && okState.frames > 0 && okState.vw > 0 && String(okState.src).includes('/stream'),
       `frames=${okState && okState.frames} ${okState && okState.vw}x${okState && okState.vh} src=${okState && okState.src}`)
-    check('C: no compat banner and no halt for decodable item',
-      okState && !okState.banner && !okState.halt,
-      `banner=${okState && okState.banner} halt=${okState && okState.halt}`)
+    check('C: no halt for decodable item',
+      okState && !okState.halt,
+      `halt=${okState && okState.halt}`)
 
     const errs = page.pageErrors().slice(0, 10)
     console.log('[verify] PAGE_ERRORS:', JSON.stringify(errs))

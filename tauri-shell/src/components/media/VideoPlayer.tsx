@@ -1240,15 +1240,9 @@ export function VideoPlayer({
         </div>
       )}
 
-      {/* 兼容流横幅（BUG-208）：原始编码浏览器解不动，已切换服务端实时转码（H.264） */}
-      {usingCompat && !fatal && !halted && (
-        <p
-          data-testid="player-compat-banner"
-          className="absolute left-1/2 top-16 z-20 -translate-x-1/2 rounded-md border border-white/20 bg-black/70 px-3 py-1.5 text-center text-xs text-white/90 backdrop-blur-sm"
-        >
-          {t('player.compatStream')}
-        </p>
-      )}
+      {/* 兼容流横幅已移除（BUG-245）：转码是常态实现路径而非异常，常驻横幅把「能播」
+          播报成「出问题了」，且长期占位遮挡画面。`usingCompat` 仍保留并驱动换档
+          effect；真正需要告知用户的只有 fatal/halted 遮罩与下方解码异常提示。 */}
 
       {/* 解码异常提示（onError 抓不到的两类静默失败，BUG-034） */}
       {!fatal && !halted && decode !== 'ok' && (
