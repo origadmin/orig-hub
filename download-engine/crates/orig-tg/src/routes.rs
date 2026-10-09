@@ -1153,6 +1153,18 @@ async fn enqueue_cache_task(
     if created {
         spawn_cache_task(st.clone(), task.id);
     }
+    // BUG-246：入队即登记消息元数据。任务标题的事实源是 `media_message` 表，而该行
+    // 历史上只在 worker **启动任务时**由 `IngestCtx::prepare()` 补写；排队任务不启动
+    // worker ⇒ 行整条缺失 ⇒ 标题恒 None ⇒ 前端退回裸频道名。这里后台补写、不阻塞
+    // 入队响应：与 BUG-170 的裁定同向——元数据登记是瞬间的，耗时的只有字节搬运。
+    {
+        let st_meta = st.clone();
+        let chat_id = req.chat_id;
+        let msg_ids = req.message_ids.clone();
+        tokio::spawn(async move {
+            ensure_message_rows(&st_meta, chat_id, &msg_ids).await;
+        });
+    }
     Ok(Json(task))
 }
 
@@ -1350,6 +1362,45 @@ pub fn spawn_cache_task(st: Arc<AppState>, task_id: i64) {
     });
 }
 
+/// 消息元数据登记的唯一真源：为本组消息**补写缺失的** `media_message` 行（幂等）。
+///
+/// **为什么要在入队时也登记一次（BUG-246）**：任务标题链
+/// （`cache_task_titles` → `message_captions_for_channels`）的事实源是
+/// `media_message` 表；而该行历史上只在 worker **启动任务时**由
+/// `IngestCtx::prepare()` 补写。排队任务根本不启动 worker ⇒ 行整条缺失 ⇒
+/// 标题恒 None ⇒ 前端退回裸频道名（实测：83 条任务里 `queued` 12/12 无 title，
+/// 库中逐消息查全是「缺行」——既不是 caption 为空，也不是 ID 形态不符）。
+///
+/// 与 BUG-170 的裁定同向：**元数据登记是瞬间的，耗时的只有字节**。所以在入队这条
+/// 快路径上顺手登记掉元数据，字节仍交给 worker 慢慢搬。
+///
+/// 只补缺失：`get_message` 已命中的消息直接跳过，避免每次入队都打一轮 MTProto。
+/// 容错语义与 `prepare()` 完全一致——单行失败跳过、不返回错误：元数据只影响标题，
+/// 绝不能反过来阻断入队或字节入库。
+async fn ensure_message_rows(st: &Arc<AppState>, chat_id: i64, msg_ids: &[i64]) {
+    for msg_id in msg_ids {
+        if matches!(st.store.get_message(chat_id, *msg_id).await, Ok(Some(_))) {
+            continue;
+        }
+        if let Ok(Some(m)) = st.client.message_meta(chat_id, *msg_id).await {
+            let _ = st
+                .store
+                .upsert_message(
+                    chat_id,
+                    *msg_id,
+                    m.caption.as_deref(),
+                    m.mime_type.as_deref(),
+                    m.size,
+                    m.media_type.as_deref(),
+                    m.date,
+                    m.duration,
+                    m.group_id,
+                )
+                .await;
+        }
+    }
+}
+
 // ---- 缓存任务的元数据登记（byte-ownership P1：事实先登记，设计 I1） ----
 
 /// 消息元数据 → 规范 kind（T0 登记与组预扫共用的同一把尺子）。
@@ -1423,27 +1474,9 @@ impl IngestCtx {
     /// has_video。元数据拉取失败的消息不阻断：行缺席时该消息不进目标池，T0 登记
     /// 退化为 file/无标题（与旧实现 meta 缺失同貌）。
     async fn prepare(st: &Arc<AppState>, task: &CacheTask) -> Self {
-        for msg_id in &task.message_ids {
-            if matches!(st.store.get_message(task.chat_id, *msg_id).await, Ok(Some(_))) {
-                continue;
-            }
-            if let Ok(Some(m)) = st.client.message_meta(task.chat_id, *msg_id).await {
-                let _ = st
-                    .store
-                    .upsert_message(
-                        task.chat_id,
-                        *msg_id,
-                        m.caption.as_deref(),
-                        m.mime_type.as_deref(),
-                        m.size,
-                        m.media_type.as_deref(),
-                        m.date,
-                        m.duration,
-                        m.group_id,
-                    )
-                    .await;
-            }
-        }
+        // 元数据登记走唯一真源（BUG-246）：入队时通常已补过行，这里重跑是幂等的
+        // 安全网——历史任务、入队时登记失败的消息、以及升级前入队的任务都靠它兜底。
+        ensure_message_rows(st, task.chat_id, &task.message_ids).await;
         let mut slot_msgs = Vec::new();
         let mut has_video = false;
         for msg_id in &task.message_ids {
