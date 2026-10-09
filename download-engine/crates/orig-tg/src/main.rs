@@ -167,6 +167,32 @@ async fn main() {
             .map(|ip| ip.is_loopback())
             .unwrap_or(true),
     );
+    // 先占端口，再连 Telegram（BUG-227）。
+    //
+    // 为什么顺序要紧：daemon 判定「起来没起来」用的是 **TCP 能否连上本端口**
+    // （`orig-daemon/src/state.rs::tg_port_has_listener`），而它的等待窗口原为 5s；
+    // 而 orig-tg 原来把 bind 放在 MTProto 之后 —— 「到开始监听」的耗时于是等于
+    // **网络登录耗时**（实测 5.10 s / 6.96 s，随代理链路抖动），恰好把窗口顶穿，
+    // daemon 于是把一个本可成功的进程判死并 kill，用户看到「TG 服务未能启动，模块已隐藏」。
+    // 端口与登录是两件事：端口先归我们所有，登录慢只影响 `/api/tg/*` 的可用性
+    // （`Availability::Unavailable` → 503），不该反过来把服务本身判成起不来。
+    // 先 bind 期间到达的连接排在 backlog 里，等 `axum::serve` 起来照常处理，不丢请求。
+    let addr: std::net::SocketAddr = match format!("{}:{}", config.bind, config.port).parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[fatal] invalid bind address {}/{}: {e}", config.bind, config.port);
+            std::process::exit(EXIT_BIND_FAILED);
+        }
+    };
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[fatal] orig-tg bind {addr} failed: {e}");
+            std::process::exit(EXIT_BIND_FAILED);
+        }
+    };
+    eprintln!("orig-tg bound {addr} (TCP listening; telegram connect follows)");
+
     let (client, availability, mock) = build_client(&config).await;
 
     // 打开存储；失败即致命退出（见 `EXIT_STORE_FAILED` 注释），不做空库兜底。
@@ -294,25 +320,9 @@ async fn main() {
             .max_age(std::time::Duration::from_secs(3600)),
     );
 
-    let addr: std::net::SocketAddr = match format!("{}:{}", config.bind, config.port).parse() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("[fatal] invalid bind address {}/{}: {e}", config.bind, config.port);
-            std::process::exit(EXIT_BIND_FAILED);
-        }
-    };
-
-    // bind 成功之后才宣告 listening。
-    // 此前日志打在 bind **之前**：端口被占用时仍打印 "listening on http://..." 后 panic，
-    // 把排查引向「服务已起但接口 404」的错方向（BUG-023 的直接误导源）。
-    // 端口占用不再 `unwrap()` panic，而是给出确定退出码。
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[fatal] orig-tg bind {addr} failed: {e}");
-            std::process::exit(EXIT_BIND_FAILED);
-        }
-    };
+    // 端口已在启动早期 bind（见上，BUG-227）；这里只补「什么模式」这一句。
+    // 「bind 前就宣告 listening」的老毛病（BUG-023 的误导源）不会回来：那行日志
+    // 现在紧跟在真正的 bind 之后，端口被占用时根本走不到这里。
     eprintln!(
         "orig-tg listening on http://{addr} (mode={} mock={mock})",
         availability.label()

@@ -126,6 +126,18 @@ export interface DaemonConfig {
    * 服务不可用时侧栏没有 TG 入口，原因必须摆在设置页开关旁，否则用户只会以为功能没了。
    */
   tg_last_error?: string | null
+  /**
+   * 调试日志路径（BUG-243）：由 daemon 下发**绝对路径**，设置-关于页直接展示，
+   * 用户出错时照路径就能翻到日志，不必先问「日志在哪」。前端不拼路径——
+   * 拼接权在引擎（`state::log_dir()` 是唯一真源），否则两端各拼一套必然漂移。
+   *  - `orig-tg.log`：orig-tg 子进程完整 stdout/stderr（启动失败原因在这里）；
+   *  - `errors.log`：daemon 记录的核心错误（append-only，超 8 MiB 滚动一代）。
+   */
+  logs?: {
+    dir: string
+    orig_tg: string
+    errors: string
+  }
 }
 
 /** 代理配置（HTTP 下载） */

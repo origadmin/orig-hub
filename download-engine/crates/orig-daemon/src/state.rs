@@ -42,7 +42,15 @@ const TG_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 就退了 —— 而旧实现 `spawn()` 一返回就 `Ok(true)`，于是 `/api/config` 报
 /// `tg_enabled=true` 而进程列表里根本没有 orig-tg：**「已开启但未连接」这个不该
 /// 存在的状态就是这么来的**。等不到监听者就如实报错。
-const TG_START_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// ⚠️ 这个窗口**必须覆盖 orig-tg 的冷启动**（BUG-227）。orig-tg 的启动顺序是
+/// 「先连 MTProto（`build_client`）→ 再 bind HTTP」，所以「到开始监听」的耗时 =
+/// 网络登录耗时，**不是**本机进程启动耗时。同一二进制实测：**5.10 s / 6.96 s**
+/// （走 socks5 代理，需等 MTProto 协商完盐与 future salts），抖动全在网络侧。
+/// 原值 5 s 恰好落在实测区间内 ⇒ 已就绪的进程被 daemon 判死并 kill，
+/// 用户看到的是「TG 服务未能启动，模块已隐藏」——**不是端口冲突，是窗口太短**。
+/// 30 s 给足慢链路余量；真正的失败仍然快速失败：子进程退出即刻中止（见下方循环）。
+const TG_START_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// TG 托管巡检周期：daemon 是 orig-tg 的**唯一所有者**，开启却没在服务是 daemon
 /// 的失职，必须自愈而不是等用户去点开关。
@@ -308,8 +316,13 @@ impl AppState {
     }
 
     /// 记一次 TG 失败原因（只记录，不吞错：错误本身仍会向上传递给调用方）。
+    ///
+    /// 同时落 `logs/errors.log`（BUG-243）：内存里的 `tg_last_error` 会被下一次成功
+    /// 拉起清空，重启后更是全无 —— 而「偶发故障」恰恰只在事后才有人来查。
     fn set_tg_last_error(&self, msg: impl Into<String>) {
-        *self.tg_last_error.write().unwrap() = Some(msg.into());
+        let msg = msg.into();
+        append_error_log(&msg);
+        *self.tg_last_error.write().unwrap() = Some(msg);
     }
 
     /// 拉起 orig-tg 子进程（幂等）：注入代理与凭据（解析规则见 [`resolve_tg_env`]，
@@ -326,6 +339,11 @@ impl AppState {
         // 一句笼统的 "exited without listening"（那会把「文件不存在」伪装成「进程自杀」）。
         let bin = tg_binary_path();
         if !bin.exists() {
+            // 记一次「尝试时间」（BUG-244）：`TG_SPAWN_COOLDOWN` 的判定读的就是这个时刻，
+            // 而它原来只在 `cmd.spawn()` **成功之后**才写 —— 于是走这条早退路径时冷却永远
+            // 不生效，巡检每 15s 重试一次，注释里承诺的「永久失败不该每 15s 起一个进程」
+            // 落空，表现是错误日志每 15s 追加一行。冷却必须覆盖**所有**失败路径。
+            *self.tg_last_spawn.lock().await = Some(tokio::time::Instant::now());
             let msg = format!(
                 "orig-tg binary not found at {}; the desktop app may need to be rebuilt/redeployed",
                 bin.display()
@@ -365,6 +383,23 @@ impl AppState {
         if inject.api_id.is_none() || inject.api_hash.is_none() {
             // 只记「没拿到」，绝不打印任何字段值（凭据永不入日志）。
             eprintln!("[tg] no MTProto credentials resolved; orig-tg will start without api_id/api_hash");
+        }
+        // 子进程输出落文件（BUG-243）：此前是**继承 daemon 的 stdio**，而 daemon 由
+        // `dev_services.py` / 桌面壳以 DEVNULL 启动 ⇒ orig-tg 的启动失败原因当场就丢了，
+        // 只剩 daemon 一句笼统的 `tg_last_error`（用户于是只能看到「未能启动」而看不到
+        // 为什么）。固定写到 `logs/orig-tg.log`，与关于页给出的路径同源。
+        // 打不开就退回继承 stdio —— 日志不能阻断服务启动。
+        match open_log_file("orig-tg.log") {
+            Some(f) => match f.try_clone() {
+                Ok(f2) => {
+                    cmd.stdout(std::process::Stdio::from(f));
+                    cmd.stderr(std::process::Stdio::from(f2));
+                }
+                Err(_) => {
+                    cmd.stdout(std::process::Stdio::from(f));
+                }
+            },
+            None => {}
         }
         let child = cmd.spawn()?;
         *self.tg_child.lock().await = Some(child);
@@ -731,6 +766,85 @@ pub fn tg_data_dir() -> PathBuf {
     }
     // 兜底：相对路径也能用，但上游 daemon 侧一般已有稳定目录。
     PathBuf::from(".orighub")
+}
+
+/// 调试日志根目录（**单一路径真源**，BUG-243）：`<数据目录>/logs`。
+///
+/// 与 `tg_data_dir()` 同源 ⇒ 调试/生产/壳三方看到的是同一个目录，用户按
+/// 设置-关于里给出的路径就能直接翻到日志，不需要问「日志在哪」。
+pub fn log_dir() -> PathBuf {
+    tg_data_dir().join("logs")
+}
+
+/// 单个日志文件的滚动上限（8 MiB，只留一代 `.1`）。
+///
+/// 为什么不无限追加：诊断价值集中在**最近一段**，而无限增长会持续吃用户磁盘 ——
+/// 与「日志不得影响整体下载/播放」这条硬约束相悖。
+const LOG_FILE_CAP_BYTES: u64 = 8 * 1024 * 1024;
+
+/// 以追加方式打开 `logs/<name>`；超过上限先把现有文件滚成 `<name>.1`（只留一代）。
+///
+/// 打开失败一律返回 `None`：**日志永远不能让主流程失败**（磁盘满、目录只读都不能
+/// 阻断下载/播放）。调用方把 `None` 当作「这次没记上」即可，不向上传播错误。
+pub(crate) fn open_log_file(name: &str) -> Option<std::fs::File> {
+    let dir = log_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let path = dir.join(name);
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > LOG_FILE_CAP_BYTES {
+        let rolled = dir.join(format!("{name}.1"));
+        let _ = std::fs::remove_file(&rolled);
+        let _ = std::fs::rename(&path, &rolled);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()
+}
+
+/// 把 Unix 秒格式化为 `YYYY-MM-DDTHH:MM:SSZ`（UTC）。
+///
+/// 不引日期库：本 crate 只需一个诊断时间戳，`civil_from_days`（Howard Hinnant
+/// 的日历算法）十几行就够，不值得为日志加一个 chrono 依赖。
+pub(crate) fn fmt_utc(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+    if mth <= 2 {
+        y += 1;
+    }
+    format!("{y:04}-{mth:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// 当前 Unix 秒（本地小工具，避免与 `routes::now_secs` 形成跨模块耦合）。
+fn epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 记录一条**核心错误**到 `logs/errors.log`（append-only，超限滚动一代）。
+///
+/// 「核心错误」= 用户可感知且事后需要排查的失败（服务拉不起来、链路断、端点拒绝），
+/// **不是逐请求流水** —— 逐请求写盘会把日志变成 IO 热点，违背「不影响下载/播放性能」。
+/// 因此本函数只在失败路径上被调用（当前唯一入口是 `set_tg_last_error`）。
+pub(crate) fn append_error_log(msg: &str) {
+    use std::io::Write;
+    if let Some(mut f) = open_log_file("errors.log") {
+        let _ = writeln!(f, "{} {}", fmt_utc(epoch_secs()), msg);
+    }
 }
 
 /// 定位 orig-tg 可执行文件：`ORIG_TG_PATH` 优先，其次当前 exe 同目录，最后回退裸名。

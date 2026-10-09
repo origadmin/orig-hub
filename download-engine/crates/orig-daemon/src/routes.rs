@@ -36,7 +36,7 @@ use orig_core::engine::Task;
 use orig_core::protocol::{DownloadConfig, ParsedUrl, SseEvent};
 use crate::activity::{self, ActivityQuery, ActivitySnapshot};
 use crate::config::{resolve_output, resolve_output_classified};
-use crate::state::{AppState, DownloadTask};
+use crate::state::{log_dir, AppState, DownloadTask};
 use crate::status::DownloadStatus;
 
 // ---- 请求结构 ----
@@ -511,6 +511,15 @@ async fn get_config(State(st): State<Arc<AppState>>) -> axum::Json<serde_json::V
         // 拉起/自愈失败的原因（null = 最近一次成功）。入口级门控「服务可用才显示 TG」
         // 会让 TG 不可用时侧栏没有入口，原因必须在设置页可见，否则用户只会以为功能没了。
         "tg_last_error": st.tg_last_error(),
+        // 调试日志（BUG-243）：把**路径**下发给设置-关于页，用户出错时能直接去查，
+        // 不必先问「日志在哪」。目录与文件同源（`state::log_dir()`），前端不拼路径。
+        // orig-tg.log = 子进程完整 stdout/stderr（启动失败原因就在里面）；
+        // errors.log  = daemon 记录的核心错误（含每一次 tg_last_error，append-only）。
+        "logs": {
+            "dir": log_dir().to_string_lossy().into_owned(),
+            "orig_tg": log_dir().join("orig-tg.log").to_string_lossy().into_owned(),
+            "errors": log_dir().join("errors.log").to_string_lossy().into_owned(),
+        },
     }))
 }
 

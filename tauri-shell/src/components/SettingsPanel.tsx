@@ -137,6 +137,13 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
   // 系统默认下载目录（按 OS 解析：Windows 为 C:\Users\<user>\Downloads）：用户未显式设置时
   // 作占位/回退，杜绝写死的 ~/Downloads（Unix 风格，在 Windows 上误导）。
   const [defaultDir, setDefaultDir] = useState('')
+  /**
+   * 调试日志路径（BUG-243）：daemon 是唯一真源（`GET /api/config` 的 `logs`），
+   * 这里只**照抄展示**，不本地拼路径 —— 引擎换目录时关于页自动跟着走。
+   */
+  const [logPaths, setLogPaths] = useState<{ dir: string; orig_tg: string; errors: string } | null>(
+    null,
+  )
   /** TG 拉起/自愈失败原因：单一真源是服务层（daemon `tg_last_error`），不另存一份 state */
   const tgError = tgService.lastError
 
@@ -229,6 +236,8 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
           setDir(c.download_dir)
           updateSettings({ downloadDirectory: c.download_dir })
         }
+        // 调试日志路径（BUG-243）：同一份 config 里带下来，不额外打一次请求。
+        if (c.logs) setLogPaths(c.logs)
       })
       .catch(() => {})
     // TG 拉起失败原因（BUG-177 / BUG-178）：服务不可用时侧栏没有 TG 入口，
@@ -377,6 +386,19 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
   /** 打开库根文件夹（tauri opener 通道；浏览器 dev 下无插件 —— 记录后静默） */
   const openLibraryFolder = async () => {
     const target = libDirSaved || libDir
+    if (!target) return
+    try {
+      const { openPath } = await import('@tauri-apps/plugin-opener')
+      await openPath(target)
+    } catch (e) {
+      console.error('openPath failed', e)
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  /** 打开调试日志目录（BUG-243；tauri opener 通道，浏览器 dev 下无插件 —— 记录后静默） */
+  const openLogFolder = async () => {
+    const target = logPaths?.dir
     if (!target) return
     try {
       const { openPath } = await import('@tauri-apps/plugin-opener')
@@ -1149,6 +1171,49 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
                     {t('tg.startFailedHint', { reason: tgError })}
                   </p>
                 ) : null}
+              </div>
+
+              {/*
+                调试日志（BUG-243）：把**日志路径**摆到关于页，出错时用户照路径就能查，
+                不必问「日志在哪」——「无法检查」本身就是故障不可解的一半原因。
+                路径全部来自 daemon `/api/config` 的 `logs`（唯一真源），前端不拼路径。
+                性能约束（用户明确要求）：日志只写**启动/失败**两类事件，不逐请求落盘，
+                因此不影响下载与播放；单文件超 8 MiB 滚动一代，不做无限追加。
+              */}
+              <div
+                className="space-y-3 rounded-xl border border-border-subtle bg-surface p-5"
+                data-testid="about-logs"
+              >
+                <div className="flex items-start justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="text-[13px] font-medium text-fg-strong">{t('about.logs')}</p>
+                    <p className="mt-0.5 text-[11px] text-muted">{t('about.logsHint')}</p>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    onClick={openLogFolder}
+                    disabled={!logPaths?.dir}
+                    data-testid="about-logs-open"
+                  >
+                    {t('about.logsOpen')}
+                  </Button>
+                </div>
+                <p
+                  className="break-all rounded-md bg-surface-2 px-3 py-2 font-mono text-[11px] text-fg-mid"
+                  data-testid="about-logs-dir"
+                >
+                  {logPaths?.dir ?? t('about.logsUnavailable')}
+                </p>
+                <ul className="space-y-1 text-[11px] text-muted">
+                  <li>
+                    <span className="font-mono text-fg-mid">orig-tg.log</span> ·{' '}
+                    {t('about.logsOrigTg')}
+                  </li>
+                  <li>
+                    <span className="font-mono text-fg-mid">errors.log</span> ·{' '}
+                    {t('about.logsErrors')}
+                  </li>
+                </ul>
               </div>
             </div>
           )}
