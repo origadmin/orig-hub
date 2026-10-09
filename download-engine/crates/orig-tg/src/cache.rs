@@ -981,10 +981,16 @@ async fn retry_task(
     Ok(Json(retry_task_kernel(&st, id).await?))
 }
 
-/// 批量动作的状态门（**批量语义比单条更严**，见各自端点的注释）。
+/// 批量动作的状态门（单条端点共用同一门，见各自端点的注释）。
 ///
-/// - `Retry`：只有终态能被复位。`done` **不在内**——它没有「重跑」的语义，
-///   要重下得走「重新入队」；把它混进批量重试会让一次误点重下若干已完成的成品。
+/// - `Retry`：只有 `failed` / `cancelled` / `interrupted` 能被复位。
+///   **`done` 不在内**，与前端单条按钮的判据**同源**——`tauri-shell/src/components/
+///   CacheManagerDialog.tsx:76` 的 `RETRYABLE` 同样排除 `done`。端点必须与 UI 的
+///   可操作性一致，否则会出现「界面上没有按钮、API 却接受」的判据分裂。
+///   （`store::retry_cache_task` 的 `status NOT IN ('running','queued')` 是更宽的
+///   **历史**判据、允许 `done`，但 UI 路径不可达；不要据此把 `done` 放进来。）
+///   `done` 要重下走「重新入队」（`enqueue_cache_task`）：worker 对「已缓存且文件
+///   存在」的条目本就幂等跳过，复位 `done` 只会让队列空转一圈再回到 `done`。
 /// - `Cancel`：只有活跃态可取消；终态没有可取消的动作，含终态的整请求 422。
 const RETRYABLE_STATES: [&str; 3] = ["failed", "cancelled", "interrupted"];
 const CANCELLABLE_STATES: [&str; 2] = ["queued", "running"];
