@@ -1345,23 +1345,19 @@ async fn cache_task_by_id(
 }
 
 /// DELETE /api/tg/cache/tasks/:id — 取消缓存任务（worker 在下一条目间隙退出）。
+///
+/// BUG-249：状态迁移走 `cache::cancel_task_kernel` —— 批量取消端点
+/// （`POST /api/cache/tasks/cancel?ids=`）调的是同一个内核，单条/批量**同一真源**。
 async fn cancel_cache_task_route(
     State(st): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let hit = st
-        .store
-        .cancel_cache_task(id)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-    if !hit {
+    if !crate::cache::cancel_task_kernel(&st, id).await? {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "no active cache task with this id",
         ));
     }
-    st.push_log(format!("/api/tg/cache/tasks/{id}: cancel requested"));
-    st.refresh_cache_tasks().await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -6753,7 +6749,7 @@ mod tests {
             "新入队任务此刻必须是 queued"
         );
 
-        // 登记在后台协程里跑（同一 spawn：BUG-246 元数据 → BUG-248 条目），轮询等它落地。
+        // 登记在后台协程里跑（同一 spawn：条目 → BUG-246 元数据 → 补强），轮询等它落地。
         let video_ref = format!("{CACHE_FIXTURE_CHAT}:11");
         let photo_ref = format!("{CACHE_FIXTURE_CHAT}:12");
         let video_id = wait_item_id(&st, &video_ref).await;
@@ -6763,12 +6759,19 @@ mod tests {
         let live = st.store.get_cache_task(task_id).await.unwrap().unwrap();
         assert_eq!(live.status, "queued", "登记期间任务必须保持排队态");
 
+        // 元数据到位前后都是同一条目（补强不是新建），故先把「字节未到」钉死。
+        let seed = st.store.get_media_item(video_id).await.unwrap().unwrap();
+        assert_eq!(seed.file_path, None, "T0 登记字节未落 ⇒ file_path 必须是 NULL");
+
+        // 元数据（同一协程的第 ② 步）到位后被补强为与 worker 同一把尺子的 kind/标题。
+        wait_title(&st, video_id, "先登记的一集 标题行").await;
         let video = st.store.get_media_item(video_id).await.unwrap().unwrap();
-        assert_eq!(video.file_path, None, "T0 登记字节未落 ⇒ file_path 必须是 NULL");
+        assert_eq!(video.file_path, None, "补强不碰字节");
         assert_eq!(video.kind, "video", "kind 与 worker 同一把尺子（meta_kind）");
         assert_eq!(video.title, "先登记的一集 标题行", "标题取 caption 首行");
         assert_eq!(video.description.as_deref(), Some("说明行"));
 
+        wait_title(&st, photo_id, "TG 图片 #12").await;
         let photo = st.store.get_media_item(photo_id).await.unwrap().unwrap();
         assert_eq!(photo.file_path, None);
         assert_eq!(photo.kind, "photo");
