@@ -600,6 +600,22 @@ fn parse_range(value: Option<&HeaderValue>) -> Result<Option<MediaRange>, ApiErr
     Ok(Some(MediaRange::Closed(start, end)))
 }
 
+/// 仅取 `Range` 头的起始字节偏移（B 路径用：判断 `.part` 已落盘足够字节即可 206 服务）。
+/// 解析失败/非 `bytes=` 单位/尾部计数（`bytes=-N`）一律返回 None（交由直播流处理）。
+fn range_start_only(rstr: &str) -> Option<u64> {
+    let text = rstr.trim();
+    if !text.starts_with("bytes=") {
+        return None;
+    }
+    let spec = text["bytes=".len()..].trim();
+    let (start_s, _) = spec.split_once('-')?;
+    let start_s = start_s.trim();
+    if start_s.is_empty() {
+        return None; // bytes=-N（末尾计数）不在本辅助范围内
+    }
+    start_s.parse::<u64>().ok()
+}
+
 /// GET /api/tg/folders — 用户自定义分组（DialogFilter）。
 ///
 /// **失败降级而非裸抛 400（BUG-106）**：原实现 `st.client.folders().await?` 会把
@@ -3210,8 +3226,25 @@ fn transformed_duration(duration_secs: Option<i64>, speed_hundredths: Option<u16
     }
 }
 
-fn speed_video_filter(speed_hundredths: u16) -> String {
-    format!("setpts=(PTS-STARTPTS)/{:.2},fps=30", speed_value(speed_hundredths))
+/// H.264 编码档位（BUG: 高倍速实时转码 veryfast 跟不上 → 直播流被播放器反超而卡死）。
+/// ≥3x 退让画质保“跟得上实时”：ultrafast + 更高 crf + 更低 fps。
+#[derive(Clone, Copy)]
+struct EncodeProfile {
+    preset: &'static str,
+    crf: u8,
+    fps: u16,
+}
+
+fn encode_profile(speed_hundredths: u16) -> EncodeProfile {
+    if speed_hundredths >= 300 {
+        EncodeProfile { preset: "ultrafast", crf: 28, fps: 24 }
+    } else {
+        EncodeProfile { preset: "veryfast", crf: 23, fps: 30 }
+    }
+}
+
+fn speed_video_filter(speed_hundredths: u16, fps: u16) -> String {
+    format!("setpts=(PTS-STARTPTS)/{:.2},fps={}", speed_value(speed_hundredths), fps)
 }
 
 /// Keep every atempo stage in FFmpeg's supported [0.5, 2.0] range.
@@ -3383,6 +3416,12 @@ async fn media_item_stream(
 
     // 1) 代理命中：完整文件走既有投递契约。
     if tokio::fs::metadata(&final_p).await.is_ok() {
+        // 命中即「最近使用」：刷新 mtime，使 LRU 预算（enforce_proxy_budget）
+        // 优先淘汰久未播放的代理，而非正在看 / 刚看过的。
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&final_p)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
         let mut res = serve_local_file(
             final_p.to_string_lossy().as_ref(),
             Some("video"),
@@ -3441,6 +3480,10 @@ async fn media_item_stream(
             })
             .await;
             if tokio::fs::metadata(&final_p).await.is_ok() {
+                let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&final_p)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
                 let mut res = serve_local_file(
                     final_p.to_string_lossy().as_ref(),
                     Some("video"),
@@ -3458,6 +3501,32 @@ async fn media_item_stream(
             ))
         }
         Role::Start(tx) => {
+            // B：可寻址化——若客户端带 Range 且同键转码的 `.part` 已落盘足够字节，
+            // 直接从增长中的 `.part` 回 206（serve_local_file 按当前实际长度给 Content-Range），
+            // 浏览器缺多少再要多少。这样 4x 暂停后再播不必等整片转完、也不必重新起直播流。
+            // 该分支只发响应；transcode_pump 仍在后台把 `.part` 写完整并重命名为正式代理。
+            if registered {
+                if let Some(rstr) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
+                    if let Some(start) = range_start_only(rstr) {
+                        if let Ok(meta) = tokio::fs::metadata(&part_p).await {
+                            if meta.len() > start {
+                                let mut res = serve_local_file(
+                                    part_p.to_string_lossy().as_ref(),
+                                    Some("video"),
+                                    None,
+                                    &headers,
+                                )
+                                .await?;
+                                res.headers_mut().insert(
+                                    "x-orig-stream",
+                                    stream_mode_header(speed_hundredths, "part"),
+                                );
+                                return Ok(res);
+                            }
+                        }
+                    }
+                }
+            }
             let (resp_tx, resp_rx) =
                 tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
             tokio::spawn(transcode_pump(
@@ -3476,6 +3545,12 @@ async fn media_item_stream(
             let mut res = Response::new(body);
             res.headers_mut()
                 .insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
+            // 仅可缓存路径（registered）声明可 Range：完成代理与增长中 `.part` 都能 206 服务；
+            // 锚点 live-only 流不落盘、不可 Range。
+            if registered {
+                res.headers_mut()
+                    .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            }
             res.headers_mut()
                 .insert("x-orig-stream", stream_mode_header(speed_hundredths, "live"));
             Ok(res)
@@ -3546,34 +3621,39 @@ async fn transcode_pump(
         "-map",
         "0:a:0?",
     ]);
+    let profile = speed_hundredths.map(encode_profile);
+    let preset = profile.map(|p| p.preset).unwrap_or("veryfast");
+    let crf = profile.map(|p| p.crf.to_string()).unwrap_or_else(|| "23".to_string());
+    let fpsmax = profile.map(|p| p.fps.to_string()).unwrap_or_else(|| "30".to_string());
     if let Some(speed) = speed_hundredths {
-        // Retimestamp then sample CFR 30fps; supports fractional speed, VFR and any source fps.
+        // Retimestamp then sample CFR N fps; supports fractional speed, VFR and any source fps.
         //
-        // BUG-223：**不传 `-r 30`**。`fps=30` 滤镜已把输出重采样为 CFR 30，
-        // 而下面无条件带的 `-fpsmax 30` 与 `-r` 在同一条流上互斥
+        // BUG-223：**不传 `-r`**。`fps=N` 滤镜已把输出重采样为 CFR N，
+        // 而下面无条件带的 `-fpsmax N` 与 `-r` 在同一条流上互斥
         // （ffmpeg: "Only one of -fpsmax and -r can be set for a stream."），
         // 两者同时出现会让 ffmpeg **拒绝打开输出文件** → 整条 FRC 流 0 字节，
-        // 浏览器端表现为「切了倍速就再也出不了画面」。判据①②的实测都建立在
-        // 只带`-r 30`（判据①脚本）或只带 `-fpsmax 30`（本函数）的单一上限上。
+        // 浏览器端表现为「切了倍速就再也出不了画面」。高倍速（≥3x）改用更低 fps
+        // （见 `encode_profile`）以换取实时余量。
+        let fps = profile.map(|p| p.fps).unwrap_or(30);
         command
             .arg("-vf")
-            .arg(speed_video_filter(speed))
+            .arg(speed_video_filter(speed, fps))
             .arg("-af")
             .arg(atempo_filter(speed));
     }
     command.args([
-        // H.264：全平台硬解兼容目标（veryfast 在本机实测可实时转码）。
+        // H.264：全平台硬解兼容目标。
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        preset,
         "-crf",
-        "23",
+        crf.as_str(),
         "-pix_fmt",
         "yuv420p",
-        // 兼容代理与 FRC 变体均限制输出视频最高 30fps。
+        // 兼容代理与 FRC 变体均限制输出视频最高 fps（与滤镜 fps 对齐）。
         "-fpsmax",
-        "30",
+        fpsmax.as_str(),
         "-c:a",
         "aac",
         "-b:a",
@@ -3636,11 +3716,28 @@ async fn transcode_pump(
 
     let mut buf = vec![0u8; 256 * 1024];
     let mut client_gone = false;
+    // C：单飞防饿死——转码若长时间无输出（ffmpeg 卡死/源损坏），超过时限即杀进程并出坑，
+    // 避免同一条目被一个僵死的 4x 转码永久占用（原先最长阻塞 600s）。
+    let stall_limit = std::time::Duration::from_secs(30);
+    let mut last_progress = std::time::Instant::now();
+    let mut ever_read = false;
     loop {
+        if ever_read && last_progress.elapsed() > stall_limit {
+            tracing::warn!(target: "orig_tg::transcode", "item {id}: no ffmpeg output for {:.1}s; aborting wedged transcode", stall_limit.as_secs_f32());
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            if persist {
+                let _ = tokio::fs::remove_file(&part_p).await;
+            }
+            finish(false);
+            return;
+        }
         match stdout.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
                 use tokio::io::AsyncWriteExt;
+                last_progress = std::time::Instant::now();
+                ever_read = true;
                 if let Some(file) = file.as_mut() {
                     if file.write_all(&buf[..n]).await.is_err() {
                         // 落盘失败不影响直播给客户端（例如磁盘满时至少本次能看完）
@@ -3684,6 +3781,10 @@ async fn transcode_pump(
                 if persist && tokio::fs::rename(&part_p, &final_p).await.is_ok() {
                     completed = true;
                     tracing::info!(target: "orig_tg::transcode", "item {id}: proxy ready at {}", final_p.display());
+                    // 落盘后立刻清算代理缓存磁盘预算（在 blocking 线程跑，不拖慢收尾）。
+                    if let Some(dir) = final_p.parent().map(|p| p.to_path_buf()) {
+                        let _ = tokio::task::spawn_blocking(move || enforce_proxy_budget(&dir, id)).await;
+                    }
                 }
             }
             Ok(s) => {
@@ -3701,6 +3802,58 @@ async fn transcode_pump(
         }
     }
     finish(completed);
+}
+
+/// 代理缓存磁盘预算（LRU 淘汰）。
+///
+/// 每次转码完成、正式代理改名落盘后调用一次：扫描 `proxy_dir` 下所有已完成
+/// `*.mp4`，若总占用超 `ORIG_TG_PROXY_MAX_BYTES`（默认 2 GiB），按**文件修改时间
+/// 升序**（最旧先淘汰）删除代理，直到降到阈值的 90%（留余量，避免下一次完成又
+/// 立刻触发）。
+///
+/// 不碰 `*.part`（在途转码尚未完成，删了会打断正在生成的代理）；被 serve 命中的
+/// 代理已在读取前 `set_modified` 刷新 mtime，故「正在看 / 刚看过」的代理不会优先
+/// 被淘汰。这是重播缓存（开播即落盘整部代理）的代价回收器。
+fn enforce_proxy_budget(proxy_dir: &std::path::Path, id: i64) {
+    let max = std::env::var("ORIG_TG_PROXY_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2 * 1024 * 1024 * 1024);
+    let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let mut total: u64 = 0;
+    let read = match std::fs::read_dir(proxy_dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for ent in read.flatten() {
+        let p = ent.path();
+        // 只清算正式代理 `*.mp4`；跳过 `.part`（在途转码）与无扩展名文件。
+        if p.extension().and_then(|e| e.to_str()) != Some("mp4") {
+            continue;
+        }
+        if let Ok(meta) = ent.metadata() {
+            let sz = meta.len();
+            total = total.saturating_add(sz);
+            let mt = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            files.push((p, sz, mt));
+        }
+    }
+    if total <= max {
+        return;
+    }
+    // 最旧（修改时间最早）在前优先淘汰。
+    files.sort_by_key(|a| a.2);
+    let target = max * 9 / 10;
+    let mut freed: u64 = 0;
+    for (p, sz, _) in files {
+        if total.saturating_sub(freed) <= target {
+            break;
+        }
+        if std::fs::remove_file(&p).is_ok() {
+            tracing::info!(target: "orig_tg::proxy", "item {id}: evicted proxy {} ({} bytes) to stay under budget", p.display(), sz);
+            freed = freed.saturating_add(sz);
+        }
+    }
 }
 
 /// 投递节流是否仅针对非环回（真实远端）场景的开关。
@@ -4671,8 +4824,8 @@ mod tests {
         assert_eq!(transformed_duration(Some(120), Some(50)), Some(240));
         assert_eq!(transformed_duration(Some(120), Some(200)), Some(60));
         assert_eq!(transformed_duration(Some(120), None), Some(120));
-        assert_eq!(speed_video_filter(50), "setpts=(PTS-STARTPTS)/0.50,fps=30");
-        assert_eq!(speed_video_filter(200), "setpts=(PTS-STARTPTS)/2.00,fps=30");
+        assert_eq!(speed_video_filter(50, 30), "setpts=(PTS-STARTPTS)/0.50,fps=30");
+        assert_eq!(speed_video_filter(200, 30), "setpts=(PTS-STARTPTS)/2.00,fps=30");
         assert_eq!(atempo_filter(50), "asetpts=PTS-STARTPTS,atempo=0.50");
         assert_eq!(atempo_filter(200), "asetpts=PTS-STARTPTS,atempo=2.00");
         assert_eq!(atempo_filter(300), "asetpts=PTS-STARTPTS,atempo=2.0,atempo=1.50");

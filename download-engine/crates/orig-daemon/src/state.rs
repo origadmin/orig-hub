@@ -321,7 +321,20 @@ impl AppState {
             return Ok(true);
         }
         let cfg = self.config.read().unwrap().clone();
-        let mut cmd = tokio::process::Command::new(tg_binary_path());
+
+        // 二进制缺失是**永久失败**：先拦截，给出可行动的明确信息，而不是 spawn 后才拿到
+        // 一句笼统的 "exited without listening"（那会把「文件不存在」伪装成「进程自杀」）。
+        let bin = tg_binary_path();
+        if !bin.exists() {
+            let msg = format!(
+                "orig-tg binary not found at {}; the desktop app may need to be rebuilt/redeployed",
+                bin.display()
+            );
+            self.set_tg_last_error(&msg);
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, msg));
+        }
+
+        let mut cmd = tokio::process::Command::new(&bin);
         // 端口由入参决定（起点 `TG_PORT`=19787，不可绑定时 `tg_reselect_port` 顺延）。
         // 凭据显式注入（不依赖父进程环境继承），保证 Tauri/开机重启后 real 模式仍生效；
         // `[tg]` 段为空时回退同目录 `tg/config.json`（BUG-094）。
@@ -361,13 +374,29 @@ impl AppState {
         // 起不来（端口被占用 / 落在系统保留区 / 二进制缺陷）就**如实报错**并把原因
         // 记进 `tg_last_error` —— 绝不留一个「已开启但未连接」的幽灵状态。
         let deadline = tokio::time::Instant::now() + TG_START_WAIT_TIMEOUT;
+        // 保留子进程退出码：区分「崩了（有退出码）」与「超时未监听（无退出码）」。
+        let mut exit_status: Option<std::process::ExitStatus> = None;
         loop {
             if tg_port_has_listener(port).await {
                 self.clear_tg_last_error();
                 return Ok(true);
             }
-            // 子进程已经退出（bind 失败等）→ 立刻判定失败，不必空等到超时。
-            if !self.tg_managed_alive().await {
+            // 直接探子进程退出状态（保留退出码），不再经由 `tg_managed_alive` 丢弃它。
+            let exited = {
+                let mut g = self.tg_child.lock().await;
+                match g.as_mut() {
+                    Some(c) => match c.try_wait() {
+                        Ok(Some(status)) => {
+                            *g = None;
+                            exit_status = Some(status);
+                            true
+                        }
+                        _ => false,
+                    },
+                    None => true,
+                }
+            };
+            if exited {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -384,11 +413,24 @@ impl AppState {
             let _ = tokio::time::timeout(TG_STOP_WAIT_TIMEOUT, c.wait()).await;
         }
         *g = None;
-        // 区分两种「起不来」：端口根本绑不上（保留区 / 被占）vs 起来了但没监听。
-        // 混成一句「exited without listening」会把「本机这个端口不可用」伪装成
-        // 「orig-tg 自己崩了」，排查方向直接错。
-        let msg = if port_bindable(port).await {
-            format!("orig-tg exited without listening on 127.0.0.1:{port}")
+        // 失败原因分三档，信息量从「能行动」到「需排查」：
+        //  1) 二进制缺失 -> 已在上面拦截；
+        //  2) 进程起了但退出 -> 带上退出码与二进制路径，立刻能看出是崩了还是被信号杀；
+        //  3) 端口绑不上 -> 明确是保留区/被占，daemon 下次会顺延端口。
+        let msg = if let Some(status) = exit_status {
+            format!(
+                "orig-tg ({}) exited without listening on 127.0.0.1:{} (exit status: {:?})",
+                bin.display(),
+                port,
+                status.code()
+            )
+        } else if port_bindable(port).await {
+            format!(
+                "orig-tg ({}) started but did not begin listening on 127.0.0.1:{} within {}s",
+                bin.display(),
+                port,
+                TG_START_WAIT_TIMEOUT.as_secs()
+            )
         } else {
             format!(
                 "port 127.0.0.1:{port} is not bindable on this host (reserved by the OS or already in use); \
