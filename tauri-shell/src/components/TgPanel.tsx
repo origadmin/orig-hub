@@ -910,7 +910,12 @@ export function TgPanel(
     playableHits.filter((u) => isSameKind(u, item)),
   )
 
-  /** 点全局命中 → 打开预览（已缓存走本地流，未缓存在线流），标题带频道名 */
+  /** 点全局命中 → 打开预览（已缓存走本地流，未缓存在线流）。
+   * BUG-231：播放器标题必须是**内容标题**（命中消息的 caption），绝不能是频道名 ——
+   * 用户裁定「要求是记录标题，不是频道；现在是显示频道，完全不知道内容」。
+   * 频道名只用于结果分组（`globalGroups` 的 key），不进播放器标题。
+   * 与本文件其他 openViewer 调用点（1286/1318 `item.caption?.trim()`）同一约定：
+   * caption 为空时标题留空，由播放器内部兜底，不拿频道名顶替。 */
   const onGlobalHitPreview = useEvent((hit: TgStoredMessage & { channelTitle?: string }) => {
     const item = fromHit(hit)
     // BUG-137：命中集就是邻居序列（跨频道搜索结果按命中顺序）。此前这里只传
@@ -919,7 +924,7 @@ export function TgPanel(
     const seq = sameKindOfHits(item)
     const idx = seq.findIndex((u) => u.key === item.key)
     openViewer({
-      title: hit.channelTitle,
+      title: hit.caption?.trim() || undefined,
       // 点击项不可播（file）时它不在序列里 —— 单条打开，不谎报位置。
       index: idx < 0 ? 0 : idx,
       items: toViewerItems(idx < 0 ? [item] : seq),
@@ -1135,15 +1140,20 @@ export function TgPanel(
     (item: FeedItem | undefined, fallback: FeedItem[], fallbackIndex: number) => {
       const seq = sameKindSeq(item)
       const idx = item ? seq.findIndex((u) => u.key === item.key) : -1
+      // BUG-231：播放器标题必须是**内容标题**（条目 caption），绝不能是频道名 ——
+      // 用户裁定「要求是记录标题，不是频道；现在是显示频道，完全不知道内容」。
+      // 此前两处都传 `selectedChannel?.title`，频道消息流点播时播放器标题栏
+      // 永远是频道名。频道名属于第一栏的频道列表，不进播放器标题。
+      const contentTitle = item?.caption?.trim() || undefined
       if (!item || idx < 0) {
         openViewer({
-          title: selectedChannel?.title,
+          title: contentTitle,
           index: fallbackIndex,
           items: toViewerItems(fallback),
         })
         return
       }
-      openViewer({ title: selectedChannel?.title, index: idx, items: toViewerItems(seq) })
+      openViewer({ title: contentTitle, index: idx, items: toViewerItems(seq) })
     },
   )
 

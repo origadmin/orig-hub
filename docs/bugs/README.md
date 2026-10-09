@@ -256,3 +256,4 @@ bash scripts/install-hooks.sh    # 安装 pre-commit 与 commit-msg（钩子不�
 | BUG-228 | 外部实例占用端口 + link 断 ⇒ tg_reselect_port 每次重启迁走端口，端口漂移风暴、前端 tg_port 来回跳；修法方向 = 迁移前探测占用者健康度/占用不迁移/spawn 成功后才改 tg_port | open | engine |
 | BUG-229 | 非 1x 倍速无条件切 FRC 转码流 ⇒ 浏览器对 fMP4 代理乱序 range 风暴（69 req/s）+ 预读 66% 全片 + 整片转码落盘；修：倍速换档仅限已在兼容流上的源，可直解源保持原 src + playbackRate（实测 2x 直解 /stream 请求 0、缓冲 66%→12%、effRate 0.995）；验收 = `tauri-shell/verify/_probe_reqstorm.cjs` 前后对照 | fixed | engine+shell |
 | BUG-230 | raw 直解路径本机全程卡顿（1x 卡/2x 非常卡/4x 无法播放）、stream 流畅 ⇒ 播放主路径翻转 stream-first（挂载即转码流，非 1x=FRC 变体），raw 退役为下载/导出端点；rememberedCompat 记忆机制删除；改 `tauri-shell/src/components/media/VideoPlayer.tsx` | fixed | shell |
+| BUG-231 | TG 侧播放器标题显示频道名（西瓜短剧(AI短剧)）而非内容标题，用户完全不知道内容；TgPanel 两处 openViewer 误传 channelTitle/selectedChannel.title（频道流点播 + 全局搜索预览）；改传 caption，频道名只留分组用途 | fixed | shell |
