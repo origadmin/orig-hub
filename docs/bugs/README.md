@@ -256,5 +256,11 @@ bash scripts/install-hooks.sh    # 安装 pre-commit 与 commit-msg（钩子不�
 | BUG-228 | 外部实例占用端口 + link 断 ⇒ tg_reselect_port 每次重启迁走端口，端口漂移风暴、前端 tg_port 来回跳；修法方向 = 迁移前探测占用者健康度/占用不迁移/spawn 成功后才改 tg_port | open | engine |
 | BUG-229 | 非 1x 倍速无条件切 FRC 转码流 ⇒ 浏览器对 fMP4 代理乱序 range 风暴（69 req/s）+ 预读 66% 全片 + 整片转码落盘；修：倍速换档仅限已在兼容流上的源，可直解源保持原 src + playbackRate（实测 2x 直解 /stream 请求 0、缓冲 66%→12%、effRate 0.995）；验收 = `tauri-shell/verify/_probe_reqstorm.cjs` 前后对照 | fixed | engine+shell |
 | BUG-230 | raw 直解路径本机全程卡顿（1x 卡/2x 非常卡/4x 无法播放）、stream 流畅 ⇒ 播放主路径翻转 stream-first（挂载即转码流，非 1x=FRC 变体），raw 退役为下载/导出端点；rememberedCompat 记忆机制删除；改 `tauri-shell/src/components/media/VideoPlayer.tsx` | fixed | shell |
-| BUG-231 | TG 侧播放器标题显示频道名（西瓜短剧(AI短剧)）而非内容标题，用户完全不知道内容；TgPanel 两处 openViewer 误传 channelTitle/selectedChannel.title（频道流点播 + 全局搜索预览）；改传 caption，频道名只留分组用途 | fixed | shell |
-| BUG-232 | 入库流水线行标题只有频道维度（频道名/裸 chatId），从无内容标题路径（9bee7b8 起即如此，旧修复疑随历史丢失湮灭）；行标题链改为 入库内容标题(by-ref 查库)→频道名→裸 chatId，覆盖 done/interrupted；36 条有条目行逐条对账全中；failed/queued 行需引擎落 caption（剩余范围） | fixed | shell |
+| BUG-231 | TG 侧播放器标题显示频道名而非内容标题，用户完全不知道内容；TgPanel 两处 openViewer 误传 channelTitle/selectedChannel.title（频道流点播 + 全局搜索预览）；改传 caption，频道名只留分组用途 | fixed | shell |
+| BUG-232 | 入库流水线行标题只有频道维度（频道名/裸 chatId），从无内容标题路径；v1 用 by-ref 查媒体库被裁定**获取层错误**（消息基础数据早已在 media_message 落库含 caption，3665 行实测）⇒ 重开，v2 = 引擎任务列表服务端 JOIN media_message 带出 caption，全状态覆盖，shell 删逐行补查 | open | shell+engine |
+| BUG-233 | 设置-关于页签只有 daemon 引擎状态，无 TG 插件状态（enabled/在线/端口/错误）；状态数据在 tgService 已有、呈现缺位；长期随 BUG-238 插件注册表统一渲染 | open | shell |
+| BUG-234 | 下载目录修改完全无效：updateSettings 只写 localStorage，daemon 无 download_dir 运行时 PUT 端点（classify/proxy/tg 有、download_dir 漏），config 仅启动读 toml；修法 = 仿 classify 增 PUT /api/config/download + shell 接线 | open | shell+engine |
+| BUG-235 | 库根目录与下载路径/子目录分类体系脱节：两棵互不相干的目录树，下载文件与媒体库条目放置关联缺失；推荐裁决 = 库根为唯一根、下载目录收纳为其子树，动面前需拍板 | open | engine+shell |
+| BUG-236 | 语言设置仅中英两语种，无语种扩充流程（无回退链/无缺失键校验）；默认按「注明仅支持中英」闭环，除非有多语种需求 | open | shell |
+| BUG-237 | ffmpeg 设置未实现：引擎有 resolve 解析链但壳层零呈现（路径/版本/可用性不可见）；参考项目 FFmpegFreeUI 未分析；最小闭环 = 状态行，参数 UI 随 BUG-238 插件框架定 | open | engine+shell |
+| BUG-238 | 插件化管理框架缺失：TG 启停是孤例特例；提案 = FeaturePlugin 模型（enabled/status/settings/fallback 四元组）+ daemon 插件注册表 + GET /api/plugins，ffmpeg/外置默认播放器/未来上传等纳入，缺席降级（ffmpeg 未装→系统默认播放器播 raw） | open | engine+shell |
