@@ -1156,13 +1156,20 @@ async fn enqueue_cache_task(
     // BUG-246：入队即登记消息元数据。任务标题的事实源是 `media_message` 表，而该行
     // 历史上只在 worker **启动任务时**由 `IngestCtx::prepare()` 补写；排队任务不启动
     // worker ⇒ 行整条缺失 ⇒ 标题恒 None ⇒ 前端退回裸频道名。这里后台补写、不阻塞
-    // 入队响应：与 BUG-170 的裁定同向——元数据登记是瞬间的，耗时的只有字节搬运。
+    // 入队响应：这里后台做、不阻塞返回：与 BUG-170 的裁定同向——事实登记是瞬间的，
+    // 耗时的只有字节搬运。
+    //
+    // BUG-248：同一协程里一并登记**条目本身**（`media_item`）——这是 BUG-170
+    // 「先入信息、再入字节」未兑现的另一半：此前条目只由 worker 顺带登记，排队期间
+    // 这条内容在媒体库里**查不到**。登记同样失败不阻断入队。
+    // 刻意**不另起一个 spawn**：三步串在同一个协程里（条目 → 元数据 → 补强，
+    // 见 `register_enqueued_items`），避免两个后台任务同时抢 MTProto 连接。
     {
-        let st_meta = st.clone();
+        let st_bg = st.clone();
         let chat_id = req.chat_id;
         let msg_ids = req.message_ids.clone();
         tokio::spawn(async move {
-            ensure_message_rows(&st_meta, chat_id, &msg_ids).await;
+            register_enqueued_items(&st_bg, chat_id, &msg_ids).await;
         });
     }
     Ok(Json(task))
@@ -1454,6 +1461,186 @@ fn path_ext(path: &str) -> String {
         .to_string()
 }
 
+/// **T0 事实登记的唯一真源**：`media_item` 行（`file_path=NULL` 待回填），
+/// 返回 `(item_id, 库中 kind)`。
+///
+/// 登记 **= 事实先到**，`file_path=NULL` 是它的核心语义（字节未落、信息先在）：
+/// 用户点「加入媒体库」的瞬间条目就该存在于媒体库，而不是等 worker 把字节搬完。
+/// BUG-248 之前本函数只挂在 [`IngestCtx::register_item`] 上，而它的调用点只有
+/// worker 逐条路径 ⇒ 排队期间条目在媒体库里**根本不存在**（顺序倒置）。提取成与
+/// `IngestCtx` 无关的自由函数后，入队时刻（没有该剧集/槽位上下文）也能直接复用
+/// 同一份登记逻辑——AGENTS.md §2 单一真源，禁止两处各写一份。
+///
+/// 已存在（按 `source`+`ref`）时**不新建第二行**，而是走 [`strengthen_registered_item`]
+/// 用**更强的事实补强**它：T0 那一刻可能还没有 `media_message` 行（RT 慢/值尚未拉取），
+/// 登记只能用「空」事实（kind=file、标题空），元数据到位后必须能把这两种事实修回来，
+/// 否则「先登记」换来的就是一个永远认不出的空卡片（BUG-220 同类的认不出）。
+///
+/// kind 以**库中值**为准：重复登记（重试/幂等重跑）的旧条目保留既有 kind——
+/// 与旧实现 `item_kinds` 取数同源；新建条目写入 T0 判定的 kind（字节未落，
+/// 无扩展名可判）。登记失败返回 `None`（不阻断调用方——**登记是加速，不是字节的前提**）。
+async fn register_media_item_t0(
+    st: &Arc<AppState>,
+    chat_id: i64,
+    msg_id: i64,
+    photo_rule: bool,
+) -> Option<(i64, String)> {
+    let ref_key = format!("{}:{}", chat_id, msg_id);
+    let row = st.store.get_message(chat_id, msg_id).await.ok().flatten();
+    let kind = match &row {
+        Some(m) => meta_kind(m.media_type.as_deref(), m.mime_type.as_deref()),
+        None => "file".to_string(),
+    };
+    let id = match st.store.item_id_by_ref("tg", &ref_key).await {
+        Ok(Some(id)) => {
+            // 已在库：只做补强（同一事实的更完整版本），不再开口重新 upsert。
+            strengthen_registered_item(st, id, &row, kind.as_str(), msg_id, photo_rule).await;
+            id
+        }
+        _ => {
+            // 新登记：file_path=NULL 是 T0 的核心语义（字节未落，事实先在）。
+            // 标题只取 caption 首行（split_caption），其余进 description——
+            // 与剧集、与旧 import_cached_file/import_photo_item 同一把尺子。
+            let (title, desc) = row
+                .as_ref()
+                .and_then(|m| m.caption.as_deref())
+                .map(crate::media::split_caption)
+                .unwrap_or((None, None));
+            // BUG-049 照片条目的可读兜底标题（旧 import_photo_item 同款）；
+            // 非照片维持空串（BUG-154：不拿内部文件名伪装标题）。
+            let title = match title {
+                Some(t) => t,
+                None if photo_rule => format!("TG 图片 #{msg_id}"),
+                None => String::new(),
+            };
+            match st
+                .store
+                .upsert_media_item(
+                    "tg",
+                    &ref_key,
+                    &title,
+                    &kind,
+                    None,
+                    row.as_ref().and_then(|m| m.size),
+                    row.as_ref().and_then(|m| m.duration),
+                    desc.as_deref(),
+                )
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    st.push_log(&format!("cache ingest failed for {ref_key}: {e}"));
+                    return None;
+                }
+            }
+        }
+    };
+    let kind = st
+        .store
+        .item_kinds(&[id])
+        .await
+        .ok()
+        .and_then(|m| m.get(&id).cloned())
+        .unwrap_or(kind);
+    Some((id, kind))
+}
+
+/// 用**更强的事实**补强一条已登记的条目（只在「更强」时动手）。
+///
+/// 为什么需要它：BUG-248 的登记被推到入队时刻，而那一刻 `media_message` 行可能还没到
+///（RT 受 MTProto 影响，实测同一条消息在下载争用下 27s 后才落行）。先登记是契约，
+/// 于是首版用到的事实可能是空的：kind 只能判成 `file`、标题只能是空串。元数据到位后
+/// 必须补回来——否则「先入信息」换来的就是一张永远认不出的卡。
+///
+/// 保守规则（宁可少写，不可改写用户的事实）：
+///   - 标题：只有**现有标题为空/纯空白**时才写入（用户改过的、参照 BUG-049 生成的
+///     兜底标题一律不动）；拿不到 caption 就不写（BUG-154：不拿内部文件名伪装）；
+///   - kind：只做**单向升级**（`file` → `video`/`photo`/`audio`），不降级。字节落盘后
+///     由 `backfill_item_bytes` 按扩展名再校正一次，这里不与它抢判；
+///   - 介绍/时长/尺寸：结构性缺失（NULL）才补，已有值不动。
+async fn strengthen_registered_item(
+    st: &Arc<AppState>,
+    id: i64,
+    row: &Option<crate::store::StoredMessage>,
+    derived_kind: &str,
+    msg_id: i64,
+    photo_rule: bool,
+) {
+    let Some(msg) = row.as_ref() else {
+        // 元数据仍未到位：此刻没有任何更强的事实，什么都不写（下一次登记会再来）。
+        return;
+    };
+    let Some(existing) = st.store.get_media_item(id).await.ok().flatten() else {
+        return;
+    };
+    let existing_blank = existing.title.trim().is_empty();
+    let (title, desc) = msg
+        .caption
+        .as_deref()
+        .map(crate::media::split_caption)
+        .unwrap_or((None, None));
+    let patch_title = match title {
+        Some(t) if existing_blank => Some(t),
+        // 没有 caption 的照片：BUG-049 兜底标题（`TG 图片 #{msg_id}`）同样只在标题仍空时补。
+        None if existing_blank && photo_rule => Some(format!("TG 图片 #{msg_id}")),
+        _ => None,
+    };
+    // kind 只单向升级：`file` 是从「没有元数据」推出来的占位，被更有信息量的判定替换
+    // 才叫补强；反过来把已明确的 kind 降级成一无所知的 `file` 是破坏。
+    let patch_kind = match (existing.kind.as_str(), derived_kind) {
+        ("file", k) if k != "file" => Some(k.to_string()),
+        _ => None,
+    };
+    let patch_duration = msg.duration.filter(|_| existing.duration.is_none());
+    if patch_title.is_none() && patch_kind.is_none() && patch_duration.is_none() {
+        return;
+    }
+    let patch = crate::media::ItemPatch {
+        title: patch_title,
+        description: desc.map(Some),
+        poster: None,
+        duration: patch_duration,
+        width: None,
+        height: None,
+        kind: patch_kind,
+    };
+    if let Err(e) = st.store.update_media_item(id, &patch).await {
+        st.push_log(&format!("cache ingest strengthen #{id} failed: {e}"));
+    }
+}
+
+/// BUG-248：入队时刻的登记 —— 「信息已在、字节未到」在这里落地。
+///
+/// 三步**串在同一个协程**里，顺序是刻意的：
+///
+///   ① **先登记**（此刻有什么事实就用什么，可能只有 ref）：不等 MTProto —— 用户点
+///      「加入媒体库」的瞬间条目就该在媒体库里，排队期间看得见是本条的全部要义；
+///   ② 补 `media_message` 行（BUG-246 的同一件事，慢路径，MTProto RT）；
+///   ③ 再登记一次：①建的条目此时被 [`strengthen_registered_item`] 用真标题/kind 补强，
+///      **不必等 worker 轮到这条任务**（队列可能要排几十分钟）。
+///
+/// 剧集槽位**不在这里登记**——入队时刻没有剧集/归属上下文（那份目标池来自全组预扫
+/// [`IngestCtx::prepare`]），槽位仍由 worker 处理时建立。
+///
+/// 容错与 BUG-246 一致（**登记失败不阻断入队**）：登记只影响「先在」，字节搬运由
+/// worker 负责；把一次 DB 故障变成「加入媒体库失败」比不做更糟。
+async fn register_enqueued_items(st: &Arc<AppState>, chat_id: i64, msg_ids: &[i64]) {
+    // ① T0 事实登记：快路径，不为元数据行等待。
+    for msg_id in msg_ids {
+        register_media_item_t0(st, chat_id, *msg_id, false).await;
+    }
+    // ② 元数据登记（BUG-246 的唯一真源，幂等、缺黄豆几百毫秒到几十秒都可能）。
+    ensure_message_rows(st, chat_id, msg_ids).await;
+    // ③ 元数据到位后补强既有条目（标题 / kind / 时长）。
+    for msg_id in msg_ids {
+        let photo_rule = matches!(
+            st.store.get_message(chat_id, *msg_id).await,
+            Ok(Some(m)) if m.media_type.as_deref() == Some("photo")
+        );
+        register_media_item_t0(st, chat_id, *msg_id, photo_rule).await;
+    }
+}
+
 /// 逐任务登记上下文（metadata-first ingest 的状态机）。
 ///
 /// 职责：把旧实现「任务末尾一次性 `append_episodes_ranged` + 照片归属」的**最终
@@ -1498,11 +1685,11 @@ impl IngestCtx {
     /// has_video。元数据拉取失败的消息不阻断：行缺席时该消息不进目标池，T0 登记
     /// 退化为 file/无标题（与旧实现 meta 缺失同貌）。
     async fn prepare(st: &Arc<AppState>, task: &CacheTask) -> Self {
-        // 元数据登记走唯一真源（BUG-246）：入队时通常已补过行，这里重跑是幂等的
-        // 安全网——历史任务、入队时登记失败的消息、以及升级前入队的任务都靠它兜底。
-        ensure_message_rows(st, task.chat_id, &task.message_ids).await;
-        let mut slot_msgs = Vec::new();
-        let mut has_video = false;
+    // 元数据登记走唯一真源（BUG-246）：入队时通常已补过行，这里重跑是幂等的
+    // 安全网——历史任务、入队时登记失败的消息、以及升级前入队的任务都靠它兜底。
+    ensure_message_rows(st, task.chat_id, &task.message_ids).await;
+    let mut slot_msgs = Vec::new();
+    let mut has_video = false;
         for msg_id in &task.message_ids {
             let kind = match st.store.get_message(task.chat_id, *msg_id).await {
                 Ok(Some(m)) => meta_kind(m.media_type.as_deref(), m.mime_type.as_deref()),
@@ -1530,71 +1717,19 @@ impl IngestCtx {
         }
     }
 
-    /// T0 事实登记：media_item 行（`file_path=NULL` 待回填），返回 (item_id, 库中 kind)。
+    /// T0 事实登记：`media_item` 行（`file_path=NULL` 待回填），返回 (item_id, 库中 kind)。
     ///
-    /// kind 以**库中值**为准：重复登记（重试/幂等重跑）的旧条目保留既有 kind——
-    /// 与旧实现 `item_kinds` 取数同源；新建条目写入 T0 判定的 kind（字节未落，
-    /// 无扩展名可判）。登记失败返回 None（不阻断任务——旧实现入库失败同样只记日志）。
+    /// 逻辑本体在上方的 [`register_media_item_t0`] —— 它是登记的唯一真源，入队时刻
+    /// （BUG-248）与本 worker 路径共用同一份实现，语义不变：**含 `item_id_by_ref`
+    /// 复用、失败只记日志、返回 `(item_id, 库中 kind)`**。这里的 `&self` 只提供
+    /// `chat_id`（剧集上下文在 `register_slot`，与条目登记无关）。
     async fn register_item(
         &self,
         st: &Arc<AppState>,
         msg_id: i64,
         photo_rule: bool,
     ) -> Option<(i64, String)> {
-        let ref_key = format!("{}:{}", self.chat_id, msg_id);
-        let row = st.store.get_message(self.chat_id, msg_id).await.ok().flatten();
-        let kind = match &row {
-            Some(m) => meta_kind(m.media_type.as_deref(), m.mime_type.as_deref()),
-            None => "file".to_string(),
-        };
-        let id = match st.store.item_id_by_ref("tg", &ref_key).await {
-            Ok(Some(id)) => id,
-            _ => {
-                // 新登记：file_path=NULL 是 T0 的核心语义（字节未落，事实先在）。
-                // 标题只取 caption 首行（split_caption），其余进 description——
-                // 与剧集、与旧 import_cached_file/import_photo_item 同一把尺子。
-                let (title, desc) = row
-                    .as_ref()
-                    .and_then(|m| m.caption.as_deref())
-                    .map(crate::media::split_caption)
-                    .unwrap_or((None, None));
-                // BUG-049 照片条目的可读兜底标题（旧 import_photo_item 同款）；
-                // 非照片维持空串（BUG-154：不拿内部文件名伪装标题）。
-                let title = match title {
-                    Some(t) => t,
-                    None if photo_rule => format!("TG 图片 #{msg_id}"),
-                    None => String::new(),
-                };
-                match st
-                    .store
-                    .upsert_media_item(
-                        "tg",
-                        &ref_key,
-                        &title,
-                        &kind,
-                        None,
-                        row.as_ref().and_then(|m| m.size),
-                        row.as_ref().and_then(|m| m.duration),
-                        desc.as_deref(),
-                    )
-                    .await
-                {
-                    Ok(id) => id,
-                    Err(e) => {
-                        st.push_log(&format!("cache ingest failed for {ref_key}: {e}"));
-                        return None;
-                    }
-                }
-            }
-        };
-        let kind = st
-            .store
-            .item_kinds(&[id])
-            .await
-            .ok()
-            .and_then(|m| m.get(&id).cloned())
-            .unwrap_or(kind);
-        Some((id, kind))
+        register_media_item_t0(st, self.chat_id, msg_id, photo_rule).await
     }
 
     /// T0 槽位登记：非照片条目编入剧集；混编组照片挂目标集图片位；
@@ -6395,6 +6530,445 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["added"], 1, "去重后只搬 1 集");
         assert!(st.store.get_series(a).await.unwrap().is_none(), "源应被删除");
+    }
+
+    // ---- BUG-248：入队即登记条目（「先入信息、再入字节」） ----
+
+    use super::{enqueue_cache_task, register_enqueued_items, register_media_item_t0, EnqueueCacheReq};
+
+    /// 元数据**迟到**的客户端：`message_meta` 先睡 `delay_ms` 再给真值。
+    ///
+    /// 它复刻的是运行时实测到的病态（BUG-248 A/B 首轮）：MTProto 与下载争用时，
+    /// 同一条消息的元数据要 **27s** 后才落 `media_message` 行。任何「等元数据齐了再登记」
+    /// 的实现都会在这段窗口里让媒体库空着 —— 也就是用户投诉的原样。
+    struct SlowMetaClient {
+        meta: std::collections::HashMap<i64, TgMedia>,
+        delay_ms: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl Client for SlowMetaClient {
+        async fn start(&self, _phone: &str) -> Result<LoginPhase, ClientError> {
+            Ok(LoginPhase::CodeRequired)
+        }
+        async fn submit_code(&self, _p: &str, _c: &str) -> Result<LoginPhase, ClientError> {
+            Ok(LoginPhase::Authorized)
+        }
+        async fn submit_password(&self, _p: &str, _w: &str) -> Result<LoginPhase, ClientError> {
+            Err(ClientError::Other("no 2FA in BUG-248 fixture".into()))
+        }
+        async fn view(&self) -> SessionView {
+            SessionView { phase: LoginPhase::Authorized, phone: None, user_id: None }
+        }
+        async fn dialogs(&self) -> Result<Vec<Channel>, ClientError> {
+            Ok(Vec::new())
+        }
+        async fn folders(&self) -> Result<Vec<Folder>, ClientError> {
+            Ok(Vec::new())
+        }
+        async fn messages(
+            &self,
+            _chat_id: i64,
+            _limit: u32,
+            _before_id: Option<i64>,
+        ) -> Result<Vec<TgMedia>, ClientError> {
+            Ok(Vec::new())
+        }
+        async fn thumb(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+        ) -> Result<Option<Thumbnail>, ClientError> {
+            Ok(None)
+        }
+        async fn media(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _range: Option<MediaRange>,
+        ) -> Result<MediaStream, ClientError> {
+            Err(ClientError::MediaNotFound)
+        }
+        async fn download(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _dir: &str,
+            _progress: Option<&crate::login::DownloadProgress>,
+        ) -> Result<DownloadOutcome, ClientError> {
+            Err(ClientError::Other("BUG-248 fixture: no bytes".into()))
+        }
+        async fn message_meta(
+            &self,
+            _chat_id: i64,
+            message_id: i64,
+        ) -> Result<Option<TgMedia>, ClientError> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            Ok(self.meta.get(&message_id).cloned())
+        }
+    }
+
+    /// BUG-248 判据（运行时病态的回归）：**元数据迟到也不许拖住登记**。
+    ///
+    /// 登记必须在入队那一刻就发生（条目先到），标题/kind 等元数据到位后被**补强**，
+    /// 而且这条路径不依赖 worker —— 队列可能要排几十分钟。
+    #[tokio::test]
+    async fn enqueue_registers_the_item_even_when_metadata_arrives_late() {
+        let dir = scratch_dir("bug248_late_metadata");
+        let mut by_id = std::collections::HashMap::new();
+        by_id.insert(
+            41,
+            fixture_msg(41, "video", "video/mp4", Some("迟到的标题\n说明"), None),
+        );
+        let mut cfg = Config::default();
+        cfg.download_dir = dir.to_path_buf();
+        let st = Arc::new(AppState::new(
+            Arc::new(SlowMetaClient { meta: by_id, delay_ms: 1200 }),
+            cfg,
+            Availability::Ready,
+            false,
+            Store::open(":memory:").await.expect("in-memory store must open"),
+        ));
+        assert!(st.claim_cache_worker(), "门禁初始必须空闲");
+
+        let (status, task) = enqueue_call(
+            st.clone(),
+            EnqueueCacheReq {
+                chat_id: CACHE_FIXTURE_CHAT,
+                message_ids: vec![41],
+                group_id: None,
+                dir: None,
+            },
+        )
+        .await
+        .expect("元数据迟到不得阻断入队");
+        assert_eq!(status, StatusCode::OK);
+        let task_id = task["id"].as_i64().expect("task id");
+
+        // ① 元数据还没回来，条目就必须已经在（短板事实：kind=file、标题空）。
+        let ref_key = format!("{CACHE_FIXTURE_CHAT}:41");
+        let id = wait_item_id(&st, &ref_key).await;
+        let early = st.store.get_media_item(id).await.unwrap().unwrap();
+        assert_eq!(early.file_path, None, "T0 登记字节未落");
+        assert_eq!(
+            early.kind, "file",
+            "元数据未到时只能判成 file（无常可言；后续一次ாக upgrade）"
+        );
+        assert!(
+            early.title.trim().is_empty(),
+            "拿不到 caption 就必须是空标题（BUG-154：不拿内部文件名伪装），实得 {early_title:?}",
+            early_title = early.title
+        );
+        assert_eq!(
+            st.store.get_cache_task(task_id).await.unwrap().unwrap().status,
+            "queued",
+            "登记这一步不等字节、不动任务状态"
+        );
+
+        // ② 元数据回库后（不等 worker）：标题/kind 被补强，且不产生第二行。
+        wait_title(&st, id, "迟到的标题").await;
+        let late = st.store.get_media_item(id).await.unwrap().unwrap();
+        assert_eq!(late.title, "迟到的标题", "标题必须被补强");
+        assert_eq!(late.kind, "video", "kind 必须升级（file → video）");
+        assert_eq!(late.description.as_deref(), Some("说明"));
+        assert_eq!(late.duration, Some(12), "缺失的时长同样补齐");
+        assert_eq!(late.file_path, None, "补强不碰字节");
+        assert_eq!(count_rows(&st, &ref_key).await, 1, "补强不得产生第二行");
+        assert_eq!(
+            st.store.get_cache_task(task_id).await.unwrap().unwrap().status,
+            "queued",
+            "任务始终 queued（worker 没起）"
+        );
+
+        // ③ 已有的强事实不被改写：用户改过标题后再登记一次，标题保持用户值。
+        let _ = st
+            .store
+            .update_media_item(
+                id,
+                &crate::media::ItemPatch {
+                    title: Some("用户改过的标题".to_string()),
+                    description: None,
+                    poster: None,
+                    duration: None,
+                    width: None,
+                    height: None,
+                    kind: None,
+                },
+            )
+            .await
+            .unwrap();
+        register_enqueued_items(&st, CACHE_FIXTURE_CHAT, &[41]).await;
+        let kept = st.store.get_media_item(id).await.unwrap().unwrap();
+        assert_eq!(kept.title, "用户改过的标题", "补强不许覆盖用户已改的标题");
+    }
+
+    /// 轮询等待某条目被补强到目标标题（后台协程异步进行）。
+    async fn wait_title(st: &AppState, id: i64, want: &str) {
+        for _ in 0..200 {
+            if let Ok(Some(it)) = st.store.get_media_item(id).await {
+                if it.title == want {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("BUG-248: 条目 {id} 的标题应在 10s 内被补强为 {want:?}");
+    }
+
+    /// BUG-248 判据 1：**任务仍在 `queued`** 时条目必须已在媒体库里可查，
+    /// 且字节未到（`file_path` 为 NULL）。缺陷原形下这一步要等 worker 轮到才开始，
+    /// 排队期间 `item_id_by_ref` 恒为 None。
+    #[tokio::test]
+    async fn enqueue_registers_media_items_while_the_task_is_still_queued() {
+        let dir = scratch_dir("bug248_enqueue_register");
+        let st = cache_fixture_state(
+            &dir,
+            vec![],
+            vec![
+                fixture_msg(11, "video", "video/mp4", Some("先登记的一集 标题行\n说明行"), None),
+                fixture_msg(12, "photo", "image/jpeg", None, None),
+            ],
+        )
+        .await;
+        // 占住单飞门禁：新任务不会被 worker 拉起 ⇒ 真实复现「排队期间」。
+        // worker 一旦启动就会自己去登记条目，那样本用例什么也证明不了。
+        assert!(st.claim_cache_worker(), "门禁初始必须空闲");
+
+        let (status, task) = enqueue_call(
+            st.clone(),
+            EnqueueCacheReq {
+                chat_id: CACHE_FIXTURE_CHAT,
+                message_ids: vec![11, 12],
+                group_id: None,
+                dir: None,
+            },
+        )
+        .await
+        .expect("入队不得因登记失败而报错");
+        assert_eq!(status, StatusCode::OK);
+        let task_id = task["id"].as_i64().expect("task id");
+        assert_eq!(
+            task["status"].as_str(),
+            Some("queued"),
+            "新入队任务此刻必须是 queued"
+        );
+
+        // 登记在后台协程里跑（同一 spawn：BUG-246 元数据 → BUG-248 条目），轮询等它落地。
+        let video_ref = format!("{CACHE_FIXTURE_CHAT}:11");
+        let photo_ref = format!("{CACHE_FIXTURE_CHAT}:12");
+        let video_id = wait_item_id(&st, &video_ref).await;
+        let photo_id = wait_item_id(&st, &photo_ref).await;
+
+        // 任务**仍然是 queued**（worker 没动过它）—— 这正是本条要的前时态。
+        let live = st.store.get_cache_task(task_id).await.unwrap().unwrap();
+        assert_eq!(live.status, "queued", "登记期间任务必须保持排队态");
+
+        let video = st.store.get_media_item(video_id).await.unwrap().unwrap();
+        assert_eq!(video.file_path, None, "T0 登记字节未落 ⇒ file_path 必须是 NULL");
+        assert_eq!(video.kind, "video", "kind 与 worker 同一把尺子（meta_kind）");
+        assert_eq!(video.title, "先登记的一集 标题行", "标题取 caption 首行");
+        assert_eq!(video.description.as_deref(), Some("说明行"));
+
+        let photo = st.store.get_media_item(photo_id).await.unwrap().unwrap();
+        assert_eq!(photo.file_path, None);
+        assert_eq!(photo.kind, "photo");
+        assert_eq!(
+            photo.title, "TG 图片 #12",
+            "photo 兜底标题口径必须与 worker 一致（BUG-049）"
+        );
+
+        // 剧集槽位不在入队时刻登记（没有剧集上下文），worker 处理时才建。
+        assert_eq!(
+            video.series_id, None,
+            "入队只登记事实，槽位归 worker（本用例 worker 未启动）"
+        );
+    }
+
+    /// BUG-248 判据 2：重复入队 / 已存在条目**不产生第二行**（幂等）。
+    /// 元数据标题缺失的行**不**在此伪造：`EnsureItemRows` 跳过无元数据的消息，
+    /// 交给 worker 补齐后登记（避免空标题被首次登记坐实）。
+    #[tokio::test]
+    async fn repeated_enqueue_never_creates_a_second_media_item() {
+        let dir = scratch_dir("bug248_enqueue_idempotent");
+        let st = cache_fixture_state(
+            &dir,
+            vec![],
+            vec![fixture_msg(21, "video", "video/mp4", Some("幂等条目"), None)],
+        )
+        .await;
+        assert!(st.claim_cache_worker());
+
+        let first = enqueue_call(
+            st.clone(),
+            EnqueueCacheReq {
+                chat_id: CACHE_FIXTURE_CHAT,
+                message_ids: vec![21],
+                group_id: None,
+                dir: None,
+            },
+        )
+        .await
+        .expect("首次入队必须成功");
+        let first_id = first.1["id"].as_i64().unwrap();
+        let ref_key = format!("{CACHE_FIXTURE_CHAT}:21");
+        let item = wait_item_id(&st, &ref_key).await;
+
+        // 第二次入队：同 key ⇒ 复用活跃任务，登记协程再跑一遍。
+        for _ in 0..3 {
+            let (_, again) = enqueue_call(
+                st.clone(),
+                EnqueueCacheReq {
+                    chat_id: CACHE_FIXTURE_CHAT,
+                    message_ids: vec![21],
+                    group_id: None,
+                    dir: None,
+                },
+            )
+            .await
+            .expect("重复入队必须成功");
+            assert_eq!(
+                again["id"].as_i64(),
+                Some(first_id),
+                "同 key 入队必须复用同一任务"
+            );
+        }
+        // 直接再打一次登记内核（幂等性的最低层 Likewise 由 `item_id_by_ref` 命中保证）。
+        let again_id = register_media_item_t0(&st, CACHE_FIXTURE_CHAT, 21, false)
+            .await
+            .expect("重复登记必须返回既有条目")
+            .0;
+
+        assert_eq!(again_id, item, "重复登记必须回到同一个 item id");
+
+        // 入队时刻的批量入口同样幂等（每条消息走一次内核）。
+        register_enqueued_items(&st, CACHE_FIXTURE_CHAT, &[21]).await;
+        assert_eq!(count_rows(&st, &ref_key).await, 1, "条目只能有一行");
+    }
+
+    /// BUG-248 判据 3：登记失败**不阻断入队**（与 BUG-246 同一个容错语义）。
+    ///
+    /// 失败用**真实 DB 层故障**注入（BEFORE INSERT 触发器 RAISE(ABORT)），
+    /// 不是给函数打个假返回值：这样连同一条 SQL、同一条错误返回路径都覆盖到了。
+    #[tokio::test]
+    async fn enqueue_survives_item_registration_failure() {
+        let dir = scratch_dir("bug248_enqueue_failure");
+        let st = cache_fixture_state(
+            &dir,
+            vec![],
+            vec![fixture_msg(31, "video", "video/mp4", Some("登记会失败"), None)],
+        )
+        .await;
+        assert!(st.claim_cache_worker());
+        st.store
+            .conn
+            .execute(
+                "CREATE TRIGGER bug248_block_insert BEFORE INSERT ON media_item
+                 BEGIN SELECT RAISE(ABORT, 'bug-248 injected registration failure'); END",
+                (),
+            )
+            .await
+            .expect("failure injection must be installed");
+
+        // 内核层：故障必须表现为 `None`（无可奉告），不得 panic / 不得谎报成功。
+        assert_eq!(
+            register_media_item_t0(&st, CACHE_FIXTURE_CHAT, 31, false).await,
+            None,
+            "登记失败必须返回 None（调用方据此不阻断）"
+        );
+        // 只统计**入队之前**的失败日志：下面要证明的是「后台那次登记真的跑过并失败了」，
+        // 而不是被这次直接调用混过去。
+        let noted_before = log_count(&st, "cache ingest failed");
+
+        // 端点层：入队照常 200 + 任务照常落库（登记只是「先在」，不是字节的前提）。
+        let (status, task) = enqueue_call(
+            st.clone(),
+            EnqueueCacheReq {
+                chat_id: CACHE_FIXTURE_CHAT,
+                message_ids: vec![31],
+                group_id: None,
+                dir: None,
+            },
+        )
+        .await
+        .expect("登记失败不得让入队失败");
+        assert_eq!(status, StatusCode::OK);
+        let task_id = task["id"].as_i64().expect("task id");
+        let live = st.store.get_cache_task(task_id).await.unwrap().unwrap();
+        assert_eq!(live.status, "queued", "任务必须照常排队");
+        assert_eq!(
+            st.store
+                .item_id_by_ref("tg", &format!("{CACHE_FIXTURE_CHAT}:31"))
+                .await
+                .unwrap(),
+            None,
+            "登记失败 ⇒ 条目确实没建成（不得假装登记成功）"
+        );
+        wait_log(&st, "cache ingest failed", noted_before).await;
+    }
+
+    /// 调用入队端点并解构为 `(状态码, 任务 JSON)`。
+    async fn enqueue_call(
+        st: Arc<AppState>,
+        req: EnqueueCacheReq,
+    ) -> Result<(StatusCode, serde_json::Value), (StatusCode, String)> {
+        match enqueue_cache_task(State(st), Json(req)).await {
+            Ok(resp) => {
+                let resp = resp.into_response();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .expect("body must be readable");
+                let v: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("body must be JSON");
+                Ok((status, v))
+            }
+            Err(e) => Err((e.status, e.message().to_string())),
+        }
+    }
+
+    /// 轮询等待某个 `ref` 的条目落地（后台登记协程是异步的）。
+    async fn wait_item_id(st: &AppState, ref_key: &str) -> i64 {
+        for _ in 0..200 {
+            if let Ok(Some(id)) = st.store.item_id_by_ref("tg", ref_key).await {
+                return id;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("BUG-248: 入队后最多 5s 内条目必须出现在媒体库（ref={ref_key}）");
+    }
+
+    /// 等待某条日志**新增**（失败路径必须留痕，不能静默吞掉）。
+    ///
+    /// `baseline` 是入队之前的命中条数：等到它增加，才证明**后台那次登记真的跑过**
+    /// ——否则用例会被更早一次同名日志蒙混过关。
+    async fn wait_log(st: &AppState, needle: &str, baseline: usize) {
+        for _ in 0..200 {
+            if log_count(st, needle) > baseline {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("BUG-248: 登记失败必须留痕（期待日志含 {needle}）");
+    }
+
+    /// 环形日志里含 `needle` 的条数。
+    fn log_count(st: &AppState, needle: &str) -> usize {
+        st.logs.recent(200).iter().filter(|l| l.contains(needle)).count()
+    }
+
+    /// 某个 `ref` 的条目行数（幂等判据）。
+    async fn count_rows(st: &AppState, ref_key: &str) -> i64 {
+        let mut rows = st
+            .store
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM media_item WHERE source = 'tg' AND ref = ?1",
+                libsql::params![ref_key.to_string()],
+            )
+            .await
+            .expect("count must run");
+        let row = rows.next().await.expect("count row").expect("count row exists");
+        row.get(0).expect("count column")
     }
 }
 
