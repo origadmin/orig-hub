@@ -7,6 +7,7 @@ import { resolveSeriesCover } from '../../lib/episodePresentation'
 import { generateVideoPoster } from '../../lib/poster'
 import { TagToken } from './TagToken'
 import { useTranslation } from '../../i18n'
+import { seriesLabel } from '../../lib/displayTitle'
 
 /** 剧集卡片（剧集浏览墙用） */
 export function SeriesCard(props: {
@@ -95,8 +96,8 @@ export function SeriesCard(props: {
           type="button"
           role="checkbox"
           aria-checked={isSelected}
-          aria-label={t('media.seriesSelectionToggle', { title: series.title })}
-          title={t('media.seriesSelectionToggle', { title: series.title })}
+          aria-label={t('media.seriesSelectionToggle', { title: seriesLabel(series.title) })}
+          title={t('media.seriesSelectionToggle', { title: seriesLabel(series.title) })}
           data-testid="series-card-select"
           data-series-id={series.id}
           onClick={(e) => {

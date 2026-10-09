@@ -6,6 +6,7 @@ import { canRecacheFromSource, coverFit, fmtDuration, hasMediaBytes, sourceLabel
 import { episodeSlotLabel, shouldRenderEpisodeTitle } from '../../lib/episodePresentation'
 import { CoverImage } from './CoverImage'
 import { useTranslation } from '../../i18n'
+import { seriesLabel } from '../../lib/displayTitle'
 
 /**
  * 单集**行态**：位置（集号）+ 指代（封面）+ 标识（标题）+ 关键状态（时长 / 多源 /
@@ -175,7 +176,7 @@ export function EpisodeRow(props: {
               <span className="text-accent/80">
                 {' · '}
                 {ep.originSeriesTitle
-                  ? t('media.episode.originFrom', { title: ep.originSeriesTitle })
+                  ? t('media.episode.originFrom', { title: seriesLabel(ep.originSeriesTitle) })
                   : t('media.episode.originFromUntitled')}
                 {ep.originEpisodeNo != null
                   ? ` ${t('media.episode.originEpisode', { n: ep.originEpisodeNo })}`

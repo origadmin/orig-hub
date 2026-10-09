@@ -6,6 +6,7 @@ import { cn } from '../../lib/utils'
 import { coverFit, fmtDuration } from '../../lib/tgmedia'
 import { useTranslation } from '../../i18n'
 import { sortEpisodes } from '../../hooks/useSeriesDetail'
+import { seriesLabel } from '../../lib/displayTitle'
 
 /**
  * 播放/浏览中的分集列表侧栏（纯展示）。
@@ -228,7 +229,7 @@ export function EpisodeList({
                     {(ep.originSeriesTitle || ep.originEpisodeNo != null) && (
                       <span className="block text-[10px] text-accent/75">
                         {ep.originSeriesTitle
-                          ? `合并自《${ep.originSeriesTitle}》`
+                          ? `合并自${seriesLabel(ep.originSeriesTitle)}`
                           : '合并自其他剧集'}
                         {ep.originEpisodeNo != null ? ` 原 E${ep.originEpisodeNo}` : ''}
                       </span>

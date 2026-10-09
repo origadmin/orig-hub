@@ -18,6 +18,7 @@ import {
 import { EpisodeEditPanel } from './EpisodeEditPanel'
 import { CoverImage } from './CoverImage'
 import { useTranslation } from '../../i18n'
+import { seriesLabel } from '../../lib/displayTitle'
 
 /** 展开态挂图横滚条的最大张数（超出后靠横滚，不再展开/收起） */
 const IMAGE_TILE_LIMIT = 24
@@ -317,7 +318,7 @@ export function EpisodeExpanded(props: {
         {ep.originSeriesTitle || ep.originEpisodeNo != null ? (
           <span className="text-accent/80">
             {ep.originSeriesTitle
-              ? t('media.episode.originFrom', { title: ep.originSeriesTitle })
+              ? t('media.episode.originFrom', { title: seriesLabel(ep.originSeriesTitle) })
               : t('media.episode.originFromUntitled')}
             {ep.originEpisodeNo != null
               ? ` ${t('media.episode.originEpisode', { n: ep.originEpisodeNo })}`

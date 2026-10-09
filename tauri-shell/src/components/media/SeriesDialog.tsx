@@ -5,6 +5,7 @@ import { Input } from '../ui/input'
 import { appendEpisodes, createSeries, mergeSeries, mergeSeriesMulti } from '../../api/media'
 import type { MediaSeries, MergeResult } from '../../api/media'
 import { useTranslation } from '../../i18n'
+import { seriesLabel } from '../../lib/displayTitle'
 
 const KIND_OPTIONS = [
   { value: 'series', label: '剧集', hint: '有季/集编号的连续内容（如番剧、课程）' },
@@ -266,7 +267,7 @@ export function MergeSeriesDialog(props: {
         </h4>
         <p className="mt-1 text-[11px] text-muted">
           把另一个剧集的内容并入
-          <span className="font-medium text-fg-strong">《{target.title}》</span>（
+          <span className="font-medium text-fg-strong">{seriesLabel(target.title)}</span>（
           {target.episodeCount} 集），源剧集随后被删除。
         </p>
 
@@ -302,7 +303,7 @@ export function MergeSeriesDialog(props: {
             </p>
             {confirming && source && (
               <p className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-[11px] leading-relaxed text-destructive">
-                将把《{source.title}》的 {source.episodeCount} 个分集并入《{target.title}》，
+                将把{seriesLabel(source.title)}的 {source.episodeCount} 个分集并入{seriesLabel(target.title)}，
                 源剧集会被删除，此操作无法撤销。
               </p>
             )}
@@ -473,7 +474,7 @@ export function MergeSeriesMultiDialog(props: {
               className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-[11px] leading-relaxed text-destructive"
               data-testid="series-merge-confirm-warn"
             >
-              {t('media.seriesMergeConfirmBody', { n: sourceIds.length, target: target?.title ?? '' })}
+              {t('media.seriesMergeConfirmBody', { n: sourceIds.length, target: seriesLabel(target?.title ?? '') })}
             </p>
             <p className="text-[10px] font-medium text-destructive">
               {t('media.seriesMergeWillDelete')}

@@ -70,6 +70,7 @@ import { TagToken } from './TagToken'
 import { CoverImage } from './CoverImage'
 import { Button } from '../ui/button'
 import { useTranslation } from '../../i18n'
+import { seriesLabel } from '../../lib/displayTitle'
 
 /**
  * 剧集介绍折叠阈值（像素）：超过该高度才给「展开 / 收起」（照抄 `SeriesHero.tsx` 的
@@ -869,7 +870,7 @@ export function SeriesDetail(props: {
                 {cur.originSeriesTitle || cur.originEpisodeNo != null ? (
                   <span className="text-accent/80">
                     {cur.originSeriesTitle
-                      ? t('media.episode.originFrom', { title: cur.originSeriesTitle })
+                      ? t('media.episode.originFrom', { title: seriesLabel(cur.originSeriesTitle) })
                       : t('media.episode.originFromUntitled')}
                     {cur.originEpisodeNo != null
                       ? ` ${t('media.episode.originEpisode', { n: cur.originEpisodeNo })}`

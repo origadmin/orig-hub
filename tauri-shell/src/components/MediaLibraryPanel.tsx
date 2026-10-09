@@ -22,6 +22,7 @@ import {
 } from '../api/media'
 import { loadSeriesDetail, isSeriesNotFound } from '../hooks/useSeriesDetail'
 import { cacheKey, cached, invalidateCache } from '../lib/fetchCache'
+import { seriesLabel } from '../lib/displayTitle'
 import type {
   LibraryStats,
   MediaItem,
@@ -1459,8 +1460,8 @@ export function MediaLibraryPanel() {
             // 静默会让用户以为全搬完了（与「已导入 N 项」同一反馈位）。
             setError(
               res.skippedCount > 0
-                ? `已把《${sourceTitle}》的 ${res.added} 集并入，${res.skippedCount} 集因已在剧中而跳过`
-                : `已把《${sourceTitle}》的 ${res.added} 集并入`,
+                ? `已把${seriesLabel(sourceTitle)}的 ${res.added} 集并入，${res.skippedCount} 集因已在剧中而跳过`
+                : `已把${seriesLabel(sourceTitle)}的 ${res.added} 集并入`,
             )
           }}
           onError={(m) => setError(m)}
@@ -1479,11 +1480,11 @@ export function MediaLibraryPanel() {
             setError(
               res.skippedCount > 0
                 ? t('media.seriesMergeMultiDoneSkip', {
-                    target: targetTitle,
+                    target: seriesLabel(targetTitle),
                     n: res.added,
                     m: res.skippedCount,
                   })
-                : t('media.seriesMergeMultiDone', { target: targetTitle, n: res.added }),
+                : t('media.seriesMergeMultiDone', { target: seriesLabel(targetTitle), n: res.added }),
             )
           }}
           onError={(m) => setError(m)}
@@ -1549,7 +1550,7 @@ export function MediaLibraryPanel() {
                       data-testid="series-confirm-delete-item"
                       className="truncate px-1.5 py-0.5 text-[11px] text-fg-strong"
                     >
-                      《{s.title}》 · {t('media.episodeCount', { n: s.episodeCount })}
+                      {seriesLabel(s.title)} · {t('media.episodeCount', { n: s.episodeCount })}
                     </div>
                   ))}
                 </div>
