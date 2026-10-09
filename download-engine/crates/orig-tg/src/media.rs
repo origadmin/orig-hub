@@ -790,6 +790,16 @@ pub struct SeriesView {
     pub updated_at: i64,
     pub episode_count: i64,
     pub season_count: i64,
+    /// 剧集内的**内容构成**（BUG-250）：主页剧集卡必须能体现「有没有视频 / 有没有图片」——
+    /// 用户看列表时无法点进每一部去确认，0 也要如实显示（不是省略）。
+    pub video_count: i64,
+    pub photo_count: i64,
+    /// `cover_item_id` 那一条**是否已有字节**（BUG-250）。
+    ///
+    /// false ⇒ 前端**不得**对它抽帧：`/api/media/items/:id/raw` 对无字节条目必然失败
+    /// （video 实测 404），抽帧只会在控制台刷错误。photo 封面不受此限——图片字节
+    /// 由 raw 端点现场代理 TG 缩略图（BUG-049），那正是它唯一的图源。
+    pub cover_has_bytes: bool,
     pub tags: Vec<TagRef>,
 }
 
@@ -1481,7 +1491,22 @@ impl Store {
                             ORDER BY e.season, e.episode_no, e.id LIMIT 1),
                           (SELECT i.kind FROM media_episode e JOIN media_item i ON i.id = e.item_id
                             WHERE e.series_id = s.id
-                            ORDER BY e.season, e.episode_no, e.id LIMIT 1))
+                            ORDER BY e.season, e.episode_no, e.id LIMIT 1)),
+                        -- BUG-250：内容构成（主页剧集卡要能看出有没有视频/图片）。
+                        (SELECT COUNT(*) FROM media_episode e JOIN media_item i ON i.id = e.item_id
+                          WHERE e.series_id = s.id AND i.kind = 'video'),
+                        (SELECT COUNT(*) FROM media_episode e JOIN media_item i ON i.id = e.item_id
+                          WHERE e.series_id = s.id AND i.kind = 'photo'),
+                        -- BUG-250：封面条目是否有字节。与上面的 cover_item_id 同优先级
+                        -- （photo 优先、回退首集），避免「封面判了 A、可用性判了 B」。
+                        COALESCE(
+                          (SELECT (i.file_path IS NOT NULL) FROM media_episode e JOIN media_item i ON i.id = e.item_id
+                            WHERE e.series_id = s.id AND i.kind = 'photo'
+                            ORDER BY e.season, e.episode_no, e.id LIMIT 1),
+                          (SELECT (i.file_path IS NOT NULL) FROM media_episode e JOIN media_item i ON i.id = e.item_id
+                            WHERE e.series_id = s.id
+                            ORDER BY e.season, e.episode_no, e.id LIMIT 1),
+                          0)
                    FROM media_series s
                   WHERE (?1 IS NULL
                          OR s.id IN (SELECT series_id FROM media_series_tag WHERE tag_id = ?1))
@@ -1507,6 +1532,9 @@ impl Store {
                 updated_at: r.get(7)?,
                 episode_count: r.get(8)?,
                 season_count: r.get(9)?,
+                video_count: r.get(13)?,
+                photo_count: r.get(14)?,
+                cover_has_bytes: r.get::<i64>(15)? != 0,
                 tags: Vec::new(),
             });
         }
