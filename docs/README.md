@@ -41,7 +41,7 @@
 
 ---
 
-## 三、设计文档（`docs/design/`，25 篇）
+## 三、设计文档（`docs/design/`，30 篇）
 
 ### 3.1 媒体库 · 剧集内页（**改这里之前必读**）
 
@@ -54,6 +54,9 @@
 | `episode-multi-source-design-2026-09-22.md` | 单集多视频源（多版本/主次/选主/归并）**未落地** | 09-22 | draft |
 | `episode-segment-model-2026-09-29.md` | 一集 = N 个顺序片段（新需求，待裁定） | 09-29 | draft |
 | `episode-internal-ia.md` | 剧集内页信息架构 PRD（问题池 + 分层） | 09-29 | 未标注 |
+| `episode-internal-ia-v2-2026-09-29.md` | 剧集内页增量 PRD v2（左栏封面编辑 + 右栏主次重排；**冲突处以 v2 为准**） | 09-29 | 未标注 |
+| `episode-cover-and-layout-2026-09-29.md` | 剧集封面替换 + 内页布局收敛增量设计（上游 = ia-v2；§6 待明确 X1–X3） | 09-29 | draft |
+| `episode-binding-model-decision-2026-09-29.md` | 挂载模型重估：选「新增独立表」是否在堆债务（回答 segment-model §2.3 的 A） | 09-29 | 未标注 |
 | `episode-source-and-library-ux-2026-09-29.md` | 来源区语义收敛 + 卡片可读性 + 选集器 N+更多 + 跳过片头（含 D1–D3 待拍板） | 09-29 | draft |
 
 ### 3.2 TG · 来源域
@@ -94,6 +97,12 @@
 | `ROUND9-DESIGN-EVAL.md` | 第 9 轮设计评估 | — | 未标注 |
 | `ee-export-p6-2026-09-25.md` | EE 导出 P6 | 09-25 | 未标注 |
 
+### 3.6 产品方向 · 依赖组件
+
+| 文档 | 主题 | 日期 | 状态 |
+|---|---|---|---|
+| `product-direction-and-ffmpeg-2026-10-09.md` | **产品主体重定位评估 + ffmpeg 组件化（安装/设置/提供服务）+ 优先度与里程碑**；含 3 条待拍板 | 10-09 | draft |
+
 ---
 
 ## 四、规则（`docs/rules/`）
@@ -129,6 +138,7 @@
 |---|---|
 | `docs/review/media-tg-review-2026-09-22.md` | 媒体/TG 评审 |
 | `docs/review/pending-decisions-2026-09-22.md` | 待拍板清单 |
+| `docs/review/product-direction-decisions-2026-10-09.md` | 产品方向待拍板清单（D1 文件管理 vs 媒体库 / D2 ffmpeg 获取策略 / D3 共享形态） |
 | `docs/incidents/INC-001-git-total-loss.md` | Git 全量丢失事故取证 |
 
 ---
