@@ -20,9 +20,13 @@
  */
 
 const cdp = require('./lib/cdp.cjs')
+const endpoints = require('./_lib_endpoints.cjs')
 
-const APP = 'http://127.0.0.1:5180/'
-const TG = 'http://127.0.0.1:19787'
+// APP / TG / isTg are resolved at runtime from the daemon's /api/config
+// (tg_port drifts between runs -- never hard-code it). Assigned in main().
+let APP = ''
+let TG = ''
+let isTg = () => false
 const FIRST_SCREEN_MS = 8000
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -44,7 +48,7 @@ function groupByEndpoint(reqs) {
     let key
     try {
       const u = new URL(r.url)
-      key = u.origin === TG ? u.pathname + (u.search || '') : `${u.origin}${u.pathname}`
+      key = isTg(r.url) ? u.pathname + (u.search || '') : `${u.origin}${u.pathname}`
     } catch {
       key = r.url
     }
@@ -70,7 +74,7 @@ function duplicateUrls(reqs) {
 }
 
 async function snapshot(page, records, label) {
-  const media = records.filter((r) => r.url.startsWith(TG))
+  const media = records.filter((r) => isTg(r.url))
   console.log(`\n=== [${label}] all=${records.length}  TG=${media.length} ===`)
   for (const g of groupByEndpoint(records)) {
     console.log(`  ${String(g.count).padStart(4)}x  ${g.key}\n           trigger: ${g.sites}`)
@@ -124,70 +128,80 @@ async function enterMedia(page) {
 }
 
 async function main() {
+  const ep = await endpoints.resolve()
+  APP = ep.app
+  TG = ep.tg
+  isTg = ep.isTg
+
   const browser = await cdp.launch({ headless: false, args: ['--autoplay-policy=no-user-gesture-required'] })
-  const page = await browser.newPage()
-  await page.goto(APP, { waitUntil: 'load' })
-  await delay(2500)
+  try {
+    const page = await browser.newPage()
+    await page.goto(APP, { waitUntil: 'load' })
+    await delay(2500)
 
-  await page.conn.send('Network.enable', {}, { sessionId: page.sessionId })
-  const records = []
-  page.conn.on('Network.requestWillBeSent', (p) => {
-    const url = p.request.url
-    if (url.startsWith('data:') || url.startsWith('blob:')) return
-    records.push({ ts: p.timestamp, url, type: p.type || '', site: triggerSite(p) })
-  })
+    await page.conn.send('Network.enable', {}, { sessionId: page.sessionId })
+    const records = []
+    page.conn.on('Network.requestWillBeSent', (p) => {
+      const url = p.request.url
+      if (url.startsWith('data:') || url.startsWith('blob:')) return
+      records.push({ ts: p.timestamp, url, type: p.type || '', site: triggerSite(p) })
+    })
 
-  // ---- P1: first entry into media library ----
-  const m0 = records.length
-  const ok1 = await enterMedia(page)
-  const p1 = records.slice(m0)
-  await snapshot(page, p1, `P1 first-entry (clicked=${ok1})`)
-  const dom1 = await readDom(page)
-  console.log('  DOM P1:', JSON.stringify(dom1))
+    // ---- P1: first entry into media library ----
+    const m0 = records.length
+    const ok1 = await enterMedia(page)
+    const p1 = records.slice(m0)
+    await snapshot(page, p1, `P1 first-entry (clicked=${ok1})`)
+    const dom1 = await readDom(page)
+    console.log('  DOM P1:', JSON.stringify(dom1))
+    // A zero-traffic window means the resolved port is wrong (or capture broke)
+    // -- fail loudly instead of reporting it as a clean "no requests".
+    ep.assertTgTraffic(p1.filter((r) => isTg(r.url)).length, 'P1 first-entry')
 
-  // ---- P2: full reload, then re-enter ----
-  const m1 = records.length
-  await page.goto(APP, { waitUntil: 'load' })
-  await delay(3000)
-  const ok2 = await enterMedia(page)
-  const p2 = records.slice(m1)
-  await snapshot(page, p2, `P2 reload+entry (clicked=${ok2})`)
-  const dom2 = await readDom(page)
-  console.log('  DOM P2:', JSON.stringify(dom2))
+    // ---- P2: full reload, then re-enter ----
+    const m1 = records.length
+    await page.goto(APP, { waitUntil: 'load' })
+    await delay(3000)
+    const ok2 = await enterMedia(page)
+    const p2 = records.slice(m1)
+    await snapshot(page, p2, `P2 reload+entry (clicked=${ok2})`)
+    const dom2 = await readDom(page)
+    console.log('  DOM P2:', JSON.stringify(dom2))
 
-  // ---- P3: switch away to "all files" then back to media ----
-  const m2 = records.length
-  const okAway = await clickTestId(page, 'all-files-row')
-  await delay(1500)
-  const okBack = await enterMedia(page)
-  const p3 = records.slice(m2)
-  await snapshot(page, p3, `P3 switch-away-and-back (away=${okAway} back=${okBack})`)
-  const dom3 = await readDom(page)
-  console.log('  DOM P3:', JSON.stringify(dom3))
+    // ---- P3: switch away to "all files" then back to media ----
+    const m2 = records.length
+    const okAway = await clickTestId(page, 'all-files-row')
+    await delay(1500)
+    const okBack = await enterMedia(page)
+    const p3 = records.slice(m2)
+    await snapshot(page, p3, `P3 switch-away-and-back (away=${okAway} back=${okBack})`)
+    const dom3 = await readDom(page)
+    console.log('  DOM P3:', JSON.stringify(dom3))
 
-  // ---- P4: switch to the flat "全部内容" items grid and count DOM cards ----
-  const m3 = records.length
-  const okItems = await clickTestId(page, 'media-cat-all')
-  await delay(6000)
-  const p4 = records.slice(m3)
-  await snapshot(page, p4, `P4 items-grid (clicked=${okItems})`)
-  const dom4 = await readDom(page)
-  console.log('  DOM P4:', JSON.stringify(dom4))
+    // ---- P4: switch to the flat "全部内容" items grid and count DOM cards ----
+    const m3 = records.length
+    const okItems = await clickTestId(page, 'media-cat-all')
+    await delay(6000)
+    const p4 = records.slice(m3)
+    await snapshot(page, p4, `P4 items-grid (clicked=${okItems})`)
+    const dom4 = await readDom(page)
+    console.log('  DOM P4:', JSON.stringify(dom4))
 
-  console.log('\n=== VERDICT SUMMARY ===')
-  const mt = (a) => a.filter((r) => r.url.startsWith(TG)).length
-  console.log(`P1 first-entry : all=${p1.length} TG=${mt(p1)}`)
-  console.log(`P2 reload+entry: all=${p2.length} TG=${mt(p2)}`)
-  console.log(`P3 re-entry    : all=${p3.length} TG=${mt(p3)}`)
-  console.log(`P4 items-grid  : all=${p4.length} TG=${mt(p4)}`)
-  console.log(
-    `DOM seriesCards: P1=${dom1.seriesCards}/${dom1.seriesCardsUniq}unq  P2=${dom2.seriesCards}/${dom2.seriesCardsUniq}unq  P3=${dom3.seriesCards}/${dom3.seriesCardsUniq}unq`,
-  )
-  console.log(
-    `DOM mediaCards : P4=${dom4.mediaCards}/${dom4.mediaCardsUniq}unq dupKeys=${JSON.stringify(dom4.mediaDupKeys)}`,
-  )
-
-  await browser.close()
+    console.log('\n=== VERDICT SUMMARY ===')
+    const mt = (a) => a.filter((r) => isTg(r.url)).length
+    console.log(`P1 first-entry : all=${p1.length} TG=${mt(p1)}`)
+    console.log(`P2 reload+entry: all=${p2.length} TG=${mt(p2)}`)
+    console.log(`P3 re-entry    : all=${p3.length} TG=${mt(p3)}`)
+    console.log(`P4 items-grid  : all=${p4.length} TG=${mt(p4)}`)
+    console.log(
+      `DOM seriesCards: P1=${dom1.seriesCards}/${dom1.seriesCardsUniq}unq  P2=${dom2.seriesCards}/${dom2.seriesCardsUniq}unq  P3=${dom3.seriesCards}/${dom3.seriesCardsUniq}unq`,
+    )
+    console.log(
+      `DOM mediaCards : P4=${dom4.mediaCards}/${dom4.mediaCardsUniq}unq dupKeys=${JSON.stringify(dom4.mediaDupKeys)}`,
+    )
+  } finally {
+    await browser.close()
+  }
 }
 
 main().catch((e) => {

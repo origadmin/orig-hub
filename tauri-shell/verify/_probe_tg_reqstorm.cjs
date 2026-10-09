@@ -15,18 +15,18 @@
  */
 
 const cdp = require('./lib/cdp.cjs')
+const endpoints = require('./_lib_endpoints.cjs')
 
-const APP = 'http://127.0.0.1:5180/'
-const TG = 'http://127.0.0.1:19787'
+// Resolved at runtime from daemon /api/config (tg_port drifts -- never hard-code).
+let APP = ''
+let TG = ''
+/** 只统计打到 orig-tg（媒体库 API + TG API 同进程）的请求。 */
+let isTgApi = () => false
+
 const TITLE = process.argv[2] || '每日沙雕墙'
 const WINDOW_MS = Number(process.argv[3] || 30000)
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms))
-
-/** 只统计打到 orig-tg（媒体库 API + TG API 同进程）的请求。 */
-function isTgApi(url) {
-  return url.startsWith(TG) || /127\.0\.0\.1:19787\//.test(url)
-}
 
 function pathKey(url) {
   try {
@@ -103,86 +103,96 @@ function summarize(records, label, windowMs) {
 }
 
 async function main() {
+  const ep = await endpoints.resolve()
+  APP = ep.app
+  TG = ep.tg
+  isTgApi = ep.isTg
+
   const browser = await cdp.launch({
     headless: false,
     args: ['--autoplay-policy=no-user-gesture-required'],
   })
-  const page = await browser.newPage()
-  await page.goto(APP, { settleMs: 2000 })
+  try {
+    const page = await browser.newPage()
+    await page.goto(APP, { settleMs: 2000 })
 
-  // 先开 Network，抓「进入频道」前的基线（面板自身的挂载请求）
-  await page.conn.send('Network.enable', {}, { sessionId: page.sessionId })
-  const records = []
-  let navMark = 0
-  page.conn.on('Network.requestWillBeSent', (p) => {
-    const init = p.initiator || {}
-    let stack = []
-    if (init.stack && Array.isArray(init.stack.callFrames)) {
-      stack = init.stack.callFrames.map((f) => ({
-        url: String(f.url || ''),
-        lineNumber: f.lineNumber,
-        columnNumber: f.columnNumber,
-        functionName: f.functionName || '',
-      }))
-    }
-    records.push({
-      ts: p.wallTime || p.timestamp,
-      url: p.request.url,
-      method: p.request.method,
-      type: p.type || '',
-      initType: init.type || '',
-      stack,
+    // 先开 Network，抓「进入频道」前的基线（面板自身的挂载请求）
+    await page.conn.send('Network.enable', {}, { sessionId: page.sessionId })
+    const records = []
+    let navMark = 0
+    page.conn.on('Network.requestWillBeSent', (p) => {
+      const init = p.initiator || {}
+      let stack = []
+      if (init.stack && Array.isArray(init.stack.callFrames)) {
+        stack = init.stack.callFrames.map((f) => ({
+          url: String(f.url || ''),
+          lineNumber: f.lineNumber,
+          columnNumber: f.columnNumber,
+          functionName: f.functionName || '',
+        }))
+      }
+      records.push({
+        ts: p.wallTime || p.timestamp,
+        url: p.request.url,
+        method: p.request.method,
+        type: p.type || '',
+        initType: init.type || '',
+        stack,
+      })
     })
-  })
 
-  // 进入 TG 面板（面板挂载会自动选中第一个监控频道 → 即触发 feed 加载）
-  navMark = records.length
-  const navOk = await page.evaluate(() => {
-    const b = document.querySelector('[data-testid="nav-tg"]')
-    if (!b) return false
-    b.click()
-    return true
-  })
-  if (!navOk) throw new Error('nav-tg not found')
-  await page.waitForFunction(() => !!document.querySelector('[data-testid="tg-panel-root"]'), {
-    timeout: 20000,
-    intervalMs: 250,
-  })
-  await delay(3500)
-  const panelBaseCount = records.length
-  const mountSum = summarize(records.slice(navMark), '面板挂载 + 自动选中首个监控频道（0→3.5s）', 3500)
-  console.log(`[baseline] 面板挂载后（含自动进入频道）请求数=${records.filter((r) => isTgApi(r.url)).length}`)
+    // 进入 TG 面板（面板挂载会自动选中第一个监控频道 → 即触发 feed 加载）
+    navMark = records.length
+    const navOk = await page.evaluate(() => {
+      const b = document.querySelector('[data-testid="nav-tg"]')
+      if (!b) return false
+      b.click()
+      return true
+    })
+    if (!navOk) throw new Error('nav-tg not found')
+    await page.waitForFunction(() => !!document.querySelector('[data-testid="tg-panel-root"]'), {
+      timeout: 20000,
+      intervalMs: 250,
+    })
+    await delay(3500)
+    const panelBaseCount = records.length
+    const mountSum = summarize(records.slice(navMark), '面板挂载 + 自动选中首个监控频道（0→3.5s）', 3500)
+    console.log(`[baseline] 面板挂载后（含自动进入频道）请求数=${records.filter((r) => isTgApi(r.url)).length}`)
+    // 错误端口 ⇒ 零流量；大声失败，绝不当作「无请求」通过。
+    ep.assertTgTraffic(records.slice(navMark).filter((r) => isTgApi(r.url)).length, 'TG 面板挂载')
 
-  // 进入目标频道：点监控行里标题匹配的按钮（若已自动选中则为幂等重选）
-  const clicked = await page.evaluate((title) => {
-    const btns = [...document.querySelectorAll('[data-testid="tg-panel-root"] aside button')]
-    const hit = btns.find((b) => (b.textContent || '').includes(title))
-    if (!hit) return false
-    hit.click()
-    return true
-  }, TITLE)
-  if (!clicked) throw new Error(`monitored row「${TITLE}」not found`)
-  console.log(`[enter] clicked monitored row「${TITLE}」，开始 ${WINDOW_MS / 1000}s 采样`)
+    // 进入目标频道：点监控行里标题匹配的按钮（若已自动选中则为幂等重选）
+    const clicked = await page.evaluate((title) => {
+      const btns = [...document.querySelectorAll('[data-testid="tg-panel-root"] aside button')]
+      const hit = btns.find((b) => (b.textContent || '').includes(title))
+      if (!hit) return false
+      hit.click()
+      return true
+    }, TITLE)
+    if (!clicked) throw new Error(`monitored row「${TITLE}」not found`)
+    console.log(`[enter] clicked monitored row「${TITLE}」，开始 ${WINDOW_MS / 1000}s 采样`)
 
-  const mark = records.length
-  await delay(WINDOW_MS)
+    const mark = records.length
+    await delay(WINDOW_MS)
 
-  // 采样后 DOM 统计（关联请求数与渲染瓦片数）
-  const dom = await page.evaluate(() => {
-    const root = document.querySelector('[data-testid="tg-panel-root"]')
-    const imgs = root ? [...root.querySelectorAll('img')] : []
-    const thumbs = imgs.map((i) => i.getAttribute('src') || '').filter((s) => s.includes('/api/tg/thumb/'))
-    const tiles = root ? root.querySelectorAll('[data-testid^="tg-album-tile-"]').length : 0
-    const photos = root ? root.querySelectorAll('[data-testid="tg-photo-preview"]').length : 0
-    return { imgCount: imgs.length, thumbImgs: thumbs.length, albumTiles: tiles, photoPreviews: photos }
-  })
-  console.log('[dom]', JSON.stringify(dom))
+    // 采样后 DOM 统计（关联请求数与渲染瓦片数）
+    const dom = await page.evaluate(() => {
+      const root = document.querySelector('[data-testid="tg-panel-root"]')
+      const imgs = root ? [...root.querySelectorAll('img')] : []
+      const thumbs = imgs.map((i) => i.getAttribute('src') || '').filter((s) => s.includes('/api/tg/thumb/'))
+      const tiles = root ? root.querySelectorAll('[data-testid^="tg-album-tile-"]').length : 0
+      const photos = root ? root.querySelectorAll('[data-testid="tg-photo-preview"]').length : 0
+      return { imgCount: imgs.length, thumbImgs: thumbs.length, albumTiles: tiles, photoPreviews: photos }
+    })
+    console.log('[dom]', JSON.stringify(dom))
 
-  const win = records.slice(mark)
-  const sum = summarize(win, `进入「${TITLE}」后 ${WINDOW_MS / 1000}s`, WINDOW_MS)
-  console.log('\n[VERDICT] /api 总数=' + sum.total + ' peak/s=' + sum.peak + ' 重复URL数=' + sum.dupes)
-
-  await browser.close()
+    const win = records.slice(mark)
+    const sum = summarize(win, `进入「${TITLE}」后 ${WINDOW_MS / 1000}s`, WINDOW_MS)
+    console.log('\n[VERDICT] /api 总数=' + sum.total + ' peak/s=' + sum.peak + ' 重复URL数=' + sum.dupes)
+    ep.assertTgTraffic(sum.total, `进入「${TITLE}」${WINDOW_MS / 1000}s`)
+  } finally {
+    await browser.close()
+  }
 }
 
 main().catch((e) => {

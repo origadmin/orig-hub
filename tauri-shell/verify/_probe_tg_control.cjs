@@ -6,10 +6,15 @@
  * 用法：node _probe_tg_control.cjs "麻豆短剧"
  */
 const cdp = require('./lib/cdp.cjs')
-const TG = 'http://127.0.0.1:19787'
+const endpoints = require('./_lib_endpoints.cjs')
+
+// Resolved at runtime from daemon /api/config (tg_port drifts -- never hard-code).
+let APP = ''
+let TG = ''
+let isTgApi = () => false
+
 const TARGET = process.argv[2] || '麻豆短剧'
 const delay = (ms) => new Promise((r) => setTimeout(r, ms))
-const isTgApi = (u) => u.startsWith(TG) || /127\.0\.0\.1:19787\//.test(u)
 const fam = (u) => { try { const x = new URL(u); return x.pathname.split('?')[0].replace(/\/api\/tg\/thumb\/[^/]+\/[^/]+/, '/api/tg/thumb/{c}/{m}').replace(/\/api\/tg\/file\/[^/]+\/[^/]+/, '/api/tg/file/{c}/{m}').replace(/\/api\/tg\/local\/[^/]+\/[^/]+/, '/api/tg/local/{c}/{m}').replace(/\/api\/tg\/messages\/[^/]+/, '/api/tg/messages/{c}').replace(/\/api\/tg\/downloaded\/[^/]+/, '/api/tg/downloaded/{c}') } catch { return u } }
 
 async function openPanel(page) {
@@ -26,9 +31,14 @@ async function openPanel(page) {
 }
 
 async function main() {
+  const ep = await endpoints.resolve()
+  APP = ep.app
+  TG = ep.tg
+  isTgApi = ep.isTg
+
   const browser = await cdp.launch({ headless: false })
   const page = await browser.newPage()
-  await page.goto('http://127.0.0.1:5180/', { settleMs: 3000 })
+  await page.goto(APP + '/', { settleMs: 3000 })
   if (!(await openPanel(page))) throw new Error('panel not opened')
   // 等频道列表（「全部订阅N」）载入：轮询直到计数 > 0
   let secLabel = null
@@ -78,6 +88,7 @@ async function main() {
   const m = recs.length
   await delay(30000)
   const win = recs.slice(m).filter((r) => isTgApi(r.url))
+  ep.assertTgTraffic(win.length, `对照频道「${TARGET}」30s 窗口`)
   const byMethod = {}
   const byFam = {}
   const byFamMethod = {}

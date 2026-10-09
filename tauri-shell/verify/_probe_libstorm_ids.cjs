@@ -8,8 +8,7 @@
  * (series-wall) view card count / unique id count for contrast.
  */
 const cdp = require('./lib/cdp.cjs')
-const APP = 'http://127.0.0.1:5180/'
-const TG = 'http://127.0.0.1:19787'
+const endpoints = require('./_lib_endpoints.cjs')
 const delay = (ms) => new Promise((r) => setTimeout(r, ms))
 
 async function click(page, id) {
@@ -63,9 +62,10 @@ async function readSeries(page) {
 }
 
 async function main() {
+  const ep = await endpoints.resolve()
   const browser = await cdp.launch({ headless: false })
   const page = await browser.newPage()
-  await page.goto(APP, { waitUntil: 'load' })
+  await page.goto(ep.app, { waitUntil: 'load' })
   await delay(3000)
   await click(page, 'nav-media')
   await delay(7000)

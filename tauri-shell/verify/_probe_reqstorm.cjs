@@ -22,9 +22,12 @@
  */
 
 const cdp = require('./lib/cdp.cjs')
+const endpoints = require('./_lib_endpoints.cjs')
 
-const APP = 'http://127.0.0.1:5180/'
-const TG = 'http://127.0.0.1:19787'
+// Resolved at runtime from daemon /api/config (tg_port drifts -- never hard-code).
+let APP = ''
+let TG = ''
+let isTg = () => false
 const ITEM = 673
 const PHASE_A_MS = 20000
 const PHASE_B_MS = 30000
@@ -161,6 +164,11 @@ function summarize(reqs, label) {
 }
 
 async function main() {
+  const ep = await endpoints.resolve()
+  APP = ep.app
+  TG = ep.tg
+  isTg = ep.isTg
+
   const browser = await cdp.launch({
     headless: false,
     args: [
@@ -171,58 +179,62 @@ async function main() {
       '--autoplay-policy=no-user-gesture-required',
     ],
   })
-  const page = await browser.newPage()
-  await page.goto(APP, { waitUntil: 'load' })
-  await delay(1500)
+  try {
+    const page = await browser.newPage()
+    await page.goto(APP, { waitUntil: 'load' })
+    await delay(1500)
 
-  await page.conn.send('Network.enable', {}, { sessionId: page.sessionId })
-  const records = []
-  page.conn.on('Network.requestWillBeSent', (p) => {
-    records.push({
-      ts: p.timestamp,
-      url: p.request.url,
-      range: p.request.headers.Range || p.request.headers.range || '',
-      type: p.type || '',
-      init: (p.initiator && p.initiator.type) || '',
+    await page.conn.send('Network.enable', {}, { sessionId: page.sessionId })
+    const records = []
+    page.conn.on('Network.requestWillBeSent', (p) => {
+      records.push({
+        ts: p.timestamp,
+        url: p.request.url,
+        range: p.request.headers.Range || p.request.headers.range || '',
+        type: p.type || '',
+        init: (p.initiator && p.initiator.type) || '',
+      })
     })
-  })
 
-  // ---- Phase A: 1x ----
-  await openItem(page, ITEM)
-  await delay(2000)
-  const markA = records.length
-  await page.evaluate(() => {
-    const v = document.querySelector('[data-testid="media-viewer"] video')
-    if (v) { v.muted = true; v.play().catch(() => {}) }
-  })
-  await delay(PHASE_A_MS)
-  const sumA = summarize(records.slice(markA), `A 1x (${PHASE_A_MS / 1000}s)`)
+    // ---- Phase A: 1x ----
+    await openItem(page, ITEM)
+    await delay(2000)
+    const markA = records.length
+    await page.evaluate(() => {
+      const v = document.querySelector('[data-testid="media-viewer"] video')
+      if (v) { v.muted = true; v.play().catch(() => {}) }
+    })
+    await delay(PHASE_A_MS)
+    const sumA = summarize(records.slice(markA), `A 1x (${PHASE_A_MS / 1000}s)`)
+    // Wrong port => zero captured TG traffic; fail loudly instead of "no storm".
+    ep.assertTgTraffic(records.slice(markA).filter((r) => isTg(r.url)).length, 'phase A 1x')
 
-  // ---- Phase B: 2x ----
-  const markB = records.length
-  await setRate(page, 2)
-  await delay(PHASE_B_MS)
-  const vState = await page.evaluate(() => {
-    const v = document.querySelector('[data-testid="media-viewer"] video')
-    if (!v) return null
-    return {
-      src: v.currentSrc,
-      contentSpeed: v.dataset?.contentSpeed || '1',
-      rate: v.playbackRate,
-      bufAhead: v.buffered.length ? +(v.buffered.end(v.buffered.length - 1) - v.currentTime).toFixed(1) : 0,
-      dur: +Number(v.duration || 0).toFixed(1),
-    }
-  })
-  const sumB = summarize(records.slice(markB), `B 2x (${PHASE_B_MS / 1000}s)`)
+    // ---- Phase B: 2x ----
+    const markB = records.length
+    await setRate(page, 2)
+    await delay(PHASE_B_MS)
+    const vState = await page.evaluate(() => {
+      const v = document.querySelector('[data-testid="media-viewer"] video')
+      if (!v) return null
+      return {
+        src: v.currentSrc,
+        contentSpeed: v.dataset?.contentSpeed || '1',
+        rate: v.playbackRate,
+        bufAhead: v.buffered.length ? +(v.buffered.end(v.buffered.length - 1) - v.currentTime).toFixed(1) : 0,
+        dur: +Number(v.duration || 0).toFixed(1),
+      }
+    })
+    const sumB = summarize(records.slice(markB), `B 2x (${PHASE_B_MS / 1000}s)`)
 
-  console.log('\n=== video state after phase B ===')
-  console.log(JSON.stringify(vState, null, 2))
+    console.log('\n=== video state after phase B ===')
+    console.log(JSON.stringify(vState, null, 2))
 
-  console.log('\n=== VERDICT ===')
-  console.log(`A(1x): requests=${sumA.count} peak=${sumA.peak} monotonic=${sumA.monotonic} storm=${sumA.storm}`)
-  console.log(`B(2x): requests=${sumB.count} peak=${sumB.peak} monotonic=${sumB.monotonic} storm=${sumB.storm}`)
-
-  await browser.close()
+    console.log('\n=== VERDICT ===')
+    console.log(`A(1x): requests=${sumA.count} peak=${sumA.peak} monotonic=${sumA.monotonic} storm=${sumA.storm}`)
+    console.log(`B(2x): requests=${sumB.count} peak=${sumB.peak} monotonic=${sumB.monotonic} storm=${sumB.storm}`)
+  } finally {
+    await browser.close()
+  }
 }
 
 main().catch((e) => {
