@@ -164,40 +164,15 @@ const CENTER_MS = 1500
 /** 自动连播倒计时秒数 */
 const COUNTDOWN_SEC = 5
 
-// ---- 兼容流记忆（BUG-208）：解码不动的原始源记入 localStorage，下次直开兼容流，
-// 免走「先试原始流 → 无帧 → 再切」的弯路（也少付一次 abort-re-request 代价）。 ----
+// ---- 兼容流记忆（BUG-208）已彻底移除（BUG-224 停用 + 2026-10-09 stream-first 翻转）----
 //
-// BUG-224：**记忆机制已停用**（`readCompatSet` 恒返回空并顺手清 key）。
-//
-// 它的前提是「这些源本机解不动，只有服务端转码能救」。实测该前提不成立：
-// 媒体库 138 个视频里 30 个是 HEVC/hvc1，但本机 Chromium 经 Media Foundation
-// **能解** —— `items/415/raw`(720p HEVC) 首帧 0.63s、`items/673/raw`(1080p HEVC)
-// 首帧 0.92s，videoWidth 分别为 720 / 1920（`verify/_probe_bug224_decode.cjs`）。
-//
-// 记忆带来的代价远大于省下的几秒：
-//   1. 一次误判 = 该文件**此后每次**都直开兼容流；兼容流每次冷启动实时转码
-//      （实测首字节 2.44s、1.05 MB/s，143MB 源要转 136s），比直接播原源慢一个量级；
-//   2. 没有清除入口（只能手写 `localStorage.removeItem`），用户无法自愈；
-//   3. 兼容流是 live fMP4、不支持 Range，暂停 / seek / 切速都会断流 → 报错。
-//
-// 判定侧的根本修正见 `lib/decodeHealth.ts` 的 `zeroFrameVerdict`：
-// 「还没解出第一帧」不再等同于「解不了」。真正的解不了，仍由
-// `MEDIA_ERR_SRC_NOT_SUPPORTED` 或 12s 预算耗尽来判定。
-const COMPAT_KEY = 'orighub.compatSrcs'
-
-function readCompatSet(): string[] {
-  // BUG-224：读即清空。旧 key 可能仍存着历史误判条目，继续尊重它等于继续把
-  // 「本机明明能播」的文件钉在慢转码上。
-  try {
-    localStorage.removeItem(COMPAT_KEY)
-  } catch {
-    // 隐私模式等场景没有 localStorage，仅本次会话生效，不影响功能
-  }
-  return []
-}
+// BUG-224 曾把记忆机制停用（读即清空），前提是「这些源本机解得动」。2026-10-09
+// 用户实测推翻：raw 直解 1x 卡 / 2x 非常卡 / 4x 无法播放，stream 转码流流畅
+// —— 播放不再选择源：有 compatSrc 一律 stream-first（见组件内 streamFirst），
+// 「记忆哪些源要转码」这个问题本身不再存在。
 
 function rememberCompatSrc(_src: string): void {
-  // BUG-224：不再写入。理由见上方。
+  // stream-first 后不再需要任何记忆。
 }
 
 /**
@@ -637,22 +612,23 @@ export function VideoPlayer({
   const [showCountdown, setShowCountdown] = useState(false)
   const [fatal, setFatal] = useState(false)
   const [fellBack, setFellBack] = useState(false)
-  /** Known unsupported sources start from the H.264 compatibility proxy; non-1x starts on its FRC variant. */
-  const [rememberedCompat] = useState(
-    () => Boolean(compatSrc && compatSrc !== src && readCompatSet().includes(src)),
-  )
-  const initialFrc = Boolean(compatSrc && compatSrc !== src && playbackRate !== 1)
+  /** 2026-10-09 用户裁定（推翻 BUG-229 的「可直解源一律 raw」）：播放一律从服务端转码流起步。
+   *  raw 直解在本机实测 1x 卡 / 2x 非常卡 / 4x 无法播放（硬解吞吐不足），stream（H.264 30fps）
+   *  实测流畅 —— raw 退役为下载/导出端点，不再参与播放。有 compatSrc 即 stream-first；
+   *  非 1x 直接起对应 FRC 变体。 */
+  const streamFirst = Boolean(compatSrc && compatSrc !== src)
+  const initialFrc = streamFirst && playbackRate !== 1
   const activeSrcAtMountRef = useRef(
     initialFrc
       ? streamUrlAtRate(compatSrc!, playbackRate)
-      : rememberedCompat
+      : streamFirst
         ? compatSrc!
         : src,
   )
   const [activeSrc, setActiveSrc] = useState(activeSrcAtMountRef.current)
-  const [usingCompat, setUsingCompat] = useState(rememberedCompat)
-  const compatTriedRef = useRef(initialFrc || rememberedCompat)
-  const baseCompatRef = useRef(rememberedCompat)
+  const [usingCompat, setUsingCompat] = useState(streamFirst)
+  const compatTriedRef = useRef(streamFirst)
+  const baseCompatRef = useRef(streamFirst)
   const originalSrcRef = useRef(src)
   const compatSrcRef = useRef(compatSrc)
   const hasVideoTrackRef = useRef(hasVideoTrack)
@@ -692,7 +668,14 @@ export function VideoPlayer({
     if (baseCompatRef.current && playbackRate === 1 && activeSrc === original) {
       baseCompatRef.current = false
     }
-    const rateSrc = playbackRate === 1 ? null : streamUrlAtRate(compat, playbackRate)
+    // 2026-10-09 stream-first 翻转（用户裁定）：播放一律在转码流上，倍速换档 =
+    // 在 FRC 变体之间切换（streamUrlAtRate），1x = 基础转码流。原生源（/raw）
+    // 只在没有 compatSrc 时兜底出现（此时 onCompat=false，倍速走 playbackRate）。
+    // 历史（BUG-229）：非 1x 无条件切 FRC 曾引发 fMP4 乱序 range 风暴（69 req/s、
+    // 预读 66% 全片）——该问题现由磁盘预算 LRU（ORIG_TG_PROXY_MAX_BYTES）兜底，
+    // 且 stream-first 后换档发生在同容器变体之间，不再有 raw↔stream 往返。
+    const onCompat = usingCompat || baseCompatRef.current || activeSrc.includes('/stream')
+    const rateSrc = playbackRate === 1 || !onCompat ? null : streamUrlAtRate(compat, playbackRate)
     const targetSrc = rateSrc ?? (baseCompatRef.current ? compat : original)
     const targetContentSpeed = rateSrc ? playbackRate : 1
     // 锚点 URL（...&t=N）属于同一目标变体：提前返回时不得动 offset/seekable。
@@ -739,7 +722,7 @@ export function VideoPlayer({
     return () => {
       cancelled = true
     }
-  }, [activeSrc, autoPlay, decode, playbackRate])
+  }, [activeSrc, autoPlay, decode, playbackRate, usingCompat])
 
   /**
    * 视频轨判定「解不出来」→ **先试兼容流，退无可退才停载**（BUG-208 接棒 BUG-207）。
@@ -762,6 +745,10 @@ export function VideoPlayer({
       rememberCompatSrc(src)
       setActiveSrc(compatSrc)
       setUsingCompat(true)
+      // 兼容流不带 speed 参数 = 内容速率 1（播放速率由 applyPrefs 钳回 1）。
+      // 直解高倍速中切兼容流时必须同步归位，否则 contentTime 换算全错。
+      activeContentSpeedRef.current = 1
+      contentOffsetRef.current = 0
       return
     }
     v.pause()
@@ -780,8 +767,13 @@ export function VideoPlayer({
     if (!v) return
     v.volume = volume
     v.muted = isMuted
-    v.playbackRate = compatSrc && hasVideoTrack ? 1 : playbackRate
-  }, [volume, isMuted, playbackRate, activeSrc, compatSrc, hasVideoTrack])
+    // 唯一真相源是 activeSrc：FRC 流（URL 带 speed 参数，内容时间轴已被服务端
+    // 压缩 N 倍）播放速率必须钳 1 —— 不得用 usingCompat 判定，commit 的 rateSrc
+    // 分支会把 usingCompat 置 false（BUG-229 修复时引入的回归：FRC 2x 实际
+    // 2×2=4 倍速、4x 实际 8 倍速，且持久化倍速污染后续播放）。base 兼容流
+    // （unsupported 兜底，URL 无 speed 参数 = 内容速率 1）同样钳 1。
+    v.playbackRate = activeSrc.includes('/stream') && hasVideoTrack ? 1 : playbackRate
+  }, [volume, isMuted, playbackRate, activeSrc, hasVideoTrack])
 
   useEffect(() => {
     applyPrefs()

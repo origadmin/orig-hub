@@ -248,9 +248,11 @@ bash scripts/install-hooks.sh    # 安装 pre-commit 与 commit-msg（钩子不�
 | BUG-220 | 入库流水线只显示频道不显示内容，无法知道入库的是什么 | open | shell |
 | BUG-221 | 入库流水线看不到进度：单条大文件全程 0%、卡死与正常下载不可分辨 | open | shell |
 | BUG-222 | 回收临时文件选择模型混乱：分档按钮静默丢弃「按频道选定」，单频道时频道 chips 消失 | open | shell |
-| BUG-223 | 非 1x 倍速卡顿：服务端 30fps FRC 降低浏览器解码负载 | in_progress | engine+shell |
+| BUG-223 | 非 1x 倍速卡顿：服务端 30fps FRC 降低浏览器解码负载 | fixed | engine+shell |
 | BUG-224 | 浏览器报「无法解码该格式」：最该被救的 MPEG-TS 恰好判据看不见；零帧 3s 预算与转码启动赛跑 + localStorage 永久记忆 | fixed | shell |
 | BUG-225 | FRC 流上播放时间不对/跳转归零：live fMP4 loadedmetadata 时 duration=NaN，durationRef 恒 0 把位置恢复与 ±10s 钳回 0:00；修：durationchange 同步 contentDurationRef + 恢复上限仅在有限 duration 时钳制 + 内容时间契约（offset+媒体时间×speed）下发叶子组件；验收 = `tauri-shell/verify/verify_bug_225_time_contract.cjs` | fixed | shell |
 | BUG-226 | 冷缓存换档/深位续播卡：live 转码从 0:00 起须追平全部已播内容（长视频分钟级）；修：`/stream?probe=1` 零副作用探针 + `?t=` 锚点起转（`-ss` 输入侧、live-only 不落盘不进单飞表）+ 前端换档先探针、冷缓存深位带 t 重锚、live 拖拽出覆盖范围重锚；实测 630 @30s 冷切 2x 首帧 ≤6s 位置偏差 ≤2s；验收 = `tauri-shell/verify/verify_bug_226_stream_anchor.cjs` + `parse_stream_start_*` 单测 4 例 | fixed | engine+shell |
 | BUG-227 | daemon 拉 orig-tg 用 5s 全程连通窗口：已配置凭证时代理链路慢时 bind 实测 ~11.7s > 5s，子进程被系统性否决（"exited without listening" 假象）；修法方向 = bind 成功即算就绪/连通交给二层巡检 | open | engine |
 | BUG-228 | 外部实例占用端口 + link 断 ⇒ tg_reselect_port 每次重启迁走端口，端口漂移风暴、前端 tg_port 来回跳；修法方向 = 迁移前探测占用者健康度/占用不迁移/spawn 成功后才改 tg_port | open | engine |
+| BUG-229 | 非 1x 倍速无条件切 FRC 转码流 ⇒ 浏览器对 fMP4 代理乱序 range 风暴（69 req/s）+ 预读 66% 全片 + 整片转码落盘；修：倍速换档仅限已在兼容流上的源，可直解源保持原 src + playbackRate（实测 2x 直解 /stream 请求 0、缓冲 66%→12%、effRate 0.995）；验收 = `tauri-shell/verify/_probe_reqstorm.cjs` 前后对照 | fixed | engine+shell |
+| BUG-230 | raw 直解路径本机全程卡顿（1x 卡/2x 非常卡/4x 无法播放）、stream 流畅 ⇒ 播放主路径翻转 stream-first（挂载即转码流，非 1x=FRC 变体），raw 退役为下载/导出端点；rememberedCompat 记忆机制删除；改 `tauri-shell/src/components/media/VideoPlayer.tsx` | fixed | shell |

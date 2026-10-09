@@ -318,7 +318,7 @@
   "tg.downloadDirTip": "Where cached files are saved. Applies immediately (new caches only).",
   "tg.cancel": "Cancel",
   "tg.close": "Close",
-  "tg.decodeFail": "This format (e.g. .mov/QuickTime) cannot be decoded by the browser. Open it with the system player inside the APP",
+  "tg.decodeFail": "This format (e.g. .mov/QuickTime) cannot be decoded by the browser, and the compatibility stream is also unavailable. Make sure the OrigHub backend service (orig-tg) is running, or open the original file with your system player outside the app",
   "tg.decodeUnsupported": "This video's codec cannot be decoded by the local browser (e.g. HEVC/H.265). Loading has been stopped to avoid wasted traffic; open the original file with the system player",
   "tg.decodeStrained": "Decoding is struggling: frames are being dropped. A lower playback speed will be noticeably smoother",
   "tg.save": "Save",

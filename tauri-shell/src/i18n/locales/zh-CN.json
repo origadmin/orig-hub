@@ -313,7 +313,7 @@
   "tg.downloadDirTip": "缓存文件落地位置，保存后立即生效（仅影响之后的新缓存）",
   "tg.cancel": "取消",
   "tg.close": "关闭",
-  "tg.decodeFail": "浏览器无法解码该格式（如 .mov/QuickTime），请在 APP 内用系统播放器打开",
+  "tg.decodeFail": "浏览器无法解码该格式（如 .mov/QuickTime），且兼容转码流也不可用。请确认 OrigHub 后台服务（orig-tg）正在运行；或退出 APP 用系统播放器打开原文件",
   "tg.decodeUnsupported": "该视频编码本机浏览器无法解码（如 HEVC/H.265），已停止加载以避免无效流量；请用系统播放器打开原文件",
   "tg.decodeStrained": "解码吃力：画面在丢帧，调低播放速度会明显更流畅",
   "tg.save": "保存",
