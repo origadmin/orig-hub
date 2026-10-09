@@ -64,4 +64,28 @@ export const cacheKey = {
   seriesList: (tagId: number | null) => `series:list:${tagId ?? 'all'}`,
   /** 剧集详情（含分集列表） */
   seriesDetail: (id: number) => `series:detail:${id}`,
+  /**
+   * 库级统计（`GET /api/media/stats`）—— 全库唯一一份，与任何筛选无关。
+   *
+   * 它是媒体库的**探活判据**（`probeLibraryBackend`）也是左栏徽标的数据源
+   * （`loadMeta`）。两处若不共用同一 key，进一次媒体库就会把同一份 stats 各拉一遍
+   * （含严格模式双调用），正是 BUG-239 的放大器。写操作后必须 `invalidateCache`。
+   */
+  libraryStats: () => 'library:stats',
+  /**
+   * 标签列表（`GET /api/media/tags`）—— 全量一份，与筛选无关。
+   *
+   * 与 `libraryStats` 同理：左栏标签墙、批量打标对话框、标签管理都读它，
+   * 必须共用同一 key 才不会被当成多份数据（BUG-239）。写操作后必须失效。
+   */
+  tagList: () => 'tags:list',
+  /**
+   * TG 运行诊断（`GET /api/tg/diag`）—— 来源「可用性」探活的真值来源
+   * （`mediaSources.tgAdapter.health()`）。
+   *
+   * 存活态在**一次会话内**复用一份：`alive` 反复翻转、切走再回都不该重发探活
+   * （BUG-239 根因 4）。用户显式点「重连」时走 `probeRecacheBackends(true)`
+   * 强制作废本 key 拿实时结果，故不会出现「点了没反应」。
+   */
+  tgDiag: () => 'tg:diag',
 }

@@ -3,6 +3,7 @@ import { Image as ImageIcon } from 'lucide-react'
 import { Button } from './ui/button'
 import { useTranslation } from '../i18n'
 import { mediaItemStreamUrl } from '../api/media'
+import { setPosterExtractionPaused } from '../lib/poster'
 import { cn } from '../lib/utils'
 import { VideoPlayer } from './media/VideoPlayer'
 import { EpisodeList } from './media/EpisodeList'
@@ -53,6 +54,18 @@ export function MediaViewer(props: {
   /** 图片降级失败（视频的失败由 VideoPlayer 内部处理） */
   const [imgFailed, setImgFailed] = useState(false)
   useEffect(() => setImgFailed(false), [cur?.key])
+
+  /**
+   * 播放让路（BUG-239 预算门 3）：播放器打开期间**暂停封面抽帧**。
+   *
+   * 播放器是盖在网格之上的覆盖层，网格与其卡片**仍然挂载**——若不暂停，被覆盖的
+   * 卡片会继续排进解码队列，与正在播放的视频争解码/IO（实测播放中 `currentTime`
+   * 只推进 0.72×，即用户体感的卡顿）。挂载置位、卸载复位：用户正在看的内容优先。
+   */
+  useEffect(() => {
+    setPosterExtractionPaused(true)
+    return () => setPosterExtractionPaused(false)
+  }, [])
 
   const seriesId = cur?.seriesId ?? null
   /**

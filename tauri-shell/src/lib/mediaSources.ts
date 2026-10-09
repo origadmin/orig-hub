@@ -16,6 +16,7 @@ import { clearCacheItem, enqueueCacheTask, tgDiag } from '../api/tg'
 import { ensureDaemon } from '../api/tauri'
 import { restartTgService } from '../api/daemon'
 import { getLibraryStats } from '../api/media'
+import { cacheKey, cached, invalidateCache } from './fetchCache'
 import {
   coverFit,
   fmtDuration,
@@ -66,7 +67,12 @@ const tgAdapter: SourceAdapter = {
    */
   async health() {
     try {
-      const d = await tgDiag()
+      // 走读缓存（BUG-239 根因 4）：存活态在一次会话内复用一份，`alive` 翻转 /
+      // 切走再回都不重发 `/api/tg/diag`。**为什么能缓存而不失真**：这是一次
+      // 「能不能原路取回字节」的**粗粒度**判断，缓存里的 `available` 至多让入口
+      // 短暂偏保守（点了重缓存才吃 503）；而它偏乐观的代价由用户点「重连」兜底
+      // ——`probeRecacheBackends(true)` 会强制失效本 key 拿实时结果。
+      const d = await cached(cacheKey.tgDiag(), () => tgDiag())
       return Boolean(d.available)
     } catch {
       return false
@@ -123,7 +129,10 @@ export async function recacheFromSource(
  */
 export async function probeLibraryBackend(): Promise<boolean> {
   try {
-    await getLibraryStats()
+    // 与 `loadMeta` 共用同一份 stats 缓存（BUG-239 根因 2）：探活与首屏徽标读的是
+    // **同一份数据**，不该各发一次。失败不入缓存（`cached` 的错误路径），
+    // 故「后端挂了 → 重试」仍会真发请求。
+    await cached(cacheKey.libraryStats(), () => getLibraryStats())
     return true
   } catch {
     return false
@@ -163,8 +172,16 @@ export function recacheCapableSources(): string[] {
     .map((a) => a.type)
 }
 
-/** 批量探测可重缓存来源的存活态，形如 `{ tg: true }` */
-export async function probeRecacheBackends(): Promise<Record<string, boolean>> {
+/**
+ * 批量探测可重缓存来源的存活态，形如 `{ tg: true }`。
+ *
+ * `force`（默认 false）：命中读缓存直接返回，不重发探活请求 —— 媒体库进入 /
+ * `alive` 翻转复用同一份存活态，否则每次都要重发 `/api/tg/diag`（BUG-239 根因 4）。
+ * 用户显式点「重连」时传 `true`：那次探活**必须**打到后端拿实时结果，
+ * 否则缓存里的旧值会把「重连」顶回去，表现为点了没反应。
+ */
+export async function probeRecacheBackends(force = false): Promise<Record<string, boolean>> {
+  if (force) invalidateCache(cacheKey.tgDiag())
   const out: Record<string, boolean> = {}
   await Promise.all(
     recacheCapableSources().map(async (s) => {

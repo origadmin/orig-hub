@@ -94,6 +94,13 @@ export function MediaLibraryPanel() {
   // ---- 资料库后端探活（**不探 TG**：TG 只是来源之一，挂了不影响库）----
   const [alive, setAlive] = useState(false)
   const [libRetrying, setLibRetrying] = useState(false)
+  /**
+   * 库探活。函数体里两处 `probeLibraryBackend()` **不是重复调用**：
+   * 第二处只在「第一次失败 **且** 运行在 Tauri」时才到达（先 `ensureLibraryBackend()`
+   * 拉起 daemon 再复探）—— 正常路径只走第一处。二者不是同一路径上的两次，
+   * 故不合并（BUG-239 根因 1 的「单次探活发两次 stats」实测来自别处，见 `loadMeta`）。
+   * 探活本身走 `cached(cacheKey.libraryStats())`，与首屏徽标共用同一份 stats。
+   */
   const probeLibrary = useCallback(async () => {
     const isTauri = '__TAURI_INTERNALS__' in window
     if (await probeLibraryBackend()) {
@@ -124,6 +131,11 @@ export function MediaLibraryPanel() {
    */
   const [sourceAlive, setSourceAlive] = useState<Record<string, boolean>>({})
   useEffect(() => {
+    // 只在**库可用之后**探来源：库都没起，探来源没有意义，且 `alive` 从 false
+    // 出发时那次探测纯属白发（BUG-239 根因 4 —— 它使 `alive` 每次翻转都重发
+    // `/api/tg/diag`）。加上 `if (!alive) return`，effect 只在「进入 alive」时
+    // 跑一次；存活态本身再由 `cached(cacheKey.tgDiag())` 复用，切走再回也不重发。
+    if (!alive) return
     let stop = false
     void probeRecacheBackends().then((m) => {
       if (!stop) setSourceAlive(m)
@@ -209,11 +221,13 @@ export function MediaLibraryPanel() {
   // ---------- 加载 ----------
   const loadMeta = useCallback(async () => {
     try {
-      // 剧集列表与「剧集墙」共用同一份缓存：徽标要的是**无条件总数**，
-      // 但那是同一份数据 —— 各拉一次就是启动时两次相同请求（实测）。
+      // 三份数据**都**走 `fetchCache`（BUG-239）：stats 同时是 `probeLibraryBackend`
+      // 的探活判据、tags 同时被批量打标对话框读，只有全部走 cached() 才谈得上
+      // 「同一份数据一次会话只拉一次」——否则未走缓存的那两份会绕过在途合并，
+      // 严格模式双调用 / 探活 + 首屏各拉一遍，就是用户看到的成倍请求。
       const [s, tg, sr] = await Promise.all([
-        getLibraryStats(),
-        listTags(),
+        cached(cacheKey.libraryStats(), () => getLibraryStats()),
+        cached(cacheKey.tagList(), () => listTags()),
         cached(cacheKey.seriesList(null), () => listSeries()),
       ])
       setStats(s)
@@ -225,6 +239,20 @@ export function MediaLibraryPanel() {
       setError(e instanceof Error ? e.message : String(e))
     }
   }, [setError])
+
+  /**
+   * 标签写操作（新建 / 重命名 / 删除）后的统一收尾。
+   *
+   * 标签列表与 `stats.tags` 都变了，必须**先作废再重取** —— `fetchCache` 不做
+   * 时间过期，不失效就会把改动前那一份读回来（表现为「刚建的标签不见了」）。
+   * 新建标签的四处入口（剧集内页 / 两种批量打标 / 内容编辑）与标签管理都走这里，
+   * 避免各写一份、漏掉一处（BUG-239 的失效纪律）。
+   */
+  const refreshTags = useCallback(async () => {
+    invalidateCache(cacheKey.tagList())
+    invalidateCache(cacheKey.libraryStats())
+    await loadMeta()
+  }, [loadMeta])
 
   const loadItems = useCallback(async () => {
     setLoading(true)
@@ -443,6 +471,10 @@ export function MediaLibraryPanel() {
       }
       try {
         await recacheFromSource(item.ref, item.source)
+        // 重缓存会改变 `stats.totalSize`，但**完成是异步的**（这里只入队，前端没有
+        // 完成回调）。作废 stats 是尽力而为：让下一次读重取，而不是把入队前那一份
+        // 无限期留在缓存里（BUG-239 失效纪律）。
+        invalidateCache(cacheKey.libraryStats())
         setError(t('media.recacheQueued'))
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e))
@@ -464,7 +496,9 @@ export function MediaLibraryPanel() {
 
   /** 用户主动重连来源后端（TG 未启动时给一条明路，而不是死按钮） */
   const reconnectSources = useCallback(async () => {
-    const next = await probeRecacheBackends()
+    // `true` = 强制失效存活态缓存再探：用户点「重连」就是要拿**实时**结果，
+    // 命中旧缓存会把这次点击顶回去（表现为「点了没反应」）。
+    const next = await probeRecacheBackends(true)
     setSourceAlive(next)
   }, [])
 
@@ -570,10 +604,12 @@ export function MediaLibraryPanel() {
   )
 
   const refreshAll = async () => {
-    await loadMeta()
-    // 写操作之后必须作废读缓存，否则会看着「刚改完的标题又变回去了」
-    // （缓存里存的是改动前那一份，且它不会自己过期）。
+    // **先失效、再重取**：写操作之后必须作废读缓存，否则会看着「刚改完的标题又变
+    // 回去了」（缓存里存的是改动前那一份，且它不会自己过期）。顺序不能反 ——
+    // 原来的 `await loadMeta()` 在 `invalidateCache()` **之前**，stats/tags 一旦
+    // 也走缓存，就会读到改动前那一份（BUG-239 失效纪律）。
     invalidateCache()
+    await loadMeta()
     if (view === 'items') await loadItems()
     else if (view === 'series') await loadSeries()
     else if (view === 'seriesDetail' && activeSeriesId) await openSeries(activeSeriesId)
@@ -1127,6 +1163,12 @@ export function MediaLibraryPanel() {
             onRemoveEpisode={async (ep) => {
               try {
                 await deleteEpisode(ep.id)
+                // 移除分集改变了剧集详情与剧集列表的集数 —— 必须先失效再重取。
+                // 否则 `openSeries` / `loadMeta` 会命中改动前那一份（缓存不过期），
+                // 被移除的分集仍然显示 —— 正是「删了还在」（BUG-239 失效纪律）。
+                if (activeSeriesId) invalidateCache(cacheKey.seriesDetail(activeSeriesId))
+                invalidateCache(cacheKey.seriesList(activeTagId))
+                invalidateCache(cacheKey.seriesList(null))
                 if (activeSeriesId) await openSeries(activeSeriesId)
                 await loadMeta()
               } catch (e) {
@@ -1146,7 +1188,7 @@ export function MediaLibraryPanel() {
             onCreateTag={async (name) => {
               try {
                 const r = await createTag(name)
-                await loadMeta()
+                await refreshTags()
                 return r.id
               } catch (e) {
                 setError(e instanceof Error ? e.message : String(e))
@@ -1357,7 +1399,7 @@ export function MediaLibraryPanel() {
         <TagManagerDialog
           tags={tags}
           onClose={() => setTagMgrOpen(false)}
-          onChanged={() => void loadMeta()}
+          onChanged={() => void refreshTags()}
           onError={(m) => setError(m)}
         />
       ) : null}
@@ -1370,7 +1412,7 @@ export function MediaLibraryPanel() {
           onCreate={async (name) => {
             try {
               const r = await createTag(name)
-              await loadMeta()
+              await refreshTags()
               return r.id
             } catch (e) {
               setError(e instanceof Error ? e.message : String(e))
@@ -1395,7 +1437,7 @@ export function MediaLibraryPanel() {
           onCreate={async (name) => {
             try {
               const r = await createTag(name)
-              await loadMeta()
+              await refreshTags()
               return r.id
             } catch (e) {
               setError(e instanceof Error ? e.message : String(e))
@@ -1501,7 +1543,7 @@ export function MediaLibraryPanel() {
           onCreateTag={async (name) => {
             try {
               const r = await createTag(name)
-              await loadMeta()
+              await refreshTags()
               return r.id
             } catch (e) {
               setError(e instanceof Error ? e.message : String(e))

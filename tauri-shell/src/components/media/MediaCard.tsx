@@ -21,10 +21,13 @@ import {
   sourceLabelKey,
 } from '../../lib/mediaSources'
 import {
-  generateImageThumb,
-  generateVideoPoster,
+  cancelCoverJob,
+  COVER_VIEWPORT_MARGIN,
+  isPosterBudgetDropped,
   markPosterFailed,
   posterFailed,
+  requestImageThumb,
+  requestVideoPoster,
 } from '../../lib/poster'
 import { TagToken } from './TagToken'
 
@@ -137,7 +140,6 @@ function MediaCardBase(props: {
   const [poster, setPoster] = useState<string | null>(item.poster ?? null)
   const [genFailed, setGenFailed] = useState(false)
   const boxRef = useRef<HTMLDivElement | null>(null)
-  const startedRef = useRef(false)
 
   /**
    * 有没有字节（BUG-080）。
@@ -157,10 +159,16 @@ function MediaCardBase(props: {
   useEffect(() => {
     setPoster(item.poster ?? null)
     setGenFailed(posterFailed(`v-${item.id}`))
-    startedRef.current = false
   }, [item.id, item.poster])
 
-  /** 图片直接原图；视频无封面时进入视口再抽帧（懒生成，避免首屏解码风暴） */
+  /**
+   * 视频封面：进入视口（含 `COVER_VIEWPORT_MARGIN` 余量）才抽帧（BUG-239 预算门 1）。
+   *
+   * 离开视口即撤销**尚未启动**的排队（门 1 后半）；去重、队列上限、播放让路都在
+   * `lib/poster` 的预算层（`requestVideoPoster`）。因预算被丢弃的（队列满 / 离开视口
+   * 撤销）**不是失败**：不进 `genFailed`，重新进入视口再试 —— 保证「省请求」
+   * 不以「封面永久空白」为代价（BUG-239 覆盖不倒退）。
+   */
   useEffect(() => {
     if (poster || genFailed) return
     if (item.kind !== 'video') return
@@ -168,59 +176,114 @@ function MediaCardBase(props: {
     if (!playable) return
     const el = boxRef.current
     if (!el || typeof IntersectionObserver === 'undefined') return
+    const key = `v-${item.id}`
+    let alive = true
+    let visible = false
+    let retryTimer: ReturnType<typeof setTimeout> | undefined
 
-    const start = async () => {
-      if (startedRef.current) return
-      startedRef.current = true
-      try {
-        const probe = await generateVideoPoster(mediaItemUrl(item.id), 1, 480)
-        setPoster(probe.dataUrl)
-        onPosterReady?.({
-          id: item.id,
-          poster: probe.dataUrl,
-          duration: probe.duration || undefined,
-        })
-      } catch {
-        markPosterFailed(`v-${item.id}`)
-        setGenFailed(true)
-      }
+    const attempt = () => {
+      if (!alive || !visible) return
+      requestVideoPoster(key, mediaItemUrl(item.id), 1, 480).then(
+        (probe) => {
+          if (!alive) return
+          setPoster(probe.dataUrl)
+          onPosterReady?.({
+            id: item.id,
+            poster: probe.dataUrl,
+            duration: probe.duration || undefined,
+          })
+        },
+        (e) => {
+          if (!alive) return
+          if (isPosterBudgetDropped(e)) {
+            // 预算丢弃（队列满 / 离开视口撤销）：不是失败，稍后重试。
+            if (visible) retryTimer = setTimeout(attempt, 1500)
+            return
+          }
+          markPosterFailed(key)
+          setGenFailed(true)
+        },
+      )
     }
 
     const io = new IntersectionObserver(
       (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          io.disconnect()
-          void start()
+        for (const en of entries) {
+          if (en.isIntersecting) {
+            visible = true
+            attempt()
+          } else {
+            visible = false
+            cancelCoverJob(key)
+          }
         }
       },
-      { rootMargin: '200px' },
+      { rootMargin: COVER_VIEWPORT_MARGIN },
     )
     io.observe(el)
-    return () => io.disconnect()
+    return () => {
+      alive = false
+      io.disconnect()
+      if (retryTimer) clearTimeout(retryTimer)
+      cancelCoverJob(key)
+    }
     // onPosterReady 每次渲染都变，故意不进依赖，否则观察器反复重建
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [item.id, item.kind, poster, genFailed, playable])
 
-  /** 图片类：生成统一缩略图（原图可能很大，直接进网格浪费解码） */
+  /** 图片类：进入视口才生成统一缩略图（与视频封面共用同一条预算队列，BUG-239）。 */
   useEffect(() => {
     if (poster || genFailed) return
     if (item.kind !== 'photo') return
     // BUG-250：无字节条目不发缩略图请求（photo+missing 的 /raw 走现场代理，
     // 虽返回 200，但对「已清缓存/已丢失」的条目请求它同样是无效流量）
     if (!playable) return
+    const el = boxRef.current
+    if (!el || typeof IntersectionObserver === 'undefined') return
+    const key = `p-${item.id}`
     let alive = true
-    generateImageThumb(mediaItemUrl(item.id), 480)
-      .then((u) => {
-        if (!alive) return
-        setPoster(u)
-        onPosterReady?.({ id: item.id, poster: u })
-      })
-      .catch(() => {
-        if (!alive) return
-        setGenFailed(true)
-      })
+    let visible = false
+    let retryTimer: ReturnType<typeof setTimeout> | undefined
+
+    const attempt = () => {
+      if (!alive || !visible) return
+      requestImageThumb(key, mediaItemUrl(item.id), 480).then(
+        (u) => {
+          if (!alive) return
+          setPoster(u)
+          onPosterReady?.({ id: item.id, poster: u })
+        },
+        (e) => {
+          if (!alive) return
+          if (isPosterBudgetDropped(e)) {
+            if (visible) retryTimer = setTimeout(attempt, 1500)
+            return
+          }
+          setGenFailed(true)
+        },
+      )
+    }
+
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const en of entries) {
+          if (en.isIntersecting) {
+            visible = true
+            attempt()
+          } else {
+            visible = false
+            cancelCoverJob(key)
+          }
+        }
+      },
+      { rootMargin: COVER_VIEWPORT_MARGIN },
+    )
+    io.observe(el)
     return () => {
       alive = false
+      io.disconnect()
+      if (retryTimer) clearTimeout(retryTimer)
+      cancelCoverJob(key)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [item.id, item.kind, poster, genFailed, playable])
@@ -254,6 +317,7 @@ function MediaCardBase(props: {
     <div
       ref={boxRef}
       data-testid="media-card"
+      data-item-id={item.id}
       className={[
         'group relative flex flex-col overflow-hidden rounded-lg border bg-surface transition-colors',
         selected

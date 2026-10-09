@@ -1,10 +1,15 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Film, Image as ImageIcon, Trash2 } from 'lucide-react'
 import type { MediaSeries, MediaTag } from '../../api/media'
 import { mediaItemUrl } from '../../api/media'
 import { coverFit } from '../../lib/mediaSources'
 import { resolveSeriesCover } from '../../lib/episodePresentation'
-import { generateVideoPoster } from '../../lib/poster'
+import {
+  cancelCoverJob,
+  COVER_VIEWPORT_MARGIN,
+  isPosterBudgetDropped,
+  requestVideoPoster,
+} from '../../lib/poster'
 import { TagToken } from './TagToken'
 import { useTranslation } from '../../i18n'
 import { seriesLabel } from '../../lib/displayTitle'
@@ -31,13 +36,21 @@ export function SeriesCard(props: {
   const { series, tags, onOpen, onDelete, onCoverReady, selected, onSelectToggle } = props
   const [poster, setPoster] = useState<string | null>(series.poster ?? null)
   const [coverFailed, setCoverFailed] = useState(false)
+  const cardRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     setPoster(series.poster ?? null)
     setCoverFailed(false)
   }, [series.id, series.poster])
 
-  /** 首集是视频且没有封面 → 抽帧生成并回写（与内容卡片同一套机制） */
+  /**
+   * 首集是视频且没有封面 → 抽帧并回写（与内容卡片同一套机制）。
+   *
+   * BUG-239：**进入视口才抽帧**（此前是挂载即抽 —— 剧集墙上几十张卡会同时排队
+   * 解码；`.jpg` 抽帧与播放器争资源，正是用户体感的卡顿）。可见性、去重、队列上限、
+   * 播放让路统一由 `lib/poster` 的预算层负责；key 用 `v-<coverItemId>`，与
+   * `MediaCard` 对同一条目的抽帧**合并为一次**（同一份字节）。
+   */
   useEffect(() => {
     if (poster || coverFailed) return
     if (series.coverKind !== 'video' || !series.coverItemId) return
@@ -50,18 +63,54 @@ export function SeriesCard(props: {
      * 此时按既有行为继续抽帧，不做静默改变。
      */
     if (series.coverHasBytes === false) return
+    const el = cardRef.current
+    if (!el || typeof IntersectionObserver === 'undefined') return
+    const coverItemId = series.coverItemId
+    const key = `v-${coverItemId}`
     let alive = true
-    generateVideoPoster(mediaItemUrl(series.coverItemId), 1, 480)
-      .then((p) => {
-        if (!alive) return
-        setPoster(p.dataUrl)
-        onCoverReady?.(series.id, p.dataUrl)
-      })
-      .catch(() => {
-        if (alive) setCoverFailed(true)
-      })
+    let visible = false
+    let retryTimer: ReturnType<typeof setTimeout> | undefined
+
+    const attempt = () => {
+      if (!alive || !visible) return
+      requestVideoPoster(key, mediaItemUrl(coverItemId), 1, 480).then(
+        (p) => {
+          if (!alive) return
+          setPoster(p.dataUrl)
+          onCoverReady?.(series.id, p.dataUrl)
+        },
+        (e) => {
+          if (!alive) return
+          if (isPosterBudgetDropped(e)) {
+            // 预算丢弃不是失败：重新进入视口再试（覆盖不倒退）。
+            if (visible) retryTimer = setTimeout(attempt, 1500)
+            return
+          }
+          setCoverFailed(true)
+        },
+      )
+    }
+
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const en of entries) {
+          if (en.isIntersecting) {
+            visible = true
+            attempt()
+          } else {
+            visible = false
+            cancelCoverJob(key)
+          }
+        }
+      },
+      { rootMargin: COVER_VIEWPORT_MARGIN },
+    )
+    io.observe(el)
     return () => {
       alive = false
+      io.disconnect()
+      if (retryTimer) clearTimeout(retryTimer)
+      cancelCoverJob(key)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [series.id, series.coverKind, series.coverItemId, series.coverHasBytes, poster, coverFailed])
@@ -79,6 +128,7 @@ export function SeriesCard(props: {
   const isSelected = Boolean(selected)
   return (
     <div
+      ref={cardRef}
       data-testid="series-card-root"
       data-series-id={series.id}
       data-selected={isSelected ? 'true' : 'false'}
