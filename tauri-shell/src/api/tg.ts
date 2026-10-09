@@ -81,10 +81,13 @@ export function tgFailureMessage(status: number, statusText: string, body: strin
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  // Content-Type 只在**真有请求体**时设置（BUG-241）。它不是 CORS 安全头：GET/HEAD
+  // 带上会让跨源（app 5180 → orig-tg 19788）对每个首次出现的 URL 先打一次 OPTIONS 预检，
+  // 请求数近乎翻倍。由 body 派生而非 method，未来调用方不可能写错。
   let res: Response
   try {
     res = await fetch(`${tgBase()}${path}`, {
-      headers: { 'Content-Type': 'application/json' },
+      headers: init?.body != null ? { 'Content-Type': 'application/json' } : undefined,
       ...init,
     })
   } catch (e) {

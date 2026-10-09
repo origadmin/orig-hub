@@ -35,8 +35,11 @@ export function daemonBase(): string {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  // Content-Type 只在**真有请求体**时设置（BUG-241，与 api/tg.ts、api/media.ts 同模式）：
+  // 它是非 CORS 安全头，GET（/health、/api/config、/api/downloads…）带上会触发跨源
+  // OPTIONS 预检。由 body 派生而非 method，未来调用方不可能写错。
   const res = await fetch(`${daemonBase()}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
+    headers: init?.body != null ? { 'Content-Type': 'application/json' } : undefined,
     ...init,
   })
   if (!res.ok) {

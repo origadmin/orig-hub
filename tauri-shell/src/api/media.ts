@@ -206,9 +206,15 @@ export interface MediaListQuery {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  // Content-Type 只在**真有请求体**时设置（BUG-241）：它不是 CORS 安全头，GET/HEAD
+  // 带上会触发跨源 OPTIONS 预检（by-ref 的 54 次 ≈ 27 张照片 × 2）。由 body 派生而非
+  // method，未来调用方不可能写错；init.headers 仍按原顺序合并，覆盖同名键。
   const res = await fetch(`${mediaBase()}${path}`, {
     ...init,
-    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+    headers: {
+      ...(init?.body != null ? { 'Content-Type': 'application/json' } : {}),
+      ...(init?.headers ?? {}),
+    },
   })
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`
