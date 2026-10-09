@@ -513,11 +513,18 @@ async function main() {
     // ---- C9: the response header the PLAYER received ------------------------
     // Read from the CDP-observed responses, not from a separate probe request:
     // the criterion is about what the real element was served.
+    // BUG-226: `?probe=1` 是零副作用 JSON 探针端点（无 x-orig-stream 头），
+    // 不属于"流响应"，从本判据的观测里排除。
     const headersFor = (speed) =>
       Array.from(
         new Set(
           responses
-            .filter((r) => r.url.includes(`/items/${ITEM}/stream`) && speedOf(r.url) === speed)
+            .filter(
+              (r) =>
+                r.url.includes(`/items/${ITEM}/stream`) &&
+                !r.url.includes('probe=1') &&
+                speedOf(r.url) === speed,
+            )
             .map((r) => String(r.origStream)),
         ),
       )

@@ -2327,6 +2327,7 @@ async fn ensure_authorized(st: &AppState) -> Result<(), ApiError> {
 
 // ---- 错误映射 ----
 
+#[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
     message: String,
@@ -3158,6 +3159,48 @@ fn speed_value(speed_hundredths: u16) -> f64 {
     f64::from(speed_hundredths) / 100.0
 }
 
+/// Parse the optional `t` query param: a start anchor in **source-content**
+/// seconds (BUG-226).
+///
+/// `Some(t)` asks the server to start the transcode at `t` instead of 0:00, so a
+/// cold-cache deep-position entry plays instantly instead of waiting for the
+/// transcode to chew through everything before the anchor. Values below 0.25s
+/// are canonicalized to `None` (an anchor at 0 *is* the canonical proxy's
+/// timeline; there is no reason to fork behaviour for it). The anchor is clamped
+/// into the source so ffmpeg always has something to encode.
+fn parse_stream_start(
+    query: &HashMap<String, String>,
+    src_duration: Option<i64>,
+) -> Result<Option<f64>, ApiError> {
+    let Some(raw) = query.get("t") else {
+        return Ok(None);
+    };
+    let t: f64 = raw.trim().parse().map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid stream anchor; t must be seconds",
+        )
+    })?;
+    if !t.is_finite() || t < 0.0 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid stream anchor; t must be a non-negative number of seconds",
+        ));
+    }
+    if t < 0.25 {
+        return Ok(None);
+    }
+    if let Some(d) = src_duration {
+        if d > 0 {
+            let cap = (d as f64 - 0.5).max(0.0);
+            if t > cap {
+                return Ok(Some(cap));
+            }
+        }
+    }
+    Ok(Some(t))
+}
+
 fn transformed_duration(duration_secs: Option<i64>, speed_hundredths: Option<u16>) -> Option<i64> {
     match (duration_secs, speed_hundredths) {
         (Some(duration), Some(speed)) if duration > 0 => {
@@ -3274,7 +3317,9 @@ fn resolve_ffmpeg_from(
 /// 自带软件解码；**任何投递算法都变不出解码能力**，唯一结构性出路是转成
 /// 浏览器必解的 H.264（兼容性碾压：全平台硬解）。
 ///
-/// 行为（三态）：
+/// 行为：
+///   0. **探针**（`?probe=1`，BUG-226）→ 只答 `{"ready":bool,"duration":s}`，
+///      不占坑、不起 ffmpeg——前端换档前据此决定直连代理还是带 `t` 锚点。
 ///   1. **代理命中**（`<id>.mp4` 或 `<id>-speed-<百分之一倍速>.mp4` 已存在）→ 直接
 ///      `serve_local_file`（Range / ETag / MIME / 背压一处定义，不重造）；FRC 响应头标记 `decimate=S`。
 ///   2. **同一变体转码在途** → 挂在 watch 上等完成再服务代理（单飞），不同速度有独立缓存/任务键。
@@ -3282,6 +3327,9 @@ fn resolve_ffmpeg_from(
 ///      浏览器无需等整片转完即可开播），stdout 一边泵给响应、一边 tee 落 `.part`，
 ///      成功后原子改名成正式代理；客户端断开 → 杀 ffmpeg + 清 `.part`。
 ///      头 `x-orig-stream: live`。
+///   4. **锚点起转**（`?t=<源内容秒>`，BUG-226）→ `-ss t` 从指定位置起转的
+///      **live-only** 流：字节与正式代理（从 0:00 起）不同源，不落盘、不改名、
+///      不进单飞表；冷缓存下深位换档/续播用它免去「转码从 0 追上来」的等待。
 ///
 /// 失败语义：ffmpeg 不存在 → 501；转码中途失败 → 流提前终止（浏览器走 onError
 /// → 致命遮罩），`.part` 清除不留垃圾。代理目录在 TG 数据目录下（**不进库**：
@@ -3319,6 +3367,20 @@ async fn media_item_stream(
     let part_p = proxy_dir.join(format!("{variant}.part"));
     let stream_duration = transformed_duration(item.duration, speed_hundredths);
 
+    // 0) 探针（BUG-226）：只回答「该变体的代理是否已就绪 + 源内容时长」，
+    //    **绝不**占单飞坑、**绝不** spawn ffmpeg——否则一次探测就会把「冷缓存的
+    //    正式代理转码」从天而降地启动。前端换档前用它决定：代理就绪 → 直接换
+    //    src（Range 可拖）；冷缓存 → 带 `t` 从当前内容位置起转，免去转码从 0:00
+    //    追上来的分钟级等待。
+    if query.get("probe").map(String::as_str) == Some("1") {
+        let ready = tokio::fs::metadata(&final_p).await.is_ok();
+        return Ok(
+            Json(json!({ "ready": ready, "duration": item.duration })).into_response(),
+        );
+    }
+
+    let start_secs = parse_stream_start(&query, item.duration)?;
+
     // 1) 代理命中：完整文件走既有投递契约。
     if tokio::fs::metadata(&final_p).await.is_ok() {
         let mut res = serve_local_file(
@@ -3342,11 +3404,19 @@ async fn media_item_stream(
     })?;
 
     // 2)/3) 单飞占坑：抢到 = 冷启动；没抢到 = 在途等待。
+    //
+    // BUG-226：带 `t` 锚点的请求**不进单飞表**——锚点流是 live-only（不落盘、
+    // 不改名、不可被后续请求命中），每次请求各起一条；若与正式代理转码共用
+    // 一个键，锚点流的 finish 会把别人的占坑顶掉。
     enum Role {
         Start(tokio::sync::watch::Sender<bool>),
         Wait(TranscodeDone),
     }
-    let role = {
+    let registered = start_secs.is_none();
+    let role = if !registered {
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        Role::Start(tx)
+    } else {
         let mut m = transcode_inflight().lock().expect("transcode map poisoned");
         match m.get(&key) {
             Some(rx) => Role::Wait(rx.clone()),
@@ -3397,6 +3467,8 @@ async fn media_item_stream(
                 final_p,
                 key,
                 speed_hundredths,
+                start_secs,
+                registered,
                 tx,
                 resp_tx,
             ));
@@ -3415,6 +3487,12 @@ async fn media_item_stream(
 ///
 /// 成功（exit 0 且客户端未中途断开）→ `.part` 原子改名成正式代理；
 /// 客户端断开 / 转码失败 → 清 `.part` 不留垃圾。出口统一：出表 + 唤醒等待者。
+///
+/// BUG-226：`start_secs = Some(t)` 时是**锚点 live-only 流**——`-ss t` 从指定
+/// 内容位置起转，字节流与正式代理（从 0:00 起）不是同一份字节，因此**不落盘、
+/// 不改名、不进单飞表**（`registered=false`，finish 不得出别人的坑），客户端
+/// 断开即杀 ffmpeg。
+#[allow(clippy::too_many_arguments)]
 async fn transcode_pump(
     ffmpeg: PathBuf,
     src: PathBuf,
@@ -3422,16 +3500,22 @@ async fn transcode_pump(
     final_p: PathBuf,
     key: TranscodeKey,
     speed_hundredths: Option<u16>,
+    start_secs: Option<f64>,
+    registered: bool,
     done_tx: tokio::sync::watch::Sender<bool>,
     resp_tx: tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
 ) {
     let id = key.item_id;
+    let persist = start_secs.is_none();
     let finish = |completed: bool| {
         // 出表 + 唤醒等待者（drop done_tx 兜底：panic 路径也会关闭 watch）。
-        transcode_inflight()
-            .lock()
-            .expect("transcode map poisoned")
-            .remove(&key);
+        // 锚点流没占过坑，绝不能把（可能属于别人的）同键条目顶掉。
+        if registered {
+            transcode_inflight()
+                .lock()
+                .expect("transcode map poisoned")
+                .remove(&key);
+        }
         let _ = done_tx.send(completed);
     };
 
@@ -3444,6 +3528,12 @@ async fn transcode_pump(
     }
 
     let mut command = tokio::process::Command::new(&ffmpeg);
+    // BUG-226：`-ss` 必须放在 `-i` **之前**（输入侧快 seek）；输出时间轴由
+    // `setpts=PTS-STARTPTS` 归零，从锚点起算。
+    if let Some(t) = start_secs {
+        tracing::info!(target: "orig_tg::transcode", "item {id}: anchored live stream from {t:.3}s (not persisted)");
+        command.arg("-ss").arg(format!("{t:.3}"));
+    }
     command.args([
         "-hide_banner",
         "-loglevel",
@@ -3530,13 +3620,18 @@ async fn transcode_pump(
             }
         });
     }
-    let mut file = match tokio::fs::File::create(&part_p).await {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::error!(target: "orig_tg::transcode", "item {id}: create .part failed: {e}");
-            finish(false);
-            return;
+    // `.part` 只为可缓存的正式代理而写；锚点 live-only 流不落盘。
+    let mut file = if persist {
+        match tokio::fs::File::create(&part_p).await {
+            Ok(f) => Some(f),
+            Err(e) => {
+                tracing::error!(target: "orig_tg::transcode", "item {id}: create .part failed: {e}");
+                finish(false);
+                return;
+            }
         }
+    } else {
+        None
     };
 
     let mut buf = vec![0u8; 256 * 1024];
@@ -3546,9 +3641,11 @@ async fn transcode_pump(
             Ok(0) => break,
             Ok(n) => {
                 use tokio::io::AsyncWriteExt;
-                if file.write_all(&buf[..n]).await.is_err() {
-                    // 落盘失败不影响直播给客户端（例如磁盘满时至少本次能看完）
-                    tracing::warn!(target: "orig_tg::transcode", "item {id}: write .part failed; proxy will be skipped");
+                if let Some(file) = file.as_mut() {
+                    if file.write_all(&buf[..n]).await.is_err() {
+                        // 落盘失败不影响直播给客户端（例如磁盘满时至少本次能看完）
+                        tracing::warn!(target: "orig_tg::transcode", "item {id}: write .part failed; proxy will be skipped");
+                    }
                 }
                 if !client_gone
                     && resp_tx
@@ -3556,10 +3653,12 @@ async fn transcode_pump(
                         .await
                         .is_err()
                 {
-                    // Legacy compatibility requests cancel immediately. FRC variants keep
-                    // transcoding to a seekable speed-specific proxy after client disconnect.
+                    // Legacy compatibility requests and anchored live-only streams
+                    // (BUG-226) cancel immediately. Canonical FRC variants keep
+                    // transcoding to a seekable speed-specific proxy after client
+                    // disconnect.
                     client_gone = true;
-                    if speed_hundredths.is_none() {
+                    if speed_hundredths.is_none() || !persist {
                         break;
                     }
                 }
@@ -3572,26 +3671,32 @@ async fn transcode_pump(
     }
 
     let mut completed = false;
-    if client_gone && speed_hundredths.is_none() {
+    if client_gone && (speed_hundredths.is_none() || !persist) {
         let _ = child.kill().await;
         let _ = child.wait().await;
-        let _ = tokio::fs::remove_file(&part_p).await;
+        if persist {
+            let _ = tokio::fs::remove_file(&part_p).await;
+        }
     } else {
         drop(stdout); // 关闭管道让 ffmpeg 收到 EOF、自然退出
         match child.wait().await {
             Ok(s) if s.success() => {
-                if tokio::fs::rename(&part_p, &final_p).await.is_ok() {
+                if persist && tokio::fs::rename(&part_p, &final_p).await.is_ok() {
                     completed = true;
                     tracing::info!(target: "orig_tg::transcode", "item {id}: proxy ready at {}", final_p.display());
                 }
             }
             Ok(s) => {
                 tracing::warn!(target: "orig_tg::transcode", "item {id}: transcode failed: {s}");
-                let _ = tokio::fs::remove_file(&part_p).await;
+                if persist {
+                    let _ = tokio::fs::remove_file(&part_p).await;
+                }
             }
             Err(e) => {
                 tracing::error!(target: "orig_tg::transcode", "item {id}: wait ffmpeg failed: {e}");
-                let _ = tokio::fs::remove_file(&part_p).await;
+                if persist {
+                    let _ = tokio::fs::remove_file(&part_p).await;
+                }
             }
         }
     }
@@ -4543,6 +4648,7 @@ mod tests {
     use super::merge_media_series;
     use super::normalized_series_name;
     use super::parse_stream_speed;
+    use super::parse_stream_start;
     use super::resolve_ffmpeg_from;
     use super::speed_video_filter;
     use super::atempo_filter;
@@ -4848,6 +4954,51 @@ mod tests {
     ///
     /// 4 MiB 文件 + `duration=500` ⇒ 速率被 1 MiB/s 下限钉住；`CHUNK = 1 MiB`，
     /// 旧实现首块要等 `1MiB / 1MiB/s ≈ 1000 ms`，本用例会因此 FAIL。
+    /// BUG-226：`t` 锚点解析——缺省/近零归一为 None（走正式代理时间轴）。
+    #[test]
+    fn parse_stream_start_ignores_absent_and_near_zero() {
+        let mut q: HashMap<String, String> = HashMap::new();
+        assert_eq!(parse_stream_start(&q, Some(50)).unwrap(), None);
+        q.insert("t".into(), "0".into());
+        assert_eq!(parse_stream_start(&q, Some(50)).unwrap(), None);
+        q.insert("t".into(), "0.1".into());
+        assert_eq!(parse_stream_start(&q, Some(50)).unwrap(), None);
+    }
+
+    /// BUG-226：合法正锚点原样通过；前后空白容忍。
+    #[test]
+    fn parse_stream_start_accepts_positive_anchor() {
+        let mut q: HashMap<String, String> = HashMap::new();
+        q.insert("t".into(), "30".into());
+        assert_eq!(parse_stream_start(&q, Some(50)).unwrap(), Some(30.0));
+        q.insert("t".into(), " 12.5 ".into());
+        assert_eq!(parse_stream_start(&q, None).unwrap(), Some(12.5));
+    }
+
+    /// BUG-226：垃圾与负数必须 400，绝不把任意字符串带进 ffmpeg 命令行。
+    #[test]
+    fn parse_stream_start_rejects_garbage_and_negative() {
+        let mut q: HashMap<String, String> = HashMap::new();
+        q.insert("t".into(), "abc".into());
+        assert!(parse_stream_start(&q, None).is_err());
+        q.insert("t".into(), "-1".into());
+        assert!(parse_stream_start(&q, None).is_err());
+        q.insert("t".into(), "NaN".into());
+        assert!(parse_stream_start(&q, None).is_err());
+    }
+
+    /// BUG-226：锚点被钳进源内（至少给 ffmpeg 留 0.5s 可转）；未知时长不设上限。
+    #[test]
+    fn parse_stream_start_clamps_to_source_tail() {
+        let mut q: HashMap<String, String> = HashMap::new();
+        q.insert("t".into(), "49.9".into());
+        assert_eq!(parse_stream_start(&q, Some(50)).unwrap(), Some(49.5));
+        q.insert("t".into(), "1000".into());
+        assert_eq!(parse_stream_start(&q, Some(50)).unwrap(), Some(49.5));
+        q.insert("t".into(), "1000".into());
+        assert_eq!(parse_stream_start(&q, None).unwrap(), Some(1000.0));
+    }
+
     #[tokio::test]
     async fn serve_local_file_first_byte_is_immediate() {
         use futures::StreamExt;

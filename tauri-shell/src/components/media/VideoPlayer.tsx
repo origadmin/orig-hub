@@ -91,8 +91,70 @@ function streamUrlAtRate(src: string, rate: number): string {
   return url.toString()
 }
 
+/**
+ * Ask the server whether the variant's proxy file is already on disk (BUG-226).
+ * The probe endpoint (`?probe=1`) is metadata-only: it never occupies the
+ * single-flight slot and never spawns ffmpeg. `duration` is the *source-content*
+ * duration, used by the display layer before the element learns its own.
+ */
+interface StreamProbe {
+  ready: boolean
+  duration: number | null
+}
+
+async function probeStream(streamUrl: string): Promise<StreamProbe | null> {
+  try {
+    const url = new URL(streamUrl, window.location.href)
+    url.searchParams.set('probe', '1')
+    const res = await fetch(url.toString())
+    if (!res.ok) return null
+    const data = (await res.json()) as { ready?: unknown; duration?: unknown }
+    if (typeof data.ready !== 'boolean') return null
+    return {
+      ready: data.ready,
+      duration:
+        typeof data.duration === 'number' && data.duration > 0 ? data.duration : null,
+    }
+  } catch {
+    return null
+  }
+}
+
+/** Attach a `t` (source-content seconds) anchor so the transcode starts there. */
+function withStartParam(streamUrl: string, startSecs: number): string {
+  const url = new URL(streamUrl, window.location.href)
+  url.searchParams.set('t', String(Math.floor(startSecs)))
+  return url.toString()
+}
+
+/**
+ * Same variant? Compares origin+path and the `speed` param only — the `t` anchor
+ * deliberately does NOT count, otherwise the anchored URL we just committed would
+ * never match `targetSrc` and the rate-switch effect would re-probe in a loop.
+ */
+function sameStreamTarget(a: string, b: string): boolean {
+  if (a === b) return true
+  try {
+    const ua = new URL(a, window.location.href)
+    const ub = new URL(b, window.location.href)
+    return (
+      ua.origin + ua.pathname === ub.origin + ub.pathname &&
+      ua.searchParams.get('speed') === ub.searchParams.get('speed')
+    )
+  } catch {
+    return false
+  }
+}
+
 /** 快退/快进步长（秒） */
 const SKIP_SEC = 10
+/**
+ * 冷缓存锚定阈值（BUG-226，源内容秒）：换档时位置在此之下不重锚，走从 0:00
+ * 起转的普通 live 流。两个原因：① 片头附近「转码追上来」的等待很小；② 正式
+ * 代理缓存（BUG-223 的按速独立缓存）只在从 0:00 起转的 live 流上累积——客户端
+ * 断开也继续转完落盘，太早锚定会让缓存永远建不起来。
+ */
+const ANCHOR_MIN_CONTENT_SEC = 10
 /** 播放中控件自动隐藏延时 */
 const HIDE_MS = 3000
 /** 控件层淡出时长（与 Tailwind `duration-300` 对齐）：淡出结束后才把控件层移出合成（BUG-217）。 */
@@ -141,6 +203,11 @@ function rememberCompatSrc(_src: string): void {
 /**
  * 播放时钟（仅**时间文案**用，BUG-216）：把「随时间推进」的状态隔离在叶子组件里。
  *
+ * BUG-225/226 时间契约：FRC 流的媒体时间轴被压缩为源内容/S，且**锚点流**
+ * （`?t=`，冷缓存深位起转）的 0:00 对应内容位置 `contentOffset`。显示值恒为
+ * `contentOffset + 媒体时间 × timeScale`；总时长优先用服务端探针给的源内容
+ * 时长，否则由元素 duration 换算。
+ *
  * 为什么抽成 hook 并由叶子组件持有：
  * 时间文案随媒体时间推进。若把这个 state 放在 `VideoPlayer` 顶层，每次 `timeupdate`
  * （约 3.8 次/秒，与倍速无关）都会重渲染**整棵控件树**（含 8 项倍速菜单、音量、
@@ -152,15 +219,23 @@ function rememberCompatSrc(_src: string): void {
  * React 的 characterData 写入本就与之等频（1 次/秒），无需再降到 DOM 层。
  * 进度条（更高频、需要条宽）走 `PlayerProgressBar` 的 ref + 直接写 DOM。
  */
-function useMediaClock(videoRef: React.RefObject<HTMLVideoElement | null>, timeScale = 1) {
+function useMediaClock(
+  videoRef: React.RefObject<HTMLVideoElement | null>,
+  timeScale = 1,
+  contentOffset = 0,
+  contentDuration: number | null = null,
+) {
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
 
   useEffect(() => {
     const v = videoRef.current
     if (!v) return
-    const onTime = () => setCurrentTime(v.currentTime * timeScale)
-    const onDur = () => setDuration((Number.isFinite(v.duration) ? v.duration : 0) * timeScale)
+    const onTime = () => setCurrentTime(contentOffset + v.currentTime * timeScale)
+    const onDur = () => {
+      if (contentDuration != null && contentDuration > 0) setDuration(contentDuration)
+      else setDuration((Number.isFinite(v.duration) ? v.duration : 0) * timeScale + contentOffset)
+    }
     v.addEventListener('timeupdate', onTime)
     // seeked：`skip()` 直接写 `v.currentTime` 后即时刷新（不必等下一个 timeupdate）
     v.addEventListener('seeked', onTime)
@@ -175,7 +250,7 @@ function useMediaClock(videoRef: React.RefObject<HTMLVideoElement | null>, timeS
       v.removeEventListener('loadedmetadata', onDur)
       v.removeEventListener('durationchange', onDur)
     }
-  }, [videoRef, timeScale])
+  }, [videoRef, timeScale, contentOffset, contentDuration])
 
   return { currentTime, duration }
 }
@@ -184,11 +259,15 @@ function useMediaClock(videoRef: React.RefObject<HTMLVideoElement | null>, timeS
 function PlayerTimeText({
   videoRef,
   timeScale = 1,
+  contentOffset = 0,
+  contentDuration = null,
 }: {
   videoRef: React.RefObject<HTMLVideoElement | null>
   timeScale?: number
+  contentOffset?: number
+  contentDuration?: number | null
 }) {
-  const { currentTime, duration } = useMediaClock(videoRef, timeScale)
+  const { currentTime, duration } = useMediaClock(videoRef, timeScale, contentOffset, contentDuration)
   return (
     <span className="min-w-[92px] pl-1 text-xs font-medium tabular-nums text-white/90 md:text-sm">
       {fmtDuration(Math.floor(currentTime)) || '0:00'} / {fmtDuration(Math.floor(duration)) || '--:--'}
@@ -219,6 +298,15 @@ interface PlayerProgressBarProps {
   compact?: boolean
   /** The transformed stream's media clock is compressed by the selected content speed. */
   timeScale?: number
+  /** BUG-226：锚点流的 0:00 对应的内容位置（源内容秒）。 */
+  contentOffset?: number
+  /** BUG-226：源内容总时长（秒）——探针先于元素元数据已知时用它画全局比例。 */
+  contentDuration?: number | null
+  /**
+   * BUG-226：live 流上的拖拽落点超出已转码覆盖范围时由父组件换 src 重锚。
+   * 返回 true = 父组件已处理（本地不再写 currentTime）；false = 本地 seek。
+   */
+  onContentSeek?: (contentSec: number) => boolean
 }
 
 /**
@@ -233,7 +321,16 @@ interface PlayerProgressBarProps {
  * 即时跟手，**不写 `currentTime`** —— 每次写 `currentTime` 都会中止旧请求再发一个新
  * Range 请求，实测 2s 拖拽 7 发 7 取消）；只有 `pointerup` 才提交唯一一次 `seekToRatio`。
  */
-function PlayerProgressBar({ videoRef, barHover, onBarHoverChange, compact = false, timeScale = 1 }: PlayerProgressBarProps) {
+function PlayerProgressBar({
+  videoRef,
+  barHover,
+  onBarHoverChange,
+  compact = false,
+  timeScale = 1,
+  contentOffset = 0,
+  contentDuration = null,
+  onContentSeek,
+}: PlayerProgressBarProps) {
   const { t } = useTranslation()
   const barRef = useRef<HTMLDivElement>(null)
   const playedRef = useRef<HTMLDivElement>(null)
@@ -246,15 +343,15 @@ function PlayerProgressBar({ videoRef, barHover, onBarHoverChange, compact = fal
   const lastBufferedPct = useRef(-1)
 
   /** 把当前播放位置 / 缓冲 / aria 直接写进 DOM（不经 React state）。
-   *  `force=true` 用于离散事件（seek / 拖拽 / 元数据）即时刷新，不受节流限制。 */
-  /**
-   * 直接写（**刻意不用 rAF**）。
-   *
-   * 曾试过把写入合并到 `requestAnimationFrame`，实测反而把上屏节拍打坏：
-   * 同一条件下 app@2x 从 presented 55.7 掉到 51.5、rVFC 间隔 >25ms 的帧从 42 涨到 84
-   * （`_probe_render_churn.cjs`）。原因是 rAF 回调与视频呈现同帧竞争，回调里的
-   * 样式写入会推迟该帧的合成。改为在事件回调里同步写、靠墙钟节流降频即可。
-   */
+   *  `force=true` 用于离散事件（seek / 拖拽 / 元数据）即时刷新，不受节流限制。
+   *  BUG-225/226：所有比例都定义在**源内容时间轴**上（contentOffset 修正 +
+   *  timeScale 换算），进度条在锚点流与完整代理上呈现同一全局比例。 */
+  const displayDur = () => {
+    const v = videoRef.current
+    if (contentDuration != null && contentDuration > 0) return contentDuration
+    if (!v) return 0
+    return (Number.isFinite(v.duration) ? v.duration : 0) * timeScale + contentOffset
+  }
   const write = useCallback(
     (force: boolean) => {
       const v = videoRef.current
@@ -263,10 +360,10 @@ function PlayerProgressBar({ videoRef, barHover, onBarHoverChange, compact = fal
       // 只要 slider 还在，aria 就必须继续更新（AT 可达是硬约束）。
       if (!v || !slider) return
       const played = playedRef.current
-      const dur = (Number.isFinite(v.duration) ? v.duration : 0) * timeScale
+      const dur = displayDur()
       const now = performance.now()
       const ratio = dragRatioRef.current
-      const shown = ratio !== null && dur > 0 ? ratio * dur : v.currentTime * timeScale
+      const shown = ratio !== null && dur > 0 ? ratio * dur : contentOffset + v.currentTime * timeScale
 
       // 播放段：墙钟节流 + 只在值变化时写（compact 态无可见条面，跳过）
       if (played && (force || now - lastBarMs.current >= BAR_WRITE_MS)) {
@@ -288,7 +385,10 @@ function PlayerProgressBar({ videoRef, barHover, onBarHoverChange, compact = fal
       const buffered = bufferedRef.current
       if (buffered && dur > 0 && (force || now - lastBufferedMs.current >= BUFFERED_WRITE_MS)) {
         const b = v.buffered
-        const bp = b.length > 0 ? Math.max(0, Math.min(100, (b.end(b.length - 1) / (Number.isFinite(v.duration) ? v.duration : 0)) * 100)) : 0
+        const bp =
+          b.length > 0
+            ? Math.max(0, Math.min(100, ((contentOffset + b.end(b.length - 1) * timeScale) / dur) * 100))
+            : 0
         if (force || Math.abs(bp - lastBufferedPct.current) >= BUFFERED_DELTA_PCT) {
           lastBufferedMs.current = now
           lastBufferedPct.current = bp
@@ -296,7 +396,9 @@ function PlayerProgressBar({ videoRef, barHover, onBarHoverChange, compact = fal
         }
       }
     },
-    [videoRef, timeScale],
+    // `displayDur` 读的是 props 与元素属性，无自身状态；依赖与旧实现一致
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [videoRef, timeScale, contentOffset, contentDuration],
   )
 
   useEffect(() => {
@@ -337,12 +439,20 @@ function PlayerProgressBar({ videoRef, barHover, onBarHoverChange, compact = fal
     (ratio: number) => {
       const v = videoRef.current
       if (!v) return
-      const dur = Number.isFinite(v.duration) ? v.duration : 0
+      const dur = contentDuration != null && contentDuration > 0
+        ? contentDuration
+        : (Number.isFinite(v.duration) ? v.duration : 0) * timeScale + contentOffset
       if (!dur) return
-      v.currentTime = ratio * dur
+      const contentSec = ratio * dur
+      // live 流上目标超出已转码覆盖范围 → 父组件换 src 重锚（BUG-226）
+      if (onContentSeek && onContentSeek(contentSec)) {
+        write(true)
+        return
+      }
+      v.currentTime = Math.max(0, (contentSec - contentOffset) / (timeScale || 1))
       write(true)
     },
-    [videoRef, write],
+    [videoRef, write, timeScale, contentOffset, contentDuration, onContentSeek],
   )
 
   const onPointerDown = useCallback(
@@ -474,9 +584,15 @@ export function VideoPlayer({
   const videoRef = useRef<HTMLVideoElement>(null)
   const hideTimer = useRef<number | null>(null)
   const centerTimer = useRef<number | null>(null)
-  /** 时长快照（BUG-216）：仅供 `skip()` 在 `v.duration` 不可用时兜底，
-   *  用 ref 而非 state —— 它不参与渲染，不该触发重渲染。 */
-  const durationRef = useRef(0)
+  /**
+   * 源内容总时长（秒，BUG-226）：探针在换档时先于元素元数据拿到；
+   * 元素自己学会 duration 后兜底换算。挂载时为 null（未知）。
+   * 旧 `durationRef`（BUG-216）已并入此处——它在 live 流上永远停在 0，
+   * 正是 BUG-225 位置被钳回 0:00 的帮凶。
+   */
+  const contentDurationRef = useRef<number | null>(null)
+  /** BUG-226：当前流 0:00 对应的内容位置（锚点流 > 0，其余为 0）。 */
+  const contentOffsetRef = useRef(0)
 
   const [isPlaying, setIsPlaying] = useState(false)
   const [isBuffering, setIsBuffering] = useState(false)
@@ -547,7 +663,14 @@ export function VideoPlayer({
   }, [compatSrc, hasVideoTrack, src])
   /** Rate-transcoded streams use a compressed media timeline; scale back to source-content seconds. */
   const activeContentSpeedRef = useRef(initialFrc ? playbackRate : 1)
-  const pendingRateSwitchRef = useRef<{ contentTime: number; wasPlaying: boolean } | null>(null)
+  /**
+   * BUG-225/226：换 src 的位置恢复委托。`contentTime` 是**源内容秒**；
+   * `offset` 是新流的锚点（`?t=`），恢复的媒体时间 = (contentTime - offset) / speed。
+   */
+  const pendingRateSwitchRef = useRef<{ contentTime: number; wasPlaying: boolean; offset: number } | null>(null)
+  /** BUG-226：当前 src 是否支持任意位置 Range seek（原生源 / 完整代理 = true）。
+   *  挂载即 FRC（未探针）时保守按 live 处理。 */
+  const streamSeekableRef = useRef(!initialFrc)
   /** 已停载（退无可退）：渲染 BUG-207 的诚实失败遮罩 */
   const [halted, setHalted] = useState(false)
 
@@ -557,6 +680,10 @@ export function VideoPlayer({
 
   // Keep the selected playback rate, but let the server transcode every non-1x rate to
   // a 30fps stream. Preserve source-content position/play state across the URL switch.
+  //
+  // BUG-226：换档前先探针该变体的代理是否就绪。就绪 → 直接换 src（完整代理，
+  // Range 可拖，位置恢复走 currentTime）；冷缓存 → 带 `t=<当前内容秒>` 从当前
+  // 位置起转的 live-only 流，免去「转码从 0:00 追上来」的分钟级等待。
   useEffect(() => {
     const compat = compatSrcRef.current
     const original = originalSrcRef.current
@@ -568,22 +695,50 @@ export function VideoPlayer({
     const rateSrc = playbackRate === 1 ? null : streamUrlAtRate(compat, playbackRate)
     const targetSrc = rateSrc ?? (baseCompatRef.current ? compat : original)
     const targetContentSpeed = rateSrc ? playbackRate : 1
-    if (targetSrc === activeSrc) {
+    // 锚点 URL（...&t=N）属于同一目标变体：提前返回时不得动 offset/seekable。
+    if (sameStreamTarget(targetSrc, activeSrc)) {
       activeContentSpeedRef.current = targetContentSpeed
       setUsingCompat(Boolean(baseCompatRef.current && targetSrc === compat))
       return
     }
 
     const v = videoRef.current
+    const contentTime = v ? v.currentTime * activeContentSpeedRef.current + contentOffsetRef.current : 0
     const wasPlaying = v ? (!v.paused || (Boolean(autoPlay) && v.readyState === 0)) : Boolean(autoPlay)
-    pendingRateSwitchRef.current = {
-      contentTime: v ? v.currentTime * activeContentSpeedRef.current : 0,
-      wasPlaying,
+    let cancelled = false
+
+    const commit = (offset: number, seekable: boolean) => {
+      if (cancelled) return
+      contentOffsetRef.current = offset
+      streamSeekableRef.current = seekable
+      pendingRateSwitchRef.current = { contentTime, wasPlaying, offset }
+      activeContentSpeedRef.current = targetContentSpeed
+      if (rateSrc) compatTriedRef.current = true
+      setActiveSrc(offset > 0 ? withStartParam(targetSrc, offset) : targetSrc)
+      setUsingCompat(Boolean(!rateSrc && baseCompatRef.current && targetSrc === compat))
     }
-    activeContentSpeedRef.current = targetContentSpeed
-    if (rateSrc) compatTriedRef.current = true
-    setActiveSrc(targetSrc)
-    setUsingCompat(Boolean(!rateSrc && baseCompatRef.current && targetSrc === compat))
+
+    if (!targetSrc.includes('/stream')) {
+      // 原生源（/raw 等）：浏览器自己管 seek 与时间轴。
+      commit(0, true)
+      return
+    }
+    void (async () => {
+      const probe = await probeStream(targetSrc)
+      if (probe?.duration != null) contentDurationRef.current = probe.duration
+      if (probe?.ready) {
+        // 代理已在盘上：完整文件，任意位置 Range 可拖。
+        commit(0, true)
+        return
+      }
+      // 冷缓存：位置 ≥ 阈值时从当前内容位置起转（锚点取整到秒）；片头附近
+      // 保持 from-0 起转以累积正式代理缓存（见 ANCHOR_MIN_CONTENT_SEC 注释）。
+      const offset = contentTime >= ANCHOR_MIN_CONTENT_SEC ? Math.floor(contentTime) : 0
+      commit(offset, false)
+    })()
+    return () => {
+      cancelled = true
+    }
   }, [activeSrc, autoPlay, decode, playbackRate])
 
   /**
@@ -685,18 +840,77 @@ export function VideoPlayer({
     pokeControls()
   }, [pokeControls])
 
+  /**
+   * live 流上的进度条拖拽（BUG-226）：目标超出已转码覆盖范围时换 src 重锚
+   * （服务端 `-ss t` 从目标位置起转）；覆盖范围内与完整代理 / 原生源都交给
+   * 浏览器本地 seek。返回 true 表示已由重锚处理。
+   *
+   * 位置约束：必须声明在 `skip` 之前（skip 对超出覆盖范围的跳转复用本重锚
+   * 通道，TS 禁止块级变量先使用后声明）。
+   */
+  const contentSeek = useCallback(
+    (contentSec: number): boolean => {
+      const v = videoRef.current
+      if (!v) return false
+      if (!activeSrc.includes('/stream')) return false
+      if (streamSeekableRef.current) return false
+      let bEnd = 0
+      try {
+        if (v.buffered.length > 0) bEnd = v.buffered.end(v.buffered.length - 1)
+      } catch {
+        // buffered 在 detached 元素上会抛；按未覆盖处理
+      }
+      const speed = activeContentSpeedRef.current || 1
+      const offset = contentOffsetRef.current
+      const mediaTarget = (contentSec - offset) / speed
+      if (mediaTarget >= 0 && mediaTarget <= bEnd + 0.5) return false
+      // 重锚：新流 0:00 = 目标内容位置
+      const base = compatSrcRef.current
+      if (!base) return false
+      const rate = playbackRate === 1 ? null : playbackRate
+      const url = rate == null ? base : streamUrlAtRate(base, rate)
+      const contentDur = contentDurationRef.current
+      const maxOffset = contentDur != null && contentDur > 0 ? Math.max(0, contentDur - 0.5) : contentSec
+      const anchor = Math.min(Math.max(0, Math.floor(contentSec)), Math.floor(maxOffset))
+      const wasPlaying = !v.paused
+      pendingRateSwitchRef.current = { contentTime: contentSec, wasPlaying, offset: anchor }
+      contentOffsetRef.current = anchor
+      streamSeekableRef.current = false
+      activeContentSpeedRef.current = rate ?? 1
+      setActiveSrc(anchor > 0 ? withStartParam(url, anchor) : url)
+      return true
+    },
+    [activeSrc, playbackRate],
+  )
+
   const skip = useCallback(
     (sec: number) => {
       const v = videoRef.current
       if (!v) return
-      const d = Number.isFinite(v.duration) ? v.duration : durationRef.current
-      const mediaDelta = sec / activeContentSpeedRef.current
-      const next = Math.max(0, Math.min(d || 0, v.currentTime + mediaDelta))
+      const speed = activeContentSpeedRef.current || 1
+      const offset = contentOffsetRef.current
+      // BUG-226：live 流上跳转落点超出已转码覆盖范围时，本地 seek 会被
+      // Chromium 钳回 seekable（= buffered）末端，实测 contentTime 纹丝不动。
+      // 跳转与拖拽同为显式意图 → 走同一条重锚通道（contentSeek 对完整代理 /
+      // 覆盖范围内返回 false，自然落到下面的本地 seek）。
+      if (contentSeek(offset + v.currentTime * speed + sec)) return
+      const mediaDelta = sec / speed
+      // 上限：已知源内容时长 → 换算成媒体时间；live 流元素 duration 可能是
+      // NaN（fMP4 empty moov）或只覆盖锚点之后的剩余段，都不许把位置钳回 0
+      // （BUG-225 实测：±10s 在 live 流上把 currentTime 归零）。
+      const contentDur = contentDurationRef.current
+      const mediaMax =
+        contentDur != null && contentDur > 0
+          ? (contentDur - offset) / speed
+          : Number.isFinite(v.duration) && v.duration > 0
+            ? v.duration
+            : Number.POSITIVE_INFINITY
+      const next = Math.max(0, Math.min(mediaMax, v.currentTime + mediaDelta))
       // 写 `currentTime` 会触发 `seeked` / `timeupdate`，叶子组件（BUG-216）据此即时刷新条面与时间文案
       v.currentTime = next
       pokeControls()
     },
-    [pokeControls],
+    [pokeControls, contentSeek],
   )
 
   const toggleMute = useCallback(() => {
@@ -755,16 +969,36 @@ export function VideoPlayer({
   )
 
   // ---------- 媒体事件 ----------
+  /** durationchange 上同步源内容时长（BUG-225）：live fMP4 的 loadedmetadata
+   *  常带 NaN duration，元素要等 fragment 流推进后才学会真实 duration——只靠
+   *  loadedmetadata 记录会让 skip/恢复永远看到 0。 */
+  const onDurationChange = useCallback(() => {
+    const v = videoRef.current
+    if (!v) return
+    const dur = Number.isFinite(v.duration) ? v.duration : 0
+    const speed = activeContentSpeedRef.current
+    if (contentDurationRef.current == null && dur > 0) {
+      contentDurationRef.current = dur * speed + contentOffsetRef.current
+    }
+  }, [])
+
   const onLoadedMetadata = useCallback(() => {
     const v = videoRef.current
     if (!v) return
-    durationRef.current = Number.isFinite(v.duration) ? v.duration : 0
+    const dur = Number.isFinite(v.duration) ? v.duration : 0
+    const speed = activeContentSpeedRef.current
+    if (contentDurationRef.current == null && dur > 0) {
+      contentDurationRef.current = dur * speed + contentOffsetRef.current
+    }
     const pending = pendingRateSwitchRef.current
     if (pending) {
       pendingRateSwitchRef.current = null
-      const speed = activeContentSpeedRef.current
-      const targetTime = speed === 1 ? pending.contentTime : pending.contentTime / speed
-      v.currentTime = Math.max(0, Math.min(durationRef.current, targetTime))
+      // BUG-225：恢复 = (内容位置 - 锚点) / 速度。live 流的 duration 常为 NaN
+      // （fMP4 empty moov），上限只在拿到有限 duration 时钳制——旧实现
+      // `Math.min(durationRef=0, target)` 把深位恢复直接钳回 0:00。
+      const mediaTarget = (pending.contentTime - pending.offset) / (speed || 1)
+      const upper = dur > 0 ? dur : Number.POSITIVE_INFINITY
+      v.currentTime = Math.max(0, Math.min(upper, mediaTarget))
     }
     applyPrefs()
     if (pending?.wasPlaying) void v.play().catch(() => {})
@@ -925,6 +1159,7 @@ export function VideoPlayer({
         autoPlay={autoPlay && (!pendingRateSwitchRef.current || pendingRateSwitchRef.current.wasPlaying)}
         data-playback-mode={activeContentSpeedRef.current === 1 ? 'native' : 'frc'}
         data-content-speed={activeContentSpeedRef.current}
+        data-content-offset={contentOffsetRef.current}
         playsInline
         preload="auto"
         /* 必须 h-full w-full + object-contain：max-h/max-w 只能缩小不能放大，
@@ -934,6 +1169,7 @@ export function VideoPlayer({
         className="h-full w-full bg-black object-contain"
         onClick={togglePlay}
         onLoadedMetadata={onLoadedMetadata}
+        onDurationChange={onDurationChange}
         onPlay={() => {
           setIsPlaying(true)
           setIsBuffering(false)
@@ -1122,6 +1358,9 @@ export function VideoPlayer({
           onBarHoverChange={setBarHover}
           compact
           timeScale={activeContentSpeedRef.current}
+          contentOffset={contentOffsetRef.current}
+          contentDuration={contentDurationRef.current}
+          onContentSeek={contentSeek}
         />
       )}
 
@@ -1145,6 +1384,9 @@ export function VideoPlayer({
               barHover={barHover}
               onBarHoverChange={setBarHover}
               timeScale={activeContentSpeedRef.current}
+              contentOffset={contentOffsetRef.current}
+              contentDuration={contentDurationRef.current}
+              onContentSeek={contentSeek}
             />
           )}
 
@@ -1235,8 +1477,13 @@ export function VideoPlayer({
                 </div>
               </div>
 
-              {/* 时间（BUG-216：状态在叶子组件内） */}
-              <PlayerTimeText videoRef={videoRef} timeScale={activeContentSpeedRef.current} />
+              {/* 时间（BUG-216：状态在叶子组件内；BUG-225/226：内容时间契约） */}
+              <PlayerTimeText
+                videoRef={videoRef}
+                timeScale={activeContentSpeedRef.current}
+                contentOffset={contentOffsetRef.current}
+                contentDuration={contentDurationRef.current}
+              />
             </div>
 
             <div className="flex items-center gap-1 md:gap-2">
