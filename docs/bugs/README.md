@@ -257,3 +257,4 @@ bash scripts/install-hooks.sh    # 安装 pre-commit 与 commit-msg（钩子不�
 | BUG-229 | 非 1x 倍速无条件切 FRC 转码流 ⇒ 浏览器对 fMP4 代理乱序 range 风暴（69 req/s）+ 预读 66% 全片 + 整片转码落盘；修：倍速换档仅限已在兼容流上的源，可直解源保持原 src + playbackRate（实测 2x 直解 /stream 请求 0、缓冲 66%→12%、effRate 0.995）；验收 = `tauri-shell/verify/_probe_reqstorm.cjs` 前后对照 | fixed | engine+shell |
 | BUG-230 | raw 直解路径本机全程卡顿（1x 卡/2x 非常卡/4x 无法播放）、stream 流畅 ⇒ 播放主路径翻转 stream-first（挂载即转码流，非 1x=FRC 变体），raw 退役为下载/导出端点；rememberedCompat 记忆机制删除；改 `tauri-shell/src/components/media/VideoPlayer.tsx` | fixed | shell |
 | BUG-231 | TG 侧播放器标题显示频道名（西瓜短剧(AI短剧)）而非内容标题，用户完全不知道内容；TgPanel 两处 openViewer 误传 channelTitle/selectedChannel.title（频道流点播 + 全局搜索预览）；改传 caption，频道名只留分组用途 | fixed | shell |
+| BUG-232 | 入库流水线行标题只有频道维度（频道名/裸 chatId），从无内容标题路径（9bee7b8 起即如此，旧修复疑随历史丢失湮灭）；行标题链改为 入库内容标题(by-ref 查库)→频道名→裸 chatId，覆盖 done/interrupted；36 条有条目行逐条对账全中；failed/queued 行需引擎落 caption（剩余范围） | fixed | shell |

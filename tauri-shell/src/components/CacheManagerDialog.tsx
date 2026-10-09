@@ -624,6 +624,60 @@ export function CacheManagerDialog(props: {
   const groups = useMemo(() => groupCounts(counts), [counts])
 
   /**
+   * 入库内容标题（BUG-232）：流水线行的标题必须是**入库的内容**，频道只是元数据
+   * —— 与 BUG-231 同一原则（分组维度 ≠ 内容标题），此前行标题只有
+   * 「频道名或 `频道 {chatId}`」一条路，dialogs 拿不到频道名时连人话都不剩。
+   *
+   * 完成态任务按 by-ref（`source="tg"`、`ref="{chat}:{msg}"`）查媒体库条目，
+   * 条目标题就是入库内容的标题（入库写入路径保证，BUG-156 修复后不再是兜底名）。
+   * 每 ref 只问一次（`ingestTitleRef` 缓存，含「查过但无」的 null），顺序有界，
+   * 不在渲染期发起；查不到/失败 ⇒ 行标题退回频道名链。
+   */
+  const [ingestTitles, setIngestTitles] = useState<Map<string, string>>(new Map())
+  const ingestTitleRef = useRef<Map<string, string | null>>(new Map())
+  useEffect(() => {
+    const pending = visible.filter(
+      (x) =>
+        // done 必有库条目；interrupted 部分入库（by-ref miss 由缓存如实降级）。
+        (x.status === 'done' || x.status === 'interrupted') &&
+        x.messageIds[0] != null &&
+        !ingestTitleRef.current.has(`${x.chatId}:${x.messageIds[0]}`),
+    )
+    if (pending.length === 0) return
+    let alive = true
+    void (async () => {
+      for (const task of pending) {
+        const ref = `${task.chatId}:${task.messageIds[0]}`
+        let title: string | null = null
+        try {
+          const id = await findMediaItemIdByRef('tg', ref)
+          if (id != null) title = (await getMediaItem(id)).title || null
+        } catch {
+          title = null
+        }
+        ingestTitleRef.current.set(ref, title)
+        if (!alive) return
+      }
+      const next = new Map<string, string>()
+      for (const [ref, resolved] of ingestTitleRef.current) if (resolved) next.set(ref, resolved)
+      if (alive) setIngestTitles(next)
+    })()
+    return () => {
+      alive = false
+    }
+  }, [visible])
+
+  /** 行标题链（BUG-232）：入库内容标题 → 频道名 → 裸 chatId。 */
+  const ingestTitleOf = useCallback(
+    (task: TgCacheTask): string | null => {
+      const msgId = task.messageIds[0]
+      if (msgId == null) return null
+      return ingestTitles.get(`${task.chatId}:${msgId}`) ?? null
+    },
+    [ingestTitles],
+  )
+
+  /**
    * 当前筛选内被勾中的 id（BUG-149）。
    *
    * 用「当前可见行 ∩ 选中集」导出，而不是直接用选中集：列表刷新/记录被删/切筛选档后
@@ -865,7 +919,7 @@ export function CacheManagerDialog(props: {
             <IngestTaskRow
               key={task.id}
               task={task}
-              title={titleOf(task.chatId) ?? `频道 ${task.chatId}`}
+              title={ingestTitleOf(task) ?? titleOf(task.chatId) ?? `频道 ${task.chatId}`}
               busy={busy}
               confirming={confirm?.kind === 'one' && confirm.id === task.id}
               missing={
@@ -914,7 +968,7 @@ export function CacheManagerDialog(props: {
                   <IngestTaskRow
                     key={task.id}
                     task={task}
-                    title={titleOf(task.chatId) ?? `频道 ${task.chatId}`}
+                    title={ingestTitleOf(task) ?? titleOf(task.chatId) ?? `频道 ${task.chatId}`}
                     busy={busy}
                     confirming={confirm?.kind === 'one' && confirm.id === task.id}
                     missing={false}
