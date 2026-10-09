@@ -179,7 +179,67 @@ def read_text(path: str) -> str:
         return raw.decode("utf-8", errors="replace")
 
 
+# ---- git 批量预取（2026-10-10，BUG-243 的性能根因）----------------------------------
+# 为什么：原实现**逐次 spawn** —— 实测 **871 次** `git check-ignore` + **45 次** `git cat-file`
+# = **916 次子进程**，单次约 430–460 ms ⇒ 全量跑 **399 s**（最慢一次 **7 分 0.8 秒**）。
+# 而候选集合**有限且可预先枚举**（实测 284 个路径 + 66 个 hash），故改成
+# 「先扫一遍文件取出全部候选 → 各发**一条**批量命令」：**916 次 → 2 次**。
+#
+# 语义**不变**：批量命令 rc 不在允许集合内（无 git / 非仓库 / 命令缺失）时缓存保持 None，
+# 两个判定函数**自动退回**原来的逐次实现 —— 不做静默降级判断。
+_IGNORED: set[str] | None = None      # 会被 `.gitignore` 忽略的路径（None = 无批量结果）
+_COMMITS: set[str] | None = None      # 在本仓库可达的提交（None = 无批量结果）
+
+
+def _prefetch_git() -> None:
+    """「扫全库文件取候选 → 批量问 git」只做一次，供下面两个判定函数查表。"""
+    global _IGNORED, _COMMITS
+    if not os.path.isdir(BUGS):
+        return
+    paths: set[str] = set()
+    hashes: set[str] = set()
+    for fn in sorted(os.listdir(BUGS)):
+        if not fn.endswith(".md"):
+            continue
+        try:
+            with open(os.path.join(BUGS, fn), "rb") as fh:
+                text = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        paths.update(PATH_RE.findall(text))
+        hashes.update(HASH_RE.findall(text))
+
+    try:
+        if paths:
+            r = subprocess.run(
+                ["git", "check-ignore", "--stdin", "-z"],
+                cwd=ROOT, input="\0".join(sorted(paths)),
+                text=True, capture_output=True,
+            )
+            if r.returncode in (0, 1):   # 1 = 没有任何路径被忽略（正常态）
+                _IGNORED = {p for p in r.stdout.split("\0") if p}
+        if hashes:
+            r = subprocess.run(
+                ["git", "cat-file", "--batch-check"],
+                cwd=ROOT, input="".join(f"{h}^{{commit}}\n" for h in sorted(hashes)),
+                text=True, capture_output=True,
+            )
+            if r.returncode == 0:
+                # 命中行回的是**解析后的完整 hash**，缺失行回的是 `<输入>^{commit} missing`。
+                # 故「存在」= 该候选是某个已解析完整 hash 的前缀 —— 不依赖行序、不依赖回显。
+                resolved = {
+                    parts[0] for line in r.stdout.splitlines()
+                    if len(parts := line.split()) >= 2 and parts[1] != "missing"
+                }
+                _COMMITS = {h for h in hashes if any(f.startswith(h) for f in resolved)}
+    except OSError:
+        _IGNORED = None
+        _COMMITS = None
+
+
 def git_has_commit(sha: str) -> bool:
+    if _COMMITS is not None:
+        return sha in _COMMITS
     try:
         r = subprocess.run(
             ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
@@ -199,6 +259,8 @@ def git_ignores(rel: str) -> bool:
 
     用它而不是硬编码「哪些目录算本地证据」：新增 ignored 目录时门禁自动跟上。
     """
+    if _IGNORED is not None:
+        return rel in _IGNORED
     try:
         r = subprocess.run(
             ["git", "check-ignore", "-q", "--", rel],
@@ -220,6 +282,8 @@ def main() -> int:
     if not os.path.isdir(BUGS):
         err("docs/bugs/ 不存在")
         return 1
+
+    _prefetch_git()   # 916 次子进程 → 2 次（见上方「git 批量预取」）
 
     files: dict[int, str] = {}
     for fn in sorted(os.listdir(BUGS)):
