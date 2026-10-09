@@ -230,6 +230,10 @@ export function MergeSeriesDialog(props: {
   onError: (msg: string) => void
 }) {
   const { target, series, onClose, onDone, onError } = props
+  // 订阅 UI 语言（BUG-251）：seriesLabel 在函数内部读 `getLanguage()` 决定标记形态，
+  // 本组件渲染的两处剧名依赖它 —— 不订阅 `settings.language` 则语言切换后标记不更新。
+  // （本对话框文案为既有的中文硬编码，此处只补订阅，不改文案。）
+  useTranslation()
   // 目标自己不能当源
   const candidates = series.filter((s) => s.id !== target.id)
   const [sourceId, setSourceId] = useState<number | null>(candidates[0]?.id ?? null)
