@@ -3,7 +3,7 @@ import { ChevronDown, ChevronRight, X } from 'lucide-react'
 import { Button } from './ui/button'
 import { Progress } from './ui/progress'
 import { CacheBytesPanel } from './CacheBytesPanel'
-import { cn } from '../lib/utils'
+import { cn, formatBytes, formatSpeed } from '../lib/utils'
 import { useTranslation } from '../i18n'
 import { describeTgFailure } from '../lib/tgReason'
 import { deriveEntryState } from '../lib/entryState'
@@ -139,6 +139,32 @@ function fmtWhen(sec: number): string {
 }
 
 /**
+ * 停滞阈值（BUG-221）：字节超过 15s 没再推进而任务仍 `running` ⇒ 行内报
+ * 「已 N 秒无进展」。
+ *
+ * 为什么是 15s：轮询 5s，取 3 拍 —— 既不会把「5s 轮询的正常间隙」误报成卡死，
+ * 也不会让用户等上半分钟才知道停了。
+ */
+const STALL_MS = 15_000
+
+/**
+ * 速度读数的保鲜窗口：最后一次字节推进距今超过 10s 就**不再显示速度**。
+ *
+ * 速度是「相邻两次采样的字节差」派生出来的，它天然带着采样时刻；一旦字节停了，
+ * 这个差值就变成历史值 —— 继续显示等于拿旧速率冒充当前速率（宁缺勿假）。
+ */
+const RATE_FRESH_MS = 10_000
+
+/** 剩余时间文案（`≈3 分 20 秒` 这一档由 i18n 决定语序）。 */
+function fmtEta(sec: number, t: (key: string, vars?: Record<string, string | number>) => string): string {
+  const s = Math.max(0, Math.round(sec))
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const rest = s % 60
+  return h > 0 ? t('tg.ingestEtaHour', { h, m }) : t('tg.ingestEtaMinSec', { m, s: rest })
+}
+
+/**
  * 流水线的一行（AGENTS.md §5：高频路径的行组件必须 `memo` 化）。
  *
  * 行内动作**按组切换**，且只有一条主按钮：已入库 → 去媒体库查看（成品的出口）；
@@ -148,6 +174,8 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
   task: TgCacheTask
   /** 频道标题（宿主没给频道表时退回 `#<chatId>`） */
   title: string
+  /** 宿主时钟（ms）：停滞秒数与速度保鲜都按它算，随轮询刷新（不新开定时器） */
+  now: number
   busy: boolean
   /** 该行是否正在确认「删除记录」 */
   confirming: boolean
@@ -168,6 +196,7 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
   const {
     task,
     title,
+    now,
     busy,
     confirming,
     missing,
@@ -182,7 +211,71 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
     onDismissDelete,
   } = props
   const { t } = useTranslation()
-  const pct = task.total > 0 ? (task.done / task.total) * 100 : 0
+  /**
+   * 进度**以字节为准**（BUG-221）。
+   *
+   * 旧式 `done/total` 的分母是**消息数**：一条几百 MB 的视频 `total = 1`，完成前
+   * 恒 0% —— 最耗时的恰恰最不可见。现在 running 且总量已知时优先用
+   * `progressBytes/progressBytesTotal`；总量未知就退回消息级读数；
+   * 两者都不可用时显示「准备中」，**不假造百分比**。
+   */
+  const pb = task.progressBytes ?? null
+  const pbTotalNum = task.progressBytesTotal ?? 0
+  const running = task.status === 'running'
+  const bytePct =
+    running && pb !== null && pb > 0 && pbTotalNum > 0
+      ? Math.min(100, (pb / pbTotalNum) * 100)
+      : null
+  const msgPct = task.total > 0 ? (task.done / task.total) * 100 : null
+  const pct = bytePct ?? msgPct
+  /** 还没起步（running 但既无字节进度也无已完成条目）：如实说「准备中」，不报 0%。 */
+  const preparing = running && bytePct === null && task.done === 0
+
+  /** 字节心跳距今多久（ms）；`null` = 服务端没给心跳（老库/未起步）。 */
+  const sinceMs = task.progressAt != null ? now - task.progressAt : null
+  const stalled = running && sinceMs !== null && sinceMs > STALL_MS
+  const stalledSec = stalled && sinceMs !== null ? Math.floor(sinceMs / 1000) : null
+
+  /**
+   * 速度 / 剩余时间：相邻两次采样的字节差派生（复用现有 5s 轮询，不新增轮询源）。
+   *
+   * 只有**一次**采样（或字节没涨、心跳没走）时保持 `null` —— 不给数字好过给假数字。
+   * 心跳时间戳用服务端下发的 `progressAt` 做差（同一时钟），不受本机时钟漂移影响。
+   */
+  const [rate, setRate] = useState<{ bps: number; etaSec: number | null } | null>(null)
+  const prevSample = useRef<{ bytes: number; at: number } | null>(null)
+  useEffect(() => {
+    const bytes = task.progressBytes ?? null
+    const at = task.progressAt ?? null
+    const clear = () => setRate((prev) => (prev === null ? prev : null))
+    if (!running || bytes === null || at === null) {
+      prevSample.current = null
+      clear()
+      return
+    }
+    const prev = prevSample.current
+    prevSample.current = { bytes, at }
+    if (prev === null || at <= prev.at || bytes <= prev.bytes) {
+      clear()
+      return
+    }
+    const bps = ((bytes - prev.bytes) * 1000) / (at - prev.at)
+    const remainSec = pbTotalNum > bytes ? Math.round((pbTotalNum - bytes) / bps) : null
+    setRate((p) =>
+      p !== null && Math.abs(p.bps - bps) < 0.5 && p.etaSec === remainSec
+        ? p
+        : { bps, etaSec: remainSec },
+    )
+  }, [running, task.progressBytes, task.progressAt, pbTotalNum])
+
+  /** 速度只在「采样还新鲜」时显示：字节一停，旧速率就不再是当前速率。 */
+  const rateFresh = rate !== null && sinceMs !== null && sinceMs <= RATE_FRESH_MS
+  const bytesLabel =
+    pb !== null && pb > 0
+      ? pbTotalNum > 0
+        ? `${formatBytes(pb)} / ${formatBytes(pbTotalNum)}`
+        : t('tg.ingestDownloaded', { size: formatBytes(pb) })
+      : null
   const active = ACTIVE_STATUS.has(task.status)
   const ingested = task.status === 'done'
   const retryable = RETRYABLE.has(task.status)
@@ -286,12 +379,58 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
         </div>
       </div>
       <div className="mt-1.5 flex items-center gap-2">
-        <Progress value={pct} animated={task.status === 'running'} smoothMs={4800} className="flex-1" />
+        <Progress
+          value={pct ?? 0}
+          animated={running && !stalled}
+          smoothMs={4800}
+          className="flex-1"
+        />
+        {preparing ? (
+          <span className="shrink-0 text-[11px] text-fg-muted" data-testid="cache-task-preparing">
+            {t('tg.ingestPreparing')}
+          </span>
+        ) : pct !== null ? (
+          <span
+            className="shrink-0 text-[11px] tabular-nums text-fg-muted"
+            data-testid="cache-task-bytes-pct"
+          >
+            {pct.toFixed(1)}%
+          </span>
+        ) : null}
         <span className="shrink-0 text-[11px] tabular-nums text-fg-muted">
           {task.done}/{task.total}
         </span>
         <span className="shrink-0 text-[11px] text-fg-muted">{fmtWhen(task.updatedAt)}</span>
       </div>
+      {/* 字节读数 / 速度 / 剩余时间 / 停滞（BUG-221）：把「在下载 / 卡死 / 已恢复」
+          变成可观测的读数，而不是让用户盯着分钟级时间戳猜。 */}
+      {bytesLabel !== null || rateFresh || stalledSec !== null ? (
+        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-fg-muted">
+          {bytesLabel !== null ? (
+            <span className="tabular-nums" data-testid="cache-task-bytes">
+              {bytesLabel}
+            </span>
+          ) : null}
+          {rateFresh && rate !== null ? (
+            <span className="tabular-nums" data-testid="cache-task-speed">
+              {formatSpeed(rate.bps)}
+            </span>
+          ) : null}
+          {rateFresh && rate !== null && rate.etaSec !== null ? (
+            <span className="tabular-nums" data-testid="cache-task-eta">
+              {fmtEta(rate.etaSec, t)}
+            </span>
+          ) : null}
+          {stalledSec !== null ? (
+            <span
+              className="font-medium text-amber-600 dark:text-amber-400"
+              data-testid="cache-task-stalled"
+            >
+              {t('tg.ingestStalled', { n: stalledSec })}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
       {active && task.currentId != null ? (
         <p className="mt-1 text-[11px] text-fg-muted">
           {t('tg.cacheCurrentMsg', { id: task.currentId })}
@@ -473,9 +612,15 @@ export function CacheManagerDialog(props: {
       if (!aliveRef.current) return
       const list = res.tasks ?? []
       const nextCounts = res.counts ?? {}
+      // BUG-221：字节进度与心跳必须进等值判据 —— 否则「只有字节在涨」的刷新会被
+      // 短路掉，行内读数又变回「分钟级不动」，正是本 BUG 的现象。
       const sig =
         list
-          .map((x) => `${x.id}:${x.status}:${x.done}:${x.total}:${x.currentId ?? ''}:${x.error ?? ''}`)
+          .map(
+            (x) =>
+              `${x.id}:${x.status}:${x.done}:${x.total}:${x.currentId ?? ''}:${x.error ?? ''}` +
+              `:${x.progressBytes ?? ''}:${x.progressAt ?? ''}`,
+          )
           .join('|') +
         '#' +
         JSON.stringify(nextCounts)
@@ -500,11 +645,23 @@ export function CacheManagerDialog(props: {
     }
   }, [load])
 
+  /**
+   * 宿主时钟（ms）：停滞秒数与速度保鲜都按它算。
+   *
+   * 为什么要它：字节一停，`progressAt` 就不变，等值短路会拦掉 setState —— 没有
+   * 独立时钟的话「已 N 秒无进展」会冻在第一次读到的 N 上，等于报了个过期数。
+   * 复用既有 5s 轮询的节拍（同一拍里更新），**不新开第二个定时器**。
+   */
+  const [nowMs, setNowMs] = useState(() => Date.now())
+
   // 轮询三律：有活才轮（5s）；全部终态即停。
   const hasActive = tasks.some((x) => ACTIVE_STATUS.has(x.status))
   useEffect(() => {
     if (!hasActive) return
-    const iv = setInterval(() => void load(), 5000)
+    const iv = setInterval(() => {
+      setNowMs(Date.now())
+      void load()
+    }, 5000)
     return () => clearInterval(iv)
   }, [hasActive, load])
 
@@ -877,6 +1034,7 @@ export function CacheManagerDialog(props: {
               key={task.id}
               task={task}
               title={ingestTitleOf(task) ?? titleOf(task.chatId) ?? `频道 ${task.chatId}`}
+              now={nowMs}
               busy={busy}
               confirming={confirm?.kind === 'one' && confirm.id === task.id}
               missing={
@@ -926,6 +1084,7 @@ export function CacheManagerDialog(props: {
                     key={task.id}
                     task={task}
                     title={ingestTitleOf(task) ?? titleOf(task.chatId) ?? `频道 ${task.chatId}`}
+                    now={nowMs}
                     busy={busy}
                     confirming={confirm?.kind === 'one' && confirm.id === task.id}
                     missing={false}

@@ -296,6 +296,19 @@ export interface TgCacheTask {
   itemBytes?: number
   itemBytesTotal?: number
   /**
+   * 字节心跳（BUG-221，仅 running 且已收到字节时有值）。
+   *
+   * 与上两个字段的区别：`itemBytes*` 要求**总量已知**（否则 0/0 没有意义），
+   * 而这里的 `progressBytes` **总量未知也要下发** —— 「未知总量」不能退化成
+   * 「无数据」，否则又回到「0/1 恒 0%」。`progressAt` 是字节最后一次推进的
+   * 墙钟（ms epoch），是前端区分「在下载 / 已停滞」的唯一依据：
+   * `cache_task.updated_at` 只在消息边界与状态变更时写，条目内下载期间不动。
+   */
+  progressAt?: number
+  progressBytes?: number
+  /** 总量未知时服务端显式下发 `null`（不是 0）：据此显示「已下载 X MB」而非假百分比 */
+  progressBytesTotal?: number | null
+  /**
    * 入库内容标题（BUG-232 v2）：该任务覆盖的第一条消息的 caption，
    * 服务端从消息同步时已落库的 `media_message` 带出（/tasks/all 与 /tasks/:id）。
    * 与任务成败无关 —— failed/queued 同样有值；为空时才退回频道链。

@@ -1216,6 +1216,30 @@ fn task_with_progress(st: &AppState, t: &CacheTask, title: Option<&str>) -> serd
                     v["itemBytesTotal"] = json!(total);
                 }
             }
+            // BUG-221：字节心跳。与上面的 `itemBytes` 是**两件事**：
+            // - `itemBytes` 是「条目内进度条」用的读数，要求总量已知（total > 0）才给，
+            //   否则 0/0 的分母没有意义；
+            // - `progressBytes` 是「有没有在推进」的读数，**总量未知也要如实下发**
+            //   （真实场景里 total 常在开流后若干 chunk 才可知），否则「未知总量」会
+            //   退化成「无数据」，界面又回到「0/1 恒 0%」的老样子。
+            //   总量未知时 `progressBytesTotal` 显式为 null：前端据此显示
+            //   「已下载 X MB」而不是拿 0 当分母假造百分比。
+            // `progressAt` 是字节最后一次推进的墙钟（ms epoch），只在真的推进过
+            // （`last_ms > 0`）时才给 —— 它是前端区分「在下载 / 卡死」的唯一依据。
+            // 全部走内存快照，不碰 SQLite（本端点是 1s 轮询的高频读路径）。
+            if let Some((bytes, total, at_ms)) = st.cache_dl_progress_at(t.id) {
+                if bytes > 0 {
+                    v["progressBytes"] = json!(bytes);
+                    v["progressBytesTotal"] = if total > 0 {
+                        json!(total)
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    if at_ms > 0 {
+                        v["progressAt"] = json!(at_ms);
+                    }
+                }
+            }
         }
     }
     v
@@ -5662,6 +5686,167 @@ mod tests {
         assert!(
             task_json.get("itemBytes").is_none(),
             "解绑后不得再注入 itemBytes"
+        );
+    }
+
+    /// BUG-221 判据 a：running 且字节已推进 ⇒ 注入**具体**的 `progressAt`（ms epoch）
+    /// 与 `progressBytes`/`progressBytesTotal`。
+    ///
+    /// 「具体」是关键：`progressAt` 若退化成 0/缺失，前端就只剩 `updated_at`
+    /// （只在消息边界写）可看 —— 大文件下载数分钟期间它不动，用户只能判定「卡死」。
+    #[tokio::test]
+    async fn progress_heartbeat_is_injected_while_bytes_advance() {
+        let dir = scratch_dir("bug221_heartbeat");
+        let st = cache_fixture_state(
+            &dir,
+            vec![],
+            vec![fixture_msg(1, "video", "video/mp4", Some("EP01"), None)],
+        )
+        .await;
+        let task = enqueue_fixture_task(&st, &[1], None).await;
+        let _ = st.store.mark_cache_task_running(task.id).await;
+        st.refresh_cache_tasks().await;
+
+        // 起步（未收字节）：**不得**注入 —— 没起步不等于卡住，此时报心跳是假信号。
+        st.cache_dl_begin(task.id);
+        st.cache_dl.set_total(200);
+        let resp = cache_tasks_payload(&st).await;
+        let task_json = resp.get("task").cloned().expect("task field present");
+        assert!(
+            task_json.get("progressAt").is_none(),
+            "一个字节都还没推进时不得注入心跳（否则「未起步」会被当成「刚动过」）"
+        );
+        assert!(
+            task_json.get("progressBytes").is_none(),
+            "零字节时不得注入 progressBytes"
+        );
+
+        // 真正推进：注入具体毫秒值（不是 0，不是缺失）。
+        st.cache_dl.add_bytes(80);
+        let resp = cache_tasks_payload(&st).await;
+        let task_json = resp.get("task").cloned().expect("task field present");
+        let at = task_json
+            .get("progressAt")
+            .and_then(|v| v.as_u64())
+            .expect("running 且有字节推进时必须注入 progressAt");
+        assert!(
+            at > 1_600_000_000_000,
+            "progressAt 必须是具体的 ms epoch 值，实际: {at}"
+        );
+        assert_eq!(
+            task_json.get("progressBytes").and_then(|v| v.as_u64()),
+            Some(80),
+            "已收字节必须如实下发"
+        );
+        assert_eq!(
+            task_json.get("progressBytesTotal").and_then(|v| v.as_u64()),
+            Some(200),
+            "总量已知时必须下发，供前端算百分比"
+        );
+
+        // 再次推进：心跳必须跟着往前走（「恢复推进」在服务端是可观测的）。
+        let before = at;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        st.cache_dl.add_bytes(40);
+        let resp = cache_tasks_payload(&st).await;
+        let task_json = resp.get("task").cloned().expect("task field present");
+        let after = task_json
+            .get("progressAt")
+            .and_then(|v| v.as_u64())
+            .expect("继续推进后仍须有心跳");
+        assert!(
+            after >= before,
+            "心跳必须单调前移：before={before} after={after}"
+        );
+        assert_eq!(
+            task_json.get("progressBytes").and_then(|v| v.as_u64()),
+            Some(120),
+            "字节必须累加下发"
+        );
+
+        // 解绑（条目结束/切走）：心跳不得再归属本任务。
+        st.cache_dl_end();
+        let resp = cache_tasks_payload(&st).await;
+        let task_json = resp.get("task").cloned().expect("task field present");
+        assert!(
+            task_json.get("progressAt").is_none(),
+            "解绑后不得再注入 progressAt（旧心跳不得错配）"
+        );
+    }
+
+    /// BUG-221 判据 b：总量未知（total == 0）时**仍要**下发已收字节，
+    /// `progressBytesTotal` 显式为 `null` —— 「未知总量」不得退化成「无数据」。
+    #[tokio::test]
+    async fn progress_bytes_survive_unknown_total() {
+        let dir = scratch_dir("bug221_unknown_total");
+        let st = cache_fixture_state(
+            &dir,
+            vec![],
+            vec![fixture_msg(1, "video", "video/mp4", Some("EP01"), None)],
+        )
+        .await;
+        let task = enqueue_fixture_task(&st, &[1], None).await;
+        let _ = st.store.mark_cache_task_running(task.id).await;
+        st.refresh_cache_tasks().await;
+
+        st.cache_dl_begin(task.id);
+        // 不 set_total：模拟「开流了但服务端还没拿到 Content-Length」。
+        st.cache_dl.add_bytes(4096);
+        let resp = cache_tasks_payload(&st).await;
+        let task_json = resp.get("task").cloned().expect("task field present");
+        assert_eq!(
+            task_json.get("progressBytes").and_then(|v| v.as_u64()),
+            Some(4096),
+            "总量未知也必须如实下发已收字节"
+        );
+        assert!(
+            task_json
+                .get("progressBytesTotal")
+                .map(|v| v.is_null())
+                .unwrap_or(false),
+            "总量未知时 progressBytesTotal 必须是显式的 null，实际: {:?}",
+            task_json.get("progressBytesTotal")
+        );
+        assert!(
+            task_json.get("itemBytes").is_none(),
+            "总量未知时仍不注入 itemBytes（0/0 的分母没有意义）"
+        );
+    }
+
+    /// BUG-221 判据 c：非 running 的任务**不**注入心跳。
+    ///
+    /// 排队任务挂着旧条目的字节是错配的常见形态：心跳一旦越界，前端会对一个
+    /// 还没开工的任务报「已 N 秒无进展」。
+    #[tokio::test]
+    async fn progress_heartbeat_is_not_injected_for_queued_task() {
+        let dir = scratch_dir("bug221_queued");
+        let st = cache_fixture_state(
+            &dir,
+            vec![],
+            vec![fixture_msg(1, "video", "video/mp4", Some("EP01"), None)],
+        )
+        .await;
+        let task = enqueue_fixture_task(&st, &[1], None).await;
+        // 故意**不**置 running：任务仍是 queued。
+        st.refresh_cache_tasks().await;
+        assert_eq!(
+            st.cache_tasks_snapshot().await.first().map(|t| t.status.clone()),
+            Some("queued".to_string()),
+            "前置：任务须处于 queued"
+        );
+
+        st.cache_dl_begin(task.id);
+        st.cache_dl.set_total(100);
+        st.cache_dl.add_bytes(50);
+        let resp = cache_tasks_payload(&st).await;
+        let task_json = resp.get("task").cloned().expect("task field present");
+        assert!(
+            task_json.get("progressAt").is_none(),
+            "排队任务不得注入心跳"
+        );
+        assert!(
+            task_json.get("progressBytes").is_none(),
+            "排队任务不得注入字节进度"
         );
     }
 

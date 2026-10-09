@@ -13,6 +13,7 @@
 //!     → Authorized(user_id, phone)
 
 use std::pin::Pin;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -147,10 +148,25 @@ pub struct MediaStream {
 /// 内 `done` 计数纹丝不动，对用户完全等价于「系统死了」）。
 ///
 /// 字段全是 `Arc<AtomicU64>`：句柄可 Clone 进 worker 与序列化方，无锁累加。
+///
+/// `last_ms`（BUG-221）：**字节最后一次推进**的墙钟时刻（ms epoch，0 = 尚无推进）。
+/// 它只在 `add_bytes` 里随字节一起更新（单一真源），因此「有字节、但很久没再涨」
+/// 与「正在跑」在服务端就是可区分的两件事 —— 没有它，前端只能拿
+/// `cache_task.updated_at`（只在消息边界写）去猜，大文件下载期间那个值天然不动，
+/// 用户据此只能判定「卡住了」。
 #[derive(Clone, Default)]
 pub struct DownloadProgress {
     pub bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub last_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// 当前墙钟（ms epoch）；取不到（时钟早于 epoch）时为 0 —— 宁可「未知」也不假造。
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl DownloadProgress {
@@ -161,15 +177,33 @@ impl DownloadProgress {
     pub fn add_bytes(&self, n: u64) {
         self.bytes
             .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        // 只有**真的推进**才刷新心跳：空 chunk（n == 0）不构成进展，
+        // 否则「零字节空转」会被当成「刚动过」，停滞判据失效。
+        if n > 0 {
+            self.last_ms
+                .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+        }
     }
     pub fn reset(&self) {
         self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
         self.total.store(0, std::sync::atomic::Ordering::Relaxed);
+        // 新条目尚无推进 ⇒ 心跳未知（0）。写成 now() 会让「排队后刚开流、一个字节
+        // 都还没到」被算成「刚推进过」，停滞判据就被推迟了一次假心跳。
+        self.last_ms.store(0, std::sync::atomic::Ordering::Relaxed);
     }
     pub fn load(&self) -> (u64, u64) {
         (
             self.bytes.load(std::sync::atomic::Ordering::Relaxed),
             self.total.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+    /// 字节 + 总量 + 最后推进时刻（`BUG-221`）。`last_ms == 0` 表示尚无推进。
+    pub fn load_with_at(&self) -> (u64, u64, u64) {
+        let (bytes, total) = self.load();
+        (
+            bytes,
+            total,
+            self.last_ms.load(std::sync::atomic::Ordering::Relaxed),
         )
     }
 }

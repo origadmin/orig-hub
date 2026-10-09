@@ -184,6 +184,23 @@ impl AppState {
         }
     }
 
+    /// 当前条目字节**连同最后推进时刻**（BUG-221，原子同拍读取）。
+    ///
+    /// 返回 `(bytes, total, last_ms)`，`last_ms == 0` 表示「绑定了但一个字节都还没推进」
+    /// （此时不得算出停滞：还没起步不等于卡住）。归属判定与 `cache_dl_progress` 同口径：
+    /// 字节不属于 `task_id` 时返回 None，防止旧条目的心跳错配到新任务上。
+    pub fn cache_dl_progress_at(&self, task_id: i64) -> Option<(u64, u64, u64)> {
+        if self
+            .cache_dl_task
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == task_id
+        {
+            Some(self.cache_dl.load_with_at())
+        } else {
+            None
+        }
+    }
+
     /// 尝试占住 worker 名额：返回 false 表示已有 worker 在跑（新任务留在队列等接续）。
     pub fn claim_cache_worker(&self) -> bool {
         self.cache_worker_alive
