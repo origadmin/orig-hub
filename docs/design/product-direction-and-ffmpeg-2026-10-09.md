@@ -1,12 +1,22 @@
 ---
 status: draft
+author: 高见远（架构师）
+date: 2026-10-09
+topic: governance
+module: docs
+decided-by: —（待 D1/D2/D3 拍板，见 `docs/review/product-direction-decisions-2026-10-09.md`）
+decided-at: —
+landed-in: 无（本文为评估与计划；PD-T01~PD-T05 均未开工）
 ---
 
-# 产品主体重定位 + ffmpeg 组件化：评估、方案、优先度与里程碑
+# 产品主体重定位 + ffmpeg 组件化：评估、方案、任务分解与里程碑
 
 - 日期: 2026-10-09
-- 类型: 产品定位评估 + 依赖组件化设计
-- 状态: draft —— 含 **3 条待拍板**，见 `docs/review/product-direction-decisions-2026-10-09.md`
+- 类型: 产品定位评估 + 依赖组件化设计 + 执行计划
+- 状态: draft —— 含 **3 条待拍板**（`decided-by` 为 `—` 期间本文不得被当作既成事实执行）
+- 关联待拍板清单: `docs/review/product-direction-decisions-2026-10-09.md`
+- 关联任务表: 本文 **§4.2**（`PD-T01`~`PD-T05`，含源文件/依赖/优先级/状态/负责）
+- `topic` 取值说明: 本文是**产品定位与路线图**，故取 `governance`；其中 ffmpeg 分发（档 B）与共享（D3）的落地细节属 `deployment` 域，届时另开 `docs/design/*` 档并在 `docs/README.md` 登记
 - 触发: 产品负责人 2026-10-09 提出两项：
   ① **ffmpeg 将作为默认播放组件或插件** —— 需要设计安装、设置、提供服务的方案；
   ② 结合当前的改名，**工具主体是否应调整为「以媒体为核心的下载/上传/共享/管理工具」** ——
@@ -19,10 +29,10 @@ status: draft
 
 | # | 结论 | 严重度 |
 |---|---|---|
-| 1 | **BUG-230 把 raw 退役为下载/导出端点之后，ffmpeg 已从「可选兜底」变成「唯一播放路径」** —— 但产品里**没有安装、没有版本管理、没有一个设置项**；缺失时 orig-tg 回 501（`routes.rs:3438-3443`），前端只显示停载遮罩，文案还把用户引向「检查后台服务」（`zh-CN.json:316`）—— **指错了方向**。这是本轮最该先补的缺口 | 高 |
+| 1 | **BUG-230 把 raw 退役为下载/导出端点之后，ffmpeg 已从「可选兜底」变成「唯一播放路径」** —— 但产品里**没有安装、没有版本管理、没有一个设置项**；缺失时 orig-tg 回 501（`download-engine/crates/orig-tg/src/routes.rs:3481-3486`），前端只显示停载遮罩，文案还把用户引向「检查后台服务」（`tauri-shell/src/i18n/locales/zh-CN.json:323`）—— **指错了方向**。这是本轮最该先补的缺口 | 高 |
 | 2 | 你的三项新能力里，**上传与共享是零实现**，**通用文件管理也是新能力**（现有「文件」能力全被媒体域包裹）。所以这不是「调整主体」，是**新增三个模块** | 高 |
-| 3 | 「共享」在语义上要求**首次把服务暴露到非环回地址**。现状 orig-tg 与 daemon 均只绑 `127.0.0.1`（`config.rs:14`），且投递节流**只在非环回生效**（BUG-199）。共享不是「加个端点」，是**首次变更安全姿态**，必须先有裁定 | 高 |
-| 4 | 定位表述与你的表述**已经不一致**：`README.md:3` 与 `Sidebar.tsx:8` 都写「下载管理器 / APP 核心是下载工具」，而 `DESIGN_BRIEF.md:5` 早已写「下载管理器 **+ 媒体中心**」。**先把定位对齐（零代码风险）比先写代码更能决定后续排序** | 中 |
+| 3 | 「共享」在语义上要求**首次把服务暴露到非环回地址**。现状 orig-tg 与 daemon 均只绑 `127.0.0.1`（`download-engine/crates/orig-tg/src/config.rs:14`），且投递节流**只在非环回生效**（BUG-199）。共享不是「加个端点」，是**首次变更安全姿态**，必须先有裁定 | 高 |
+| 4 | 定位表述与你的表述**已经不一致**：`./README.md:3` 与 `tauri-shell/src/components/Sidebar.tsx:8` 都写「下载管理器 / APP 核心是下载工具」，而 `docs/DESIGN_BRIEF.md:5` 早已写「下载管理器 **+ 媒体中心**」。**先把定位对齐（零代码风险）比先写代码更能决定后续排序** | 中 |
 | 5 | 「改名」的仓库证据只有**内核 crate `surge-*` → `orig-*`**（`6f2a62a`）与两处文档改名；**产品名 Orig Hub 未变**。若你要的是产品级改名，波及面要单独列清单（sidecar 名 / appData 目录 / 环境变量 / localStorage 键 / HTTP 头），见 §3.3 | 中 |
 | 6 | **不存在任何产品级路线图文档**（全库无 roadmap/milestone）。既有「计划」载体都是功能级/缺陷级（`docs/design/*-plan.md`、`docs/bugs/BACKLOG-*.md`）。本文的 §4 是第一份 | 中 |
 
@@ -30,20 +40,29 @@ status: draft
 
 ## 1. 事实底座（可复核）
 
+> **引用锚定说明（2026-10-09）**：本节及全文所有 `文件:行号` 引用**锚定于 2026-10-09 的工作区状态**。
+> 当时 `download-engine/crates/orig-tg/src/routes.rs`、`download-engine/crates/orig-daemon/src/routes.rs`、
+> `download-engine/crates/orig-tg/src/store.rs` 三个文件**含有未提交的在途改动**
+> （`git diff --numstat` 分别为 `+52/-9`、`+44/-0`、`+31/-0`），本次已按工作区重新锚定，
+> 映射见文末「变更记录」。
+> **行号会随代码移动而失效，构造名不会** —— 引用对不上时请按**构造名**检索，不要按行号找：
+> `resolve_ffmpeg_path`（ffmpeg 解析链）、`transcode_pump`（唯一 spawn 点）、`media_item_stream`（stream 端点）、
+> `encode_profile`（编码档位）、`proxy_dir`（产物落盘目录）。
+
 ### 1.1 ffmpeg 现状：一个完全隐式的运行期外部依赖
 
 | 维度 | 事实 | 证据 |
 |---|---|---|
-| 调用点 | 全仓**唯一** spawn ffmpeg 的地方是 orig-tg 的转码泵；**ffprobe 在产品代码中零调用** | `download-engine/crates/orig-tg/src/routes.rs:3605`（`transcode_pump` 内，3571-3805） |
-| 用途 | 服务端实时转码：H.264 兼容流 + 按倍速的 FRC 变体（fMP4 直播流 / 落盘代理） | 参数构造 `routes.rs:3612-3667` |
-| 端点 | `GET /api/media/items/:id/stream`（命中代理直接投递，冷启动才 spawn） | `routes.rs:3370-3559` |
-| 定位方式 | **无 bundled sidecar**。解析链：`ORIG_FFMPEG_PATH` → 可执行文件同目录 → `<TG 数据目录>/bin/` → `%LOCALAPPDATA%\OrigHub\bin` → `<TG 数据目录>/../bin/` → `PATH` | `routes.rs:3286-3343`（env 读于 `:3287`，候选目录 `:3319-3341`） |
-| 缺失时 | 返回 **501 NOT_IMPLEMENTED**，文案要求用户自行安装或设 env | `routes.rs:3438-3443` |
+| 调用点 | 全仓**唯一** spawn ffmpeg 的地方是 orig-tg 的转码泵；**ffprobe 在产品代码中零调用** | `download-engine/crates/orig-tg/src/routes.rs:3648`（`transcode_pump` 内，3614-3848） |
+| 用途 | 服务端实时转码：H.264 兼容流 + 按倍速的 FRC 变体（fMP4 直播流 / 落盘代理） | 参数构造 `download-engine/crates/orig-tg/src/routes.rs:3655-3710` |
+| 端点 | `GET /api/media/items/:id/stream`（命中代理直接投递，冷启动才 spawn） | `download-engine/crates/orig-tg/src/routes.rs:3413-3602` |
+| 定位方式 | **无 bundled sidecar**。解析链：`ORIG_FFMPEG_PATH` → 可执行文件同目录 → `<TG 数据目录>/bin/` → `%LOCALAPPDATA%\OrigHub\bin` → `<TG 数据目录>/../bin/` → `PATH` | `download-engine/crates/orig-tg/src/routes.rs:3329-3386`（env 读于 `:3330`，候选目录 `:3362-3384`） |
+| 缺失时 | 返回 **501 NOT_IMPLEMENTED**，文案要求用户自行安装或设 env | `download-engine/crates/orig-tg/src/routes.rs:3481-3486` |
 | 前端表现 | 拿不到兼容流 → 停载遮罩 + 致命态 | `tauri-shell/src/components/media/VideoPlayer.tsx:738-760`、`:1040` |
 | 安装/版本管理 | **不存在**。无下载代码、无校验、无最低版本断言 | `scripts/sync-sidecars.sh:73` 只同步 `orig-tg`/`orig-daemon`；`tauri-shell/src-tauri/tauri.conf.json:34` `externalBin` 不含 ffmpeg；`.github/workflows/ci.yml` 无 ffmpeg 步骤 |
 | 设置面 | 前端**无任何** ffmpeg / 转码 / 清晰度设置项 | `tauri-shell/src/components/SettingsPanel.tsx` 无匹配；`tauri-shell/src/hooks/usePlayerSettings.ts:11` 注释明写「无多档转码，不存在清晰度概念」 |
-| 可调项 | 仅 3 个 env；编码档位**硬编码在代码里** | `ORIG_FFMPEG_PATH` `routes.rs:3287`；`ORIG_TG_PROXY_MAX_BYTES` `routes.rs:3818`；`ORIG_TG_DELIVERY_BPS` `routes.rs:3931`；`encode_profile` `routes.rs:3238-3244` |
-| 产物落盘 | `<TG 数据目录>/proxies/`，命名 `<id>.mp4` / `<id>-speed-<百分之一倍速>.mp4` | `crates/orig-tg/src/store.rs:724`、`routes.rs:3396-3398` |
+| 可调项 | 仅 3 个 env；编码档位**硬编码在代码里** | `ORIG_FFMPEG_PATH` `download-engine/crates/orig-tg/src/routes.rs:3330`；`ORIG_TG_PROXY_MAX_BYTES` `download-engine/crates/orig-tg/src/routes.rs:3861`；`ORIG_TG_DELIVERY_BPS` `download-engine/crates/orig-tg/src/routes.rs:3974`；`encode_profile` `download-engine/crates/orig-tg/src/routes.rs:3281-3287` |
+| 产物落盘 | `<TG 数据目录>/proxies/`，命名 `<id>.mp4` / `<id>-speed-<百分之一倍速>.mp4` | `download-engine/crates/orig-tg/src/store.rs:750-761`、`download-engine/crates/orig-tg/src/routes.rs:3439-3441` |
 | 本机现状 | 唯一「落地」是人工记录：ffmpeg 9.0.2 手工放在 `%LocalAppData%\OrigHub\bin\ffmpeg.exe` | `docs/bugs/BUG-208.md:48-49` |
 
 > **一句话**：ffmpeg 是「用户看不见、装不了、查不到、也关不掉」的组件，而它现在承载着**全部播放**。
@@ -52,7 +71,7 @@ status: draft
 
 | 位置 | 表述 |
 |---|---|
-| `README.md:3` | 「Orig Hub —— 基于 Surge 架构参考的**桌面端下载管理器**（YouTube Studio 风格）」 |
+| `./README.md:3` | 「Orig Hub —— 基于 Surge 架构参考的**桌面端下载管理器**（YouTube Studio 风格）」 |
 | `tauri-shell/src/components/Sidebar.tsx:8` | 「**APP 核心是下载工具**，下载队列按 `download.status` 的七态拆成三档导航」 |
 | `docs/DESIGN_BRIEF.md:5` | 「Orig Hub 是一款**桌面端下载管理器 + 媒体中心**……新增视频播放（接入 orig-cms-ee）、媒体库、悬浮窗、FAB 等核心模块」 |
 | `download-engine/README.md:1` | 「orig-hub 下载内核」 |
@@ -60,7 +79,7 @@ status: draft
 **已写下的模块边界裁定**（与「媒体为核心」方向一致，是既有地基）：
 
 - `docs/MEDIA-DESIGN.md:11-16`：M1 展示 / M2 缓存 / M3 媒体库 三模块职责与**禁区**；M3 的禁区含「**不依赖 TG 会话**」。
-- `docs/design/media-service-deployment-decision-2026-09-28.md:5-6`：裁定「**媒体库是独立核心模块；Telegram 只是可替换的采集/传输通道**」。
+- `docs/design/media-service-deployment-decision-2026-09-28.md:6-8`：裁定「**媒体库是独立核心模块；Telegram 只是可替换的采集/传输通道**」。
 
 **未写下**：任何产品级的「本产品不做 X」非目标声明。
 
@@ -68,10 +87,10 @@ status: draft
 
 | 能力 | 你的定位 | 现状 | 证据 |
 |---|---|---|---|
-| 下载 | 既有 | ✅ 已实现（CRUD + SSE + activity） | `download-engine/crates/orig-daemon/src/routes.rs:884-897` |
-| 播放 | 隐含（「视频为主」） | ✅ 已实现，但**硬依赖 ffmpeg**（BUG-230 后） | `crates/orig-tg/src/routes.rs:96`（raw）、`:98`（stream） |
-| 媒体库 | （未提，但已存在） | ✅ 已成型：条目 / 剧集 / 标签 / 相册 / 导出 | `tauri-shell/src/components/MediaLibraryPanel.tsx`、`components/media/*`、`crates/orig-tg/src/routes.rs:86-167` |
-| **文件管理（通用）** | **核心** | ❌ **无**。现有「文件」能力**全部被媒体域包裹**：`/api/media/scan`（`routes.rs:168`）、导入（`routes.rs:88-89`）、剧集内移动（`routes.rs:132-135`）。没有通用浏览/移动/删除/去重端点 | 同上 |
+| 下载 | 既有 | ✅ 已实现（CRUD + SSE + activity） | `download-engine/crates/orig-daemon/src/routes.rs:925-931` |
+| 播放 | 隐含（「视频为主」） | ✅ 已实现，但**硬依赖 ffmpeg**（BUG-230 后） | `download-engine/crates/orig-tg/src/routes.rs:96`（raw）、`:98`（stream） |
+| 媒体库 | （未提，但已存在） | ✅ 已成型：条目 / 剧集 / 标签 / 相册 / 导出 | `tauri-shell/src/components/MediaLibraryPanel.tsx`、`components/media/*`、`download-engine/crates/orig-tg/src/routes.rs:86-167` |
+| **文件管理（通用）** | **核心** | ❌ **无**。现有「文件」能力**全部被媒体域包裹**：`/api/media/scan`（`download-engine/crates/orig-tg/src/routes.rs:168`）、导入（`download-engine/crates/orig-tg/src/routes.rs:88-89`）、剧集内移动（`download-engine/crates/orig-tg/src/routes.rs:132-135`）。没有通用浏览/移动/删除/去重端点 | 同上 |
 | **上传** | 强化（EE 平台，后期） | ❌ **无**。只有「**导出**本地目录供 orig-studio-ee 上传」一侧，上传本体在产品之外 | `docs/design/ee-export-p6-2026-09-25.md:3` |
 | **共享（本地/FTP/HTTP）** | 强化 | ❌ **无**。`SourceKind::Ftp` 是**下载协议枚举**不是共享服务；FTP 在下载侧也只是「未来插件」 | `download-engine/crates/orig-core/src/protocol.rs:271`；`download-engine/README.md:108` |
 
@@ -85,9 +104,9 @@ BUG-230 之前，raw 直解是主路径，ffmpeg 只是「浏览器解不了时�
 BUG-230 之后（`docs/bugs/BUG-230.md`，用户裁定），**播放一律 stream-first**，raw 退役为下载/导出端点。于是：
 
 - ffmpeg 缺失 = **什么视频都放不了**，而不是「个别格式放不了」；
-- 而用户看到的文案是「请确认 OrigHub 后台服务（orig-tg）正在运行」（`zh-CN.json:316`）——
+- 而用户看到的文案是「请确认 OrigHub 后台服务（orig-tg）正在运行」（`tauri-shell/src/i18n/locales/zh-CN.json:323`）——
   后台服务明明在跑，**文案把用户引向了一个不会出错的方向**；
-- 501 的原文（`routes.rs:3441`）虽然说了要装 ffmpeg，但它是**HTTP 响应体**，不是用户可见的 UI 文案。
+- 501 的原文（`download-engine/crates/orig-tg/src/routes.rs:3484`）虽然说了要装 ffmpeg，但它是**HTTP 响应体**，不是用户可见的 UI 文案。
 
 **结论：这不是「新功能」，是一个由 BUG-230 直接引出的既有缺陷。** 它排 P0。
 
@@ -95,11 +114,11 @@ BUG-230 之后（`docs/bugs/BUG-230.md`，用户裁定），**播放一律 strea
 
 **档 A — 可诊断（最小）**
 
-- 启动自检：复用既有解析链 `routes.rs:3286-3343`，在 `/api/tg/diag` 增加 ffmpeg 字段
+- 启动自检：复用既有解析链 `download-engine/crates/orig-tg/src/routes.rs:3329-3386`，在 `/api/tg/diag` 增加 ffmpeg 字段
   （是否找到 / 路径 / 版本）。
 - 前端：设置页显示「播放引擎：已安装 v9.0.2（路径…）/ **未安装**」；
   把 501 翻译成能行动的文案（装什么、放哪里、或点哪个按钮）。
-- 涉及: `download-engine/crates/orig-tg/src/routes.rs:3286-3343`（复用，不重写）、
+- 涉及: `download-engine/crates/orig-tg/src/routes.rs:3329-3386`（复用，不重写）、
   `tauri-shell/src/components/SettingsPanel.tsx`、`tauri-shell/src/i18n/locales/zh-CN.json`、
   `tauri-shell/src/i18n/locales/en-US.json`
 - 量化: 1 个 diag 字段 + 1 个设置区块 + 2~3 处文案；**0 新增依赖、0 新端点**
@@ -110,22 +129,22 @@ BUG-230 之后（`docs/bugs/BUG-230.md`，用户裁定），**播放一律 strea
 
 - 应用内一键安装/更新：下载静态构建 → **校验 sha256** → 落到
   `%LOCALAPPDATA%\OrigHub\bin\ffmpeg.exe`。
-  **注意：这个位置已经是既有解析链的第 4 位（`routes.rs:3323-3325`），装进去即生效，无需改解析链。**
+  **注意：这个位置已经是既有解析链的第 4 位（`download-engine/crates/orig-tg/src/routes.rs:3366-3368`），装进去即生效，无需改解析链。**
 - 版本记录 + 最低版本断言（代码已依赖 `-fpsmax` 与 `atempo` 的段界行为，
-  见 `routes.rs:3632-3634`、`:3250-3263`，但没有任何版本护栏）。
-- 设置面：转码开关、缓存预算（`ORIG_TG_PROXY_MAX_BYTES` 已有 env，`routes.rs:3818`）、
-  编码档位（现硬编码 `routes.rs:3238-3244`）。
+  见 `download-engine/crates/orig-tg/src/routes.rs:3675-3677`、`:3293-3306`，但没有任何版本护栏）。
+- 设置面：转码开关、缓存预算（`ORIG_TG_PROXY_MAX_BYTES` 已有 env，`download-engine/crates/orig-tg/src/routes.rs:3861`）、
+  编码档位（现硬编码 `download-engine/crates/orig-tg/src/routes.rs:3281-3287`）。
 - 涉及: `download-engine/crates/orig-tg/src/`（**将新建**安装模块）、
   `download-engine/crates/orig-daemon/src/routes.rs`（下载代理端点，**将新建**）、
   `tauri-shell/src/components/SettingsPanel.tsx`
 - 量化: 首次约 80–120 MB 下载；新增 3~4 个端点；1 个版本常量
 - 回归风险: 中 —— 引入供应链信任（镜像可信度）、代理（本机是 SOCKS5 `127.0.0.1:7897` 场景，
-  见 `crates/orig-tg/src/config.rs:30-32`）、离线可用性
+  见 `download-engine/crates/orig-tg/src/config.rs:30-32`）、离线可用性
 - 后果: 用户零操作即可播；但产品从此背上**分发与信任责任**
 
 **档 C — 插件化（可替换后端）**
 
-- 把 spawn 点 `routes.rs:3605` 与 `encode_profile`/`speed_video_filter` 抽象为 provider trait，
+- 把 spawn 点 `download-engine/crates/orig-tg/src/routes.rs:3648` 与 `encode_profile`/`speed_video_filter` 抽象为 provider trait，
   允许 ffmpeg 之外的实现（硬件编码器、远程转码）。
 - 量化: **无法量化收益** —— 现在没有第二个后端，抽象是为不存在的需求付成本
 - 后果: 增加一层间接，且会拖慢 A/B
@@ -140,7 +159,7 @@ C 需要第二个后端才有意义，现在做就是过度设计。
 
 ### 2.4 边界（明确不做）
 
-- **不做转码参数的用户可见"画质档位"**：`usePlayerSettings.ts:11` 已裁定「本地文件直投，不存在清晰度概念」；
+- **不做转码参数的用户可见"画质档位"**：`tauri-shell/src/hooks/usePlayerSettings.ts:11` 已裁定「本地文件直投，不存在清晰度概念」；
   B 档暴露的是**开关与预算**，不是"1080p/720p"这种伪档位。
 - **不把 ffmpeg 塞进 Tauri `externalBin`**：那会让安装包膨胀且把 GPL/LGPL 分发义务带进主包；
   独立安装到用户数据目录同时解决了体积与许可两个问题。
@@ -165,7 +184,7 @@ C 需要第二个后端才有意义，现在做就是过度设计。
 **张力一：文件管理 vs 媒体库 —— 是「同一件事的两个视图」，还是「两个模块」？**
 
 - 媒体库管的是**领域模型**（条目 / 剧集 / 来源），且已裁定为独立核心模块、
-  明确「不依赖 TG」（`docs/MEDIA-DESIGN.md:11-16`、`media-service-deployment-decision-2026-09-28.md:5-6`）。
+  明确「不依赖 TG」（`docs/MEDIA-DESIGN.md:11-16`、`docs/design/media-service-deployment-decision-2026-09-28.md:6-8`）。
 - 「文件管理」管的是**磁盘上的字节**（浏览 / 移动 / 删除 / 去重 / 占用）。
 - 两者关系必须选一种，否则做出来会互相打架：
   - 若文件管理 = 媒体库的一个**视图**（只看媒体文件在磁盘上的呈现）→ 增量小，
@@ -177,7 +196,7 @@ C 需要第二个后端才有意义，现在做就是过度设计。
 
 **张力二：共享 = 首次把服务暴露到局域网**
 
-- 现状：orig-tg `config.rs:14` 默认 `bind = "127.0.0.1"`（注释明写「仅本机」）；daemon 同理。
+- 现状：orig-tg `download-engine/crates/orig-tg/src/config.rs:14` 默认 `bind = "127.0.0.1"`（注释明写「仅本机」）；daemon 同理。
 - BUG-199 已裁定：媒体投递节流**只在非环回生效**（环回时返回 0 = 不限速）。
   一旦监听非环回，**限速 / 背压 / 并发会立刻从"不存在的问题"变成真问题**。
 - 另外还缺：认证（谁能看）、绑定策略（`0.0.0.0` 还是指定网卡）、防火墙引导、TLS。
@@ -196,24 +215,33 @@ C 需要第二个后端才有意义，现在做就是过度设计。
 
 仓库里**已发生**的改名只有内核 crate：`6f2a62a refactor(download-engine): rename entire Rust kernel from surge-* to orig-*`
 （`libsurge→orig-core`、`surge-daemon→orig-daemon`、`surge-net→orig-net`、`surge-protocol-*→orig-protocol-*`），
-以及两处文档改名。**产品名「Orig Hub」在 `README.md:1`、`DESIGN_BRIEF.md:5` 一致，未变。**
+以及两处文档改名。**产品名「Orig Hub」在 `./README.md:1`、`docs/DESIGN_BRIEF.md:5` 一致，未变。**
 
 若要做产品级改名，以下标识符会被波及（**这些比文档改名贵得多**）：
 
 | 类别 | 现状 | 证据 |
 |---|---|---|
-| sidecar 名 | `orig-daemon`、`orig-tg` | `tauri-shell/src-tauri/tauri.conf.json:34`、`src-tauri/src/lib.rs:16` |
+| sidecar 名 | `orig-daemon`、`orig-tg` | `tauri-shell/src-tauri/tauri.conf.json:34`、`tauri-shell/src-tauri/src/lib.rs:16` |
 | appData 目录 | `%APPDATA%\com.origadmin.orighub`（`daemon.endpoint` 真源） | 运行时实测 |
 | 环境变量 | 旧名残留 `SURGE_DOWNLOAD_DIR`/`SURGE_MAX_CONNECTIONS`/`SURGE_TOKEN`；新名 `ORIG_*` 一组 | `download-engine/README.md:49,64,73` |
 | localStorage 键 | `orighub_player_settings`；`orighub.compatSrcs`（已废） | `tauri-shell/src/hooks/usePlayerSettings.ts:20` |
-| HTTP 头 | `x-orig-stream` | `crates/orig-tg/src/routes.rs:3433` |
+| HTTP 头 | `x-orig-stream` | `download-engine/crates/orig-tg/src/routes.rs:3476` |
 
 **判定：改名本身不产生用户价值，但会产生一次全量回归风险**（旧 appData 目录里的会话/凭据/缓存会"丢失"，
 旧 env 失效）。除非有外部约束（品牌 / 上架），建议**只统一用户可见的产品名与文档表述，不动标识符**。
 
 ---
 
-## 4. 优先度与里程碑
+## 4. 计划：优先度、任务分解、里程碑
+
+> **本节是本文的可执行部分。**
+> 本文首版（2026-10-09）只有散文式优先级（P0–P4）与里程碑表 —— **没有任务、没有依赖、没有负责**。
+> 产品负责人同日指出「无管理、无计划、完全脱离、不符合规范流程」，§4.2~§4.5 即为该缺口的补齐：
+> **§4.2 = 任务（谁、做什么、改哪个文件、卡在谁身上）**，**§4.3 = 里程碑与任务的对应**，
+> **§4.4 = 与缺陷登记册的接口**，**§4.5 = 这份计划本身怎么被维护**。
+>
+> 表列沿用本仓既有计划范式 `docs/design/store-db-split-design-2026-09-29.md` §7
+> （`Task ID | 任务名 | 源文件 | 依赖 | 优先级`），并按「无管理」的批评补 `状态` 与 `负责` 两列。
 
 ### 4.1 排序依据（不是偏好，是依赖）
 
@@ -231,15 +259,68 @@ C 需要第二个后端才有意义，现在做就是过度设计。
 | **P3** | **共享最小可用**（局域网 HTTP 只读） | 你的「强化」；安全裁定已在 P1 完成 |
 | **P4** | **上传**（EE 直传，导出包升级） | 你自己定的「后期」；且导出包已能过渡 |
 
-### 4.2 里程碑
+### 4.2 任务清单（5 项，按依赖排序）
 
-| 里程碑 | 内容 | 完成判据（可证伪） |
+| Task ID | 任务名 | 源文件 | 依赖 | 优先级 | 状态 | 负责 |
+|---|---|---|---|---|---|---|
+| **PD-T01** | **播放引擎可见性（档 A）**：`/api/tg/diag` 增 ffmpeg 字段（找到/路径/版本）；设置页显示「播放引擎」状态；把 501 翻译成可行动文案（改掉把用户引向「检查后台服务」的 `tauri-shell/src/i18n/locales/zh-CN.json:323`） | `download-engine/crates/orig-tg/src/routes.rs:3329-3386`（复用解析链，**不重写**）、`tauri-shell/src/components/SettingsPanel.tsx`、`tauri-shell/src/i18n/locales/zh-CN.json`、`tauri-shell/src/i18n/locales/en-US.json` | — | P0 | 未开工 | 工程师（engine+shell） |
+| **PD-T02** | **定位对齐**：`README.md`/`Sidebar.tsx`/`DESIGN_BRIEF.md` 三处表述统一到「媒体为核心的文件管理工具」，并在 `DESIGN_BRIEF.md` 追加「非目标声明」节（本文 §2.4 / §3.2 的边界沉淀为常驻条文） | `./README.md:3`、`tauri-shell/src/components/Sidebar.tsx:8`、`docs/DESIGN_BRIEF.md:5` | —（与 PD-T01 无依赖，可并行） | P1 | 未开工 | PM + 架构师（纯文档，0 代码风险） |
+| **PD-T03** | **ffmpeg 受管理组件（档 B）**：应用内下载 → **sha256 校验** → 落 `%LOCALAPPDATA%\OrigHub\bin\ffmpeg.exe`（该位置已是既有解析链第 4 位，**无需改解析链**）；版本记录 + 最低版本断言；设置面暴露开关与缓存预算（`ORIG_TG_PROXY_MAX_BYTES`） | `download-engine/crates/orig-tg/src/`（**新建**安装/校验模块）、`download-engine/crates/orig-daemon/src/routes.rs`（**新建**下载代理端点）、`tauri-shell/src/components/SettingsPanel.tsx` | **D2 拍板** | P1 | 未开工 | 工程师（engine+shell） |
+| **PD-T04** | **文件管理**（视频为主，其他次之）：通用浏览/移动/删除，形态由 D1 决定 —— A 档为纲（一级导航重排 + daemon 通用文件端点组），B 档为视图（媒体库内存储子视图 + 2~3 个端点） | **依 D1**：A → `tauri-shell/src/components/Sidebar.tsx` + `download-engine/crates/orig-daemon/src/routes.rs`（**新建**端点组）；B → `tauri-shell/src/components/MediaLibraryPanel.tsx` + `download-engine/crates/orig-tg/src/routes.rs`（**新建** 2~3 端点） | **D1 拍板**、PD-T02 | P2 | 未开工 | 工程师（engine+shell） |
+| **PD-T05** | **共享最小可用**：局域网 HTTP 只读 + 认证；共享绑定与现有 `bind` **分离**；非环回投递限速（BUG-199 判据）在共享路径上复验 | `download-engine/crates/orig-tg/src/config.rs`（**新建**共享绑定，与 `:14` 的 `bind` 分离）、`download-engine/crates/orig-tg/src/routes.rs`（**新建**共享端点组 + 认证）、`tauri-shell/src/components/SettingsPanel.tsx` | **D3 拍板**、PD-T03 | P3 | 未开工 | 工程师（engine+shell） |
+
+> **任务数 = 5**（与 `store-db-split-design-2026-09-29.md` §7 同一上限：任务表超过 5 行就没人读得完）。
+> **P4（上传）刻意不在此表** —— 它的前置是 **EE 侧接口**（`docs/design/ee-export-p6-2026-09-25.md`），
+> 接口未定前拆解出来的任务必返工。接口定稿后在本表新增 `PD-T06`，并同步 §4.3 的 M4 行。
+>
+> **依赖图**（`A → B` 读作「A 完成后才能开工 B」）：
+>
+> ```mermaid
+> graph LR
+>     D1[D1 拍板 文件管理形态] --> PD-T04
+>     D2[D2 拍板 ffmpeg 获取] --> PD-T03
+>     D3[D3 拍板 共享形态] --> PD-T05
+>     PD-T02[PD-T02 定位对齐] --> PD-T04
+>     PD-T03[PD-T03 ffmpeg 受管理组件] --> PD-T05
+>     PD-T01[PD-T01 播放引擎可见性 P0] --> PD-T05
+> ```
+>
+> **可并行**：PD-T01 与 PD-T02 无依赖，可同时开工；D2 与 D1/D3 无依赖，可同时拍板。
+
+### 4.3 里程碑（与任务的对应）
+
+| 里程碑 | 对应任务 | 内容 | 完成判据（可证伪） |
+|---|---|---|---|
+| **M0 收尾** | `PD-T01` | 播放主线冻结 + ffmpeg 可诊断 | ① `docs/bugs/` 中 BUG-223~230 状态与代码一致、`check-bugs.py` 绿；② 断开 ffmpeg（临时改 env 指向不存在路径）后，设置页明确显示「未安装」，播放失败文案指向安装而不是「检查后台服务」 |
+| **M1 定位与引擎** | `PD-T02`、`PD-T03` | 定位对齐 + ffmpeg 受管理组件 + 三个拍板落定 | ① `README.md`/`Sidebar.tsx` 表述与裁定一致；② 一台**没装过 ffmpeg** 的机器上，从零到能播放不需要命令行操作；③ 三个 D 项在 `docs/review/` 标为已决并写明裁定 |
+| **M2 文件管理** | `PD-T04` | 通用文件浏览/移动/删除 + 视频优先视图 | ① 非媒体文件（如 `.pdf`/`.zip`）可浏览、可移动、可删除；② 视频仍走既有媒体库视图，**两处不出现同一文件的两套事实** |
+| **M3 共享** | `PD-T05` | 局域网 HTTP 只读共享 | ① 同网段另一台设备能播放；② 非环回时投递限速**确实生效**（BUG-199 的判据在共享路径上复验）；③ 未授权设备拿不到内容 |
+| **M4 上传** | （未拆解，待 EE 接口定稿后新增 `PD-T06`） | EE 直传 | ① 导出包可直接推送到 EE，无需手工搬运；② 失败可重试且不重复上传 |
+
+### 4.4 与缺陷登记册的接口（本文**不**吞缺陷）
+
+本文 §1.3 的「媒体库」一栏只写了「已成型」，**没有写它的性能缺陷** —— 那会让本文变成一张与
+`docs/bugs/` 脱节的表。为避免「完全脱离」，此处显式登记**本文成稿后同日新发现的 3 条缺陷**
+及其与本计划的关系：
+
+| 缺陷 | 归属域 | 与本计划的关系 |
 |---|---|---|
-| **M0 收尾** | 播放主线冻结 + ffmpeg 可诊断 | ① `docs/bugs/` 中 BUG-223~230 状态与代码一致、`check-bugs.py` 绿；② 断开 ffmpeg（临时改 env 指向不存在路径）后，设置页明确显示「未安装」，播放失败文案指向安装而不是「检查后台服务」 |
-| **M1 定位与引擎** | 定位对齐 + ffmpeg 受管理组件 + 三个拍板落定 | ① `README.md`/`Sidebar.tsx` 表述与裁定一致；② 一台**没装过 ffmpeg** 的机器上，从零到能播放不需要命令行操作；③ 三个 D 项在 `docs/review/` 标为已决并写明裁定 |
-| **M2 文件管理** | 通用文件浏览/移动/删除 + 视频优先视图 | ① 非媒体文件（如 `.pdf`/`.zip`）可浏览、可移动、可删除；② 视频仍走既有媒体库视图，**两处不出现同一文件的两套事实** |
-| **M3 共享** | 局域网 HTTP 只读共享 | ① 同网段另一台设备能播放；② 非环回时投递限速**确实生效**（BUG-199 的判据在共享路径上复验）；③ 未授权设备拿不到内容 |
-| **M4 上传** | EE 直传 | ① 导出包可直接推送到 EE，无需手工搬运；② 失败可重试且不重复上传 |
+| `docs/bugs/BUG-239.md` 媒体库请求成倍放大 | `shell` | **不进本任务表**（缺陷走缺陷流程）。但它直接影响 M0「播放主线冻结」的体验基线 —— 若 P0 期间用户报「媒体库卡」，应先按 BUG-239 处置，再回本计划 |
+| `docs/bugs/BUG-240.md` 媒体库「大量重复数据」实为不可辨识条目 | `engine+shell` | 同上。与 PD-T04（文件管理）**不同域**：BUG-240 治的是「卡片不可辨识」，PD-T04 治的是「文件没有家」，**不得混为一次改动** |
+| `docs/bugs/BUG-241.md` TG 面板挂载即请求爆炸 | `shell` | 同上。它是 `tg` 域的结构性缺陷（内容量 × 每项 N+1），**不由 D1/D2/D3 任一条裁定解除** |
+
+> **边界声明**：本计划（PD-T01~PD-T05）**只含产品方向与依赖组件化**，不含缺陷修复。
+> 缺陷一律在 `docs/bugs/` 登记、按 `docs/rules/bug-registry.md` 走状态机。
+> 两边的**唯一接口**是本节的这张表 + §4.5 的维护约定 —— **不允许把缺陷塞进 PD-Txx**（那会让任务表变成第二本缺陷册）。
+
+### 4.5 这份计划本身的维护约定
+
+1. **每完成一个 `PD-Txx`** ⇒ ① 回填 §4.2 该行 `状态`；② 若该任务由设计文档驱动，在对应 `docs/design/*` 的 front-matter 填 `landed-in`（commit 短 hash 或 `file:line`）；③ 同步 `docs/README.md` §3.6 的「落地证据」列。
+2. **front-matter 状态迁移**（依 `docs/rules/doc-first.md` §2.3）：
+   `draft`（现在）→ `decided`（**D1/D2/D3 三条全部裁定**后，由主理人回填 `decided-by`/`decided-at`）
+   → `implemented`（`PD-T01`~`PD-T05` 全部落地并填 `landed-in`）。
+3. **新增/删除任务**必须同步三处：§4.2 任务表、§4.3 里程碑「对应任务」列、§4.4 缺陷接口表（若涉及）。
+4. **不新建第二份计划文档**。本文是**唯一**的产品级计划载体；后续修订一律在文末 `## 变更记录` 追加，**不改写既有结论**（BUG-082 惯例 + `doc-first.md` §2.4）。
 
 ---
 
@@ -252,6 +333,7 @@ C 需要第二个后端才有意义，现在做就是过度设计。
 - **D3** 共享的第一形态（局域网 HTTP 只读 / FTP / 不做）
 
 依赖顺序：**D2 与 D1/D3 无依赖，可同时拍**；D1 拍完才能开工 P2，D3 拍完才能开工 P3。
+**三条全部裁定前**，本文件 front-matter 保持 `status: draft`、`decided-by: —` —— 新会话读到它不得当既成事实执行。
 
 ---
 
@@ -259,7 +341,23 @@ C 需要第二个后端才有意义，现在做就是过度设计。
 
 - `docs/bugs/BUG-230.md`（播放主路径 stream-first 翻转 —— 本文结论 #1 的前提）
 - `docs/bugs/BUG-208.md`（ffmpeg 本机手工安装的唯一记录）
+- `docs/bugs/BUG-239.md` / `BUG-240.md` / `BUG-241.md`（本文成稿后同日登记的 3 条缺陷 —— 与本文的接口见 §4.4）
 - `docs/MEDIA-DESIGN.md`（M1/M2/M3 模块边界，既有地基）
 - `docs/design/media-service-deployment-decision-2026-09-28.md`（媒体库独立核心模块裁定）
 - `docs/design/ee-export-p6-2026-09-25.md`（EE 导出包形态 —— 上传的前身）
+- `docs/design/store-db-split-design-2026-09-29.md` §7（本文 §4.2 任务表的**列格式来源**）
+- `docs/rules/doc-first.md`（本文 front-matter 与状态机的规范来源）
 - `docs/review/product-direction-decisions-2026-10-09.md`（本文三条待拍板的强制格式版）
+- `docs/README.md` §3.6（本文在文档地图中的登记位）
+
+---
+
+## 变更记录
+
+> 依 `docs/rules/doc-first.md` §2.4：**只追加，不改写既有结论**。旧结论若被推翻，在此写明「当年立足点对，变的是前提」。
+
+| 日期 | 谁 | 改了哪节的结论 | 为什么 |
+|---|---|---|---|
+| 2026-10-09 | 高见远（架构师） | **建立本文**：§0 结论摘要、§1 事实底座、§2 ffmpeg 三档方案（推荐 A+B、不做 C）、§3 主体调整评估（含 D1/D3 两个张力）、§4 优先度 P0–P4 + 里程碑 M0–M4、§5 三条待拍板 | 产品负责人提出两项：ffmpeg 作为默认播放组件的安装/设置/服务方案；工具主体是否调整为「以媒体为核心的下载/上传/共享/管理工具」 |
+| 2026-10-09 | 高见远（架构师） | **规范化改造**（不改 §0–§3 与 §5–§6 的任何结论）：① 补全 front-matter 全部字段（原只有 `status: draft` 一行，不合 `doc-first.md` §2.1）；② §4 由「散文式 P0–P4 + 里程碑」改为**可执行计划** —— 新增 §4.2 任务表（`PD-T01`~`PD-T05`，列 `Task ID \| 任务名 \| 源文件 \| 依赖 \| 优先级 \| 状态 \| 负责`）、§4.3 里程碑加「对应任务」列、§4.4 与缺陷登记册的接口、§4.5 计划维护约定；③ 新增本节 | 产品负责人指出本文「无管理、无计划、完全脱离、不符合规范流程」 |
+| 2026-10-09 | 高见远（架构师） | **引用重新锚定 + 路径补全**（不改任何结论文字）：① **30 处裸文件名**（`routes.rs:…` 等 —— 仓内有 `orig-daemon` 与 `orig-tg` **两个** `routes.rs`，裸名不可判定）补全为仓库根起算的完整路径；② `download-engine/crates/orig-tg/src/routes.rs` **16 处 +43**（`3281-3287` / `3293-3306` / `3329-3386` / `3330` / `3362-3384` / `3366-3368` / `3413-3602` / `3439-3441` / `3476` / `3481-3486` / `3484` / `3648` / `3655-3710` / `3675-3677` / `3861` / `3974`），`transcode_pump` 括注 `3571-3805` → `3614-3848`；③ `download-engine/crates/orig-daemon/src/routes.rs:884-897` → `:925-931`；④ `download-engine/crates/orig-tg/src/store.rs:724` → `:750-761`；⑤ `tauri-shell/src/i18n/locales/zh-CN.json:316` → `:323`、`docs/design/media-service-deployment-decision-2026-09-28.md:5-6` → `:6-8`；⑥ §1 增「引用锚定说明」 | 独立核验发现：原引用**对 HEAD 是正确的**，但对**当前工作区**已漂移 —— 漂移量恰等于并行会话三个文件的未提交增量（`+52/-9`、`+44/-0`、`+31/-0`），即漂移由在途改动造成，非原引用写错 |

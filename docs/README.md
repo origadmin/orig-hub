@@ -97,11 +97,19 @@
 | `ROUND9-DESIGN-EVAL.md` | 第 9 轮设计评估 | — | 未标注 |
 | `ee-export-p6-2026-09-25.md` | EE 导出 P6 | 09-25 | 未标注 |
 
-### 3.6 产品方向 · 依赖组件
+### 3.6 产品方向 · 依赖组件（**本节列格式 = `docs/rules/doc-first.md` §1.2 模板**）
 
-| 文档 | 主题 | 日期 | 状态 |
-|---|---|---|---|
-| `product-direction-and-ffmpeg-2026-10-09.md` | **产品主体重定位评估 + ffmpeg 组件化（安装/设置/提供服务）+ 优先度与里程碑**；含 3 条待拍板 | 10-09 | draft |
+| 文档 | 主题 | 模块 | 状态 | 日期 | 已落地 | 落地证据（commit / 代码位置） |
+|---|---|---|---|---|---|---|
+| `product-direction-and-ffmpeg-2026-10-09.md` | governance | docs | draft | 2026-10-09 | 否 | 无（任务表 `PD-T01`~`PD-T05` 均未开工，见该文 §4.2；`decided-by: —`） |
+
+> **本节与 §3.1~§3.5 的列不同是刻意的**：§3.1~§3.5（30 行）是补标前建的旧表（4 列，`主题` 列写的是自由描述），
+> 尚未授权统一；**自 2026-10-09 起，本文所有新建/新改的表（§3.6、§六）一律用 `doc-first.md` §1.2 的 7 列模板**
+> （`主题`/`模块` 取 §1.1 的受控枚举）。存量 §3.1~§3.5 待 `doc-first.md` §7 的补标授权后一次性统一
+> （避免一次改动 30 行引发与并行会话的冲突）。
+>
+> 本节现有文档一句话说明：
+> - `product-direction-and-ffmpeg-2026-10-09.md` —— 产品主体重定位评估 + ffmpeg 组件化（安装/设置/提供服务）+ **可执行任务表 §4.2（`PD-T01`~`PD-T05`）** + 里程碑 M0–M4；含 3 条待拍板。
 
 ---
 
@@ -134,12 +142,12 @@
 
 ## 六、评审 · 事故
 
-| 文档 | 主题 |
-|---|---|
-| `docs/review/media-tg-review-2026-09-22.md` | 媒体/TG 评审 |
-| `docs/review/pending-decisions-2026-09-22.md` | 待拍板清单 |
-| `docs/review/product-direction-decisions-2026-10-09.md` | 产品方向待拍板清单（D1 文件管理 vs 媒体库 / D2 ffmpeg 获取策略 / D3 共享形态） |
-| `docs/incidents/INC-001-git-total-loss.md` | Git 全量丢失事故取证 |
+| 文档 | 主题 | 模块 | 状态 | 日期 | 已落地 | 落地证据（commit / 代码位置） |
+|---|---|---|---|---|---|---|
+| `docs/review/media-tg-review-2026-09-22.md` | governance | docs | 未标注 | 2026-09-22 | 否 | 无 |
+| `docs/review/pending-decisions-2026-09-22.md` | governance | docs | 未标注 | 2026-09-22 | 否 | 无（**早于 `doc-first.md`，缺 front-matter**） |
+| `docs/review/product-direction-decisions-2026-10-09.md` | governance | docs | draft | 2026-10-09 | 否 | 无（D1/D2/D3 **三条均未裁定**，`decided-by: —`；阻塞 `PD-T03`/`PD-T04`/`PD-T05`） |
+| `docs/incidents/INC-001-git-total-loss.md` | governance | docs | 未标注 | 2026-09-23 | 否 | 无（**事故取证档，不适用落地语义**） |
 
 ---
 
@@ -148,7 +156,10 @@
 - **不配门禁脚本，不加 CI job。** 理由：本仓已有 3 个 CI job，其中 `check-bugs.py`
   单项实测即需数十分钟；再加全量扫描型门禁会拖慢每一次提交，收益远小于成本。
   本索引的价值在「存在」而非「被强制校验」。
-- **新建 `docs/design/*.md` 时顺手在第三节加一行**（文档 / 主题 / 日期 / 状态）。
+- **新建 `docs/design/*.md` 或 `docs/review/*.md` 时，两件事必须同时做**：
+  ① 文件顶部写 `docs/rules/doc-first.md` §2.1 规定的**完整 front-matter**（不是只写 `status` 一行）；
+  ② 在本文第三节（或第六节）按 **7 列模板**加一行，`状态` 取自该文件 front-matter、`已落地` 由 `status` 推出、
+  `落地证据` 抄 `landed-in` 原文。**两处不一致即视为登记未完成。**
 - **给存量文档补状态时，用 front-matter**，并把本表对应行的 `未标注` 换成真实值。
   补标只插 front-matter，**正文一字不改**；**疑义一律标 `draft`**
   （标一个不实的 `decided` 比不标更坏）。
