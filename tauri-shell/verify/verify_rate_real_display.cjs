@@ -354,7 +354,6 @@ async function videoSnapshot(page) {
       currentTime: v.currentTime,
       duration: Number.isFinite(v.duration) ? v.duration : null,
       rootChildren: document.querySelector('#root')?.children.length ?? -1,
-      compatBanner: !!document.querySelector('[data-testid="player-compat-banner"]'),
       halted: !!document.querySelector('[data-testid="player-unsupported-halt"]'),
       strained: document.body.innerText.includes('解码吃力'),
     }
@@ -578,7 +577,6 @@ async function measureWindow(page, seconds) {
       duration: Number.isFinite(v.duration) ? v.duration : null,
       path: src.includes('/stream') ? 'stream' : src.includes('/raw') ? 'raw' : 'other',
       currentSrc: src,
-      compatBanner: !!document.querySelector('[data-testid="player-compat-banner"]'),
       halted: !!document.querySelector('[data-testid="player-unsupported-halt"]'),
       strained: document.body.innerText.includes('解码吃力'),
     }

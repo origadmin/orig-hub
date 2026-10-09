@@ -173,7 +173,6 @@ async function videoSnapshot(page) {
       networkState: v.networkState,
       paused: v.paused,
       playbackRate: v.playbackRate,
-      compatBanner: !!document.querySelector('[data-testid="player-compat-banner"]'),
       halted: !!document.querySelector('[data-testid="player-unsupported-halt"]'),
       strained: document.body.innerText.includes('解码吃力'),
     }
@@ -201,7 +200,6 @@ async function rawContrastTrace(page, item) {
         vw: s.vw,
         frames: s.frames,
         readyState: s.readyState,
-        compatBanner: s.compatBanner,
         halted: s.halted,
       })
       if (switchedAt === null && s.path === 'stream') switchedAt = t
@@ -410,7 +408,6 @@ async function measureWindow(page, seconds) {
       playbackRate: v.playbackRate,
       path: src.includes('/stream') ? 'stream' : src.includes('/raw') ? 'raw' : 'other',
       currentSrc: src,
-      compatBanner: !!document.querySelector('[data-testid="player-compat-banner"]'),
       halted: !!document.querySelector('[data-testid="player-unsupported-halt"]'),
       strained: document.body.innerText.includes('解码吃力'),
     }
