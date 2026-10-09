@@ -172,6 +172,23 @@ export function saveClassifyConfig(req: {
   })
 }
 
+/**
+ * PUT /api/config/download — 保存下载目录（运行时生效 + 持久化）。
+ *
+ * BUG-234：此前目录只写 localStorage，引擎从不收到 —— 设置页改了目录，下载照旧落原处。
+ * `dir` 传空串 = 清除设置，回退系统默认下载目录。
+ */
+export function saveDownloadConfig(req: { dir: string }): Promise<{
+  ok: boolean
+  download_dir: string | null
+  default_download_dir: string
+}> {
+  return request('/api/config/download', {
+    method: 'PUT',
+    body: JSON.stringify(req),
+  })
+}
+
 /** PUT /api/config/tg — 启停 TG 可选插件（运行时生效 + 持久化；同时拉起/终止 orig-tg 子服务） */
 export function saveTgConfig(req: {
   enabled: boolean

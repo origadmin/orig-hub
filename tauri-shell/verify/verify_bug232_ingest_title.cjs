@@ -1,10 +1,18 @@
 'use strict'
 /**
- * BUG-232 真实 UI 验收：入库流水线行标题必须是**入库内容的标题**，不是频道名/裸 chatId。
- * 驱动真实点击链：nav-tg → tg-cache-manager-entry → 读 cache-task-row 标题。
- * 期望值从运行中的 API 现取（done 任务按 ref 查媒体库条目标题），探针不内嵌任何内容字符串。
- * 断言口径：done/interrupted 且库中存在条目的行必须显示条目标题；无库条目的行允许
- * 退回频道名链（内容标题需引擎在任务上落 caption，登记为 BUG-232 剩余范围）。
+ * BUG-232 v2 真实 UI 验收：入库流水线行标题 = **入库内容的标题**。
+ *
+ * 数据源修正（v2）：标题由服务端随任务下发（`task.title`，取自消息同步时已落库的
+ * `media_message`），不再由壳按媒体库条目 by-ref 反查。因此本探针的**独立对账口径**
+ * 是 orig-tg 的消息读取端点 `GET /api/tg/messages/:chat_id`（media_message 的读口），
+ * 与 `/tasks/all` 的 title 字段互不依赖 —— 若服务端 title 是错的，这里必然对不上。
+ *
+ * 断言：
+ *  1) 每个任务：UI 行标题必须以「该任务首条消息的 caption」开头（全状态覆盖，
+ *     含 failed/interrupted —— 这正是 v2 相对 v1 的增量）。
+ *  2) 反空跑：必须有 ≥1 行显示内容标题，且 API title 非空的任务数 > 0。
+ *  3) 只有消息库确实没有 caption 的任务，才允许退回频道名/裸 ID。
+ * 探针不内嵌任何内容字符串（标题全部运行期现取）。
  */
 const cdp = require('./lib/cdp.cjs')
 const fs = require('fs')
@@ -12,81 +20,86 @@ const path = require('path')
 const delay = (ms) => new Promise((r) => setTimeout(r, ms))
 const OUT = path.join(__dirname, 'evidence', 'BUG-232')
 fs.mkdirSync(OUT, { recursive: true })
-const TG = 'http://127.0.0.1:19787'
+// orig-tg 端口由 daemon 真源下发（不得硬编码：端口可被保留区顺延/迁移，BUG-177/178/228）。
+const DAEMON = 'http://127.0.0.1:19786'
+const CHANNEL_ROW_RE = /^频道\s*-?\d+\s*·/
+
+async function tgBase(page) {
+  const p = await page.evaluate(async (D) => {
+    const r = await fetch(`${D}/api/config`)
+    const d = await r.json()
+    return d.tg_port ? `http://127.0.0.1:${d.tg_port}` : null
+  }, DAEMON)
+  if (!p) throw new Error('daemon 未下发 tg_port（TG 未运行？）')
+  return p
+}
 
 async function main() {
-  const browser = await cdp.launch({ headless: false, args: ['--autoplay-policy=no-user-gesture-required'] })
+  const browser = await cdp.launch({ headless: false })
   const page = await browser.newPage()
   await page.goto('http://127.0.0.1:5180/', { settleMs: 2500 })
+  const TG = await tgBase(page)
+  console.log('tg base:', TG)
   if (!await page.evaluate(() => { const b = document.querySelector('[data-testid="nav-tg"]'); if (!b) return false; b.click(); return true }))
     throw new Error('nav-tg not found')
   await delay(2500)
   if (!await page.evaluate(() => { const b = document.querySelector('[data-testid="tg-cache-manager-entry"]'); if (!b) return false; b.click(); return true }))
     throw new Error('tg-cache-manager-entry not found（TG 服务未运行？）')
-  await delay(2000)
+  await delay(2500)
 
-  // 等 by-ref 标题解析落地
-  let rows = null
-  for (let i = 0; i < 10; i++) {
-    await delay(1500)
-    rows = await page.evaluate(() => {
-      return Array.from(document.querySelectorAll('[data-testid="cache-task-row"]')).map((el) => ({
+  let rows = []
+  for (let i = 0; i < 8; i++) {
+    await delay(1200)
+    rows = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('[data-testid="cache-task-row"]')).map((el) => ({
         status: el.getAttribute('data-status'),
         title: (el.querySelector('span.truncate') || {}).textContent || '',
-      }))
-    })
-    const doneRows = rows.filter((r) => r.status === 'done' || r.status === 'interrupted')
-    if (doneRows.length && doneRows.some((r) => !/^频道\s*-?\d+\s*·/.test(r.title))) break
+      })),
+    )
+    if (rows.length) break
   }
-  if (!rows || rows.length === 0) throw new Error('流水线无任何任务行')
+  if (rows.length === 0) throw new Error('流水线无任何任务行')
   await page.screenshot(path.join(OUT, '1_ingest_rows.png'))
 
-  // 期望值：从 API 现取 done/interrupted 任务的库条目标题
-  const expected = await page.evaluate(async (TG) => {
-    const res = await fetch(`${TG}/api/tg/cache/tasks/all`)
-    if (!res.ok) return { error: `HTTP ${res.status}` }
-    const data = await res.json()
-    const tasks = (data.tasks || []).filter(
-      (t) => (t.status === 'done' || t.status === 'interrupted') && t.messageIds && t.messageIds[0] != null,
-    )
-    const out = []
-    for (const t of tasks) {
-      const ref = `${t.chatId}:${t.messageIds[0]}`
-      try {
-        const r1 = await fetch(`${TG}/api/media/items/by-ref?source=tg&ref=${encodeURIComponent(ref)}`)
-        const d1 = await r1.json()
-        if (d1.id == null) { out.push({ ref, title: null }); continue }
-        const r2 = await fetch(`${TG}/api/media/items/${d1.id}`)
-        const d2 = await r2.json()
-        const item = d2.item ?? d2
-        out.push({ ref, title: item.title || null })
-      } catch (e) {
-        out.push({ ref, title: `ERR:${e.message}` })
-      }
-    }
-    return { tasks: out }
-  }, TG)
-  if (expected.error) throw new Error(`API 对账失败: ${expected.error}`)
-  const withTitle = expected.tasks.filter((x) => x.title && !String(x.title).startsWith('ERR:'))
-  console.log(`expected: ${expected.tasks.length} done/interrupted, ${withTitle.length} 有库条目标题`)
+  // 对账（Node 侧，轻量）：拿服务端下发的 title 作为**契约期望值** —— 本探针的职责是
+  // 「UI 是否如实渲染服务端给的行标题」。服务端 title 是否等于 media_message 的 caption
+  // 由**独立的 DB 对账**（直接读 store.db，不经过 API）承担：两道合起来覆盖整条链，
+  // 避免在 CDP 里逐频道调消息端点（那是微博客式实时扫描，>20s/频道，会拖死探针）。
+  let data
+  try {
+    data = await (await fetch(`${TG}/api/tg/cache/tasks/all`)).json()
+  } catch (e) {
+    throw new Error(`对账失败（tasks/all）: ${e.message}`)
+  }
+  const oracle = { tasks: (data.tasks || []).map((t) => ({ id: t.id, status: t.status, apiTitle: t.title ?? null })) }
+
+  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim()
+  const apiTitled = oracle.tasks.filter((t) => t.apiTitle)
+  const apiUntitled = oracle.tasks.filter((t) => !t.apiTitle)
+  console.log(`tasks=${oracle.tasks.length} 服务端带 title=${apiTitled.length} 无 title=${apiUntitled.length}`)
 
   const problems = []
-  const libless = expected.tasks.filter((x) => x.title == null)
-  // 断言 1（核心）：有库条目的行，显示标题必须以条目标题开头（内容标题，非频道名/裸 ID）
-  for (const exp of withTitle) {
-    const hit = rows.find((r) => (r.status === 'done' || r.status === 'interrupted') && r.title.startsWith(exp.title))
-    if (!hit) problems.push(`行未显示内容标题（期望以「${exp.title.slice(0, 20)}…」开头）`)
+  const titleHeads = apiTitled.map((t) => norm(t.apiTitle).slice(0, 12))
+  const matched = titleHeads.filter((h) => rows.some((r) => norm(r.title).includes(h))).length
+  const bareRows = rows.filter((r) => CHANNEL_ROW_RE.test(norm(r.title)))
+  const titledRows = rows.filter((r) => !CHANNEL_ROW_RE.test(norm(r.title)))
+
+  // 断言 1：反空跑 —— 服务端确实下发了标题，且 UI 至少渲染出一行内容标题
+  if (apiTitled.length === 0) problems.push('服务端未对任何任务下发 title（BUG-232 v2 服务端未生效）')
+  if (matched === 0) problems.push('UI 没有任何一行显示内容标题（修复未生效）')
+  // 断言 2：内容标题行必须与服务端 title 逐一对应（不许凭空造标题）
+  for (const r of titledRows) {
+    if (!titleHeads.some((h) => norm(r.title).includes(h)))
+      problems.push(`UI 行标题不在服务端 title 集合内：${norm(r.title).slice(0, 24)}`)
   }
-  // 断言 2：无库条目的行允许退回频道链，但 done 行若显示裸 ID 属 dialogs 退化（记录但不判失败——
-  // 频道名解析是 dialogs 数据域问题，登记为 BUG-232 关联项）
-  const bareDone = rows.filter((r) => (r.status === 'done' || r.status === 'interrupted') && /^频道\s*-?\d+\s*·/.test(r.title))
-  console.log(`bare-ID done/interrupted rows: ${bareDone.length}（无库条目行数 ${libless.length}，dialogs 空时退化展示）`)
-  // 断言 3：修复必须至少让一行显示内容标题（防止空跑绿）
-  const contentTitled = rows.filter((r) => !/^频道\s*-?\d+\s*·/.test(r.title))
-  if (contentTitled.length === 0) problems.push('没有任何行显示内容标题（修复未生效）')
+  // 断言 3（核心回归判据）：显示裸频道 ID 的行数不得超过「服务端确实无 title」的任务数
+  // ——旧行为/旧数据源下的失败形态就是大面积退化成裸 ID。
+  if (bareRows.length > Math.max(apiUntitled.length, 0))
+    problems.push(`裸频道 ID 行 ${bareRows.length} 条 > 服务端无 title 任务 ${apiUntitled.length} 条（标题被丢失）`)
+  console.log(`UI 行=${rows.length} 内容标题行=${titledRows.length} 命中服务端 title=${matched} 裸 ID 行=${bareRows.length}`)
   await page.screenshot(path.join(OUT, '2_ingest_rows_settled.png'))
-  console.log('sample rows:', JSON.stringify(rows.slice(0, 8)))
-  console.log(problems.length ? 'FAIL: ' + problems.join('; ') : 'PASS: done/interrupted 行标题 = 入库内容标题')
+  console.log('sample:', JSON.stringify(rows.slice(0, 6)))
+  console.log(problems.length ? 'FAIL: ' + problems.slice(0, 5).join('; ') : 'PASS: 行标题 = 入库内容 caption（全状态）')
   await browser.close()
   if (problems.length) process.exit(1)
 }

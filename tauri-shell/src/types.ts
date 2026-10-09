@@ -295,6 +295,12 @@ export interface TgCacheTask {
    */
   itemBytes?: number
   itemBytesTotal?: number
+  /**
+   * 入库内容标题（BUG-232 v2）：该任务覆盖的第一条消息的 caption，
+   * 服务端从消息同步时已落库的 `media_message` 带出（/tasks/all 与 /tasks/:id）。
+   * 与任务成败无关 —— failed/queued 同样有值；为空时才退回频道链。
+   */
+  title?: string
 }
 
 /**

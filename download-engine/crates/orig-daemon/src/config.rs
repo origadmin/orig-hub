@@ -390,6 +390,42 @@ impl Config {
         Ok(out)
     }
 
+    /// 保存下载目录（顶层键 `download_dir`）：运行时生效 + 持久化到 `download-engine.toml`。
+    ///
+    /// 与 `[classify]`/`[proxy]`/`[tg]` 段重写器不同，它是**顶层键**（`config.rs` 的
+    /// 顶层键解析分支），段重写器帮不上忙，单独实现、语义相同。
+    /// 写入用正斜杠：TOML 最小解析器只 `trim_matches('"')` 不做反转义，
+    /// Windows 路径若写反斜杠会被 TOML 当转义序列，读回即坏。
+    pub fn save_download_dir(&self, path: &str) -> std::io::Result<String> {
+        let existing = std::fs::read_to_string(path).unwrap_or_default();
+        let value = self
+            .download_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let mut out = String::new();
+        let mut written = false;
+        for raw in existing.lines() {
+            let line = raw.trim_end();
+            let trimmed = line.trim();
+            // 已有 download_dir 行：值非空则原地替换，空值则（清空设置）删除该行。
+            if trimmed.starts_with("download_dir") && trimmed.contains('=') {
+                if !value.is_empty() {
+                    out.push_str(&format!("download_dir = \"{value}\"\n"));
+                    written = true;
+                }
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        if !written && !value.is_empty() {
+            out = format!("download_dir = \"{value}\"\n{out}");
+        }
+        std::fs::write(path, &out)?;
+        Ok(out)
+    }
+
     /// 将代理配置持久化到 `download-engine.toml` 的 `[proxy]` 段（保留其它段）。
     /// 返回写出的完整文本。
     pub fn save_proxy(&self, path: &str) -> std::io::Result<String> {

@@ -491,6 +491,37 @@ impl Store {
         Ok(())
     }
 
+    /// 消息 caption 批量取（BUG-232 v2）：按频道一次性取回 caption，
+    /// 供任务列表在**服务端**拼出行标题。
+    ///
+    /// 为什么是这里、而不是壳按媒体库条目 by-ref 反查（v1 的错误修法）：
+    /// caption 在**消息同步时**就已落 `media_message`，与任务成败无关 ——
+    /// failed/queued 的任务同样有标题可显示；按媒体库条目查只覆盖已出成品的任务，
+    /// 且把「一次 SQL」变成「每行一次 HTTP + 渲染期补数据」。
+    /// 频道数是个位数（任务只跨少数频道），逐频道一次查询，不做 N 次行级查询。
+    pub async fn message_captions_for_channels(
+        &self,
+        channels: &[i64],
+    ) -> libsql::Result<std::collections::HashMap<(i64, i64), String>> {
+        let mut out = std::collections::HashMap::new();
+        for ch in channels {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT message_id, caption FROM media_message \
+                     WHERE channel_id = ?1 AND caption IS NOT NULL AND caption <> ''",
+                    params![*ch],
+                )
+                .await?;
+            while let Some(r) = rows.next().await? {
+                let mid: i64 = r.get(0)?;
+                let cap: String = r.get(1)?;
+                out.insert((*ch, mid), cap);
+            }
+        }
+        Ok(out)
+    }
+
     /// 列出某频道已入库消息（新→旧）。
     ///
     /// `before_id` 为历史游标（exclusive）：`Some(id)` 只返回 message_id < id 的行，

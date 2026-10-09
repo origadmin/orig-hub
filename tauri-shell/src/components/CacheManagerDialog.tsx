@@ -624,58 +624,15 @@ export function CacheManagerDialog(props: {
   const groups = useMemo(() => groupCounts(counts), [counts])
 
   /**
-   * 入库内容标题（BUG-232）：流水线行的标题必须是**入库的内容**，频道只是元数据
-   * —— 与 BUG-231 同一原则（分组维度 ≠ 内容标题），此前行标题只有
-   * 「频道名或 `频道 {chatId}`」一条路，dialogs 拿不到频道名时连人话都不剩。
+   * 行标题（BUG-232 v2）：**入库内容的标题**，由服务端随任务一起下发
+   * （`task.title` = 该任务覆盖的第一条消息的 caption，取自消息同步时已落库的
+   * `media_message` —— 与任务成败无关，failed/queued/interrupted 同样有标题）。
    *
-   * 完成态任务按 by-ref（`source="tg"`、`ref="{chat}:{msg}"`）查媒体库条目，
-   * 条目标题就是入库内容的标题（入库写入路径保证，BUG-156 修复后不再是兜底名）。
-   * 每 ref 只问一次（`ingestTitleRef` 缓存，含「查过但无」的 null），顺序有界，
-   * 不在渲染期发起；查不到/失败 ⇒ 行标题退回频道名链。
+   * v1 的错误修法（已被用户裁定「获取逻辑完全错了」）：壳按媒体库条目 by-ref 反查。
+   * 那套只覆盖已出成品的任务（failed/queued 必然空白），还把「服务端一次 SQL」
+   * 换成「每行一次 HTTP + 渲染期补数据」——数据早已在本地，是获取路径选错了层。
    */
-  const [ingestTitles, setIngestTitles] = useState<Map<string, string>>(new Map())
-  const ingestTitleRef = useRef<Map<string, string | null>>(new Map())
-  useEffect(() => {
-    const pending = visible.filter(
-      (x) =>
-        // done 必有库条目；interrupted 部分入库（by-ref miss 由缓存如实降级）。
-        (x.status === 'done' || x.status === 'interrupted') &&
-        x.messageIds[0] != null &&
-        !ingestTitleRef.current.has(`${x.chatId}:${x.messageIds[0]}`),
-    )
-    if (pending.length === 0) return
-    let alive = true
-    void (async () => {
-      for (const task of pending) {
-        const ref = `${task.chatId}:${task.messageIds[0]}`
-        let title: string | null = null
-        try {
-          const id = await findMediaItemIdByRef('tg', ref)
-          if (id != null) title = (await getMediaItem(id)).title || null
-        } catch {
-          title = null
-        }
-        ingestTitleRef.current.set(ref, title)
-        if (!alive) return
-      }
-      const next = new Map<string, string>()
-      for (const [ref, resolved] of ingestTitleRef.current) if (resolved) next.set(ref, resolved)
-      if (alive) setIngestTitles(next)
-    })()
-    return () => {
-      alive = false
-    }
-  }, [visible])
-
-  /** 行标题链（BUG-232）：入库内容标题 → 频道名 → 裸 chatId。 */
-  const ingestTitleOf = useCallback(
-    (task: TgCacheTask): string | null => {
-      const msgId = task.messageIds[0]
-      if (msgId == null) return null
-      return ingestTitles.get(`${task.chatId}:${msgId}`) ?? null
-    },
-    [ingestTitles],
-  )
+  const ingestTitleOf = useCallback((task: TgCacheTask): string | null => task.title ?? null, [])
 
   /**
    * 当前筛选内被勾中的 id（BUG-149）。

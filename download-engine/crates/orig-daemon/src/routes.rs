@@ -521,6 +521,47 @@ pub struct ClassifyUpdateReq {
     pub rules: HashMap<String, String>,
 }
 
+/// PUT /api/config/download — 保存下载目录（运行时生效 + 持久化到 download-engine.toml）。
+/// body: `{"dir": "D:/Videos"}`；`dir` 空/缺省 = 回到平台默认目录（`default_download_dir`）。
+///
+/// BUG-234：此前 `download_dir` 只有 GET（`/api/config`），设置页保存只写 localStorage，
+/// 用户改了目录下载照旧 —— 分类/代理/TG 都有「运行时生效 + 持久化」端点，唯它漏掉。
+async fn put_config_download(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<DownloadUpdateReq>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let dir = req
+        .dir
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .map(|d| orig_core::paths::expand_tilde(&d));
+    {
+        let mut cfg = st.config.write().unwrap();
+        cfg.download_dir = dir;
+        // 持久化（读锁已释放）
+        cfg.save_download_dir("download-engine.toml")
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("persist download config: {e}"),
+                )
+            })?;
+    }
+    let cfg = st.config.read().unwrap();
+    Ok(axum::Json(serde_json::json!({
+        "ok": true,
+        "download_dir": cfg.download_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        "default_download_dir": orig_core::paths::default_download_dir().to_string_lossy().into_owned(),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct DownloadUpdateReq {
+    /// 目标下载目录；空串/缺省 = 清除设置，回退平台默认。
+    #[serde(default)]
+    pub dir: Option<String>,
+}
+
 /// PUT /api/config/classify — 保存自动分类规则（运行时生效 + 持久化到 download-engine.toml）。
 /// body: {"enabled": bool, "rules": {"mp4": "Videos", ...}}
 /// rules 为完整覆盖：先合并内置默认，再应用用户覆盖（未提供的扩展名回退默认分类）。
@@ -892,6 +933,9 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/api/config", get(get_config))
         .route("/api/config/classify", axum::routing::put(put_config_classify))
         .route("/api/config/proxy", axum::routing::put(put_config_proxy))
+        // BUG-234：download_dir 此前只读（GET /api/config），设置页改了也不生效 ——
+        // 补上与 classify/proxy/tg 同语义的「运行时生效 + 持久化」端点。
+        .route("/api/config/download", axum::routing::put(put_config_download))
         .route("/api/proxy/verify", axum::routing::post(post_proxy_verify))
         .route("/api/config/tg", axum::routing::put(put_config_tg))
         .route("/api/tg/restart", axum::routing::post(post_tg_restart))

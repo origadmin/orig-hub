@@ -1160,13 +1160,49 @@ async fn enqueue_cache_task(
 ///
 /// `total == 0`（条目刚起步、总量未可知）不注入，前端按「无字节进度」渲染，
 /// 避免 `0/0` 这类空洞分母出现。
-fn task_with_progress(st: &AppState, t: &CacheTask) -> serde_json::Value {
+/// 任务行标题（BUG-232 v2）：**入库内容的 caption**，数据源是消息同步时已落库的
+/// `media_message`——不是媒体库条目（v1 的错误修法：按 by-ref 反查成品，只覆盖已入库的任务，
+/// 且把服务端一次 SQL 变成客户端逐行补数据）。
+async fn cache_task_titles(
+    st: &AppState,
+    tasks: &[CacheTask],
+) -> std::collections::HashMap<(i64, i64), String> {
+    let mut chans: Vec<i64> = tasks.iter().map(|t| t.chat_id).collect();
+    chans.sort_unstable();
+    chans.dedup();
+    st.store
+        .message_captions_for_channels(&chans)
+        .await
+        .unwrap_or_default()
+}
+
+/// 取任务的标题：覆盖消息里**第一条有 caption 的**（无则 None → 前端退回频道链）。
+///
+/// 为什么不是「第一条消息的 caption」：相册/合集的**首条往往是图片或空说明**
+/// （实测：某任务 10 条消息里首条 caption 为空、第 3 条才是文案），
+/// 只认首条会让大量任务白拿不到标题、退化成裸频道 ID —— 这正是用户看到「频道 -100…」的形态。
+fn cache_task_title<'a>(
+    t: &CacheTask,
+    titles: &'a std::collections::HashMap<(i64, i64), String>,
+) -> Option<&'a str> {
+    t.message_ids
+        .iter()
+        .find_map(|m| titles.get(&(t.chat_id, *m)).map(|s| s.as_str()))
+}
+
+fn task_with_progress(st: &AppState, t: &CacheTask, title: Option<&str>) -> serde_json::Value {
     let mut v = serde_json::to_value(t).unwrap_or(serde_json::Value::Null);
-    if v.is_object() && t.status == "running" {
-        if let Some((bytes, total)) = st.cache_dl_progress(t.id) {
-            if total > 0 {
-                v["itemBytes"] = json!(bytes);
-                v["itemBytesTotal"] = json!(total);
+    if v.is_object() {
+        // 标题随任务一起下发（BUG-232 v2）：行标题 = 入库内容，频道只是元数据。
+        if let Some(ti) = title {
+            v["title"] = json!(ti);
+        }
+        if t.status == "running" {
+            if let Some((bytes, total)) = st.cache_dl_progress(t.id) {
+                if total > 0 {
+                    v["itemBytes"] = json!(bytes);
+                    v["itemBytesTotal"] = json!(total);
+                }
             }
         }
     }
@@ -1210,7 +1246,10 @@ async fn cache_tasks_payload(st: &AppState) -> serde_json::Value {
         })
         .collect();
     json!({
-        "task": task.as_ref().map(|t| task_with_progress(st, t)),
+        // 标题**不在这里**取（BUG-232 v2）：这是 1s 轮询端点，读路径契约是
+        // 「服务内存快照，不碰 SQLite」——为了标题加一次 DB 查询会把流畅度底线换掉。
+        // 需要标题的是缓存管理面板（/tasks/all）与单任务端点，两者各自带出。
+        "task": task.as_ref().map(|t| task_with_progress(st, t, None)),
         "queued": queued,
     })
 }
@@ -1227,9 +1266,10 @@ async fn list_all_cache_tasks(State(st): State<Arc<AppState>>) -> Result<impl In
         .list_cache_tasks(500)
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let titles = cache_task_titles(&st, &tasks).await;
     let tasks: Vec<serde_json::Value> = tasks
         .iter()
-        .map(|t| task_with_progress(&st, t))
+        .map(|t| task_with_progress(&st, t, cache_task_title(t, &titles)))
         .collect();
     let mut counts = serde_json::Map::new();
     for s in ["queued", "running", "done", "failed", "cancelled", "interrupted"] {
@@ -1252,7 +1292,10 @@ async fn cache_task_by_id(
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
     match st.store.get_cache_task(id).await {
-        Ok(Some(t)) => Ok(Json(task_with_progress(&st, &t))),
+        Ok(Some(t)) => {
+            let titles = cache_task_titles(&st, std::slice::from_ref(&t)).await;
+            Ok(Json(task_with_progress(&st, &t, cache_task_title(&t, &titles))))
+        }
         Ok(None) => Err(ApiError::new(StatusCode::NOT_FOUND, "cache task not found")),
         Err(e) => Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
     }

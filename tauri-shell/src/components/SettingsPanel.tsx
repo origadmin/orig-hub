@@ -7,7 +7,14 @@ import { Input } from './ui/input'
 import { DirectoryPicker } from './DirectoryPicker'
 import { InterfacePickerDialog, type InterfaceSelection } from './InterfacePickerDialog'
 import { AccountsPanel } from './AccountsPanel'
-import { getConfig, listInterfaces, saveClassifyConfig, saveProxyConfig, verifyProxy } from '../api/daemon'
+import {
+  getConfig,
+  listInterfaces,
+  saveClassifyConfig,
+  saveDownloadConfig,
+  saveProxyConfig,
+  verifyProxy,
+} from '../api/daemon'
 import { getCacheClearPreview, getCacheStats, getTgConfig, setTgLibraryDir } from '../api/tg'
 import { CacheManagerDialog } from './CacheManagerDialog'
 import { useStore } from '../store/useStore'
@@ -82,7 +89,7 @@ interface CategoryRow {
  */
 export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}) {
   const { t, language, setLanguage, supported } = useTranslation()
-  const { settings, updateSettings, daemon, setError, tgService, setTgEnabled, refreshTgState } =
+  const { settings, updateSettings, daemon, setError, tgService, tgLink, setTgEnabled, refreshTgState } =
     useStore()
   // 服务层（进程）与链路层（Telegram）分开（BUG-178）：开关说的是「服务在不在」，
   // 不再掺链路状态 —— 掺了就会出现「插件：运行中」与「Telegram 不可用」同屏打架。
@@ -214,7 +221,15 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
     // 系统默认下载目录：daemon 按 OS 解析（Windows = C:\Users\<user>\Downloads），
     // 用作未显式设置时的占位/回退，替代写死的 ~/Downloads。
     getConfig()
-      .then((c) => setDefaultDir(c.default_download_dir ?? ''))
+      .then((c) => {
+        setDefaultDir(c.default_download_dir ?? '')
+        // 下载目录的**唯一真源是引擎**（它决定文件实际落哪，BUG-234）：
+        // 引擎已配置则照它显示并同步本地镜像；未配置保持编辑态（空 = 走系统默认）。
+        if (c.download_dir) {
+          setDir(c.download_dir)
+          updateSettings({ downloadDirectory: c.download_dir })
+        }
+      })
       .catch(() => {})
     // TG 拉起失败原因（BUG-177 / BUG-178）：服务不可用时侧栏没有 TG 入口，
     // 若这里也不说原因，用户只会以为「TG 功能没了」。走唯一刷新入口，不另拉一次 config。
@@ -283,6 +298,24 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
       setClearableCount(0)
     } finally {
       setCacheUsageLoaded(true)
+    }
+  }
+
+  /**
+   * 保存下载目录到 daemon（运行时生效 + 持久化，BUG-234）。
+   *
+   * 此前 handleSave 只调 `updateSettings({downloadDirectory})` —— 那是**纯 localStorage**，
+   * 引擎从头到尾没收到过新目录，用户改了目录下载照旧落原处。
+   * 现在与分类/代理同语义：PUT 到 daemon，成功后再回写本地镜像，失败走全局错误提示。
+   */
+  const persistDownload = async () => {
+    try {
+      const r = await saveDownloadConfig({ dir: dir.trim() })
+      const saved = r.download_dir ?? ''
+      setDir(saved)
+      updateSettings({ downloadDirectory: saved })
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -367,6 +400,7 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
       autoClassify,
     })
     await persistClassify()
+    await persistDownload()
     await persistProxy()
     await persistLibrary()
     setSaved(true)
@@ -465,7 +499,7 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
                     <p className="text-[13px] font-medium text-fg-strong">{t('downloads.dir')}</p>
                     <p className="text-[11px] text-muted">{t('downloads.dirHint')}</p>
                   </div>
-                  <div className="mt-2">
+                  <div className="mt-2" data-testid="download-dir-picker">
                     <DirectoryPicker value={dir} onChange={setDir} placeholder={dir || defaultDir || t('downloads.dirPlaceholder')} onError={setError} />
                   </div>
                   <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
@@ -1061,6 +1095,61 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
                   </div>
                 </div>
               </div>
+
+              {/*
+                Telegram 插件状态（BUG-233）：关于页此前只有下载引擎一项，
+                TG 是可选插件却不见踪影 —— 用户想确认「TG 到底在不在跑」只能去常规页签翻开关。
+                服务层（进程）与链路层（Telegram）分开呈现，与常规页签的语义一致（BUG-178）：
+                「插件：运行中」与「Telegram 不可用」是两件事，不合并成一个含糊的绿点。
+                这里只读状态，开关仍在「常规」页签 —— 状态与动作不重复安放。
+              */}
+              <div
+                className="space-y-3 rounded-xl border border-border-subtle bg-surface p-5"
+                data-testid="about-tg"
+              >
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-[13px] font-medium text-fg-strong">{t('about.tgPlugin')}</p>
+                    <p className="mt-0.5 text-[11px] text-muted">
+                      {!tgEnabled
+                        ? t('about.tgLinkOff')
+                        : tgLink.state === 'ready'
+                          ? t('about.tgLinkReady')
+                          : t('about.tgLinkNotReady')}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 text-xs">
+                    <span
+                      className={cn(
+                        'h-2 w-2 rounded-full',
+                        tgEnabled && tgRunning
+                          ? 'bg-success'
+                          : tgEnabled
+                            ? 'bg-danger'
+                            : 'bg-muted',
+                      )}
+                    />
+                    <span className="text-fg-mid" data-testid="about-tg-status">
+                      {!tgEnabled
+                        ? t('about.tgOff')
+                        : tgRunning
+                          ? t('about.tgRunning')
+                          : t('about.tgDead')}
+                      {tgEnabled && tgRunning && tgService.port
+                        ? ` · ${t('about.port')} ${tgService.port}`
+                        : ''}
+                    </span>
+                  </div>
+                </div>
+                {tgEnabled && !tgRunning && tgError ? (
+                  <p
+                    className="rounded-md bg-danger/10 px-3 py-2 text-[11px] leading-relaxed text-danger"
+                    data-testid="about-tg-error"
+                  >
+                    {t('tg.startFailedHint', { reason: tgError })}
+                  </p>
+                ) : null}
+              </div>
             </div>
           )}
         </div>
@@ -1077,7 +1166,7 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
               <Button variant="ghost" onClick={handleReset}>
                 {t('settings.reset')}
               </Button>
-              <Button onClick={handleSave} disabled={classifyBusy}>
+              <Button onClick={handleSave} disabled={classifyBusy} data-testid="settings-save">
                 {classifyBusy ? t('settings.saving') : saved ? t('settings.saved') : t('settings.save')}
               </Button>
             </div>
