@@ -395,6 +395,7 @@
   "media.episode.cacheCancelled": "缓存已取消",
   "media.episode.cacheDoneNoBytes": "缓存已完成但字节缺失",
   "media.episode.cacheRetry": "重试",
+  "media.episode.pickSourceTitle": "选择缓存来源",
   "media.fileMissing": "文件已丢失",
   "media.fileMissingHint": "文件已丢失：磁盘上找不到字节",
   "media.attachImages": "给这一集挂图",

@@ -243,20 +243,46 @@ export function SeriesDetail(props: {
   }
 
   /**
-   * 重新缓存某一集（BUG-080；判据 BUG-261 重写）。
+   * 多来源时的**来源选择**（此前是暗箱）：一集有多个可缓存来源时，按钮直接取
+   * `episodeRecacheCandidates(ep)[0]` 入队 —— 界面既不显示会走哪个源，也没有别的
+   * 选择。现在改为：单来源直接缓存；**多来源先让用户选**，选完再入队。
+   */
+  const [sourcePick, setSourcePick] = useState<{
+    ep: MediaEpisode
+    candidates: Array<{ source: string; ref: string }>
+  } | null>(null)
+
+  /**
+   * 重新缓存某一集（BUG-080；判据 BUG-261 重写；来源选择 BUG-220）。
    *
    * 旧判据绑「当前主源」——主源 local、备用源 tg 时按钮永久禁用且不解释原因。
    * 新判据 = 这一集是否有**任一**可用来源（引擎下发的 `hasRecacheableSource` /
    * 本地按主源+备用源推导）：命中后优先用主源 ref，主源不可用（local / ref 缺失）
    * 则直接用备用源 ref 下发，不再要求用户先「切换来源」再重缓存。
+   *
+   * **多个来源时不再暗箱取 [0]**：弹出来源选择，让「走哪个源」显式可控。
    */
   const recacheEpisode = (ep: MediaEpisode) => {
-    const cand = episodeRecacheCandidates(ep)[0]
+    const cands = episodeRecacheCandidates(ep)
+    const cand = cands[0]
     if (!cand) {
       // 无任何可缓存坐标：入口必须解释原因，不得静默（BUG-261 判据 4）
       onError(t('media.episode.recacheNoRoute', { source: t(sourceLabelKey(ep.source)) }))
       return
     }
+    // 多个来源 ⇒ 先让用户选（此前静默取 [0]，用户无法知道会走哪个源）。
+    if (cands.length > 1) {
+      setSourcePick({ ep, candidates: cands })
+      return
+    }
+    recacheFromSource(cand.ref, cand.source)
+      .then(() => onError(t('media.episode.recacheQueued')))
+      .catch((e: unknown) => onError(e instanceof Error ? e.message : String(e)))
+  }
+
+  /** 选定来源后入队（来源选择弹窗的确认动作）。 */
+  const recacheFrom = (cand: { source: string; ref: string }) => {
+    setSourcePick(null)
     recacheFromSource(cand.ref, cand.source)
       .then(() => onError(t('media.episode.recacheQueued')))
       .catch((e: unknown) => onError(e instanceof Error ? e.message : String(e)))
@@ -1152,6 +1178,47 @@ export function SeriesDetail(props: {
               : undefined
           }
         />
+      ) : null}
+
+      {/* 缓存来源选择（BUG-220）：多个可缓存来源时按下按钮先选来源，不再暗箱取 [0]。
+          单来源路径不经过这里（recacheEpisode 直接入队），保持一键缓存。 */}
+      {sourcePick ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6"
+          data-testid="episode-source-picker"
+          onClick={() => setSourcePick(null)}
+        >
+          <div
+            className="w-full max-w-sm rounded-lg border border-border bg-surface p-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <p className="mb-1 text-sm font-medium text-fg-strong">
+              {t('media.episode.pickSourceTitle')}
+            </p>
+            <p className="mb-3 text-[11px] text-muted">{sourcePick.ep.title}</p>
+            <div className="flex flex-col gap-1">
+              {sourcePick.candidates.map((c) => (
+                <button
+                  key={`${c.source}:${c.ref}`}
+                  type="button"
+                  data-testid="episode-source-option"
+                  className="flex items-center justify-between gap-2 rounded px-2 py-1.5 text-left text-[12px] hover:bg-surface-2"
+                  onClick={() => recacheFrom(c)}
+                >
+                  <span className="min-w-0 truncate text-fg-mid">
+                    {t(sourceLabelKey(c.source))}
+                  </span>
+                  <span className="shrink-0 font-mono text-[10px] text-muted">{c.ref}</span>
+                </button>
+              ))}
+            </div>
+            <div className="mt-3 flex justify-end">
+              <Button variant="ghost" size="sm" onClick={() => setSourcePick(null)}>
+                {t('media.cancel')}
+              </Button>
+            </div>
+          </div>
+        </div>
       ) : null}
     </div>
   )

@@ -213,8 +213,17 @@ export function SeriesCard(props: {
             {t('media.notCached')}
           </span>
         ) : null}
-        <span className="absolute bottom-1 right-1 rounded bg-black/75 px-1 text-[10px] text-white">
-          {t('media.episodeCount', { n: series.episodeCount })}
+        <span
+          className="absolute bottom-1 right-1 rounded bg-black/75 px-1 text-[10px] text-white"
+          data-testid="series-video-count"
+        >
+          {/*
+            BUG-220：这里原先渲染 `episodeCount`（「N 集」），而它是**集数、不分 kind**
+            —— 纯图片专辑也会显示成「10 集」，用户读作视频数就是「图片被统计成视频」。
+            改为名副其实的**视频数**：角标只给视频，图片数由下面的内容构成行承担。
+            老后端不下发 videoCount 时不渲染（不编造 0）。
+          */}
+          {series.videoCount != null ? t('media.series.videoCount', { n: series.videoCount }) : null}
         </span>
       </button>
       <div className="flex min-w-0 flex-1 flex-col gap-0.5 px-2 py-1.5">
@@ -223,7 +232,10 @@ export function SeriesCard(props: {
         </p>
         <p className="text-[10px] text-muted">
           {t('media.series.seasonCount', { n: series.seasonCount })} ·{' '}
-          {t('media.episodeCount', { n: series.episodeCount })}
+          {/* BUG-220：同角标——「N 集」改为视频数，集数口径含图片会误导。 */}
+          {series.videoCount != null
+            ? t('media.series.videoCount', { n: series.videoCount })
+            : t('media.episodeCount', { n: series.episodeCount })}
         </p>
         {/* BUG-250：内容构成（有没有视频 / 有没有图片）必须在主页可见 ——
             0 也如实显示，用户不该为了确认「这部剧里有没有图片」而逐个点进去。

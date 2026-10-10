@@ -852,7 +852,12 @@ export function MediaLibraryPanel() {
                   className={railBtn(view === 'seriesDetail' && activeSeriesId === s.id)}
                 >
                   <span className="min-w-0 flex-1 truncate pl-3">{s.title}</span>
-                  <span className="shrink-0 text-[10px] text-muted">{s.episodeCount}</span>
+                  {/* BUG-220：原先是裸 `episodeCount`（集数、不分 kind）——纯图片专辑
+                      会显示成「10」，读作视频数就是「图片被算成视频」。改为视频数；
+                      老后端不下发时回退集数（保持旧行为，不编造）。 */}
+                  <span className="shrink-0 text-[10px] text-muted">
+                    {s.videoCount != null ? s.videoCount : s.episodeCount}
+                  </span>
                 </button>
               ))}
             </div>
