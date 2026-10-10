@@ -34,8 +34,8 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::login::{
-    Channel, Client, ClientError, DownloadOutcome, Folder, LoginPhase, MediaItem, MediaRange,
-    MediaStream, SessionView, Thumbnail,
+    dialog_display_title, Channel, Client, ClientError, DownloadOutcome, Folder, LoginPhase,
+    MediaItem, MediaRange, MediaStream, SessionView, Thumbnail,
 };
 
 /// 把 panic payload 转成可读字符串（BUG-106）。
@@ -366,6 +366,7 @@ impl Client for GrammersClient {
         // 分组读取失败（如代理连接抖动被断）不阻塞频道枚举：仅降级为「未分组」。
         let folder_of = self.folder_of().await;
         let mut out = Vec::new();
+        let mut skipped_unidentifiable = 0usize;
         let mut iter = self.inner.iter_dialogs();
         while let Some(dialog) = iter
             .next()
@@ -375,7 +376,18 @@ impl Client for GrammersClient {
             // 枚举时顺便填充 PeerRef 缓存（媒体/消息接口后续直接命中）。
             let id = dialog.peer().id().bot_api_dialog_id().unwrap_or(0);
             self.peer_cache.lock().await.insert(id, dialog.peer_ref());
-            out.push(channel_from_dialog(&dialog, &folder_of));
+            // BUG-194：身份不可判定的 Dialog（id 解析失败）不入库，
+            // 否则会以 id=0 撞主键、覆盖出一条假会话。
+            match channel_from_dialog(&dialog, &folder_of) {
+                Some(ch) => out.push(ch),
+                None => skipped_unidentifiable += 1,
+            }
+        }
+        if skipped_unidentifiable > 0 {
+            // 不静默丢数据：留下可对账的痕迹（BUG-013 实证日志风格）。
+            eprintln!(
+                "[tg] dialog scan: skipped {skipped_unidentifiable} dialogs with unidentifiable peer"
+            );
         }
         Ok(out)
     }
@@ -936,18 +948,31 @@ impl GrammersClient {
 }
 
 /// 将一条 Dialog 转换为公共 Channel DTO（含分组标题映射）。
+///
+/// 返回 `None` 表示这条 Dialog **无法确定身份**，调用方应跳过、不入库
+/// （BUG-194 修复项 2：区分「名字为空」与「peer 解析失败」）。
 fn channel_from_dialog(
     dialog: &grammers_client::peer::Dialog,
     folder_of: &std::collections::HashMap<i64, String>,
-) -> Channel {
+) -> Option<Channel> {
     let peer = dialog.peer();
-    let id = peer.id().bot_api_dialog_id().unwrap_or(0);
-    Channel {
+    // `bot_api_dialog_id()` 仅对 self_user 返回 None。旧代码 `unwrap_or(0)`
+    // 会把这类 Dialog 写成 id=0，而 `dialog_cache.id` 是主键 ⇒ 多条互相覆盖
+    // 成一条假的「会话 0」。身份不可判定 ⇒ 不入库。
+    let id = peer.id().bot_api_dialog_id()?;
+    // BUG-194 根因：原为 `peer.name().unwrap_or_default().to_string()`，
+    // 把「解析不到名字」静默降级成「名字是空字符串」——信息丢失且与
+    // 「真的叫空名字」不可区分，前端 `groupChannels` 只按搜索词过滤、
+    // 不过滤空标题 ⇒ 列表里渲染出 156 个认不出的空白行。
+    // 现在按 doc 修复项 1：给出带 id 的可辨识兜底标识，不直接留空。
+    // 有名会话（实测 363 条）走原样返回，不受任何影响。
+    let title = dialog_display_title(peer.name(), id);
+    Some(Channel {
         id,
-        title: peer.name().unwrap_or_default().to_string(),
+        title,
         username: peer.username().map(str::to_string),
         folder: folder_of.get(&id).cloned(),
-    }
+    })
 }
 
 /// 清洗文件名：Windows 非法字符/控制字符替换为 `_`，去尾部 `.`/空格（NTFS 拒绝），

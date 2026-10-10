@@ -54,6 +54,53 @@ pub struct Channel {
     pub folder: Option<String>,
 }
 
+impl Channel {
+    /// BUG-194：返回一份**展示名永不为空**的副本，供写入 `dialog_cache`。
+    ///
+    /// 写入路径（`upsert_dialog`）统一走这里，使「库里不存在空标题行」成为
+    /// 存储层不变量 —— 无论标题来自 grammers 枚举、mock 还是将来的调用方。
+    pub fn identified(mut self) -> Self {
+        self.title = identified_title(&self.title, self.id);
+        self
+    }
+}
+
+/// BUG-194：`peer.name()` 解析不到名字时的**可辨识**兜底名。
+///
+/// 刻意**只陈述已知事实**：不写「已删除账户」这类断言，因为
+/// `grammers` 明确说明 `name()` 为 `None` 有多种成因（peer 不可访问、
+/// 账号已删除、**或者此前根本没收到过这个名字**）。断言一个未经证实的成因，
+/// 与 BUG-194 要修的「把『未知』降级成『空』」是同一类错误。
+///
+/// 带 id 是必须的：实测 158 条无名会话里若全部标成同一个「已删除账户」，
+/// 用户依旧无法分辨（doc 验收要求「每个条目都有可辨识的展示文本」）。
+/// id 取正负与 Bot API 约定一致（正 = 用户，负 = 群组/频道）。
+pub fn unnamed_dialog_title(id: i64) -> String {
+    if id > 0 {
+        format!("用户 {id}（无名称）")
+    } else {
+        format!("群组/频道 {id}（无名称）")
+    }
+}
+
+/// BUG-194：把一个可能为空的标题收敛成**永不为空**且按 id 可辨识的展示名。
+///
+/// 非空白标题**原样返回**（仅用 `trim` 判定是否为空，不改写既有 363 条
+/// 有名会话，避免顺带改动无关数据）。
+pub fn identified_title(raw: &str, id: i64) -> String {
+    if raw.trim().is_empty() {
+        unnamed_dialog_title(id)
+    } else {
+        raw.to_string()
+    }
+}
+
+/// BUG-194：枚举期入口 —— 把 `peer.name()` 的 `Option` 直接收敛成展示名，
+/// 杜绝调用方再写 `unwrap_or_default()` 把「未知」降级成「空」。
+pub fn dialog_display_title(peer_name: Option<&str>, id: i64) -> String {
+    identified_title(peer_name.unwrap_or_default(), id)
+}
+
 /// TG 自定义分组（DialogFilter）的公共 DTO，用于前端分组筛选。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Folder {
@@ -362,6 +409,33 @@ pub enum ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BUG-194 策略钉子（纯函数层）：空标题永不落空，且按 id 可辨识。
+    ///
+    /// 这一层是 `grammers::channel_from_dialog` 的根因修复点 —— 旧代码
+    /// `peer.name().unwrap_or_default()` 正是从这里把「未知」降级成「空」。
+    #[test]
+    fn blank_dialog_title_falls_back_to_identifiable_bug194() {
+        // None（peer 解析不到名字）与空串、纯空白：三者都必须被兜底。
+        for raw in [None, Some(""), Some("   "), Some("\t\n ")] {
+            let t = dialog_display_title(raw, 270804017);
+            assert!(
+                !t.trim().is_empty(),
+                "无名会话不得产出空标题（BUG-194），raw={raw:?}"
+            );
+            assert!(t.contains("270804017"), "兜底名须带 id 以便可辨识: {t}");
+        }
+        // 有名会话原样保留（不回归）。
+        assert_eq!(dialog_display_title(Some("麻豆短剧"), -1004493170102), "麻豆短剧");
+        assert_eq!(dialog_display_title(Some("Telegram"), 777000), "Telegram");
+        // 有名字但首尾带空白：判定按 trim，但不改写内容。
+        assert_eq!(dialog_display_title(Some(" Telegram "), 777000), " Telegram ");
+        // 正负 id 分别对应用户 / 群组频道（Bot API 约定）。
+        assert!(unnamed_dialog_title(100).starts_with("用户"));
+        assert!(unnamed_dialog_title(-100).starts_with("群组/频道"));
+        // 两条无名会话必须彼此可区分。
+        assert_ne!(dialog_display_title(None, 1), dialog_display_title(None, 2));
+    }
 
     /// 可用内存中的纯状态机，便于逻辑自测（不依赖真实 Telegram）。
     struct InMemoryClient(std::sync::Mutex<LoginPhase>);

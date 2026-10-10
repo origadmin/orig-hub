@@ -322,6 +322,37 @@ async fn migrate_cache_task_priority(conn: &Connection) -> libsql::Result<()> {
     Ok(())
 }
 
+/// BUG-194 迁移：把 `dialog_cache` 里**存量**的空/纯空白标题行补成可辨识兜底名。
+///
+/// 只改 `title` 为空的行 ⇒ 天然幂等（第二次执行影响 0 行），且已有 363 条
+/// 有名会话一字不动（doc 验收：频道/群组部分不受影响、不回归）。
+///
+/// 与 `migrate_media_message` / `migrate_cache_task_priority` 同为「打开库时
+/// 跑一次、不删数据」的幂等迁移；这里无需 `PRAGMA table_info` 判列，因为
+/// 不新增列，只回填既有列的值。
+async fn migrate_dialog_cache_blank_titles(conn: &Connection) -> libsql::Result<usize> {
+    let mut rows = conn
+        .query(
+            "SELECT id FROM dialog_cache WHERE title IS NULL OR TRIM(title) = ''",
+            (),
+        )
+        .await?;
+    let mut ids = Vec::new();
+    while let Some(r) = rows.next().await? {
+        ids.push(r.get::<i64>(0)?);
+    }
+    let n = ids.len();
+    for id in ids {
+        // 逐行 UPDATE 而非一条 `IN (...)`：兜底名含各自的 id，需按行计算。
+        conn.execute(
+            "UPDATE dialog_cache SET title = ?1 WHERE id = ?2",
+            params![crate::login::unnamed_dialog_title(id), id],
+        )
+        .await?;
+    }
+    Ok(n)
+}
+
 /// 按 `list_messages`/`get_message` 的 SELECT 列顺序映射一行。
 /// 列顺序：channel_id, message_id, caption, mime_type, size, downloaded, created_at,
 ///         media_type, msg_date, duration, file_path, group_id
@@ -422,6 +453,11 @@ impl Store {
         migrate_media_message(&conn).await?;
         // 旧库的 cache_task 缺 priority：幂等补列，不删数据（BUG-277）。
         migrate_cache_task_priority(&conn).await?;
+        // BUG-194：存量 dialog_cache 里的空标题行回填为可辨识兜底名（幂等）。
+        let healed = migrate_dialog_cache_blank_titles(&conn).await?;
+        if healed > 0 {
+            eprintln!("[store] BUG-194: backfilled {healed} blank dialog_cache titles");
+        }
         // 媒体资料库（内容/剧集/标签）：与 TG 流水同库、职责分离。
         crate::media::migrate(&conn).await?;
         Ok(Self { conn, db_path })
@@ -1629,15 +1665,20 @@ impl Store {
     // ---- 频道分组缓存（分页枚举加速） ----
 
     /// upsert 一条会话缓存（同 id 幂等，更新标题/用户名/分组）。
+    ///
+    /// BUG-194：标题经 `Channel::identified()` 收敛，**保证落库标题非空**。
+    /// 存储层兜住不变量，使「`dialog_cache` 不存在空标题行」与调用方
+    /// （grammers 枚举 / mock / 将来的新写入点）解耦。
     pub async fn upsert_dialog(&self, ch: &Channel) -> libsql::Result<()> {
         let t = now();
+        let ch = ch.clone().identified();
         self.conn
             .execute(
                 "INSERT INTO dialog_cache (id, title, username, folder, init_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(id) DO UPDATE
                    SET title = excluded.title, username = excluded.username, folder = excluded.folder",
-                params![ch.id, ch.title.clone(), ch.username.as_deref(), ch.folder.as_deref(), t],
+                params![ch.id, ch.title, ch.username.as_deref(), ch.folder.as_deref(), t],
             )
             .await?;
         Ok(())
@@ -1886,6 +1927,104 @@ mod tests {
         // 清缓存仅清 dialog_cache。
         s.clear_dialog_cache().await.unwrap();
         assert_eq!(s.count_dialogs().await.unwrap(), 0);
+    }
+
+    /// BUG-194 策略钉子：`dialog_cache` **永不**接受空标题行。
+    ///
+    /// 覆盖写入侧的不变量（空串、纯空白、None 全部被兜底成带 id 的可辨识名），
+    /// 以及「有名会话一字不动」的不回归（doc 验收：279 条频道/群组不受影响）。
+    #[tokio::test]
+    async fn dialog_cache_never_stores_blank_title_bug194() {
+        let s = store("dialog_cache_bug194").await;
+        let raw = |id: i64, title: &str| Channel {
+            id,
+            title: title.to_string(),
+            username: None,
+            folder: None,
+        };
+        // 空串、纯空白、知名会话、以及一个频道（负 id）。
+        s.upsert_dialog(&raw(100, "")).await.unwrap();
+        s.upsert_dialog(&raw(101, "   ")).await.unwrap();
+        s.upsert_dialog(&raw(-1004493170102, "麻豆短剧")).await.unwrap();
+        s.upsert_dialog(&raw(777000, "Telegram")).await.unwrap();
+
+        let all = s.read_dialogs(0, 100).await.unwrap();
+        // 验收断言（doc）：空标题条数 = 0。
+        let blanks = all.iter().filter(|c| c.title.trim().is_empty()).count();
+        assert_eq!(blanks, 0, "dialog_cache 不得存在空标题行: {all:?}");
+        assert_eq!(all.len(), 4);
+
+        // 无名条目必须「可辨识」：两两不同，且都带自己的 id —— 否则 158 条
+        // 全标成同一个「已删除账户」，用户依旧分辨不出来。
+        let by_id = |id: i64| all.iter().find(|c| c.id == id).unwrap().title.clone();
+        assert_ne!(by_id(100), by_id(101), "两条无名会话必须可区分");
+        assert!(by_id(100).contains("100"), "兜底名须带 id: {}", by_id(100));
+        assert!(by_id(101).contains("101"), "兜底名须带 id: {}", by_id(101));
+        // 知名会话原样保留（不回归）。
+        assert_eq!(by_id(777000), "Telegram");
+        assert_eq!(by_id(-1004493170102), "麻豆短剧");
+
+        // 幂等：重复 upsert 同一行仍非空，且不新增行。
+        s.upsert_dialog(&raw(100, "")).await.unwrap();
+        assert_eq!(s.count_dialogs().await.unwrap(), 4);
+        let page = s.read_dialogs(0, 100).await.unwrap();
+        assert_eq!(page.iter().filter(|c| c.title.trim().is_empty()).count(), 0);
+    }
+
+    /// BUG-194：存量空标题行被迁移幂等回填；第二次打开影响 0 行。
+    #[tokio::test]
+    async fn dialog_cache_backfill_is_idempotent_bug194() {
+        let dir = std::env::temp_dir().join(format!(
+            "orig_tg_store_bug194_backfill_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db");
+
+        // 先造一个「旧库」：绕过 upsert_dialog 直接写空标题，模拟 BUG-194 修复前。
+        {
+            let s = Store::open(&path).await.unwrap();
+            s.conn
+                .execute(
+                    "INSERT INTO dialog_cache (id, title, username, folder, init_at)
+                     VALUES (555, '', NULL, NULL, 0), (556, '  ', NULL, NULL, 0),
+                            (777000, 'Telegram', NULL, NULL, 0)",
+                    (),
+                )
+                .await
+                .unwrap();
+            assert_eq!(s.count_dialogs().await.unwrap(), 3);
+        }
+
+        // 重新打开 ⇒ 迁移跑过：两条空标题被补成可辨识名，知名行不动。
+        let healed = {
+            let s = Store::open(&path).await.unwrap();
+            let all = s.read_dialogs(0, 100).await.unwrap();
+            assert_eq!(all.iter().filter(|c| c.title.trim().is_empty()).count(), 0);
+            assert_eq!(all.len(), 3, "回填不得增删行");
+            let named = all.iter().find(|c| c.id == 777000).unwrap();
+            assert_eq!(named.title, "Telegram", "有名会话不得被回填改动");
+            let f = |id: i64| all.iter().find(|c| c.id == id).unwrap().title.clone();
+            assert!(f(555).contains("555") && f(556).contains("556"));
+            assert_ne!(f(555), f(556));
+            // 第三次打开：幂等，影响 0 行。
+            drop(s);
+            migrate_dialog_cache_blank_titles_readonly(&path).await
+        };
+        assert_eq!(healed, 0, "回填必须幂等：第二次不应再改任何行");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 以独立连接跑一次回填迁移并返回受影响行数（用于断言幂等）。
+    async fn migrate_dialog_cache_blank_titles_readonly(path: &Path) -> usize {
+        let conn = libsql::Builder::new_local(path)
+            .build()
+            .await
+            .unwrap()
+            .connect()
+            .unwrap();
+        migrate_dialog_cache_blank_titles(&conn).await.unwrap()
     }
 
     /// 缓存任务状态机：入队 → 复用 → 进度 → 终态 → 取消 → 僵尸降级。
