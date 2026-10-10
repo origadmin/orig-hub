@@ -62,6 +62,17 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             "/api/tg/cache/tasks/:id",
             get(cache_task_by_id).delete(cancel_cache_task_route),
         )
+        // BUG-277：队列优先级（置顶 / 取消置顶）。单条走 `:id`，**批量走同一个动词
+        // 的静态段**（body `{ids:[…]}`）——多选置顶必须一个请求完成，
+        // 禁止前端循环调单条（BUG-249 先例）。实现在 `cache::`。
+        .route(
+            "/api/tg/cache/tasks/:id/priority",
+            axum::routing::post(crate::cache::set_task_priority),
+        )
+        .route(
+            "/api/tg/cache/tasks/priority",
+            axum::routing::post(crate::cache::set_tasks_priority),
+        )
         .route("/api/tg/messages/:chat_id", get(messages))
         .route("/api/tg/download/:chat_id/:message_id", axum::routing::post(download))
         .route(

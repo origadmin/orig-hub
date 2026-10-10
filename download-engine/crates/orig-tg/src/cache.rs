@@ -21,6 +21,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 
@@ -1130,6 +1131,229 @@ fn batch_ids(q: &std::collections::HashMap<String, String>) -> Result<Vec<i64>, 
     Ok(ids)
 }
 
+// ---- BUG-277：队列优先级（置顶 / 取消置顶） ----
+
+/// 置顶目标：显式数值，或「由后端取当前最大 + 1」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PriorityTarget {
+    /// 显式优先级（取消置顶 = `Value(0)`）。
+    Value(i64),
+    /// 置顶：数值由后端算（`max(priority) + 1`），前端不猜。
+    Top,
+}
+
+/// `POST /api/tg/cache/tasks/:id/priority` 与批量端点共用的一份 body。
+///
+/// `priority` 与 `top` **互斥**：两者都给或都不给 ⇒ 422（静默取一个会让
+/// 「置顶」变成薛定谔的操作）。`ids` 只有批量端点用（单条端点给了也忽略，
+/// 路径上的 id 才是真源 —— 两个真源必然分叉）。
+#[derive(Debug, Deserialize)]
+pub struct SetPriorityReq {
+    pub priority: Option<i64>,
+    pub top: Option<bool>,
+    pub ids: Option<Vec<i64>>,
+}
+
+/// body → 置顶目标；不合法即 422（**不静默回落**）。
+pub(crate) fn priority_target(req: &SetPriorityReq) -> Result<PriorityTarget, ApiError> {
+    match (req.priority, req.top) {
+        (Some(_), Some(_)) => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "priority and top are mutually exclusive: send exactly one",
+        )),
+        (None, None) => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "priority (integer >= 0) or top (true) is required",
+        )),
+        (None, Some(false)) => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "top=false is not a pin request: send priority instead",
+        )),
+        (None, Some(true)) => Ok(PriorityTarget::Top),
+        (Some(v), None) if v < 0 => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "priority must be >= 0",
+        )),
+        (Some(v), None) => Ok(PriorityTarget::Value(v)),
+    }
+}
+
+/// 「置顶」对谁有意义：**排队中的任务**。
+///
+/// 已置顶的任务（priority > 0）即使不再排队也**必须**允许取消置顶 ——
+/// 否则用户点了置顶之后就再也撤销不掉（任务终态后按钮还在、点了却 422，
+/// 那是界面与端点判据分裂，BUG-249 已吃过一次）。
+/// 其余情形（终态且未置顶）置顶没有任何可观察效果，给 422 而不是假装成功。
+const PRIORITY_REJECT_MSG: &str =
+    "priority only applies to queued tasks (or to unpinning an already pinned one)";
+
+fn prioritizable(t: &CacheTask) -> bool {
+    t.status == "queued" || t.priority > 0
+}
+
+/// 单条**置顶 / 取消置顶**的状态迁移内核（唯一真源）。
+///
+/// 批量端点循环调它，批量不另写一份状态机（AGENTS.md §2）。
+/// 返回 `(id, 生效后的 priority)`。
+pub(crate) async fn set_task_priority_kernel(
+    st: &Arc<AppState>,
+    id: i64,
+    target: PriorityTarget,
+) -> Result<(i64, i64), ApiError> {
+    let Some(task) = st
+        .store
+        .get_cache_task(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    else {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "cache task not found"));
+    };
+    if !prioritizable(&task) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            PRIORITY_REJECT_MSG,
+        ));
+    }
+    let priority = match target {
+        PriorityTarget::Value(v) => v,
+        PriorityTarget::Top => st
+            .store
+            .max_cache_task_priority()
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+            + 1,
+    };
+    let Some(updated) = st
+        .store
+        .set_cache_task_priority(id, priority)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    else {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "cache task not found"));
+    };
+    // **不 spawn、不抢占**（BUG-257 不弃单）：置顶只改一个标量，正在跑的 worker
+    // 会在当前任务终态后按新顺序接续。这里若顺手起 worker，就会把「置顶」变成
+    // 「插队执行」，单飞门禁也会凭空多出一个竞争者。
+    st.refresh_cache_tasks().await;
+    st.push_log(format!(
+        "/api/tg/cache/tasks/{id}: priority set to {priority}"
+    ));
+    Ok((id, updated.priority))
+}
+
+/// 批量置顶：一次请求改多条（BUG-249 先例：**禁止**前端循环调单条）。
+///
+/// 契约与批量重试/取消同源：
+/// - `ids` 缺失 / 空 ⇒ 422（不得静默 no-op）；
+/// - 任一条不可置顶 ⇒ **整请求 422**，合法的几条**不部分执行**；
+/// - 读不到的 id（越界）沿用 BUG-249 口径：不动手、不报错，只是不出现在返回里；
+/// - 同批 `top`：按 **id 升序**分配 `max+N … max+1` ⇒ 批内仍保持 FIFO
+///   （先入队的先跑），否则「一起置顶」会把用户原本的顺序整个倒过来。
+async fn set_tasks_priority_batch(
+    st: &Arc<AppState>,
+    ids: &[i64],
+    target: PriorityTarget,
+) -> Result<Vec<(i64, i64)>, ApiError> {
+    if ids.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ids provided but empty: nothing selected",
+        ));
+    }
+    let mut invalid: Vec<i64> = Vec::new();
+    let mut targets: Vec<i64> = Vec::new();
+    for id in ids {
+        let task = st
+            .store
+            .get_cache_task(*id)
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        match task {
+            None => {}
+            Some(t) if prioritizable(&t) => targets.push(*id),
+            Some(_) => invalid.push(*id),
+        }
+    }
+    if !invalid.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("{PRIORITY_REJECT_MSG}; invalid ids: {invalid:?}"),
+        ));
+    }
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    // 批内按 id 升序发号：先入队的拿到更大的 priority（= 先跑）。
+    targets.sort_unstable();
+    let base = match target {
+        PriorityTarget::Value(_) => 0,
+        PriorityTarget::Top => st
+            .store
+            .max_cache_task_priority()
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?,
+    };
+    let n = targets.len() as i64;
+    let mut out = Vec::with_capacity(targets.len());
+    for (i, id) in targets.iter().enumerate() {
+        let priority = match target {
+            PriorityTarget::Value(v) => v,
+            PriorityTarget::Top => base + n - i as i64,
+        };
+        out.push(set_task_priority_kernel(st, *id, PriorityTarget::Value(priority)).await?);
+    }
+    st.push_log(format!(
+        "/api/tg/cache/tasks/priority ids={} updated={}",
+        ids.len(),
+        out.len()
+    ));
+    Ok(out)
+}
+
+/// `POST /api/tg/cache/tasks/:id/priority`（body `{priority}` 或 `{top:true}`）
+/// —— 单条置顶 / 取消置顶（BUG-277）。
+pub async fn set_task_priority(
+    State(st): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<i64>,
+    body: Option<Json<SetPriorityReq>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let req = body.map(|b| b.0).unwrap_or(SetPriorityReq {
+        priority: None,
+        top: None,
+        ids: None,
+    });
+    let target = priority_target(&req)?;
+    let (tid, priority) = set_task_priority_kernel(&st, id, target).await?;
+    Ok(Json(json!({"ok": true, "tasks": [{"id": tid, "priority": priority}]})))
+}
+
+/// `POST /api/tg/cache/tasks/priority`（body `{ids:[…], priority|top}`）
+/// —— **批量**置顶 / 取消置顶（BUG-277 + BUG-249 的原子性纪律）：
+/// 多选置顶必须**一个请求**完成，禁止前端循环调单条。
+pub async fn set_tasks_priority(
+    State(st): State<Arc<AppState>>,
+    body: Option<Json<SetPriorityReq>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let req = body.map(|b| b.0).unwrap_or(SetPriorityReq {
+        priority: None,
+        top: None,
+        ids: None,
+    });
+    let target = priority_target(&req)?;
+    let Some(ids) = req.ids.clone() else {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ids is required for the batch priority endpoint: expected {\"ids\":[1,2,3]}",
+        ));
+    };
+    let updated = set_tasks_priority_batch(&st, &ids, target).await?;
+    let tasks: Vec<serde_json::Value> = updated
+        .iter()
+        .map(|(id, priority)| json!({"id": id, "priority": priority}))
+        .collect();
+    Ok(Json(json!({"ok": true, "tasks": tasks})))
+}
+
 /// `DELETE /api/cache/tasks?scope=all|success|failed` 或 `?ids=1,2,3`
 /// —— 批量清除任务记录的**唯一端点**。
 ///
@@ -1781,5 +2005,326 @@ mod tests {
         // 整个应用路由（含 merge）也必须建得起来：冲突会在这里立刻 panic。
         let _ = crate::routes::router(st);
         let _ = router();
+    }
+
+    // ---- BUG-277：队列优先级（置顶 / 取消置顶） ----
+
+    /// 建一个**文件库**（不是 `:memory:`），用于验证加列迁移与二次启动（判据 6）。
+    fn priority_db(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("orig_priority_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("store.db")
+    }
+
+    /// 单条置顶端点 → `(状态码, JSON)`，与 `batch_call` 同一手写解构
+    /// （`ApiError` / `impl IntoResponse` 都没有 `Debug`）。
+    async fn priority_call(
+        st: Arc<AppState>,
+        id: i64,
+        body: serde_json::Value,
+    ) -> Result<(StatusCode, serde_json::Value), (StatusCode, serde_json::Value)> {
+        let req: SetPriorityReq = serde_json::from_value(body).expect("body must deserialize");
+        match set_task_priority(State(st), AxumPath(id), Some(Json(req))).await {
+            Ok(Json(v)) => Ok((StatusCode::OK, v)),
+            // `ApiError` 的字段是 routes 私有的，这里只能走它公开的实现
+            // （`IntoResponse` → `{"error": …}`）取状态码与报文。
+            Err(e) => Err(error_response(e).await),
+        }
+    }
+
+    /// `ApiError` → `(状态码, JSON)`（同 `batch_call` 的手写解构）。
+    async fn error_response(e: ApiError) -> (StatusCode, serde_json::Value) {
+        let resp = e.into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body must be readable");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+        (status, v)
+    }
+
+    /// 批量置顶端点 → `(状态码, JSON)`。
+    async fn priority_batch_call(
+        st: Arc<AppState>,
+        body: serde_json::Value,
+    ) -> Result<(StatusCode, serde_json::Value), (StatusCode, serde_json::Value)> {
+        let req: SetPriorityReq = serde_json::from_value(body).expect("body must deserialize");
+        match set_tasks_priority(State(st), Some(Json(req))).await {
+            Ok(Json(v)) => Ok((StatusCode::OK, v)),
+            Err(e) => Err(error_response(e).await),
+        }
+    }
+
+    /// 排队任务（按入队顺序返回 id），用于队列取序断言。
+    async fn queued_ids(st: &Arc<AppState>) -> Vec<i64> {
+        st.store
+            .recover_queued_cache_tasks()
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect()
+    }
+
+    /// 判据 6：加列迁移**幂等** —— 二次启动不报错、不删数据，且存量任务
+    /// `priority=0` ⇒ 取序与旧实现（`ORDER BY id ASC`）**逐字一致**。
+    #[tokio::test]
+    async fn priority_migration_is_idempotent_and_keeps_fifo_order_bug277() {
+        let db = priority_db("migrate");
+        let first = Store::open(&db).await.expect("first open must succeed");
+        let mut ids = Vec::new();
+        for k in 0..3 {
+            let (t, created) = first
+                .enqueue_cache_task(7, None, &format!("m:7:9{k}"), &[90 + k], "D:/dl")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(created);
+            assert_eq!(t.priority, 0, "新入队任务默认 0（= 不置顶）");
+            ids.push(t.id);
+        }
+        let before: Vec<i64> = first
+            .recover_queued_cache_tasks()
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(before, ids, "首次启动：全 0 ⇒ 严格 id ASC");
+        assert_eq!(
+            first.next_queued_task().await.unwrap().map(|t| t.id),
+            Some(ids[0])
+        );
+        drop(first);
+
+        // 二次启动：列已存在 ⇒ 迁移必须跳过（不报错、不改写任何数据）。
+        let second = Store::open(&db).await.expect("second open must not fail");
+        let after: Vec<i64> = second
+            .recover_queued_cache_tasks()
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(after, before, "二次启动后顺序必须一字不变（判据 6）");
+        for id in &ids {
+            let t = second.get_cache_task(*id).await.unwrap().unwrap();
+            assert_eq!(t.priority, 0, "存量任务 priority 必须是 0");
+        }
+        // 三次启动同理（幂等不是「第二次恰好没事」）。
+        drop(second);
+        let third = Store::open(&db).await.expect("third open must not fail");
+        let third_ids: Vec<i64> = third
+            .recover_queued_cache_tasks()
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(third_ids, before);
+    }
+
+    /// 判据 2（向后兼容）：没人置顶时，取序与呈现都不变。
+    #[tokio::test]
+    async fn queue_stays_fifo_while_no_task_is_pinned_bug277() {
+        let st = state().await;
+        assert!(st.claim_cache_worker());
+        let a = seeded_task(&st, "m:7:41", "queued").await;
+        let b = seeded_task(&st, "m:7:42", "queued").await;
+        let c = seeded_task(&st, "m:7:43", "queued").await;
+
+        assert_eq!(queued_ids(&st).await, vec![a, b, c], "全 0 ⇒ id ASC");
+        assert_eq!(st.store.next_queued_task().await.unwrap().map(|t| t.id), Some(a));
+        // 显式设成同一个 0（= 取消置顶）也不得改变顺序。
+        let (_status, _v) = priority_call(st.clone(), c, json!({"priority": 0}))
+            .await
+            .expect("取消置顶必须成功");
+        assert_eq!(queued_ids(&st).await, vec![a, b, c]);
+    }
+
+    /// 判据 1 + 5：非队首置顶后**下一个必是它**；且**不抢占**当前任务
+    /// （running 仍是那一条、字节与状态一字不动）。
+    #[tokio::test]
+    async fn pin_makes_the_task_next_and_never_preempts_the_running_one_bug277() {
+        let st = state().await;
+        assert!(st.claim_cache_worker());
+        let running = seeded_task(&st, "m:7:51", "running").await;
+        let a = seeded_task(&st, "m:7:52", "queued").await;
+        let b = seeded_task(&st, "m:7:53", "queued").await;
+
+        // 置顶最后一条（既非队首、也非当前）。
+        let (status, v) = priority_call(st.clone(), b, json!({"top": true}))
+            .await
+            .expect("置顶排队任务必须成功");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["tasks"][0]["id"], json!(b));
+        assert_eq!(v["tasks"][0]["priority"], json!(1), "置顶 = 当前最大 + 1");
+
+        // 判据 1：下一个跑的必须是它。
+        assert_eq!(
+            st.store.next_queued_task().await.unwrap().map(|t| t.id),
+            Some(b),
+            "置顶后接续的必须是被置顶的那条（判据 1）"
+        );
+        // 判据 5：不抢占 —— 当前任务原样不动，且全库 running 仍 ≤ 1。
+        let cur = st.store.current_cache_task().await.unwrap().unwrap();
+        assert_eq!(cur.id, running, "呈现的当前任务仍是 running 那条（不被插队）");
+        assert_eq!(cur.status, "running");
+        assert!(st.store.has_running_cache_task().await.unwrap());
+        let running_count = st
+            .store
+            .count_cache_tasks()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(s, _)| s == "running")
+            .map(|(_, n)| n)
+            .unwrap_or(0);
+        assert_eq!(running_count, 1, "单飞契约：running ≤ 1（判据 4/5）");
+        assert_eq!(queued_ids(&st).await, vec![b, a], "恢复路径同款排序（判据 3）");
+
+        // 再置顶 a ⇒ a 反而排到 b 前面（max+1 逐次递增，后点的不会覆盖先点的）。
+        priority_call(st.clone(), a, json!({"top": true}))
+            .await
+            .expect("第二次置顶必须成功");
+        assert_eq!(st.store.next_queued_task().await.unwrap().map(|t| t.id), Some(a));
+        assert_eq!(queued_ids(&st).await, vec![a, b]);
+
+        // 取消置顶 ⇒ 回到 FIFO。
+        priority_call(st.clone(), a, json!({"priority": 0}))
+            .await
+            .expect("取消置顶必须成功");
+        assert_eq!(st.store.next_queued_task().await.unwrap().map(|t| t.id), Some(b));
+        priority_call(st.clone(), b, json!({"priority": 0}))
+            .await
+            .expect("取消置顶必须成功");
+        assert_eq!(queued_ids(&st).await, vec![a, b], "取消后置顶前还原为 id ASC");
+    }
+
+    /// 判据 3（原子性）：批量置顶**一个请求**改多条；批内保持 FIFO
+    /// （先入队的先跑），否则「一起置顶」会把用户原本的顺序整个倒过来。
+    #[tokio::test]
+    async fn batch_pin_is_one_request_and_keeps_fifo_within_the_batch_bug277() {
+        let st = state().await;
+        assert!(st.claim_cache_worker());
+        let a = seeded_task(&st, "m:7:61", "queued").await;
+        let b = seeded_task(&st, "m:7:62", "queued").await;
+        let c = seeded_task(&st, "m:7:63", "queued").await;
+
+        // 故意**乱序**提交 ids：批内顺序由后端按 id 定，不信任入参顺序。
+        let (status, v) =
+            priority_batch_call(st.clone(), json!({"ids": [c, a], "top": true}))
+                .await
+                .expect("批量置顶必须成功");
+        assert_eq!(status, StatusCode::OK);
+        let tasks = v["tasks"].as_array().expect("tasks array").clone();
+        assert_eq!(tasks.len(), 2, "一次请求改两条（不是两次单条）");
+        let got: std::collections::HashMap<i64, i64> = tasks
+            .iter()
+            .map(|t| {
+                (
+                    t["id"].as_i64().unwrap(),
+                    t["priority"].as_i64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(got.get(&a), Some(&2), "先入队的拿更大的 priority（批内 FIFO）");
+        assert_eq!(got.get(&c), Some(&1));
+        assert_eq!(got.get(&b), None, "没被选中的那条不动");
+        assert_eq!(st.store.next_queued_task().await.unwrap().map(|t| t.id), Some(a));
+        assert_eq!(queued_ids(&st).await, vec![a, c, b]);
+    }
+
+    /// 批量置顶的契约边界：`ids` 缺失 / 空 ⇒ 422；越界 id 沿用 BUG-249 口径
+    /// （不动手、不报错、不进返回）；含不可置顶的终态 ⇒ 整请求 422，
+    /// **合法的那条不得被部分执行**。
+    #[tokio::test]
+    async fn batch_pin_contract_matches_bug249_bug277() {
+        let st = state().await;
+        assert!(st.claim_cache_worker());
+        let queued = seeded_task(&st, "m:7:71", "queued").await;
+        let done = seeded_task(&st, "m:7:72", "done").await;
+
+        let (_s, err) = priority_batch_call(st.clone(), json!({"top": true}))
+            .await
+            .expect_err("缺 ids 必须 422");
+        assert_eq!(_s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(err["error"].as_str().is_some_and(|s| !s.is_empty()), "422 必须带 error");
+
+        let (_s, _err) = priority_batch_call(st.clone(), json!({"ids": [], "top": true}))
+            .await
+            .expect_err("空 ids 必须 422");
+        assert_eq!(_s, StatusCode::UNPROCESSABLE_ENTITY);
+
+        // 越界 id：不动手、不报错，只不出现在返回里。
+        let ghost = 999_999_i64;
+        let (status, v) =
+            priority_batch_call(st.clone(), json!({"ids": [ghost, queued], "top": true}))
+                .await
+                .expect("合法请求必须成功");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["tasks"].as_array().map(|a| a.len()), Some(1));
+        assert_eq!(v["tasks"][0]["id"], json!(queued));
+
+        // 含终态（未置顶）⇒ 整请求 422，且合法的那条不被改动。
+        let before = st.store.get_cache_task(queued).await.unwrap().unwrap().priority;
+        let (_s, err) =
+            priority_batch_call(st.clone(), json!({"ids": [queued, done], "top": true}))
+                .await
+                .expect_err("含终态必须整请求 422");
+        assert_eq!(_s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            err["error"].as_str().is_some_and(|s| s.contains("invalid ids")),
+            "422 必须点名哪几条不合法，实得 {err}"
+        );
+        assert_eq!(
+            st.store.get_cache_task(queued).await.unwrap().unwrap().priority,
+            before,
+            "整请求失败 ⇒ 合法的那条不得被部分执行"
+        );
+    }
+
+    /// 单条端点与批量端点共用同一内核；请求体本身的非法形态一律 422（不静默回落）。
+    #[tokio::test]
+    async fn priority_endpoint_rejects_malformed_requests_bug277() {
+        let st = state().await;
+        assert!(st.claim_cache_worker());
+        let queued = seeded_task(&st, "m:7:81", "queued").await;
+        let done = seeded_task(&st, "m:7:82", "done").await;
+
+        for bad in [
+            json!({}),
+            json!({"priority": 1, "top": true}),
+            json!({"top": false}),
+            json!({"priority": -1}),
+        ] {
+            let (s, _) = priority_call(st.clone(), queued, bad.clone())
+                .await
+                .expect_err("非法 body 必须 422");
+            assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "bad body = {bad}");
+        }
+
+        // 终态且未置顶 ⇒ 422（置顶对它没有任何可观察效果，不假装成功）。
+        let (s, _) = priority_call(st.clone(), done, json!({"top": true}))
+            .await
+            .expect_err("终态任务置顶必须 422");
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        // 但已置顶的任务即使终态也**必须**能取消置顶（否则置顶不可撤销）。
+        let (s, _) = priority_call(st.clone(), queued, json!({"top": true}))
+            .await
+            .expect("置顶成功");
+        assert_eq!(s, StatusCode::OK);
+        st.store.finish_cache_task(queued, "done", None).await.unwrap();
+        let (s, v) = priority_call(st.clone(), queued, json!({"priority": 0}))
+            .await
+            .expect("已置顶任务的取消置顶必须始终可用");
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(v["tasks"][0]["priority"], json!(0));
+
+        // 不存在的 id ⇒ 404（不是 422：id 不存在的语义是「找不到」，不是「不合法」）。
+        let (s, _) = priority_call(st.clone(), 999_999, json!({"top": true}))
+            .await
+            .expect_err("未知 id 必须 404");
+        assert_eq!(s, StatusCode::NOT_FOUND);
     }
 }

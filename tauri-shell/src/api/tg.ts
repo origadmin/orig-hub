@@ -504,6 +504,51 @@ export async function clearCacheTasks(
   return request(`/api/cache/tasks?scope=${encodeURIComponent(scope)}`, { method: 'DELETE' })
 }
 
+/** `POST /api/tg/cache/tasks[/:id]/priority` 的返回：改了哪几条、各改成了多少。 */
+export interface CacheTaskPriorityResult {
+  ok: boolean
+  tasks: Array<{ id: number; priority: number }>
+}
+
+/**
+ * POST /api/tg/cache/tasks/:id/priority — **单条**置顶 / 取消置顶（BUG-277）。
+ *
+ * 两种互斥的写法，后端都按「意图」而不是数值处理：
+ *   - `{ top: true }`  → 置顶，具体数值由**后端**取当前最大 + 1（前端拿不到全量
+ *     队列，让它猜 max 就会撞号，撞号后顺序又退回 id 排序 = 点了没生效）；
+ *   - `{ priority: 0 }`→ 取消置顶（归零即回到 FIFO）。
+ * 两者都给或都不给 ⇒ 422（静默取一个会让「置顶」变成薛定谔的操作）。
+ *
+ * 置顶**不抢占**：正在跑的任务不受影响，只改「它跑完后接哪一条」。
+ */
+export async function setCacheTaskPriority(
+  id: number,
+  opts: { priority?: number; top?: boolean },
+): Promise<CacheTaskPriorityResult> {
+  return request(`/api/tg/cache/tasks/${encodeURIComponent(String(id))}/priority`, {
+    method: 'POST',
+    body: JSON.stringify(opts),
+  })
+}
+
+/**
+ * POST /api/tg/cache/tasks/priority — **批量**置顶 / 取消置顶（BUG-277）。
+ *
+ * 多选置顶**必须一个请求**完成：循环调单条既没有原子性（中途失败留下半置顶的
+ * 队列），也让「置顶了 3 条」在网络面板里变成 3 次写（BUG-249 先例）。
+ * 契约与批量重试/取消同源：任一条不可置顶 ⇒ 整请求 422 且不部分执行。
+ */
+export async function setCacheTasksPriority(
+  ids: number[],
+  opts: { priority?: number; top?: boolean },
+): Promise<CacheTaskPriorityResult> {
+  if (ids.length === 0) throw new Error('没有勾选任何记录')
+  return request('/api/tg/cache/tasks/priority', {
+    method: 'POST',
+    body: JSON.stringify({ ids, ...opts }),
+  })
+}
+
 /** GET /api/tg/cache/tasks/all — 全量任务 + 各状态计数（缓存管理面板用，低频拉取）。 */
 export async function listAllCacheTasks(): Promise<{
   tasks: TgCacheTask[]

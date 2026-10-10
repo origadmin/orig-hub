@@ -19,6 +19,8 @@ import {
   listTgDialogs,
   retryCacheTask,
   retryCacheTasks,
+  setCacheTaskPriority,
+  setCacheTasksPriority,
 } from '../api/tg'
 import type { TgCacheTask, TgChannel, ViewerItem } from '../types'
 
@@ -76,6 +78,27 @@ const STATUS_STYLE: Record<TgCacheTask['status'], string> = {
 /** 记录的三种「结果」归属：成功 / 失败（含取消、中断）/ 活跃。 */
 const ACTIVE_STATUS = new Set<TgCacheTask['status']>(['queued', 'running'])
 const RETRYABLE = new Set<TgCacheTask['status']>(['failed', 'cancelled', 'interrupted'])
+
+/**
+ * 「置顶」对哪条记录有意义（BUG-277）。
+ *
+ * 只有**排队中**的任务才谈得上「下一个跑它」；已经跑完/失败的任务改顺序没有任何
+ * 可观察效果，给它一个点了没反应的按钮等于骗人。
+ *
+ * 唯一的例外是**已置顶的任务**：它必须**随时可以取消置顶**，哪怕它已经不在排队
+ * （否则用户点了置顶之后就再也撤销不掉 —— 按钮还在、点了却 422，那是界面与端点
+ * 判据分裂，BUG-249 已经吃过一次）。
+ *
+ * 与后端 `cache::prioritizable` 逐字同源（端点对不可置顶的 id 回 422）。
+ */
+function prioritizable(task: TgCacheTask): boolean {
+  return task.status === 'queued' || (task.priority ?? 0) > 0
+}
+
+/** 是否已置顶（后端 `priority` > 0）。 */
+function isPinned(task: TgCacheTask): boolean {
+  return (task.priority ?? 0) > 0
+}
 
 /**
  * 入库分组（呈现口径）：一条记录处在入库流程的哪一段。
@@ -205,6 +228,10 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
   onGoLibrary: (task: TgCacheTask) => void
   onRetry: (task: TgCacheTask) => void
   onCancel: (task: TgCacheTask) => void
+  /** 置顶（BUG-277）：当前任务跑完后下一个跑它，不打断正在跑的任务 */
+  onPin: (task: TgCacheTask) => void
+  /** 取消置顶：回到 FIFO */
+  onUnpin: (task: TgCacheTask) => void
   onAskDelete: (task: TgCacheTask) => void
   onDelete: (task: TgCacheTask) => void
   onDismissDelete: () => void
@@ -222,6 +249,8 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
     onGoLibrary,
     onRetry,
     onCancel,
+    onPin,
+    onUnpin,
     onAskDelete,
     onDelete,
     onDismissDelete,
@@ -296,6 +325,10 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
   const ingested = task.status === 'done'
   const retryable = RETRYABLE.has(task.status)
   const single = task.groupId == null
+  /** 置顶态与可置顶性：与后端 `cache::prioritizable` 同源（见 `prioritizable`）。 */
+  const pinned = isPinned(task)
+  const canPin = prioritizable(task) && !pinned
+  const canUnpin = pinned
   // BUG-170：行内状态徽标走**单源派生**（deriveEntryState）——任务 done = 字节
   // 落库（present）、活跃 = 缓存中、failed/interrupted = 失败、cancelled 归
   // 「缺字节可重试」档。动作按钮（重试/取消/删除）仍按任务机状态判定，两者语义不同。
@@ -317,6 +350,8 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
       className="rounded-md border border-border-subtle bg-surface-2/40 p-2.5"
       data-testid="cache-task-row"
       data-status={task.status}
+      data-task-id={task.id}
+      data-priority={task.priority ?? 0}
     >
       <div className="flex items-center gap-2">
         {selectable ? (
@@ -340,12 +375,51 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
           >
             {t(ENTRY_LABEL_KEY[entry])}
           </span>
+          {/* 置顶徽标（BUG-277）：「已置顶」是这一行的**排序状态**，必须看得见 ——
+              否则用户点了置顶，除了列表顺序以外没有任何反馈可核对。 */}
+          {pinned ? (
+            <span
+              className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[11px] font-medium text-accent"
+              title={t('tg.cachePinHint')}
+              data-testid="cache-task-pinned"
+            >
+              {t('tg.cachePinned')}
+            </span>
+          ) : null}
           <span className="truncate text-xs text-fg-strong">
             {title} · {single ? t('tg.cacheScopeSingle') : t('tg.cacheScopeGroup')} ·{' '}
             {t('tg.cacheCountUnit', { n: task.messageIds.length })}
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
+          {/* 置顶 / 取消置顶（BUG-277）：只对「排队中」或「已置顶」的记录出现。
+              语义写在 title 里：置顶 = 当前任务跑完后下一个跑它，**不是**立即抢占。 */}
+          {canPin ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              disabled={busy}
+              title={t('tg.cachePinHint')}
+              onClick={() => onPin(task)}
+              data-testid="cache-task-pin"
+            >
+              {t('tg.cachePin')}
+            </Button>
+          ) : null}
+          {canUnpin ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              disabled={busy}
+              title={t('tg.cacheUnpinHint')}
+              onClick={() => onUnpin(task)}
+              data-testid="cache-task-unpin"
+            >
+              {t('tg.cacheUnpin')}
+            </Button>
+          ) : null}
           {ingested ? (
             <Button
               variant="secondary"
@@ -664,7 +738,9 @@ export function CacheManagerDialog(props: {
           .map(
             (x) =>
               `${x.id}:${x.status}:${x.done}:${x.total}:${x.currentId ?? ''}:${x.error ?? ''}` +
-              `:${x.progressBytes ?? ''}:${x.progressAt ?? ''}`,
+              `:${x.progressBytes ?? ''}:${x.progressAt ?? ''}` +
+              // BUG-277：只看进度会漏掉「只有置顶变了」的刷新（顺序与徽标都不更新）。
+              `:${x.priority ?? 0}`,
           )
           .join('|') +
         '#' +
@@ -773,6 +849,25 @@ export function CacheManagerDialog(props: {
   const batchCancel = useEvent(() => {
     if (cancellableSelected.length === 0) return
     void act(() => cancelCacheTasks(cancellableSelected))
+  })
+
+  /**
+   * 批量置顶（BUG-277）：**一个请求**改完勾选的几条（循环调单条既没有原子性，
+   * 也会让「置顶 3 条」在网络面板里变成 3 次写 —— BUG-249 的同一条纪律）。
+   *
+   * 与单条共用同一个端点族：批量走 `POST /api/tg/cache/tasks/priority`（body `ids`），
+   * 单条走 `POST /api/tg/cache/tasks/:id/priority`；数值由后端算（前端只给 `top: true`）。
+   * 置顶后**保留选中**：任务不消失，用户要接着看它排到前面。
+   */
+  const batchPin = useEvent(() => {
+    if (pinnableSelected.length === 0) return
+    void act(() => setCacheTasksPriority(pinnableSelected, { top: true }))
+  })
+
+  /** 批量取消置顶：同样只发可取消置顶的子集（已置顶的那些）。 */
+  const batchUnpin = useEvent(() => {
+    if (unpinnableSelected.length === 0) return
+    void act(() => setCacheTasksPriority(unpinnableSelected, { priority: 0 }))
   })
 
   /**
@@ -905,6 +1000,16 @@ export function CacheManagerDialog(props: {
     () => selectedTasks.filter((x) => ACTIVE_STATUS.has(x.status)).map((x) => x.id),
     [selectedTasks],
   )
+  /** 可置顶的子集：排队中**且**尚未置顶（已置顶的那批归 `unpinnableSelected`）。 */
+  const pinnableSelected = useMemo(
+    () => selectedTasks.filter((x) => prioritizable(x) && !isPinned(x)).map((x) => x.id),
+    [selectedTasks],
+  )
+  /** 可取消置顶的子集：已置顶的（含不再排队的 —— 置顶必须随时可撤销）。 */
+  const unpinnableSelected = useMemo(
+    () => selectedTasks.filter((x) => isPinned(x)).map((x) => x.id),
+    [selectedTasks],
+  )
 
   const onToggleSelect = useEvent((task: TgCacheTask) => {
     setSelected((prev) => {
@@ -935,6 +1040,13 @@ export function CacheManagerDialog(props: {
   // 行内回调必须引用恒定，否则行组件的 memo 白做（AGENTS.md §5）。
   const onRetry = useEvent((task: TgCacheTask) => void retry(task))
   const onCancelTask = useEvent((task: TgCacheTask) => void act(() => cancelCacheTask(task.id)))
+  // 置顶 / 取消置顶同样必须引用恒定（memo 行组件，AGENTS.md §5）。
+  const onPin = useEvent((task: TgCacheTask) =>
+    void act(() => setCacheTaskPriority(task.id, { top: true })),
+  )
+  const onUnpin = useEvent((task: TgCacheTask) =>
+    void act(() => setCacheTaskPriority(task.id, { priority: 0 })),
+  )
   // 「去媒体库查看」同样必须引用恒定：写成内联箭头函数的话，行组件每次渲染都收到新的
   // prop，`memo` 直接失效 —— 轮询一刷新就整列表重渲染（AGENTS.md §5）。
   const onGoLibrary = useEvent((task: TgCacheTask) => void goLibrary(task))
@@ -1108,6 +1220,35 @@ export function CacheManagerDialog(props: {
                   })}
                 </span>
                 <span className="min-w-0 flex-1" />
+                {/* 置顶 / 取消置顶（BUG-277）：与重试、取消同一条「只发适用子集」的纪律。 */}
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  disabled={busy || pinnableSelected.length === 0}
+                  title={
+                    pinnableSelected.length < selectedIds.length
+                      ? t('tg.cacheBatchPinHint', {
+                          hit: pinnableSelected.length,
+                          miss: selectedIds.length - pinnableSelected.length,
+                        })
+                      : undefined
+                  }
+                  onClick={batchPin}
+                  data-testid="cache-batch-pin"
+                >
+                  {t('tg.cacheBatchPin', { n: pinnableSelected.length })}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  disabled={busy || unpinnableSelected.length === 0}
+                  onClick={batchUnpin}
+                  data-testid="cache-batch-unpin"
+                >
+                  {t('tg.cacheBatchUnpin', { n: unpinnableSelected.length })}
+                </Button>
                 <Button
                   variant="secondary"
                   size="sm"
@@ -1213,6 +1354,8 @@ export function CacheManagerDialog(props: {
               onGoLibrary={onGoLibrary}
               onRetry={onRetry}
               onCancel={onCancelTask}
+              onPin={onPin}
+              onUnpin={onUnpin}
               onAskDelete={onAskDelete}
               onDelete={onDelete}
               onDismissDelete={onDismissDelete}
@@ -1260,6 +1403,8 @@ export function CacheManagerDialog(props: {
                     onGoLibrary={onGoLibrary}
                     onRetry={onRetry}
                     onCancel={onCancelTask}
+                    onPin={onPin}
+                    onUnpin={onUnpin}
                     onAskDelete={onAskDelete}
                     onDelete={onDelete}
                     onDismissDelete={onDismissDelete}

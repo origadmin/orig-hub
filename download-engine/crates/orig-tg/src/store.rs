@@ -174,6 +174,12 @@ pub struct CacheTask {
     pub created_at: i64,
     #[serde(rename = "updatedAt")]
     pub updated_at: i64,
+    /// 优先级（BUG-277）：越大越先跑；`0` = 未置顶（存量任务一律 0）。
+    ///
+    /// 语义**不是**抢占：它只决定「单飞 worker 跑完当前任务后**接哪一条**」，
+    /// 正在跑的任务不受影响（BUG-257 不弃单）。置顶值由后端算（`max + 1`），
+    /// 前端只表达意图（"top": true），不猜数值。
+    pub priority: i64,
 }
 
 /// 任务是否处于「活跃」态（活跃态由 `cache_task_active_uniq` 保证同 key 唯一）。
@@ -181,7 +187,7 @@ pub const CACHE_TASK_ACTIVE_STATES: &str = "('queued', 'running')";
 
 /// 按 `list_cache_tasks`/`get_cache_task` 的 SELECT 列顺序映射一行。
 /// 列顺序：id, chat_id, group_id, item_key, items, total, done, status,
-///         current_id, error, created_at, updated_at
+///         current_id, error, created_at, updated_at, priority
 fn cache_task_from_row(r: &Row) -> libsql::Result<CacheTask> {
     let items: String = r.get(4)?;
     Ok(CacheTask {
@@ -197,12 +203,23 @@ fn cache_task_from_row(r: &Row) -> libsql::Result<CacheTask> {
         error: r.get(9)?,
         created_at: r.get(10)?,
         updated_at: r.get(11)?,
+        // 老库加列前的行由迁移补成 `DEFAULT 0`；这里再兜一层 `unwrap_or(0)`
+        // （列缺失的极端情况不得让「读队列」整条失败）。
+        priority: r.get(12).unwrap_or(0),
     })
 }
 
 /// `cache_task` 的 SELECT 列清单（与 `cache_task_from_row` 严格同序）。
 const CACHE_TASK_COLS: &str = "id, chat_id, group_id, item_key, items, total, done, \
-                               status, current_id, error, created_at, updated_at";
+                               status, current_id, error, created_at, updated_at, priority";
+
+/// 队列取序（BUG-277）：**置顶优先，同优先级仍是 FIFO**。
+///
+/// 为什么必须是**同一份常量**：`next_queued_task`（worker 收尾接续）与
+/// `recover_queued_cache_tasks`（重启恢复）是同一条队列的两条入口，各写一遍
+/// `ORDER BY` 就一定会漂移 —— 届时「运行中置顶有效、重启后失效」这种只在重启
+/// 路径才出现的偏差，几乎不可能被复现（判据 2/3 都要按同一把尺子量）。
+const CACHE_TASK_QUEUE_ORDER: &str = "priority DESC, id ASC";
 
 fn now() -> i64 {
     SystemTime::now()
@@ -260,6 +277,37 @@ async fn migrate_media_message(conn: &Connection) -> libsql::Result<()> {
         conn.execute("ALTER TABLE media_message ADD COLUMN group_id INTEGER", ())
             .await?;
     }
+    Ok(())
+}
+
+/// 迁移：为既有的 `cache_task` 补 `priority` 列（BUG-277）。幂等、不删数据。
+///
+/// **为什么用 `PRAGMA table_info` 探测而不是 `app_setting` 标记键**
+/// （`media.rs` 的 `*_MIG` 是另一种先例，那里判的是「这段一次性数据搬运跑过没」）：
+/// 标记键记的是「迁移跑过」，而加列要的判据是「列**现在**在不在」——两者会漂移：
+/// 列在而标记丢失 ⇒ 再 `ALTER` 一次必然报错（启动即失败）；标记在而列被别的路径
+/// 弄丢 ⇒ 静默少一列，取序 SQL 直接炸在运行时。加列的判据本来就在 schema 里，
+/// 直接读它，就没有第二种真源，也不存在「标记写了但 ALTER 失败」的中间态。
+///
+/// `NOT NULL DEFAULT 0` 的存量语义：旧行一律 0 ⇒ 取序退化为 `id ASC`，
+/// 与迁移前**逐字一致**（判据 6）。
+async fn migrate_cache_task_priority(conn: &Connection) -> libsql::Result<()> {
+    let mut rows = conn.query("PRAGMA table_info(cache_task)", ()).await?;
+    let mut have_priority = false;
+    while let Some(r) = rows.next().await? {
+        let name: String = r.get(1)?;
+        if name == "priority" {
+            have_priority = true;
+        }
+    }
+    if have_priority {
+        return Ok(());
+    }
+    conn.execute(
+        "ALTER TABLE cache_task ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+        (),
+    )
+    .await?;
     Ok(())
 }
 
@@ -349,7 +397,9 @@ impl Store {
                 dir        TEXT,
                 error      TEXT,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                -- BUG-277：置顶优先级。越大越先跑；存量/新入队一律 0 ⇒ 顺序不变。
+                priority   INTEGER NOT NULL DEFAULT 0
             );
             CREATE UNIQUE INDEX IF NOT EXISTS cache_task_active_uniq
                 ON cache_task(item_key) WHERE status IN ('queued', 'running');
@@ -358,6 +408,8 @@ impl Store {
         .await?;
         // 旧库（v0.3.x）的 media_message 缺 media_type/msg_date：幂等补列，不删数据。
         migrate_media_message(&conn).await?;
+        // 旧库的 cache_task 缺 priority：幂等补列，不删数据（BUG-277）。
+        migrate_cache_task_priority(&conn).await?;
         // 媒体资料库（内容/剧集/标签）：与 TG 流水同库、职责分离。
         crate::media::migrate(&conn).await?;
         Ok(Self { conn, db_path })
@@ -933,13 +985,19 @@ impl Store {
     }
 
     /// 列出任务：活跃优先，其余新→旧（前端据此恢复「缓存中 n/N」）。
+    ///
+    /// BUG-277：活跃组内**置顶的行排在前面** —— 呈现序必须与执行序同向，
+    /// 否则「点了置顶，它还躺在列表底下」，用户无法从界面判断置顶是否生效
+    /// （判据 7 要求 DOM 顺序可核）。同优先级内保留原有的 `id DESC`，
+    /// 存量列表的观感一字不变。
     pub async fn list_cache_tasks(&self, limit: u32) -> libsql::Result<Vec<CacheTask>> {
         let mut rows = self
             .conn
             .query(
                 &format!(
                     "SELECT {CACHE_TASK_COLS} FROM cache_task \
-                     ORDER BY CASE WHEN status IN {CACHE_TASK_ACTIVE_STATES} THEN 0 ELSE 1 END, id DESC \
+                     ORDER BY CASE WHEN status IN {CACHE_TASK_ACTIVE_STATES} THEN 0 ELSE 1 END, \
+                     priority DESC, id DESC \
                      LIMIT ?1"
                 ),
                 params![limit as i64],
@@ -1146,18 +1204,58 @@ impl Store {
         Ok(true)
     }
 
-    /// 最老的排队任务（worker 跑完当前任务后按 FIFO 接续）。
+    /// 下一个该跑的排队任务（BUG-277）：**置顶优先，同优先级仍是最老的先跑**。
+    ///
+    /// 单飞 worker 跑完当前任务后调它接续。`priority` 全是 0 时（= 迁移前的行为）
+    /// 排序退化为 `id ASC`，与旧实现逐字一致。
     pub async fn next_queued_task(&self) -> libsql::Result<Option<CacheTask>> {
         self.row_opt(
             &format!(
                 "SELECT {CACHE_TASK_COLS} FROM cache_task \
-                 WHERE status = 'queued' ORDER BY id ASC LIMIT 1"
+                 WHERE status = 'queued' ORDER BY {CACHE_TASK_QUEUE_ORDER} LIMIT 1"
             ),
             (),
         )
         .await?
         .map(|r| cache_task_from_row(&r))
         .transpose()
+    }
+
+    /// 当前最大的任务优先级（BUG-277）：置顶 = 它 + 1。
+    ///
+    /// **必须由后端算**：前端拿不到全量队列（`/api/tg/cache/tasks` 只给一个当前任务
+    /// + 20 条摘要），让它猜 max 就会出现两条任务撞到同一个 priority，届时顺序
+    /// 又退回 id 排序 —— 用户点了置顶却没生效，正是本 BUG 的观感。
+    pub async fn max_cache_task_priority(&self) -> libsql::Result<i64> {
+        match self
+            .row_opt("SELECT COALESCE(MAX(priority), 0) FROM cache_task", ())
+            .await?
+        {
+            Some(r) => Ok(r.get(0).unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    /// 设置任务优先级（BUG-277）。返回更新后的任务；id 不存在 ⇒ `None`。
+    ///
+    /// 只改 `priority` 一个标量：**不动 status、不动 done、不动字节**。
+    /// 置顶因此天然「不抢占」——在跑的任务仍是 running，只是它之后的接续顺序变了。
+    pub async fn set_cache_task_priority(
+        &self,
+        id: i64,
+        priority: i64,
+    ) -> libsql::Result<Option<CacheTask>> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE cache_task SET priority = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, priority, now()],
+            )
+            .await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        self.get_cache_task(id).await
     }
 
     /// 当前应呈现给前端的**唯一**任务（设计裁定：无论多少缓存在排队，task 只返回一个结果）：
@@ -1231,7 +1329,8 @@ impl Store {
 
     /// 启动时**可恢复**的排队任务（BUG-257）。
     ///
-    /// 返回全部仍是 `queued` 的任务（按 id 升序 = FIFO），交给启动流程重新入队。
+    /// 返回全部仍是 `queued` 的任务（按队列取序 = 置顶优先、同优先级 FIFO），
+    /// 交给启动流程重新入队。
     /// 刻意**返回列表而不自己 spawn**：投递只有一个入口（`spawn_cache_task`），
     /// 单飞门禁也在那里——在 store 层另起一套投递就会绕过门禁、出现双跑。
     ///
@@ -1242,7 +1341,7 @@ impl Store {
             .conn
             .prepare(&format!(
                 "SELECT {CACHE_TASK_COLS} FROM cache_task \
-                 WHERE status = 'queued' ORDER BY id ASC"
+                 WHERE status = 'queued' ORDER BY {CACHE_TASK_QUEUE_ORDER}"
             ))
             .await?;
         let mut rows = stmt.query(()).await?;
