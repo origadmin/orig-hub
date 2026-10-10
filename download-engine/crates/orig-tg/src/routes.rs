@@ -115,6 +115,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         // BUG-208：浏览器无硬件 HEVC 时的兼容流（按需实时转码 H.264 + 代理缓存）。
         .route("/api/media/items/:id/stream", get(media_item_stream))
         .route("/api/media/items/by-ref", get(media_item_by_ref))
+        .route("/api/media/items/by-refs", get(media_item_by_refs))
         .route("/api/media/export/preview", get(export_preview))
         .route("/api/media/export", axum::routing::post(export_media))
         .route(
@@ -3170,6 +3171,13 @@ struct ByRefQuery {
     ref_key: String,
 }
 
+/// BUG-241 Priority 2：批量 by-ref 的查询参数（`refs` = 逗号分隔的 `chat:msg` 列表）。
+#[derive(Deserialize)]
+struct ByRefsQuery {
+    source: String,
+    refs: String,
+}
+
 /// `GET /api/media/items/by-ref?source=tg&ref=<chat>:<msg>` — 按 (source,ref) 查条目。
 /// BUG-049：前端据此判断图片是否已入库（已入库显「已入库」，否则给「加入媒体库」）。
 async fn media_item_by_ref(
@@ -3182,6 +3190,34 @@ async fn media_item_by_ref(
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     Ok(Json(json!({ "id": id })))
+}
+
+/// `GET /api/media/items/by-refs?source=tg&refs=<r1>,<r2>,…` — 批量按 (source,ref) 查条目。
+///
+/// BUG-241 Priority 2：TG 面板此前对每张未见过的图片各发一次 `by-ref`（逐条 N+1，
+/// 实测首屏 54 次）；此端点**一个请求**覆盖全部 ref，返回 `{ ids: { ref: id } }`
+/// （未入库的 ref 不出现）。前端据此消除 N+1。
+async fn media_item_by_refs(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<ByRefsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let refs: Vec<String> = q
+        .refs
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    let ids = st
+        .store
+        .item_ids_by_refs(&q.source, &refs)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let mut map = serde_json::Map::new();
+    for (r, id) in ids {
+        map.insert(r, json!(id));
+    }
+    Ok(Json(json!({ "ids": map })))
 }
 
 /// `GET /api/media/items/:id`

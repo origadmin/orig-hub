@@ -371,6 +371,18 @@ export async function findMediaItemIdByRef(source: string, ref: string): Promise
   return d.id
 }
 
+/** 批量按 (source, ref) 查条目 id（BUG-241 Priority 2）。返回一个 ref→id 映射
+ *  （未入库的 ref 不出现）。TG 面板用它**一次请求**覆盖所有图片，消除逐条 N+1。 */
+export async function findMediaItemIdsByRefs(
+  source: string,
+  refs: string[],
+): Promise<Record<string, number>> {
+  if (refs.length === 0) return {}
+  const sp = new URLSearchParams({ source, refs: refs.join(',') })
+  const d = await request<{ ids?: Record<string, number> }>(`/api/media/items/by-refs?${sp}`)
+  return d.ids ?? {}
+}
+
 export async function getLibraryStats(): Promise<LibraryStats> {
   return request<LibraryStats>('/api/media/stats')
 }

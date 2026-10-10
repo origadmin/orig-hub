@@ -1602,6 +1602,26 @@ impl Store {
         }
     }
 
+    /// 批量版 `item_id_by_ref`（BUG-241 Priority 2）：一次覆盖多个 ref，返回
+    /// `ref -> id` 映射（未入库的 ref 不出现在 map 里）。
+    ///
+    /// 前端（TG 面板图片「已入库」判定）此前对每张照片各发一次 by-ref（逐条 N+1），
+    /// 实测 4s 内 54 次；批量化后**一个 HTTP 请求**覆盖全部，DB 侧走索引单读，
+    /// 无放大。
+    pub async fn item_ids_by_refs(
+        &self,
+        source: &str,
+        refs: &[String],
+    ) -> libsql::Result<std::collections::HashMap<String, i64>> {
+        let mut out = std::collections::HashMap::new();
+        for r in refs {
+            if let Some(id) = self.item_id_by_ref(source, r).await? {
+                out.insert(r.clone(), id);
+            }
+        }
+        Ok(out)
+    }
+
     /// 局部更新：标题 / 介绍 / 封面 / 时长 / 尺寸（None = 不改）。
     ///
     /// 标题的空值语义与介绍**刻意不同**：介绍空 = 显式清空（可表达的意图），
@@ -4748,6 +4768,39 @@ mod tests {
             Some(r) => r.get(0).unwrap(),
             None => 0,
         }
+    }
+
+    /// BUG-241 Priority 2：批量 `item_ids_by_refs`——一次覆盖多个 ref，返回
+    /// `ref -> id` 映射，未入库的 ref 不出现；与单条 `item_id_by_ref` 同一真源。
+    #[tokio::test]
+    async fn item_ids_by_refs_batches_and_skips_missing_bug241() {
+        let s = Store::open(tmp_db("byrefs241")).await.unwrap();
+        s.upsert_media_item("tg", "-100:1", "A", "video", None, None, None, None)
+            .await
+            .unwrap();
+        s.upsert_media_item("tg", "-100:2", "B", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let refs = vec![
+            "-100:1".to_string(),
+            "-100:2".to_string(),
+            "-100:3".to_string(),
+        ];
+        let ids = s.item_ids_by_refs("tg", &refs).await.unwrap();
+        assert_eq!(ids.len(), 2, "只返回已入库的两个 ref");
+        assert_eq!(
+            ids.get("-100:1").copied(),
+            s.item_id_by_ref("tg", "-100:1").await.unwrap(),
+            "批量与单条必须同源"
+        );
+        assert_eq!(
+            ids.get("-100:2").copied(),
+            s.item_id_by_ref("tg", "-100:2").await.unwrap(),
+            "批量与单条必须同源"
+        );
+        assert!(!ids.contains_key("-100:3"), "未入库的 ref 不得出现");
+        // 空输入 → 空 map。
+        assert!(s.item_ids_by_refs("tg", &[]).await.unwrap().is_empty());
     }
 
     /// 回归（BUG-031）：**旧库 + 新代码** 首次启动时 `Store::open` 必须成功。

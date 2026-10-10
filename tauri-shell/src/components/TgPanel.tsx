@@ -26,7 +26,7 @@ import {
   enqueueCacheTask,
   cancelCacheTask,
 } from '../api/tg'
-import { findMediaItemIdByRef, importMediaItems } from '../api/media'
+import { findMediaItemIdsByRefs, importMediaItems } from '../api/media'
 import type { ImportEntry } from '../api/media'
 import type {
   TgCacheTask,
@@ -1032,6 +1032,8 @@ export function TgPanel(
 
   // BUG-049：feed 里每张未见过的图片查一次「是否已入库」，驱动图片气泡的
   // 「加入媒体库 / 已入库」状态（图片不缓存，这是图片唯一的落库路径标记）。
+  // BUG-241 Priority 2：**批量**一次请求覆盖所有未见过的图片（此前逐条 by-ref
+  // N+1，实测首屏 54 次）；查过的记入 photoCheckedRef 不再重复请求。
   useEffect(() => {
     const todos = feed
       .filter((f) => f.type === 'photo')
@@ -1039,15 +1041,19 @@ export function TgPanel(
       .filter((r) => !photoCheckedRef.current.has(r))
     if (todos.length === 0) return
     let alive = true
+    for (const r of todos) photoCheckedRef.current.add(r)
     void (async () => {
-      for (const r of todos) {
-        photoCheckedRef.current.add(r)
-        try {
-          const id = await findMediaItemIdByRef('tg', r)
-          if (alive && id != null) setPhotoLibRefs((prev) => new Set(prev).add(r))
-        } catch {
-          /* 服务不可用：静默，按钮保持可点击 */
-        }
+      try {
+        const ids = await findMediaItemIdsByRefs('tg', todos)
+        if (!alive) return
+        if (Object.keys(ids).length === 0) return
+        setPhotoLibRefs((prev) => {
+          const next = new Set(prev)
+          for (const r of Object.keys(ids)) next.add(r)
+          return next
+        })
+      } catch {
+        /* 服务不可用：静默，按钮保持可点击 */
       }
     })()
     return () => {
