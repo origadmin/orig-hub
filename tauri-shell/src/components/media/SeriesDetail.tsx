@@ -729,55 +729,60 @@ export function SeriesDetail(props: {
                 </div>
               ) : null}
 
-              {/* 来源 = 切换视频来源来播放（BUG-198）：不是信息展板。剥掉 ref / 内部 id
-                  这类「这道菜怎么烧」的噪声，只留「当前播放来源 + 备用版本一键切换」。
-                  设计 `episode-internal-ia-v2` §5 S4：「无备用源 ⇒ 来源区整块不渲染」
-                  （原则「无选择即无控件」）—— 无备用源时本块在 DOM 中**完全不存在**，
-                  而非 hidden/opacity-0。「正在从哪播」已由标题行 meta 的 source 徽标承载，
-                  故门控不丢失信息（BUG-210）。 */}
-              {(cur.sources ?? []).length > 0 ? (
-                <div className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5">
-                  <span className="text-[11px] font-medium text-fg-strong">{t('media.episode.sourcesTitle')}</span>
-                  {/* 主版本 = 当前播放来源（来源只标 TG/local 这种「哪道菜」，不标 ref 路径） */}
-                  <div className="flex items-center gap-2 rounded border border-accent/40 bg-accent/5 px-2 py-1 text-[11px]">
-                    <span className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[10px] text-accent">
-                      {t('media.episode.sourcePrimary')}
-                    </span>
-                    <span className="min-w-0 flex-1 truncate text-fg-strong">{cur.title || `#${cur.itemId}`}</span>
-                    <span className="shrink-0 text-[10px] text-muted">
-                      {cur.source ? t(sourceLabelKey(cur.source)) : 'local'}
-                    </span>
-                  </div>
-                  {(cur.sources ?? []).length > 0 ? (
-                    <ul className="flex flex-col gap-1">
-                      {(cur.sources ?? []).map((s) => (
-                        <li
-                          key={s.itemId}
-                          className="flex items-center gap-2 rounded border border-border-subtle/70 px-2 py-1 text-[11px]"
-                        >
-                          <span className="min-w-0 flex-1 truncate text-fg-mid">{s.title || `#${s.itemId}`}</span>
-                          <button
-                            type="button"
-                            onClick={() => switchSource(cur, s.itemId)}
-                            className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-muted hover:bg-surface-2 hover:text-fg-mid"
-                            data-testid="episode-source-switch"
-                          >
-                            {t('media.episode.switchPrimary')}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => detachSource(cur.id, s.itemId)}
-                            className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-destructive hover:bg-destructive/10"
-                            data-testid="episode-source-detach"
-                          >
-                            {t('media.episode.detachSource')}
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : null}
+              {/* 来源（BUG-265）= 「信息段 + 控件段」两层门控：
+                  信息段（区块标题 + 当前播放来源行）**恒渲染** ——「正在从哪播」是信息，
+                  不因「没有可切换的备选项」而失去意义（BUG-148：实现约束 ≠ 产品信息）。
+                  BUG-210 曾把两段放进同一个门控，而生产库备用源表 0 行 ⇒ 45/45 部剧
+                  该块 0 渲染，用户两次报告「来源没有了」。
+                  控件段（备用源列表 + 切换 / 摘除）保留 BUG-210 原门控不变：
+                  设计 episode-internal-ia-v2 §5 S4「无备用源 ⇒ 不渲染」收窄到只约束
+                  **控件** —— 无备用源时 `<ul>` 不进 DOM（非 hidden/opacity-0），
+                  既有 2 个 testid（episode-source-switch / episode-source-detach）原样保留。 */}
+              <div
+                className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5"
+                data-testid="episode-source-info"
+              >
+                <span className="text-[11px] font-medium text-fg-strong">{t('media.episode.sourcesTitle')}</span>
+                {/* 主版本 = 当前播放来源（来源只标 TG/local 这种「哪道菜」，不标 ref 路径） */}
+                <div className="flex items-center gap-2 rounded border border-accent/40 bg-accent/5 px-2 py-1 text-[11px]">
+                  <span className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[10px] text-accent">
+                    {t('media.episode.sourcePrimary')}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-fg-strong">{cur.title || `#${cur.itemId}`}</span>
+                  <span className="shrink-0 text-[10px] text-muted">
+                    {/* BUG-265：无来源回退走 i18n（source.local = 本地 / Local），不再用裸字符串 */}
+                    {cur.source ? t(sourceLabelKey(cur.source)) : t('source.local')}
+                  </span>
                 </div>
-              ) : null}
+                {(cur.sources ?? []).length > 0 ? (
+                  <ul className="flex flex-col gap-1">
+                    {(cur.sources ?? []).map((s) => (
+                      <li
+                        key={s.itemId}
+                        className="flex items-center gap-2 rounded border border-border-subtle/70 px-2 py-1 text-[11px]"
+                      >
+                        <span className="min-w-0 flex-1 truncate text-fg-mid">{s.title || `#${s.itemId}`}</span>
+                        <button
+                          type="button"
+                          onClick={() => switchSource(cur, s.itemId)}
+                          className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-muted hover:bg-surface-2 hover:text-fg-mid"
+                          data-testid="episode-source-switch"
+                        >
+                          {t('media.episode.switchPrimary')}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => detachSource(cur.id, s.itemId)}
+                          className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-destructive hover:bg-destructive/10"
+                          data-testid="episode-source-detach"
+                        >
+                          {t('media.episode.detachSource')}
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
 
               {/* 单集结构性操作：上移 / 下移 / 移除（编辑入口已上移到标题行，见右栏头） */}
               <div className="flex flex-wrap items-center gap-2 border-t border-border-subtle/60 pt-2.5">
