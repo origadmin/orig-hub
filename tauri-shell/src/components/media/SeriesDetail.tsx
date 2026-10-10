@@ -797,7 +797,19 @@ export function SeriesDetail(props: {
                             ) : (
                               <CloudOff className="h-3 w-3" />
                             )}
-                            <span data-testid="episode-nobytes-cache">{label}</span>
+                            {/* 标签只放**短**原因（shortReason 已截断）；完整错误原文
+                                放 title，需要时可查 —— 绝不把多 KB 错误渲染成行内文本。 */}
+                            <span
+                              className="truncate"
+                              data-testid="episode-nobytes-cache"
+                              title={
+                                st.kind === 'failed' || st.kind === 'interrupted'
+                                  ? (st.task.error ?? label)
+                                  : label
+                              }
+                            >
+                              {label}
+                            </span>
                           </span>
                           {st.kind === 'queued' && task ? (
                             <button
