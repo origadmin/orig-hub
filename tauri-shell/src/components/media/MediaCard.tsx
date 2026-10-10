@@ -446,7 +446,18 @@ function MediaCardBase(props: {
           {item.title}
         </p>
         <p className="flex items-center gap-1 truncate text-[10px] text-muted">
-          <span>{fmtSize(item.size)}</span>
+          {/*
+           * BUG-133：这里的 `item.size` 是**登记值**（源头元数据），不是本地磁盘占用。
+           * 此前它被裸展示成一个和「占用空间」毫无区别的数字，两处读数被当成同一口径，
+           * 于是清缓存后卡片没变、用户以为字节没回收。改为显式标注口径。
+           *
+           * 逐条的真实占盘字节没有下发（那需要为每张卡片 stat 一次，列表页不可接受），
+           * 故这里只做**口径标注**、不编造数字 —— 未落盘/已清字节的内容照样显示登记值，
+           * 但读的人知道那不是磁盘事实。
+           */}
+          <span title="内容在源头的大小（登记值），非本地磁盘占用；未落盘或字节已清时仍显示此值">
+            {fmtSize(item.size)}
+          </span>
           {/* 来源徽标（S2）：一眼分清这条内容是从哪来的 */}
           <span
             className="shrink-0 rounded bg-surface-2/70 px-1 text-[10px] leading-none text-muted"

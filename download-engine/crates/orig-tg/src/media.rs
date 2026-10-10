@@ -14,8 +14,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use libsql::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 
+use futures::stream::StreamExt;
+
 use crate::cache::{probe_cached_bytes, BytesPresence};
 use crate::store::Store;
+
+/// 磁盘真值统计的**条目上限**（BUG-133）。
+///
+/// 每次 `library_stats()` 都要stat，故必须有界：超大库（十万级条目）下
+/// 一次全stat 会让「进面板」变成一次 IO 风暴。超出部分不统计，
+/// 并由 `disk_bytes_truncated` **如实上报**，界面标注「已截断」。
+const DISK_SCAN_LIMIT: usize = 20_000;
+
+/// 磁盘真值统计的**并发 stat 上限**。
+///
+/// 无界 `join_all` 会同时打出成千上万个 metadata 请求，把运行时线程池打满
+/// 并连带拖慢同进程的其它 IO（播放/缓存都共用它）。32 足以让stat 流水化，
+/// 又不至于挤占运行时。
+const DISK_SCAN_CONCURRENCY: usize = 32;
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -4283,7 +4299,26 @@ impl Store {
     }
 
     /// 资料库总览统计（首页概览条用）。
+    ///
+    /// **两个口径，含义不同，不可互相替代**（BUG-125 / BUG-133）：
+    ///
+    /// | 字段 | 口径 | 含义 |
+    /// |---|---|---|
+    /// | `disk_bytes` | **磁盘真值**（主口径） | 本机实际落盘的字节，逐条 stat 求和 |
+    /// | `total_size` | 登记值（次口径） | `SUM(media_item.size)`，内容在源头的大小 |
+    ///
+    /// 为什么主口径必须是磁盘真值：清缓存只把 `file_path` 置空、**不清 `size`**
+    /// （BUG-051/BUG-096 裁定：清字节永不删条目），故 `total_size` 在清缓存后
+    /// **本来就不该变** —— 拿它当「占用空间」会让用户清完缓存发现数字没动，
+    /// 误判成「没删成功」。「登记值不变」是正确行为，缺陷在**展示口径**。
+    ///
+    /// 磁盘真值按 `file_path IS NOT NULL` 逐条 stat（经 `resolve_item_path` 解析，
+    /// 覆盖归仓前的下载目录与归仓后的库根两处），**不是**遍历库根目录：
+    /// 目录遍历会漏掉尚未归仓的字节、并把无主孤儿文件算进来，与 `cache/stats`
+    /// 的口径打架。`file_path IS NOT NULL` 只是数据库的**承诺**，故仍以 stat
+    /// 结果为准：文件被外部删掉时该条**不计入**磁盘占用。
     pub async fn library_stats(&self) -> libsql::Result<LibraryStats> {
+        let (disk_bytes, on_disk_items, disk_bytes_truncated) = self.disk_usage().await;
         Ok(LibraryStats {
             items: self.count_one("SELECT COUNT(*) FROM media_item", ()).await?,
             videos: self
@@ -4300,7 +4335,82 @@ impl Store {
             total_size: self
                 .count_one("SELECT COALESCE(SUM(size), 0) FROM media_item", ())
                 .await?,
+            disk_bytes,
+            on_disk_items,
+            disk_bytes_truncated,
         })
+    }
+
+    /// 磁盘真值：库内**实际落盘**的字节累计（BUG-125 / BUG-133 主口径）。
+    ///
+    /// 返回 `(字节, 实际有字节的条目数, 是否被上限截断)`。
+    ///
+    /// 成本与边界（前端每次进面板都会拉 stats，故必须封顶）：
+    ///   - 只 stat `file_path IS NOT NULL` 的行 —— **有登记路径的条目数**，
+    ///     不是库根里的文件数，也不是全库行数（未落盘条目 0 次 stat）；
+    ///   - `LIMIT DISK_SCAN_LIMIT` 硬上限，超出即置 `truncated` 让前端**如实标注
+    ///     「已截断」**，而不是静默少报（静默少报 = 又一次「数字不反映事实」）；
+    ///   - 并发封顶 `DISK_SCAN_CONCURRENCY`，避免大库一次性打出上千个
+    ///     metadata 请求把运行时打满；
+    ///   - 单条 stat 失败（文件已被外部删除 / 无权限）**跳过且不计字节**，
+    ///     与 `probe_cached_bytes` 的「有字节」判据一致（零字节文件不算有字节）。
+    ///
+    /// **不做时间片缓存**：加了 TTL 就可能在「清缓存 → 立刻回看」时读到清之前的
+    /// 旧值，正好把 BUG-133 要修的「数字不动」复现回来。壳侧已有
+    /// `cached(cacheKey.libraryStats())` 做在途合并与结果缓存，且该端点不在
+    /// 任何 1s 轮询路径上（面板只在挂载 / 失效后拉），无需在此再加一层。
+    async fn disk_usage(&self) -> (i64, i64, bool) {
+        let lib_root = self.library_root().await;
+        let mut rows = match self
+            .conn
+            .query(
+                "SELECT file_path FROM media_item \
+                 WHERE file_path IS NOT NULL LIMIT ?1",
+                params![DISK_SCAN_LIMIT as i64],
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return (0, 0, false),
+        };
+        let mut paths: Vec<String> = Vec::new();
+        // `next()` 返回 `Result<Option<Row>>`：中途出错（I/O 错误等）就停，
+        // 已读到的部分照常统计 —— 半个真值远好过整个 0，且不抛给调用方。
+        while let Ok(Some(r)) = rows.next().await {
+            match r.get::<Option<String>>(0) {
+                Ok(Some(p)) => paths.push(p),
+                // NULL 行已被 WHERE 过滤；Err = 该行类型异常，跳过而非中断整次统计。
+                _ => continue,
+            }
+        }
+        drop(rows);
+
+        // 截断判据：带字节的行数超过本次实际统计的行数 = 有一部分没统计到。
+        let total = self
+            .count_one("SELECT COUNT(*) FROM media_item WHERE file_path IS NOT NULL", ())
+            .await
+            .unwrap_or(0);
+        let truncated = total > paths.len() as i64;
+
+        let stats = futures::stream::iter(paths.into_iter().map(|p| {
+            // 绝对 → 原样（存量/降级），相对 → join 库根（归仓产出）：与所有其它
+            // 读字节的路径同走`resolve_item_path`，不在这里另写一套解析规则。
+            let abs = crate::cache::resolve_item_path(&lib_root, &p);
+            async move { tokio::fs::metadata(abs).await.ok() }
+        }))
+        .buffer_unordered(DISK_SCAN_CONCURRENCY);
+
+        futures::pin_mut!(stats);
+        let (mut bytes, mut items) = (0i64, 0i64);
+        while let Some(m) = stats.next().await {
+            if let Some(m) = m {
+                if m.is_file() && m.len() > 0 {
+                    bytes = bytes.saturating_add(m.len() as i64);
+                    items += 1;
+                }
+            }
+        }
+        (bytes, items, truncated)
     }
 }
 
@@ -4314,7 +4424,26 @@ pub struct LibraryStats {
     pub audios: i64,
     pub series: i64,
     pub tags: i64,
+    /// **登记值**（次口径）：`SUM(media_item.size)`，内容在源头的大小之和。
+    ///
+    /// 字段名保持不变是**兼容**：老壳读它仍是「登记体积」这个含义，没被悄悄改口径。
+    /// 它在清缓存后**不下降**是正确的（BUG-051：清字节不删条目、不清 `size`），
+    /// 所以它**不能**当「占用空间」展示 —— 前端必须以 `disk_bytes` 为主口径。
     pub total_size: i64,
+    /// **磁盘真值**（主口径，BUG-133）：本机实际落盘的字节数。
+    ///
+    /// 逐条 stat 求和（见 [`Store::disk_usage`]），故清缓存后**必然下降**。
+    pub disk_bytes: i64,
+    /// 实际有字节的条目数（磁盘口径下「占了地方的条目」）。
+    ///
+    /// 与 `items` 的差额 = 尚未落盘 / 字节已清的条目数，界面上单列比让用户
+    /// 自己拿两个数相减更省事。
+    pub on_disk_items: i64,
+    /// `disk_bytes` 是否因超过 [`DISK_SCAN_LIMIT`] 而**只统计了一部分**。
+    ///
+    /// 为真时界面必须标注「已截断」—— 少报可以，但必须**说出来**，
+    /// 否则又是一个「数字不反映事实」（BUG-109 同款）。
+    pub disk_bytes_truncated: bool,
 }
 
 /// 区分「字段缺省」与「显式 null」。
@@ -4819,6 +4948,147 @@ mod tests {
             Some(r) => r.get(0).unwrap(),
             None => 0,
         }
+    }
+
+    /// 建一条「库根相对路径 + 真实文件」的条目，返回 (库根, 写入字节数)。
+    ///
+    /// 走`mark_downloaded` 之外的直写路径 `set_item_file_path` —— 与清缓存
+    /// 置空 `file_path` 走的是同一个入口，故本组测试的「写入/清空」与生产同路径。
+    async fn seed_housed_item(
+        s: &Store,
+        lib_root: &Path,
+        name: &str,
+        declared_size: i64,
+        bytes: usize,
+    ) -> i64 {
+        let dir = lib_root.join("chat");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), vec![b'x'; bytes]).unwrap();
+        s.upsert_media_item("tg", &format!("-100:{name}"), name, "video", None, Some(declared_size), None, None)
+            .await
+            .unwrap();
+        let id = s
+            .item_id_by_ref("tg", &format!("-100:{name}"))
+            .await
+            .unwrap()
+            .expect("seeded item must exist");
+        // 库内规范形式 = 库根相对路径（归仓产出形态，见 resolve_item_path）。
+        s.set_item_file_path(id, Some(&format!("chat/{name}")))
+            .await
+            .unwrap();
+        id
+    }
+
+    fn tmp_lib_root(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "orig_tg_media_{}_{name}_lib",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// BUG-133 判据 1 + 3：清字节后**磁盘口径下降**、**登记口径不变**，
+    /// 且二者差异可由同一次 `library_stats()` 一并读出。
+    ///
+    /// 这条测试是「口径问题而非功能缺失」的核心证据：同一个库、同一时刻，
+    /// `disk_bytes` 变而 `total_size` 不变 —— 若两者一起变，说明功能真的坏了。
+    #[tokio::test]
+    async fn library_stats_disk_bytes_drops_while_registered_total_size_holds_bug133() {
+        let lib = tmp_lib_root("bug133");
+        let s = Store::open(tmp_db("bug133")).await.unwrap();
+        s.set_setting("library_dir", lib.to_str().unwrap()).await.unwrap();
+
+        let id = seed_housed_item(&s, &lib, "a.mp4", /*declared*/ 900, /*on disk*/ 100).await;
+
+        let before = s.library_stats().await.unwrap();
+        assert_eq!(before.disk_bytes, 100, "磁盘真值 = 实际落盘字节");
+        assert_eq!(before.total_size, 900, "登记值 = SUM(size)，与磁盘无关");
+        assert_eq!(before.on_disk_items, 1);
+        assert!(!before.disk_bytes_truncated);
+
+        // 清字节 = 只置空 file_path（BUG-051：条目与 size 都不动）。
+        s.set_item_file_path(id, None).await.unwrap();
+
+        let after = s.library_stats().await.unwrap();
+        assert_eq!(
+            after.disk_bytes, 0,
+            "BUG-133 判据1：清字节后磁盘口径必须下降"
+        );
+        assert_eq!(
+            after.total_size, 900,
+            "BUG-051 行为不得改变：清字节不清 size，登记值保持不变"
+        );
+        assert_eq!(after.items, 1, "清字节不删条目");
+        assert_eq!(after.on_disk_items, 0);
+    }
+
+    /// BUG-133 规定的**反向证伪**：不清字节直接断言「磁盘值下降」必须 FAIL。
+    ///
+    /// 没有这条，上面那条就可能是因为「统计恒为 0」而假通过 ——
+    /// 任何时候都断言下降的测试是无法证伪的。
+    #[tokio::test]
+    async fn library_stats_disk_bytes_holds_without_clearing_bytes_bug133() {
+        let lib = tmp_lib_root("bug133_falsify");
+        let s = Store::open(tmp_db("bug133_falsify")).await.unwrap();
+        s.set_setting("library_dir", lib.to_str().unwrap()).await.unwrap();
+
+        seed_housed_item(&s, &lib, "keep.mp4", /*declared*/ 500, /*on disk*/ 250).await;
+
+        let a = s.library_stats().await.unwrap();
+        let b = s.library_stats().await.unwrap();
+        assert_eq!(a.disk_bytes, 250);
+        assert_eq!(
+            b.disk_bytes, a.disk_bytes,
+            "未清字节时磁盘值必须**不降** —— 这条断言若失败说明口径本身是错的"
+        );
+    }
+
+    /// 未落盘条目（`file_path IS NULL`）**不计入**磁盘占用（BUG-125 缺陷1）。
+    ///
+    /// `size` 来自 TG 元数据、字节还在 Telegram 上 —— 计入磁盘占用就是撒谎。
+    #[tokio::test]
+    async fn library_stats_excludes_items_without_bytes_from_disk_bug125() {
+        let lib = tmp_lib_root("bug125_pending");
+        let s = Store::open(tmp_db("bug125_pending")).await.unwrap();
+        s.set_setting("library_dir", lib.to_str().unwrap()).await.unwrap();
+
+        seed_housed_item(&s, &lib, "here.mp4", /*declared*/ 100, /*on disk*/ 100).await;
+        // 未落盘：只有 size，没有 file_path。
+        s.upsert_media_item("tg", "-100:remote", "remote.mp4", "video", None, Some(7_777), None, None)
+            .await
+            .unwrap();
+
+        let st = s.library_stats().await.unwrap();
+        assert_eq!(st.items, 2);
+        assert_eq!(
+            st.disk_bytes, 100,
+            "未落盘条目的size 不得计入磁盘占用"
+        );
+        assert_eq!(st.total_size, 100 + 7_777, "登记值仍按 SUM(size)");
+        assert_eq!(st.on_disk_items, 1, "只有一条真有字节");
+    }
+
+    /// 文件被**外部删除**（`file_path` 还在、字节没了）→ 不计入磁盘占用。
+    ///
+    /// `file_path IS NOT NULL` 是数据库的承诺，不是字节本身；承诺失效时
+    /// 必须以 stat 为准，否则又是一个「数字不反映事实」。
+    #[tokio::test]
+    async fn library_stats_drops_vanished_file_from_disk_total_bug133() {
+        let lib = tmp_lib_root("bug133_vanish");
+        let s = Store::open(tmp_db("bug133_vanish")).await.unwrap();
+        s.set_setting("library_dir", lib.to_str().unwrap()).await.unwrap();
+
+        seed_housed_item(&s, &lib, "gone.mp4", /*declared*/ 300, /*on disk*/ 300).await;
+        assert_eq!(s.library_stats().await.unwrap().disk_bytes, 300);
+
+        std::fs::remove_file(lib.join("chat").join("gone.mp4")).unwrap();
+
+        let st = s.library_stats().await.unwrap();
+        assert_eq!(st.disk_bytes, 0, "字节没了就不得继续占用");
+        assert_eq!(st.total_size, 300, "登记值不受文件系统影响");
+        assert_eq!(st.on_disk_items, 0);
     }
 
     /// BUG-241 Priority 2：批量 `item_ids_by_refs`——一次覆盖多个 ref，返回

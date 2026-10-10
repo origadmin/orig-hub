@@ -157,7 +157,28 @@ export function MediaLibraryPanel() {
   }, [alive])
 
   // ---- 数据 ----
-  const [stats, setStats] = useState<LibraryStats | null>(null)
+  /**
+   * 库级统计。**两个口径必须分清**（BUG-125 / BUG-133）：
+   *
+   * | 字段 | 口径 | 界面角色 |
+   * |---|---|---|
+   * | `diskBytes` | 磁盘真值（本机实际落盘字节） | **主口径**，清缓存后会下降 |
+   * | `totalSize` | 登记值（`SUM(size)`，源头大小） | 次口径，仅作对照展示 |
+   *
+   * 此前只展示 `totalSize` 且无标注，用户清缓存后发现数字不动 → 误判「没删成功」
+   * （字节其实已经回收，是展示口径在骗人）。
+   *
+   * 后端先于本次修复时可能不下发磁盘口径字段，故三个字段都按可选处理：
+   * 缺失时**不伪造** 0，而是回退到登记值并明确标注它是什么口径 ——
+   * 宁可显示「登记值」，也不显示一个没有来源的「0 字节」。
+   */
+  type LibraryStatsView = LibraryStats & {
+    diskBytes?: number
+    onDiskItems?: number
+    diskBytesTruncated?: boolean
+  }
+
+  const [stats, setStats] = useState<LibraryStatsView | null>(null)
   const [items, setItems] = useState<MediaItem[]>([])
   const [total, setTotal] = useState(0)
   const [series, setSeries] = useState<MediaSeries[]>([])
@@ -804,6 +825,24 @@ export function MediaLibraryPanel() {
   // 判据用**库级统计** stats.items，不能用列表响应的 total：
   // total 是筛选后总数（标签筛空时为 0），会让"无匹配"伪装成"库空"。
   const libraryEmpty = (stats?.items ?? 0) === 0
+
+  /**
+   * 占用空间的主口径与是否有两个口径（BUG-133）。
+   *
+   * `diskBytes` 缺失 = 后端还没提供磁盘真值，此时**回退登记值**并改口径说明，
+   * 而不是显示 0 或假装它就是磁盘占用。
+   */
+  const hasDiskBasis = typeof stats?.diskBytes === 'number'
+  const leadingBytes = hasDiskBasis ? (stats?.diskBytes ?? 0) : (stats?.totalSize ?? 0)
+  /**
+   * 占用空间的显示值。
+   *
+   * `fmtSize(0)` 返回 `—`（它的语义是「没有读数」）。但「磁盘占用真的归零了」
+   * 是一个**确定的事实**，不是缺读数 —— 显示成 `—` 会让刚清完缓存的用户以为
+   * 「读不出来 / 又坏了」，恰恰是 BUG-133 那类「数字不反映事实」的翻版。
+   * 故归零时显式写 `0 B`，只有**真的没有读数**时才轮到 `—`。
+   */
+  const fmtOccupancy = (b: number): string => (b > 0 ? fmtSize(b) : '0 B')
   const emptyState = (
     <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-10">
       {libraryEmpty ? (
@@ -846,7 +885,38 @@ export function MediaLibraryPanel() {
           </h3>
           {stats ? (
             <p className="mt-0.5 truncate text-[10px] text-muted">
-              {stats.items} 项 · {fmtSize(stats.totalSize)}
+              {stats.items} 项 ·{' '}
+              {/*
+               * BUG-133：**主口径 = 磁盘真值**。
+               * 此前这里直接展示 `totalSize`（登记值）且无任何标注，用户清缓存后
+               * 数字不动 → 误判「没删成功」。字节其实已经回收，是口径在骗人。
+               * 现在主数字是「实际占盘」，并在 title 里**写明口径**，
+               * 两个口径同时可查（BUG-133 判据 2：不得只给一个未加说明的数字）。
+               *
+               * 后端未下发磁盘口径时回退登记值，并把口径写进 title ——
+               * 不把一个来路不明的数当磁盘占用展示。
+               */}
+              <span
+                title={
+                  hasDiskBasis
+                    ? '占用空间 = 资料库在本机实际占用的磁盘字节（清缓存后会下降）'
+                    : '占用空间 = 媒体库登记的内容大小（后端未提供磁盘占用读数；清缓存后此值不变）'
+                }
+                data-testid="media-disk-usage"
+              >
+                占用 {fmtOccupancy(leadingBytes)}
+                {stats.diskBytesTruncated ? '（已截断）' : ''}
+              </span>
+              {/* 次口径：明确标注它**不是**本地占用，否则两个数字仍会被读成一回事。 */}
+              {hasDiskBasis ? (
+                <span
+                  className="ml-1"
+                  title="登记值 = 内容在源头的大小之和（未落盘/字节已清的内容仍计入），不是本地磁盘占用"
+                  data-testid="media-registered-size"
+                >
+                  · 登记 {fmtSize(stats.totalSize)}
+                </span>
+              ) : null}
             </p>
           ) : null}
         </div>
