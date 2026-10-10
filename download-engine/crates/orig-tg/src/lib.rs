@@ -25,6 +25,8 @@ pub mod monitor;
 pub mod routes;
 pub mod state;
 pub mod store;
+/// ffmpeg 硬件解码能力探测与推荐配置（PD-T06，设计 §2.5；只编译，尚未接线进转码参数构造）。
+pub mod ffmpeg_caps;
 /// 不可用时的诚实空对象（说真话，不产假数据）。
 pub mod unavailable;
 
