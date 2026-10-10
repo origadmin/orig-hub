@@ -2658,9 +2658,20 @@ async fn monitor_messages(
 }
 
 /// POST /api/tg/monitor/sync — 手动触发一轮增量同步（调试/即时入库）。
+///
+/// **单飞（BUG-102）**：响应为 `{"started": bool, "added": u64}`。
+/// `started === false` 表示**已有一轮同步在跑、本次被单飞挡下**（未发起任何
+/// Telegram RPC）——此时 `added` 恒为 0。调用方据此区分「我触发的」与「被合并的」，
+/// 而不是把「被挡下」误读成「同步了但没新内容」。
 async fn monitor_sync(State(st): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     match monitor::sync_once(&st).await {
-        Ok(added) => Ok(Json(json!({"added": added}))),
+        Ok(outcome) => Ok(Json(json!({
+            "started": outcome.started(),
+            "added": match outcome {
+                monitor::SyncOutcome::Ran { added } => added,
+                monitor::SyncOutcome::Skipped => 0,
+            },
+        }))),
         Err(e) => Err(ApiError::new(StatusCode::BAD_GATEWAY, &e)),
     }
 }

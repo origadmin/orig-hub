@@ -237,8 +237,12 @@ export async function listTgMonitorMessages(
   }
 }
 
-/** POST /api/tg/monitor/sync — 手动触发一轮增量同步 */
-export function syncTgMonitor(): Promise<{ added: number }> {
+/** POST /api/tg/monitor/sync — 手动触发一轮增量同步
+ *
+ *  BUG-102 单飞：`started === false` 表示已有一轮同步在跑、本次被挡下
+ *  （未发起任何 Telegram RPC），此时 `added` 恒为 0。调用方须据 `started`
+ *  区分「我触发的」与「被合并的」，否则会把「被挡下」误读成「同步了但没新内容」。 */
+export function syncTgMonitor(): Promise<{ started: boolean; added: number }> {
   return request('/api/tg/monitor/sync', { method: 'POST' })
 }
 

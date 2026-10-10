@@ -116,6 +116,16 @@ pub struct AppState {
     /// 缓存 worker 单飞门禁：同一时刻至多一个 worker 协程在跑（进程内判定；
     /// DB 侧 `has_running_cache_task` 是跨请求的慢判定，两者配合防双跑）。
     cache_worker_alive: AtomicBool,
+    /// 增量同步单飞门禁（BUG-102）：同一时刻至多一轮 `monitor::sync_once` 在跑。
+    ///
+    /// **为什么必须单飞**：触发源有三路且可同时打向同一批频道——后台定时循环
+    /// （`monitor::spawn`，默认 30s）、前端 60s 轮询 `POST /api/tg/monitor/sync`、
+    /// 用户手动点击。此前 `sync_once` 全程无互斥，三路可并发推进同一批频道的游标，
+    /// 而一轮同步并不便宜（翻页扫描 + 串行 upsert），于是 **Telegram RPC 预算被叠加
+    /// 消耗**——正是本条要消除的浪费。
+    ///
+    /// 进程内判定（`AtomicBool`）即可：三个触发源全在同一进程，不存在跨进程并发。
+    sync_inflight: AtomicBool,
     /// 节流留痕用的「上次记录时刻」表（BUG-106）。
     ///
     /// 缩略图这类高频路径一页就是几十个请求，链路一断会灌进几十上百条**内容相同**
@@ -190,6 +200,24 @@ impl CacheCancel {
     }
 }
 
+/// 同步单飞守卫（BUG-102）：**持有即占住名额，Drop 即释放**。
+///
+/// 为什么是 RAII 而不是在 `sync_once` 末尾手写 `release_sync()`：`sync_once` 内部
+/// 有多个 `?` 早返回（`list_channels` / `messages` / `upsert_message` 任一失败即返回），
+/// 手写释放必然漏掉其中一条 —— 而漏掉的后果不是「多跑一轮」，而是**同步被永久焊死**
+/// （标志再也回不到 false，之后所有触发源全部空转，TG 内容再也不更新，且没有任何报错）。
+/// 这类「失败即静默永久失效」比原缺陷更难发现。`Drop` 覆盖所有出口：正常返回、
+/// 早返回、panic、以及任务被取消（future drop）。
+pub struct SyncGuard<'a> {
+    owner: &'a AppState,
+}
+
+impl Drop for SyncGuard<'_> {
+    fn drop(&mut self) {
+        self.owner.release_sync();
+    }
+}
+
 impl AppState {
     pub fn new(
         client: Arc<dyn Client>,
@@ -208,6 +236,7 @@ impl AppState {
             dialog_scanning: AtomicBool::new(false),
             cache_tasks: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             cache_worker_alive: AtomicBool::new(false),
+            sync_inflight: AtomicBool::new(false),
             log_throttle: Mutex::new(HashMap::new()),
             cache_dl: crate::login::DownloadProgress::default(),
             cache_dl_task: std::sync::atomic::AtomicI64::new(0),
@@ -296,6 +325,27 @@ impl AppState {
     /// worker 退出时释放名额。
     pub fn release_cache_worker(&self) {
         self.cache_worker_alive.store(false, Ordering::SeqCst)
+    }
+
+    // ---- BUG-102：增量同步单飞（三路触发源并发打同一批频道） ----
+
+    /// 尝试占住同步名额：返回 `Some` 表示本协程独家获得本轮同步的执行权，
+    /// `None` 表示**已有一轮在跑**，调用方应立即放弃本轮（不得排队）。
+    pub fn claim_sync(&self) -> Option<SyncGuard<'_>> {
+        self.sync_inflight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| SyncGuard { owner: self })
+    }
+
+    /// 释放同步名额。
+    pub fn release_sync(&self) {
+        self.sync_inflight.store(false, Ordering::SeqCst)
+    }
+
+    /// 当前是否有一轮同步在跑（诊断/端点暴露用）。
+    pub fn is_sync_running(&self) -> bool {
+        self.sync_inflight.load(Ordering::SeqCst)
     }
 
     /// 从 DB 重建缓存任务快照（每次 DB 变更后由唯一写者调用）。
