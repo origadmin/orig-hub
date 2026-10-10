@@ -1295,6 +1295,52 @@ fn cache_task_title<'a>(
         .find_map(|m| titles.get(&(t.chat_id, *m)).map(|s| s.as_str()))
 }
 
+/// 标题自愈（BUG-220 + BUG-246 合流根因）：队列读到**无标题**任务 ⇒ 后台补登记其消息
+/// 元数据，下一轮轮询即可拿到 caption。
+///
+/// 为什么需要：入队时的登记是一次性 `spawn`（`ensure_message_rows` 逐条 MTProto，可失败、
+/// 可被连接抢占），**失败后无任何重试** ⇒ 该任务标题永久空 ⇒ 前端退回频道名（用户看到
+/// 「又是频道名不是内容」）。这里在**读路径**上补一个自愈闸：读到空就补登记。
+///
+/// 自限性：`ensure_message_rows` 对**已有行**直接跳过，所以
+/// ① 真正缺行（登记失败）会被补上、之后不再重复打 MTProto；
+/// ② 消息**本身无 caption**（行存在但 caption 空）不会被反复重取——那类没有标题可造，
+///    由前端回退链如实呈现，不属于本自愈能解决的。
+static TITLE_SELFHEAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn spawn_title_selfheal(
+    st: &Arc<AppState>,
+    tasks: &[CacheTask],
+    titles: &std::collections::HashMap<(i64, i64), String>,
+) {
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+    // 无标题任务的消息，按 chat 分组。
+    let mut by_chat: HashMap<i64, Vec<i64>> = HashMap::new();
+    for t in tasks {
+        if cache_task_title(t, titles).is_none() {
+            by_chat
+                .entry(t.chat_id)
+                .or_default()
+                .extend(t.message_ids.iter().copied());
+        }
+    }
+    if by_chat.is_empty() {
+        return;
+    }
+    // 同一时刻只跑一轮自愈（面板会轮询，避免每轮都拉起）。
+    if TITLE_SELFHEAL.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let st2 = st.clone();
+    tokio::spawn(async move {
+        for (chat, msgs) in by_chat {
+            ensure_message_rows(&st2, chat, &msgs).await;
+        }
+        TITLE_SELFHEAL.store(false, Ordering::SeqCst);
+    });
+}
+
 fn task_with_progress(st: &AppState, t: &CacheTask, title: Option<&str>) -> serde_json::Value {
     let mut v = serde_json::to_value(t).unwrap_or(serde_json::Value::Null);
     if v.is_object() {
@@ -1396,6 +1442,8 @@ async fn list_all_cache_tasks(State(st): State<Arc<AppState>>) -> Result<impl In
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     let titles = cache_task_titles(&st, &tasks).await;
+    // 无标题 ⇒ 后台自愈补登记，下轮轮询即拿到 caption（别再退回频道名）。
+    spawn_title_selfheal(&st, &tasks, &titles);
     let tasks: Vec<serde_json::Value> = tasks
         .iter()
         .map(|t| task_with_progress(&st, t, cache_task_title(t, &titles)))
