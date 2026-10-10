@@ -51,7 +51,14 @@
 //! [`FfmpegConfig::input_args`] **只产出输入侧参数**（`-hwaccel` / `-hwaccel_device`）。
 //! preset / crf / fps / `-vf` / `-af` 等档位参数**仍归 `encode_profile` 独管**，本模块**不碰**。
 
+use std::ffi::OsStr;
 use std::fmt;
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
+
+use tokio::process::Command;
+use tokio::time::timeout;
 
 /// `ffmpeg -hwaccels` 输出的标题行前缀。
 const HWACCELS_TITLE_PREFIX: &str = "hardware acceleration methods";
@@ -623,6 +630,240 @@ pub fn recommend(caps: &Caps) -> FfmpegConfig {
     FfmpegConfig::software()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 采集层：真正去跑命令，把解析层需要的那些文本拿回来
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 上面一整层是「文本进、结构出」的纯函数；这一层回答的是「**怎么拿到那些文本**」。
+//
+// ## ★ 降级纪律（BUG-237「未安装降级」与 §2.5.4「硬解失败自动回落软解」在探测层的同一形态）
+//
+// - 任何一条命令**失败 / 超时 / 二进制不存在** ⇒ 记一条人类可读原因到
+//   [`ProbeOutcome::errors`]，该来源视作**空**，其余来源照常继续；
+// - `probe_ffmpeg` / `probe_gpus` **绝不返回 `Result`、绝不 panic**；
+// - 能力探测失败的最终后果**只能是「退化为软解」**，**绝不能让播放挂掉**。
+//
+// ## GPU 是**可选**来源
+//
+// 没有 `nvidia-smi`（无 N 卡的机器）是**常态**，其后果仅仅是「不知道有独显」⇒
+// 走核显 / 软解路径，属于正常结果而**不是错误**。因此 [`GpuProbe`] **不设 errors 字段**，
+// 缺失原因只进 `tracing` 日志；只有 **ffmpeg 探测**失败才进 `errors`，因为它直接决定
+// 「有没有硬解」这个用户可见的结论。
+
+/// 单条探测命令的超时上限。
+///
+/// 能力探测必须**远快于一次播放**地放弃：宁可探不到（退化为软解），
+/// 也不能让转码去等一个卡死的 `ffmpeg -encoders`（它的输出有数万行）。
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `ffmpeg -hwaccels` / `ffmpeg -encoders` 的探测结果。
+///
+/// ★ **永不失败的容器**：命令失败 / 超时 / 二进制不存在都**不**返回 `Result`、
+/// **不** panic —— 原因记为 `errors` 里的一条人类可读文本，对应来源为空字符串。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProbeOutcome {
+    /// `ffmpeg -hide_banner -hwaccels` 的 stdout + stderr（失败时为空串）。
+    pub hwaccels_out: String,
+    /// `ffmpeg -hide_banner -encoders` 的 stdout + stderr（失败时为空串）。
+    pub encoders_out: String,
+    /// 探测过程中发生的**人类可读**失败原因；为空表示两条命令都正常返回。
+    ///
+    /// 这些原因只用于**解释「为什么没启用硬解」**（见 [`describe_with_errors`]），
+    /// **不参与控制流** —— 控制流只看解析出来的能力。
+    pub errors: Vec<String>,
+}
+
+impl ProbeOutcome {
+    /// 两条命令都正常返回（没有失败记录）。
+    pub fn ok(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    /// 至少有一条命令失败 / 超时 / 不存在。
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+}
+
+/// GPU 探测结果（两个**可选**来源，`None` = 该来源不可用）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GpuProbe {
+    /// `nvidia-smi -L` 的输出（无 NVIDIA 驱动 / 命令不存在 ⇒ `None`）。
+    pub nvidia_smi: Option<String>,
+    /// Windows WMI `Win32_VideoController` 的 CSV（非 Windows 恒为 `None`）。
+    pub wmi: Option<String>,
+}
+
+/// 跑 `ffmpeg -hide_banner -hwaccels` 与 `ffmpeg -hide_banner -encoders`，收集二者输出。
+///
+/// stdout **与** stderr **都要**收：`-hwaccels` 的标题与列表混在 stdout，
+/// 但失败/警告信息常常走 stderr。
+///
+/// ★ 违反降级纪律的写法（返回 `Result`、panic）在此被刻意禁止：调用方拿到的一定是
+/// 一个可用的 [`ProbeOutcome`]，最坏情况是「两个来源都空 + errors 有两条原因」
+/// ⇒ 上游 `probe_config` 自然退化为 [`FfmpegConfig::software`]。
+pub async fn probe_ffmpeg(ffmpeg: &Path) -> ProbeOutcome {
+    let mut outcome = ProbeOutcome::default();
+
+    match run_capture(ffmpeg, &["-hide_banner", "-hwaccels"]).await {
+        Ok(text) => outcome.hwaccels_out = text,
+        Err(reason) => outcome
+            .errors
+            .push(format!("ffmpeg -hwaccels 探测失败：{reason}")),
+    }
+    match run_capture(ffmpeg, &["-hide_banner", "-encoders"]).await {
+        Ok(text) => outcome.encoders_out = text,
+        Err(reason) => outcome
+            .errors
+            .push(format!("ffmpeg -encoders 探测失败：{reason}")),
+    }
+
+    outcome
+}
+
+/// 探测本机有哪些显卡：`nvidia-smi -L`（全平台都试）+ Windows 上再走 WMI。
+///
+/// ★ 两个来源**都可能为 `None`**，且**都不算错误**：GPU 信息缺失的后果只是
+/// 「不知道有独显」⇒ 决策落到核显 / 软解路径（见 [`recommend`]），播放不受影响。
+pub async fn probe_gpus() -> GpuProbe {
+    let nvidia_smi = match run_capture("nvidia-smi", &["-L"]).await {
+        Ok(text) => Some(text),
+        Err(reason) => {
+            // 无 N 卡机器上这是常态，用 debug 级记录即可（不是故障）
+            tracing::debug!("nvidia-smi -L 不可用（{reason}）：按「无 NVIDIA 独显」继续");
+            None
+        }
+    };
+
+    GpuProbe {
+        nvidia_smi,
+        wmi: probe_wmi().await,
+    }
+}
+
+/// Windows：取 `Win32_VideoController` 的 `Name` / `AdapterRAM`（CSV）。
+///
+/// ★ **不用 `wmic`** —— 新版 Windows 已移除该命令；改用 PowerShell CIM。
+#[cfg(windows)]
+async fn probe_wmi() -> Option<String> {
+    const WMI_COMMAND: &str =
+        "Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM | ConvertTo-Csv -NoTypeInformation";
+    match run_capture("powershell", &["-NoProfile", "-NoLogo", "-Command", WMI_COMMAND]).await {
+        Ok(text) => Some(text),
+        Err(reason) => {
+            // Windows 上 WMI 应当可用，失败属于异常 ⇒ warn 级可见
+            tracing::warn!("Win32_VideoController 探测失败（{reason}）：按「无 GPU 信息」继续");
+            None
+        }
+    }
+}
+
+/// 非 Windows：没有 WMI，恒为 `None`（`nvidia-smi` 分支仍保留）。
+#[cfg(not(windows))]
+async fn probe_wmi() -> Option<String> {
+    None
+}
+
+/// 把探测到的原始文本汇总成 [`Caps`]（纯函数，便于单测）。
+pub fn caps_from_probe(ffmpeg_out: &ProbeOutcome, gpus: &GpuProbe) -> Caps {
+    Caps {
+        hwaccels: parse_hwaccels(&ffmpeg_out.hwaccels_out),
+        encoders: parse_encoders(&ffmpeg_out.encoders_out),
+        gpus: parse_gpu_list(gpus.nvidia_smi.as_deref(), gpus.wmi.as_deref()),
+    }
+}
+
+/// 探测文本 ⇒ 推荐配置（[`caps_from_probe`] + [`recommend`]，纯函数）。
+///
+/// ★ 探测全失败的后果就在这里收敛为「软解」，绝不会向上传播错误。
+pub fn probe_config(ffmpeg_out: &ProbeOutcome, gpus: &GpuProbe) -> FfmpegConfig {
+    recommend(&caps_from_probe(ffmpeg_out, gpus))
+}
+
+/// 一行摘要，供 diag 与设置页文案使用（不带失败原因）。
+pub fn describe(cfg: &FfmpegConfig) -> String {
+    describe_with_errors(cfg, &[])
+}
+
+/// 一行摘要（软解且给了失败原因时，把**首条**原因附在后面）。
+///
+/// 两种形态：
+/// - 硬解：`硬解 cuda（设备 0）` / `硬解 d3d11va`
+/// - 软解：`未启用硬件解码（原因：ffmpeg -hwaccels 探测失败：…）`
+///   / `未启用硬件解码（本机未探测到可用硬解后端）`
+pub fn describe_with_errors(cfg: &FfmpegConfig, errors: &[String]) -> String {
+    let Some(hwaccel) = cfg.hwaccel else {
+        return match errors.first() {
+            Some(reason) => format!("未启用硬件解码（原因：{reason}）"),
+            None => "未启用硬件解码（本机未探测到可用硬解后端）".to_string(),
+        };
+    };
+
+    let mut out = match &cfg.device {
+        Some(device) => format!("硬解 {}（设备 {device}）", hwaccel.as_str()),
+        None => format!("硬解 {}", hwaccel.as_str()),
+    };
+    if cfg.hw_encode {
+        out.push_str(" + 硬件编码");
+    }
+    out
+}
+
+/// 跑一条命令并收齐 stdout + stderr；任何异常都转成**人类可读的 Err 文本**。
+///
+/// 失败语义：无法启动 / 读取失败 / 超时 / 退出码非 0 —— 一律 `Err(reason)`，
+/// 由调用方决定「记进 errors」还是「仅记日志」。绝不 panic。
+async fn run_capture<P: AsRef<OsStr>>(program: P, args: &[&str]) -> Result<String, String> {
+    let display = Path::new(program.as_ref()).to_string_lossy().to_string();
+
+    let child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null()) // 不给 stdin：探测命令不该等输入
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true) // 超时取消时把子进程一并带走，不留孤儿
+        .spawn()
+        .map_err(|e| format!("无法启动 {display}（{e}）"))?;
+
+    let output = match timeout(PROBE_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return Err(format!("读取 {display} 输出失败（{e}）")),
+        Err(_) => {
+            return Err(format!(
+                "{display} 超时（{}s 未完成）",
+                PROBE_TIMEOUT.as_secs()
+            ))
+        }
+    };
+
+    // stdout 与 stderr 都要：能力列表在 stdout，失败原因常常在 stderr
+    let mut combined = String::new();
+    combined.push_str(&String::from_utf8_lossy(&output.stdout));
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+
+    if !output.status.success() {
+        let code = output
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "被信号终止".to_string());
+        return Err(match first_useful_line(&combined) {
+            Some(line) => format!("{display} 退出码 {code}：{line}"),
+            None => format!("{display} 退出码 {code}"),
+        });
+    }
+
+    Ok(combined)
+}
+
+/// 取输出里第一行非空文本（用于把冗长的 ffmpeg 报错压成一句人话）。
+fn first_useful_line(text: &str) -> Option<String> {
+    text.lines()
+        .map(|line| line.trim())
+        .find(|line| !line.is_empty())
+        .map(|line| line.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,6 +1127,240 @@ AdapterRAM,DriverVersion,Name
         assert!(!gpus[0].dedicated, "Intel 核显不是独显");
         assert_eq!(gpus[0].memory_bytes, Some(1073741824));
         assert!(parse_gpu_list(None, None).is_empty(), "两源皆空 ⇒ 空列表");
+    }
+
+    /// 13.（采集层）假 ffmpeg 夹具 ⇒ 7 个后端，且 `probe_config` 产出 Cuda + device="0"。
+    #[tokio::test]
+    async fn probe_ffmpeg_with_fake_binary_yields_cuda_config() {
+        let dir = temp_probe_dir("fake_ok");
+        let ffmpeg = write_fake_ffmpeg(&dir, HWACCEL_OUTPUT_LINES, ENCODER_OUTPUT_LINES);
+        let gpus = fake_gpu_probe();
+
+        let out = probe_ffmpeg(&ffmpeg).await;
+        assert!(out.ok(), "不该有错误: {:?}", out.errors);
+        assert_eq!(caps_from_probe(&out, &gpus).hwaccels.len(), 7);
+
+        let cfg = probe_config(&out, &gpus);
+        assert_eq!(cfg.hwaccel, Some(HwAccel::Cuda), "{cfg:?}");
+        assert_eq!(cfg.device.as_deref(), Some("0"));
+        assert_eq!(cfg.input_args(), vec!["-hwaccel", "cuda", "-hwaccel_device", "0"]);
+        assert!(!cfg.hw_encode, "硬件编码默认必须关闭: {cfg:?}");
+        assert!(describe(&cfg).contains("硬解 cuda"), "{}", describe(&cfg));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 14.（采集层）假 ffmpeg 的 `-hwaccels` 只有标题 ⇒ 软解 + 空 input_args。
+    #[tokio::test]
+    async fn probe_ffmpeg_without_backends_degrades_to_software() {
+        let dir = temp_probe_dir("fake_empty");
+        let ffmpeg = write_fake_ffmpeg(&dir, &["Hardware acceleration methods:"], ENCODER_OUTPUT_LINES);
+        let gpus = fake_gpu_probe();
+
+        let out = probe_ffmpeg(&ffmpeg).await;
+        // 命令本身成功了（只是没有后端）⇒ 不算错误
+        assert!(out.ok(), "命令成功不该记错误: {:?}", out.errors);
+
+        let cfg = probe_config(&out, &gpus);
+        assert!(cfg.is_software(), "{cfg:?}");
+        assert!(cfg.input_args().is_empty());
+        let text = describe(&cfg);
+        assert!(text.contains("未启用硬件解码"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 15.（降级）假 ffmpeg 退出码非 0 ⇒ errors 非空、caps 空、配置软解、**不 panic**。
+    #[tokio::test]
+    async fn probe_ffmpeg_failure_is_recorded_and_degrades_to_software() {
+        let dir = temp_probe_dir("fake_fail");
+        let ffmpeg = write_failing_ffmpeg(&dir);
+
+        let out = probe_ffmpeg(&ffmpeg).await; // ★ 必须不 panic、不返回 Result
+        assert!(out.has_errors(), "失败必须被记录: {out:?}");
+        assert_eq!(out.errors.len(), 2, "两条命令各记一条: {:?}", out.errors);
+        assert!(
+            out.errors.iter().any(|e| e.contains("unable to start")),
+            "原因要带上 stderr 里的人话: {:?}",
+            out.errors
+        );
+
+        let caps = caps_from_probe(&out, &GpuProbe::default());
+        assert!(caps.hwaccels.is_empty(), "{caps:?}");
+        assert!(caps.encoders.is_empty(), "{caps:?}");
+
+        let cfg = probe_config(&out, &GpuProbe::default());
+        assert_eq!(cfg, FfmpegConfig::software(), "{cfg:?}");
+        let text = describe_with_errors(&cfg, &out.errors);
+        assert!(text.contains("未启用硬件解码") && text.contains("原因"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 16.（降级）二进制不存在 ⇒ 同样只是「退化为软解」。
+    #[tokio::test]
+    async fn probe_ffmpeg_missing_binary_degrades_to_software() {
+        let dir = temp_probe_dir("missing");
+        let missing = dir.join(if cfg!(windows) {
+            "no_such_ffmpeg.exe"
+        } else {
+            "no_such_ffmpeg"
+        });
+
+        let out = probe_ffmpeg(&missing).await; // ★ 不 panic
+        assert!(out.has_errors(), "{out:?}");
+        assert!(
+            out.errors.iter().any(|e| e.contains("无法启动")),
+            "原因要说明是启动失败: {:?}",
+            out.errors
+        );
+        assert!(probe_config(&out, &GpuProbe::default()).is_software());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 17.（降级）真跑一次 `probe_gpus()`：任何环境都不能 panic，缺失只是 `None`。
+    #[tokio::test]
+    async fn probe_gpus_never_panics_on_host() {
+        let probe = probe_gpus().await; // 真跑 nvidia-smi / powershell，缺哪个都只是 None
+        let gpus = parse_gpu_list(probe.nvidia_smi.as_deref(), probe.wmi.as_deref());
+        // 只断言「不炸且结果是合法列表」，不断言具体有几张卡（机器相关）
+        for gpu in &gpus {
+            assert!(!gpu.name.is_empty());
+        }
+        let caps = Caps {
+            hwaccels: vec!["d3d11va".to_string()],
+            encoders: Vec::new(),
+            gpus,
+        };
+        assert_eq!(recommend(&caps).hwaccel, Some(HwAccel::D3d11va));
+    }
+
+    /// 假 ffmpeg 夹具用的 `-hwaccels` 输出行（对应本机真实的 7 后端）。
+    const HWACCEL_OUTPUT_LINES: &[&str] = &[
+        "Hardware acceleration methods:",
+        "cuda",
+        "vaapi",
+        "dxva2",
+        "qsv",
+        "d3d11va",
+        "d3d12va",
+        "amf",
+    ];
+
+    /// 假 ffmpeg 夹具用的 `-encoders` 输出行（含 libx264 与 h264_nvenc）。
+    const ENCODER_OUTPUT_LINES: &[&str] = &[
+        "Encoders:",
+        " V..... = Video",
+        " ------",
+        " V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10",
+        " V....D h264_nvenc           NVIDIA NVENC H.264 encoder",
+    ];
+
+    /// 直接构造 GPU 探测结果（不依赖本机是否真有 N 卡，保证测试确定性）。
+    fn fake_gpu_probe() -> GpuProbe {
+        GpuProbe {
+            nvidia_smi: Some(NVIDIA_SMI_3060.to_string()),
+            wmi: Some(WMI_CSV_MULTI.to_string()),
+        }
+    }
+
+    /// 本次测试专用的临时目录（路径带 pid + 纳秒，避免并发测试互相踩）。
+    fn temp_probe_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("orig_tg_ffmpeg_caps_{tag}_{}_{nanos}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// 写一个假 ffmpeg：按 argv 里的 `-hwaccels` / `-encoders` 分支 echo 固定文本。
+    #[cfg(windows)]
+    fn write_fake_ffmpeg(dir: &Path, hwaccels: &[&str], encoders: &[&str]) -> std::path::PathBuf {
+        let path = dir.join("fake_ffmpeg.cmd");
+        let mut script = String::from("@echo off\r\nsetlocal\r\nset \"MODE=\"\r\n");
+        script.push_str("for %%a in (%*) do (\r\n");
+        script.push_str("  if \"%%a\"==\"-hwaccels\" set \"MODE=hwaccels\"\r\n");
+        script.push_str("  if \"%%a\"==\"-encoders\" set \"MODE=encoders\"\r\n");
+        script.push_str(")\r\n");
+        script.push_str("if \"%MODE%\"==\"hwaccels\" goto :hwaccels\r\n");
+        script.push_str("if \"%MODE%\"==\"encoders\" goto :encoders\r\n");
+        script.push_str("exit /b 0\r\n");
+        script.push_str(":hwaccels\r\n");
+        for line in hwaccels {
+            script.push_str(&format!("echo {line}\r\n"));
+        }
+        script.push_str("exit /b 0\r\n");
+        script.push_str(":encoders\r\n");
+        for line in encoders {
+            script.push_str(&format!("echo {line}\r\n"));
+        }
+        script.push_str("exit /b 0\r\n");
+        std::fs::write(&path, script).expect("写假 ffmpeg 脚本失败");
+        path
+    }
+
+    /// 写一个假 ffmpeg（Unix 版，`.sh` + 可执行位）。
+    #[cfg(not(windows))]
+    fn write_fake_ffmpeg(dir: &Path, hwaccels: &[&str], encoders: &[&str]) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("fake_ffmpeg.sh");
+        let mut script = String::from("#!/bin/sh\nMODE=\"\"\n");
+        script.push_str("for a in \"$@\"; do\n");
+        script.push_str("  case \"$a\" in\n");
+        script.push_str("    -hwaccels) MODE=hwaccels ;;\n");
+        script.push_str("    -encoders) MODE=encoders ;;\n");
+        script.push_str("  esac\n");
+        script.push_str("done\n");
+        script.push_str("if [ \"$MODE\" = \"hwaccels\" ]; then\ncat <<'ORIG_HWA_EOF'\n");
+        for line in hwaccels {
+            script.push_str(line);
+            script.push('\n');
+        }
+        script.push_str("ORIG_HWA_EOF\nfi\n");
+        script.push_str("if [ \"$MODE\" = \"encoders\" ]; then\ncat <<'ORIG_ENC_EOF'\n");
+        for line in encoders {
+            script.push_str(line);
+            script.push('\n');
+        }
+        script.push_str("ORIG_ENC_EOF\nfi\n");
+        script.push_str("exit 0\n");
+        std::fs::write(&path, script).expect("写假 ffmpeg 脚本失败");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("设置可执行位失败");
+        path
+    }
+
+    /// 写一个**注定失败**的假 ffmpeg（stderr 输出 + 退出码 1）。
+    #[cfg(windows)]
+    fn write_failing_ffmpeg(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("fake_ffmpeg_fail.cmd");
+        std::fs::write(
+            &path,
+            "@echo off\r\necho fake-ffmpeg: unable to start 1>&2\r\nexit /b 1\r\n",
+        )
+        .expect("写失败脚本失败");
+        path
+    }
+
+    /// 写一个**注定失败**的假 ffmpeg（Unix 版）。
+    #[cfg(not(windows))]
+    fn write_failing_ffmpeg(dir: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("fake_ffmpeg_fail.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho \"fake-ffmpeg: unable to start\" 1>&2\nexit 1\n",
+        )
+        .expect("写失败脚本失败");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("设置可执行位失败");
+        path
     }
 
     /// 12.（附加）`HwAccel::from_name` / `as_str` 往返一致，且不认 `auto`。
