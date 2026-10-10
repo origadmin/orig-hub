@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
+  AlertTriangle,
   ChevronDown,
   ChevronUp,
   CloudOff,
@@ -18,6 +19,8 @@ import type {
 } from 'react'
 import type { MediaEpisode, MediaSeriesDetail, MediaTag } from '../../api/media'
 import { recacheSeriesMissing } from '../../api/media'
+import { getCacheTaskForItem } from '../../api/tg'
+import type { TgCacheTask } from '../../types'
 
 /**
  * 方向判定 hook：preload 首帧源图，按实际尺寸判竖/横（v3 `isPortrait` 等价实现；
@@ -51,6 +54,7 @@ import {
 } from '../../api/media'
 import {
   coverFit,
+  episodeCacheStatus,
   episodeRecacheCandidates,
   fmtDuration,
   hasMediaBytes,
@@ -162,6 +166,50 @@ export function SeriesDetail(props: {
   const [descExpanded, setDescExpanded] = useState(false)
 
   const { playEps, photoEps } = partitionEpisodes(detail)
+
+  /**
+   * BUG-279：每集的缓存任务态（按 ref 索引）。未缓存分集据此展示「排队中 / 下载中 /
+   * 上次失败（原因）/ 已取消 / 已完成但无字节」。详情加载时按集批量查询
+   * `getCacheTaskForItem`（只查有可缓存 ref 的集），结果进本 map；与字节态
+   * （`hasMediaBytes`）分别判定后再合并渲染。
+   */
+  const [cacheTasks, setCacheTasks] = useState<Record<string, TgCacheTask | null>>({})
+  useEffect(() => {
+    let alive = true
+    const refs: Array<{ ref: string; chatId: number; messageId: number }> = []
+    for (const ep of detail.episodes) {
+      const r = episodeRecacheCandidates(ep)[0]?.ref
+      if (!r) continue
+      const at = r.lastIndexOf(':')
+      if (at <= 0) continue
+      const chatId = Number(r.slice(0, at))
+      const messageId = Number(r.slice(at + 1))
+      if (!Number.isFinite(chatId) || !Number.isFinite(messageId)) continue
+      refs.push({ ref: r, chatId, messageId })
+    }
+    if (refs.length === 0) {
+      setCacheTasks({})
+      return
+    }
+    Promise.all(
+      refs.map(async ({ ref, chatId, messageId }) => {
+        try {
+          const { task } = await getCacheTaskForItem(chatId, messageId)
+          return [ref, task] as const
+        } catch {
+          return [ref, null] as const
+        }
+      }),
+    ).then((entries) => {
+      if (!alive) return
+      const map: Record<string, TgCacheTask | null> = {}
+      for (const [ref, task] of entries) map[ref] = task
+      setCacheTasks(map)
+    })
+    return () => {
+      alive = false
+    }
+  }, [detail])
 
   /**
    * 单层剧集（R7）：唯一集**默认聚焦**；否则聚焦第一集 —— 左选右看形态下
@@ -642,21 +690,68 @@ export function SeriesDetail(props: {
                       </span>
                     ) : (
                       (() => {
-                        const cacheable = episodeRecacheCandidates(ep).length > 0
+                        const candidates = episodeRecacheCandidates(ep)
+                        const cacheable = candidates.length > 0
+                        const ref = candidates[0]?.ref ?? null
+                        const task = ref ? (cacheTasks[ref] ?? null) : null
+                        const st = episodeCacheStatus(task)
+                        const tone =
+                          st.kind === 'failed' ||
+                          st.kind === 'interrupted' ||
+                          st.kind === 'done-no-bytes'
+                            ? 'text-red-500'
+                            : st.kind === 'queued' || st.kind === 'running'
+                              ? 'text-blue-400'
+                              : 'text-amber-500'
+                        const label = (() => {
+                          switch (st.kind) {
+                            case 'no-task':
+                              return t('media.notCached')
+                            case 'queued':
+                              return t('media.episode.cacheQueued')
+                            case 'running':
+                              return `${t('media.episode.cacheRunning')}${
+                                st.task.done != null && st.task.total
+                                  ? ` ${st.task.done}/${st.task.total}`
+                                  : ''
+                              }`
+                            case 'failed':
+                              return t('media.episode.cacheFailed', { reason: st.reason })
+                            case 'interrupted':
+                              return t('media.episode.cacheInterrupted', { reason: st.reason })
+                            case 'cancelled':
+                              return t('media.episode.cacheCancelled')
+                            case 'done-no-bytes':
+                              return t('media.episode.cacheDoneNoBytes')
+                          }
+                        })()
+                        // 可重试态（失败 / 中断 / 取消 / 完成无字节）且仍可缓存 ⇒ 点击重缓存
+                        const retryable =
+                          cacheable &&
+                          (st.kind === 'failed' ||
+                            st.kind === 'interrupted' ||
+                            st.kind === 'cancelled' ||
+                            st.kind === 'done-no-bytes')
+                        const clickable = cacheable || retryable
                         return (
                           <span
-                            className={`flex items-center gap-0.5 rounded px-0.5 font-mono text-[10.5px] text-amber-500 ${
-                              cacheable ? 'cursor-pointer hover:bg-amber-500/10' : 'cursor-not-allowed'
+                            className={`flex items-center gap-0.5 rounded px-0.5 font-mono text-[10.5px] ${tone} ${
+                              clickable ? 'cursor-pointer hover:bg-amber-500/10' : 'cursor-not-allowed'
                             }`}
                             data-testid="episode-nobytes"
+                            data-status={st.kind}
                             title={
-                              cacheable
-                                ? t('media.episode.cacheThis')
-                                : t('media.episode.recacheNoRoute', {
-                                    source: t(sourceLabelKey(ep.source)),
-                                  })
+                              st.kind === 'no-task'
+                                ? cacheable
+                                  ? t('media.episode.cacheThis')
+                                  : t('media.episode.recacheNoRoute', {
+                                      source: t(sourceLabelKey(ep.source)),
+                                    })
+                                : retryable
+                                  ? t('media.episode.cacheRetry')
+                                  : label
                             }
-                            {...(cacheable
+                            {...(clickable
                               ? {
                                   role: 'button' as const,
                                   tabIndex: 0,
@@ -674,8 +769,12 @@ export function SeriesDetail(props: {
                                 }
                               : {})}
                           >
-                            <CloudOff className="h-3 w-3" />
-                            <span data-testid="episode-nobytes-cache">{t('media.notCached')}</span>
+                            {st.kind === 'failed' || st.kind === 'interrupted' ? (
+                              <AlertTriangle className="h-3 w-3" />
+                            ) : (
+                              <CloudOff className="h-3 w-3" />
+                            )}
+                            <span data-testid="episode-nobytes-cache">{label}</span>
                           </span>
                         )
                       })()

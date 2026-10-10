@@ -29,6 +29,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::login::{ClientError, DownloadOutcome, LoginPhase, MediaRange};
 use crate::monitor;
 use crate::state::{AppState, Availability};
+use crate::ffmpeg_caps::{describe, probe_config, probe_ffmpeg, probe_gpus, FfmpegConfig};
 use crate::store::{CacheTask, StoredQuery};
 
 pub fn router(state: Arc<AppState>) -> axum::Router {
@@ -58,6 +59,12 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         // 全量任务列表 + 状态计数（缓存管理面板）。与上面单结果契约并存，
         // 管理面板低频拉取，不参与 1s 轮询（BUG-027 的轮询三律不受影响）。
         .route("/api/tg/cache/tasks/all", get(list_all_cache_tasks))
+        // BUG-279：按条目（chat:msg）查其缓存任务态，媒体库未缓存条目展示用。
+        // 必须放在 `:id` 之前（静态段优先于动态段）。
+        .route(
+            "/api/tg/cache/tasks/by-item",
+            get(cache_task_by_item),
+        )
         .route(
             "/api/tg/cache/tasks/:id",
             get(cache_task_by_id).delete(cancel_cache_task_route),
@@ -1418,6 +1425,35 @@ async fn cache_task_by_id(
             Ok(Json(task_with_progress(&st, &t, cache_task_title(&t, &titles))))
         }
         Ok(None) => Err(ApiError::new(StatusCode::NOT_FOUND, "cache task not found")),
+        Err(e) => Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+    }
+}
+
+/// BUG-279：`GET /api/tg/cache/tasks/by-item` 的查询参数（chat:msg → 坐标）。
+#[derive(Debug, Deserialize)]
+struct CacheTaskByItemQuery {
+    #[serde(rename = "chatId")]
+    chat_id: i64,
+    #[serde(rename = "messageId")]
+    message_id: i64,
+}
+
+/// GET /api/tg/cache/tasks/by-item?chatId=&messageId= — 按条目查其缓存任务态（BUG-279）。
+///
+/// 媒体库未缓存条目据此展示「排队中 / 正在下 / 上次失败（原因）/ 被取消 /
+/// 已完成但无字节」。`task: null` 表示这条视频**从未入队 / 记录已删**——
+/// 与「失败 / 取消」语义严格区分（后者都有任务记录）。端点只读、不新建表。
+/// 复用 `task_with_progress` 渲染通道，前端零额外适配。
+async fn cache_task_by_item(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<CacheTaskByItemQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    match st.store.cache_task_for_item(q.chat_id, q.message_id).await {
+        Ok(Some(t)) => {
+            let titles = cache_task_titles(&st, std::slice::from_ref(&t)).await;
+            Ok(Json(json!({ "task": task_with_progress(&st, &t, cache_task_title(&t, &titles)) })))
+        }
+        Ok(None) => Ok(Json(json!({ "task": null }))),
         Err(e) => Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
     }
 }
@@ -3751,6 +3787,43 @@ fn resolve_ffmpeg_from(
     None
 }
 
+/// §2.5.7：ffmpeg 能力配置（硬件加速解码）进程级缓存。
+///
+/// 仅探测一次；探测失败 / 被 `ORIG_TG_HWACCEL=off` 禁用时一律回落软件解码——
+/// 软件解码下 `FfmpegConfig::input_args()` 返回空 `Vec`，命令行逐字等价于现状
+/// （不加任何 `-hwaccel`）。默认 `auto` = 按探测结果启用硬件解码（HEVC 等硬解
+/// 走 GPU，规避纯软件解码的实时性瓶颈）。
+static FFMPEG_CONFIG: tokio::sync::OnceCell<FfmpegConfig> = tokio::sync::OnceCell::const_new();
+
+/// 解析当前 ffmpeg 的能力配置（带缓存 + 软件兜底）。
+async fn ffmpeg_config(ffmpeg: &std::path::Path) -> FfmpegConfig {
+    if std::env::var("ORIG_TG_HWACCEL").as_deref() == Ok("off") {
+        return FfmpegConfig::software();
+    }
+    FFMPEG_CONFIG
+        .get_or_init(|| async {
+            let probe = probe_ffmpeg(ffmpeg).await;
+            if !probe.ok() {
+                tracing::warn!(
+                    target: "orig_tg::transcode",
+                    "ffmpeg caps probe failed ({:?}); falling back to software decode",
+                    probe.errors
+                );
+                return FfmpegConfig::software();
+            }
+            let gpus = probe_gpus().await;
+            let cfg = probe_config(&probe, &gpus);
+            tracing::info!(
+                target: "orig_tg::transcode",
+                "ffmpeg config resolved: {}",
+                describe(&cfg)
+            );
+            cfg
+        })
+        .await
+        .clone()
+}
+
 /// `GET /api/media/items/:id/stream[?speed=S]` — H.264 compatibility/FRC stream (BUG-208/223).
 ///
 /// 背景：库内重量级条目（>8Mbps 共 9 条）实测整类 HEVC，Chromium 只认硬件 HEVC
@@ -3844,7 +3917,10 @@ async fn media_item_stream(
     }
 
     // ffmpeg 不存在应在占坑**之前**判定——否则 501 早退会把在途表弄脏（占坑无 pump）。
-    let ffmpeg = resolve_ffmpeg_path(&proxy_dir).ok_or_else(|| {
+    // BUG-278：探测落点必须是**真实数据目录本体**（`data_dir()`），而非派生的
+    // `proxy_dir`（`<数据目录>/proxies`）——否则 `<数据目录>/bin` 这一受支持落点会
+    // 退化成 `<数据目录>/proxies/bin`（恒空）。
+    let ffmpeg = resolve_ffmpeg_path(&st.store.data_dir()).ok_or_else(|| {
         ApiError::new(
             StatusCode::NOT_IMPLEMENTED,
             "ffmpeg not available; install it (set ORIG_FFMPEG_PATH, or place ffmpeg.exe at %LocalAppData%\\OrigHub\\bin\\ffmpeg.exe) to enable compatibility streams",
@@ -3938,6 +4014,7 @@ async fn media_item_stream(
             }
             let (resp_tx, resp_rx) =
                 tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
+            let cfg = ffmpeg_config(&ffmpeg).await;
             tokio::spawn(transcode_pump(
                 ffmpeg,
                 src,
@@ -3949,6 +4026,7 @@ async fn media_item_stream(
                 registered,
                 tx,
                 resp_tx,
+                cfg,
             ));
             let body = axum::body::Body::from_stream(ReceiverStream::new(resp_rx));
             let mut res = Response::new(body);
@@ -3988,6 +4066,7 @@ async fn transcode_pump(
     registered: bool,
     done_tx: tokio::sync::watch::Sender<bool>,
     resp_tx: tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
+    cfg: FfmpegConfig,
 ) {
     let id = key.item_id;
     let persist = start_secs.is_none();
@@ -4018,6 +4097,9 @@ async fn transcode_pump(
         tracing::info!(target: "orig_tg::transcode", "item {id}: anchored live stream from {t:.3}s (not persisted)");
         command.arg("-ss").arg(format!("{t:.3}"));
     }
+    // §2.5.7：输入侧硬件加速参数（软件解码时为空 `Vec`，逐字兼容现状）。
+    // 必须放在 `-i` **之前**，否则 ffmpeg 拒绝。
+    command.args(cfg.input_args());
     command.args([
         "-hide_banner",
         "-loglevel",

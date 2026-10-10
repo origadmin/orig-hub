@@ -813,6 +813,21 @@ impl Store {
         base.join("proxies")
     }
 
+    /// 真实 TG 数据目录：库根（store.db 所在目录）。
+    ///
+    /// 与 `proxy_dir()`（其下 `proxies` 子目录）区分：ffmpeg 二进制探测、外部工具
+    /// 落点等需要的是**数据目录本体**而非派生的代理缓存目录。BUG-278 修复点：此前
+    /// 误把 `proxy_dir()` 传给 `resolve_ffmpeg_path`，使受支持的 `<数据目录>/bin`
+    /// 落点退化为 `<数据目录>/proxies/bin`（恒空），ffmpeg 只能靠
+    /// `%LocalAppData%\OrigHub\bin` 或 PATH 兜底。
+    pub fn data_dir(&self) -> PathBuf {
+        self.db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    }
+
     /// 读 config.json 的 `libraryDir`（缺文件/缺键/解析失败 → None，不阻断）。
     pub fn config_json_library_dir(db_path: &Path) -> Option<PathBuf> {
         let base = db_path
@@ -969,8 +984,54 @@ impl Store {
             params![item_key],
         )
         .await?
-        .map(|r| cache_task_from_row(&r))
-        .transpose()
+            .map(|r| cache_task_from_row(&r))
+            .transpose()
+    }
+
+    /// 按条目查其缓存任务态（BUG-279）。
+    ///
+    /// 媒体库未缓存条目需要展示「排队 / 正在下 / 上次失败（原因）/ 被取消 /
+    /// 已完成但无字节」，而旧 `active_cache_task` 只开放 `queued`/`running`。
+    /// 本查询开放到**全部状态**，并覆盖两种去重键：
+    ///   - 单条：`m:{chat}:{msg}` 精确匹配；
+    ///   - 组/相册任务：`g:{chat}:%` 且 `items` JSON 数组包含 `{msg}`
+    ///     （`message_ids` 实际存于 `items` 列，必须用 `json_each` 而非 LIKE）。
+    /// 两路各取 `id` 最大者，再取二者中 `id` 更大者 = 最近一次尝试。
+    pub async fn cache_task_for_item(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> libsql::Result<Option<CacheTask>> {
+        let single = self
+            .row_opt(
+                &format!(
+                    "SELECT {CACHE_TASK_COLS} FROM cache_task \
+                     WHERE item_key = ?1 ORDER BY id DESC LIMIT 1"
+                ),
+                params![format!("m:{chat_id}:{message_id}")],
+            )
+            .await?
+            .map(|r| cache_task_from_row(&r));
+        let group = self
+            .row_opt(
+                &format!(
+                    "SELECT {CACHE_TASK_COLS} FROM cache_task \
+                     WHERE item_key LIKE ?1 \
+                       AND EXISTS (SELECT 1 FROM json_each(items) \
+                                   WHERE json_each.value = ?2) \
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                params![format!("g:{chat_id}:%"), message_id],
+            )
+            .await?
+            .map(|r| cache_task_from_row(&r));
+        match (single, group) {
+            (Some(Ok(s)), Some(Ok(g))) => Ok(Some(if s.id >= g.id { s } else { g })),
+            (Some(Ok(s)), _) => Ok(Some(s)),
+            (_, Some(Ok(g))) => Ok(Some(g)),
+            (Some(Err(e)), _) | (_, Some(Err(e))) => Err(e),
+            (None, None) => Ok(None),
+        }
     }
 
     /// 读单个任务。
@@ -2133,5 +2194,76 @@ mod tests {
             N,
             "并发 16 个不同 key 应恰好落 16 行"
         );
+    }
+
+    /// BUG-279：按条目查任务态——单条（m:）精确匹配、组任务（g:）按 items JSON 包含，
+    /// 两路取 id 最大者；开放到全部状态（含终态 failed/cancelled/done）。
+    #[tokio::test]
+    async fn cache_task_for_item_resolves_single_group_and_terminal_bug279() {
+        let s = store("bug279").await;
+        // 单条任务 m:7:21（chat 7, msg 21）。
+        let (single, _) = s
+            .enqueue_cache_task(7, None, "m:7:21", &[21], "D:/dl")
+            .await
+            .unwrap()
+            .expect("single enqueue");
+        // 组任务 g:7:900 覆盖 [11,12,13]。
+        let (group, _) = s
+            .enqueue_cache_task(7, Some(900), "g:7:900", &[11, 12,13], "D:/dl")
+            .await
+            .unwrap()
+            .expect("group enqueue");
+
+        // 单条精确匹配。
+        let found = s.cache_task_for_item(7, 21).await.unwrap().expect("single");
+        assert_eq!(found.id, single.id);
+
+        // 组任务：msg 12 在 items 数组里 ⇒ 命中组任务。
+        let found = s.cache_task_for_item(7, 12).await.unwrap().expect("group");
+        assert_eq!(found.id, group.id);
+
+        // 不存在的 msg ⇒ None（no-task）。
+        assert!(s.cache_task_for_item(7, 999).await.unwrap().is_none());
+
+        // 终态也开放：把组任务标 failed + 原因，仍能被查到（失败态展示用）。
+        s.conn
+            .execute(
+                "UPDATE cache_task SET status='failed', error='boom' WHERE id=?",
+                params![group.id],
+            )
+            .await
+            .unwrap();
+        let found = s
+            .cache_task_for_item(7, 12)
+            .await
+            .unwrap()
+            .expect("group failed");
+        assert_eq!(found.status, "failed");
+        assert_eq!(found.error.as_deref(), Some("boom"));
+
+        // 重新尝试（同 key 更高 id 的新行）⇒ 取 max id（最近一次尝试）。
+        let (group2, _) = s
+            .enqueue_cache_task(7, Some(900), "g:7:900", &[12], "D:/dl")
+            .await
+            .unwrap()
+            .expect("group re-enqueue");
+        assert!(group2.id > group.id, "重试必须新建更高 id 的行");
+        let found = s
+            .cache_task_for_item(7, 12)
+            .await
+            .unwrap()
+            .expect("group2");
+        assert_eq!(found.id, group2.id, "必须取 id 更大（最近一次尝试）");
+    }
+
+    /// BUG-278：真实数据目录 = 库根（store.db 父目录），与派生的 proxy_dir 严格区分。
+    #[tokio::test]
+    async fn data_dir_is_library_root_not_proxy_dir_bug278() {
+        let dir = std::env::temp_dir().join(format!("orig_tg_datadir_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Store::open(dir.join("store.db")).await.unwrap();
+        assert_eq!(s.data_dir(), dir);
+        assert_eq!(s.proxy_dir(), dir.join("proxies"));
+        assert_ne!(s.data_dir(), s.proxy_dir());
     }
 }

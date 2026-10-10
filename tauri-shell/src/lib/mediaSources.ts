@@ -13,6 +13,7 @@
  * 不得再碰 `lib/tgmedia`（即使只是通用格式化工具，也已在本文件 re-export，统一从这里取）。
  */
 import { clearCacheItem, enqueueCacheTask, tgDiag } from '../api/tg'
+import type { TgCacheTask } from '../types'
 import { ensureDaemon } from '../api/tauri'
 import { restartTgService } from '../api/daemon'
 import { getLibraryStats } from '../api/media'
@@ -156,6 +157,45 @@ export function episodeRecacheCandidates(
   push(ep.source, ep.ref)
   for (const s of ep.sources ?? []) push(s.source, s.ref)
   return out
+}
+
+/**
+ * 集级缓存任务态判别（BUG-279）——与字节态（hasMediaBytes，lib/tgmedia.ts）分别
+ * 判定后再合并：**任务态只答「它在队列 / 正在下 / 上次失败（原因）/ 被取消 /
+ * 已完成但无字节」，不答「有没有字节」**。
+ *
+ * - `task === null` ⇒ `no-task`：这条视频从未入队 / 记录已删（与「失败 / 取消」严格区分）。
+ * - `done` 但调用方已确认无字节 ⇒ `done-no-bytes`（异常，不掩盖）；
+ *   `interrupted` 并入失败类提示并带原因。
+ * 字节态真源始终是 `hasMediaBytes`；本函数只管「任务态」这一面。
+ */
+export type EpisodeCacheStatus =
+  | { kind: 'no-task' }
+  | { kind: 'queued'; task: TgCacheTask }
+  | { kind: 'running'; task: TgCacheTask }
+  | { kind: 'failed'; task: TgCacheTask; reason: string }
+  | { kind: 'cancelled'; task: TgCacheTask }
+  | { kind: 'done-no-bytes'; task: TgCacheTask }
+  | { kind: 'interrupted'; task: TgCacheTask; reason: string }
+
+export function episodeCacheStatus(task: TgCacheTask | null): EpisodeCacheStatus {
+  if (!task) return { kind: 'no-task' }
+  switch (task.status) {
+    case 'queued':
+      return { kind: 'queued', task }
+    case 'running':
+      return { kind: 'running', task }
+    case 'failed':
+      return { kind: 'failed', task, reason: task.error || 'failed' }
+    case 'interrupted':
+      return { kind: 'interrupted', task, reason: task.error || 'interrupted' }
+    case 'cancelled':
+      return { kind: 'cancelled', task }
+    case 'done':
+      return { kind: 'done-no-bytes', task }
+    default:
+      return { kind: 'no-task' }
+  }
 }
 
 /** 原路重新缓存；来源不支持时抛错（由调用方转成非致命提示） */

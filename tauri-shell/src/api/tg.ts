@@ -397,6 +397,21 @@ export async function getCacheTask(): Promise<{
   return { task: res.task ?? null, queued: res.queued ?? [] }
 }
 
+/** GET /api/tg/cache/tasks/by-item?chatId=&messageId= — 按条目查其缓存任务态（BUG-279）。
+ *  返回 task=null 表示这条视频**从未入队 / 记录已删**（与「失败 / 取消」语义区分）。
+ *  媒体库未缓存条目据此展示「排队中 / 正在下 / 上次失败（原因）/ 被取消 / 已完成但无字节」。 */
+export async function getCacheTaskForItem(
+  chatId: number,
+  messageId: number,
+): Promise<{ task: TgCacheTask | null }> {
+  const res = await request<{ task?: TgCacheTask | null }>(
+    `/api/tg/cache/tasks/by-item?chatId=${encodeURIComponent(
+      String(chatId),
+    )}&messageId=${encodeURIComponent(String(messageId))}`,
+  )
+  return { task: res.task ?? null }
+}
+
 /**
  * POST /api/tg/cache/tasks — 入队缓存任务。
  * 幂等：同 key 已有活跃任务时后端复用该任务，不重复下载。
