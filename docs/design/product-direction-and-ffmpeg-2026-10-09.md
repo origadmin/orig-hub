@@ -4,16 +4,16 @@ author: 高见远（架构师）
 date: 2026-10-09
 topic: governance
 module: docs
-decided-by: —（待 D1/D2/D3 拍板，见 `docs/review/product-direction-decisions-2026-10-09.md`）
-decided-at: —
-landed-in: 无（本文为评估与计划；PD-T01~PD-T06 均未开工）
+decided-by: D3 已由产品负责人裁定为 A（2026-10-11，见 `docs/review/product-direction-decisions-2026-10-09.md`）；D1/D2 仍待拍板
+decided-at: 2026-10-11（D3）
+landed-in: D3 取证见 `docs/review/shared-d3-forensics-2026-10-11.md`（本文为评估与计划；PD-T01~PD-T06 均未开工）
 ---
 
 # 产品主体重定位 + ffmpeg 组件化：评估、方案、任务分解与里程碑
 
 - 日期: 2026-10-09
 - 类型: 产品定位评估 + 依赖组件化设计 + 执行计划
-- 状态: draft —— 含 **3 条待拍板**（`decided-by` 为 `—` 期间本文不得被当作既成事实执行）
+- 状态: draft —— 含 **2 条待拍板**（D1/D2；D3 已于 2026-10-11 决为 A，本文不得被当作既成事实执行）
 - 关联待拍板清单: `docs/review/product-direction-decisions-2026-10-09.md`
 - 关联任务表: 本文 **§4.2**（`PD-T01`~`PD-T05`，含源文件/依赖/优先级/状态/负责）
 - `topic` 取值说明: 本文是**产品定位与路线图**，故取 `governance`；其中 ffmpeg 分发（档 B）与共享（D3）的落地细节属 `deployment` 域，届时另开 `docs/design/*` 档并在 `docs/README.md` 登记
@@ -343,7 +343,7 @@ C 需要第二个后端才有意义，现在做就是过度设计。
 | 媒体库 | 未提，但已存在 | ✅ 已成型 | — | — |
 | 文件管理（通用） | **核心** | ❌ 无 | **新模块** | 需先定它与媒体库的关系（D1） |
 | 上传 | 强化 / 后期 | ❌ 无（只有导出包） | **新模块** | EE 侧接口（D 之外） |
-| 共享 | 强化 | ❌ 无 | **新模块 + 安全姿态变更** | 需先定形态（D3） |
+| 共享 | 强化 | ❌ 无 | **新模块 + 安全姿态变更** | D3 已定为 A（局域网 HTTP 只读，2026-10-11） |
 
 ### 3.2 三个必须先解决的张力
 
@@ -368,7 +368,7 @@ C 需要第二个后端才有意义，现在做就是过度设计。
 - 另外还缺：认证（谁能看）、绑定策略（`0.0.0.0` 还是指定网卡）、防火墙引导、TLS。
 - 结论：共享不是「加个端点」，是**首次变更安全姿态**。
 
-→ **待拍板 D3**。
+→ **D3 已拍板 = A（2026-10-11）**。
 
 **张力三：上传 = 导出包的直传升级（所以它排最后不亏）**
 
@@ -433,7 +433,7 @@ C 需要第二个后端才有意义，现在做就是过度设计。
 | **PD-T02** | **定位对齐**：`README.md`/`Sidebar.tsx`/`DESIGN_BRIEF.md` 三处表述统一到「媒体为核心的文件管理工具」，并在 `DESIGN_BRIEF.md` 追加「非目标声明」节（本文 §2.4 / §3.2 的边界沉淀为常驻条文） | `./README.md:3`、`tauri-shell/src/components/Sidebar.tsx:8`、`docs/DESIGN_BRIEF.md:5` | —（与 PD-T01 无依赖，可并行） | P1 | 未开工 | PM + 架构师（纯文档，0 代码风险） |
 | **PD-T03** | **ffmpeg 受管理组件（档 B）**：应用内下载 → **sha256 校验** → 落 `%LOCALAPPDATA%\OrigHub\bin\ffmpeg.exe`（该位置已是既有解析链第 4 位，**无需改解析链**）；版本记录 + 最低版本断言；设置面暴露开关与缓存预算（`ORIG_TG_PROXY_MAX_BYTES`） | `download-engine/crates/orig-tg/src/`（**新建**安装/校验模块）、`download-engine/crates/orig-daemon/src/routes.rs`（**新建**下载代理端点）、`tauri-shell/src/components/SettingsPanel.tsx` | **D2 拍板** | P1 | 未开工 | 工程师（engine+shell） |
 | **PD-T04** | **文件管理**（视频为主，其他次之）：通用浏览/移动/删除，形态由 D1 决定 —— A 档为纲（一级导航重排 + daemon 通用文件端点组），B 档为视图（媒体库内存储子视图 + 2~3 个端点） | **依 D1**：A → `tauri-shell/src/components/Sidebar.tsx` + `download-engine/crates/orig-daemon/src/routes.rs`（**新建**端点组）；B → `tauri-shell/src/components/MediaLibraryPanel.tsx` + `download-engine/crates/orig-tg/src/routes.rs`（**新建** 2~3 端点） | **D1 拍板**、PD-T02 | P2 | 未开工 | 工程师（engine+shell） |
-| **PD-T05** | **共享最小可用**：局域网 HTTP 只读 + 认证；共享绑定与现有 `bind` **分离**；非环回投递限速（BUG-199 判据）在共享路径上复验 | `download-engine/crates/orig-tg/src/config.rs`（**新建**共享绑定，与 `:14` 的 `bind` 分离）、`download-engine/crates/orig-tg/src/routes.rs`（**新建**共享端点组 + 认证）、`tauri-shell/src/components/SettingsPanel.tsx` | **D3 拍板**、PD-T03 | P3 | 未开工 | 工程师（engine+shell） |
+| **PD-T05** | **共享最小可用**：局域网 HTTP 只读 + 认证；共享绑定与现有 `bind` **分离**；非环回投递限速（BUG-199 判据）在共享路径上复验 | `download-engine/crates/orig-tg/src/config.rs`（**新建**共享绑定，与 `:14` 的 `bind` 分离）、`download-engine/crates/orig-tg/src/routes.rs`（**新建**共享端点组 + 认证）、`tauri-shell/src/components/SettingsPanel.tsx` | ~~D3 拍板~~（已决=A 2026-10-11；**实现前须先落定 A 的 3 条前置**：认证 / 绑定策略 / 共享路径限速复验）、PD-T03 | P3 | 未开工 | 工程师（engine+shell） |
 
 | **PD-T06** | **硬件解码默认 + 多显卡 + 静态能力评估**（2026-10-10 用户指令）：探测 `ffmpeg -hwaccels` / `-encoders` + GPU 枚举 → 生成**推荐配置**（**显式**后端与设备，不依赖 `auto`）→ 在 `-i` 之前插入硬解参数；**必须保留软件回退**；设置页可覆盖后端 / 设备。**不跑基准、不做分辨率切换、不做「自动最佳分辨率」** | `download-engine/crates/orig-tg/src/routes.rs:4004-4059`（硬解参数插入点）、`download-engine/crates/orig-tg/src/`（**新建**能力探测模块）、`tauri-shell/src/components/SettingsPanel.tsx` | —（与 `PD-T01` 无依赖，可并行；`PD-T03` 的安装能力可复用） | **P0** | 未开工 | 工程师（engine+shell） |
 
@@ -448,7 +448,7 @@ C 需要第二个后端才有意义，现在做就是过度设计。
 > graph LR
 >     D1[D1 拍板 文件管理形态] --> PD-T04
 >     D2[D2 拍板 ffmpeg 获取] --> PD-T03
->     D3[D3 拍板 共享形态] --> PD-T05
+>     D3[D3 已决=A 共享形态] --> PD-T05
 >     PD-T02[PD-T02 定位对齐] --> PD-T04
 >     PD-T03[PD-T03 ffmpeg 受管理组件] --> PD-T05
 >     PD-T01[PD-T01 播放引擎可见性 P0] --> PD-T05

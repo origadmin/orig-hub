@@ -4,9 +4,9 @@ author: 高见远（架构师）
 date: 2026-10-09
 topic: governance
 module: docs
-decided-by: —（等待产品负责人裁定 D1/D2/D3）
-decided-at: —
-landed-in: 无（三条均未裁定，故无代码落地）
+decided-by: 产品负责人（D3 已决 2026-10-11 选 A；D1/D2 仍待裁定）
+decided-at: 2026-10-11（D3）
+landed-in: D3 取证与对比见 `docs/review/shared-d3-forensics-2026-10-11.md`（结论 A，附 3 条强制前置；PD-T05 据此解除阻塞）
 ---
 
 # 待拍板决策清单（产品方向 · 2026-10-09）
@@ -22,11 +22,11 @@ landed-in: 无（三条均未裁定，故无代码落地）
 | 项 | 值 |
 |---|---|
 | 建立日期 | 2026-10-09 |
-| 待拍板数 | **3**（D1 / D2 / D3） |
+| 待拍板数 | **2**（D1 / D2；D3 已于 2026-10-11 决为 A） |
 | 裁定人 | 产品负责人 |
 | 裁定方式 | 逐条回「选 A / B / 不做」即可；**不需要补充信息** |
 | 裁定后动作 | ① 该节改标「**已决**」并写明裁定解读（原选项留痕，不删）；② 回填本文 front-matter 的 `decided-by`/`decided-at`；③ 同步 `docs/design/product-direction-and-ffmpeg-2026-10-09.md` 的 §4.2 任务表（D1→`PD-T04`、D2→`PD-T03`、D3→`PD-T05` 解除阻塞）与 front-matter |
-| 阻塞关系 | D1 阻塞 `PD-T04`（P2 文件管理）；D3 阻塞 `PD-T05`（P3 共享）；D2 阻塞 `PD-T03`（P1 ffmpeg 受管理组件）。**三者都不阻塞 P0（`PD-T01`）** |
+| 阻塞关系 | D1 阻塞 `PD-T04`（P2 文件管理）；~~D3 阻塞 `PD-T05`（P3 共享）~~ —— **D3 已决为 A，`PD-T05` 解除阻塞**（但 A 的 3 条前置须在实现前逐条拍板，见 D3 裁定解读）；D2 阻塞 `PD-T03`（P1 ffmpeg 受管理组件）。**三者都不阻塞 P0（`PD-T01`）** |
 | 逾期规则 | 依 `docs/rules/doc-first.md` §4.1 的 **C1c**：`decided-at` 起 14 天仍无 `landed-in` ⇒ 门禁告警。**本清单尚无 `decided-at`，故不触发** |
 | 全部裁定前 | front-matter 保持 `status: draft`、`decided-by: —` —— 新会话读到本文件**不得**把任一选项当既成事实执行 |
 
@@ -129,6 +129,16 @@ landed-in: 无（三条均未裁定，故无代码落地）
 
 ### D3. 共享的第一形态：局域网 HTTP 只读，还是 FTP？
 
+- **状态**: **已决（2026-10-11）= A. 局域网 HTTP 只读共享**
+- **裁定解读**: 取证与三形态对比见 `docs/review/shared-d3-forensics-2026-10-11.md`。
+  选 A 的理由：与「媒体为核心 + stream-first 播放」最契合，可复用既有 `/stream` 流式端点
+  与投递节流；B(FTP) 观看无 seek、依赖膨胀；C 维持现状让「跨设备观看」长期缺位。
+  **A 的 3 条强制前置（缺一不可，否则等于上线无认证局域网服务 = 安全事故），须在
+  PD-T05 实现前逐条拍板、不得延后**：① **认证**（共享端点必须校验，不能匿名读媒体库）；
+  ② **绑定策略**（默认关闭 + 用户显式选网卡/端口）；③ **共享路径复验投递节流**
+  （非环回下 `ORIG_TG_DELIVERY_BPS` 限速与转码代理 LRU 在共享路径生效，须实测）。
+  **裁定人明示流程要求（2026-10-11）**：拍板必须在文档阶段前置完成，一切不明项先解决再动手，
+  不得把决策延到实现阶段。原 A/B/C 选项下方留痕不删。
 - **问题**: 共享先做局域网 HTTP 只读，还是先做 FTP/SFTP，还是不做？
 - **现状与代价**: 共享**零实现**。orig-tg 默认 `bind = "127.0.0.1"`（注释明写「仅本机」，
   `download-engine/crates/orig-tg/src/config.rs:14`），daemon 同理；且已裁定
@@ -139,7 +149,7 @@ landed-in: 无（三条均未裁定，故无代码落地）
 - **设计锚点**: `docs/design/product-direction-and-ffmpeg-2026-10-09.md` §3.2「张力二」
 - **请求**: 选 A 还是 B？
 
-**A. 局域网 HTTP 只读共享（本机起服务，链接/扫码观看）**
+**A. 局域网 HTTP 只读共享（本机起服务，链接/扫码观看）** ← **已决（2026-10-11）**
 
 - 涉及: `download-engine/crates/orig-tg/src/config.rs`（**将新建**共享绑定配置，与现有 `bind` 分离）、
   `download-engine/crates/orig-tg/src/routes.rs`（**将新建**共享端点组 + 认证）、
