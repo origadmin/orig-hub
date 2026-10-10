@@ -409,4 +409,18 @@ export interface ViewerItem {
    * `video.duration`（会随转码推进抖动增长，绝不能当总数）。
    */
   duration?: number | null
+  /**
+   * 字节态（BUG-254）：本条目当前是否有可播放的字节。
+   * `false` ⇒ 播放器渲染专属「无内容 / 未缓存」态，与「浏览器无法解码该格式」
+   * 明确区分，并给出「重新缓存」入口；`true`/`undefined` ⇒ 走正常播放 / 解码失败路径。
+   * 由 `hasMediaBytes` 在构造处统一推导，避免各消费点重复判定逻辑。
+   */
+  hasBytes?: boolean | null
+  /**
+   * 来源定位符（BUG-254）：无字节时驱动「重新缓存」入口
+   * （`recacheFromSource(ref, source)`）。缺省 = 无法定位来源，隐藏入口。
+   */
+  ref?: string | null
+  /** 来源标识（BUG-254）：'local' / 'tg' 等，决定重缓存走哪条适配器。 */
+  source?: string | null
 }

@@ -548,6 +548,9 @@ export function SeriesDetail(props: {
               detail.episodes.map((ep, i) => {
               const on = ep.id === cur?.id
               const photo = isPhotoEpisode(ep)
+              // BUG-254：字节态决定这一行尾列是「时长」还是「未缓存」。无字节分集不显示时长
+              // （那是假信息，会误导用户以为可播），改用 `episode-nobytes` 标记。
+              const withBytes = hasMediaBytes(ep)
               const showGroup = showSeasons && (i === 0 || detail.episodes[i - 1].season !== ep.season)
               return (
                 <div key={ep.id}>
@@ -580,9 +583,21 @@ export function SeriesDetail(props: {
                     >
                       {shouldRenderEpisodeTitle(ep, detail) ? ep.title : episodeSlotLabel(ep)}
                     </span>
-                    <span className="font-mono text-[10.5px] text-muted">
-                      {!photo && ep.duration != null ? fmtDuration(ep.duration) : ''}
-                    </span>
+                    {/* BUG-254：有字节 → 显示时长；无字节 → 显示「未缓存」标记（不显时长）。 */}
+                    {withBytes ? (
+                      <span className="font-mono text-[10.5px] text-muted">
+                        {!photo && ep.duration != null ? fmtDuration(ep.duration) : ''}
+                      </span>
+                    ) : (
+                      <span
+                        className="flex items-center gap-0.5 font-mono text-[10.5px] text-amber-500"
+                        data-testid="episode-nobytes"
+                        title={t('media.notCached')}
+                      >
+                        <CloudOff className="h-3 w-3" />
+                        {t('media.notCached')}
+                      </span>
+                    )}
                   </button>
                 </div>
               )
@@ -635,7 +650,8 @@ export function SeriesDetail(props: {
                   {episodeSlotLabel(cur)}
                 </span>
                 <span className="shrink-0 text-[11px] text-muted">
-                  {!isPhotoEpisode(cur) && cur.duration != null ? `${fmtDuration(cur.duration)} · ` : ''}
+                  {/* BUG-254：无字节的本集不显示时长（假信息）。 */}
+                  {!isPhotoEpisode(cur) && cur.duration != null && hasMediaBytes(cur) ? `${fmtDuration(cur.duration)} · ` : ''}
                   {cur.source ? `${t(sourceLabelKey(cur.source))} · ` : ''}#{cur.itemId}
                 </span>
               </div>

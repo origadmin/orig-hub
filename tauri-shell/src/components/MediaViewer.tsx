@@ -4,6 +4,7 @@ import { Button } from './ui/button'
 import { useTranslation } from '../i18n'
 import { mediaItemStreamUrl } from '../api/media'
 import { setPosterExtractionPaused } from '../lib/poster'
+import { recacheFromSource } from '../lib/mediaSources'
 import { cn } from '../lib/utils'
 import { VideoPlayer } from './media/VideoPlayer'
 import { EpisodeList } from './media/EpisodeList'
@@ -236,6 +237,16 @@ export function MediaViewer(props: {
               // BUG-253：真源总时长（来自 `GET /api/media/items/<id>` 的 duration 字段），
               // 播放器据此显示正确总数，不取 live 转码流的瞬时 `video.duration`。
               duration={cur.duration ?? undefined}
+              // BUG-254：透传字节态；无字节时播放器渲染专属「无内容 / 未缓存」态，
+              // 并给出「重新缓存」入口（按来源定位符重抓）。
+              hasBytes={cur.hasBytes}
+              onRecache={
+                cur.ref
+                  ? () => {
+                      void recacheFromSource(cur.ref, cur.source)
+                    }
+                  : undefined
+              }
             />
           ) : (
             <p className="max-w-[80%] rounded-md border border-white/20 bg-white/5 px-3 py-2 text-center text-xs text-white/85">

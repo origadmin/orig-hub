@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Film, Image as ImageIcon, Trash2 } from 'lucide-react'
+import { CloudOff, Film, Image as ImageIcon, Trash2 } from 'lucide-react'
 import type { MediaSeries, MediaTag } from '../../api/media'
 import { mediaItemUrl } from '../../api/media'
 import { coverFit } from '../../lib/mediaSources'
@@ -205,6 +205,19 @@ export function SeriesCard(props: {
         <span className="absolute left-1 top-1 rounded bg-accent/90 px-1.5 py-0.5 text-[10px] font-semibold text-white">
           {kindLabel(series.kind)}
         </span>
+        {/* BUG-254：封面条目无字节（coverHasBytes === false）时给出可见标记，
+            与 BUG-250 的 no-bytes 视觉语言一致（CloudOff + amber）。老后端不下发该字段时
+            coverHasBytes 为 undefined，按「可能有字节」处理，不显示标记。 */}
+        {series.coverHasBytes === false ? (
+          <span
+            className="absolute right-1 top-1 flex items-center gap-0.5 rounded bg-black/75 px-1 py-0.5 text-[10px] font-semibold text-amber-500"
+            title={t('media.notCached')}
+            data-testid="series-nobytes"
+          >
+            <CloudOff className="h-3 w-3" />
+            {t('media.notCached')}
+          </span>
+        ) : null}
         <span className="absolute bottom-1 right-1 rounded bg-black/75 px-1 text-[10px] text-white">
           {t('media.episodeCount', { n: series.episodeCount })}
         </span>

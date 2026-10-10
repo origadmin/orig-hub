@@ -163,6 +163,7 @@ export function EpisodeList({
                 ref={active ? activeRef : undefined}
                 type="button"
                 disabled={!enabled}
+                data-testid={`episode-list-item-${ep.itemId}`}
                 aria-current={active ? 'true' : undefined}
                 onClick={() => {
                   if (!active && enabled) onSelect(ep.itemId)

@@ -510,6 +510,7 @@
   "player.prevPhoto": "上一张",
   "player.nextPhoto": "下一张",
   "player.unsupported": "此类型不支持在应用内预览",
+  "player.noContent": "该内容没有可播放的字节（缓存已清理 / 文件已丢失），无法在应用内播放。可尝试「重新缓存」，或用系统播放器打开原文件",
   "player.untitled": "未命名",
   "player.mixedCount": "视频 {v} · 图片 {p}",
   "media.delete": "删除",

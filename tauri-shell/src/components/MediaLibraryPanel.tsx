@@ -44,6 +44,7 @@ import {
   isRawFileName,
   canRecacheFromSource,
   recacheFromSource,
+  hasMediaBytes,
   probeLibraryBackend,
   ensureLibraryBackend,
   probeRecacheBackends,
@@ -78,6 +79,12 @@ function toViewerItem(i: MediaItem): ViewerItem {
     seriesId: i.seriesId ?? null,
     // BUG-253：真源总时长随条目下发，播放器据此显示正确总数（不取 live 转码流的瞬时 duration）。
     duration: i.duration,
+    // BUG-254：透传字节态与来源，使播放器能区分「无内容」与「解码失败」并给出重缓存入口。
+    // 字节态用 `hasMediaBytes` 统一推导（TG 图片不落盘 / 后端 probe 真值 / 落盘路径兜底），
+    // 不在各消费点重复判定。
+    hasBytes: hasMediaBytes(i),
+    ref: i.ref ?? null,
+    source: i.source ?? null,
   }
 }
 
@@ -349,8 +356,10 @@ export function MediaLibraryPanel() {
   const episodesToItems = (d: MediaSeriesDetail): MediaItem[] =>
     d.episodes.map((e) => ({
       id: e.itemId,
-      source: 'local',
-      ref: String(e.itemId),
+      // BUG-254：透传真实来源与定位符，使无字节分集的「重新缓存」能定位到正确来源
+      // （此前一律填 'local' / itemId，导致重缓存走错适配器）。
+      source: e.source ?? 'local',
+      ref: e.ref ?? String(e.itemId),
       // 原始文件名（photo--123_456）不是标题：留空交给展示层给可读占位。
       title: isRawFileName(e.title) ? '' : (e.title ?? ''),
       description: e.description ?? null,
@@ -360,6 +369,10 @@ export function MediaLibraryPanel() {
       kind: (e.kind ?? 'file') as MediaKind,
       poster: e.poster,
       duration: e.duration,
+      // BUG-254：无落盘路径；字节态由后端 probe 真值驱动，转成 bytesPresence
+      // 供 `hasMediaBytes` 统一判定（与条目视图同源）。
+      filePath: null,
+      bytesPresence: e.hasBytes ? 'present' : e.hasBytes === false ? 'absent' : null,
       addedAt: 0,
       tags: [],
       seriesId: d.id,

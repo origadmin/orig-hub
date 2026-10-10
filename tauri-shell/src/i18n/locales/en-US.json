@@ -510,6 +510,7 @@
   "player.prevPhoto": "Previous photo",
   "player.nextPhoto": "Next photo",
   "player.unsupported": "This type cannot be previewed in the app",
+  "player.noContent": "This content has no playable bytes (cache cleared or file missing) and cannot play in the app. Try \"Re-cache\", or open the original file with your system player",
   "player.untitled": "Untitled",
   "player.mixedCount": "{v} videos · {p} photos",
   "media.delete": "Delete",

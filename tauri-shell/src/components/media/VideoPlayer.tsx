@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   AlertTriangle,
+  CloudOff,
   FastForward,
   Maximize,
   Minimize,
@@ -87,6 +88,15 @@ export interface VideoPlayerProps {
    * 缺省（上游未提供）时退回元素 duration 作最后一次兜底。
    */
   duration?: number | null
+  /**
+   * 字节态（BUG-254）：本条目当前是否还有可播放的字节。
+   * `false` ⇒ 渲染专属「无内容 / 未缓存」遮罩，与「浏览器无法解码该格式」明确区分，
+   * 不显示误导性 codec 文案，并给出 `onRecache` 入口。缺省（`true` / undefined）⇒
+   * 走正常播放 / 解码失败路径。
+   */
+  hasBytes?: boolean | null
+  /** 无字节时「重新缓存」入口（BUG-254）；缺省 = 不展示重缓存按钮。 */
+  onRecache?: () => void
 }
 
 /** 可选倍速档位（与 EE 一致；3x/4x 为 BUG-209 新增——用户要求高倍速审看，
@@ -553,8 +563,16 @@ export function VideoPlayer({
   hasVideoTrack = true,
   compatSrc,
   duration,
+  hasBytes,
+  onRecache,
 }: VideoPlayerProps) {
   const { t } = useTranslation()
+  /**
+   * BUG-254：无字节（无播放源）专属态标志。为 `false` 时渲染「无内容 / 未缓存」遮罩，
+   * 并压制下方三类「解码失败」遮罩（致命 / 停载 / 解码异常）——让「没有内容」与
+   * 「浏览器无法解码该格式」在视觉与文案上彻底分开，不显示误导性 codec 提示。
+   */
+  const noContent = hasBytes === false
   const {
     volume,
     isMuted,
@@ -1235,10 +1253,34 @@ export function VideoPlayer({
         </div>
       )}
 
-      {/* 致命错误遮罩 */}
-      {fatal && (
+      {/* BUG-254：无字节（无播放源）专属态 —— 与「浏览器无法解码该格式」明确区分，
+          不显示误导性 codec 文案，给出「重新缓存」入口。压制所有解码失败遮罩。 */}
+      {noContent && (
         <div
           role="alert"
+          data-testid="player-nobytes"
+          className="absolute inset-0 z-50 flex flex-col items-center justify-center gap-3 bg-black/90 p-8"
+        >
+          <CloudOff className="h-12 w-12 text-amber-500" />
+          <p className="max-w-md text-center text-sm text-white/90">{t('player.noContent')}</p>
+          {onRecache && (
+            <button
+              type="button"
+              onClick={onRecache}
+              className="rounded bg-accent px-3 py-1.5 text-[12px] font-medium text-white transition-colors hover:bg-accent/90"
+              data-testid="player-recache"
+            >
+              {t('media.recache')}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* 致命错误遮罩 */}
+      {fatal && !noContent && (
+        <div
+          role="alert"
+          data-testid="player-decode-error"
           className="absolute inset-0 z-40 flex flex-col items-center justify-center gap-3 bg-black/85 p-8"
         >
           <AlertTriangle className="h-12 w-12 text-danger" />
@@ -1247,10 +1289,10 @@ export function VideoPlayer({
       )}
 
       {/* 视频轨解不出来且无兼容流可退：已停载（BUG-207/208），整屏告知而不是让用户对着黑屏听声音 */}
-      {halted && (
+      {halted && !noContent && (
         <div
           role="alert"
-          data-testid="player-unsupported-halt"
+          data-testid="player-decode-error"
           className="absolute inset-0 z-40 flex flex-col items-center justify-center gap-3 bg-black/85 p-8"
         >
           <AlertTriangle className="h-12 w-12 text-danger" />
@@ -1263,8 +1305,11 @@ export function VideoPlayer({
           effect；真正需要告知用户的只有 fatal/halted 遮罩与下方解码异常提示。 */}
 
       {/* 解码异常提示（onError 抓不到的两类静默失败，BUG-034） */}
-      {!fatal && !halted && decode !== 'ok' && (
-        <p className="absolute bottom-20 left-1/2 z-20 max-w-[80%] -translate-x-1/2 rounded-md border border-white/20 bg-black/70 px-3 py-1.5 text-center text-xs text-white/90 backdrop-blur-sm">
+      {!fatal && !halted && decode !== 'ok' && !noContent && (
+        <p
+          data-testid="player-decode-error"
+          className="absolute bottom-20 left-1/2 z-20 max-w-[80%] -translate-x-1/2 rounded-md border border-white/20 bg-black/70 px-3 py-1.5 text-center text-xs text-white/90 backdrop-blur-sm"
+        >
           {t(decodeStateKey(decode) ?? 'tg.decodeFail')}
         </p>
       )}
