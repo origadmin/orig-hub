@@ -48,9 +48,15 @@ export function Lightbox(props: {
 
   if (!item) return null
 
+  // BUG-215：浮层参照系必须是**内容框**（标题栏下缘），不是视口。
+  // 原 `fixed inset-0` 锚视口顶，而可见内容从 y=--titlebar-h 开始，
+  // 角部锚定的 `top-4` 按钮（16–56px）上半截落进标题栏带内，
+  // 又因 z-50 < 标题栏 z-60 被盖住 —— 既看不见也点不到（拖拽区吞命中）。
+  // 改锚内容框后：① 按钮整体落在内容框内，可见可点；
+  // ② 顺带不再往标题栏区绘制遮罩（原先那份绘制被标题栏完全盖住，属无效绘制）。
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-8"
+      className="fixed inset-x-0 bottom-0 top-[var(--titlebar-h)] z-50 flex items-center justify-center bg-black/85 p-8"
       onClick={onClose}
       data-testid="lightbox"
     >

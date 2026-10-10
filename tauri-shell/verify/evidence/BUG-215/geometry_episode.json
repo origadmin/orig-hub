@@ -1,0 +1,53 @@
+{
+  "viewport": {
+    "w": 1440,
+    "h": 900
+  },
+  "titlebar": {
+    "top": 0,
+    "bottom": 40,
+    "height": 40,
+    "zIndex": "60"
+  },
+  "overlay": {
+    "top": 40,
+    "bottom": 900,
+    "left": 0,
+    "right": 1440
+  },
+  "overlayZ": "50",
+  "buttons": {
+    "close": {
+      "top": 56,
+      "bottom": 96,
+      "left": 1384,
+      "right": 1424,
+      "width": 40,
+      "height": 40,
+      "hitIsSelf": true,
+      "hitDesc": "path"
+    },
+    "detach": {
+      "top": 56,
+      "bottom": 96,
+      "left": 16,
+      "right": 56,
+      "width": 40,
+      "height": 40,
+      "hitIsSelf": true,
+      "hitDesc": "svg"
+    },
+    "prev": null,
+    "next": null,
+    "position": {
+      "top": 868,
+      "bottom": 884,
+      "left": 706.84,
+      "right": 733.16,
+      "width": 26.31,
+      "height": 16,
+      "hitIsSelf": true,
+      "hitDesc": "p[lightbox-position]"
+    }
+  }
+}

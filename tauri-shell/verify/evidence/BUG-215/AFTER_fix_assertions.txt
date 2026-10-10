@@ -1,0 +1,66 @@
+[场景A] 已进入剧集: ✓查看剧集6 集🌟🔥《我的温柔妈妈》1 季 · 6 集视
+
+=== 场景A 集级挂图灯箱（series = ✓查看剧集6 集🌟🔥《我的温柔妈妈》1 季 · 6 集视 ）几何 ===
+{
+  "viewport": {
+    "w": 1440,
+    "h": 900
+  },
+  "titlebar": {
+    "top": 0,
+    "bottom": 40,
+    "height": 40,
+    "zIndex": "60"
+  },
+  "overlay": {
+    "top": 40,
+    "bottom": 900,
+    "left": 0,
+    "right": 1440
+  },
+  "overlayZ": "50",
+  "buttons": {
+    "close": {
+      "top": 56,
+      "bottom": 96,
+      "left": 1384,
+      "right": 1424,
+      "width": 40,
+      "height": 40,
+      "hitIsSelf": true,
+      "hitDesc": "path"
+    },
+    "detach": {
+      "top": 56,
+      "bottom": 96,
+      "left": 16,
+      "right": 56,
+      "width": 40,
+      "height": 40,
+      "hitIsSelf": true,
+      "hitDesc": "svg"
+    },
+    "prev": null,
+    "next": null,
+    "position": {
+      "top": 868,
+      "bottom": 884,
+      "left": 706.84,
+      "right": 733.16,
+      "width": 26.31,
+      "height": 16,
+      "hitIsSelf": true,
+      "hitDesc": "p[lightbox-position]"
+    }
+  }
+}
+  PASS: 浮层 top=40 >= 标题栏 bottom=40（未侵入标题栏，无需靠 z 层级兜底）
+  PASS: close top=56 >= 标题栏 bottom=40（完整可见，纵向占 56~96）
+  PASS: close 中心点命中自身（可点击）
+  PASS: detach top=56 >= 标题栏 bottom=40（完整可见，纵向占 56~96）
+  PASS: detach 中心点命中自身（可点击）
+  PASS: close 真实点击生效（灯箱已关闭）
+[场景B] 已进入剧集: ✓查看剧集未缓存10 集#投稿1 季 · 10 集视频 0 
+  （场景B 跳过：该剧集无图册瓦片）
+
+RESULT: PASS {"A_episode":true,"A_closeClick":true,"B_gallery":true}

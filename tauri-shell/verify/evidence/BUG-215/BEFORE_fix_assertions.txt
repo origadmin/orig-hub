@@ -1,0 +1,67 @@
+[场景A] 已进入剧集: ✓查看剧集6 集🌟🔥《我的温柔妈妈》1 季 · 6 集视
+
+=== 场景A 集级挂图灯箱（series = ✓查看剧集6 集🌟🔥《我的温柔妈妈》1 季 · 6 集视 ）几何 ===
+{
+  "viewport": {
+    "w": 1440,
+    "h": 900
+  },
+  "titlebar": {
+    "top": 0,
+    "bottom": 40,
+    "height": 40,
+    "zIndex": "60"
+  },
+  "overlay": {
+    "top": 0,
+    "bottom": 900,
+    "left": 0,
+    "right": 1440
+  },
+  "overlayZ": "50",
+  "buttons": {
+    "close": {
+      "top": 16,
+      "bottom": 56,
+      "left": 1384,
+      "right": 1424,
+      "width": 40,
+      "height": 40,
+      "hitIsSelf": false,
+      "hitDesc": "button"
+    },
+    "detach": {
+      "top": 16,
+      "bottom": 56,
+      "left": 16,
+      "right": 56,
+      "width": 40,
+      "height": 40,
+      "hitIsSelf": false,
+      "hitDesc": "div"
+    },
+    "prev": null,
+    "next": null,
+    "position": {
+      "top": 868,
+      "bottom": 884,
+      "left": 706.84,
+      "right": 733.16,
+      "width": 26.31,
+      "height": 16,
+      "hitIsSelf": true,
+      "hitDesc": "p[lightbox-position]"
+    }
+  }
+}
+  FAIL: 浮层 top=0 侵入标题栏带（标题栏 bottom=40）—— 遮罩仍在标题栏区无效绘制
+  FAIL: 浮层与标题栏重叠，且 z-index=50 未高于标题栏 z-index=60 → 被盖住
+  FAIL: close top=16 < 标题栏 bottom=40 —— 上半截仍被标题栏盖住（±2px）
+  FAIL: close 中心点命中的是 button 而不是按钮自身 —— 点击仍被遮挡/吞掉
+  FAIL: detach top=16 < 标题栏 bottom=40 —— 上半截仍被标题栏盖住（±2px）
+  FAIL: detach 中心点命中的是 div 而不是按钮自身 —— 点击仍被遮挡/吞掉
+  PASS: close 真实点击生效（灯箱已关闭）
+[场景B] 已进入剧集: ✓查看剧集未缓存10 集#投稿1 季 · 10 集视频 0 
+  （场景B 跳过：该剧集无图册瓦片）
+
+RESULT: FAIL -> A_episode

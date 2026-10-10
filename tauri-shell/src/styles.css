@@ -53,6 +53,11 @@
   --track: #3f3f46;
   --titlebar-bg: #18181b;
   --titlebar-text: #a1a1aa;
+  /* 自绘标题栏高度 —— **唯一真源**（BUG-215）。
+     视口浮层（`fixed inset-0`）的参照系是视口顶，而可见内容框从标题栏下缘开始，
+     二者不一致会让角部锚定元素（`top-4` 之类）落进标题栏带内被盖住。
+     浮层改锚「标题栏以下」时统一读这个变量，不要再散写 40px。 */
+  --titlebar-h: 40px;
 }
 
 /* ── 浅色 ── */
@@ -87,7 +92,7 @@ body {
   z-index: 60;
   display: flex;
   align-items: center;
-  height: 40px;
+  height: var(--titlebar-h);
   padding-left: 12px;
   background: var(--titlebar-bg);
   border-bottom: 1px solid var(--border-subtle);
