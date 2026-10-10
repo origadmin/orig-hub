@@ -4980,8 +4980,14 @@ mod tests {
     }
 
     fn tmp_lib_root(name: &str) -> PathBuf {
+        // 每次调用都取**唯一**目录：仅靠 name 时，同名调用（重试/并行/未来新增同名
+        // 测试）会 `remove_dir_all` 互相抹掉对方目录 —— 曾观测到约 1/6 的偶发失败，
+        // 表现为若干 library_stats_* 同时挂掉，极易被误判成被测逻辑有问题。
+        // 计数器保证「同一次测试进程内、任意两次调用」都不重叠。
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "orig_tg_media_{}_{name}_lib",
+            "orig_tg_media_{}_{name}_lib_{seq}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
