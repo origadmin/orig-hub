@@ -3,11 +3,18 @@ import { GitMerge } from 'lucide-react'
 import { Button } from '../ui/button'
 import { Input } from '../ui/input'
 import { appendEpisodes, createSeries, mergeSeries, mergeSeriesMulti } from '../../api/media'
-import type { MediaSeries, MergeResult } from '../../api/media'
+import type { MediaSeries, MergeResult, SeriesKind } from '../../api/media'
 import { useTranslation } from '../../i18n'
 import { seriesLabel } from '../../lib/displayTitle'
 
-const KIND_OPTIONS = [
+/**
+ * 建剧集时的类型选项（带一句「它是什么」的解释）。
+ *
+ * `value` 显式标注为 `SeriesKind`：新增类型时这里会**编译失败**，而不是静默少一个
+ * 选项（BUG-258 的教训正是「写路径不校验、读路径把未知值原样透出」，两份定义必然漂移；
+ * 后端 `media::SERIES_KINDS` 对枚举外的值一律 422）。
+ */
+const KIND_OPTIONS: { value: SeriesKind; label: string; hint: string }[] = [
   { value: 'series', label: '剧集', hint: '有季/集编号的连续内容（如番剧、课程）' },
   { value: 'collection', label: '合集', hint: '同一主题的松散聚合（如同类视频合辑）' },
   { value: 'album', label: '图集', hint: '以图片为主的相册' },
@@ -22,7 +29,7 @@ export function CreateSeriesDialog(props: {
   const { onClose, onCreated, onError } = props
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
-  const [kind, setKind] = useState('series')
+  const [kind, setKind] = useState<SeriesKind>('series')
   const [year, setYear] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -34,7 +41,7 @@ export function CreateSeriesDialog(props: {
       const res = await createSeries({
         title: title.trim(),
         description: description.trim() || undefined,
-        kind: kind as 'series' | 'collection' | 'album',
+        kind,
         year: Number.isFinite(y) ? y : undefined,
       })
       onCreated(res.id, title.trim())

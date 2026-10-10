@@ -32,6 +32,31 @@ const ITEM_TEXT_SPLIT_MIG: &str = "mig.item_text_split_v1";
 /// 分集文案并入条目的一次性迁移标记（见 [`collapse_episode_text`]）。
 const EPISODE_TEXT_MIG: &str = "mig.episode_text_to_item_v1";
 
+/// 「有分集就把 kind 打成 series」这条历史脏徽标纠正的**一次性**标记（`app_setting`）。
+///
+/// **为什么必须是一次性**（BUG-258）：那条 UPDATE 的原意是纠正 BUG-044 之前
+/// 自动成剧写下的混编 `collection/album` 脏徽标，但它本该带的护栏
+/// 「且全部分集都是 video/photo」早已恒真 —— 同一份 `migrate()` 建的
+/// `trg_media_episode_media_only_*` 触发器已经保证分集只能是 `video|photo`。
+/// 于是它的实际语义退化成「**任何有分集的剧集，每次启动都被改回 series**」，
+/// 用户的类型选择当场保存成功、重启后被静默撤销（实测真库 45/45 全是 `series`）。
+///
+/// 护栏既然恒真，就只剩两种选择：删掉（丢掉真实修过的脏徽标）或收成一次性
+/// （保留对存量库的纠正，且**只**纠正一次）。这里选后者 —— 与
+/// [`ITEM_TEXT_SPLIT_MIG`] / [`EPISODE_TEXT_MIG`] 同一套 `app_setting` 机制。
+const SERIES_KIND_NORMALIZE_MIG: &str = "mig.series_kind_normalize_v1";
+
+/// `media_series.kind` 的**合法取值全集**。
+///
+/// 前端下拉（`SeriesEditPanel` 的 `KINDS`）与后端校验共用这一份定义，
+/// 避免「界面给得出、接口收不了」的漂移。
+pub const SERIES_KINDS: [&str; 3] = ["series", "collection", "album"];
+
+/// `kind` 是否是合法枚举值（大小写敏感 —— 列值与前端 `KINDS` 逐字对应）。
+pub fn is_valid_series_kind(kind: &str) -> bool {
+    SERIES_KINDS.contains(&kind)
+}
+
 /// 求某条 TG 引用（`"<chat_id>:<message_id>"`）在流水表里的原始 caption。
 ///
 /// 回填优先用它而不是 `title`：流水里的 caption 是最全的原文，
@@ -215,6 +240,71 @@ async fn collapse_episode_text(conn: &Connection) -> libsql::Result<(usize, usiz
     )
     .await?;
     Ok((filled as usize, diverged))
+}
+
+/// **一次性**归一历史脏徽标：把「有分集」的剧集类型纠正为 `'series'`（BUG-044 残留）。
+///
+/// 返回被纠正的行数（首次启动通常 > 0，之后恒为 0）。
+///
+/// ## 为什么是「一次性」而不是每次启动都跑
+///
+/// 这条 UPDATE 自 BUG-044 起就挂在 `migrate()` 里，而 `migrate()` 由
+/// `Store::open` **无条件**调用。它的护栏「且全部分集都是 video/photo」在
+/// BUG-044 把分集放宽到 `video|photo` 之后已经**恒真** —— 同一份 `migrate()`
+/// 建的 `trg_media_episode_media_only_ins/_upd` 触发器
+/// （`media.rs` 的 `BUG-044 规则级不变量`）保证任何分集条目必属 `video|photo`。
+/// 于是实际语义退化为：
+///
+/// > **任何有分集的剧集，每次启动都被强制改成 `'series'`。**
+///
+/// 用户在编辑面板把类型改成「合集 / 图集」，保存当场成功，重启后变回「剧集」，
+/// 没有任何提示（BUG-258 实测真库 `kind` 45/45 全是 `series`）。三个下拉选项里
+/// 有两个**永远不可达** —— 这正是用户报的「类型…其中一个是空的」。
+///
+/// 它当年确实修过真实的脏徽标（老自动成剧把相册整组编成剧集却标成「相集」），
+/// **不建议直接删掉**：那会让存量库的历史脏徽标永远留在界面上。故用
+/// [`SERIES_KIND_NORMALIZE_MIG`] 收口 —— 对存量库纠正一次（那正是它该做的），
+/// 此后用户的每一次选择都被尊重。
+///
+/// 守卫语义不变（`kind IS NOT 'series'` + 有分集 + 分集全 video/photo），
+/// 所以**无分集**剧集与混入非法分集（已被上面删掉）的剧集都不受影响。
+///
+/// 返回 0 表示「本次未纠正任何行」——既可能是标记已存在（第二次及以后的启动），
+/// 也可能库里本来就干净。调用方不得据此区分这两种情况。
+async fn normalize_series_kind_once(conn: &Connection) -> libsql::Result<usize> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS app_setting (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    )
+    .await?;
+    let stmt = conn
+        .prepare("SELECT 1 FROM app_setting WHERE key = ?1")
+        .await?;
+    let mut rows = stmt.query(params![SERIES_KIND_NORMALIZE_MIG]).await?;
+    let already = rows.next().await?.is_some();
+    drop(rows);
+    if already {
+        return Ok(0);
+    }
+
+    // 守卫与原语句逐字一致：只是从「每次启动」变成「只此一次」。
+    let fixed = conn
+        .execute(
+            "UPDATE media_series SET kind = 'series'
+              WHERE kind IS NOT 'series'
+                AND EXISTS (SELECT 1 FROM media_episode e WHERE e.series_id = media_series.id)
+                AND NOT EXISTS (
+                    SELECT 1 FROM media_episode e JOIN media_item i ON i.id = e.item_id
+                     WHERE e.series_id = media_series.id AND i.kind NOT IN ('video','photo'))",
+            (),
+        )
+        .await?;
+
+    conn.execute(
+        "INSERT OR REPLACE INTO app_setting (key, value) VALUES (?1, '1')",
+        params![SERIES_KIND_NORMALIZE_MIG],
+    )
+    .await?;
+    Ok(fixed as usize)
 }
 
 /// 建表（幂等）。与 TG 流水表同库，表名统一 `media_*` 前缀但语义独立。
@@ -483,16 +573,16 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
     }
     // kind 必须反映实际构成（BUG-044 残留：只摘图片分集不重算 kind，幸存的
     // 混编 collection/album 分集已全视频，徽标却仍是「相集」——展示与事实脱节）。
-    conn.execute(
-        "UPDATE media_series SET kind = 'series'
-          WHERE kind IS NOT 'series'
-            AND EXISTS (SELECT 1 FROM media_episode e WHERE e.series_id = media_series.id)
-            AND NOT EXISTS (
-                SELECT 1 FROM media_episode e JOIN media_item i ON i.id = e.item_id
-                 WHERE e.series_id = media_series.id AND i.kind NOT IN ('video','photo'))",
-        (),
-    )
-    .await?;
+    //
+    // BUG-258：这条纠正是**一次性**的（见 [`normalize_series_kind_once`]）。
+    // 此前它每次启动都跑，而它的护栏「分集全是 video/photo」早已恒真 ——
+    // 结果不是「纠正错误徽标」，而是「抹掉用户刚选的类型」：三个选项里
+    // `collection/album` 永远不可达，用户保存成功、重启后被静默改回。
+    // 现在存量库仍被纠正一次，此后类型选择被尊重。
+    let kind_fixed = normalize_series_kind_once(conn).await?;
+    if kind_fixed > 0 {
+        eprintln!("[media] series kind normalized to 'series' (one-time): {kind_fixed} row(s)");
+    }
     // 剧集是**通用归档容器**（用户在第 4 轮裁定）：所有缓存内容都进剧集 —— 单条视频、
     // 单张图片也成剧，因为只有剧集才有「标题 + 介绍 + 标签」的完整档案位。
     // 因此对分集放宽到 `video | photo`；图片作为**浏览位内容**入剧，
@@ -2201,6 +2291,10 @@ impl Store {
     /// 会返回他人（甚至别的表）的 rowid（实测 16 路并发有 6 路拿到重复 id），进而让「按回包
     /// id 记录、随后 DELETE 或当合并源」的调用方**误删真实数据**（真实剧集 108 即因此被删）。
     /// RETURNING 由 SQLite 在**同一语句内**返回本行 id，从根本上消除该窗口。
+    ///
+    /// BUG-258：`kind` 必须是合法枚举（[`is_valid_series_kind`]）。非法值一律拒绝 ——
+    /// 前端 `kindLabel()` 会把未知值原样透出，脏值一旦进列就成了「用户看得见、
+    /// 却没有任何语义」的徽标（这正是缺陷本身的一半）。
     pub async fn create_series(
         &self,
         title: &str,
@@ -2209,6 +2303,11 @@ impl Store {
         year: Option<i64>,
         source_key: Option<&str>,
     ) -> libsql::Result<i64> {
+        if !is_valid_series_kind(kind) {
+            return Err(libsql::Error::Misuse(format!(
+                "invalid series kind {kind:?}: expected one of {SERIES_KINDS:?}"
+            )));
+        }
         let t = now_secs();
         let row = self
             .row_opt(
@@ -2231,7 +2330,17 @@ impl Store {
         }
     }
 
-    /// 更新剧集元数据（None = 不改）。
+    /// 更新剧集元数据。
+    ///
+    /// 每个可空字段都是**三态**（缺省 / 显式 null / 新值），`None` 一律表示
+    /// 「不改」——「空」与「不改」在契约上必须可区分，否则设过一次就永远清不掉。
+    ///
+    /// BUG-258：
+    /// - `year` 由 `Option<i64>` 升为 `Option<Option<i64>>`。此前它是本结构里
+    ///   **唯一**漏掉 `nullable` 契约的可空字段（`description` / `poster` 都有），
+    ///   于是 `None` 同时表示「不改」与「清空」，年份只能设不能清。
+    /// - `kind` 必须是合法枚举（[`is_valid_series_kind`]），非法值报错而不是
+    ///   原样写进列。
     pub async fn update_series(&self, id: i64, patch: &SeriesPatch) -> libsql::Result<bool> {
         let Some(cur) = self.get_series(id).await? else {
             return Ok(false);
@@ -2248,12 +2357,25 @@ impl Store {
             Some(v) => v.clone(),
             None => s.description,
         };
-        let kind = patch.kind.clone().unwrap_or(s.kind);
+        // 类型：缺省=不改；给出则必须是合法枚举（否则脏值进列，见 create_series）。
+        let kind = match &patch.kind {
+            Some(k) if !is_valid_series_kind(k) => {
+                return Err(libsql::Error::Misuse(format!(
+                    "invalid series kind {k:?}: expected one of {SERIES_KINDS:?}"
+                )));
+            }
+            Some(k) => k.clone(),
+            None => s.kind,
+        };
         let poster = match patch.poster.clone() {
             Some(v) => v, // 显式 null → 清空，回退到自动推导的首集封面
             None => s.poster,
         };
-        let year = patch.year.or(s.year);
+        // 年份：Some(Some(y))=设成 y；Some(None)=显式清空为 NULL；None=不改。
+        let year = match &patch.year {
+            Some(v) => *v,
+            None => s.year,
+        };
         let t = now_secs();
         self.conn
             .execute(
@@ -3908,6 +4030,10 @@ pub struct ItemPatch {
 }
 
 /// 剧集局部更新入参（id 同样来自路径）。
+///
+/// 每个可空字段都是三态：`None` = 缺省（不改）/ `Some(None)` = 显式 `null`（清空）/
+/// `Some(Some(v))` = 改成 v。**`year` 曾是本结构里唯一漏掉该契约的可空字段**
+/// （BUG-258：年份只能设、永远清不掉）。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SeriesPatch {
@@ -3915,11 +4041,21 @@ pub struct SeriesPatch {
     /// 介绍：缺省=不改；`null`=**显式清空**（介绍必须可清，否则设过就永远删不掉）。
     #[serde(default, deserialize_with = "nullable")]
     pub description: Option<Option<String>>,
+    /// 类型：缺省=不改；必须是合法枚举（`series` / `collection` / `album`），
+    /// 否则 [`Store::update_series`] 报错 —— 脏值不得进列。
     pub kind: Option<String>,
     /// 封面：缺省=不改；`null`=清空（回退到自动推导的首集封面）。
     #[serde(default, deserialize_with = "nullable")]
     pub poster: Option<Option<String>>,
-    pub year: Option<i64>,
+    /// 年份：缺省=不改；`null`=**显式清空**（与介绍/封面同一契约）。
+    ///
+    /// BUG-258：此前是 `Option<i64>`，`None` 同时意味着「不改」与「清空」，
+    /// `update_series` 用 `patch.year.or(s.year)` 保留旧值 —— 于是「填错了
+    /// 就再也改不掉」。`media_series.year` 在**原始 DDL** 里（`migrate()` 建表），
+    /// 从没有过回填迁移，所以全库为空；而清空又不可表达，两个缺陷叠在一起，
+    /// 就是用户看到的「年份是空的，且填了也删不掉」。
+    #[serde(default, deserialize_with = "nullable")]
+    pub year: Option<Option<i64>>,
 }
 
 /// 分集局部更新入参：文本字段 + 槽位（season / episode_no）。`None` = 不改该字段。
@@ -5416,10 +5552,16 @@ mod tests {
     }
 
     /// 启动修复：只有**非法 kind**（既非 video 也非 photo）的分集会被摘除；
-    /// 失去全部分集的剧集随之删除；残留的旧 kind 重算为 series。
+    /// 失去全部分集的剧集随之删除。
     ///
     /// 第 4 轮裁定后**图片分集是合法内容**（浏览位），因此「纯图剧」不再被清除 ——
     /// 这正是本测试断言变化的原因：删的是 audio 这类根本不该进剧集的东西。
+    ///
+    /// BUG-258：本用例**不再**断言「每次启动都把 kind 重算为 series」—— 那条断言
+    /// 编码的正是缺陷本身（用户选的类型被静默撤销）。归一化现在是一次性的，
+    /// 由 [`series_kind_choice_survives_repeated_migrations`] 单独证明。
+    /// 这里的「残留相集」是**存量脏徽标**（BUG-044 之前的自动成剧留下的），
+    /// 首次启动仍应被纠正一次 —— 故仍断言 `series`，但注释写明这是「一次性」。
     #[tokio::test]
     async fn startup_repair_strips_illegal_episodes_only() {
         let path = tmp_db("repair");
@@ -5477,12 +5619,320 @@ mod tests {
         assert_eq!(det.episodes.len(), 2, "混编剧的视频集与图片集都在");
         assert_eq!(det.episodes[0].item_id, 1);
         assert_eq!(det.episodes[0].kind.as_deref(), Some("video"));
-        // 残留相集：分集已全视频 → kind 重算为 series
+        // 残留相集：存量脏徽标（BUG-044 之前的自动成剧留下的），**首次**启动仍纠正为 series。
+        // 第二次及以后不再纠正 —— 见 series_kind_choice_survives_repeated_migrations。
         let repaired = series
             .iter()
             .find(|x| x.title == "残留相集")
             .expect("残留相集应幸存");
-        assert_eq!(repaired.kind, "series", "全视频分集的 kind 应回归 series");
+        assert_eq!(
+            repaired.kind, "series",
+            "存量脏徽标应在首次启动时被一次性归一为 series"
+        );
+        // 纯图剧是**合法**的 album（只有图片分集，也是合法内容）—— 一次性归一的守卫
+        // 「有分集 + 分集全 video/photo」对它是真命题，但它本来就该被纠正。
+        // 反过来：用户**此刻**把类型选成别的，第二次启动不得再动它（BUG-258 核心判据）。
+        drop(s);
+        let s2 = Store::open(&path).await.unwrap();
+        s2.conn
+            .execute(
+                "UPDATE media_series SET kind = 'album' WHERE title = '残留相集'",
+                (),
+            )
+            .await
+            .unwrap();
+        drop(s2);
+        let s3 = Store::open(&path).await.unwrap();
+        let after = s3
+            .list_series()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|x| x.title == "残留相集")
+            .expect("残留相集仍应存在");
+        assert_eq!(
+            after.kind, "album",
+            "BUG-258：用户选的类型在第二次启动后必须被尊重（一次性归一不得变成每次都跑）"
+        );
+    }
+
+    /// BUG-258 判据 1 + 判据 2：**剧集类型一经选定，重启多少次都不变**。
+    ///
+    /// 缺陷原形：`migrate()` 每次启动都跑
+    /// `UPDATE media_series SET kind='series' WHERE kind IS NOT 'series' AND 有分集 AND 分集全 video/photo`，
+    /// 而最后一个子句被触发器保证恒真 ⇒ 任何有分集的剧集每次启动都被打回 `series`。
+    ///
+    /// 本用例把「重启两次」写成可证伪的步骤：设 `album` → 重开 → 仍 `album`；
+    /// 再重开 → 仍 `album`。同时用 `collection` 走一遍，并用**零分集**剧集作负控
+    /// （判据 2：负控本来就通过，这里防止有人把整条迁移删掉后反而「看起来没问题」）。
+    #[tokio::test]
+    async fn series_kind_choice_survives_repeated_migrations() {
+        /// 走真实写路径把类型改成 `kind`（模拟用户在编辑面板上下拉里选了一项）。
+        async fn set_kind(path: &Path, ids: &[i64], kind: &str) {
+            let s = Store::open(path).await.unwrap();
+            for id in ids {
+                s.update_series(*id, &SeriesPatch {
+                    kind: Some(kind.to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            }
+        }
+        /// 开一次库（即一次「重启」）后读回类型。
+        async fn read_kind_after_restart(path: &Path, id: i64) -> String {
+            let s = Store::open(path).await.unwrap();
+            s.get_series(id).await.unwrap().unwrap().series.kind
+        }
+
+        let path = tmp_db("kind_once");
+        let (with_ep, without_ep) = {
+            let s = Store::open(&path).await.unwrap();
+            let item = s
+                .upsert_media_item("tg", "ref:k", "v", "video", None, None, None, None)
+                .await
+                .unwrap();
+            let with = s.create_series("有分集", None, "series", None, None).await.unwrap();
+            s.add_episode(with, item, 1, 1).await.unwrap();
+            let without = s.create_series("零分集", None, "series", None, None).await.unwrap();
+            (with, without)
+        };
+
+        for kind in ["album", "collection"] {
+            set_kind(&path, &[with_ep, without_ep], kind).await;
+            // 重启 #1
+            assert_eq!(
+                read_kind_after_restart(&path, with_ep).await,
+                kind,
+                "BUG-258：重启一次后类型必须仍是 {kind}（有分集剧集）"
+            );
+            assert_eq!(
+                read_kind_after_restart(&path, without_ep).await,
+                kind,
+                "BUG-258 判据 2：零分集剧集重启后类型必须不变（负控）"
+            );
+            // 重启 #2 —— 缺陷原形下第二次启动同样会打回，这里证明标记键真的生效。
+            assert_eq!(
+                read_kind_after_restart(&path, with_ep).await,
+                kind,
+                "BUG-258：重启两次后类型必须仍是 {kind}（一次性标记键未生效？）"
+            );
+        }
+    }
+
+    /// BUG-258 反向对照：一次性归一**只**在首次启动发生。
+    ///
+    /// 若有人把 `normalize_series_kind_once` 改回「每次启动都跑」，本用例 FAIL；
+    /// 若有人把整条迁移连同标记键一起删掉，`series_kind_choice_survives_repeated_migrations`
+    /// 仍会 PASS —— 所以必须**两处都有**才算守住：这里证明存量脏徽标仍被纠正一次。
+    ///
+    /// 夹具必须**先于**第一次 `Store::open` 造好（裸 SQL 建表 + 塞入脏徽标），
+    /// 否则那次 open 就已经把一次性机会用掉了，后面再造的脏数据谁也不会去纠正。
+    #[tokio::test]
+    async fn series_kind_normalize_runs_exactly_once() {
+        let path = tmp_db("kind_once_flag");
+        // 「上一版」的库形态：collection 徽标 + 一个视频分集（BUG-044 之前的自动成剧留下的）。
+        {
+            let conn = libsql::Builder::new_local(&path).build().await.unwrap().connect().unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE media_item (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, ref TEXT NOT NULL,
+                    title TEXT NOT NULL, kind TEXT NOT NULL, file_path TEXT, poster TEXT,
+                    size INTEGER, duration INTEGER, width INTEGER, height INTEGER,
+                    added_at INTEGER NOT NULL, UNIQUE(source, ref)
+                );
+                CREATE TABLE media_series (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT,
+                    kind TEXT NOT NULL DEFAULT 'series', poster TEXT, year INTEGER,
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE media_episode (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, series_id INTEGER NOT NULL,
+                    item_id INTEGER NOT NULL, season INTEGER NOT NULL, episode_no INTEGER NOT NULL,
+                    title TEXT, description TEXT,
+                    UNIQUE(series_id, season, episode_no)
+                );
+                INSERT INTO media_item (source, ref, title, kind, added_at)
+                    VALUES ('tg','ref:d','v','video',1);
+                INSERT INTO media_series (title, kind, created_at, updated_at)
+                    VALUES ('脏徽标','collection',1,1);
+                INSERT INTO media_episode (series_id, item_id, season, episode_no)
+                    VALUES (1, 1, 1, 1);
+                "#,
+            )
+            .await
+            .unwrap();
+        }
+        const ID: i64 = 1;
+
+        // 首启：标记键刚被写入，归一已执行 → 纠正成 series。
+        {
+            let s = Store::open(&path).await.unwrap();
+            assert_eq!(
+                scalar_i64(
+                    &s.conn,
+                    &format!("SELECT COUNT(*) FROM app_setting WHERE key = '{SERIES_KIND_NORMALIZE_MIG}'")
+                )
+                .await,
+                1,
+                "首次启动必须写入一次性标记键"
+            );
+            let got = s.get_series(ID).await.unwrap().unwrap().series.kind;
+            assert_eq!(got, "series", "存量脏徽标必须在首次启动被纠正一次");
+        }
+        // 二启：用户改回 album → 必须被尊重（标记键已存在，归一不再执行）。
+        {
+            let s = Store::open(&path).await.unwrap();
+            s.update_series(ID, &SeriesPatch {
+                kind: Some("album".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        {
+            let s = Store::open(&path).await.unwrap();
+            let got = s.get_series(ID).await.unwrap().unwrap().series.kind;
+            assert_eq!(
+                got, "album",
+                "标记键存在后归一不得再跑（否则用户选择仍被撤销 = 缺陷仍在）"
+            );
+        }
+    }
+
+    /// BUG-258 判据 3 + 判据 4：**年份必须可清空**，且「缺省」仍是不改。
+    ///
+    /// 缺陷原形：`SeriesPatch.year` 是 `Option<i64>`，`None` 同时表示「不改」与
+    /// 「清空」，`update_series` 用 `patch.year.or(s.year)` 保留旧值。
+    #[tokio::test]
+    async fn series_year_supports_explicit_clear() {
+        let path = tmp_db("year_clear");
+        let s = Store::open(&path).await.unwrap();
+        let sid = s.create_series("有年份的剧", None, "series", Some(2024), None).await.unwrap();
+
+        // 设值：三态里的 Some(Some(y))
+        s.update_series(sid, &SeriesPatch {
+            year: Some(Some(1999)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            s.get_series(sid).await.unwrap().unwrap().series.year,
+            Some(1999),
+            "年份必须能设成新值"
+        );
+
+        // 缺省（键缺省 ⇒ None）= 不改 —— 判据 4：不得把已有年份写坏。
+        s.update_series(sid, &SeriesPatch {
+            title: Some("改名了".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            s.get_series(sid).await.unwrap().unwrap().series.year,
+            Some(1999),
+            "缺省 year 键必须保持原值（不改语义仍须可用）"
+        );
+
+        // 显式 null ⇒ Some(None) = 清空为 NULL —— 判据 3。
+        s.update_series(sid, &SeriesPatch {
+            year: Some(None),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            s.get_series(sid).await.unwrap().unwrap().series.year,
+            None,
+            "BUG-258：PATCH 携带 year: null 必须清空年份"
+        );
+
+        // 清空后再缺省保存，仍是 NULL（不会被「补回」）。
+        s.update_series(sid, &SeriesPatch {
+            title: Some("再改名".to_string()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            s.get_series(sid).await.unwrap().unwrap().series.year,
+            None,
+            "已清空的年份不得被后续缺省保存写回"
+        );
+    }
+
+    /// BUG-258：`year` 的**反序列化契约**必须分得清「键缺省」与「显式 null」。
+    ///
+    /// 这层是 HTTP 契约的真正入口：路由把 `Json<SeriesPatch>` 直接交给
+    /// `update_series`，若这里把两者都映射成 `None`，上面的 store 用例就毫无意义。
+    #[test]
+    fn series_patch_year_distinguishes_absent_from_null() {
+        let absent: SeriesPatch = serde_json::from_str(r#"{"title":"x"}"#).unwrap();
+        assert_eq!(absent.year, None, "键缺省 ⇒ None（不改）");
+
+        let explicit_null: SeriesPatch = serde_json::from_str(r#"{"year":null}"#).unwrap();
+        assert_eq!(
+            explicit_null.year,
+            Some(None),
+            "显式 null ⇒ Some(None)（清空）"
+        );
+
+        let value: SeriesPatch = serde_json::from_str(r#"{"year":2024}"#).unwrap();
+        assert_eq!(value.year, Some(Some(2024)), "有值 ⇒ Some(Some(y))");
+    }
+
+    /// BUG-258：**非法类型枚举不得进列**（`update_series` 与 `create_series` 都要拦）。
+    ///
+    /// store 层这道断言是纵深防御 —— 路由已经先给 422，但库里还有别处的写路径
+    /// （将来的导入、脚本），不能只靠调用方自觉。
+    #[tokio::test]
+    async fn series_kind_rejects_values_outside_the_enum() {
+        let path = tmp_db("kind_enum");
+        let s = Store::open(&path).await.unwrap();
+        let sid = s.create_series("合法剧", None, "album", None, None).await.unwrap();
+
+        let err = s
+            .update_series(sid, &SeriesPatch {
+                kind: Some("garbage".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("非法 kind 必须报错");
+        assert!(
+            matches!(err, libsql::Error::Misuse(_)),
+            "必须是「用法错误」而不是数据库故障，得到 {err:?}"
+        );
+        // 列值必须原封不动。
+        assert_eq!(
+            s.get_series(sid).await.unwrap().unwrap().series.kind,
+            "album",
+            "被拒绝的写入不得部分生效"
+        );
+
+        // 大小写敏感：`Album` 不是 `album`。
+        assert!(s
+            .update_series(sid, &SeriesPatch {
+                kind: Some("Album".to_string()),
+                ..Default::default()
+            })
+            .await
+            .is_err());
+
+        // 建剧集同样拒绝。
+        assert!(s.create_series("坏剧", None, "garbage", None, None).await.is_err());
+        // 三个合法值都必须通过（别把枚举写死成只认一个）。
+        for kind in SERIES_KINDS {
+            assert!(is_valid_series_kind(kind), "{kind} 必须被认定为合法");
+            let id = s.create_series("好剧", None, kind, None, None).await.unwrap();
+            assert_eq!(
+                s.get_series(id).await.unwrap().unwrap().series.kind,
+                kind,
+                "{kind} 必须能写入"
+            );
+        }
     }
 
     /// BUG-045：`#标签` 归档到**内容条目**（无剧集可挂时），union 语义与剧集版一致。

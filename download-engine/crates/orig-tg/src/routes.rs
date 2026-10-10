@@ -2013,14 +2013,19 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
     // 下载失败 → 条目保留缺字节、任务 failed，登记不撤销（重试只重做字节）。
     // 这正是「缓存→不见了→完成→出现」闪烁的根治：条目自 T0 起持续可见。
     let mut ing = IngestCtx::prepare(st, &task).await;
+    // BUG-257：条目之间的取消判据从「读 DB」改为「认令牌」。两者都在，但令牌是
+    // **可达在途 IO** 的那个（见下方 `select!`），必须让两处读**同一个**判据 ——
+    // 否则会出现「在途被取消了、下一条目却又按 DB 判成活跃」的自相矛盾。
+    let cancel = st.cache_cancel(task_id);
     for msg_id in task.message_ids.iter().copied() {
-        if !st.store.is_cache_task_active(task_id).await.unwrap_or(false) {
+        if cancel.is_set() || !st.store.is_cache_task_active(task_id).await.unwrap_or(false) {
             st.push_log(format!(
                 "cache task {task_id}: cancelled at {done}/{}",
                 task.total
             ));
             // 事实不回滚：已登记条目保留；未落位的挂起照片留给下次任务补齐。
             ing.finish(st).await;
+            st.clear_cache_cancel(task_id);
             return;
         }
         let _ = st
@@ -2081,7 +2086,34 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
             st.refresh_cache_tasks().await;
             continue;
         }
-        match cache_one_bytes(st, Some(task_id), task.chat_id, msg_id, &dir).await {
+        // BUG-257：取消**可达在途条目**。此前这里只有一个 `.await`，取消只在下一条目
+        // 之前生效 ⇒ 用户按了取消，正在下这一条仍要等满 90s 空闲看门狗才停
+        //（判据 1）。现在把整个下载 future 与取消令牌竞速：取消置位 ⇒ 本 await 立即
+        // 返回，`.part` 随 future drop 清理（`PartFile` 的 Drop 语义），队列前进。
+        //
+        // `biased` 且取消分支排第一：取消与下载完成同时就绪时**优先判取消**——
+        // 都已经到终态了，再把这一条计成 done 只会让用户看到「取消了却还在涨进度」。
+        let cancel = st.cache_cancel(task_id);
+        let download = cache_one_bytes(st, Some(task_id), task.chat_id, msg_id, &dir);
+        tokio::pin!(download);
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.wait() => {
+                st.push_log(format!(
+                    "cache task {task_id}: cancelled during item {msg_id} at {done}/{} \
+                     (in-flight transfer aborted)",
+                    task.total
+                ));
+                // 事实不回滚：已登记条目保留（含缺字节的当前条目）。
+                // **不调 finish_cache_task**：`cancel_cache_task` 已置 `cancelled`，
+                // 再写一次终态只会把「用户取消」说成别的状态。
+                ing.finish(st).await;
+                st.clear_cache_cancel(task_id);
+                return;
+            }
+            res = &mut download => res,
+        };
+        match outcome {
             Ok(outcome) => {
                 match &registered {
                     Some((item, _)) => {
@@ -2134,12 +2166,15 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
                 // 事实不回滚：已登记条目（含缺字节的当前条目）全部保留；
                 // 未落位的挂起照片如实留痕，重试任务幂等补齐。
                 ing.finish(st).await;
+                st.clear_cache_cancel(task_id);
                 return;
             }
         }
     }
     let _ = st.store.finish_cache_task(task_id, "done", None).await;
     ing.finish(st).await;
+    // 终态即注销令牌：否则 token 表随任务数单调增长（队列可达几十条 × 进程生命周期）。
+    st.clear_cache_cancel(task_id);
     let item_ids: Vec<i64> = ing.ingested.iter().map(|(_, id)| *id).collect();
 
     // ③b：组内 caption 的 `#标签` 收集（BUG-045：与成剧**解耦** —— 任何缓存任务
@@ -2632,8 +2667,8 @@ impl IntoResponse for ApiError {
 // 与 TG 流水（/api/tg/*）职责分离：这里是用户可增删改的**资料库**。
 
 use crate::media::{
-    classify_ext, scan_dir, split_caption, BundleError, EpisodeEdit, EpisodeMove, ItemPatch,
-    ItemQuery, SeriesPatch,
+    classify_ext, is_valid_series_kind, scan_dir, split_caption, BundleError, EpisodeEdit,
+    EpisodeMove, ItemPatch, ItemQuery, SeriesPatch, SERIES_KINDS,
 };
 
 /// `GET /api/media/items?kind=&q=&tagId=&seriesId=&unassigned=&sort=&limit=&offset=`
@@ -4416,6 +4451,7 @@ async fn list_media_series(
 struct CreateSeriesReq {
     title: String,
     description: Option<String>,
+    /// 类型；缺省 = `series`。枚举外的值一律 422（BUG-258：脏类型不得进列）。
     kind: Option<String>,
     year: Option<i64>,
 }
@@ -4425,12 +4461,22 @@ async fn create_media_series(
     State(st): State<Arc<AppState>>,
     Json(body): Json<CreateSeriesReq>,
 ) -> Result<impl IntoResponse, ApiError> {
+    // 类型枚举在**路由层**就 422，而不是等 store 报错后回 500：调用方（前端表单、
+    // 脚本）需要知道「这个值非法」，而不是「服务端炸了」。store 侧另有一道
+    // 断言（`create_series` 校验 `is_valid_series_kind`），拦住绕过路由的写路径。
+    let kind = body.kind.as_deref().unwrap_or("series");
+    if !is_valid_series_kind(kind) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("invalid series kind {kind:?}: expected one of {SERIES_KINDS:?}"),
+        ));
+    }
     let id = st
         .store
         .create_series(
             &body.title,
             body.description.as_deref(),
-            body.kind.as_deref().unwrap_or("series"),
+            kind,
             body.year,
             None, // 用户手动创建：不参与 TG 幂等去重
         )
@@ -4456,11 +4502,23 @@ async fn get_media_series(
 }
 
 /// `PATCH /api/media/series/:id`
+///
+/// BUG-258：类型枚举在路由层 422。`kind` 曾是「任何字符串都照收」的字段，
+/// 而前端 `kindLabel()` 会把未知值原样透出 —— 于是 `PATCH {"kind":"garbage"}`
+/// 能把一个界面无法解释的徽标写进列。**非法状态必须不可表达**。
 async fn patch_media_series(
     State(st): State<Arc<AppState>>,
     Path(id): Path<i64>,
     Json(body): Json<SeriesPatch>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if let Some(kind) = body.kind.as_deref() {
+        if !is_valid_series_kind(kind) {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                &format!("invalid series kind {kind:?}: expected one of {SERIES_KINDS:?}"),
+            ));
+        }
+    }
     let ok = st
         .store
         .update_series(id, &body)
@@ -5028,11 +5086,13 @@ mod tests {
     use super::delete_media_item;
     use super::delivery_due_secs;
     use super::cache_tasks_payload;
+    use super::create_media_series;
     use super::list_episode_bindings;
     use super::merge_media_series;
     use super::normalized_series_name;
     use super::parse_stream_speed;
     use super::parse_stream_start;
+    use super::patch_media_series;
     use super::resolve_ffmpeg_from;
     use super::speed_video_filter;
     use super::atempo_filter;
@@ -5040,6 +5100,205 @@ mod tests {
     use super::router;
     use super::serve_local_file;
     use super::MergeSeriesReq;
+
+    // ── BUG-257：取消可达在途 IO（判据 1） ────────────────────────────────
+
+    /// 一个 `download()` **永远挂住**的客户端：精确复现「卡住的条目」。
+    ///
+    /// 它刻意**不**自己超时：真实卡死时能救场的只有 90s 空闲看门狗，而那正是本测试
+    /// 要证明**不必再等**的东西。用它当夹具，「取消是否可达在途」就是被测命题本身，
+    /// 而不是对某个 mock 行为的间接断言。
+    struct HangingClient {
+        /// 被`download()` 进入的次数（用来确认「确实卡在下载里」而不是提前退出）。
+        entered: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::login::Client for HangingClient {
+        async fn start(&self, _: &str) -> Result<crate::login::LoginPhase, crate::login::ClientError> {
+            Err(crate::login::ClientError::NotInitialized)
+        }
+        async fn submit_code(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::login::LoginPhase, crate::login::ClientError> {
+            Err(crate::login::ClientError::NotInitialized)
+        }
+        async fn submit_password(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<crate::login::LoginPhase, crate::login::ClientError> {
+            Err(crate::login::ClientError::NotInitialized)
+        }
+        async fn view(&self) -> crate::login::SessionView {
+            crate::login::SessionView {
+                phase: crate::login::LoginPhase::Anonymous,
+                phone: None,
+                user_id: None,
+            }
+        }
+        async fn dialogs(&self) -> Result<Vec<crate::login::Channel>, crate::login::ClientError> {
+            Ok(Vec::new())
+        }
+        async fn folders(&self) -> Result<Vec<crate::login::Folder>, crate::login::ClientError> {
+            Ok(Vec::new())
+        }
+        async fn messages(
+            &self,
+            _: i64,
+            _: u32,
+            _: Option<i64>,
+        ) -> Result<Vec<crate::login::MediaItem>, crate::login::ClientError> {
+            Ok(Vec::new())
+        }
+        async fn thumb(
+            &self,
+            _: i64,
+            _: i64,
+        ) -> Result<Option<crate::login::Thumbnail>, crate::login::ClientError> {
+            Ok(None)
+        }
+        async fn media(
+            &self,
+            _: i64,
+            _: i64,
+            _: Option<crate::login::MediaRange>,
+        ) -> Result<crate::login::MediaStream, crate::login::ClientError> {
+            Err(crate::login::ClientError::MediaNotFound)
+        }
+        /// 永不返回：模拟「TCP 半死、range 流next() 永不返回」。
+        async fn download(
+            &self,
+            _: i64,
+            _: i64,
+            _: &str,
+            _: Option<&crate::login::DownloadProgress>,
+        ) -> Result<crate::login::DownloadOutcome, crate::login::ClientError> {
+            self.entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // 永久挂起：只有取消（或进程结束）能解开，正是要修的那个形态。
+            std::future::pending::<()>().await;
+            unreachable!("pending() 永不返回")
+        }
+        async fn message_meta(
+            &self,
+            _: i64,
+            _: i64,
+        ) -> Result<Option<crate::login::MediaItem>, crate::login::ClientError> {
+            Ok(None)
+        }
+    }
+
+    /// 判据 1（BUG-257）：对**卡在条目内**的任务发出取消，必须在**秒级**退出，
+    /// 而**不是**等满 90s 空闲看门狗；且任务**不得**被写成 `done`/`failed`。
+    ///
+    /// 三条断言分别锁住用户能感知到的三件事：
+    /// ① 生效上限（秒级，不是 90s）；② 终态是 `cancelled`（用户取消，不是被判定失败）；
+    /// ③ 确实卡在下载里（否则本测试可能只是「提前退出」的假阳性）。
+    #[tokio::test]
+    async fn cancel_aborts_an_in_flight_download_in_seconds_not_ninety() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let st = std::sync::Arc::new(crate::state::AppState::new(
+            std::sync::Arc::new(HangingClient { entered: entered.clone() }),
+            crate::config::Config::default(),
+            crate::state::Availability::Ready,
+            false,
+            crate::store::Store::open(":memory:").await.expect("store"),
+        ));
+
+        // 入队一条真实会走下载路径的任务（媒体类型非 photo ⇒ 不走「图片不缓存」分支）。
+        st.store
+            .upsert_message(-1001, 55, Some("hangs"), Some("video/mp4"), Some(9_000), Some("video".into()), Some(0), None, None)
+            .await
+            .unwrap();
+        let (task, created) = st
+            .store
+            .enqueue_cache_task(-1001, None, "m:-1001:55", &[55], &std::env::temp_dir().to_string_lossy())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(created);
+
+        let worker = tokio::spawn({
+            let st = st.clone();
+            async move { run_one_cache_task(&st, task.id).await }
+        });
+
+        // 等worker 真的卡进download()（而不是还没起步就退出了）。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while entered.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "夹具前提：worker 必须已卡在 download() 里"
+        );
+
+        // 取消 → 计时。
+        let t0 = Instant::now();
+        assert!(crate::cache::cancel_task_kernel(&st, task.id).await.expect("cancel must succeed"));
+        tokio::time::timeout(Duration::from_secs(20), worker)
+            .await
+            .expect("BUG-257：取消必须在 20s 内让在途传输退出（旧行为要等满 90s 看门狗）")
+            .expect("worker task must not panic");
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "取消生效上限实测 {elapsed:?}，超过 10s 就不是「可达在途」"
+        );
+
+        let t = st.store.get_cache_task(task.id).await.unwrap().unwrap();
+        assert_eq!(
+            t.status, "cancelled",
+            "取消后的终态必须是 cancelled —— 被判定成 done/failed 都是谎报"
+        );
+        assert!(
+            st.logs
+                .recent(50)
+                .iter()
+                .any(|l| l.contains("in-flight transfer aborted")),
+            "在途中止必须留痕，否则无法与「压根没跑」区分"
+        );
+        println!("BUG-257 判据 1 实测：取消在途生效耗时 {elapsed:?}（旧行为需等满 90s 看门狗）");
+    }
+
+    /// **反向证伪**（BUG-257 判据 7）：把在途 `select!` 换回「只查DB」的旧语义，
+    /// 判据 1 必须重新 FAIL——否则它测的就不是「取消可达在途 IO」，而是别的什么东西。
+    ///
+    /// 这条断言的价值恰恰在它**会失败**：它锁住的是「判据 1 仍然有效」。若将来有人
+    /// 顺手把 `select!` 简化回`cache_one_bytes(..).await`（看起来完全等价、因为
+    /// 循环顶部仍在查活跃性），本测试会立刻红给你看，而不是让BUG-257 悄悄复活。
+    ///
+    /// 复现旧行为的方式：直接调`download()` 并**只**等它自己结束——永不返回的夹具
+    /// 于是只能靠 20s 超时兜住，与「90s 看门狗」同构。
+    #[tokio::test]
+    async fn falsification_without_select_the_download_only_ends_by_timeout() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let client = HangingClient { entered: entered.clone() };
+
+        // 旧路径：`download()` 直接 await，**没有任何取消信号**参与竞速。
+        let hung = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.download(-1001, 55, ".", None),
+        )
+        .await;
+
+        assert_eq!(entered.load(Ordering::SeqCst), 1, "夹具必须已进入 download()");
+        assert!(
+            hung.is_err(),
+            "无 select! 时在途下载只能靠外部超时结束 —— 这正是 BUG-257 修掉的那条路径；\
+             若本行失败，说明夹具不再复现「卡住」，判据 1 就失去了对照"
+        );
+    }
 
     #[test]
     fn stream_speed_profiles_are_whitelisted_and_build_cfr_filters() {
@@ -5132,6 +5391,7 @@ mod tests {
     use axum::Json;
 
     use crate::config::Config;
+    use crate::media::SeriesPatch;
     use crate::state::{AppState, Availability};
     use crate::store::Store;
 
@@ -5315,6 +5575,147 @@ mod tests {
         assert!(
             st.store.get_media_item(id).await.unwrap().is_none(),
             "条目必须从库里移除"
+        );
+    }
+
+    // ---- BUG-258：剧集类型枚举 422 / 年份三态（HTTP 契约层）----
+
+    /// BUG-258：`PATCH /api/media/series/:id` 收到非法 `kind` 必须 **422**。
+    ///
+    /// 缺陷原形：路由把 `SeriesPatch` 原样交给 store，而 `kind` 是「任何字符串都
+    /// 照收」的字段 ⇒ `{"kind":"garbage"}` 成功写入，界面上的 `kindLabel()` 又把
+    /// 未知值原样透出，于是出现一个用户看得见、却没有任何语义的徽标。
+    /// **非法状态必须不可表达。**
+    #[tokio::test]
+    async fn patch_series_rejects_a_kind_outside_the_enum_with_422() {
+        let dir = scratch_dir("kind_422");
+        let st = state_in_download_dir(&dir).await;
+        let sid = st
+            .store
+            .create_series("合法剧", None, "series", None, None)
+            .await
+            .unwrap();
+
+        // 逐个非法值都必须 422（大小写敏感、空串、以及「看起来像」的近邻词）。
+        for bad in ["garbage", "", "Album", "SERIES", "series ", "album2"] {
+            let body: SeriesPatch = serde_json::from_value(json!({ "kind": bad }))
+                .unwrap_or_else(|e| panic!("body must deserialize so the 422 comes from validation: {e}"));
+            let res = patch_media_series(State(st.clone()), Path(sid), Json(body)).await;
+            let err = match res {
+                Ok(_) => panic!("kind={bad:?} 必须被拒绝，却返回成功"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err.status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "kind={bad:?} 必须 422（可枚举的非法值不该报成 500）"
+            );
+            // 422 之后列值必须原封不动。
+            assert_eq!(
+                st.store.get_series(sid).await.unwrap().unwrap().series.kind,
+                "series",
+                "kind={bad:?} 被拒后不得部分写入"
+            );
+        }
+
+        // 三个合法值都必须 200（别把枚举写死成只认一个）。
+        for good in crate::media::SERIES_KINDS {
+            let body: SeriesPatch =
+                serde_json::from_value(json!({ "kind": good })).expect("legal kind deserializes");
+            let res = patch_media_series(State(st.clone()), Path(sid), Json(body)).await;
+            assert!(res.is_ok(), "kind={good:?} 必须被接受");
+            assert_eq!(
+                st.store.get_series(sid).await.unwrap().unwrap().series.kind,
+                good,
+                "kind={good:?} 必须真的写进列"
+            );
+        }
+    }
+
+    /// BUG-258：`POST /api/media/series` 同样拒绝非法 `kind`（建剧集也是写路径）。
+    #[tokio::test]
+    async fn create_series_rejects_a_kind_outside_the_enum_with_422() {
+        let dir = scratch_dir("kind_422_create");
+        let st = state_in_download_dir(&dir).await;
+        let res = create_media_series(
+            State(st.clone()),
+            Json(super::CreateSeriesReq {
+                title: "坏剧".to_string(),
+                description: None,
+                kind: Some("garbage".to_string()),
+                year: None,
+            }),
+        )
+        .await;
+        let err = match res {
+            Ok(_) => panic!("非法 kind 必须被拒绝，却返回成功"),
+            Err(e) => e,
+        };
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            st.store.list_series().await.unwrap().is_empty(),
+            "被拒的建剧请求不得留下任何行"
+        );
+    }
+
+    /// BUG-258 判据 3 + 判据 4（HTTP 层）：`{"year": null}` 清空年份，
+    /// 而**缺省该键**保持原值。
+    ///
+    /// 这是前端唯一的通道（`SeriesEditPanel` 的保存），因此必须在端点这一层
+    /// 证明三态成立 —— 只在 store 层证明不足以说明真实调用链可用。
+    #[tokio::test]
+    async fn patch_series_year_clears_on_explicit_null_and_keeps_when_absent() {
+        let dir = scratch_dir("year_three_state");
+        let st = state_in_download_dir(&dir).await;
+        let sid = st
+            .store
+            .create_series("年份剧", None, "series", Some(2024), None)
+            .await
+            .unwrap();
+
+        let patch_json = |v: serde_json::Value| -> SeriesPatch {
+            serde_json::from_value(v).expect("body deserializes")
+        };
+
+        // ① 设值 → 2024 保持。
+        let res = patch_media_series(
+            State(st.clone()),
+            Path(sid),
+            Json(patch_json(json!({ "year": 2024 }))),
+        )
+        .await;
+        assert!(res.is_ok());
+        assert_eq!(
+            st.store.get_series(sid).await.unwrap().unwrap().series.year,
+            Some(2024)
+        );
+
+        // ② 缺省 year 键（只改标题）→ 年份不得被写坏（判据 4）。
+        let res = patch_media_series(
+            State(st.clone()),
+            Path(sid),
+            Json(patch_json(json!({ "title": "只改标题" }))),
+        )
+        .await;
+        assert!(res.is_ok());
+        assert_eq!(
+            st.store.get_series(sid).await.unwrap().unwrap().series.year,
+            Some(2024),
+            "BUG-258 判据 4：缺省 year 键必须是不改"
+        );
+
+        // ③ 显式 null → 清空为 NULL（判据 3）。缺陷原形下这里是 200 但值不变。
+        let res = patch_media_series(
+            State(st.clone()),
+            Path(sid),
+            Json(patch_json(json!({ "year": null }))),
+        )
+        .await;
+        assert!(res.is_ok(), "清空年份必须是成功而不是报错");
+        assert_eq!(
+            st.store.get_series(sid).await.unwrap().unwrap().series.year,
+            None,
+            "BUG-258 判据 3：PATCH {{\"year\": null}} 必须把年份清成 NULL"
         );
     }
 

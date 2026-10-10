@@ -42,6 +42,7 @@ import {
   detachEpisodeImage,
   detachEpisodeSource,
   moveEpisode,
+  seriesKindLabelKey,
 } from '../../api/media'
 import {
   canRecacheFromSource,
@@ -300,12 +301,7 @@ export function SeriesDetail(props: {
     ? null
     : detail.episodes.find((e) => e.id === attachingEpisodeId) ?? null
 
-  const kindLabel = (k: string): string => {
-    if (k === 'series') return t('media.series.kindSeries')
-    if (k === 'collection') return t('media.series.kindCollection')
-    if (k === 'album') return t('media.series.kindAlbum')
-    return k
-  }
+  const kindLabel = (k: string): string => t(seriesKindLabelKey(k))
 
   const cover = resolveSeriesCover(detail)
   const showSeasons = showSeasonHeaders(detail)

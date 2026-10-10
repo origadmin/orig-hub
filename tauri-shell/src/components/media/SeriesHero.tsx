@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Film, GitMerge, Image as ImageIcon, Pencil, Tag } from 'lucide-react'
 import { Button } from '../ui/button'
 import type { MediaSeriesDetail, MediaTag } from '../../api/media'
+import { seriesKindLabelKey } from '../../api/media'
 import { coverFit } from '../../lib/mediaSources'
 import { resolveSeriesCover } from '../../lib/episodePresentation'
 import { CoverImage } from './CoverImage'
@@ -54,13 +55,15 @@ export function SeriesHero(props: {
     setOverflowing(el != null && el.scrollHeight > DESC_CLAMP_PX + 4)
   }, [detail.description])
 
-  /** 类型标签走 i18n（`KIND_LABEL` 硬编码中文已移除，R9） */
-  const kindLabel = (k: string): string => {
-    if (k === 'series') return t('media.series.kindSeries')
-    if (k === 'collection') return t('media.series.kindCollection')
-    if (k === 'album') return t('media.series.kindAlbum')
-    return k
-  }
+  /**
+   * 类型标签走 i18n，且**不原样透出未知枚举**（BUG-258）。
+   *
+   * 此前这段三分支在四个文件里各写一遍（`SeriesHero` / `SeriesCard` /
+   * `SeriesDetail` / `SeriesEditPanel`），都以 `return k` 收尾 —— 四份定义必然漂移，
+   * 且每份的兜底都会把一个界面无法解释的字符串显示成「合法类型」。现在统一走
+   * `api/media#seriesKindLabelKey`（后端 `media::SERIES_KINDS` 对枚举外的值 422）。
+   */
+  const kindLabel = (k: string): string => t(seriesKindLabelKey(k))
 
   return (
     <section className="flex min-w-0 flex-col gap-4 border-b border-border-subtle/60 p-4" data-testid="series-hero">

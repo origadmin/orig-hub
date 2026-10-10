@@ -1,13 +1,18 @@
 import { useState } from 'react'
 import { Button } from '../ui/button'
 import { Input } from '../ui/input'
-import { patchSeries, setSeriesTags } from '../../api/media'
-import type { MediaSeriesDetail, MediaTag } from '../../api/media'
+import { patchSeries, setSeriesTags, SERIES_KINDS, seriesKindLabelKey } from '../../api/media'
+import type { MediaSeriesDetail, MediaTag, SeriesKind } from '../../api/media'
 import { TagPicker } from './TagManagerDialog'
 import { useTranslation } from '../../i18n'
 
-/** 剧集类型可选项 —— 与后端 `media_series.kind` 的三个取值一一对应 */
-const KINDS = ['series', 'collection', 'album'] as const
+/**
+ * 剧集类型可选项 —— 取自 `api/media` 的 `SERIES_KINDS`，与后端 `media::SERIES_KINDS`
+ * 是**同一份枚举**（PATCH 时枚举外的值一律 422）。
+ *
+ * 此前这里内联 `['series','collection','album'] as const`，与后端校验各写一份。
+ * BUG-258 的根因之一就是「写路径不校验、读路径把未知值原样透出」，两份定义必然漂移。
+ */
 
 /**
  * 剧集编辑面板：`title` / `description` / `kind` / `year` / `tags` **一次提交**（R10）。
@@ -20,8 +25,10 @@ const KINDS = ['series', 'collection', 'album'] as const
  *   - `setSeriesTags(id, ids)`
  *   - 就地新建标签由父层 `onCreateTag` 提供（建完父层刷新，返回 id 让选择器立即勾上）
  *
- * `description` 空值下发 `null`（**显式清空**，后端 `Option<Option<String>>` 契约）——
- * 否则介绍设过就永远清不掉。
+ * `description` 与 `year` 都是「缺省 = 不改 / `null` = 显式清空」。
+ * 年份此前**只发键不发值**：字段为空时展开式把整个 `year` 键省掉，而后端
+ * `Option<i64>` 把 `None` 理解为「不改」—— 于是「空」与「不改」在契约上
+ * 不可区分，**填错就永远清不掉**。现在按下方的 `yearTouched` 三态下发。
  */
 export function SeriesEditPanel(props: {
   series: MediaSeriesDetail
@@ -36,24 +43,25 @@ export function SeriesEditPanel(props: {
   const { series, tags, onClose, onSaved, onError, onCreateTag } = props
   const [title, setTitle] = useState(series.title)
   const [desc, setDesc] = useState(series.description ?? '')
-  const [kind, setKind] = useState(series.kind)
+  const [kind, setKind] = useState<SeriesKind>(series.kind)
   const [year, setYear] = useState(series.year != null ? String(series.year) : '')
+  /**
+   * 用户是否碰过年份输入框（BUG-258）—— 三态里的第三个状态。
+   *
+   * **没碰过** ⇒ 键缺省 ⇒ 后端按「不改」处理，于是「打开面板什么都不改就保存」
+   * 不会误清别人填的年份；**碰过且清空** ⇒ 显式发 `null` ⇒ 真清空。
+   */
+  const [yearTouched, setYearTouched] = useState(false)
   const [selected, setSelected] = useState<number[]>(series.tags.map((x) => x.id))
   const [busy, setBusy] = useState(false)
 
-  const kindLabel = (k: string): string => {
-    if (k === 'series') return t('media.series.kindSeries')
-    if (k === 'collection') return t('media.series.kindCollection')
-    if (k === 'album') return t('media.series.kindAlbum')
-    return k
-  }
+  const kindLabel = (k: string): string => t(seriesKindLabelKey(k))
 
   /**
    * 保存。
    *
    * 标题是列表/卡片的主标识，`NOT NULL` —— **空值前端先拦**：空标题会让剧集在墙上
    * 变成一张无法辨认的卡。前端拦下一道，避免发一次必然 422 的请求。
-   * 年份是可选字段：留空 = 显式不发（后端按「不改」处理，年份本身可缺省）。
    */
   const save = async () => {
     const nextTitle = title.trim()
@@ -62,7 +70,7 @@ export function SeriesEditPanel(props: {
       return
     }
     const yearRaw = year.trim()
-    let yearValue: number | undefined
+    let yearValue: number | null = null
     if (yearRaw !== '') {
       const y = Number(yearRaw)
       if (!Number.isInteger(y) || y < 0) {
@@ -78,7 +86,8 @@ export function SeriesEditPanel(props: {
         // 空介绍 = 显式清空（null），不是「不改」
         description: desc.trim() || null,
         kind,
-        ...(yearValue !== undefined ? { year: yearValue } : {}),
+        // 年份三态：碰过就发（空 ⇒ null = 清空），没碰过 ⇒ 省键 = 不改。
+        ...(yearTouched ? { year: yearValue } : {}),
       })
       await setSeriesTags(series.id, selected)
       onSaved()
@@ -132,12 +141,12 @@ export function SeriesEditPanel(props: {
             <span>{t('media.series.editKind')}</span>
             <select
               value={kind}
-              onChange={(e) => setKind(e.target.value)}
+              onChange={(e) => setKind(e.target.value as SeriesKind)}
               aria-label={t('media.series.editKind')}
               data-testid="series-kind-select"
               className="h-7 rounded-md border border-border-subtle bg-surface px-1.5 text-[11.5px] text-fg-strong"
             >
-              {KINDS.map((k) => (
+              {SERIES_KINDS.map((k) => (
                 <option key={k} value={k}>
                   {kindLabel(k)}
                 </option>
@@ -150,7 +159,12 @@ export function SeriesEditPanel(props: {
               type="number"
               min={0}
               value={year}
-              onChange={(e) => setYear(e.target.value)}
+              // BUG-258：一旦用户碰过这个字段就置位，于是「清空输入框 + 保存」
+              // 会被当作**显式清空**下发（`year: null`），而不是「省键 = 不改」。
+              onChange={(e) => {
+                setYear(e.target.value)
+                setYearTouched(true)
+              }}
               className="h-7 w-24 text-[11.5px]"
               aria-label={t('media.series.editYear')}
               data-testid="series-year-input"

@@ -14,6 +14,74 @@ const mediaBase = () => tgBase()
 /** 媒体类型 */
 export type MediaKind = 'video' | 'photo' | 'audio' | 'file'
 
+/**
+ * 剧集类型 —— 与后端 `media_series.kind` 的合法枚举**逐字对应**
+ * （后端 `media::SERIES_KINDS`，枚举外的值 PATCH 一律 422）。
+ *
+ * 单独导出而不是各处内联字面量：BUG-258 的教训正是「写路径不校验、读路径把未知值
+ * 原样透出」两头对不上，于是 `garbage` 能进库并在界面上显示成一个无意义的徽标。
+ * 一份定义 + 后端强校验 = 非法状态不可表达。
+ */
+export type SeriesKind = 'series' | 'collection' | 'album'
+
+/** 剧集类型可选项（下拉顺序即此顺序） */
+export const SERIES_KINDS: readonly SeriesKind[] = ['series', 'collection', 'album'] as const
+
+/**
+ * 内容类型 → i18n 键。**存的是键，不是文案** —— 双语应用里硬编码中文会让英文界面
+ * 混排「视频 / 图片」（BUG-128），渲染时才用 `t()` 求值。
+ *
+ * 为什么不复用 `media.videos` / `media.photos`：那三个是**复数分类名**（左栏分类按钮
+ * 的文案），这里是**单数类型名**，语义不同 —— 复用会让将来改分类名时意外改掉徽标。
+ *
+ * 单一来源：`MediaCard` 的角标与 `ItemEditDialog` 的只读类型行都从这里取，
+ * 免得同一份映射在两个文件里各写一遍、其中一处漏了新类型（BUG-258：内容弹窗此前
+ * 直接渲染后端原始枚举 `video/photo/file`，没走 i18n，英文界面里也是裸值）。
+ *
+ * @param kind 后端 `media_item.kind`
+ * @returns i18n 键；**未知类型返回 `null`** —— 「没有对应文案」是一个与
+ *   「文案是空的」不同的状态，调用方必须自己决定怎么办（`MediaCard` 选择不画徽标，
+ *   `ItemEditDialog` 选择回落到「文档」）。这里**故意不返回原始枚举**：把未知值
+ *   透出到界面上会被读成「这是一个合法类型」，正是 BUG-258 的病症之一。
+ */
+export function kindLabelKey(kind?: string | null): string | null {
+  switch (kind) {
+    case 'video':
+      return 'media.kindVideo'
+    case 'photo':
+      return 'media.kindPhoto'
+    case 'audio':
+      return 'media.kindAudio'
+    case 'file':
+      return 'media.kindFile'
+    default:
+      return null
+  }
+}
+
+/**
+ * 剧集类型 → i18n 键。与 [`kindLabelKey`] 同构，但走 `media.series.*` 一组。
+ *
+ * 此前 `SeriesEditPanel` / `SeriesCard` / `SeriesDetail` 三处**各写一遍**同样的
+ * 三分支，且都以 `return k` 收尾 —— 未知枚举被原样渲染（BUG-258）。后端现在对
+ * 枚举外的值 422，脏值不再产生；但**存量库**里可能已经有（老版本收过任意字符串），
+ * 所以读路径仍不得透出原值：回落到「剧集」这个默认值，好过一个界面无法解释的串。
+ *
+ * @returns i18n 键；未知类型回落到 `media.series.kindSeries`（**绝不**返回原值）
+ */
+export function seriesKindLabelKey(kind?: string | null): string {
+  switch (kind) {
+    case 'collection':
+      return 'media.series.kindCollection'
+    case 'album':
+      return 'media.series.kindAlbum'
+    case 'series':
+    default:
+      // `series` 与「未知」共用回落：类型下拉只有这三项，猜错时的最小误导是「剧集」。
+      return 'media.series.kindSeries'
+  }
+}
+
 /** 标签 */
 export interface MediaTag {
   id: number
@@ -63,7 +131,7 @@ export interface MediaSeries {
   title: string
   description?: string | null
   /** series（剧集）/ collection（合集）/ album（图集） */
-  kind: 'series' | 'collection' | 'album' | string
+  kind: SeriesKind
   /** 封面：显式设置优先，否则由后端取首集封面 */
   poster?: string | null
   /** 首集内容 id：封面仍缺失时可回退到该条目原图 */
@@ -418,7 +486,7 @@ export async function getSeries(id: number): Promise<MediaSeriesDetail> {
 export async function createSeries(body: {
   title: string
   description?: string
-  kind?: 'series' | 'collection' | 'album'
+  kind?: SeriesKind
   year?: number
 }): Promise<{ id: number }> {
   return request('/api/media/series', { method: 'POST', body: JSON.stringify(body) })
@@ -430,9 +498,19 @@ export async function patchSeries(
     title?: string
     /** 介绍：`null` = 显式清空（后端 Option<Option<String>> 契约） */
     description?: string | null
-    kind?: string
-    poster?: string
-    year?: number
+    /**
+     * 类型：必须是 `series` / `collection` / `album`。
+     * BUG-258：后端对枚举外的值返回 422，脏值不再可能进列。
+     */
+    kind?: SeriesKind
+    poster?: string | null
+    /**
+     * 年份：`null` = **显式清空**（后端 `Option<Option<i64>>` 契约）。
+     * BUG-258：此前类型是 `year?: number`，「清空」与「缺省」不可区分 ——
+     * 用户填错后永远改不掉，且前端在字段为空时干脆不发这个键。
+     * 键**缺省**仍是「不改」，所以「没碰过这个字段」不会误清别人的值。
+     */
+    year?: number | null
   },
 ): Promise<{ ok: boolean }> {
   return request(`/api/media/series/${id}`, { method: 'PATCH', body: JSON.stringify(patch) })

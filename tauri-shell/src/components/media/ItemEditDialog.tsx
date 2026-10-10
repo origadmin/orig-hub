@@ -3,7 +3,7 @@ import { Button } from '../ui/button'
 import { Input } from '../ui/input'
 import { patchMediaItem, setItemTags } from '../../api/media'
 import type { MediaItem, MediaTag } from '../../api/media'
-import { mediaItemUrl } from '../../api/media'
+import { kindLabelKey, mediaItemUrl } from '../../api/media'
 import { TagPicker } from './TagManagerDialog'
 // 媒体库不直接碰 TG 模块：清缓存是「库」的动作，来源知识封在 mediaSources 里
 import {
@@ -52,6 +52,20 @@ export function ItemEditDialog(props: {
    * 原先只看 `filePath`，文件被外部删掉后这里仍显示「清除缓存」，点了才发现没东西可清。
    */
   const canClear = hasMediaBytes(item)
+
+  /**
+   * 类型文案（BUG-258）：走 `media.kindVideo / kindPhoto / kindAudio / kindFile`
+   * 四个既有 i18n 键，与卡片角标共用 `api/media#kindLabelKey` 一份映射。
+   *
+   * 缺陷原形是 `<p>类型：{item.kind}</p>` —— 硬编码中文标签 + **直接渲染后端原始
+   * 枚举**（`video` / `photo` / `audio` / `file`），既没本地化也没说明它是只读的。
+   * 用户于是在同一个词「类型」上遇到两种行为：剧集面板**可改**（下拉），
+   * 内容弹窗**只读**（纯文本），且两边都不说为什么。
+   *
+   * 未知类型回落到「文档」而不是**透出原值**：一个界面无法解释的枚举被显示出来，
+   * 会被读成「这是一个合法类型」（这正是 BUG-258 病症的一半）。
+   */
+  const kindText = t(kindLabelKey(item.kind) ?? 'media.kindFile')
 
   useEffect(() => {
     setTitle(item.title)
@@ -122,7 +136,30 @@ export function ItemEditDialog(props: {
             )}
           </div>
           <div className="min-w-0 flex-1 space-y-1 text-[10.5px] text-muted">
-            <p className="truncate">类型：{item.kind}</p>
+            {/*
+             * 类型：**派生值，只读**（BUG-258）。
+             *
+             * 刻意渲染成 disabled 的 `<select>` 而不是普通文本：同名的「类型」在
+             * 剧集面板里是个可改的下拉，用户在这里看到一个长得像输入框却点不开的控件，
+             * 才知道「这一项不能改」。纯文本行做不到这点（BUG-148 裁定：能力边界必须
+             * 在用户正因此受阻时**出现在界面上**，而不是留一个看起来能改的同名字段）。
+             *
+             * `title` 用既有键 `media.episode.editAffectsAll` 说明「取自内容本身」——
+             * 这也是**为什么**不可改：`set_item_bytes` 每次按扩展名重算 `kind`，
+             * 任何手改都会在下一次字节变更时无声回退。
+             */}
+            <label className="flex items-center gap-1.5" title={t('media.episode.editAffectsAll')}>
+              <span className="shrink-0">类型</span>
+              <select
+                value={item.kind}
+                disabled
+                aria-label={t('media.series.editKind')}
+                data-testid="item-edit-kind"
+                className="h-6 min-w-0 flex-1 cursor-not-allowed rounded border border-border-subtle bg-surface-2 px-1 text-[10.5px] text-muted opacity-70"
+              >
+                <option value={item.kind}>{kindText}</option>
+              </select>
+            </label>
             {/* 来源（S2）：库只存 `source` 这个可扩展的来源类型，展示层问 mediaSources 拿标签 */}
             <p className="truncate" data-testid="item-edit-source">
               来源：{t(sourceLabelKey(item.source))}

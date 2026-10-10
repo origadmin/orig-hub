@@ -11,7 +11,7 @@ import {
   ZoomIn,
 } from 'lucide-react'
 import type { MediaItem } from '../../api/media'
-import { mediaItemUrl } from '../../api/media'
+import { kindLabelKey, mediaItemUrl } from '../../api/media'
 import { useTranslation } from '../../i18n'
 import {
   coverFit,
@@ -66,23 +66,15 @@ const KIND_ACTION_ICON: Record<string, LucideIcon> = {
 const FALLBACK_ACTION_ICON: LucideIcon = Maximize2
 
 /**
- * 类型徽标文案（BUG-123 引入，BUG-128 改为 i18n 键）。
+ * 类型徽标文案（BUG-123 引入，BUG-128 改为 i18n 键，BUG-258 上收到 `api/media`）。
  *
- * 这里存的是 **i18n 键**，不是文案 —— tauri-shell 是双语应用，硬编码中文会让
- * 英文界面里混排「视频」「图片」（BUG-128）。渲染时才用 `t()` 求值。
- *
- * 为什么不复用 `media.videos` / `media.photos`：那三个是**复数分类名**
- * （左栏分类按钮的文案），徽标是**单数类型名**，语义不同 —— 复用会让将来改
- * 分类名时意外改掉徽标。
+ * 映射本身已搬到 `api/media.ts#kindLabelKey`，与 `ItemEditDialog` 的只读类型行
+ * 共用同一份 —— 两处各写一遍时，其中一处迟早漏掉新类型（BUG-258 的内容弹窗就是
+ * 漏了：不走 i18n，直接渲染后端原始枚举）。
  *
  * 视觉刻意压低（10px、半透明黑底）—— 它是辅助信号，不抢标题与封面的戏。
+ * 未知类型**不画徽标**（`kindLabelKey` 返回 null）：显示一个错的类型比不显示更糟。
  */
-const KIND_LABEL_KEY: Record<string, string> = {
-  video: 'media.kindVideo',
-  photo: 'media.kindPhoto',
-  audio: 'media.kindAudio',
-  file: 'media.kindFile',
-}
 
 /**
  * 海报卡片（主流媒体站样式）：16:9 封面 + 悬浮操作层 + 标题/元信息。
@@ -305,7 +297,7 @@ function MediaCardBase(props: {
    * 变了才顺带刷新。那正是本条缺陷最容易踩的坑，所以订阅必须挂在组件上。
    */
   const { t } = useTranslation()
-  const kindKey = KIND_LABEL_KEY[item.kind]
+  const kindKey = kindLabelKey(item.kind)
   const kindLabel = kindKey ? t(kindKey) : null
   /**
    * 来源标签（S2）：库只记录 `source` 这个可扩展的来源类型，**不感知 TG**。

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { CloudOff, Film, Image as ImageIcon, Trash2 } from 'lucide-react'
 import type { MediaSeries, MediaTag } from '../../api/media'
-import { mediaItemUrl } from '../../api/media'
+import { mediaItemUrl, seriesKindLabelKey } from '../../api/media'
 import { coverFit } from '../../lib/mediaSources'
 import { resolveSeriesCover } from '../../lib/episodePresentation'
 import {
@@ -119,12 +119,7 @@ export function SeriesCard(props: {
   // 本地抽帧结果（poster state）优先于 resolver —— 它是刚算出来的、必然有效。
   const resolved = resolveSeriesCover({ ...series, episodes: [] })
   const cover = poster ?? resolved ?? null
-  const kindLabel = (k: string): string => {
-    if (k === 'series') return t('media.series.kindSeries')
-    if (k === 'collection') return t('media.series.kindCollection')
-    if (k === 'album') return t('media.series.kindAlbum')
-    return k
-  }
+  const kindLabel = (k: string): string => t(seriesKindLabelKey(k))
   const isSelected = Boolean(selected)
   return (
     <div
