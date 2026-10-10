@@ -397,19 +397,18 @@ export async function getCacheTask(): Promise<{
   return { task: res.task ?? null, queued: res.queued ?? [] }
 }
 
-/** GET /api/tg/cache/tasks/by-item?chatId=&messageId= — 按条目查其缓存任务态（BUG-279）。
- *  返回 task=null 表示这条视频**从未入队 / 记录已删**（与「失败 / 取消」语义区分）。
- *  媒体库未缓存条目据此展示「排队中 / 正在下 / 上次失败（原因）/ 被取消 / 已完成但无字节」。 */
-export async function getCacheTaskForItem(
-  chatId: number,
-  messageId: number,
-): Promise<{ task: TgCacheTask | null }> {
-  const res = await request<{ task?: TgCacheTask | null }>(
-    `/api/tg/cache/tasks/by-item?chatId=${encodeURIComponent(
-      String(chatId),
-    )}&messageId=${encodeURIComponent(String(messageId))}`,
+/** GET /api/tg/cache/tasks/by-item?refs=chat:msg,chat:msg,… — 批量按条目查缓存任务态（BUG-279）。
+ *  返回 `tasks[ref]` 为 null 表示该条**从未入队 / 记录已删**（与「失败 / 取消」区分）。
+ *  **剧集详情用批量一次覆盖全部分集**，避免逐集 N+1 请求（BUG-241 判据：请求数不随条目数线性）。 */
+export async function getCacheTasksForItems(
+  refs: string[],
+): Promise<Record<string, TgCacheTask | null>> {
+  if (refs.length === 0) return {}
+  const qs = refs.map((r) => encodeURIComponent(r)).join(',')
+  const res = await request<{ tasks?: Record<string, TgCacheTask | null> }>(
+    `/api/tg/cache/tasks/by-item?refs=${qs}`,
   )
-  return { task: res.task ?? null }
+  return res.tasks ?? {}
 }
 
 /**

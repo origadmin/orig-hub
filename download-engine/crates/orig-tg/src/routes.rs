@@ -1429,26 +1429,72 @@ async fn cache_task_by_id(
     }
 }
 
-/// BUG-279：`GET /api/tg/cache/tasks/by-item` 的查询参数（chat:msg → 坐标）。
+/// BUG-279：`GET /api/tg/cache/tasks/by-item` 的查询参数。
+/// - 单条：`chatId` + `messageId` → 返回 `{ task }`；
+/// - 批量：`refs=<chat:msg>,<chat:msg>,…` → 返回 `{ tasks: { "<chat:msg>": task|null } }`。
+/// 批量用于媒体库剧集详情一次覆盖全部分集，**避免逐集 N+1 请求**（BUG-241 判据：
+/// 请求数不得随条目数线性增长）。
 #[derive(Debug, Deserialize)]
 struct CacheTaskByItemQuery {
     #[serde(rename = "chatId")]
-    chat_id: i64,
+    chat_id: Option<i64>,
     #[serde(rename = "messageId")]
-    message_id: i64,
+    message_id: Option<i64>,
+    refs: Option<String>,
 }
 
-/// GET /api/tg/cache/tasks/by-item?chatId=&messageId= — 按条目查其缓存任务态（BUG-279）。
+/// GET /api/tg/cache/tasks/by-item — 按条目查其缓存任务态（BUG-279）。
 ///
 /// 媒体库未缓存条目据此展示「排队中 / 正在下 / 上次失败（原因）/ 被取消 /
-/// 已完成但无字节」。`task: null` 表示这条视频**从未入队 / 记录已删**——
-/// 与「失败 / 取消」语义严格区分（后者都有任务记录）。端点只读、不新建表。
-/// 复用 `task_with_progress` 渲染通道，前端零额外适配。
+/// 已完成但无字节」。单条 `task: null` / 批量 `tasks[ref]=null` 表示这条视频
+/// **从未入队 / 记录已删**——与「失败 / 取消」语义严格区分（后者都有任务记录）。
+/// 端点只读、不新建表。批量模式（`refs`）让剧集详情**一次请求**拿全部分集，
+/// 杜绝逐集 N+1（对齐 BUG-241 Priority 2 的批量化思路）。复用 `task_with_progress`。
 async fn cache_task_by_item(
     State(st): State<Arc<AppState>>,
     Query(q): Query<CacheTaskByItemQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    match st.store.cache_task_for_item(q.chat_id, q.message_id).await {
+    // 批量模式
+    if let Some(refs) = q.refs.as_deref() {
+        let mut map = serde_json::Map::new();
+        for r in refs.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let key = r.to_string();
+            let v = match parse_tg_ref_coords(&key) {
+                Some((c, m)) => match st.store.cache_task_for_item(c, m).await {
+                    Ok(Some(t)) => {
+                        let titles = cache_task_titles(&st, std::slice::from_ref(&t)).await;
+                        serde_json::to_value(task_with_progress(
+                            &st,
+                            &t,
+                            cache_task_title(&t, &titles),
+                        ))
+                        .unwrap_or(serde_json::Value::Null)
+                    }
+                    Ok(None) => serde_json::Value::Null,
+                    Err(e) => {
+                        return Err(ApiError::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &e.to_string(),
+                        ))
+                    }
+                },
+                None => serde_json::Value::Null,
+            };
+            map.insert(key, v);
+        }
+        return Ok(Json(json!({ "tasks": map })));
+    }
+    // 单条模式
+    let (chat_id, message_id) = match (q.chat_id, q.message_id) {
+        (Some(c), Some(m)) => (c, m),
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "chatId+messageId or refs required",
+            ))
+        }
+    };
+    match st.store.cache_task_for_item(chat_id, message_id).await {
         Ok(Some(t)) => {
             let titles = cache_task_titles(&st, std::slice::from_ref(&t)).await;
             Ok(Json(json!({ "task": task_with_progress(&st, &t, cache_task_title(&t, &titles)) })))

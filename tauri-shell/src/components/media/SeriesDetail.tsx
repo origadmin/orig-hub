@@ -19,7 +19,7 @@ import type {
 } from 'react'
 import type { MediaEpisode, MediaSeriesDetail, MediaTag } from '../../api/media'
 import { recacheSeriesMissing } from '../../api/media'
-import { getCacheTaskForItem } from '../../api/tg'
+import { getCacheTasksForItems } from '../../api/tg'
 import type { TgCacheTask } from '../../types'
 
 /**
@@ -169,43 +169,29 @@ export function SeriesDetail(props: {
 
   /**
    * BUG-279：每集的缓存任务态（按 ref 索引）。未缓存分集据此展示「排队中 / 下载中 /
-   * 上次失败（原因）/ 已取消 / 已完成但无字节」。详情加载时按集批量查询
-   * `getCacheTaskForItem`（只查有可缓存 ref 的集），结果进本 map；与字节态
-   * （`hasMediaBytes`）分别判定后再合并渲染。
+   * 上次失败（原因）/ 已取消 / 已完成但无字节」。与字节态（`hasMediaBytes`）分别判定后
+   * 再合并渲染。**一次批量请求覆盖全部分集**——逐集 N+1 会触发 BUG-241 的请求爆炸
+   * （请求数随分集数线性增长），故此处只发一个 `by-item?refs=…` 请求。
    */
   const [cacheTasks, setCacheTasks] = useState<Record<string, TgCacheTask | null>>({})
   useEffect(() => {
     let alive = true
-    const refs: Array<{ ref: string; chatId: number; messageId: number }> = []
+    const refs: string[] = []
     for (const ep of detail.episodes) {
       const r = episodeRecacheCandidates(ep)[0]?.ref
-      if (!r) continue
-      const at = r.lastIndexOf(':')
-      if (at <= 0) continue
-      const chatId = Number(r.slice(0, at))
-      const messageId = Number(r.slice(at + 1))
-      if (!Number.isFinite(chatId) || !Number.isFinite(messageId)) continue
-      refs.push({ ref: r, chatId, messageId })
+      if (r && !refs.includes(r)) refs.push(r)
     }
     if (refs.length === 0) {
       setCacheTasks({})
       return
     }
-    Promise.all(
-      refs.map(async ({ ref, chatId, messageId }) => {
-        try {
-          const { task } = await getCacheTaskForItem(chatId, messageId)
-          return [ref, task] as const
-        } catch {
-          return [ref, null] as const
-        }
-      }),
-    ).then((entries) => {
-      if (!alive) return
-      const map: Record<string, TgCacheTask | null> = {}
-      for (const [ref, task] of entries) map[ref] = task
-      setCacheTasks(map)
-    })
+    getCacheTasksForItems(refs)
+      .then((map) => {
+        if (alive) setCacheTasks(map)
+      })
+      .catch(() => {
+        if (alive) setCacheTasks({})
+      })
     return () => {
       alive = false
     }
