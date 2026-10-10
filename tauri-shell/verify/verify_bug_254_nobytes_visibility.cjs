@@ -174,7 +174,9 @@ async function main() {
     check(opened, 'media library nav entry exists ([data-testid="nav-media"])', `clicked=${opened}`)
     if (!opened) throw new Error('media library nav not found — cannot continue')
 
-    await page.waitForFunction(() => document.querySelector('[data-testid="media-panel-title"]'), {
+    // 必须回布尔：直接返回 DOM 元素会让 CDP returnByValue 序列化抛
+    // 「Object reference chain is too long」。
+    await page.waitForFunction(() => !!document.querySelector('[data-testid="media-panel-title"]'), {
       timeout: 25000,
       intervalMs: 300,
     })
@@ -289,7 +291,7 @@ async function main() {
         const card = document.querySelector(`[data-testid="series-card"][data-series-id="${sid}"]`)
         if (card) card.click()
       }, playerSeries.id)
-      await page.waitForFunction(() => document.querySelector('[data-testid="episode-picker"]'), {
+      await page.waitForFunction(() => !!document.querySelector('[data-testid="episode-picker"]'), {
         timeout: 25000,
         intervalMs: 300,
       })
@@ -344,7 +346,7 @@ async function main() {
 
       // 等到分集侧栏出现无字节分集项，再点它。
       await page.waitForFunction(
-        (itemId) => document.querySelector(`[data-testid="episode-list-item-${itemId}"]`),
+        (itemId) => !!document.querySelector(`[data-testid="episode-list-item-${itemId}"]`),
         { timeout: 20000, intervalMs: 300, args: [noBytesVid.itemId] },
       )
       await page.evaluate((itemId) => {
