@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   AlertTriangle,
   ChevronDown,
@@ -19,7 +19,7 @@ import type {
 } from 'react'
 import type { MediaEpisode, MediaSeriesDetail, MediaTag } from '../../api/media'
 import { recacheSeriesMissing } from '../../api/media'
-import { getCacheTasksForItems } from '../../api/tg'
+import { getCacheTasksForItems, setCacheTaskPriority } from '../../api/tg'
 import type { TgCacheTask } from '../../types'
 
 /**
@@ -174,8 +174,8 @@ export function SeriesDetail(props: {
    * （请求数随分集数线性增长），故此处只发一个 `by-item?refs=…` 请求。
    */
   const [cacheTasks, setCacheTasks] = useState<Record<string, TgCacheTask | null>>({})
-  useEffect(() => {
-    let alive = true
+  /** 一次批量刷新全部分集的任务态（优先下载等操作后重新同步，避免手改本地 state）。 */
+  const refreshCacheTasks = useCallback(() => {
     const refs: string[] = []
     for (const ep of detail.episodes) {
       const r = episodeRecacheCandidates(ep)[0]?.ref
@@ -186,16 +186,25 @@ export function SeriesDetail(props: {
       return
     }
     getCacheTasksForItems(refs)
-      .then((map) => {
-        if (alive) setCacheTasks(map)
-      })
-      .catch(() => {
-        if (alive) setCacheTasks({})
-      })
-    return () => {
-      alive = false
-    }
+      .then(setCacheTasks)
+      .catch(() => setCacheTasks({}))
   }, [detail])
+  useEffect(() => {
+    refreshCacheTasks()
+  }, [refreshCacheTasks])
+
+  /**
+   * 「优先下载」= 把该集的缓存任务提到队首（当前任务跑完后下一个跑它），**不抢占**、
+   * 不弃单（缓存下载无断点续传，抢占会丢弃当前条目已下字节 —— 故不做立即打断）。
+   * 再次点击 = 取消优先，回到 FIFO。priority 单一真源（引擎 cache_task.priority）。
+   */
+  const togglePreferEpisode = (task: TgCacheTask | null) => {
+    if (!task) return
+    const top = (task.priority ?? 0) <= 0
+    setCacheTaskPriority(task.id, top ? { top: true } : { priority: 0 })
+      .then(() => refreshCacheTasks())
+      .catch((e: unknown) => onError(e instanceof Error ? e.message : String(e)))
+  }
 
   /**
    * 单层剧集（R7）：唯一集**默认聚焦**；否则聚焦第一集 —— 左选右看形态下
@@ -719,7 +728,9 @@ export function SeriesDetail(props: {
                             st.kind === 'cancelled' ||
                             st.kind === 'done-no-bytes')
                         const clickable = cacheable || retryable
+                        const prioritized = (task?.priority ?? 0) > 0
                         return (
+                          <span className="flex items-center gap-1">
                           <span
                             className={`flex items-center gap-0.5 rounded px-0.5 font-mono text-[10.5px] ${tone} ${
                               clickable ? 'cursor-pointer hover:bg-amber-500/10' : 'cursor-not-allowed'
@@ -761,6 +772,21 @@ export function SeriesDetail(props: {
                               <CloudOff className="h-3 w-3" />
                             )}
                             <span data-testid="episode-nobytes-cache">{label}</span>
+                          </span>
+                          {st.kind === 'queued' && task ? (
+                            <button
+                              type="button"
+                              className="rounded px-1 font-mono text-[10.5px] text-accent hover:bg-accent/10"
+                              title={t('tg.cachePreferDownloadHint')}
+                              data-testid="episode-prefer-download"
+                              onClick={(e: ReactMouseEvent) => {
+                                e.stopPropagation()
+                                togglePreferEpisode(task)
+                              }}
+                            >
+                              {prioritized ? t('tg.cacheCancelPrefer') : t('tg.cachePreferDownload')}
+                            </button>
+                          ) : null}
                           </span>
                         )
                       })()
