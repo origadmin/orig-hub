@@ -1,27 +1,24 @@
 import { useState } from 'react'
 import { Button } from '../ui/button'
 import { Input } from '../ui/input'
-import { patchSeries, setSeriesTags, SERIES_KINDS, seriesKindLabelKey } from '../../api/media'
-import type { MediaSeriesDetail, MediaTag, SeriesKind } from '../../api/media'
+import { patchSeries, setSeriesTags } from '../../api/media'
+import type { MediaSeriesDetail, MediaTag } from '../../api/media'
 import { TagPicker } from './TagManagerDialog'
 import { useTranslation } from '../../i18n'
 
 /**
- * 剧集类型可选项 —— 取自 `api/media` 的 `SERIES_KINDS`，与后端 `media::SERIES_KINDS`
- * 是**同一份枚举**（PATCH 时枚举外的值一律 422）。
+ * 剧集编辑面板：`title` / `description` / `year` / `tags` **一次提交**（R10）。
  *
- * 此前这里内联 `['series','collection','album'] as const`，与后端校验各写一份。
- * BUG-258 的根因之一就是「写路径不校验、读路径把未知值原样透出」，两份定义必然漂移。
- */
-
-/**
- * 剧集编辑面板：`title` / `description` / `kind` / `year` / `tags` **一次提交**（R10）。
+ * **BUG-258 产品裁定（kind 收敛）**：剧集类型收敛为唯一值 `series`，本面板
+ * **不再渲染任何 kind 编辑控件**（此前是单选项下拉，属于无效 UI）。提交时
+ * **不携带 `kind` 键**（缺省 = 后端按「不改」处理），亦无隐藏的 kind 编辑通道。
+ * 引擎侧保留 `SERIES_KINDS` 枚举 422 校验与一次性迁移作为数据层防线。
  *
  * 本面板**吸收了原来的独立「改名」铅笔**（`series-title-edit`）：改名能力没有删除，
  * 只是不再单列一个入口 —— 剧集头里「改名」类独立入口数必须为 0（R10 判据）。
  *
  * 提交分三路（都是现状已有的 API，不新增后端契约）：
- *   - `patchSeries(id, { title, description, kind, year })`
+ *   - `patchSeries(id, { title, description, year })`
  *   - `setSeriesTags(id, ids)`
  *   - 就地新建标签由父层 `onCreateTag` 提供（建完父层刷新，返回 id 让选择器立即勾上）
  *
@@ -43,7 +40,6 @@ export function SeriesEditPanel(props: {
   const { series, tags, onClose, onSaved, onError, onCreateTag } = props
   const [title, setTitle] = useState(series.title)
   const [desc, setDesc] = useState(series.description ?? '')
-  const [kind, setKind] = useState<SeriesKind>(series.kind)
   const [year, setYear] = useState(series.year != null ? String(series.year) : '')
   /**
    * 用户是否碰过年份输入框（BUG-258）—— 三态里的第三个状态。
@@ -54,8 +50,6 @@ export function SeriesEditPanel(props: {
   const [yearTouched, setYearTouched] = useState(false)
   const [selected, setSelected] = useState<number[]>(series.tags.map((x) => x.id))
   const [busy, setBusy] = useState(false)
-
-  const kindLabel = (k: string): string => t(seriesKindLabelKey(k))
 
   /**
    * 保存。
@@ -85,7 +79,7 @@ export function SeriesEditPanel(props: {
         title: nextTitle,
         // 空介绍 = 显式清空（null），不是「不改」
         description: desc.trim() || null,
-        kind,
+        // BUG-258 产品裁定：不携带 kind 键（缺省 = 后端按「不改」处理）。
         // 年份三态：碰过就发（空 ⇒ null = 清空），没碰过 ⇒ 省键 = 不改。
         ...(yearTouched ? { year: yearValue } : {}),
       })
@@ -136,23 +130,8 @@ export function SeriesEditPanel(props: {
           />
         </label>
 
+        {/* BUG-258 产品裁定：不再渲染 kind 编辑控件（单选项下拉属无效 UI，直接删除而非禁用） */}
         <div className="flex flex-wrap items-end gap-3">
-          <label className="flex flex-col gap-1 text-[11px] text-muted">
-            <span>{t('media.series.editKind')}</span>
-            <select
-              value={kind}
-              onChange={(e) => setKind(e.target.value as SeriesKind)}
-              aria-label={t('media.series.editKind')}
-              data-testid="series-kind-select"
-              className="h-7 rounded-md border border-border-subtle bg-surface px-1.5 text-[11.5px] text-fg-strong"
-            >
-              {SERIES_KINDS.map((k) => (
-                <option key={k} value={k}>
-                  {kindLabel(k)}
-                </option>
-              ))}
-            </select>
-          </label>
           <label className="flex flex-col gap-1 text-[11px] text-muted">
             <span>{t('media.series.editYear')}</span>
             <Input

@@ -2,8 +2,9 @@
 'use strict'
 
 /**
- * BUG-258 真实栈验收：剧集「类型」重启后必须仍是用户选的那一项；「年份」必须能清空；
- * 内容编辑弹窗里的同名「类型」是本地化的**只读**派生值。
+ * BUG-258 真实栈验收（产品裁定后口径）：剧集类型收敛为唯一值 `series`，UI **不再有**
+ * 任何类型选择控件；数据层写入仍持久；年份必须能清空；内容编辑弹窗里的同名「类型」
+ * 是本地化的**只读**派生值。
  *
  * ## 缺陷回顾（三条独立缺陷，同一份报告）
  *
@@ -12,55 +13,60 @@
  *    由 `Store::open` **无条件**调用。最后那个子句被同一份 `migrate()` 建的
  *    `trg_media_episode_media_only_*` 触发器保证**恒真** ⇒ 任何有分集的剧集
  *    **每次启动**都被打回 `series`。用户在编辑面板改成「图集」，当场保存成功，
- *    重启后变回「剧集」，无任何提示。⇒ 三个下拉选项里两个**永远不可达**。
+ *    重启后变回「剧集」，无任何提示。
  *    修复：改成**一次性**迁移（`app_setting` 标记键 `mig.series_kind_normalize_v1`）。
+ *    **产品裁定**：随后 kind 收敛为唯一值 `series` —— UI 移除类型选择控件，引擎侧
+ *    保留枚举 422 校验与一次性迁移作为数据层防线（历史库守卫 + 封死非 UI 写路径）。
  * 2. **年份全库为空且清不掉**：`media_series.year` 在**原始 DDL** 里，从没有过回填
  *    （TG 入库路径 `routes.rs` 传 `year: None`）⇒ 全库 NULL；且 `SeriesPatch.year`
  *    是该结构里**唯一**漏掉 `nullable` 契约的可空字段，`None` 同时表示「不改」与
  *    「清空」⇒ **填错就永远改不掉**。修复：`Option<Option<i64>>` 三态。
  * 3. **内容弹窗的类型是只读原始枚举**：`<p>类型：{item.kind}</p>` —— 硬编码中文标签
  *    + 直接渲染后端枚举（`video`/`photo`/`audio`/`file`），没走 i18n，也没说不可改。
- *    修复：走 `media.kind*` 既有键，渲染成 disabled 的 `<select>`（ visibly read-only）。
+ *    修复：走 `media.kind*` 既有键，渲染成 disabled 的 `<select>`（visibly read-only）。
  *
  * ## 判据（打在**真实调用链**上 —— BUG-156：不得只看接口返回）
  *
- *   夹具：自造 1 条**有分集**的剧集（关键：缺陷原形只对「有分集」的剧集生效 ⇒
- *        零分集剧集作正控会恒绿）+ 1 个 video 条目。收尾按 id 精确删除，绝不动用户数据。
+ *   夹具：自造 1 条**有分集**的剧集 + 1 个 video 条目。收尾按 id 精确删除，绝不动用户数据。
  *
  *   G  **活体门（gate）**：先在**夹具**上探 `PATCH {"kind":"garbage"}` 是否 422。
- *        生产/开发栈里跑的 `orig-tg` 可能仍是**修复前**的二进制（`cargo build
- *        --release` 的产物比工作树旧），此时 A2 / B1b / B3 必然 FAIL —— 但那是
- *        「引擎没重建」，**不是**「修复无效」。不设这道门会把两者混成一个结论。
- *        返回 200/500 ⇒ 引擎不含本次修复 ⇒ 报 BLOCKED 并 exit 1（如实说明，不假装通过）。
+ *        生产/开发栈里跑的 `orig-tg` 可能仍是**修复前**的二进制，此时 A2 / B1b / B3
+ *        必然 FAIL —— 但那是「引擎没重建」，**不是**「修复无效」。不设这道门会把
+ *        两者混成一个结论。返回 200/500 ⇒ 引擎不含本次修复 ⇒ 报 BLOCKED 并 exit 1。
  *        ⚠️ 该探测**只打夹具剧集**：修复前的引擎会照单全收，任何打到真实 id 的探针
  *        都会把脏值写进用户的库（实测已发生过一次，已复原）。
- *
  *   P  前置：真实库里存在「有分集」的剧集（打印样本），证明结论不是空库上的巧合。
- *   A1 **判据 1（核心）**：在**真实 UI**（`series-edit-panel` → `series-kind-select`）
- *      把类型选成 `album` → 保存 → 读回仍是 `album`（当场）。
- *   A2 **判据 1（重启后）**：`POST /api/tg/restart` 重启 orig-tg（daemon 是唯一执行者）
- *      → 等服务回 ready → 重开面板 / 直接读接口都必须仍是 `album`。
- *      **这是本脚本的核心**：缺陷原形下这里必然读到 `series`。
- *   A3 **反向证伪（牙齿检查）**：脚本对「重启后 kind 仍为 album」这一项做**双通道**判定 ——
- *      既读 HTTP 返回，也读**真实 DOM**（剧集详情页的类型徽标文案）。任一通道能证明
- *      「重启后变成了 series」即 FAIL。
+ *   A1 **判据 1（UI 收敛·编辑面板，正向）**：打开真实 `series-edit-panel`，断言
+ *      `series-kind-select` 与**任何**类型选择控件（类型 select / kind radio）
+ *      **都不存在** —— 裁定是「不渲染」而不是「禁用」，也不允许留隐藏编辑通道。
+ *   A1b **判据 1（UI 收敛·新建弹窗）**：打开「新建剧集」弹窗，断言其中同样**不存在**
+ *      任何类型选择控件（此前是 `KIND_OPTIONS` 三选一 radio）。创建恒定 `kind:'series'`。
+ *   A2 **判据 1（数据层·重启后持久，走 API 层）**：UI 已无类型入口，持久性判据改打
+ *      **API 层** —— `PATCH kind='album'`（合法枚举值，探针性质）→ `POST /api/tg/restart`
+ *      重启 orig-tg（daemon 是唯一执行者）→ GET 仍是 `album`。缺陷原形下重启后必然
+ *      读回 `series`。
+ *   A3 **夹具复位**：`PATCH kind='series'` 把夹具复位回唯一合法业务值并 GET 确认 ——
+ *      与 A2 合起来证明写路径双向可逆，且脚本不把非 series 的探针值留在用户库里。
  *   B1 **判据 3**：设年份 `2024` → 保存 → 清空输入框 → 保存 → 读回 `year === null`。
  *   B2 **判据 4（负控）**：年份保持为空、且用户**没碰过**年份框时，只改标题保存，
  *      读回 `year` 仍应是原值（不得被误清）。
  *   B3 **422 契约**：`PATCH {"kind":"garbage"}` 必须 422，且库里的 kind 不得被改动
- *      （非法状态不可表达）。
+ *      （非法状态不可表达；引擎侧防线，封死非 UI 写路径）。
  *   C1 **判据 5**：`item-edit-dialog` 里的类型行是**本地化**文案（不得出现裸
- *      `video`/`photo`/`audio`/`file`），且该控件 **`disabled === true`**（ visibly read-only）。
- *   S  截图：类型选成 album 的面板、内容弹窗的类型行。
+ *      `video`/`photo`/`audio`/`file`），且该控件 **`disabled === true`**（visibly read-only）。
+ *   S  截图：编辑面板（无类型控件）、新建弹窗（无类型控件）、年份清空态、内容弹窗类型行。
  *
  * ## 牙齿检查（teeth）：为什么这个脚本会 FAIL 在缺陷原形上
  *
  * 把 `media.rs` 的 `normalize_series_kind_once` 改回「每次启动都跑那条 UPDATE」
  * （即恢复 `migrate()` 里的内联 UPDATE、删掉标记键守卫）后：
- *   - A1 仍 PASS（保存当场生效，缺陷原形下也成立），
- *   - **A2 必然 FAIL** —— 重启触发 `Store::open` → `migrate()` → 打回 `series`，
- *   - A3 的双通道判定会**独立地**再报一次 FAIL（HTTP 读数 + DOM 徽标文案）。
- * 换成把 `SeriesPatch.year` 改回 `Option<i64>`：B1 必然 FAIL（`null` 被当成「不改」）。
+ *   - **A2 必然 FAIL** —— 重启触发 `Store::open` → `migrate()` → 打回 `series`；
+ *   - B1 必然 FAIL（把 `SeriesPatch.year` 改回 `Option<i64>` 时同理，`null` 被当成「不改」）。
+ * **UI 收敛的反向验牙**：把旧 `<select data-testid="series-kind-select">`（或
+ * `KIND_OPTIONS` radio 组）临时加回 `SeriesEditPanel.tsx` / `SeriesDialog.tsx` 后，
+ * **A1 / A1b 必然 FAIL** —— `findSeriesKindControls` 不只盯一个 testid，而是三条特征
+ * 全查（专用 testid / option 含类型枚举值 / `name="series-kind"` 的 radio），换 testid
+ * 加回来也逃不掉。
  *
  * ## 环境
  *
@@ -260,25 +266,84 @@ async function openSeriesEditPanel(page) {
 }
 
 /**
- * 在**真实 DOM 控件**上改类型下拉。
+ * 在给定根容器内**寻找任何剧集类型选择控件**（BUG-258 产品裁定后必须一个都没有）。
  *
- * 刻意走 React 的原生 setter + `input`/`change` 事件（而不是只设 `.value`）——
- * 否则 React 的受控 state 不会更新，保存时发出去的仍是旧值，判据会假绿。
+ * 反向验牙的关键：检查不能只盯 `series-kind-select` 这一个 testid —— 有人把旧 UI
+ * 加回来时可能换了 testid，所以三条特征全查：
+ *   1. `data-testid="series-kind-select"`（旧编辑面板下拉的专用标识）
+ *   2. 任何 `<select>` 的 option 里含 `collection` / `album`（类型枚举的特征值）
+ *   3. 任何 `input[type=radio][name="series-kind"]`（旧新建弹窗 KIND_OPTIONS radio 组）
+ *
+ * @returns {{present: boolean, hits: string[], reason: string}}
  */
-async function setKindSelect(page, kind) {
-  const ok = await page.evaluate((k) => {
-    const sel = document.querySelector('[data-testid="series-kind-select"]')
-    if (!sel) return false
-    const setter = Object.getOwnPropertyDescriptor(
-      window.HTMLSelectElement.prototype,
-      'value',
-    ).set
-    setter.call(sel, k)
-    sel.dispatchEvent(new Event('change', { bubbles: true }))
-    return sel.value === k
-  }, kind)
-  if (!ok) throw new Error(`series-kind-select 未能设为 ${kind}`)
-  await delay(150)
+async function findSeriesKindControls(page, rootSelector) {
+  return page.evaluate((root) => {
+    const scope = root ? document.querySelector(root) : document
+    if (!scope) return { present: false, hits: [], reason: 'root-missing' }
+    const hits = []
+    const byTestid = scope.querySelector('[data-testid="series-kind-select"]')
+    if (byTestid) hits.push('select[data-testid=series-kind-select]')
+    for (const sel of scope.querySelectorAll('select')) {
+      const vals = [...sel.querySelectorAll('option')].map((o) => String(o.value))
+      if (vals.includes('collection') || vals.includes('album')) {
+        hits.push(`select(options=${vals.join('|')})`)
+      }
+    }
+    for (const r of scope.querySelectorAll('input[type="radio"]')) {
+      if (String(r.name) === 'series-kind') hits.push('radio[name=series-kind]')
+    }
+    return { present: hits.length > 0, hits, reason: 'ok' }
+  }, rootSelector)
+}
+
+/** 从剧集墙打开「新建剧集」弹窗（`media-new-series` 入口）。 */
+async function openCreateDialog(page) {
+  const ok = await page.evaluate(() => {
+    const el = document.querySelector('[data-testid="media-new-series"]')
+    if (!el) return false
+    el.click()
+    return true
+  })
+  if (!ok) throw new Error('media-new-series 入口不存在（新建剧集弹窗打不开）')
+  await page.waitForFunction(
+    () => !!document.querySelector('[data-testid="series-create-dialog"]'),
+    { timeout: 10000 },
+  )
+  await delay(300)
+}
+
+/** 关闭「新建剧集」弹窗（点组件内硬编码的「取消」按钮，绝不真的创建）。 */
+async function closeCreateDialog(page) {
+  await page.evaluate(() => {
+    const dlg = document.querySelector('[data-testid="series-create-dialog"]')
+    const btn =
+      dlg &&
+      [...dlg.querySelectorAll('button')].find(
+        (b) => String(b.textContent || '').trim() === '取消',
+      )
+    if (btn) btn.click()
+  })
+  await page
+    .waitForFunction(() => !document.querySelector('[data-testid="series-create-dialog"]'), {
+      timeout: 10000,
+    })
+    .catch(() => undefined)
+  await delay(300)
+}
+
+/** 关闭编辑面板（点遮罩层 —— 面板容器的父节点，点击即 onClose）。 */
+async function closeSeriesEditPanel(page) {
+  await page.evaluate(() => {
+    const panel = document.querySelector('[data-testid="series-edit-panel"]')
+    const backdrop = panel && panel.parentElement
+    if (backdrop) backdrop.click()
+  })
+  await page
+    .waitForFunction(() => !document.querySelector('[data-testid="series-edit-panel"]'), {
+      timeout: 10000,
+    })
+    .catch(() => undefined)
+  await delay(300)
 }
 
 /** 在真实 DOM 输入框上设年份（同样走原生 setter + input 事件，见 setKindSelect 的说明）。 */
@@ -300,14 +365,6 @@ function readYearInput(page) {
   return page.evaluate(() => {
     const input = document.querySelector('[data-testid="series-year-input"]')
     return input ? String(input.value) : null
-  })
-}
-
-/** 读类型下拉当前值。 */
-function readKindSelect(page) {
-  return page.evaluate(() => {
-    const sel = document.querySelector('[data-testid="series-kind-select"]')
-    return sel ? String(sel.value) : null
   })
 }
 
@@ -421,7 +478,7 @@ async function main() {
     pageRef = page
     await page.goto(APP_URL, { waitForRoot: true, settleMs: 2500 })
 
-    // ═════════ A 段：类型选择 → 保存 → 重启 → 仍是 album ═════════
+    // ═════════ A 段：类型选择控件已移除（UI 收敛）+ 数据层持久性（API 层） ═════════
     await navToSeriesWall(page)
     await page.waitForFunction(
       (sid) => !!document.querySelector(`[data-testid="series-card"][data-series-id="${sid}"]`),
@@ -430,31 +487,44 @@ async function main() {
     await openSeriesDetail(page, fx.seriesId)
     await openSeriesEditPanel(page)
 
-    // A1：真实 UI 把类型选成 album 并保存
-    await setKindSelect(page, TARGET_KIND)
-    const selBefore = await readKindSelect(page)
-    await shot(page, '01-series-edit-kind-album.png')
-    await clickSeriesSave(page)
-
-    const afterSave = await httpJson('GET', `${TG}/api/media/series/${fx.seriesId}`)
-    const kindAfterSave = afterSave.json && afterSave.json.kind
+    // A1：编辑面板里**不存在**任何类型选择控件（裁定：不渲染，不是禁用；无隐藏编辑通道）
+    const panelKind = await findSeriesKindControls(page, '[data-testid="series-edit-panel"]')
+    await shot(page, '01-series-edit-panel-no-kind-select.png')
     check(
-      'A1: 真实 UI 选 album 并保存后读回仍是 album',
-      kindAfterSave === TARGET_KIND,
-      `selectBeforeSave=${selBefore} apiAfterSave=${JSON.stringify(kindAfterSave)}`,
+      'A1: 编辑面板**不再存在**任何类型选择控件（series-kind-select / 类型 select / kind radio）',
+      panelKind.reason === 'ok' && panelKind.present === false,
+      `hits=${JSON.stringify(panelKind.hits)}` +
+        (panelKind.present ? '  ← 类型选择控件还在 = 裁定未落实' : ''),
       'A1',
     )
+    await closeSeriesEditPanel(page)
 
-    // A2：**重启 orig-tg** 后必须仍是 album —— 缺陷原形下这里必然变回 series。
-    //     重启走 daemon 的 POST /api/tg/restart（daemon 是 orig-tg 的唯一执行者）。
-    if (SKIP_RESTART) {
-      check(
-        'A2: **重启 orig-tg 后**类型仍是 album（BUG-258 判据 1 核心）',
-        false,
-        'SKIP: BUG258_SKIP_RESTART=1 —— 重启段被显式跳过。**未验证**，不得据此声称判据 1 成立。',
-        'A2',
-      )
-    } else {
+    // A1b：新建弹窗同样不得有任何类型选择控件（此前是 KIND_OPTIONS 三选一 radio）
+    await openCreateDialog(page)
+    const dlgKind = await findSeriesKindControls(page, '[data-testid="series-create-dialog"]')
+    await shot(page, '02-series-create-dialog-no-kind-controls.png')
+    check(
+      'A1b: 新建剧集弹窗**不存在**任何类型选择控件（创建恒定 kind=series）',
+      dlgKind.reason === 'ok' && dlgKind.present === false,
+      `hits=${JSON.stringify(dlgKind.hits)}` +
+        (dlgKind.reason === 'root-missing' ? '  ← 弹窗容器未找到（检查 testid）' : ''),
+      'A1b',
+    )
+    await closeCreateDialog(page)
+
+    // A2：数据层持久性 —— UI 已无类型入口，改走 **API 层**：
+    //     PATCH kind=album（合法枚举值，探针性质）→ 重启 orig-tg → 仍 album。
+    let patchOk = false
+    let patchStatus = null
+    let kindAfterPatch = null
+    if (!SKIP_RESTART) {
+      const patched = await httpJson('PATCH', `${TG}/api/media/series/${fx.seriesId}`, {
+        kind: TARGET_KIND,
+      })
+      patchStatus = patched.status
+      const afterPatch = await httpJson('GET', `${TG}/api/media/series/${fx.seriesId}`)
+      kindAfterPatch = afterPatch.json ? afterPatch.json.kind : null
+      patchOk = patched.status === 200 && kindAfterPatch === TARGET_KIND
       console.log('[bug258] restarting orig-tg via daemon POST /api/tg/restart ...')
       const restartRes = await httpJson('POST', `${DAEMON}/api/tg/restart`, {})
       console.log(
@@ -476,17 +546,40 @@ async function main() {
       const afterRestart = await httpJson('GET', `${TG}/api/media/series/${fx.seriesId}`)
       const kindAfterRestart = afterRestart.json ? afterRestart.json.kind : null
       check(
-        'A2: **重启 orig-tg 后**类型仍是 album（BUG-258 判据 1 核心）',
-        kindAfterRestart === TARGET_KIND,
-        `http=${JSON.stringify(kindAfterRestart)} restartStatus=${restartRes.status} tgReady=true` +
-          (kindAfterRestart === 'series' ? '  ← 被 migrate() 打回 series = 缺陷原形' : '') +
+        'A2: **API 写入 album 并重启 orig-tg 后**仍是 album（数据层持久性）',
+        patchOk && kindAfterRestart === TARGET_KIND,
+        `patchStatus=${patchStatus} afterPatch=${JSON.stringify(kindAfterPatch)} ` +
+          `afterRestart=${JSON.stringify(kindAfterRestart)} tgReady=true` +
+          (kindAfterRestart === 'series' && patchOk
+            ? '  ← 被 migrate() 打回 series = 缺陷原形'
+            : '') +
           (staleEngine ? '  （注意：引擎未重建，此 FAIL 不可归因于代码）' : ''),
+        'A2',
+      )
+    } else {
+      check(
+        'A2: **API 写入 album 并重启 orig-tg 后**仍是 album（数据层持久性）',
+        false,
+        'SKIP: BUG258_SKIP_RESTART=1 —— 重启段被显式跳过。**未验证**，不得据此声称判据 1 成立。',
         'A2',
       )
     }
 
-    // A3：双通道牙齿检查 —— 真实 DOM 上的类型徽标也必须是「图集」而不是「剧集」。
-    //     （只读接口可能因为缓存/时序说谎，DOM 是用户真正看到的东西。）
+    // A3：夹具复位 —— PATCH kind=series（唯一合法业务值）并确认写回成功。
+    //     与 A2 合起来证明写路径双向可逆，且脚本不把探针值留在用户库里。
+    const reset = await httpJson('PATCH', `${TG}/api/media/series/${fx.seriesId}`, {
+      kind: 'series',
+    })
+    const afterReset = await httpJson('GET', `${TG}/api/media/series/${fx.seriesId}`)
+    check(
+      'A3: 夹具 kind 已复位回 series（PATCH 写回路径双向可逆）',
+      reset.status === 200 && afterReset.json && afterReset.json.kind === 'series',
+      `resetStatus=${reset.status} kind=${JSON.stringify(afterReset.json && afterReset.json.kind)}` +
+        (staleEngine && reset.status !== 200 ? '  （引擎未重建：不可归因于代码）' : ''),
+      'A3',
+    )
+
+    // ═════════ B 段：年份三态（重启可能发生过，回到真实 UI 重新导航） ═════════
     await page.goto(APP_URL, { waitForRoot: true, settleMs: 2500 })
     await navToSeriesWall(page)
     await page.waitForFunction(
@@ -494,29 +587,6 @@ async function main() {
       { timeout: 25000, args: [fx.seriesId] },
     )
     await openSeriesDetail(page, fx.seriesId)
-    const domKind = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="series-meta"]')
-      return el ? String(el.textContent || '').trim() : null
-    })
-    const badgeKind = await page.evaluate((sid) => {
-      const root = document.querySelector(`[data-testid="series-card-root"][data-series-id="${sid}"]`)
-      if (!root) return null
-      const badge = [...root.querySelectorAll('span')].find((s) =>
-        /^(剧集|合集|图集|Series|Collection|Album)$/.test(String(s.textContent || '').trim()),
-      )
-      return badge ? String(badge.textContent || '').trim() : null
-    }, fx.seriesId)
-    await shot(page, '02-after-restart-kind-badge.png')
-    const domSaysAlbum = domKind != null && /图集|Album/.test(domKind)
-    check(
-      'A3: 重启后**真实 DOM** 上的类型徽标是「图集」而非「剧集」（双通道牙齿）',
-      domSaysAlbum,
-      `series-meta=${JSON.stringify(domKind)} cardBadge=${JSON.stringify(badgeKind)}` +
-        (!domSaysAlbum ? '  ← DOM 上显示剧集 = 用户看到的仍是缺陷形态' : ''),
-      'A3',
-    )
-
-    // ═════════ B 段：年份三态 ═════════
     await openSeriesEditPanel(page)
 
     // B1-a：先设年份
@@ -578,7 +648,7 @@ async function main() {
 
     // B3：422 契约 —— 非法类型枚举不得进列（活体门已用同一探针验过，这里复核夹具已复位）
     // 「未被改动」必须与 **PATCH 前实测到的那个值** 逐字比对，不能硬编码 'series'：
-    // A1 已通过真实 UI 把夹具设成 album 且 A2/A3 证明它挺过了重启，硬编码会假失败。
+    // A2/A3 对夹具做过 album↔series 的往返写入，硬编码会假失败。
     const beforeGarbage = await httpJson('GET', `${TG}/api/media/series/${fx.seriesId}`)
     const kindBefore = beforeGarbage.json && beforeGarbage.json.kind
     const garbage = await httpJson('PATCH', `${TG}/api/media/series/${fx.seriesId}`, {

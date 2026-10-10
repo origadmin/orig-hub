@@ -1105,6 +1105,7 @@ export function MediaLibraryPanel() {
                       size="sm"
                       className="h-7 px-2 text-[11px]"
                       onClick={() => setCreateOpen(true)}
+                      data-testid="media-new-series"
                     >
                       ＋ {t('media.newSeries')}
                     </Button>
