@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 use crate::config::Config;
 use crate::login::Client;
@@ -132,6 +132,62 @@ pub struct AppState {
     /// 正在报字节的缓存任务 id（0 = 无）。序列化方据此判断注入是否归属当前任务，
     /// 防止「任务已切条目/已结束但旧字节仍在」的错配。
     pub cache_dl_task: std::sync::atomic::AtomicI64,
+    /// 缓存任务的**取消令牌登记**（BUG-257）。
+    ///
+    /// 此前 `cancel_cache_task` 只改数据库状态，而 worker 只在**每条目之前**查一次
+    /// 活跃性（`routes.rs` 的 `is_cache_task_active`）⇒ 取消对**在途条目完全无效**：
+    /// 用户按了取消，唯一能打断在途 IO 的仍是 90s 空闲看门狗。这就是「卡住的资源
+    /// 无法暂停」的根因——不是缺 pause/resume（那条铁律仍然成立），而是**取消够不着
+    /// 在途 IO**。
+    ///
+    /// 令牌与任务 id 一一对应，由 worker 起跑时登记、终态时注销。取消方**先置标志
+    /// 再落库**，于是「取消先到、worker 后起」的竞态也被覆盖：worker 起跑时读到的
+    /// 已是置位的标志，不会替一条已取消的任务开跑。
+    cache_cancels: Mutex<HashMap<i64, CacheCancel>>,
+}
+
+/// 取消令牌 = **权威标志** + **唤醒源**，两者缺一不可（BUG-257）。
+///
+/// 为什么不能只用 `AtomicBool`：标志是权威但**不唤醒**——`select!` 里的等待方若只看
+/// 标志，就得靠轮询才能察觉（凭空引入延迟与 CPU 抖动）。为什么不能只用 `Notify`：
+/// 通知允许丢失（`notify_waiters()` 只唤醒**已在等**的等待方），而「置标志」与
+/// 「进入等待」之间天然存在窗口。**标志判据 + `notify_one()` 补发许可**合起来才无洞：
+/// 先到者置标志，后到者读标志；两者都到时 `notify_one()` 至少留一张许可给随后才注册的
+/// 等待方，故不会睡死。
+#[derive(Clone, Default)]
+pub struct CacheCancel {
+    /// 取消标志：`true` = 该任务已被要求停止。**唯一权威判据**。
+    pub flag: Arc<AtomicBool>,
+    /// 唤醒源：让 `select!` 的取消分支立刻被唤醒，而不是轮询。
+    pub notify: Arc<Notify>,
+}
+
+impl CacheCancel {
+    /// 置标志并唤醒等待方（幂等）。
+    pub fn trip(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        // 单飞模型下每个任务至多一个等待方，故 `notify_one` 足够；它的「无等待方时
+        // 存一张许可」语义正是补上「先置标志、后注册等待」那个窗口的关键。
+        self.notify.notify_one();
+    }
+
+    /// 已被要求停止否。
+    pub fn is_set(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// 等待取消；已取消则**立即**返回（先看权威标志，再睡）。
+    ///
+    /// 循环体是必要的：`notify_one` 的许可可能被上一轮醒来消费，而标志仍未变
+    /// （虚假唤醒），此时必须重新判据而不是误报取消。
+    pub async fn wait(&self) {
+        loop {
+            if self.is_set() {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
 }
 
 impl AppState {
@@ -155,7 +211,36 @@ impl AppState {
             log_throttle: Mutex::new(HashMap::new()),
             cache_dl: crate::login::DownloadProgress::default(),
             cache_dl_task: std::sync::atomic::AtomicI64::new(0),
+            cache_cancels: Mutex::new(HashMap::new()),
         }
+    }
+
+    // ---- BUG-257：取消可达在途 IO ----
+
+    /// 取（必要时登记）某任务的取消令牌。
+    ///
+    /// worker 起跑时调用；取消方也调同一个入口，故「取消先到」时令牌**已存在且已置位**，
+    /// worker 随后读到的是置位的令牌，不会替已取消的任务开跑。
+    pub fn cache_cancel(&self, task_id: i64) -> CacheCancel {
+        let mut g = self.cache_cancels.lock().unwrap_or_else(|e| e.into_inner());
+        g.entry(task_id).or_default().clone()
+    }
+
+    /// 请求取消某任务（**幂等**）：置标志 + 唤醒在途等待方。
+    ///
+    /// 对**不存在**的任务同样安全：登记一个已置位的令牌。若该任务之后才起跑，
+    /// `cache_cancel` 会取到这张已置位的令牌并立刻退出——竞态方向只有一个，
+    /// 不会漏取消。
+    pub fn request_cache_cancel(&self, task_id: i64) {
+        self.cache_cancel(task_id).trip();
+    }
+
+    /// 注销某任务的令牌（worker 到达终态时调用）。
+    ///
+    /// 不注销的后果是 token 表随任务数单调增长（进程内的小泄漏），而队列可能很长。
+    pub fn clear_cache_cancel(&self, task_id: i64) {
+        let mut g = self.cache_cancels.lock().unwrap_or_else(|e| e.into_inner());
+        g.remove(&task_id);
     }
 
     /// 条目下载开始：绑定任务 id 并清零字节（总量由 client 在开流前设置）。
@@ -315,5 +400,83 @@ mod tests {
         st.push_log("A1");
         st.push_log("A2");
         assert!(has(&st, "A1") && has(&st, "A2"), "低频路径不得丢日志");
+    }
+
+    // ── BUG-257：取消令牌（取消可达在途 IO 的判据） ─────────────────────
+
+    /// 未取消时令牌是干净的，且 `wait()` 不会自己醒（否则等于「恒定已取消」）。
+    #[tokio::test]
+    async fn cache_cancel_starts_clear_and_wait_blocks_until_tripped() {
+        let st = state().await;
+        let c = st.cache_cancel(42);
+        assert!(!c.is_set(), "新令牌不得一上来就是已取消");
+
+        // 未取消时 wait 必须**继续等**（用超时证明它没返回）。
+        let raced = tokio::time::timeout(std::time::Duration::from_millis(50), c.wait()).await;
+        assert!(raced.is_err(), "未取消时 wait() 不得返回 —— 否则等于恒定已取消");
+
+        c.trip();
+        assert!(c.is_set());
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.wait())
+            .await
+            .expect("已取消时 wait() 必须立即返回（不得睡死）");
+    }
+
+    /// 核心时序保证：**先置标志、后注册等待**不得睡死（BUG-257 的取消竞态）。
+    ///
+    /// 这正是 `Notify` 单用的漏洞：先 `notify_one()` 时若还没有等待方，许可会被
+    /// 存下来（`notify_one` 有许可语义），但若换成 `notify_waiters` 就会**永久丢失**。
+    /// 本测试把「置位」排在「等待」之前，正面压住这个窗口——它就是「用户按了取消，
+    /// worker 却永远等不到通知」的形态。
+    #[tokio::test]
+    async fn cache_cancel_does_not_lose_the_signal_when_trip_precedes_wait() {
+        let st = state().await;
+        let c = st.cache_cancel(7);
+        c.trip(); // 先置位
+        // 后等待：必须立刻返回，绝不能睡到看门狗那90s。
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.wait())
+            .await
+            .expect("先置位后等待必须立即返回 —— 信号不许丢");
+    }
+
+    /// 通过 AppState 取消（生产路径）与直接持有令牌是**同一个**判据。
+    #[tokio::test]
+    async fn request_cache_cancel_is_observable_through_the_registry() {
+        let st = state().await;
+        assert!(!st.cache_cancel(9).is_set());
+        st.request_cache_cancel(9);
+        assert!(
+            st.cache_cancel(9).is_set(),
+            "取消方与 worker 必须读到同一张令牌，否则取消对在途无效"
+        );
+    }
+
+    /// 注销后重新取到的是**干净**令牌：新任务不得继承上一条任务的取消标志。
+    /// 不注销或注销不干净，都会让「取消过一条」变成「之后每条都秒退」。
+    #[tokio::test]
+    async fn clear_cache_cancel_gives_the_next_task_a_clean_token() {
+        let st = state().await;
+        st.request_cache_cancel(11);
+        assert!(st.cache_cancel(11).is_set());
+        st.clear_cache_cancel(11);
+        assert!(
+            !st.cache_cancel(11).is_set(),
+            "注销必须真的移除：新任务不得继承旧任务的取消标志"
+        );
+    }
+
+    /// 取消一个**尚未起跑**的任务：令牌必须已经置位，这样 worker 起跑时立刻退出。
+    /// 这是 cancel↔enqueue 竞态的方向性保证（取消先到也不能漏）。
+    #[tokio::test]
+    async fn cancelling_before_the_worker_starts_still_trips_the_token() {
+        let st = state().await;
+        // 任务还没起跑，此刻取消
+        st.request_cache_cancel(13);
+        // worker 随后才来取令牌：取到的必须是已置位的那张
+        let c = st.cache_cancel(13);
+        assert!(c.is_set(), "取消先到、worker 后起时不得漏取消");
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.wait())
+            .await
+            .expect("已取消的任务应在起跑判定处立即退出");
     }
 }

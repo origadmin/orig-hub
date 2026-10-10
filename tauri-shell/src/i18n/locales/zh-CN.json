@@ -359,6 +359,8 @@
   "tg.retryFailed": "重试连接失败。可到下方「连接诊断」查看最近日志定位原因。",
   "tg.reasonNetwork": "无法连接到 Telegram，请检查网络与代理设置后重试。",
   "tg.reasonAuth": "Telegram 登录凭证已失效，请重新绑定账号。",
+  "tg.reasonStalled": "传输中途停滞：连接已建立，但字节流停止推进，已中止该条目以让队列继续。重试通常可解决；持续出现请检查代理稳定性。",
+  "tg.reasonRestarted": "因服务重启而中断。该任务可恢复：已下载的条目保留，重试只补未完成的条目。",
   "tg.reasonFlood": "Telegram 限制了当前账号的请求频率，请稍后再试。",
   "tg.reasonConfig": "尚未配置 Telegram API 凭证，请先完成服务配置。",
   "tg.reasonUnknown": "Telegram 暂时不可用，请稍后重试，或到「设置 → 账号」查看连接诊断。",

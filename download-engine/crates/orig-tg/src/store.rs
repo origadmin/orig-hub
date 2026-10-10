@@ -1062,6 +1062,13 @@ impl Store {
     }
 
     /// 更新进度（已完成条数 + 正在处理的条目）。
+    ///
+    /// BUG-257：**只在活跃态时写入**。此前 WHERE 只有 `id`，于是任务被取消后，
+    /// 仍在收尾的那次写入会把 `done` 继续往上加——用户点了取消，进度条却还在涨
+    /// （「取消了却还在动」）。`finish_cache_task` 早有同款状态门，唯独这里漏了。
+    ///
+    /// 判据与 `finish_cache_task` 同源（`CACHE_TASK_ACTIVE_STATES`）：终态记录
+    /// 是**事实**，不该再被一个迟到的 worker 改写。
     pub async fn update_cache_task_progress(
         &self,
         id: i64,
@@ -1070,7 +1077,10 @@ impl Store {
     ) -> libsql::Result<()> {
         self.conn
             .execute(
-                "UPDATE cache_task SET done = ?2, current_id = ?3, updated_at = ?4 WHERE id = ?1",
+                &format!(
+                    "UPDATE cache_task SET done = ?2, current_id = ?3, updated_at = ?4 \
+                     WHERE id = ?1 AND status IN {CACHE_TASK_ACTIVE_STATES}"
+                ),
                 params![id, done, current_id, now()],
             )
             .await?;
@@ -1186,21 +1196,61 @@ impl Store {
         .transpose()
     }
 
-    /// 启动时清理僵尸任务：进程被杀/崩溃时残留的 queued/running 永远等不到 worker，
-    /// 必须显式降级为 `interrupted`，否则前端会显示一个永不推进的「缓存中」（假状态）。
+    /// 启动时清理僵尸任务：**只降级 `running`**（BUG-257）。
+    ///
+    /// 降级本身是有依据的裁定（BUG-024 拒绝伪造的「缓存中」态）：进程被杀时正在传
+    /// 字节的那条任务，它的 worker 永远不会回来，不降级前端就会看到一个永不推进的
+    /// 「缓存中」——那是假状态。
+    ///
+    /// 但此前 WHERE 覆盖 `('queued','running')` **两者**，而 `queued` 的语义是
+    /// 「还没开始」：它们从未传输过一个字节，把它们降级成 `interrupted`（=「中途被打断」）
+    /// **没有依据**，且等于「重启即清空待办」——实测一次重启把 26 个 queued 全部作废。
+    /// BUG-024 反对的是**假状态**，不是保留队列；`queued` 不是假状态，它就是排队。
+    ///
+    /// 现在只降级真正传输过字节的 `running`；`queued` 原样保留，由启动流程**重新入队**
+    /// （`recover_queued_cache_tasks` → `spawn_cache_task`）。
+    ///
+    /// **降级时写入成因**（BUG-257 判据 5）：此前 `interrupted` 的 `error` 恒为 NULL，
+    /// 界面只显示「已中断」，用户无法把它与「我刚重启过」联系起来，更不知道它可重试
+    /// （它确实在 `RETRYABLE_STATES` 里）。写明成因，前端才能给出「可恢复」而非「卡住了」。
+    /// 用固定文案而非拼接：原因只有一个来源（本次重启），拼可变内容等于制造第二真源。
+    ///
     /// 返回被标记的条数。
     pub async fn mark_stale_cache_tasks(&self) -> libsql::Result<usize> {
         let n = self
             .conn
             .execute(
-                &format!(
-                    "UPDATE cache_task SET status = 'interrupted', current_id = NULL, updated_at = ?1 \
-                     WHERE status IN {CACHE_TASK_ACTIVE_STATES}"
-                ),
+                "UPDATE cache_task SET status = 'interrupted', current_id = NULL, \
+                 error = '应用重启：传输被中断，可重试继续', updated_at = ?1 \
+                 WHERE status = 'running'",
                 params![now()],
             )
             .await?;
         Ok(n as usize)
+    }
+
+    /// 启动时**可恢复**的排队任务（BUG-257）。
+    ///
+    /// 返回全部仍是 `queued` 的任务（按 id 升序 = FIFO），交给启动流程重新入队。
+    /// 刻意**返回列表而不自己 spawn**：投递只有一个入口（`spawn_cache_task`），
+    /// 单飞门禁也在那里——在 store 层另起一套投递就会绕过门禁、出现双跑。
+    ///
+    /// 「降级」与「恢复」是同一件事的两半：只降级不恢复，重启就是把队列清空；
+    /// 只恢复不降级，前端会卡在永不推进的假「缓存中」。
+    pub async fn recover_queued_cache_tasks(&self) -> libsql::Result<Vec<CacheTask>> {
+        let stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {CACHE_TASK_COLS} FROM cache_task \
+                 WHERE status = 'queued' ORDER BY id ASC"
+            ))
+            .await?;
+        let mut rows = stmt.query(()).await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(cache_task_from_row(&r)?);
+        }
+        Ok(out)
     }
 
 
@@ -1663,6 +1713,115 @@ mod tests {
             .unwrap();
         let list = s.list_cache_tasks(50).await.unwrap();
         assert_eq!(list[0].id, a.id, "活跃任务必须排在最前");
+    }
+
+    // ── BUG-257：重启恢复（queued 保留 + running 降级 + 重新入队） ─────────
+
+    /// 造一条 `queued` 任务（入队即queued，从未起跑）。
+    async fn queued_task(s: &Store, key: &str, msg: i64) -> CacheTask {
+        s.enqueue_cache_task(7, None, key, &[msg], "D:/dl")
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+    }
+
+    /// 判据 4 的核心：重启后 **`queued` 仍是 `queued`**，不得被降级（BUG-257）。
+    ///
+    /// 此前 `mark_stale_cache_tasks` 的 WHERE 覆盖 `('queued','running')`，实测一次
+    /// 重启把 26 个 `queued` 全部作废——「重启即清空待办」。`queued` 从未传输过一个
+    /// 字节，把它标成 `interrupted`（中途被打断）本就**没有依据**。
+    #[tokio::test]
+    async fn restart_keeps_queued_tasks_queued_instead_of_flattening_them() {
+        let s = store("restart_queued").await;
+        let a = queued_task(&s, "m:7:1", 1).await;
+        let b = queued_task(&s, "m:7:2", 2).await;
+
+        let n = s.mark_stale_cache_tasks().await.unwrap();
+        assert_eq!(n, 0, "只有 running 该降级；纯 queued 队列不该产生任何 interrupted");
+
+        for id in [a.id, b.id] {
+            let t = s.get_cache_task(id).await.unwrap().unwrap();
+            assert_eq!(
+                t.status, "queued",
+                "重启不得把排队任务降级 —— 用户排的队凭空消失"
+            );
+        }
+    }
+
+    /// 恢复清单：重启后交回启动流程重新入队的**正是**那些 `queued`，且按 FIFO 升序
+    /// （单飞 worker 依赖「最老的先跑」接续，顺序错了就是先跑新的）。
+    #[tokio::test]
+    async fn recover_returns_the_queued_tasks_in_fifo_order() {
+        let s = store("restart_recover").await;
+        let a = queued_task(&s, "m:7:11", 11).await;
+        let b = queued_task(&s, "m:7:12", 12).await;
+        // 一条 running：降级成 interrupted，**不得**出现在恢复清单里。
+        let c = queued_task(&s, "m:7:13", 13).await;
+        s.mark_cache_task_running(c.id).await.unwrap();
+        s.mark_stale_cache_tasks().await.unwrap();
+
+        let recovered = s.recover_queued_cache_tasks().await.unwrap();
+        let ids: Vec<i64> = recovered.iter().map(|t| t.id).collect();
+        assert_eq!(
+            ids,
+            vec![a.id, b.id],
+            "恢复清单 = 仍在排队的，按 id 升序（FIFO）"
+        );
+        assert!(
+            !ids.contains(&c.id),
+            "running 已被降级为 interrupted，不该再被当成待办重跑"
+        );
+        // 终态的 interrupted 仍是**可恢复**的（用户在 RETRYABLE_STATES 里，BUG-249）。
+        assert_eq!(
+            s.get_cache_task(c.id).await.unwrap().unwrap().status,
+            "interrupted"
+        );
+    }
+
+    /// 降级只碰 `running`：混编队列里 queued 存活、running 降级，两类互不干扰。
+    /// 这是「重启前后 queued 计数差不超过正在运行的 1 条」那条判据的 store 侧守卫。
+    #[tokio::test]
+    async fn stale_downgrade_touches_only_the_running_task() {
+        let s = store("restart_mixed").await;
+        let q1 = queued_task(&s, "m:7:21", 21).await;
+        let r1 = queued_task(&s, "m:7:22", 22).await;
+        let q2 = queued_task(&s, "m:7:23", 23).await;
+        s.mark_cache_task_running(r1.id).await.unwrap();
+
+        assert_eq!(s.mark_stale_cache_tasks().await.unwrap(), 1, "只降级那1 条 running");
+        assert_eq!(s.get_cache_task(q1.id).await.unwrap().unwrap().status, "queued");
+        assert_eq!(s.get_cache_task(r1.id).await.unwrap().unwrap().status, "interrupted");
+        assert_eq!(s.get_cache_task(q2.id).await.unwrap().unwrap().status, "queued");
+    }
+
+    /// BUG-257 附带修掉的读数泄漏：任务被取消后，**迟到的进度写不得再改写它**。
+    ///
+    /// `finish_cache_task` 早有 `status IN {CACHE_TASK_ACTIVE_STATES}` 状态门，
+    /// 唯独 `update_cache_task_progress` 漏了——于是用户点了取消，进度条还在涨
+    /// （「取消了却还在动」）。终态记录是**事实**，不该被迟到的 worker 改写。
+    #[tokio::test]
+    async fn progress_writes_stop_once_a_task_reaches_a_terminal_state() {
+        let s = store("progress_guard").await;
+        let t = queued_task(&s, "m:7:31", 31).await;
+        s.mark_cache_task_running(t.id).await.unwrap();
+        s.update_cache_task_progress(t.id, 2, Some(31)).await.unwrap();
+        assert_eq!(
+            s.get_cache_task(t.id).await.unwrap().unwrap().done,
+            2,
+            "活跃态下进度照常写入"
+        );
+
+        s.cancel_cache_task(t.id).await.unwrap();
+        // 模拟 worker 收尾时那次迟到的写（真实路径：download 返回后才写）。
+        s.update_cache_task_progress(t.id, 9, Some(99)).await.unwrap();
+        let got = s.get_cache_task(t.id).await.unwrap().unwrap();
+        assert_eq!(got.status, "cancelled", "状态不得被改写");
+        assert_eq!(
+            got.done, 2,
+            "已取消任务的 done 不得继续增长 —— 取消后进度还在涨就是假的"
+        );
+        assert_eq!(got.current_id, None, "也不该再被写入正在处理的条目");
     }
 
     /// 回归（BUG-051 缓存管理）：终态记录**必须能删**，活跃任务也能删（先取消再删行），

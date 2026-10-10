@@ -438,11 +438,20 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
           {t('tg.cacheCurrentMsg', { id: task.currentId })}
         </p>
       ) : null}
-      {task.status === 'failed' && task.error ? (
+      {/* BUG-257 判据 5：`interrupted` 也**必须**显示成因。此前条件只有
+          `status === 'failed'`，于是「因重启中断」的行只显示「已中断」——用户既
+          不知道是自己重启造成的，也不知道它可重试（它确实在 RETRYABLE 里）。
+          语义分级而非一律红色：中断是「可恢复」，不是「出错」。*/}
+      {(task.status === 'failed' || task.status === 'interrupted') && task.error ? (
         // 与 TgPanel 共用同一映射（BUG-111）：此前这里连「受保护内容」的特例都没有，
         // 任务失败原因一律原样渲染（`request error: dropped (cancelled)` 直接进界面）。
         <p
-          className="mt-1 truncate text-[11px] text-red-500"
+          className={
+            task.status === 'interrupted'
+              ? 'mt-1 truncate text-[11px] text-amber-600 dark:text-amber-400'
+              : 'mt-1 truncate text-[11px] text-red-500'
+          }
+          data-testid="cache-task-reason"
           title={describeTgFailure(task.error, t)}
         >
           {describeTgFailure(task.error, t)}

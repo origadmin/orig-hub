@@ -955,16 +955,28 @@ pub(crate) async fn retry_task_kernel(
 /// 批量端点 `POST /api/cache/tasks/cancel?ids=`。
 /// 返回 `false` = 该 id 不存在，或它不是活跃任务（已结束，没有可取消的动作）。
 pub(crate) async fn cancel_task_kernel(st: &Arc<AppState>, id: i64) -> Result<bool, ApiError> {
+    // BUG-257：**先置令牌，再落库**。
+    //
+    // 顺序是刻意的：令牌是「够得着在途 IO」的判据，DB 状态只是呈现面。若先落库再置令牌，
+    // 两次 await 之间 worker 可能正好取到未置位的令牌继续跑；而「先置位」时即便 DB 写
+    // 随后失败，用户看到的也只是「取消没生效」而不是「传输被掐断却仍显示在跑」。
+    //
+    // 对**尚未起跑**的任务同样有效：token 表里那张已置位的令牌会被 worker 起跑时取到，
+    // 于是「取消先到、worker 后起」的竞态方向只有一个 —— 不会漏取消。
+    st.request_cache_cancel(id);
     let hit = st
         .store
         .cancel_cache_task(id)
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     if !hit {
+        // 没有活跃任务可取消：撤回刚才的令牌置位，避免留下一个永不生效的标志。
+        // （worker 若已注销过令牌，这次撤回是无操作，幂等。）
+        st.clear_cache_cancel(id);
         return Ok(false);
     }
     st.refresh_cache_tasks().await;
-    st.push_log(format!("/api/cache/tasks/{id}: cancel requested"));
+    st.push_log(format!("/api/cache/tasks/{id}: cancel requested (in-flight transfer will abort)"));
     Ok(true)
 }
 

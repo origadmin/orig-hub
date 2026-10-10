@@ -364,6 +364,8 @@
   "tg.retryFailed": "Retry failed. Open Connection diagnostics below for the recent logs.",
   "tg.reasonNetwork": "Cannot reach Telegram. Check your network and proxy settings, then retry.",
   "tg.reasonAuth": "The Telegram credentials are no longer valid. Please bind the account again.",
+  "tg.reasonStalled": "Transfer stalled: the connection was established but the byte stream stopped advancing, so this item was aborted to keep the queue moving. Retrying usually helps; if it persists, check proxy stability.",
+  "tg.reasonRestarted": "Interrupted by a service restart. This task is resumable: already-downloaded items are kept, and a retry only fetches the ones that are missing.",
   "tg.reasonFlood": "Telegram is rate-limiting this account. Please try again later.",
   "tg.reasonConfig": "Telegram API credentials are not configured yet. Finish the service setup first.",
   "tg.reasonUnknown": "Telegram is temporarily unavailable. Retry later, or open Settings → Accounts for diagnostics.",

@@ -209,14 +209,33 @@ async fn main() {
 
     let state = Arc::new(AppState::new(client, config.clone(), availability.clone(), mock, store));
 
-    // 僵尸缓存任务降级（BUG-024）：进程被杀/崩溃时残留的 queued/running 永远等不到 worker，
-    // 必须显式标成 interrupted，否则前端会显示一个永不推进的「缓存中」假状态。
+    // 僵尸缓存任务降级（BUG-024）：进程被杀/崩溃时残留的 running 永远等不到 worker，
+// 必须显式标成 interrupted，否则前端会显示一个永不推进的「缓存中」假状态。
     match state.store.mark_stale_cache_tasks().await {
         Ok(n) if n > 0 => {
             state.push_log(format!("cache tasks: {n} stale task(s) marked interrupted"));
         }
         Ok(_) => {}
         Err(e) => eprintln!("[warn] mark stale cache tasks failed: {e}"),
+    }
+    // BUG-257：排队任务**保留并重新入队**。`mark_stale_cache_tasks` 只降级 `running`
+    // （`queued` 从未传输过一个字节，降级成「中途被打断」没有依据）。此前两者都被降级，
+    // 等于「重启即清空待办」——实测一次重启作废 26 个 queued。
+    //
+    // 投递**只经`spawn_cache_task`**（单飞门禁在那里）：在 store 层 spawn 会绕过门禁。
+    // 启动时首个任务直接起 worker，其余留在 `queued` 由它 FIFO 接续。
+    match state.store.recover_queued_cache_tasks().await {
+        Ok(tasks) if !tasks.is_empty() => {
+            let n = tasks.len();
+            let head = tasks[0].id;
+            for t in tasks {
+                state.push_log(format!("cache task {}: re-queued after restart", t.id));
+            }
+            orig_tg::routes::spawn_cache_task(state.clone(), head);
+            println!("[tg] cache queue resumed after restart: {n} task(s) re-queued");
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[warn] recover queued cache tasks failed: {e}"),
     }
     // 首份读快照：服务启动即有数据，避免首个 GET 返回空列表。
     state.refresh_cache_tasks().await;

@@ -19,8 +19,35 @@ export type TgReasonKey =
   | 'tg.reasonFlood'
   | 'tg.reasonConfig'
   | 'tg.reasonAuth'
+  | 'tg.reasonStalled'
+  | 'tg.reasonRestarted'
   | 'tg.reasonNetwork'
   | 'tg.reasonUnknown'
+
+/**
+ * 「传输停滞」的判据（BUG-257 判据 6）。
+ *
+ * **必须排在网络类之前**，否则这条最具体的诊断会被下面那条宽泛的网络正则吃掉：
+ * 停滞原文含 `connection presumed dead`，而网络正则含 `connect` ⇒ 命中 `tg.reasonNetwork`
+ * ⇒ 界面显示「无法连接到 Telegram，请检查网络与代理设置后重试」。
+ *
+ * 那是**误导性的可行动指引**：真实条件是「连接早已建立、字节流中途停住」，用户会去
+ * 反复改代理，而问题在传输停滞。实测原文：
+ * `download stalled: no bytes for 90s (chat -1004457697592 msg 1156); connection presumed dead, aborted to unblock the cache queue`
+ *
+ * 判据取「停滞语义」而不是整句精确匹配：后端的秒数、chat/msg 号会变，写死整句等于
+ * 给每个数字留一个漏网口。`stalled|no bytes for|connection presumed dead` 三者任一即可。
+ */
+const STALLED_RE = /download stalled|no bytes for \d+s|connection presumed dead/i
+
+/**
+ * 「因重启中断」的判据（BUG-257 点2/ 判据 5）。
+ *
+ * `interrupted` 此前**恒无原因字段**，界面只显示「已中断」——用户无法把「已中断」与
+ * 「我刚重启过」联系起来，更不知道它可重试。服务端在启动降级时写入这个原因，这里把它
+ * 翻译成能指明成因与出路的文案。
+ */
+const RESTARTED_RE = /应用重启|restart interrupted|interrupted by restart/i
 
 /**
  * 原文 → i18n 键的**分类降级**。
@@ -36,6 +63,9 @@ export function classifyTgReason(reason: string | null | undefined): TgReasonKey
   if (!raw) return 'tg.reasonUnknown'
   // 调试期离线短路：预期态，有专属文案，不能落到「暂时不可用」
   if (/offline debug mode/i.test(raw)) return 'tg.reasonOfflineDebug'
+  // 停滞与重启必须**先于**网络类：它们的原文含 `connect`/`restart`，会被网络正则吞掉。
+  if (STALLED_RE.test(raw)) return 'tg.reasonStalled'
+  if (RESTARTED_RE.test(raw)) return 'tg.reasonRestarted'
   if (/flood|rate limit|too many|retry after|FLOOD_WAIT/i.test(raw)) return 'tg.reasonFlood'
   if (/api_id|api_hash|api credential|not configured|missing api|credentials/i.test(raw))
     return 'tg.reasonConfig'
