@@ -157,6 +157,20 @@ const STALL_MS = 15_000
  */
 const RATE_FRESH_MS = 10_000
 
+/**
+ * 条目级失败汇总的识别标记（BUG-257 方向 3，与引擎 `summarize_item_failures` 约定）。
+ *
+ * 引擎把「哪几条失败了」写进任务 `error`：`N/M item(s) failed: chat:msg 原因; …`。
+ * 这类文本**原样展示**——它本身就是答案；其余错误仍走 `describeTgFailure` 折叠
+ *（BUG-111 的保护：内部报文不得直出界面）。
+ *
+ * 引擎侧若改这个前缀的形状，这里必须同步 —— 两侧都要改才生效，属于有意的
+ * 双侧约定（不引入共享模块是为了不把引擎的错误格式泄进 shell 的通用层）。
+ */
+function isItemFailureSummary(error: string): boolean {
+  return /^\d+\/\d+ item\(s\) failed:/.test(error.trim())
+}
+
 /** 剩余时间文案（`≈3 分 20 秒` 这一档由 i18n 决定语序）。 */
 function fmtEta(sec: number, t: (key: string, vars?: Record<string, string | number>) => string): string {
   const s = Math.max(0, Math.round(sec))
@@ -445,17 +459,37 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
       {(task.status === 'failed' || task.status === 'interrupted') && task.error ? (
         // 与 TgPanel 共用同一映射（BUG-111）：此前这里连「受保护内容」的特例都没有，
         // 任务失败原因一律原样渲染（`request error: dropped (cancelled)` 直接进界面）。
-        <p
-          className={
-            task.status === 'interrupted'
-              ? 'mt-1 truncate text-[11px] text-amber-600 dark:text-amber-400'
-              : 'mt-1 truncate text-[11px] text-red-500'
-          }
-          data-testid="cache-task-reason"
-          title={describeTgFailure(task.error, t)}
-        >
-          {describeTgFailure(task.error, t)}
-        </p>
+        //
+        // BUG-257 方向 3 的例外：条目级失败汇总是引擎为「哪几条失败了」专门生成的
+        //（`N/M item(s) failed: chat:msg 原因; …`，前缀由引擎与这里**约定**），
+        // 它本身就是答案——再走 `describeTgFailure` 折叠只会把它压成一句通用文案，
+        // 用户又看不到是哪几条了。只对带该标记的文本原样展示；其余照旧折叠
+        //（BUG-111 的保护对非汇总错误仍然有效）。
+        isItemFailureSummary(task.error) ? (
+          <p
+            className={
+              task.status === 'interrupted'
+                ? 'mt-1 truncate text-[11px] text-amber-600 dark:text-amber-400'
+                : 'mt-1 truncate text-[11px] text-red-500'
+            }
+            data-testid="cache-task-reason"
+            title={task.error}
+          >
+            {task.error}
+          </p>
+        ) : (
+          <p
+            className={
+              task.status === 'interrupted'
+                ? 'mt-1 truncate text-[11px] text-amber-600 dark:text-amber-400'
+                : 'mt-1 truncate text-[11px] text-red-500'
+            }
+            data-testid="cache-task-reason"
+            title={describeTgFailure(task.error, t)}
+          >
+            {describeTgFailure(task.error, t)}
+          </p>
+        )
       ) : null}
       {missing ? (
         <p className="mt-1 text-[11px] text-fg-muted" data-testid="cache-task-notinlib">

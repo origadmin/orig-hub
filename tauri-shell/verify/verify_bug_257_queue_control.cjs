@@ -202,6 +202,26 @@ function main() {
     '原因节点带 data-testid="cache-task-reason"（可被验收脚本定位）',
   )
 
+  // —— B2（方向 3）：条目级失败汇总必须**原样**展示，不得被折叠成通用文案 ——
+  //
+  // 引擎汇总 `N/M item(s) failed: chat:msg 原因; …` 本身就是「哪几条失败了」的答案；
+  // 若它被 describeTgFailure 吞掉，用户又回到「只知道失败了、不知道哪条」。
+  section('B2 条目级失败汇总原样展示（方向 3）')
+  check(
+    /isItemFailureSummary/.test(dialog) && /item\\\(s\\\) failed/.test(dialog),
+    'CacheManagerDialog 识别汇总标记（isItemFailureSummary + item(s) failed: 前缀）',
+    '识别被移除 ⇒ 汇总退回通用文案，「哪几条失败了」再次不可见',
+  )
+  check(
+    /isItemFailureSummary\(task\.error\) \?/.test(dialog) && /title=\{task\.error\}/.test(dialog),
+    '带标记的汇总原样渲染（title=原文，不走 describeTgFailure）',
+  )
+  // 两侧约定的一致性：引擎前缀与前端标记必须是同一个形状（都含 "item(s) failed:"）。
+  check(
+    /item\(s\) failed:/.test(dialog),
+    '前端标记与引擎前缀（N/M item(s) failed:）形状一致 —— 改一侧必须同步另一侧',
+  )
+
   // —— C：无回归 ——
   section('C 无回归：既有分类保持原样')
   const cases = [

@@ -1992,6 +1992,45 @@ impl IngestCtx {
 /// 单次自动归档的标签数上限（防个别刷屏消息带来成百上千标签）。
 const MAX_AUTO_TAGS: usize = 20;
 
+/// 条目级失败的**任务级汇总**（BUG-257 方向 3）。
+///
+/// `cache_task.error` 是任务级字段，而失败是条目级事件。汇总必须能直接回答用户的
+/// 问题「**哪几条**失败了」：`N/M item(s) failed: chat:msg 短原因; …`。
+///
+/// 两个封顶是刻意的：
+/// - **每条原因截 80 字符**——足够辨认「no bytes for 90s」「media not found」这类信号，
+///   又不至于把 20 条失败撑成几千字节（error 列要进任务 JSON，随 1s 轮询下发）；
+/// - **至多列 10 条**，其余以计数交代——完整逐条原因在 RingLog（`push_log`），那里
+///   才是日志的家；error 列是给前端一行展示的，不是日志的替身。
+///
+/// 前缀 `N/M item(s) failed:` 同时是**前端识别标记**：`CacheManagerDialog` 见到它
+/// 就原样展示（它本身就是答案），否则才走 `describeTgFailure` 的折叠——别改这个
+/// 前缀的形状，改了前端就退回「通用文案吃掉具体诊断」的老毛病（BUG-257 点 3）。
+fn summarize_item_failures(chat_id: i64, total: i64, failures: &[(i64, String)]) -> String {
+    const MAX_LISTED: usize = 10;
+    const MAX_REASON_CHARS: usize = 80;
+    let mut parts: Vec<String> = failures
+        .iter()
+        .take(MAX_LISTED)
+        .map(|(msg, reason)| {
+            let mut r = reason.trim().to_string();
+            if r.chars().count() > MAX_REASON_CHARS {
+                r = r.chars().take(MAX_REASON_CHARS).collect::<String>() + "…";
+            }
+            format!("{chat_id}:{msg} {r}")
+        })
+        .collect();
+    if failures.len() > MAX_LISTED {
+        parts.push(format!("… and {} more (see /api/tg/logs)", failures.len() - MAX_LISTED));
+    }
+    format!(
+        "{}/{} item(s) failed: {}",
+        failures.len(),
+        total,
+        parts.join("; ")
+    )
+}
+
 async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
     let Ok(Some(task)) = st.store.get_cache_task(task_id).await else {
         return;
@@ -2013,6 +2052,10 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
     // 下载失败 → 条目保留缺字节、任务 failed，登记不撤销（重试只重做字节）。
     // 这正是「缓存→不见了→完成→出现」闪烁的根治：条目自 T0 起持续可见。
     let mut ing = IngestCtx::prepare(st, &task).await;
+    // BUG-257（裁定 2026-10-10，方向 3）：条目级失败**不终止任务**。用户原话：
+    // 「单条失败……不应该影响其他的」。因此逐条记录失败、继续跑完剩余条目，
+    // 循环结束再按「是否有失败」落一次终态（见循环后的 summarize）。
+    let mut failures: Vec<(i64, String)> = Vec::new();
     // BUG-257：条目之间的取消判据从「读 DB」改为「认令牌」。两者都在，但令牌是
     // **可达在途 IO** 的那个（见下方 `select!`），必须让两处读**同一个**判据 ——
     // 否则会出现「在途被取消了、下一条目却又按 DB 判成活跃」的自相矛盾。
@@ -2156,22 +2199,44 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
                 st.refresh_cache_tasks().await;
             }
             Err(e) => {
+                // BUG-257（方向 3）：**记录、继续**。此前这里直接
+                // `finish_cache_task("failed")` + `return` —— 条目级事件被升级成任务级
+                // 终止，实测 9 条任务第 2 条卡死 ⇒ 剩下 7 条从未尝试（done=2/9 且整条
+                // failed）。现在失败只属于这一条：记日志（完整原因在 RingLog）、
+                // 记入汇总、`continue` 下一条。**不得**在循环内落终态。
                 let reason = e.message().to_string();
-                st.push_log(format!("cache task {task_id}: failed on {msg_id}: {reason}"));
-                let _ = st
-                    .store
-                    .finish_cache_task(task_id, "failed", Some(&reason))
-                    .await;
-                st.refresh_cache_tasks().await;
-                // 事实不回滚：已登记条目（含缺字节的当前条目）全部保留；
-                // 未落位的挂起照片如实留痕，重试任务幂等补齐。
-                ing.finish(st).await;
-                st.clear_cache_cancel(task_id);
-                return;
+                st.push_log(format!(
+                    "cache task {task_id}: item {msg_id} failed: {reason} \
+                     (continuing with remaining items)"
+                ));
+                failures.push((msg_id, reason));
+                continue;
             }
         }
     }
-    let _ = st.store.finish_cache_task(task_id, "done", None).await;
+    // 终态**只在这里落一次**（裁定方向 3）：全成 → done；有失败 → failed + 汇总。
+    // 状态语义不变（仍是既有六态，不新增值，RETRYABLE_STATES / BUG-249 契约不动）；
+    // 变的是 error 的**内容**：从「第一条失败的原因」换成「哪几条失败了」——
+    // 任务级字段终于装下了条目级的事实。取消是例外：令牌触发路径已在循环内提前
+    // 返回（终态 `cancelled` 已由 cancel_cache_task 写好），走不到这里。
+    let failed = !failures.is_empty();
+    let summary = failed.then(|| summarize_item_failures(task.chat_id, task.total, &failures));
+    let _ = st
+        .store
+        .finish_cache_task(
+            task_id,
+            if failed { "failed" } else { "done" },
+            summary.as_deref(),
+        )
+        .await;
+    st.refresh_cache_tasks().await;
+    if failed {
+        st.push_log(format!(
+            "cache task {task_id}: finished with {} failure(s): {}",
+            failures.len(),
+            summary.as_deref().unwrap_or_default()
+        ));
+    }
     ing.finish(st).await;
     // 终态即注销令牌：否则 token 表随任务数单调增长（队列可达几十条 × 进程生命周期）。
     st.clear_cache_cancel(task_id);
@@ -5988,6 +6053,12 @@ mod tests {
         msgs: HashMap<i64, TgMedia>,
         /// 下载必失败的消息号（模拟字节获取失败）。
         fail_downloads: Vec<i64>,
+        /// BUG-257：true = 每个消息只**第一次**尝试失败（瞬时故障模型），重试放行。
+        /// false（默认，既有测试语义）= 列表内的消息**每次**都失败。
+        fail_first_attempt_only: bool,
+        /// download() 调用计数（按消息号）——重试幂等判据的观测点：
+        /// 已成功条目在 retry 后**不得**再次下载（BUG-257 方向 3 实测要求）。
+        download_calls: Arc<std::sync::Mutex<HashMap<i64, usize>>>,
     }
 
     fn fixture_msg(
@@ -6070,8 +6141,20 @@ mod tests {
             dir: &str,
             _progress: Option<&crate::login::DownloadProgress>,
         ) -> Result<DownloadOutcome, ClientError> {
-            if self.fail_downloads.contains(&message_id) {
-                return Err(ClientError::Other("injected download failure".into()));
+            // 计数先行：无论成败，「这条被下载过几次」都是幂等判据的原始事实。
+            {
+                let mut g = self
+                    .download_calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                *g.entry(message_id).or_insert(0) += 1;
+                let attempts = *g.get(&message_id).unwrap_or(&0);
+                let injected = self.fail_downloads.contains(&message_id);
+                let must_fail =
+                    injected && (!self.fail_first_attempt_only || attempts == 1);
+                if must_fail {
+                    return Err(ClientError::Other("injected download failure".into()));
+                }
             }
             let path = std::path::Path::new(dir).join(format!("fixture-{chat_id}-{message_id}.mp4"));
             std::fs::write(&path, b"fixture-bytes")
@@ -6099,23 +6182,39 @@ mod tests {
         fail: Vec<i64>,
         msgs: Vec<TgMedia>,
     ) -> Arc<AppState> {
+        cache_fixture_state_counted(dir, fail, msgs, false).await.0
+    }
+
+    /// 同 [`cache_fixture_state`]，但把 download() 调用计数交给调用方，
+    /// 并可选「瞬时故障」模型（每消息只第一次失败）——BUG-257 方向 3 的
+    /// 重试幂等判据要用它**实测**「已成功条目不得重新下载」。
+    async fn cache_fixture_state_counted(
+        dir: &std::path::Path,
+        fail: Vec<i64>,
+        msgs: Vec<TgMedia>,
+        fail_first_attempt_only: bool,
+    ) -> (Arc<AppState>, Arc<std::sync::Mutex<HashMap<i64, usize>>>) {
         let mut by_id = HashMap::new();
         for m in msgs {
             by_id.insert(m.id, m);
         }
         let mut cfg = Config::default();
         cfg.download_dir = dir.to_path_buf();
-        Arc::new(AppState::new(
+        let calls = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let st = Arc::new(AppState::new(
             Arc::new(CacheFixtureClient {
                 chat_id: CACHE_FIXTURE_CHAT,
                 msgs: by_id,
                 fail_downloads: fail,
+                fail_first_attempt_only,
+                download_calls: calls.clone(),
             }),
             cfg,
             Availability::Ready,
             false,
             Store::open(":memory:").await.expect("in-memory store must open"),
-        ))
+        ));
+        (st, calls)
     }
 
     async fn enqueue_fixture_task(st: &AppState, ids: &[i64], group: Option<i64>) -> CacheTask {
@@ -6406,6 +6505,195 @@ mod tests {
             ));
         }
         out
+    }
+
+    /// BUG-257 方向 3（裁定 2026-10-10）：**一条条目失败不得终止整个任务**。
+    ///
+    /// 旧行为：`Err` 分支立刻 `finish_cache_task("failed")` + `return` —— 9 条任务
+    /// 第 2 条卡死 ⇒ 剩下 7 条**从未尝试**（实测 done=2/9 且整条 failed）。
+    /// 判据：3 条任务、第 2 条失败 ⇒ 终态 `failed`、`done=2`、**条目 3 仍被处理**
+    /// （在库、有字节），汇总 error 列出且只列出失败条目。
+    #[tokio::test]
+    async fn item_failure_is_isolated_and_remaining_items_still_process() {
+        let dir = scratch_dir("bug257_isolate");
+        let (st, _calls) = cache_fixture_state_counted(
+            &dir,
+            vec![2],
+            vec![
+                fixture_msg(1, "video", "video/mp4", Some("某剧 EP01"), None),
+                fixture_msg(2, "video", "video/mp4", Some("某剧 EP02"), None),
+                fixture_msg(3, "video", "video/mp4", Some("某剧 EP03"), None),
+            ],
+            false,
+        )
+        .await;
+        let task = enqueue_fixture_task(&st, &[1, 2, 3], None).await;
+        run_one_cache_task(&st, task.id).await;
+
+        let t = st.store.get_cache_task(task.id).await.unwrap().unwrap();
+        assert_eq!(
+            t.status, "failed",
+            "有失败 ⇒ 任务 failed（部分失败 = failed 的既有状态语义，不新增状态值）"
+        );
+        assert_eq!(
+            t.done, 2,
+            "条目 1/3 必须处理完 —— 旧实现会在第 2 条处整体终止，done 停在 1"
+        );
+
+        // 核心判据：失败条目**之后**的条目不再被放弃。
+        let id3 = st
+            .store
+            .item_id_by_ref("tg", "424242:3")
+            .await
+            .unwrap()
+            .expect("条目 3 必须被处理（旧实现在条目 2 处 return，它从未被尝试）");
+        let it3 = st.store.get_media_item(id3).await.unwrap().unwrap();
+        assert!(it3.file_path.is_some(), "条目 3 必须有字节");
+
+        // 汇总 error：列出且**只列出**失败条目（这就是「哪几条失败了」的答案）。
+        let err = t.error.expect("failed 任务必须带汇总原因");
+        assert!(
+            err.starts_with("1/3 item(s) failed:"),
+            "汇总前缀须是 N/M item(s) failed:（前端据此原样展示）: {err}"
+        );
+        assert!(err.contains("424242:2"), "汇总须列出失败条目: {err}");
+        assert!(
+            !err.contains("424242:1") && !err.contains("424242:3"),
+            "汇总不得把成功条目也列进去: {err}"
+        );
+        assert!(
+            err.contains("injected download failure"),
+            "汇总须带短原因: {err}"
+        );
+    }
+
+    /// BUG-257 方向 3 的**关键另一半**：重试幂等必须实测，不能凭「代码读起来像」。
+    ///
+    /// 对失败任务走真实 retry 路径（`retry_cache_task` 复位 → worker 重跑）：
+    /// - 已成功条目（1/3）**不得再次下载**——`cached_path()`（DB 标志 且 文件存在）
+    ///   直接跳过，download 计数不涨；
+    /// - 只有失败条目（2）重新走下载；
+    /// - `media_item` 不产生重复行（T0 登记按 ref 幂等）。
+    #[tokio::test]
+    async fn retry_reruns_only_the_failed_items_and_never_duplicates_rows() {
+        let dir = scratch_dir("bug257_retry_idempotent");
+        let (st, calls) = cache_fixture_state_counted(
+            &dir,
+            vec![2],
+            vec![
+                fixture_msg(1, "video", "video/mp4", Some("某剧 EP01"), None),
+                fixture_msg(2, "video", "video/mp4", Some("某剧 EP02"), None),
+                fixture_msg(3, "video", "video/mp4", Some("某剧 EP03"), None),
+            ],
+            false,
+        )
+        .await;
+        let task = enqueue_fixture_task(&st, &[1, 2, 3], None).await;
+        run_one_cache_task(&st, task.id).await;
+
+        // 基线：首轮下载计数 = 每条各一次；登记各一行。
+        let refs: Vec<String> = (1..=3).map(|m| format!("{CACHE_FIXTURE_CHAT}:{m}")).collect();
+        let ids_before = {
+            let mut v = Vec::new();
+            for r in &refs {
+                v.push(
+                    st.store
+                        .item_id_by_ref("tg", r)
+                        .await
+                        .unwrap()
+                        .unwrap_or_default(),
+                );
+            }
+            v
+        };
+        assert_eq!(
+            calls.lock().unwrap_or_else(|e| e.into_inner()).get(&1).copied(),
+            Some(1),
+            "前置：条目 1 首轮恰好下载一次"
+        );
+
+        // 真实 retry 路径的 store 步骤（与 retry_task_kernel 同一语句）：
+        // status→queued、done→0、error→NULL。worker 随后重跑同一条任务。
+        let retried = st
+            .store
+            .retry_cache_task(task.id)
+            .await
+            .unwrap()
+            .expect("failed 任务必须可 retry");
+        assert_eq!(retried.status, "queued");
+        run_one_cache_task(&st, task.id).await;
+
+        let g = calls.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            (g.get(&1).copied(), g.get(&3).copied()),
+            (Some(1), Some(1)),
+            "已成功条目在 retry 后**不得**重新下载 —— 这是「重试不重复下载」的硬判据"
+        );
+        assert_eq!(
+            g.get(&2).copied(),
+            Some(2),
+            "只有失败条目重新走下载（恰好再试一次，不是 N 次）"
+        );
+        drop(g);
+
+        for (r, before) in refs.iter().zip(&ids_before) {
+            assert_eq!(
+                count_rows(&st, r).await,
+                1,
+                "条目 {r} 在重试后仍只能有一行 —— 重复登记 = 重复卡片"
+            );
+            let now = st.store.item_id_by_ref("tg", r).await.unwrap().unwrap();
+            assert_eq!(now, *before, "重试必须命中同一行（upsert 幂等），不得新建");
+        }
+
+        // 条目 2 仍失败（永久故障模型）⇒ 终态仍是 failed，但 done 仍是 2 且
+        // 汇总只含条目 2 —— 重试没有把任务变得更糟。
+        let t = st.store.get_cache_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, "failed");
+        assert_eq!(t.done, 2);
+        let err = t.error.unwrap_or_default();
+        assert!(err.contains("424242:2") && !err.contains("424242:1"), "{err}");
+    }
+
+    /// 瞬时故障模型：重试后失败条目**恢复成功** ⇒ 任务到 `done`，且成功条目
+    /// **依旧零重下**。这半边证明「重试」是真实的出路，而不是永远 failed 的死循环。
+    #[tokio::test]
+    async fn transient_failure_completes_on_retry_without_redownloading_successes() {
+        let dir = scratch_dir("bug257_retry_transient");
+        let (st, calls) = cache_fixture_state_counted(
+            &dir,
+            vec![2],
+            vec![
+                fixture_msg(1, "video", "video/mp4", Some("某剧 EP01"), None),
+                fixture_msg(2, "video", "video/mp4", Some("某剧 EP02"), None),
+                fixture_msg(3, "video", "video/mp4", Some("某剧 EP03"), None),
+            ],
+            true, // 第 2 条只第一次失败：模拟「网络抖了一下」
+        )
+        .await;
+        let task = enqueue_fixture_task(&st, &[1, 2, 3], None).await;
+        run_one_cache_task(&st, task.id).await;
+        assert_eq!(
+            st.store.get_cache_task(task.id).await.unwrap().unwrap().status,
+            "failed",
+            "前置：首轮因条目 2 失败"
+        );
+
+        st.store.retry_cache_task(task.id).await.unwrap().unwrap();
+        run_one_cache_task(&st, task.id).await;
+
+        let t = st.store.get_cache_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, "done", "瞬时故障清除后，重试必须让任务走到 done");
+        assert_eq!(t.done, 3, "三条全部就位");
+        assert!(t.error.is_none(), "done 任务不得残留失败原因");
+
+        let g = calls.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            (g.get(&1).copied(), g.get(&3).copied()),
+            (Some(1), Some(1)),
+            "恢复重试同样不得重下已成功条目"
+        );
+        assert_eq!(g.get(&2).copied(), Some(2), "只有条目 2 被重下");
     }
 
     /// P1 判据 a：字节获取失败 → 条目**已登记**（file_path=NULL、槽位仍在）、
