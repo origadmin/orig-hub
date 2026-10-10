@@ -1067,6 +1067,15 @@ pub struct EpisodeView {
     /// 与 `sources`（播放来源，只认 video）语义正交 —— 这里是**浏览位**，不进播放序列。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<EpisodeImageMeta>,
+    /// 这一集**是否还有可重取/可切的 TG 来源**（BUG-261 下发步）：
+    ///
+    /// 主条目 `source == 'tg'` 且 ref 非空 ⇒ true（集无字节也能凭 ref 重取）；
+    /// 主条目不可重取但任一备用源是带 ref 的 TG 条目 ⇒ 同样 true（可切换）。
+    /// 两者皆无 ⇒ false（本地条目无 ref，缓存引擎端点只吃 `chatId + messageIds`）。
+    ///
+    /// **判据刻意不含 `has_bytes`**：有字节的 TG 条目同样 true —— 那正是
+    /// 「有更好版本能切换」的前置信号。纯读模型推导，不新增任何列。
+    pub has_recacheable_source: bool,
 }
 
 /// 集级挂图元数据（BUG-168）：`media_episode_image` join `media_item` 的读视图。
@@ -1090,6 +1099,22 @@ pub struct SourceRef {
     pub item_id: i64,
     pub title: Option<String>,
     pub kind: Option<String>,
+    /// 条目来源（local / tg）。BUG-261：只有 TG 来源能被缓存引擎重取
+    ///（`POST /api/tg/cache/tasks` 吃 `chatId + messageIds`，即 ref），
+    /// 壳侧据此分辨「这个备用源能不能点缓存」。
+    pub source: Option<String>,
+    /// 来源标识（TG `chat:msg` ref / 本地路径）。与 `source` 配对，是按来源
+    /// 下发缓存任务的唯一坐标 —— 标题不可靠。序列化为 `ref`。
+    #[serde(rename = "ref")]
+    pub ref_key: Option<String>,
+    /// 字节大小（`media_item.size`；未落盘为 None）。
+    pub size: Option<i64>,
+    /// 时长秒（`media_item.duration`；缺失为 None）。
+    pub duration: Option<i64>,
+    /// 该备用源**当前有没有字节**：与分集主条目同源 —— 读出 `file_path` 后
+    /// 走 [`crate::cache::probe_cached_bytes`]，`Present` 才算有（三态压成布尔，
+    /// `Unknown` 按「不声称有」处理）。
+    pub has_bytes: bool,
 }
 
 /// 集级「挂载」统一读模型的一项（D1=B 第一步：统一读模型）。
@@ -1869,14 +1894,20 @@ impl Store {
                 has_bytes: presence == BytesPresence::Present,
                 sources: Vec::new(),
                 images: Vec::new(),
+                // 占位：备用来源补齐后在下方统一推导（需先知道该集有哪些 TG 备用源）。
+                has_recacheable_source: false,
             });
         }
         // 备用来源（BUG-039）：一次查询补齐全部分集的来源列表（避免逐集 N+1）。
+        // BUG-261：补 SELECT 列（source/ref/size/duration/file_path）——壳侧要能
+        // 按**来源 ref**（`chatId + messageIds`）对备用源直接下发缓存任务，并展示
+        // 大小/时长/是否已有字节；判据与主条目同源（probe_cached_bytes），零 schema 变更。
         let ids: Vec<i64> = episodes.iter().map(|e| e.id).collect();
         if !ids.is_empty() {
             let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
-                "SELECT s.episode_id, s.item_id, i.title, i.kind
+                "SELECT s.episode_id, s.item_id, i.title, i.kind,
+                        i.source, i.ref, i.size, i.duration, i.file_path
                    FROM media_episode_source s
                    LEFT JOIN media_item i ON i.id = s.item_id
                   WHERE s.episode_id IN ({placeholders})
@@ -1888,16 +1919,45 @@ impl Store {
                 std::collections::HashMap::new();
             while let Some(r) = rows.next().await? {
                 let ep_id: i64 = r.get(0)?;
+                // 与分集主条目同一套字节真值：绝对路径恒等解析后 stat，
+                // `Present` 才算有（BUG-132 同款，不新写第二套判据）。
+                let file_path: Option<String> = r.get(8)?;
+                let src_has_bytes = match file_path.as_deref() {
+                    Some(p) => {
+                        let abs = crate::cache::resolve_item_path(&lib_root, p);
+                        probe_cached_bytes(&abs.to_string_lossy()).await
+                            == BytesPresence::Present
+                    }
+                    None => false,
+                };
                 by_ep.entry(ep_id).or_default().push(SourceRef {
                     item_id: r.get(1)?,
                     title: r.get(2)?,
                     kind: r.get(3)?,
+                    source: r.get(4)?,
+                    ref_key: r.get(5)?,
+                    size: r.get(6)?,
+                    duration: r.get(7)?,
+                    has_bytes: src_has_bytes,
                 });
             }
             for e in episodes.iter_mut() {
                 if let Some(list) = by_ep.remove(&e.id) {
                     e.sources = list;
                 }
+            }
+            // BUG-261：每集的「可重取/可切源」标志 —— 主条目是带 ref 的 TG 条目，
+            // 或任一备用源是带 ref 的 TG 条目，即视为该集仍有可缓存来源。
+            // 判据只看 source/ref（不看 has_bytes）：无字节的 TG 来源恰是
+            // 「要缓存」的对象，有字节的则是「可切换」的对象。
+            let main_cacheable = |e: &EpisodeView| {
+                e.source.as_deref() == Some("tg") && e.ref_key.as_deref().is_some_and(|s| !s.is_empty())
+            };
+            for e in episodes.iter_mut() {
+                e.has_recacheable_source = main_cacheable(e)
+                    || e.sources
+                        .iter()
+                        .any(|s| s.source.as_deref() == Some("tg") && s.ref_key.as_deref().is_some_and(|r| !r.is_empty()));
             }
         }
         // 集级挂图（BUG-168）：与上方备用来源同一套批量补齐纪律 —— 一条 join 查全
@@ -6573,6 +6633,115 @@ mod tests {
         s.detach_episode_source(ep, a).await.unwrap();
         let detail = s.get_series(sid).await.unwrap().unwrap();
         assert!(detail.episodes[0].sources.is_empty());
+    }
+
+    /// BUG-261 下发步（验收①）：备用源的 `SourceRef` 必须带全缓存坐标 ——
+    /// `source/ref/size/duration/has_bytes`，值与库一致。
+    ///
+    /// 背景：缓存引擎端点吃 `chatId + messageIds`（即来源 ref），壳侧若拿不到
+    /// 备用源的 ref，一切「按来源缓存」都无从谈起。字节真值与主条目同源
+    ///（`probe_cached_bytes`）：落盘文件在场 ⇒ true，无 file_path ⇒ false。
+    /// 零 schema 变更 —— 纯 SELECT 补列 + 读模型。
+    #[tokio::test]
+    async fn source_ref_exposes_recache_coordinates_bug261() {
+        let db_path = tmp_db("bug261_source_ref");
+        let dir = db_path.parent().unwrap().to_path_buf();
+        let s = Store::open(db_path).await.unwrap();
+        // 两份真实落盘文件（绝对路径 ⇒ resolve 恒等，probe 直接 stat）。
+        let f1 = dir.join("bug261_alt1.mp4");
+        std::fs::write(&f1, b"payload-alt1").unwrap();
+        let f2 = dir.join("bug261_alt2.mp4");
+        std::fs::write(&f2, b"payload-alt2").unwrap();
+
+        let sid = s.create_series("剧", None, "series", None, None).await.unwrap();
+        // 主条目：tg、有字节、有大小/时长
+        let main = s
+            .upsert_media_item(
+                "tg", "100:1", "主", "video",
+                Some(&f1.to_string_lossy()), Some(111), Some(61), None,
+            )
+            .await
+            .unwrap();
+        // 备用源 A：tg、有字节、有大小/时长
+        let alt_a = s
+            .upsert_media_item(
+                "tg", "100:2", "备A", "video",
+                Some(&f2.to_string_lossy()), Some(222), Some(62), None,
+            )
+            .await
+            .unwrap();
+        // 备用源 B：tg、**无字节**（无 file_path）
+        let alt_b = s
+            .upsert_media_item("tg", "100:3", "备B", "video", None, Some(333), Some(63), None)
+            .await
+            .unwrap();
+        let ep = s.add_episode(sid, main, 1, 1).await.unwrap();
+        assert!(s.attach_episode_source(ep, alt_a).await.unwrap());
+        assert!(s.attach_episode_source(ep, alt_b).await.unwrap());
+
+        let det = s.get_series(sid).await.unwrap().unwrap();
+        let e = &det.episodes[0];
+        // 主条目自身：字节在场（同一 probe 口径）
+        assert!(e.has_bytes, "主条目落盘文件在场 ⇒ has_bytes");
+
+        assert_eq!(e.sources.len(), 2, "两个备用源");
+        let a = e.sources.iter().find(|x| x.item_id == alt_a).unwrap();
+        assert_eq!(a.source.as_deref(), Some("tg"));
+        assert_eq!(a.ref_key.as_deref(), Some("100:2"), "ref 必须原样下发（缓存坐标）");
+        assert_eq!(a.title.as_deref(), Some("备A"));
+        assert_eq!(a.kind.as_deref(), Some("video"));
+        assert_eq!(a.size, Some(222), "size 取自关联 media_item 行");
+        assert_eq!(a.duration, Some(62), "duration 取自关联 media_item 行");
+        assert!(a.has_bytes, "备用源 A 落盘文件在场 ⇒ has_bytes=true");
+
+        let b = e.sources.iter().find(|x| x.item_id == alt_b).unwrap();
+        assert_eq!(b.source.as_deref(), Some("tg"));
+        assert_eq!(b.ref_key.as_deref(), Some("100:3"));
+        assert_eq!(b.size, Some(333));
+        assert_eq!(b.duration, Some(63));
+        assert!(!b.has_bytes, "备用源 B 无 file_path ⇒ has_bytes=false");
+    }
+
+    /// BUG-261 下发步（验收②）：`has_recacheable_source` 三态。
+    ///
+    /// 判据 = 主条目是带 ref 的 TG 条目 **或** 任一备用源是带 ref 的 TG 条目；
+    /// 刻意不看 has_bytes（无字节的 TG 来源恰是「要缓存」的对象）。
+    #[tokio::test]
+    async fn has_recacheable_source_three_states_bug261() {
+        let s = Store::open(tmp_db("bug261_recache")).await.unwrap();
+        let sid = s.create_series("剧", None, "series", None, None).await.unwrap();
+
+        // ① 主源 tg 有 ref ⇒ true
+        let m1 = s.upsert_media_item("tg", "200:1", "v1", "video", None, None, None, None).await.unwrap();
+        s.add_episode(sid, m1, 1, 1).await.unwrap();
+
+        // ② 主源非 tg（local）但有 tg 备用源 ⇒ true
+        let m2 = s
+            .upsert_media_item("local", "C:\\local\\v2.mp4", "v2", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let alt2 = s.upsert_media_item("tg", "200:2", "v2-alt", "video", None, None, None, None).await.unwrap();
+        let ep2 = s.add_episode(sid, m2, 1, 2).await.unwrap();
+        assert!(s.attach_episode_source(ep2, alt2).await.unwrap());
+
+        // ③ 主源非 tg 且备用源也非 tg ⇒ false
+        let m3 = s
+            .upsert_media_item("local", "C:\\local\\v3.mp4", "v3", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let alt3 = s
+            .upsert_media_item("local", "C:\\local\\v3-alt.mp4", "v3-alt", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let ep3 = s.add_episode(sid, m3, 1, 3).await.unwrap();
+        assert!(s.attach_episode_source(ep3, alt3).await.unwrap());
+
+        let det = s.get_series(sid).await.unwrap().unwrap();
+        let eps = &det.episodes;
+        assert_eq!(eps.len(), 3);
+        assert!(eps[0].has_recacheable_source, "主源 tg 有 ref ⇒ true");
+        assert!(eps[1].has_recacheable_source, "主源 local 但有 tg 备用源 ⇒ true");
+        assert!(!eps[2].has_recacheable_source, "主源与备用源皆 local ⇒ false");
     }
 
     /// BUG-275 判据 1（`switch_episode_source`）：事务错误路径的 `ROLLBACK`

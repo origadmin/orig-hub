@@ -200,6 +200,14 @@ export interface MediaEpisode {
    * 清缓存只删字节留条目，没有它前端无从分辨「点开能播」与「点了 404」。
    */
   hasBytes?: boolean | null
+  /**
+   * 这一集是否仍有可重取/可切的 TG 来源（BUG-261 下发步）。
+   * 主条目 `source === 'tg'` 且 ref 非空，或任一备用源如此 ⇒ true。
+   * true ⇒ 该集无论何时都可缓存/切换来源（缓存引擎端点吃来源 ref）；
+   * false ⇒ 纯本地来源，无 ref 坐标，缓存无从下发。
+   * 判据不含 hasBytes —— 无字节的 TG 来源正是「要缓存」的对象。
+   */
+  hasRecacheableSource: boolean
 }
 
 /** 剧集分集的备用来源引用 */
@@ -207,6 +215,16 @@ export interface EpisodeSourceRef {
   itemId: number
   title?: string | null
   kind?: MediaKind | null
+  /** 条目来源（'local' / 'tg'）。只有 'tg' 来源能被缓存引擎按 ref 重取（BUG-261） */
+  source?: string | null
+  /** 来源标识（TG `chat:msg` ref / 本地路径）—— 按来源下发缓存任务的坐标 */
+  ref?: string | null
+  /** 字节大小（未落盘为 null） */
+  size?: number | null
+  /** 时长秒（缺失为 null） */
+  duration?: number | null
+  /** 该备用源当前有没有字节（与主条目同一套 probe 真值） */
+  hasBytes?: boolean | null
 }
 
 /** 集级挂图元数据（BUG-168）：`media_episode_image` join `media_item` 的读视图 */
