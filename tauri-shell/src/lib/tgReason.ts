@@ -20,6 +20,7 @@ export type TgReasonKey =
   | 'tg.reasonConfig'
   | 'tg.reasonAuth'
   | 'tg.reasonStalled'
+  | 'tg.reasonTooSlow'
   | 'tg.reasonRestarted'
   | 'tg.reasonNetwork'
   | 'tg.reasonUnknown'
@@ -39,6 +40,20 @@ export type TgReasonKey =
  * 给每个数字留一个漏网口。`stalled|no bytes for|connection presumed dead` 三者任一即可。
  */
 const STALLED_RE = /download stalled|no bytes for \d+s|connection presumed dead/i
+
+/**
+ * 「慢流」判据（BUG-271）：单条目耗时超过墙钟上限。
+ *
+ * 原文形如 `download too slow: 1805.2s for chat -1001 msg 55; wall-clock limit 1800s
+ * exceeded, aborted to keep the cache queue moving`。
+ *
+ * **必须与「停滞」（STALLED_RE）分开**：停滞是「无字节」（死），慢流是「有字节但
+ * 总耗时超限」（慢）——用户可行动指引不同（停滞查代理稳定性，慢流换更快的来源或
+ * 调大 `download_item_max_secs`）。也**必须排在网络类之前**：原因串含
+ * `wall-clock`，虽不含 `connect`，但网络正则宽（`transport` 等），任何重叠都会把
+ * 具体诊断吞成「检查网络与代理」——BUG-257 点 3 的同款坑，不得再踩。
+ */
+const TOO_SLOW_RE = /download too slow|wall-clock limit \d+s exceeded/i
 
 /**
  * 「因重启中断」的判据（BUG-257 点2/ 判据 5）。
@@ -65,6 +80,8 @@ export function classifyTgReason(reason: string | null | undefined): TgReasonKey
   if (/offline debug mode/i.test(raw)) return 'tg.reasonOfflineDebug'
   // 停滞与重启必须**先于**网络类：它们的原文含 `connect`/`restart`，会被网络正则吞掉。
   if (STALLED_RE.test(raw)) return 'tg.reasonStalled'
+  // 慢流同样先于网络类（BUG-271）：否则被宽泛网络正则吞成「检查网络与代理」。
+  if (TOO_SLOW_RE.test(raw)) return 'tg.reasonTooSlow'
   if (RESTARTED_RE.test(raw)) return 'tg.reasonRestarted'
   if (/flood|rate limit|too many|retry after|FLOOD_WAIT/i.test(raw)) return 'tg.reasonFlood'
   if (/api_id|api_hash|api credential|not configured|missing api|credentials/i.test(raw))

@@ -365,6 +365,7 @@
   "tg.reasonNetwork": "Cannot reach Telegram. Check your network and proxy settings, then retry.",
   "tg.reasonAuth": "The Telegram credentials are no longer valid. Please bind the account again.",
   "tg.reasonStalled": "Transfer stalled: the connection was established but the byte stream stopped advancing, so this item was aborted to keep the queue moving. Retrying usually helps; if it persists, check proxy stability.",
+  "tg.reasonTooSlow": "Download too slow: this item exceeded the per-item time cap (30 minutes by default), so it was aborted to keep the queue moving. Retry to resume it; if the source stays slow, raise the per-item download timeout setting.",
   "tg.reasonRestarted": "Interrupted by a service restart. This task is resumable: already-downloaded items are kept, and a retry only fetches the ones that are missing.",
   "tg.reasonFlood": "Telegram is rate-limiting this account. Please try again later.",
   "tg.reasonConfig": "Telegram API credentials are not configured yet. Finish the service setup first.",

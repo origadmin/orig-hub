@@ -30,6 +30,12 @@ pub struct Config {
     /// MTProto 出口socks5代理 URL（如 "socks5://127.0.0.1:7897"）；为空走直连。
     /// 国内网络直连 Telegram 常不可达，设置后取码/登录/下载均经该代理。
     pub proxy: Option<String>,
+    /// 单条目下载**墙钟上限**（秒，BUG-271）：总耗时超过即判该条目失败（治「慢」）。
+    /// DB `app_setting: download_item_max_secs` 可运行时覆盖（允许小数秒）。
+    pub download_item_max_secs: u64,
+    /// 单条目下载**空闲上限**（秒，BUG-257/271）：连续无字节超过即判停滞（治「死」）。
+    /// DB `app_setting: download_idle_max_secs` 可运行时覆盖。
+    pub download_idle_secs: u64,
 }
 
 impl Default for Config {
@@ -47,6 +53,8 @@ impl Default for Config {
             monitor_interval_secs: 30,
             download_dir: default_download_dir(),
             proxy: None,
+            download_item_max_secs: 30 * 60,
+            download_idle_secs: 90,
         }
     }
 }
@@ -95,6 +103,17 @@ impl Config {
         if let Ok(v) = std::env::var("ORIG_TG_MONITOR_INTERVAL") {
             if let Ok(n) = v.parse() {
                 cfg.monitor_interval_secs = n;
+            }
+        }
+        // BUG-271：墙钟 / 空闲两档阈值的 env 层（链为 app_setting > env > 默认）。
+        if let Ok(v) = std::env::var("ORIG_TG_DOWNLOAD_MAX_SECS") {
+            if let Ok(n) = v.parse() {
+                cfg.download_item_max_secs = n;
+            }
+        }
+        if let Ok(v) = std::env::var("ORIG_TG_DOWNLOAD_IDLE_SECS") {
+            if let Ok(n) = v.parse() {
+                cfg.download_idle_secs = n;
             }
         }
         if let Ok(v) = std::env::var("ORIG_TG_DOWNLOAD_DIR") {

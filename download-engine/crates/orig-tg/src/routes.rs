@@ -937,6 +937,37 @@ async fn cached_path(st: &AppState, chat_id: i64, message_id: i64) -> Option<Str
 ///
 /// `task_id`（BUG-181）：Some 时把条目内字节进度挂到该任务（`cache_dl_begin/end`），
 /// 任务端点序列化时注入 `itemBytes`/`itemBytesTotal`；单条端点传 None 不报。
+/// 单条目下载限额的运行时解析（BUG-271，照 `resolve_cache_dir` 先例）。
+///
+/// 链：DB `app_setting` > config(env) > 类型默认。**「请求」档不适用**：
+/// 限额在缓存 worker 内解析，没有 HTTP 请求上下文（`resolve_cache_dir` 的请求档
+/// 来自入队请求的 `dir` 参数，这里没有对应入参）——这是一处如实登记的口径收窄。
+///
+/// 两个键都按秒解析，墙钟允许小数（测试夹具用亚秒档，生产为整档）。
+/// 解析失败回退 config，绝不 panic；钳位防止 0/负值把看门狗变相关掉：
+/// 墙钟 ∈ [0.1s, 24h]，空闲 ∈ [5s, 24h]（空闲 <5s 等于「治死」档失效）。
+async fn download_limits(st: &AppState) -> crate::login::DownloadLimits {
+    const MAX_SECS: f64 = 24.0 * 3600.0;
+    let wall = setting_secs(st, "download_item_max_secs", st.config.download_item_max_secs as f64)
+        .await
+        .clamp(0.1, MAX_SECS);
+    let idle = setting_secs(st, "download_idle_max_secs", st.config.download_idle_secs as f64)
+        .await
+        .clamp(5.0, MAX_SECS);
+    crate::login::DownloadLimits {
+        idle: std::time::Duration::from_secs_f64(idle),
+        wall: std::time::Duration::from_secs_f64(wall),
+    }
+}
+
+/// `app_setting` 里的秒数（允许小数）；缺键/空/解析失败一律回退 `fallback`。
+async fn setting_secs(st: &AppState, key: &str, fallback: f64) -> f64 {
+    match st.store.get_setting(key).await {
+        Ok(Some(v)) if !v.trim().is_empty() => v.trim().parse::<f64>().unwrap_or(fallback),
+        _ => fallback,
+    }
+}
+
 async fn cache_one_bytes(
     st: &AppState,
     task_id: Option<i64>,
@@ -949,13 +980,23 @@ async fn cache_one_bytes(
     if let Some(id) = task_id {
         st.cache_dl_begin(id);
     }
-    let outcome = match st
-        .client
-        .download(chat_id, message_id, dir, Some(&st.cache_dl))
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => {
+    // BUG-271：墙钟（治「慢」）围绕**整个条目**下载计时——与 grammers 流循环内的
+    // 空闲看门狗（治「死」，chunk 间判定）并存不合并。「每 89s 来一小块」的流
+    // 空闲永不触发，这里必触发。超墙钟走 [`Client::download_limited`] 携带的同一
+    // 限额结构，墙钟计时放在路由层：限额从 app_setting 运行时解析（见上），
+    // 且超时取消与 BUG-257 的取消语义同构——future 被 drop，`.part` 随之清理。
+    let limits = download_limits(st).await;
+    let started = std::time::Instant::now();
+    let download = st.client.download_limited(
+        chat_id,
+        message_id,
+        dir,
+        Some(&st.cache_dl),
+        &limits,
+    );
+    let outcome = match tokio::time::timeout(limits.wall, download).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
             if task_id.is_some() {
                 st.cache_dl_end();
             }
@@ -972,6 +1013,26 @@ async fn cache_one_bytes(
                 StatusCode::SERVICE_UNAVAILABLE,
                 &format!("{hint}: {reason}"),
             ));
+        }
+        Err(_elapsed) => {
+            // 超墙钟：**原因串必须与「no bytes for 90s」逐字可区分**（BUG-271 判据 4）。
+            // 刻意避开分类链路里网络类的全部签名词（connect/network/timeout/dropped/
+            // stalled），否则会被 `tg.reasonNetwork` 吃掉——BUG-257 点 3 同款坑。
+            // 该条目由调用方（`run_one_cache_task` 的失败隔离）记入汇总并继续跑
+            // 剩余条目，不弃单。
+            if task_id.is_some() {
+                st.cache_dl_end();
+            }
+            let reason = format!(
+                "download too slow: {:.1}s for chat {chat_id} msg {message_id}; \
+                 wall-clock limit {}s exceeded, aborted to keep the cache queue moving",
+                started.elapsed().as_secs_f64(),
+                limits.wall.as_secs()
+            );
+            st.push_log(&format!(
+                "cache_one({chat_id},{message_id}): too slow -> {reason}"
+            ));
+            return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, &reason));
         }
     };
     if task_id.is_some() {
@@ -5149,6 +5210,7 @@ async fn scan_media_dir(
 #[cfg(test)]
 mod tests {
     use super::delete_media_item;
+    use super::download_limits;
     use super::delivery_due_secs;
     use super::cache_tasks_payload;
     use super::create_media_series;
@@ -6234,6 +6296,281 @@ mod tests {
             .expect("enqueue must succeed")
             .expect("task must be created")
             .0
+    }
+
+    // ── BUG-271：慢流（墙钟上限）夹具与判据 ───────────────────────────────
+
+    /// 「每 interval 来 1 chunk、共 chunks 块」的慢流客户端（BUG-271 判据 1）。
+    ///
+    /// 间隔刻意**远小于**空闲看门狗（90s）⇒ 空闲档对它**永不触发**——这正是
+    /// 「慢」与「死」的分界：旧代码（无墙钟）会正常完成下载（只是慢），
+    /// 新代码在墙钟内判失败。生产里的「每 89s 来 1 chunk」被等比缩到测试尺度
+    /// （每 120ms 来 1 chunk），语义不变：chunk 间隔 ≪ 空闲阈值、总量 ≫ 墙钟。
+    struct TrickleClient {
+        chat_id: i64,
+        msgs: HashMap<i64, TgMedia>,
+        /// 走慢流的消息号；其余消息瞬时完成（与 CacheFixtureClient 同款落盘）。
+        trickle: Vec<i64>,
+        chunk_interval: std::time::Duration,
+        chunks: usize,
+        download_calls: Arc<std::sync::Mutex<HashMap<i64, usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Client for TrickleClient {
+        async fn start(&self, _phone: &str) -> Result<LoginPhase, ClientError> {
+            Ok(LoginPhase::CodeRequired)
+        }
+        async fn submit_code(&self, _p: &str, _c: &str) -> Result<LoginPhase, ClientError> {
+            Ok(LoginPhase::Authorized)
+        }
+        async fn submit_password(&self, _p: &str, _w: &str) -> Result<LoginPhase, ClientError> {
+            Err(ClientError::Other("no 2FA in trickle fixture".into()))
+        }
+        async fn view(&self) -> SessionView {
+            SessionView { phase: LoginPhase::Authorized, phone: None, user_id: None }
+        }
+        async fn dialogs(&self) -> Result<Vec<Channel>, ClientError> {
+            Ok(Vec::new())
+        }
+        async fn folders(&self) -> Result<Vec<Folder>, ClientError> {
+            Ok(Vec::new())
+        }
+        async fn messages(
+            &self,
+            _c: i64,
+            _l: u32,
+            _b: Option<i64>,
+        ) -> Result<Vec<TgMedia>, ClientError> {
+            Ok(Vec::new())
+        }
+        async fn thumb(&self, _: i64, _: i64) -> Result<Option<Thumbnail>, ClientError> {
+            Ok(None)
+        }
+        async fn media(
+            &self,
+            _: i64,
+            _: i64,
+            _: Option<MediaRange>,
+        ) -> Result<MediaStream, ClientError> {
+            Err(ClientError::MediaNotFound)
+        }
+        /// 慢流：逐 chunk 落盘、chunk 间睡 `chunk_interval`（**远小于**空闲阈值）。
+        /// 被墙钟掐断时本 future 被 drop——与生产流被 drop 同构，残余半截文件
+        /// 留在落盘目录（DB 无 downloaded 标志 ⇒ `cached_path` 不会误判已缓存）。
+        async fn download(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+            dir: &str,
+            _progress: Option<&crate::login::DownloadProgress>,
+        ) -> Result<DownloadOutcome, ClientError> {
+            {
+                let mut g = self.download_calls.lock().unwrap_or_else(|e| e.into_inner());
+                *g.entry(message_id).or_insert(0) += 1;
+            }
+            let path = std::path::Path::new(dir).join(format!("trickle-{chat_id}-{message_id}.mp4"));
+            if !self.trickle.contains(&message_id) {
+                std::fs::write(&path, b"fast-bytes")
+                    .map_err(|e| ClientError::Other(format!("write: {e}")))?;
+                return Ok(DownloadOutcome {
+                    message_id,
+                    path: path.to_string_lossy().into_owned(),
+                    bytes: 10,
+                });
+            }
+            let mut f = std::fs::File::create(&path)
+                .map_err(|e| ClientError::Other(format!("create: {e}")))?;
+            let mut total = 0u64;
+            for i in 0..self.chunks {
+                tokio::time::sleep(self.chunk_interval).await;
+                use std::io::Write;
+                f.write_all(format!("chunk-{i};").as_bytes())
+                    .map_err(|e| ClientError::Other(format!("write: {e}")))?;
+                total += 8;
+            }
+            Ok(DownloadOutcome {
+                message_id,
+                path: path.to_string_lossy().into_owned(),
+                bytes: total,
+            })
+        }
+        async fn message_meta(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+        ) -> Result<Option<TgMedia>, ClientError> {
+            if chat_id != self.chat_id {
+                return Ok(None);
+            }
+            Ok(self.msgs.get(&message_id).cloned())
+        }
+    }
+
+    /// 慢流夹具状态（同 `cache_fixture_state` 的构造纪律）。
+    async fn trickle_fixture_state(
+        dir: &std::path::Path,
+        trickle: Vec<i64>,
+        interval: std::time::Duration,
+        chunks: usize,
+        msgs: Vec<TgMedia>,
+    ) -> (
+        Arc<AppState>,
+        Arc<std::sync::Mutex<HashMap<i64, usize>>>,
+    ) {
+        let mut by_id = HashMap::new();
+        for m in msgs {
+            by_id.insert(m.id, m);
+        }
+        let mut cfg = Config::default();
+        cfg.download_dir = dir.to_path_buf();
+        let calls = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let st = Arc::new(AppState::new(
+            Arc::new(TrickleClient {
+                chat_id: CACHE_FIXTURE_CHAT,
+                msgs: by_id,
+                trickle,
+                chunk_interval: interval,
+                chunks,
+                download_calls: calls.clone(),
+            }),
+            cfg,
+            Availability::Ready,
+            false,
+            Store::open(":memory:").await.expect("in-memory store must open"),
+        ));
+        (st, calls)
+    }
+
+    fn trickle_msgs() -> Vec<TgMedia> {
+        vec![
+            fixture_msg(1, "video", "video/mp4", Some("某剧 EP01"), None),
+            fixture_msg(2, "video", "video/mp4", Some("某剧 EP02"), None),
+            fixture_msg(3, "video", "video/mp4", Some("某剧 EP03"), None),
+        ]
+    }
+
+    /// BUG-271 判据 1：慢流（chunk 间隔 ≪ 空闲阈值）在**墙钟内**判失败，且**不弃单**。
+    ///
+    /// 「每 89s 来 1 chunk」在生产不可测（30min 档要等半小时），按语义等比缩小：
+    /// 每 120ms 来 1 chunk（≪ 90s 空闲 ⇒ 空闲档永不触发，证明这确实是「慢」不是
+    /// 「死」）、共 6 块 ≈ 0.72s（≫ 墙钟 0.4s，经 `download_item_max_secs` 设置注入）。
+    /// 期望：条目 2 被墙钟判失败、条目 1/3 照常处理（done=2）、汇总只列条目 2、
+    /// 原因串为「too slow」而非「no bytes for」——两种病两种话。
+    #[tokio::test]
+    async fn trickle_stream_hits_the_wall_clock_without_abandoning_the_rest() {
+        let dir = scratch_dir("bug271_trickle_wall");
+        let (st, calls) =
+            trickle_fixture_state(&dir, vec![2], std::time::Duration::from_millis(120), 6, trickle_msgs())
+                .await;
+        // 墙钟经 app_setting 注入（判据 3：改设置即生效，无需重编译）。
+        st.store.set_setting("download_item_max_secs", "0.4").await.unwrap();
+        let task = enqueue_fixture_task(&st, &[1, 2, 3], None).await;
+
+        let t0 = std::time::Instant::now();
+        run_one_cache_task(&st, task.id).await;
+        let elapsed = t0.elapsed();
+
+        let t = st.store.get_cache_task(task.id).await.unwrap().unwrap();
+        assert_eq!(t.status, "failed", "超墙钟条目须判失败（失败隔离通道）");
+        assert_eq!(
+            t.done, 2,
+            "条目 2 超墙钟 ⇒ done 停在 2；若为 3 说明墙钟没起作用（判据 1 FAIL）"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "慢流必须在墙钟内被掐断（实测 {elapsed:?}），而不是等它自己下完/等满空闲阈值"
+        );
+        // 条目 2 确实启动过（夹具前提），但没跑完（若跑完 done 会是 3）。
+        assert_eq!(calls.lock().unwrap_or_else(|e| e.into_inner()).get(&2).copied(), Some(1));
+
+        // 不弃单：失败条目**之后**的条目照常入库。
+        let id3 = st
+            .store
+            .item_id_by_ref("tg", "424242:3")
+            .await
+            .unwrap()
+            .expect("条目 3 必须被处理（不弃单）");
+        assert!(st.store.get_media_item(id3).await.unwrap().unwrap().file_path.is_some());
+
+        // 原因串：与「no bytes for 90s」逐字可区分（判据 4 的引擎侧）。
+        let err = t.error.expect("failed 任务须带汇总");
+        assert!(err.starts_with("1/3 item(s) failed:"), "{err}");
+        assert!(err.contains("424242:2"), "{err}");
+        assert!(!err.contains("424242:1") && !err.contains("424242:3"), "{err}");
+        assert!(
+            err.contains("download too slow"),
+            "超墙钟原因必须是「too slow」语义: {err}"
+        );
+        assert!(
+            !err.contains("no bytes for") && !err.contains("download stalled"),
+            "「慢」不得被说成「死」——空闲看门狗的原因串不许出现在这里: {err}"
+        );
+    }
+
+    /// BUG-271 判据 2（反向证伪）：**墙钟够不着时**，同一条慢流会正常下完 ⇒ 任务
+    /// `done`。这就是判据 1 在「去掉墙钟分支」后的形态——若有人删掉超时分支，
+    /// 判据 1 的测试会退化成本测试的结果（done=3）而 FAIL，证明它测的确实是墙钟。
+    ///
+    /// 同时反证另一件事：全程 0.72s ≪ 90s 空闲阈值 ⇒ **空闲看门狗从未触发**，
+    /// 「慢」不由「死」的判定捕获——两档缺一不可。
+    #[tokio::test]
+    async fn falsification_without_a_reachable_wall_the_trickle_completes_normally() {
+        let dir = scratch_dir("bug271_trickle_no_wall");
+        let (st, _calls) = trickle_fixture_state(
+            &dir,
+            vec![2],
+            std::time::Duration::from_millis(120),
+            6,
+            trickle_msgs(),
+        )
+        .await;
+        // 不设小墙钟：默认 30min（1800s）远超慢流总耗时 0.72s ⇒ 墙钟判据够不着。
+        let task = enqueue_fixture_task(&st, &[1, 2, 3], None).await;
+        run_one_cache_task(&st, task.id).await;
+
+        let t = st.store.get_cache_task(task.id).await.unwrap().unwrap();
+        assert_eq!(
+            t.status, "done",
+            "无（可及的）墙钟时慢流必须正常完成——空闲档不治「慢」"
+        );
+        assert_eq!(t.done, 3, "三条全部下完");
+        assert!(t.error.is_none(), "done 任务不得残留原因");
+    }
+
+    /// BUG-271 判据 3：阈值链 app_setting > config(env) > 默认，改设置**无需重编译**；
+    /// 解析失败回退、钳位防 0 值变相关掉看门狗。
+    #[tokio::test]
+    async fn download_limits_resolve_through_the_setting_chain() {
+        let dir = scratch_dir("bug271_limits_chain");
+        let (st, _calls) = trickle_fixture_state(&dir, vec![], std::time::Duration::from_millis(1), 1, vec![])
+            .await;
+
+        // 默认档：config 默认 == 类型默认（墙钟 30min、空闲 90s）。
+        let d = download_limits(&st).await;
+        assert_eq!(d.wall, std::time::Duration::from_secs(30 * 60));
+        assert_eq!(d.idle, std::time::Duration::from_secs(90));
+
+        // app_setting 覆盖 config（墙钟允许小数——测试与精细调节用）。
+        st.store.set_setting("download_item_max_secs", "12.5").await.unwrap();
+        st.store.set_setting("download_idle_max_secs", "300").await.unwrap();
+        let d = download_limits(&st).await;
+        assert_eq!(d.wall, std::time::Duration::from_secs_f64(12.5));
+        assert_eq!(d.idle, std::time::Duration::from_secs(300));
+
+        // 解析失败回退 config（绝不 panic、绝不静默取 0）。
+        st.store.set_setting("download_item_max_secs", "abc").await.unwrap();
+        assert_eq!(
+            download_limits(&st).await.wall,
+            std::time::Duration::from_secs(30 * 60)
+        );
+
+        // 钳位：0/负值不得把看门狗变相关掉（空闲 <5s 即「治死」档失效）。
+        st.store.set_setting("download_item_max_secs", "0").await.unwrap();
+        st.store.set_setting("download_idle_max_secs", "1").await.unwrap();
+        let d = download_limits(&st).await;
+        assert!(d.wall.as_secs_f64() >= 0.1, "墙钟钳位下限 0.1s");
+        assert!(d.idle.as_secs_f64() >= 5.0, "空闲钳位下限 5s");
     }
 
     /// BUG-181 判据 a：任务 1 在跑时入队任务 2，`/api/tg/cache/tasks` 必须同时给出

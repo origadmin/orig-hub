@@ -101,7 +101,8 @@ function loadModule(src) {
       .replace(/\)\s*:\s*[\w| \[\]]+\s*\{\s*$/m, ') {')
       .replace(/^function classifyTgReason\(.*$/m, 'function classifyTgReason(reason) {')
   }
-  const js = [takeConst('STALLED_RE'), takeConst('RESTARTED_RE'), takeFn('classifyTgReason')].join('\n\n')
+  // TOO_SLOW_RE（BUG-271）也被 classifyTgReason 引用，须一并抽出，否则 ReferenceError。
+  const js = [takeConst('STALLED_RE'), takeConst('RESTARTED_RE'), takeConst('TOO_SLOW_RE'), takeFn('classifyTgReason')].join('\n\n')
   // 必须显式挂到exports：`new Function` 里的 `const` 只是函数体内的局部绑定，
   // 不会自动出现在 module.exports 上。
   return `${js}\nmodule.exports = { classifyTgReason };\n`

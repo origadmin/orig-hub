@@ -208,6 +208,40 @@ impl DownloadProgress {
     }
 }
 
+/// 单条目下载限额（BUG-271）。
+///
+/// 两个阈值治**两种病**，刻意并存、不得合并成一个判定——合并会把「慢」误判成「死」：
+///
+/// - [`DownloadLimits::idle`]（空闲，默认 90s）：治「**死**」。TCP 半死/代理断流时
+///   range 流的 `next()` 永不返回，没有它 worker 卡死在条目内。判据是「无字节间隔」，
+///   任何非空 chunk 重置计时。
+/// - [`DownloadLimits::wall`]（墙钟，默认 30min）：治「**慢**」。空闲计时对
+///   「每 89s 来一小块」的流**永不触发**（chunk 到达即重置）——连接活着、字节极慢，
+///   队首被无限期占住。墙钟是总时长死线，与 chunk 到达无关。
+///
+/// 取值链（照 `resolve_cache_dir` 先例）：DB `app_setting` > config(env) > 默认。
+/// 「请求」档不适用：限额在缓存 worker 内解析，那里没有 HTTP 请求上下文。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadLimits {
+    /// 空闲停滞上限：连续无字节超过该时长判「死」（治 BUG-257 前的卡死形态）。
+    pub idle: std::time::Duration,
+    /// 单条目墙钟上限：总耗时（与 chunk 到达无关）超过该时长判「慢」（BUG-271）。
+    pub wall: std::time::Duration,
+}
+
+impl Default for DownloadLimits {
+    fn default() -> Self {
+        Self {
+            // 90s：原 `grammers.rs` 硬编码值原样收编（治「死」的既定语义不变）。
+            idle: std::time::Duration::from_secs(90),
+            // 30min：BUG-271.md 的示例档。1MB/s 慢链 ≈ 1.8GB/条目；更大或更慢
+            // 用 `download_item_max_secs` 设置上调。超限条目可重试且不弃单
+            // （BUG-257 隔离通道），故误伤大文件的代价是「重跑该条」，不是丢任务。
+            wall: std::time::Duration::from_secs(30 * 60),
+        }
+    }
+}
+
 /// 客户端抽象：路由层只依赖此 trait，具体实现可替换。
 #[async_trait::async_trait]
 pub trait Client: Send + Sync {
@@ -268,6 +302,25 @@ pub trait Client: Send + Sync {
         dir: &str,
         progress: Option<&DownloadProgress>,
     ) -> Result<DownloadOutcome, ClientError>;
+
+    /// 同 [`Client::download`]，但携带**单条目下载限额**（BUG-271）。
+    ///
+    /// 提供默认实现（忽略限额、直通 [`Client::download`]）是刻意的：全库只有一个
+    /// 生产调用点（缓存条目路径）需要限额，而 mock / 测试夹具 / 不可用客户端共 6 个
+    /// 实现**不该**为 trait 签名变更买单。真实实现（GrammersClient）覆写本方法，
+    /// 把 `idle` 交给其流循环；`wall` 由路由层围绕本调用整体计时（见
+    /// `cache_one_bytes`）——两层各治一病，互不合并。
+    async fn download_limited(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        dir: &str,
+        progress: Option<&DownloadProgress>,
+        limits: &DownloadLimits,
+    ) -> Result<DownloadOutcome, ClientError> {
+        let _ = limits;
+        self.download(chat_id, message_id, dir, progress).await
+    }
     /// 获取单条消息的媒体元数据（下载后回填入库用）。
     ///
     /// 消息不存在、拉取失败或非媒体消息时返回 `Ok(None)`，调用方回退为仅标记 downloaded。

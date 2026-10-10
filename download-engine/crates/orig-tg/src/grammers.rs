@@ -552,6 +552,31 @@ impl Client for GrammersClient {
         dir: &str,
         progress: Option<&crate::login::DownloadProgress>,
     ) -> Result<DownloadOutcome, ClientError> {
+        // 无限额调用点（若日后出现）走默认档；缓存条目路径经
+        // `download_limited` 携带运行时解析的限额（BUG-271）。
+        self.download_limited(
+            chat_id,
+            message_id,
+            dir,
+            progress,
+            &crate::login::DownloadLimits::default(),
+        )
+        .await
+    }
+
+    /// 带限额的下载实现（BUG-271）：流循环的**空闲**判定取 `limits.idle`
+    /// （原 `STALL_IDLE` 硬编码 90s 收编为可配）。墙钟（`limits.wall`）不在这里——
+    /// 它由路由层围绕整个条目下载计时（`cache_one_bytes`）：空闲是**chunk 间**判定
+    /// （治「死」），墙钟是**条目总时长**判定（治「慢」），两个判定各管一层、
+    /// 各出各的原因串，合并会把「慢」误判成「死」。
+    async fn download_limited(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        dir: &str,
+        progress: Option<&crate::login::DownloadProgress>,
+        limits: &crate::login::DownloadLimits,
+    ) -> Result<DownloadOutcome, ClientError> {
         // PeerRef 走缓存（dialogs 扫描后已填充）。
         let peer = self.resolve_peer(chat_id).await
             .map_err(|_| ClientError::MediaNotFound)?;
@@ -622,9 +647,13 @@ impl Client for GrammersClient {
         // 卡在条目内时连取消都失灵。判据是「无字节间隔」而非总时长——大文件慢速
         // 是合法的；任何非空 chunk 都重置计时。超时即报错：任务失败 → worker 接续
         // 队列，取消也随之恢复有效（循环必然终止）。
-        const STALL_IDLE: std::time::Duration = std::time::Duration::from_secs(90);
+        //
+        // BUG-271：时长收编为可配（`limits.idle`，默认仍 90s）。它治的是「死」；
+        // 「慢」（chunk 一直来但总量耗时过长）由路由层墙钟另判——本循环对「每
+        // 89s 来一小块」的流**故意**不触发，那是墙钟的职责，不是这里的。
+        let stall_idle = limits.idle;
         loop {
-            match tokio::time::timeout(STALL_IDLE, body.next()).await {
+            match tokio::time::timeout(stall_idle, body.next()).await {
                 Ok(Some(chunk)) => {
                     let chunk =
                         chunk.map_err(|e| ClientError::Other(format!("download stream: {e}")))?;
@@ -644,7 +673,7 @@ impl Client for GrammersClient {
                     return Err(ClientError::Other(format!(
                         "download stalled: no bytes for {}s (chat {chat_id} msg {message_id}); \
                          connection presumed dead, aborted to unblock the cache queue",
-                        STALL_IDLE.as_secs()
+                        stall_idle.as_secs()
                     )));
                 }
             }
