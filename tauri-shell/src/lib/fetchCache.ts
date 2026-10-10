@@ -60,6 +60,28 @@ export function invalidateCache(prefix?: string) {
 
 /** 缓存键：集中在这里，避免各处手写字符串拼错导致「缓存了但永远不命中」。 */
 export const cacheKey = {
+  /**
+   * 内容条目列表（`GET /api/media/items`）—— **按完整查询参数分键**。
+   *
+   * `params` 必须是 `api/media` 的 `mediaListParams(q)` 产出（**不是**调用方各拼各的）：
+   * 键与请求 URL 由同一个序列化函数生成，二者不可能分叉 —— 分叉的后果是
+   * 「缓存了一份 A、显示的却是 B」，且不报错、只在数据错位时看得见。
+   *
+   * 筛过的与全量**不是同一份数据**（kind / q / tagId / seriesId / unassigned / sort
+   * 任一不同即不同结果），故一律进键，不做「只按 tagId 分」的粗粒度近似。
+   *
+   * 与同面板 `seriesList` / `libraryStats` 同策略：进途合并 + 结果缓存，
+   * **写操作后必须 `invalidateCache(cacheKey.mediaListPrefix())`**。
+   */
+  mediaList: (params: string) => `media:list:${params}`,
+  /**
+   * 条目列表全部键的公共前缀 —— 一次作废**所有**筛选组合的列表缓存。
+   *
+   * 为什么给前缀而不是要求调用方枚举当前筛选：调用点记得住的只有「我改了数据」，
+   * 记不住「此刻哪些筛选组合在缓存里」。写操作后按前缀全清是唯一不会漏的做法
+   * （漏一处 = 「刚改完又看到旧值」，代价远大于多发一次请求）。
+   */
+  mediaListPrefix: () => 'media:list:',
   /** 剧集列表（按标签筛选时是不同的 key：筛过的与全量不是同一份数据） */
   seriesList: (tagId: number | null) => `series:list:${tagId ?? 'all'}`,
   /** 剧集详情（含分集列表） */

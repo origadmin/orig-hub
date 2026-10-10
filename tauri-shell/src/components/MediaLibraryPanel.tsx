@@ -15,6 +15,7 @@ import {
   listSeries,
   listTags,
   mediaItemUrl,
+  mediaListParams,
   patchMediaItem,
   patchSeries,
   setItemTags,
@@ -27,6 +28,7 @@ import type {
   LibraryStats,
   MediaItem,
   MediaKind,
+  MediaListQuery,
   MediaSeries,
   MediaSeriesDetail,
   MediaTag,
@@ -256,17 +258,38 @@ export function MediaLibraryPanel() {
    * 时间过期，不失效就会把改动前那一份读回来（表现为「刚建的标签不见了」）。
    * 新建标签的四处入口（剧集内页 / 两种批量打标 / 内容编辑）与标签管理都走这里，
    * 避免各写一份、漏掉一处（BUG-239 的失效纪律）。
+   *
+   * **条目列表也必须一并作废**（BUG-138）：每个 `MediaItem` 自带 `tags[]`，
+   * 卡片直接渲染它（`MediaCard` 的 TagToken）。故标签一改，**已缓存的列表就是旧的**
+   * ——「重命名了标签，卡片上还挂着旧名」。这里按前缀一次清掉所有筛选组合的列表缓存：
+   * 调用点记得住的是「我改了标签」，记不住此刻哪些筛选组合进了缓存。
    */
   const refreshTags = useCallback(async () => {
     invalidateCache(cacheKey.tagList())
     invalidateCache(cacheKey.libraryStats())
+    invalidateCache(cacheKey.mediaListPrefix())
     await loadMeta()
   }, [loadMeta])
 
+  /**
+   * 条目列表读缓存（BUG-138）。
+   *
+   * 此前每次进出 items 视图都发真请求 —— 同一面板里 stats / tags / 剧集列表都有读缓存，
+   * 唯独最高频消费的条目列表没有，用户看到的症状是「来回切视图网络一直在转」。
+   * `cached()` 同时给出**在途合并**（同键并发只发一次，含 React 严格模式 effect 双调用）
+   * 与**结果缓存**（切走再回命中）。
+   *
+   * 键由 `mediaListParams(query)`（`listMediaItems` 内部发请求用的同一个函数）产出，
+   * 不在调用方手拼：手拼的键与真正的 URL 是两份真相，改一处忘另一处就会
+   * 「命中了但显示另一批数据」，且不报错。
+   *
+   * **不做时间过期**（fetchCache 既有裁定）：随机过期会让「刚改完又看到旧值」间歇出现。
+   * 代价由显式失效兜住 —— 见 `refreshTags` / `refreshAll` / `recacheItem` / `onRemoveEpisode`。
+   */
   const loadItems = useCallback(async () => {
     setLoading(true)
     try {
-      const r = await listMediaItems({
+      const query: MediaListQuery = {
         kind: tab === 'all' ? '' : tab,
         q: search.trim() || undefined,
         tagId: activeTagId ?? undefined,
@@ -274,7 +297,10 @@ export function MediaLibraryPanel() {
         sort,
         limit: PAGE,
         offset: 0,
-      })
+      }
+      const r = await cached(cacheKey.mediaList(mediaListParams(query)), () =>
+        listMediaItems(query),
+      )
       setItems(r.items)
       setTotal(r.total)
     } catch (e) {
@@ -329,6 +355,9 @@ export function MediaLibraryPanel() {
         // 只清 detail 缓存的话它会命中旧列表、墙仍残留死卡（BUG-159 复现关键）。
         invalidateCache(cacheKey.seriesList(activeTagId))
         invalidateCache(cacheKey.seriesList(null))
+        // 条目列表同样作废（BUG-138）：剧集被删/被合并后，挂在它下面的条目
+        // 在列表里的 `seriesId` / `seriesTitle` 也随之变化。
+        invalidateCache(cacheKey.mediaListPrefix())
         setDetail(null)
         setActiveSeriesId(null)
         setView('series')
@@ -496,6 +525,10 @@ export function MediaLibraryPanel() {
         // 完成回调）。作废 stats 是尽力而为：让下一次读重取，而不是把入队前那一份
         // 无限期留在缓存里（BUG-239 失效纪律）。
         invalidateCache(cacheKey.libraryStats())
+        // 条目列表同样必须作废（BUG-138）：`MediaItem.bytesPresence` / `size` /
+        // `filePath` 都随字节到位而变，卡片的判据是 `hasMediaBytes(item)` ——
+        // 不失效则缓存里那份「无字节」会一直显示「重新缓存」按钮，字节已到位却仍像丢了。
+        invalidateCache(cacheKey.mediaListPrefix())
         setError(t('media.recacheQueued'))
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e))
@@ -618,6 +651,12 @@ export function MediaLibraryPanel() {
         poster: patch.poster,
         duration: patch.duration,
       }).catch(() => undefined)
+      // 抽帧结果已落库，但**缓存里那份仍是 `poster: null`**（BUG-138）。不失效的话，
+      // 下次进 items 视图命中缓存 → 卡片按 `poster` 为空重新抽帧（视频逐条解码）
+      // 并再次 PATCH，每次进出都重做一遍。失效后最多多一次列表请求，
+      // 而封面已入库 ⇒ 那一次请求回来的数据自带 poster，不再重复生成。
+      // （收敛性：封面入库后不再产生写操作，缓存从此稳定命中。）
+      invalidateCache(cacheKey.mediaListPrefix())
       setItems((prev) =>
         prev.map((i) =>
           i.id === patch.id
@@ -634,6 +673,11 @@ export function MediaLibraryPanel() {
     // 回去了」（缓存里存的是改动前那一份，且它不会自己过期）。顺序不能反 ——
     // 原来的 `await loadMeta()` 在 `invalidateCache()` **之前**，stats/tags 一旦
     // 也走缓存，就会读到改动前那一份（BUG-239 失效纪律）。
+    //
+    // 不传 prefix = **全清**，故新增的条目列表键（`cacheKey.mediaList`，BUG-138）
+    // 自动被覆盖 —— 这里的删除 / 导入 / 编辑 / 批量打标 / 加入剧集 / 合并都走它。
+    // 上面那些按前缀精细失效的点，是**不经过 `refreshAll`** 的旁路（改标签、
+    // 重缓存、移出分集、封面回写），它们各自负责清自己的键。
     invalidateCache()
     await loadMeta()
     if (view === 'items') await loadItems()
@@ -1201,6 +1245,11 @@ export function MediaLibraryPanel() {
                 if (activeSeriesId) invalidateCache(cacheKey.seriesDetail(activeSeriesId))
                 invalidateCache(cacheKey.seriesList(activeTagId))
                 invalidateCache(cacheKey.seriesList(null))
+                // 条目列表同样要清（BUG-138）：移出分集改变了该条目在列表里的
+                // `seriesId` / `seriesTitle`（后端 ITEM_SELECT 按 episode 关联取），
+                // 以及「仅未归集」筛选下的命中集合 —— 不清则卡片上的剧集归属与
+                // 「未归集」计数停在移除前那一份。
+                invalidateCache(cacheKey.mediaListPrefix())
                 if (activeSeriesId) await openSeries(activeSeriesId)
                 await loadMeta()
               } catch (e) {

@@ -347,7 +347,24 @@ export function mediaItemStreamUrl(id: number): string {
 
 // ────────────────── 内容 ──────────────────
 
-export async function listMediaItems(q: MediaListQuery = {}): Promise<MediaListResult> {
+/**
+ * 把列表查询**规范化**成查询串 —— `listMediaItems` 的 URL 与 `fetchCache` 的
+ * `cacheKey.mediaList` 键**共用这一份**。
+ *
+ * 为什么必须是同一个函数（BUG-138）：读缓存的前提是「键能唯一标识那次请求」。
+ * 若键在调用方手拼（`kind=${tab}|q=${search}`），它与 `listMediaItems` 内部发的
+ * 查询串就是两份独立的真相 —— 改了一处忘了另一处，症状是「缓存命中了但显示的是
+ * 另一批数据」，不报错、只在数据错位时看得极难查。由同一函数产出则结构上不可能分叉。
+ *
+ * 规范化内容：
+ *   - **空值不参与**：`''` / `undefined` 一律不发（后端把空串当「不过滤」）。
+ *   - **默认值显式化**：`limit` / `offset` 缺省值写进串，故「不传 limit」与
+ *     「传 limit=60」命中同一个键 —— 它们本就是同一次请求。
+ *   - **字段定序**：按固定顺序拼，不依赖对象键序。
+ *
+ * 键里出现用户输入（`q=`）不是问题：它是键的一部分，只影响命中率。
+ */
+export function mediaListParams(q: MediaListQuery = {}): string {
   const sp = new URLSearchParams()
   if (q.kind) sp.set('kind', q.kind)
   if (q.q) sp.set('q', q.q)
@@ -357,7 +374,11 @@ export async function listMediaItems(q: MediaListQuery = {}): Promise<MediaListR
   if (q.sort) sp.set('sort', q.sort)
   sp.set('limit', String(q.limit ?? 60))
   sp.set('offset', String(q.offset ?? 0))
-  return request<MediaListResult>(`/api/media/items?${sp}`)
+  return sp.toString()
+}
+
+export async function listMediaItems(q: MediaListQuery = {}): Promise<MediaListResult> {
+  return request<MediaListResult>(`/api/media/items?${mediaListParams(q)}`)
 }
 
 export async function getMediaItem(id: number): Promise<MediaItem> {
