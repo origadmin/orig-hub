@@ -125,6 +125,12 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             "/api/media/series/:id/merge",
             axum::routing::post(merge_media_series),
         )
+        // BUG-261：剧集级「补缺」——一次请求把这部剧所有无字节分集的可缓存来源
+        // 入队（本仓规约：批量操作禁止前端循环调单条；判据 2 要求 10 集缺 ⇒ 1 个请求）。
+        .route(
+            "/api/media/series/:id/recache-missing",
+            axum::routing::post(recache_series_missing),
+        )
         .route(
             "/api/media/episodes/:id",
             axum::routing::patch(patch_media_episode).delete(delete_media_episode),
@@ -4896,6 +4902,137 @@ async fn merge_media_series(
     })))
 }
 
+// ---- BUG-261：剧集级「补缺」（缓存与来源绑定） ----
+
+/// 缺失集没有任何可缓存来源时的 skip 原因（固定英文短串；界面原样透出，不翻译）。
+const NO_RECACHEABLE_REF_REASON: &str = "no recacheable source ref (tg ref missing)";
+
+/// 解析 TG ref `"chat:msg"` 为 `(chat_id, message_id)` 坐标。
+///
+/// ref 是**内部标识**（`import_media_items` 的 `"<chat_id>:<message_id>"`）；
+/// 非 `数字:数字` 形态（老数据 / 脏数据）返回 None —— 调用方按「不可缓存」跳过，
+/// 绝不让一个坏 ref 阻断整批入队。
+fn parse_tg_ref_coords(ref_key: &str) -> Option<(i64, i64)> {
+    let (chat, msg) = ref_key.trim().rsplit_once(':')?;
+    let chat_id = chat.trim().parse::<i64>().ok()?;
+    let message_id = msg.trim().parse::<i64>().ok()?;
+    Some((chat_id, message_id))
+}
+
+/// 分集的「可缓存来源」ref：主源 tg 且 ref 非空优先，其次任一 tg 备用源。
+///
+/// 与 `EpisodeView::has_recacheable_source` 的判据**同一口径**（不含 has_bytes）——
+/// 「缓存逻辑与来源绑定」意味着判据对象是**这一集的可用来源集合**，
+/// 而不是当前主源（主源 local + 备用源 tg 的集同样可缓存，BUG-261 现象 3）。
+fn episode_recache_ref(ep: &crate::media::EpisodeView) -> Option<&str> {
+    if ep.source.as_deref() == Some("tg") {
+        if let Some(r) = ep.ref_key.as_deref().filter(|s| !s.trim().is_empty()) {
+            return Some(r);
+        }
+    }
+    ep.sources
+        .iter()
+        .find(|s| {
+            s.source.as_deref() == Some("tg")
+                && s.ref_key.as_deref().is_some_and(|r| !r.trim().is_empty())
+        })
+        .and_then(|s| s.ref_key.as_deref())
+}
+
+/// `POST /api/media/series/:id/recache-missing` — 剧集级「补缺」（BUG-261）。
+///
+/// 收集这部剧里 `has_bytes != Present` 的分集，解析各自**可缓存来源**的 ref
+/// （`episode_recache_ref`：主源 tg 优先，其次任一 tg 备用源），按 chat 聚组后
+/// 复用 `Store::enqueue_cache_task` 入队。返回 `{enqueued, groups, skipped}`：
+///
+/// - `enqueued`：入队的消息数（有字节的集不重复入队）；
+/// - `groups`：按 chat 聚的组数（同 chat 的多集合并为**一个**任务）；
+/// - `skipped`：ref 非 tg / 缺失的缺失集，**必须**带原因 ——「不得静默」是
+///   BUG-261 修复后判据 4 的硬要求，静默跳过等于把「缺来源」伪装成「已处理」。
+///
+/// 组键用 `b:` 前缀（batch），与单条 `m:` / 相册 `g:` 的键空间互不相交：
+/// 同一批次重复点击命中活跃任务直接复用（幂等），且**不会**与单条任务的键相撞
+/// —— store 的活跃任务复用按 item_key 整体命中，键相撞会把同组其余消息吞掉。
+async fn recache_series_missing(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_authorized(&st).await?;
+    let Some(d) = st
+        .store
+        .get_series(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    else {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "series not found"));
+    };
+
+    // ── 收集缺失集的可缓存坐标（主源 tg 优先，其次备用源）──
+    let mut by_chat: std::collections::BTreeMap<i64, Vec<i64>> = std::collections::BTreeMap::new();
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+    for ep in &d.episodes {
+        if ep.has_bytes {
+            continue; // 有字节的集不在「补缺」范围
+        }
+        match episode_recache_ref(ep).and_then(parse_tg_ref_coords) {
+            Some((chat_id, message_id)) => {
+                by_chat.entry(chat_id).or_default().push(message_id);
+            }
+            None => skipped.push(json!({
+                "itemId": ep.item_id,
+                "reason": NO_RECACHEABLE_REF_REASON,
+            })),
+        }
+    }
+
+    let dir = resolve_cache_dir(&st, None).await;
+    let mut enqueued = 0usize;
+    let mut groups = 0usize;
+    // BTreeMap 遍历序确定（chat 升序）——响应与日志不随 HashMap 序漂移。
+    for (chat_id, mut message_ids) in by_chat {
+        message_ids.sort_unstable();
+        message_ids.dedup();
+        let first = message_ids[0];
+        let item_key = format!("b:{}:{}", chat_id, first);
+        let Some((task, created)) = st
+            .store
+            .enqueue_cache_task(chat_id, None, &item_key, &message_ids, &dir)
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        else {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "enqueue cache task failed",
+            ));
+        };
+        enqueued += message_ids.len();
+        groups += 1;
+        st.refresh_cache_tasks().await;
+        if created {
+            // 与单条入队同一纪律：T0 登记（BUG-246/248）与 worker 单飞启动都不缺席；
+            // 两者都只在**真正新建**时做（复用活跃任务时已在跑，重复起会双跑同组）。
+            {
+                let st_bg = st.clone();
+                tokio::spawn(async move {
+                    register_enqueued_items(&st_bg, chat_id, &message_ids).await;
+                });
+            }
+            spawn_cache_task(st.clone(), task.id);
+        }
+    }
+    if groups > 0 {
+        st.push_log(&format!(
+            "/api/media/series/{id}/recache-missing: 入队 {enqueued} 集（{groups} 组），跳过 {} 集",
+            skipped.len()
+        ));
+    }
+    Ok(Json(json!({
+        "enqueued": enqueued,
+        "groups": groups,
+        "skipped": skipped,
+    })))
+}
+
 /// `PATCH /api/media/episodes/:id` — 改单集标题 / 介绍 / 集号 / 季号。
 ///
 /// 集号允许任意值（2、3…不必从 1 连续）；目标槽被同剧另一条占用时后端**对调**两条
@@ -7552,6 +7689,210 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["added"], 1, "去重后只搬 1 集");
         assert!(st.store.get_series(a).await.unwrap().is_none(), "源应被删除");
+    }
+
+    // ---- BUG-261：剧集级「补缺」端点（POST /api/media/series/:id/recache-missing）----
+
+    use super::{parse_tg_ref_coords, recache_series_missing};
+
+    /// 纯解析：`"chat:msg"` → 坐标；脏形态一律 None（路由侧据此进 skipped）。
+    #[test]
+    fn parse_tg_ref_coords_accepts_only_numeric_pairs() {
+        assert_eq!(parse_tg_ref_coords("424242:71"), Some((424242, 71)));
+        assert_eq!(parse_tg_ref_coords("-1001:55"), Some((-1001, 55)));
+        assert_eq!(parse_tg_ref_coords(" -1002 : 77 "), Some((-1002, 77)));
+        assert_eq!(parse_tg_ref_coords("not-a-ref"), None, "无冒号");
+        assert_eq!(parse_tg_ref_coords("abc:1"), None, "chat 非数字");
+        assert_eq!(parse_tg_ref_coords("100:"), None, "msg 非数字");
+        assert_eq!(parse_tg_ref_coords(""), None, "空 ref");
+    }
+
+    /// 构造一个「已授权」的补缺路由夹具（`ensure_authorized` 要求 Available+Authorized）。
+    async fn recache_missing_fixture_state() -> Arc<AppState> {
+        let mut cfg = Config::default();
+        cfg.download_dir = scratch_dir("bug261_recache_missing");
+        Arc::new(AppState::new(
+            Arc::new(CacheFixtureClient {
+                chat_id: CACHE_FIXTURE_CHAT,
+                msgs: HashMap::new(),
+                fail_downloads: Vec::new(),
+                fail_first_attempt_only: false,
+                download_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            }),
+            cfg,
+            Availability::Ready,
+            false,
+            Store::open(":memory:")
+                .await
+                .expect("in-memory store must open"),
+        ))
+    }
+
+    /// 调用 `recache_series_missing` 并解构为 `(状态码, JSON)`（同 `merge_call` 的手写解构：
+    /// `ApiError` / `impl IntoResponse` 都没有 `Debug`，不能 unwrap/expect_err）。
+    async fn recache_missing_call(
+        st: Arc<AppState>,
+        id: i64,
+    ) -> Result<(StatusCode, serde_json::Value), (StatusCode, String)> {
+        match recache_series_missing(State(st), Path(id)).await {
+            Ok(resp) => {
+                let resp = resp.into_response();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .expect("body must be readable");
+                let v: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("body must be JSON");
+                Ok((status, v))
+            }
+            Err(e) => Err((e.status, e.message().to_string())),
+        }
+    }
+
+    /// 判据主体：2 集缺字节、tg ref 同 chat ⇒ 入队 **1 组**（一个任务含 2 条消息），
+    /// 且任务保持 queued（worker 门禁被测试先占住，不真跑下载）。
+    #[tokio::test]
+    async fn recache_missing_groups_missing_episodes_by_chat_bug261() {
+        let st = recache_missing_fixture_state().await;
+        // 门禁先占住：路由里 spawn_cache_task 的 claim 会失败，任务保持 queued 可断言。
+        assert!(st.claim_cache_worker(), "门禁初始必须空闲");
+        let sid = st
+            .store
+            .create_series("补缺夹具", None, "series", None, None)
+            .await
+            .unwrap();
+        let i1 = st
+            .store
+            .upsert_media_item("tg", "424242:71", "ep1", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let i2 = st
+            .store
+            .upsert_media_item("tg", "424242:72", "ep2", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let _ = st.store.add_episode(sid, i1, 1, 1).await.unwrap();
+        let _ = st.store.add_episode(sid, i2, 1, 2).await.unwrap();
+
+        let (status, v) = recache_missing_call(st.clone(), sid)
+            .await
+            .expect("route must respond");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["enqueued"], 2, "两集缺字节 ⇒ 2 条消息入队");
+        assert_eq!(v["groups"], 1, "同 chat 聚成 1 组");
+        assert_eq!(
+            v["skipped"].as_array().map(|a| a.len()),
+            Some(0),
+            "没有该跳过的集"
+        );
+
+        let tasks = st.store.list_cache_tasks(10).await.unwrap();
+        assert_eq!(tasks.len(), 1, "同 chat 一次任务（不是逐集 2 个）");
+        assert_eq!(tasks[0].chat_id, 424242);
+        assert_eq!(tasks[0].message_ids, vec![71, 72], "组内消息按序齐全");
+        assert_eq!(tasks[0].status, "queued", "worker 未起，任务保持排队");
+    }
+
+    /// 判据 4 的服务端半边：route 缺失（local 主源 / 脏 ref）的缺失集**必须**进
+    /// skipped 并带原因，不得静默；此时不产生任何任务。
+    #[tokio::test]
+    async fn recache_missing_reports_skipped_without_route_bug261() {
+        let st = recache_missing_fixture_state().await;
+        assert!(st.claim_cache_worker());
+        let sid = st
+            .store
+            .create_series("无路夹具", None, "series", None, None)
+            .await
+            .unwrap();
+        let local = st
+            .store
+            .upsert_media_item("local", "C:/local/v.mp4", "ep1", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let dirty = st
+            .store
+            .upsert_media_item("tg", "not-a-ref", "ep2", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let _ = st.store.add_episode(sid, local, 1, 1).await.unwrap();
+        let _ = st.store.add_episode(sid, dirty, 1, 2).await.unwrap();
+
+        let (status, v) = recache_missing_call(st.clone(), sid)
+            .await
+            .expect("route must respond");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["enqueued"], 0, "无任何可缓存坐标 ⇒ 0 入队");
+        assert_eq!(v["groups"], 0);
+        let skipped = v["skipped"].as_array().expect("skipped array").clone();
+        assert_eq!(skipped.len(), 2, "两条缺失集都要如实报缺");
+        let ids: Vec<i64> = skipped
+            .iter()
+            .map(|x| x["itemId"].as_i64().expect("itemId"))
+            .collect();
+        assert!(ids.contains(&local) && ids.contains(&dirty), "ids={ids:?}");
+        for s in &skipped {
+            assert_eq!(
+                s["reason"].as_str(),
+                Some(super::NO_RECACHEABLE_REF_REASON),
+                "每条 skipped 都必须带原因（不得静默）"
+            );
+        }
+        assert!(
+            st.store.list_cache_tasks(10).await.unwrap().is_empty(),
+            "没有入队就不该有任务行"
+        );
+    }
+
+    /// 全部有字节 ⇒ 0 入队 0 跳过（补缺是「补缺」，不重复搬运已有字节）。
+    #[tokio::test]
+    async fn recache_missing_is_noop_when_all_episodes_have_bytes_bug261() {
+        let st = recache_missing_fixture_state().await;
+        assert!(st.claim_cache_worker());
+        let dir = scratch_dir("bug261_recache_missing_bytes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("ep1.mp4");
+        std::fs::write(&file, b"real bytes").unwrap();
+        let sid = st
+            .store
+            .create_series("齐装夹具", None, "series", None, None)
+            .await
+            .unwrap();
+        let item = st
+            .store
+            .upsert_media_item(
+                "tg",
+                "424242:81",
+                "ep1",
+                "video",
+                Some(&file.to_string_lossy()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let _ = st.store.add_episode(sid, item, 1, 1).await.unwrap();
+
+        let (status, v) = recache_missing_call(st.clone(), sid)
+            .await
+            .expect("route must respond");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["enqueued"], 0, "全有字节 ⇒ 0 入队");
+        assert_eq!(v["groups"], 0);
+        assert_eq!(v["skipped"].as_array().map(|a| a.len()), Some(0));
+        assert!(st.store.list_cache_tasks(10).await.unwrap().is_empty());
+    }
+
+    /// 不存在的剧集 → 404（与 `GET /api/media/series/:id` 同一语义）。
+    #[tokio::test]
+    async fn recache_missing_404_for_unknown_series_bug261() {
+        let st = recache_missing_fixture_state().await;
+        assert!(st.claim_cache_worker());
+        let (status, msg) = recache_missing_call(st.clone(), 987_654_321)
+            .await
+            .expect_err("unknown series must be 404");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(msg, "series not found");
     }
 
     // ---- BUG-248：入队即登记条目（「先入信息、再入字节」） ----

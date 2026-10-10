@@ -252,6 +252,23 @@ export interface MergeResult {
   skipped: MergeSkipped[]
 }
 
+/** 剧集级「补缺」时被跳过的缺失集（BUG-261：ref 非 tg / 缺失，缓存引擎没有坐标） */
+export interface RecacheMissingSkipped {
+  itemId: number
+  /** 服务端给定的固定英文短串（界面原样透出，不翻译） */
+  reason: string
+}
+
+/** 剧集级「补缺」结果（BUG-261）：`POST /api/media/series/:id/recache-missing` */
+export interface RecacheMissingResult {
+  /** 入队的消息数（有字节的集不重复入队） */
+  enqueued: number
+  /** 按 chat 聚的组数（同 chat 的多集合并为一个缓存任务） */
+  groups: number
+  /** 无法定位可缓存来源的缺失集（必须带原因，不静默） */
+  skipped: RecacheMissingSkipped[]
+}
+
 export interface MediaSeriesDetail extends MediaSeries {
   episodes: MediaEpisode[]
 }
@@ -599,6 +616,17 @@ export async function mergeSeriesMulti(
     method: 'POST',
     body: JSON.stringify({ sourceIds }),
   })
+}
+
+/**
+ * 剧集级「补缺」（BUG-261）：一次请求把这部剧所有无字节分集的可缓存来源入队。
+ *
+ * 走引擎原子端点（本仓规约：批量操作禁止前端循环调单条 —— 10 集全缺的剧集
+ * 必须是 1 次点击 + 1 个 HTTP 请求，而不是 10 次循环）。无任何可缓存来源的
+ * 缺失集由后端回传 `skipped` 明细（带原因），前端照数透出，不静默。
+ */
+export function recacheSeriesMissing(seriesId: number): Promise<RecacheMissingResult> {
+  return request(`/api/media/series/${seriesId}/recache-missing`, { method: 'POST' })
 }
 
 /**

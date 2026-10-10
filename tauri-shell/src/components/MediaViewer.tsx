@@ -4,7 +4,7 @@ import { Button } from './ui/button'
 import { useTranslation } from '../i18n'
 import { mediaItemStreamUrl } from '../api/media'
 import { setPosterExtractionPaused } from '../lib/poster'
-import { recacheFromSource } from '../lib/mediaSources'
+import { episodeRecacheCandidates, recacheFromSource } from '../lib/mediaSources'
 import { cn } from '../lib/utils'
 import { VideoPlayer } from './media/VideoPlayer'
 import { EpisodeList } from './media/EpisodeList'
@@ -80,6 +80,22 @@ export function MediaViewer(props: {
   const { detail, loading, error, notFound } = useSeriesDetail(seriesId)
 
   const mode = modeOf(cur?.kind)
+  /**
+   * 重缓存坐标（BUG-261）：判据从「当前主源」换成「这一集的任一可用来源」。
+   *
+   * 主源不可缓存（local / ref 缺失）时，直接用该剧集里同一分集的 tg 备用源 ref
+   * 下发 —— 「有字节可切换、无字节可缓存」用的是同一个 ref 集合，不再要求用户
+   * 先「切换来源」。当前项不属于任何剧集（TG 流打开）时退回主源坐标，行为不变。
+   */
+  const recacheCandidates = useMemo(() => {
+    if (!cur) return []
+    const ep = detail?.episodes.find((e) => e.itemId === cur.messageId)
+    return episodeRecacheCandidates({
+      source: cur.source,
+      ref: cur.ref,
+      sources: ep?.sources ?? [],
+    })
+  }, [cur, detail])
   /**
    * 当前组 = 同一使用方式的内容。
    *
@@ -239,11 +255,16 @@ export function MediaViewer(props: {
               duration={cur.duration ?? undefined}
               // BUG-254：透传字节态；无字节时播放器渲染专属「无内容 / 未缓存」态，
               // 并给出「重新缓存」入口（按来源定位符重抓）。
+              // BUG-261：坐标 = 这一集任一可用来源（主源优先，备用源兜底），
+              // 无候选（无 ref 坐标）时隐藏入口而不是给一个必然失败的按钮。
               hasBytes={cur.hasBytes}
               onRecache={
-                cur.ref
+                recacheCandidates.length > 0
                   ? () => {
-                      void recacheFromSource(cur.ref, cur.source)
+                      const c = recacheCandidates[0]
+                      void recacheFromSource(c.ref, c.source).catch(() => {
+                        /* 入队失败静默与既有行为一致：播放器内无错误展示面 */
+                      })
                     }
                   : undefined
               }

@@ -12,7 +12,12 @@ import {
   Tag,
   Trash2,
 } from 'lucide-react'
+import type {
+  KeyboardEvent as ReactKeyboardEvent,
+  MouseEvent as ReactMouseEvent,
+} from 'react'
 import type { MediaEpisode, MediaSeriesDetail, MediaTag } from '../../api/media'
+import { recacheSeriesMissing } from '../../api/media'
 
 /**
  * 方向判定 hook：preload 首帧源图，按实际尺寸判竖/横（v3 `isPortrait` 等价实现；
@@ -45,8 +50,8 @@ import {
   seriesKindLabelKey,
 } from '../../api/media'
 import {
-  canRecacheFromSource,
   coverFit,
+  episodeRecacheCandidates,
   fmtDuration,
   hasMediaBytes,
   recacheFromSource,
@@ -195,18 +200,48 @@ export function SeriesDetail(props: {
   }
 
   /**
-   * 重新缓存某一集（BUG-080）。清缓存只删字节、留条目：这一集仍在列表里，
-   * 却以「可播」外观呈现、点下去 raw 端点 404。这里给支持原路取回的来源一个
-   * 入口（TG 的 `ref` 里 `chat:msg` 就是下载地址）；本地导入文件没有原路。
+   * 重新缓存某一集（BUG-080；判据 BUG-261 重写）。
+   *
+   * 旧判据绑「当前主源」——主源 local、备用源 tg 时按钮永久禁用且不解释原因。
+   * 新判据 = 这一集是否有**任一**可用来源（引擎下发的 `hasRecacheableSource` /
+   * 本地按主源+备用源推导）：命中后优先用主源 ref，主源不可用（local / ref 缺失）
+   * 则直接用备用源 ref 下发，不再要求用户先「切换来源」再重缓存。
    */
   const recacheEpisode = (ep: MediaEpisode) => {
-    if (!canRecacheFromSource(ep.source)) {
+    const cand = episodeRecacheCandidates(ep)[0]
+    if (!cand) {
+      // 无任何可缓存坐标：入口必须解释原因，不得静默（BUG-261 判据 4）
       onError(t('media.episode.recacheNoRoute', { source: t(sourceLabelKey(ep.source)) }))
       return
     }
-    recacheFromSource(ep.ref, ep.source)
+    recacheFromSource(cand.ref, cand.source)
       .then(() => onError(t('media.episode.recacheQueued')))
       .catch((e: unknown) => onError(e instanceof Error ? e.message : String(e)))
+  }
+
+  /** 剧集级「补缺」（BUG-261）：缺失 = 无字节的分集数；随详情数据派生，N 随夹具实时变化 */
+  const missingCount = detail.episodes.filter((ep) => !hasMediaBytes(ep)).length
+  /** 补缺请求在途标记（防重复点击；单请求原子入队，无需前端循环） */
+  const [cachingMissing, setCachingMissing] = useState(false)
+  /**
+   * 「缓存缺失 N 集」（BUG-261）：一次点击 → 引擎原子端点把全部缺失集入队。
+   * 成功后复用任务入队提示模式（全局 toast）透出 enqueued / skipped 计数；
+   * skipped 明细来自后端（无来源的缺失集），照数透出不静默。
+   */
+  const cacheMissingEpisodes = () => {
+    if (cachingMissing || missingCount === 0) return
+    setCachingMissing(true)
+    recacheSeriesMissing(detail.id)
+      .then((r) => {
+        onError(
+          t('media.series.cacheMissingQueued', {
+            enqueued: r.enqueued,
+            skipped: r.skipped.length,
+          }),
+        )
+      })
+      .catch((e: unknown) => onError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setCachingMissing(false))
   }
 
   /** 打开集级挂图灯箱（范围 = **本集** `images`，R6） */
@@ -527,9 +562,24 @@ export function SeriesDetail(props: {
             </Button>
           </div>
 
-          {/* 选集器：全部分集（含 photo 集，标注「图」；图片集不进播放序列 P6） */}
+          {/* 选集器：全部分集（含 photo 集，标注「图」；图片集不进播放序列 P6）。
+              「缓存缺失 N 集」（BUG-261）：剧集级补缺入口 —— 一次点击把全部无字节
+              分集的可缓存来源入队（引擎原子端点，1 个请求）。刻意放在选集器头部
+              （N 随列表实时派生），**不进右栏来源块**（BUG-265 刚收口的信息/控件
+              两层门控，补缺是剧集级动作，不属于单集来源展示）。N=0 时禁用。 */}
           <div className="flex items-center gap-2 border-t border-border-subtle/60 pt-2.5 text-[12px] font-semibold text-fg-mid">
             <span className="flex-1">{t('media.episodeCount', { n: detail.episodeCount })}</span>
+            <button
+              type="button"
+              onClick={cacheMissingEpisodes}
+              disabled={missingCount === 0 || cachingMissing}
+              className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] font-normal text-amber-500 hover:bg-amber-500/10 disabled:cursor-not-allowed disabled:text-muted disabled:hover:bg-transparent"
+              title={t('media.series.cacheMissing', { n: missingCount })}
+              data-testid="series-recache-missing"
+            >
+              <CloudOff className="h-3 w-3" />
+              {t('media.series.cacheMissing', { n: missingCount })}
+            </button>
             <button
               type="button"
               onClick={() => setPickerCollapsed((v) => !v)}
@@ -579,20 +629,56 @@ export function SeriesDetail(props: {
                     >
                       {shouldRenderEpisodeTitle(ep, detail) ? ep.title : episodeSlotLabel(ep)}
                     </span>
-                    {/* BUG-254：有字节 → 显示时长；无字节 → 显示「未缓存」标记（不显时长）。 */}
+                    {/* BUG-254：有字节 → 显示时长；无字节 → 显示「未缓存」标记（不显时长）。
+                        BUG-261（用户裁定「点击缺失内容直接进行缓存」）：标记直接发起缓存。
+                        行本身是 `<button episode-pick>`（点击=切右栏），HTML 不允许嵌套
+                        button —— 标记保持 span，可缓存时以 role="button" 承载点击并
+                        stopPropagation（不触发行聚焦切换）；无可缓存来源时禁用并在
+                        title 里说明原因，不得静默。`episode-nobytes` 外壳逐字保留
+                        （BUG-254 的回归锚），可点击语义由内层 `episode-nobytes-cache` 承载。 */}
                     {withBytes ? (
                       <span className="font-mono text-[10.5px] text-muted">
                         {!photo && ep.duration != null ? fmtDuration(ep.duration) : ''}
                       </span>
                     ) : (
-                      <span
-                        className="flex items-center gap-0.5 font-mono text-[10.5px] text-amber-500"
-                        data-testid="episode-nobytes"
-                        title={t('media.notCached')}
-                      >
-                        <CloudOff className="h-3 w-3" />
-                        {t('media.notCached')}
-                      </span>
+                      (() => {
+                        const cacheable = episodeRecacheCandidates(ep).length > 0
+                        return (
+                          <span
+                            className={`flex items-center gap-0.5 rounded px-0.5 font-mono text-[10.5px] text-amber-500 ${
+                              cacheable ? 'cursor-pointer hover:bg-amber-500/10' : 'cursor-not-allowed'
+                            }`}
+                            data-testid="episode-nobytes"
+                            title={
+                              cacheable
+                                ? t('media.episode.cacheThis')
+                                : t('media.episode.recacheNoRoute', {
+                                    source: t(sourceLabelKey(ep.source)),
+                                  })
+                            }
+                            {...(cacheable
+                              ? {
+                                  role: 'button' as const,
+                                  tabIndex: 0,
+                                  onClick: (e: ReactMouseEvent) => {
+                                    e.stopPropagation()
+                                    recacheEpisode(ep)
+                                  },
+                                  onKeyDown: (e: ReactKeyboardEvent) => {
+                                    if (e.key === 'Enter' || e.key === ' ') {
+                                      e.stopPropagation()
+                                      e.preventDefault()
+                                      recacheEpisode(ep)
+                                    }
+                                  },
+                                }
+                              : {})}
+                          >
+                            <CloudOff className="h-3 w-3" />
+                            <span data-testid="episode-nobytes-cache">{t('media.notCached')}</span>
+                          </span>
+                        )
+                      })()
                     )}
                   </button>
                 </div>
@@ -867,18 +953,31 @@ export function SeriesDetail(props: {
                   {t('media.episode.gotoItem')}
                 </Button>
                 {!hasMediaBytes(cur) ? (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 px-2.5 text-[11px]"
-                    disabled={!canRecacheFromSource(cur.source)}
-                    onClick={() => recacheEpisode(cur)}
-                    title={canRecacheFromSource(cur.source) ? t('media.recache') : t('media.fileMissingHint')}
-                    data-testid="episode-recache"
-                  >
-                    <CloudOff className="h-3 w-3" />
-                    {t('media.recache')}
-                  </Button>
+                  (() => {
+                    // BUG-261：判据 = 这一集是否有任一可用来源（候选含备用源 ref），
+                    // 不再绑「当前主源」——主源 local、备用源 tg 时同样可用。
+                    const cand = episodeRecacheCandidates(cur)[0]
+                    return (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7 px-2.5 text-[11px]"
+                        disabled={!cand}
+                        onClick={() => recacheEpisode(cur)}
+                        title={
+                          cand
+                            ? t('media.recache')
+                            : t('media.episode.recacheNoRoute', {
+                                source: t(sourceLabelKey(cur.source)),
+                              })
+                        }
+                        data-testid="episode-recache"
+                      >
+                        <CloudOff className="h-3 w-3" />
+                        {t('media.recache')}
+                      </Button>
+                    )
+                  })()
                 ) : null}
               </div>
 

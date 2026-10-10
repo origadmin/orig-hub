@@ -107,6 +107,57 @@ export function canRecacheFromSource(source?: string | null): boolean {
   return getSourceAdapter(source)?.canRecache ?? false
 }
 
+/**
+ * 集级「可缓存」判据（BUG-261）：这一集是否仍有**任一**可用来源。
+ *
+ * 优先信引擎下发的 `hasRecacheableSource`（主源 tg 有 ref，或任一备用源 tg ⇒ true；
+ * 判据与字节态无关 —— 无字节的 TG 来源正是「要缓存」的对象）。字段缺失
+ * （老后端 / 本地构造的假数据）时回退本地推导，**不再**绑死「当前主源」：
+ * 主源 local、备用源 tg 的集同样可缓存（那正是 BUG-261 现象 3 的潜伏缺陷形态）。
+ */
+export function canRecacheEpisode(
+  ep:
+    | {
+        hasRecacheableSource?: boolean
+        source?: string | null
+        ref?: string | null
+        sources?: Array<{ source?: string | null; ref?: string | null }> | null
+      }
+    | null
+    | undefined,
+): boolean {
+  if (!ep) return false
+  if (typeof ep.hasRecacheableSource === 'boolean') return ep.hasRecacheableSource
+  return episodeRecacheCandidates(ep).length > 0
+}
+
+/**
+ * 收集一集**可缓存来源**候选（主源优先、备用源次之；只收「适配器支持重取且
+ * ref 非空」的来源）。缓存下发用第一个候选：「有字节可切换、无字节可缓存」
+ * 用的是同一个 ref 集合，不再要求用户先「切换来源」再重缓存（BUG-261）。
+ */
+export function episodeRecacheCandidates(
+  ep:
+    | {
+        source?: string | null
+        ref?: string | null
+        sources?: Array<{ source?: string | null; ref?: string | null }> | null
+      }
+    | null
+    | undefined,
+): Array<{ source: string; ref: string }> {
+  if (!ep) return []
+  const out: Array<{ source: string; ref: string }> = []
+  const push = (source?: string | null, ref?: string | null) => {
+    if (source && ref && ref.trim() && canRecacheFromSource(source)) {
+      out.push({ source, ref })
+    }
+  }
+  push(ep.source, ep.ref)
+  for (const s of ep.sources ?? []) push(s.source, s.ref)
+  return out
+}
+
 /** 原路重新缓存；来源不支持时抛错（由调用方转成非致命提示） */
 export async function recacheFromSource(
   ref?: string | null,

@@ -472,7 +472,13 @@ export function MediaLibraryPanel() {
    */
   const recacheItem = useCallback(
     async (item: MediaItem) => {
-      if (!canRecacheFromSource(item.source)) return
+      // BUG-261：可缓存 = 适配器支持重取 **且 ref 非空**（引擎对 ref 缺失/为空的
+      // tg 条目同样判不可缓存）。此前只看 source —— `tg` 但 ref 缺失的条目会给出
+      // 一个点了必然失败的入口；且早退是静默的，必须解释原因。
+      if (!canRecacheFromSource(item.source) || !item.ref) {
+        setError(t('media.recacheNoRoute', { source: t(sourceLabelKey(item.source)) }))
+        return
+      }
       // 来源后端没起（如 TG 未启动）：先尝试拉起，拉不起就**如实告知并停手**，
       // 绝不静默失败——「点了没反应」比「点了告诉我为什么」糟得多。
       if (sourceAlive[item.source] === false) {
@@ -498,10 +504,15 @@ export function MediaLibraryPanel() {
     [setError, sourceAlive, t],
   )
 
-  /** 重新缓存入口被阻断的原因（来源后端不可用）；未阻断返回 null */
+  /** 重新缓存入口被阻断的原因（无可取回地址 / 来源后端不可用）；未阻断返回 null */
   const recacheBlockedReason = useCallback(
-    (source: string): string | null => {
+    (source: string, ref?: string | null): string | null => {
       if (!canRecacheFromSource(source)) return null
+      // BUG-261：来源支持重取但 ref 缺失/为空 —— 缓存引擎没有坐标，入口必须
+      // 置灰并说明原因（禁用态解释原因，不得静默；判据 4）。
+      if (!ref || !ref.trim()) {
+        return t('media.recacheNoRoute', { source: t(sourceLabelKey(source)) })
+      }
       return sourceAlive[source] === false
         ? t('media.recacheUnavailable', { source: t(sourceLabelKey(source)) })
         : null
@@ -1309,7 +1320,7 @@ export function MediaLibraryPanel() {
                     onPosterReady={onPosterReady}
                     // 无字节且来源支持原路取回时给「重新缓存」（BUG-080）
                     onRecache={recacheItem}
-                    recacheBlockedReason={recacheBlockedReason(item.source)}
+                    recacheBlockedReason={recacheBlockedReason(item.source, item.ref)}
                   />
                 ))}
               </div>
