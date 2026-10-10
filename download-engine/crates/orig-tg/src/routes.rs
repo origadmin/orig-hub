@@ -497,6 +497,74 @@ pub fn spawn_dialog_scan(st: Arc<AppState>) {
     });
 }
 
+/// `Cache-Control` for a full-size photo proxied on demand from Telegram (BUG-117)。
+///
+/// `private`（不是 `public`）：这些是**登录用户自己的**媒体，共享缓存不得留存。
+/// 值与缩略图端点（`thumb`）一致，但语义不同 —— 缩略图是海报，本条是「查看原图」。
+const PHOTO_PROXY_CACHE_CONTROL: &str = "private, max-age=86400";
+
+/// 由传输域的 [`MediaStream`] 构造 HTTP 响应。
+///
+/// 在线流（`GET /api/tg/file/...`）与 BUG-117 的全尺寸原图代理**共用此实现**，
+/// 使 Range / 206 / `Content-Range` 契约只定义一次。`range` 必须是**同一个**
+/// 传给 `Client::media` 的值：206 分支据此决定是否回 `Content-Range`。
+fn media_stream_response(
+    stream: crate::login::MediaStream,
+    range: Option<MediaRange>,
+    cache_control: &'static str,
+) -> Response {
+    let mut res = Response::new(axum::body::Body::from_stream(stream.body));
+    let ct = HeaderValue::from_str(&stream.content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    res.headers_mut().insert(header::CONTENT_TYPE, ct);
+    res.headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache_control));
+
+    match range {
+        // 206 Partial Content：带 Content-Range + Content-Length。
+        Some(_) => {
+            let total_str = stream
+                .total_size
+                .map_or_else(|| "*".to_string(), |t| t.to_string());
+            let cr = format!("bytes {}-{}/{}", stream.start, stream.end, total_str);
+            if let Ok(v) = HeaderValue::from_str(&cr) {
+                res.headers_mut().insert(header::CONTENT_RANGE, v);
+            }
+            let len_str = (stream.end - stream.start + 1).to_string();
+            if let Ok(v) = HeaderValue::from_str(&len_str) {
+                res.headers_mut().insert(header::CONTENT_LENGTH, v);
+            }
+            *res.status_mut() = StatusCode::PARTIAL_CONTENT;
+        }
+        // 200 整段：已知总长时给 Content-Length。
+        None => {
+            if let Some(total) = stream.total_size {
+                if let Ok(v) = HeaderValue::from_str(&total.to_string()) {
+                    res.headers_mut().insert(header::CONTENT_LENGTH, v);
+                }
+            }
+        }
+    }
+    res
+}
+
+/// 416 Range Not Satisfiable：`Content-Range: bytes */total`（total 未知时 `*`）。
+fn media_range_not_satisfiable(total: Option<u64>, cache_control: &'static str) -> Response {
+    let total_str = total.map_or_else(|| "*".to_string(), |t| t.to_string());
+    let mut res = Response::new(axum::body::Body::empty());
+    if let Ok(v) = HeaderValue::from_str(&format!("bytes */{total_str}")) {
+        res.headers_mut().insert(header::CONTENT_RANGE, v);
+    }
+    res.headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache_control));
+    *res.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+    res
+}
+
 /// GET /api/tg/file/:chat_id/:message_id — 媒体在线流（原始字节，不转 JSON）。
 ///
 /// 照片返回 `image/jpeg`，文档按其 mime-type 返回 content-type；供前端
@@ -514,61 +582,10 @@ async fn media_file(
     let range = parse_range(headers.get(header::RANGE))?;
 
     match st.client.media(chat_id, message_id, range).await {
-        Ok(stream) => {
-            let mut res = axum::response::Response::new(
-                axum::body::Body::from_stream(stream.body),
-            );
-            let ct = header::HeaderValue::from_str(&stream.content_type)
-                .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-            res.headers_mut().insert(header::CONTENT_TYPE, ct);
-            res.headers_mut()
-                .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-            res.headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-
-            match range {
-                // 206 Partial Content：带 Content-Range + Content-Length。
-                Some(_) => {
-                    let total_str = stream
-                        .total_size
-                        .map_or_else(|| "*".to_string(), |t| t.to_string());
-                    let cr = format!(
-                        "bytes {}-{}/{}",
-                        stream.start, stream.end, total_str
-                    );
-                    if let Ok(v) = HeaderValue::from_str(&cr) {
-                        res.headers_mut().insert(header::CONTENT_RANGE, v);
-                    }
-                    let len_str = (stream.end - stream.start + 1).to_string();
-                    if let Ok(v) = HeaderValue::from_str(&len_str) {
-                        res.headers_mut().insert(header::CONTENT_LENGTH, v);
-                    }
-                    *res.status_mut() = StatusCode::PARTIAL_CONTENT;
-                }
-                // 200 整段：已知总长时给 Content-Length。
-                None => {
-                    if let Some(total) = stream.total_size {
-                        if let Ok(v) = HeaderValue::from_str(&total.to_string()) {
-                            res.headers_mut().insert(header::CONTENT_LENGTH, v);
-                        }
-                    }
-                }
-            }
-            Ok(res)
-        }
+        Ok(stream) => Ok(media_stream_response(stream, range, "no-store")),
         // 区间不可满足 → 416，Content-Range: bytes */total。
         Err(ClientError::UnsatisfiableRange(total)) => {
-            let total_str = total.map_or_else(|| "*".to_string(), |t| t.to_string());
-            let mut res = axum::response::Response::new(axum::body::Body::empty());
-            if let Ok(v) = HeaderValue::from_str(&format!("bytes */{total_str}")) {
-                res.headers_mut().insert(header::CONTENT_RANGE, v);
-            }
-            res.headers_mut()
-                .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-            res.headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            *res.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
-            Ok(res)
+            Ok(media_range_not_satisfiable(total, "no-store"))
         }
         Err(e) => Err(e.into()),
     }
@@ -3726,7 +3743,67 @@ fn media_parse_range(hdr: Option<&str>, total: u64) -> Option<(u64, u64, bool)> 
     }
 }
 
-/// `GET /api/media/items/:id/raw` — 按 id 流式读取落盘文件，支持 HTTP Range（拖动进度必需）。
+/// 内容域给出的**附件定位**（attachment locator）：这条内容的字节现在在哪。
+///
+/// 这是 BUG-117 的模块边界收口点。内容域（`media.rs` / 库行）只回答「字节在哪」，
+/// **不负责取字节**，因此它不需要认识 grammers 类型、也不 import 传输域 —— 铁律
+/// 「内容域不 import grammers 类型」得以保持。取字节是**路由层**的职责，由它调
+/// 传输域代理。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RawLocator {
+    /// 已落盘：库内规范路径（相对 = 库根相对），路由层解析后本地投递。
+    LocalPath(String),
+    /// 未落盘但来源是 Telegram：路由层凭坐标向传输域取**原图**。
+    ///
+    /// 只对 photo 给出：图片不落盘是产品既定行为（BUG-115/121 拍板「照片不下载」，
+    /// 故 `file_path` 为空对图片是**常态**而非异常），此时原图只能在线取。
+    TelegramPhoto {
+        /// 传输域坐标：会话 id。
+        chat_id: i64,
+        /// 传输域坐标：消息 id。
+        message_id: i64,
+    },
+    /// 既无本地字节，也无可回源来源：只能如实报「无字节」。
+    Unavailable,
+}
+
+/// 解析一条库行的原图字节定位。**纯函数**：不碰传输域、不做 IO。
+///
+/// 判据只有一条：本地有字节就本地读；没有且来源是 TG 图片，就回源取原图。
+/// 绝不因为「取不到原图」就退给缩略图 —— 那正是 BUG-117 的缺陷本体
+/// （缩略图不是原图，静默顶替等于「查看原图」这条路根本不存在）。
+fn resolve_raw_locator(
+    item: &crate::media::MediaItem,
+) -> RawLocator {
+    if let Some(p) = item.file_path.clone().filter(|s| !s.trim().is_empty()) {
+        return RawLocator::LocalPath(p);
+    }
+    // 只有 TG 来源能回源；本地/其它来源缺字节就是真缺，如实报缺。
+    if item.source == "tg" && item.kind == "photo" {
+        if let Some((chat_id, message_id)) = parse_tg_ref_coords(&item.ref_key) {
+            return RawLocator::TelegramPhoto {
+                chat_id,
+                message_id,
+            };
+        }
+    }
+    RawLocator::Unavailable
+}
+
+/// `GET /api/media/items/:id/raw` — 按 id 流式读取原图字节，支持 HTTP Range（拖动进度必需）。
+///
+/// 两条投递路径共用同一套 Range / ETag / MIME 契约：
+///
+/// 1. **已落盘** → `serve_local_file`（与 TG 已缓存投递同一实现）；
+/// 2. **未落盘的 TG 图片** → 向传输域取**原图**在线流（BUG-117）。
+///
+/// BUG-117 的两处修正，都落在这条分支上：
+/// - **画质**：改取原图（`Client::media` → `Media::Photo`），不再取缩略图
+///   （`Client::thumb`）。此前「查看原图」拿到的是 Telegram 缩略图。
+/// - **越界**：缩略图代理从内容域**上移到路由层**（本函数），内容域只经
+///   [`resolve_raw_locator`] 返回定位，不再直接调用传输域。
+///
+/// 原图取不到时**如实报错**并留痕，绝不静默给一张缩略图充数。
 async fn media_item_raw(
     State(st): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -3738,45 +3815,63 @@ async fn media_item_raw(
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "media item not found"))?;
-    let p = match item.file_path.clone() {
-        Some(p) => p,
-        None => {
-            // BUG-049：图片不落盘 —— tg 图片条目现场代理 TG 缩略图字节（不持久化），
-            // 媒体库/灯箱用同一个 mediaItemUrl 即可显示，无需感知「未缓存」状态。
-            if item.source == "tg" && item.kind == "photo" {
-                let parts: Vec<&str> = item.ref_key.splitn(2, ':').collect();
-                if parts.len() == 2 {
-                    if let (Ok(chat), Ok(msg)) =
-                        (parts[0].parse::<i64>(), parts[1].parse::<i64>())
-                    {
-                        if let Ok(Some(t)) = st.client.thumb(chat, msg).await {
-                            let mut res = Response::new(axum::body::Body::from(t.bytes));
-                            res.headers_mut().insert(
-                                header::CONTENT_TYPE,
-                                HeaderValue::from_str(&t.content_type)
-                                    .unwrap_or_else(|_| HeaderValue::from_static("image/jpeg")),
-                            );
-                            res.headers_mut().insert(
-                                header::CACHE_CONTROL,
-                                HeaderValue::from_static("public, max-age=86400"),
-                            );
-                            return Ok(res);
-                        }
-                    }
-                }
-                return Err(ApiError::new(
-                    StatusCode::NOT_FOUND,
-                    "photo not cached and thumbnail unavailable",
-                ));
-            }
-            return Err(ApiError::new(StatusCode::NOT_FOUND, "item has no local file"));
+
+    match resolve_raw_locator(&item) {
+        // P2：file_path 是库内规范形式（相对 = 库根相对），投递前先解析。
+        RawLocator::LocalPath(p) => {
+            let lib_root = st.store.library_root().await;
+            let p = crate::cache::resolve_item_path(&lib_root, &p)
+                .to_string_lossy()
+                .into_owned();
+            serve_local_file(&p, Some(item.kind.as_str()), item.duration, &headers).await
         }
-    };
-    // 与 TG 已缓存投递共用同一实现（serve_local_file）：Range / ETag / MIME 一处定义。
-    // P2：file_path 是库内规范形式（相对 = 库根相对），投递前先解析。
-    let lib_root = st.store.library_root().await;
-    let p = crate::cache::resolve_item_path(&lib_root, &p).to_string_lossy().into_owned();
-    serve_local_file(&p, Some(item.kind.as_str()), item.duration, &headers).await
+        // 未落盘 → 路由层调传输域代理**原图**（不是缩略图）。
+        RawLocator::TelegramPhoto {
+            chat_id,
+            message_id,
+        } => {
+            // 与在线流端点共用解析：Range 语义只有一处定义。
+            let range = parse_range(headers.get(header::RANGE))?;
+            match st.client.media(chat_id, message_id, range).await {
+                Ok(stream) => Ok(media_stream_response(
+                    stream,
+                    range,
+                    PHOTO_PROXY_CACHE_CONTROL,
+                )),
+                Err(ClientError::UnsatisfiableRange(total)) => Ok(media_range_not_satisfiable(
+                    total,
+                    PHOTO_PROXY_CACHE_CONTROL,
+                )),
+                Err(e) => {
+                    // 取不到原图就如实报「无字节」，并留痕（不静默、不缩略图顶替）。
+                    // 链路已断时给出可行动说明，避免把上游故障读成「图片不存在」。
+                    let reason = e.to_string();
+                    let hint = if st.client.link_alive() {
+                        "full-size photo unavailable from telegram"
+                    } else {
+                        "MTProto link is down; restart orig-tg to recover"
+                    };
+                    st.push_log_throttled(
+                        "raw_photo",
+                        60,
+                        format!(
+                            "/api/media/items/{id}/raw: no local bytes for photo {chat_id}:{message_id} \
+                             -> {reason} ({hint})"
+                        ),
+                    );
+                    Err(ApiError::new(
+                        StatusCode::NOT_FOUND,
+                        &format!("photo has no local bytes and its full-size source is unavailable: {reason}"),
+                    ))
+                }
+            }
+        }
+        // 无字节且不可回源：显式提示，不静默降级。
+        RawLocator::Unavailable => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "item has no local file",
+        )),
+    }
 }
 
 // ---- 兼容流（BUG-208）：浏览器解不动的编码（实测整类 HEVC）按需转码 ----
@@ -8015,6 +8110,325 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["added"], 1, "去重后只搬 1 集");
         assert!(st.store.get_series(a).await.unwrap().is_none(), "源应被删除");
+    }
+
+    // ---- BUG-117：原图必须是真原图，且内容域不越界调传输域 ----
+
+    use super::{media_item_raw, resolve_raw_locator, RawLocator};
+
+    /// 原图 vs 缩略图的**可区分**字节：判据要能证明「给的是原图，不是缩略图」。
+    const FULL_SIZE_BYTES: &[u8] = b"FULL-SIZE-ORIGINAL-JPEG-BYTES";
+    const THUMB_BYTES: &[u8] = b"thumb";
+
+    /// BUG-117 夹具：`media()`（原图）与 `thumb()`（缩略图）给**可区分**的字节，
+    /// 并分别计数 —— 判据因此能证明「走的是原图通道，且绝不碰缩略图通道」。
+    struct PhotoSourceClient {
+        full_size: Vec<u8>,
+        /// `media()` 返回 Err 时的模拟失败（用于「取不到原图必须如实报错」）。
+        media_fails: bool,
+        media_calls: Arc<std::sync::Mutex<Vec<(i64, i64)>>>,
+        thumb_calls: Arc<std::sync::Mutex<Vec<(i64, i64)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Client for PhotoSourceClient {
+        async fn start(&self, _phone: &str) -> Result<LoginPhase, ClientError> {
+            Ok(LoginPhase::CodeRequired)
+        }
+        async fn submit_code(&self, _p: &str, _c: &str) -> Result<LoginPhase, ClientError> {
+            Ok(LoginPhase::Authorized)
+        }
+        async fn submit_password(&self, _p: &str, _w: &str) -> Result<LoginPhase, ClientError> {
+            Err(ClientError::Other("no 2FA in BUG-117 fixture".into()))
+        }
+        async fn view(&self) -> SessionView {
+            SessionView {
+                phase: LoginPhase::Authorized,
+                phone: None,
+                user_id: None,
+            }
+        }
+        async fn dialogs(&self) -> Result<Vec<Channel>, ClientError> {
+            Ok(Vec::new())
+        }
+        async fn folders(&self) -> Result<Vec<Folder>, ClientError> {
+            Ok(Vec::new())
+        }
+        async fn messages(
+            &self,
+            _chat_id: i64,
+            _limit: u32,
+            _before_id: Option<i64>,
+        ) -> Result<Vec<TgMedia>, ClientError> {
+            Ok(Vec::new())
+        }
+        /// 缩略图通道：**只**用于列表海报。原图路径一旦碰它，判据即失败。
+        async fn thumb(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+        ) -> Result<Option<Thumbnail>, ClientError> {
+            self.thumb_calls
+                .lock()
+                .unwrap()
+                .push((chat_id, message_id));
+            Ok(Some(Thumbnail {
+                content_type: "image/jpeg".to_string(),
+                bytes: THUMB_BYTES.to_vec(),
+            }))
+        }
+        /// 原图通道：整段字节（夹具不实现区间，Range 判据另行用纯函数覆盖）。
+        async fn media(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+            _range: Option<MediaRange>,
+        ) -> Result<MediaStream, ClientError> {
+            self.media_calls.lock().unwrap().push((chat_id, message_id));
+            if self.media_fails {
+                return Err(ClientError::MediaNotFound);
+            }
+            let n = self.full_size.len() as u64;
+            // 先把字节移出`self`：`MediaStream.body`要求`'static`流，
+            // 不能让async块借用`&self`。
+            let bytes = self.full_size.clone();
+            Ok(MediaStream {
+                content_type: "image/jpeg".to_string(),
+                total_size: Some(n),
+                start: 0,
+                end: n.saturating_sub(1),
+                body: Box::pin(futures::stream::once(async move { Ok(bytes) })),
+            })
+        }
+        async fn download(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _dir: &str,
+            _progress: Option<&crate::login::DownloadProgress>,
+        ) -> Result<DownloadOutcome, ClientError> {
+            Err(ClientError::Other("BUG-117 fixture: unused".into()))
+        }
+        async fn message_meta(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+        ) -> Result<Option<TgMedia>, ClientError> {
+            Ok(None)
+        }
+    }
+
+    /// BUG-117 夹具状态：内存库 + 上述客户端；返回状态与两侧调用计数。
+    #[allow(clippy::type_complexity)]
+    async fn photo_source_state(
+        media_fails: bool,
+    ) -> (Arc<AppState>, Arc<std::sync::Mutex<Vec<(i64, i64)>>>, Arc<std::sync::Mutex<Vec<(i64, i64)>>>) {
+        let media_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let thumb_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut cfg = Config::default();
+        cfg.download_dir = scratch_dir("bug117_photo_source");
+        let st = Arc::new(AppState::new(
+            Arc::new(PhotoSourceClient {
+                full_size: FULL_SIZE_BYTES.to_vec(),
+                media_fails,
+                media_calls: media_calls.clone(),
+                thumb_calls: thumb_calls.clone(),
+            }),
+            cfg,
+            Availability::Ready,
+            false,
+            Store::open(":memory:").await.expect("in-memory store must open"),
+        ));
+        (st, media_calls, thumb_calls)
+    }
+
+    /// 调用 `media_item_raw` 并把响应体收成字节（`Ok` 侧 `Response` 无 `Debug`，
+    /// 故手写解构，同 `merge_call` / `recache_missing_call`）。
+    async fn raw_call(
+        st: Arc<AppState>,
+        id: i64,
+        headers: HeaderMap,
+    ) -> Result<(StatusCode, axum::body::Bytes), (StatusCode, String)> {
+        match media_item_raw(State(st), Path(id), headers).await {
+            Ok(resp) => {
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+                    .await
+                    .expect("body must be readable");
+                Ok((status, bytes))
+            }
+            Err(e) => Err((e.status, e.message().to_string())),
+        }
+    }
+
+    /// **BUG-117 主判据**：未落盘的 TG 图片，`/raw` 必须返回**原图**字节，
+    /// 且**绝不**返回缩略图字节。
+    ///
+    /// 这条直接钉住缺陷本体：修复前该分支调 `client.thumb()`，拿到的是
+    /// `THUMB_BYTES`；修复后走 `client.media()`，必须是 `FULL_SIZE_BYTES`。
+    #[tokio::test]
+    async fn media_item_raw_returns_full_size_not_thumbnail_bug117() {
+        let (st, media_calls, thumb_calls) = photo_source_state(false).await;
+        let id = st
+            .store
+            .upsert_media_item(
+                "tg",
+                "424242:71",
+                "photo",
+                "photo",
+                None, // file_path 为空 = 图片不落盘（BUG-115/121 拍板的常态）
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (status, body) = raw_call(st.clone(), id, HeaderMap::new())
+            .await
+            .expect("未落盘图片必须仍能取到原图，而不是 404");
+
+        assert_eq!(status, StatusCode::OK, "回源原图应 200");
+        assert_eq!(
+            body.as_ref(),
+            FULL_SIZE_BYTES,
+            "BUG-117：`/raw` 必须给**原图**字节，绝不能是缩略图字节"
+        );
+        assert_ne!(
+            body.as_ref(),
+            THUMB_BYTES,
+            "BUG-117：缩略图不得顶替原图（「查看原图」这条路必须真的存在）"
+        );
+        // 分层判据：走的是原图通道，且缩略图通道一次都没被碰。
+        assert_eq!(
+            *media_calls.lock().unwrap(),
+            vec![(424242, 71)],
+            "必须向传输域取原图，且坐标取自 ref_key"
+        );
+        assert!(
+            thumb_calls.lock().unwrap().is_empty(),
+            "BUG-117：原图路径不得再调用缩略图通道"
+        );
+    }
+
+    /// 反向判据：原图取不到时**如实报错**，不静默给缩略图充数（缺陷修复方向 3）。
+    #[tokio::test]
+    async fn media_item_raw_reports_error_instead_of_thumbnail_bug117() {
+        let (st, _media_calls, thumb_calls) = photo_source_state(true).await;
+        let id = st
+            .store
+            .upsert_media_item("tg", "424242:72", "photo", "photo", None, None, None, None)
+            .await
+            .unwrap();
+
+        let (status, msg) = raw_call(st.clone(), id, HeaderMap::new())
+            .await
+            .expect_err("原图取不到必须报错，而不是退给缩略图");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            msg.contains("no local bytes"),
+            "错误须如实说明「本地无字节且原图不可得」，实际：{msg}"
+        );
+        assert!(
+            thumb_calls.lock().unwrap().is_empty(),
+            "失败路径同样不得回退到缩略图"
+        );
+    }
+
+    /// 已落盘条目仍走本地投递，**不回源**（回归护栏：修 BUG-117 不能把
+    /// 「有本地字节」也改成在线取）。
+    #[tokio::test]
+    async fn media_item_raw_prefers_local_bytes_over_network_bug117() {
+        let (st, media_calls, thumb_calls) = photo_source_state(false).await;
+        let dir = scratch_dir("bug117_local_bytes");
+        let f = dir.join("photo.jpg");
+        std::fs::write(&f, b"LOCAL-FILE-BYTES").expect("seed local file");
+        let id = st
+            .store
+            .upsert_media_item(
+                "tg",
+                "424242:73",
+                "photo",
+                "photo",
+                Some(&f.to_string_lossy()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (status, body) = raw_call(st.clone(), id, HeaderMap::new())
+            .await
+            .expect("已落盘条目必须可读");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), b"LOCAL-FILE-BYTES", "有本地字节就必须读本地");
+        assert!(
+            media_calls.lock().unwrap().is_empty() && thumb_calls.lock().unwrap().is_empty(),
+            "已落盘时不得回源（原图与缩略图都不该被调用）"
+        );
+    }
+
+    /// 定位判据（纯函数层，模块边界的直接钉子）：内容域只回答「字节在哪」。
+    ///
+    /// `resolve_raw_locator` 必须是**纯**的：它只读库行，不碰传输域 —— 这正是
+    /// 「内容域不越界调传输域」在代码层的落点。
+    #[test]
+    fn resolve_raw_locator_localizes_bytes_without_transport_bug117() {
+        let mut item = crate::media::MediaItem {
+            id: 1,
+            source: "tg".to_string(),
+            ref_key: "424242:71".to_string(),
+            title: "t".to_string(),
+            description: None,
+            kind: "photo".to_string(),
+            file_path: Some("photos/a.jpg".to_string()),
+            absolute_path: None,
+            poster: None,
+            size: None,
+            duration: None,
+            width: None,
+            height: None,
+            added_at: 0,
+            tags: Vec::new(),
+            series_id: None,
+            series_title: None,
+            bytes_presence: crate::cache::BytesPresence::Present,
+        };
+        // 有本地字节 → 本地。
+        assert_eq!(
+            resolve_raw_locator(&item),
+            RawLocator::LocalPath("photos/a.jpg".to_string())
+        );
+        // 空白 file_path 视为无字节（不得被当成有效路径去开文件）。
+        item.file_path = Some("   ".to_string());
+        assert_eq!(
+            resolve_raw_locator(&item),
+            RawLocator::TelegramPhoto {
+                chat_id: 424242,
+                message_id: 71
+            }
+        );
+        // TG 图片无字节 → 回源原图坐标。
+        item.file_path = None;
+        assert_eq!(
+            resolve_raw_locator(&item),
+            RawLocator::TelegramPhoto {
+                chat_id: 424242,
+                message_id: 71
+            }
+        );
+        // 非图片不提供回源：视频的在线流有自己的端点，这里只如实报缺。
+        item.kind = "video".to_string();
+        assert_eq!(resolve_raw_locator(&item), RawLocator::Unavailable);
+        item.kind = "photo".to_string();
+        // 非 TG 来源不回源（本地库条目没有传输域坐标）。
+        item.source = "local".to_string();
+        assert_eq!(resolve_raw_locator(&item), RawLocator::Unavailable);
+        item.source = "tg".to_string();
+        // 脏 ref（如 BUG-261 判据 4 的 "not-a-ref"）不得被当成坐标。
+        item.ref_key = "not-a-ref".to_string();
+        assert_eq!(resolve_raw_locator(&item), RawLocator::Unavailable);
     }
 
     // ---- BUG-261：剧集级「补缺」端点（POST /api/media/series/:id/recache-missing）----
