@@ -201,7 +201,7 @@ export function ItemEditDialog(props: {
             className="w-full resize-none rounded-md border border-border-subtle bg-surface px-2.5 py-1.5 text-xs text-fg-strong placeholder:text-muted"
             data-testid="item-edit-desc"
           />
-          <label className="block text-[11px] text-muted">标签</label>
+          <label className="block text-[11px] text-muted">{t('media.tags')}</label>
           <TagPicker
             tags={tags}
             selected={selected}

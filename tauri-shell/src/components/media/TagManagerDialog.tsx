@@ -28,6 +28,7 @@ export function TagPicker(props: {
   onCreate?: (name: string) => Promise<number | null>
 }) {
   const { tags, selected, onChange, onCreate } = props
+  const { t } = useTranslation()
   const [query, setQuery] = useState('')
   const [created, setCreated] = useState<MediaTag[]>([])
   const [busy, setBusy] = useState(false)
@@ -76,7 +77,7 @@ export function TagPicker(props: {
                 type="button"
                 data-testid={`tag-picked-${id}`}
                 onClick={() => toggle(id)}
-                title="点击移除"
+                title={t('media.tag.clickToRemove')}
                 className="inline-flex max-w-full items-baseline gap-px whitespace-nowrap rounded bg-accent/15 px-1 py-px text-[10px] text-accent transition-colors hover:bg-accent/25"
               >
                 <span className="text-accent/70">#</span>
@@ -93,7 +94,7 @@ export function TagPicker(props: {
         <Input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="搜索标签，如 短剧"
+          placeholder={t('media.tag.searchPlaceholder')}
           className="h-7 text-[11px]"
           data-testid="tag-picker-input"
         />
@@ -101,10 +102,10 @@ export function TagPicker(props: {
 
       <div className="max-h-40 overflow-y-auto">
         {all.length === 0 ? (
-          <p className="py-2 text-[11px] text-muted">还没有标签，先在「标签管理」里新建</p>
+          <p className="py-2 text-[11px] text-muted">{t('media.tag.pickerEmpty')}</p>
         ) : null}
         {all.length > 0 && visible.length === 0 ? (
-          <p className="py-2 text-[11px] text-muted">没有匹配的标签</p>
+          <p className="py-2 text-[11px] text-muted">{t('media.tag.noMatch')}</p>
         ) : null}
         <div className="flex flex-wrap gap-1">
           {visible.map((tag) => {
@@ -136,7 +137,7 @@ export function TagPicker(props: {
             onClick={() => void create()}
             className="mt-1 inline-flex max-w-full items-baseline gap-px rounded px-1.5 py-0.5 text-[11px] text-accent transition-colors hover:bg-accent/10 disabled:opacity-50"
           >
-            <span className="text-accent/80">新建 #</span>
+            <span className="text-accent/80">{t('media.tag.createPrefix')}</span>
             <span className="truncate">{busy ? '…' : raw}</span>
           </button>
         ) : null}
@@ -196,7 +197,7 @@ export function BulkTagDialog(props: {
         </div>
         <div className="mt-4 flex justify-end gap-2">
           <Button variant="outline" size="sm" className="h-8 px-3 text-xs" onClick={onClose}>
-            取消
+            {t('media.cancel')}
           </Button>
           <Button
             size="sm"
@@ -212,7 +213,7 @@ export function BulkTagDialog(props: {
               }
             }}
           >
-            {busy ? '应用中…' : '应用'}
+            {busy ? t('media.tag.applying') : t('media.tag.apply')}
           </Button>
         </div>
       </div>
@@ -228,6 +229,7 @@ export function TagManagerDialog(props: {
   onError: (msg: string) => void
 }) {
   const { tags, onClose, onChanged, onError } = props
+  const { t } = useTranslation()
   const [newName, setNewName] = useState('')
   const [busy, setBusy] = useState(false)
   const [editingId, setEditingId] = useState<number | null>(null)
@@ -290,9 +292,9 @@ export function TagManagerDialog(props: {
         onClick={(e) => e.stopPropagation()}
       >
         <header className="shrink-0 border-b border-border-subtle/60 px-4 py-3">
-          <h4 className="text-[13px] font-semibold text-fg-strong">标签管理</h4>
+          <h4 className="text-[13px] font-semibold text-fg-strong">{t('media.manageTags')}</h4>
           <p className="mt-0.5 text-[11px] text-muted">
-            标签以 #名称 的形式挂在内容或剧集上，用于交叉归类检索。
+            {t('media.tag.description')}
           </p>
         </header>
 
@@ -306,7 +308,7 @@ export function TagManagerDialog(props: {
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') void add()
                 }}
-                placeholder="新标签，如 短剧"
+                placeholder={t('media.tag.newPlaceholder')}
                 className="h-8 text-xs"
                 data-testid="tag-new-input"
               />
@@ -318,7 +320,7 @@ export function TagManagerDialog(props: {
               onClick={() => void add()}
               data-testid="tag-new-submit"
             >
-              新建
+              {t('media.tag.create')}
             </Button>
           </div>
         </div>
@@ -329,14 +331,14 @@ export function TagManagerDialog(props: {
             <Input
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
-              placeholder="搜索标签"
+              placeholder={t('media.tag.search')}
               className="h-7 text-[11px]"
               data-testid="tag-manager-search"
             />
           </div>
           {visible.length === 0 ? (
             <p className="py-6 text-center text-xs text-muted">
-              {tags.length === 0 ? '暂无标签' : '没有匹配的标签'}
+              {tags.length === 0 ? t('media.tag.empty') : t('media.tag.noMatch')}
             </p>
           ) : (
             <ul className="space-y-1">
@@ -365,7 +367,7 @@ export function TagManagerDialog(props: {
                         className="h-7 shrink-0 px-2 text-[11px]"
                         onClick={() => void rename(tag.id)}
                       >
-                        保存
+                        {t('media.save')}
                       </Button>
                       <Button
                         variant="outline"
@@ -373,7 +375,7 @@ export function TagManagerDialog(props: {
                         className="h-7 shrink-0 px-2 text-[11px]"
                         onClick={() => setEditingId(null)}
                       >
-                        取消
+                        {t('media.cancel')}
                       </Button>
                     </>
                   ) : (
@@ -389,7 +391,7 @@ export function TagManagerDialog(props: {
                         <span className="truncate">{tag.name}</span>
                       </span>
                       <span className="shrink-0 text-[10px] text-muted">
-                        {tag.itemCount ?? 0} 内容 · {tag.seriesCount ?? 0} 剧集
+                        {t('media.tag.usage', { n: tag.itemCount ?? 0, m: tag.seriesCount ?? 0 })}
                       </span>
                       <Button
                         variant="outline"
@@ -400,7 +402,7 @@ export function TagManagerDialog(props: {
                           setEditName(tag.name)
                         }}
                       >
-                        重命名
+                        {t('media.tag.rename')}
                       </Button>
                       <Button
                         variant="outline"
@@ -408,7 +410,7 @@ export function TagManagerDialog(props: {
                         className="h-7 shrink-0 px-2 text-[11px] text-destructive"
                         onClick={() => void remove(tag)}
                       >
-                        删除
+                        {t('media.delete')}
                       </Button>
                     </>
                   )}
@@ -420,7 +422,7 @@ export function TagManagerDialog(props: {
 
         <footer className="flex shrink-0 justify-end border-t border-border-subtle/60 px-4 py-3">
           <Button size="sm" className="h-8 px-3 text-xs" onClick={onClose}>
-            完成
+            {t('media.tag.done')}
           </Button>
         </footer>
       </div>

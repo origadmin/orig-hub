@@ -3817,36 +3817,47 @@ impl Store {
 
     // ---- 标签 ----
 
-    /// 全部标签 + 使用计数。
+    /// 全部标签 + 使用计数（BUG-259 根因 3）。
+    ///
+    /// 旧实现是 **1 + 2N 条语句**：先取全部标签，再对每个标签单独发两条
+    /// `COUNT(*)`（条目侧 / 剧集侧）——标签一多（实测 N=5000 → 10001 条语句），
+    /// 每次刷新都要等数秒。现在改为**一条**聚合查询：`media_tag` 左联两个
+    /// 「按 `tag_id` 分组计数」的子查询，一次取回全部计数，语句数与 N 无关。
+    ///
+    /// **为什么是单条 LEFT JOIN 而不是「两次 GROUP BY 后在 Rust 里合并」**：
+    ///   - 一条语句在协议层就只有一次往返，合并计数这类纯集合运算没有理由搬到应用层；
+    ///   - `LEFT JOIN`（而非 `FULL OUTER JOIN`）在所有 SQLite/libsql 版本都可用，
+    ///     无版本兼容性顾虑；
+    ///   - 计数子查询先 `GROUP BY` 再联接，不会因关联表多行导致标签行膨胀。
+    ///
+    /// **0 计数标签必须出现在结果里**：`LEFT JOIN` 保证没有任何挂载的标签照样成行，
+    /// `COALESCE` 把空计数补成 0。BUG-068 的「0 计数不渲染」是**展示层**行为，
+    /// SQL 层不得丢行。
     pub async fn list_tags(&self) -> libsql::Result<Vec<TagView>> {
         let stmt = self
             .conn
-            .prepare("SELECT id, name, color FROM media_tag ORDER BY name COLLATE NOCASE")
+            .prepare(
+                "SELECT t.id, t.name, t.color,
+                        COALESCE(ic.cnt, 0), COALESCE(sc.cnt, 0)
+                   FROM media_tag AS t
+                   LEFT JOIN (SELECT tag_id, COUNT(*) AS cnt
+                                FROM media_item_tag GROUP BY tag_id) AS ic
+                     ON ic.tag_id = t.id
+                   LEFT JOIN (SELECT tag_id, COUNT(*) AS cnt
+                                FROM media_series_tag GROUP BY tag_id) AS sc
+                     ON sc.tag_id = t.id
+                  ORDER BY t.name COLLATE NOCASE",
+            )
             .await?;
         let mut rows = stmt.query(()).await?;
         let mut out = Vec::new();
         while let Some(r) = rows.next().await? {
-            let id: i64 = r.get(0)?;
-            let name: String = r.get(1)?;
-            let color: Option<String> = r.get(2)?;
-            let item_count: i64 = self
-                .count_one(
-                    "SELECT COUNT(*) FROM media_item_tag WHERE tag_id = ?1",
-                    params![id],
-                )
-                .await?;
-            let series_count: i64 = self
-                .count_one(
-                    "SELECT COUNT(*) FROM media_series_tag WHERE tag_id = ?1",
-                    params![id],
-                )
-                .await?;
             out.push(TagView {
-                id,
-                name,
-                color,
-                item_count,
-                series_count,
+                id: r.get(0)?,
+                name: r.get(1)?,
+                color: r.get(2)?,
+                item_count: r.get(3)?,
+                series_count: r.get(4)?,
             });
         }
         Ok(out)
@@ -3924,39 +3935,86 @@ impl Store {
         Ok(())
     }
 
-    /// 全量重设某内容的标签集合。
+    /// 全量重设某内容的标签集合（BUG-259 现象 4）。
+    ///
+    /// 事务语义（与 [`Store::switch_episode_source`] 同一套先例）：1 次 `DELETE`
+    /// + N 次 `INSERT` 同处一个 `BEGIN IMMEDIATE`，中途任何一步失败即整体
+    /// `ROLLBACK` —— 该条目的标签集合要么全旧、要么全新，绝不出现
+    /// 「先清后写、写了一半就断」的半套标签。
     pub async fn set_item_tags(&self, item_id: i64, tag_ids: &[i64]) -> libsql::Result<()> {
-        self.conn
-            .execute("DELETE FROM media_item_tag WHERE item_id = ?1", params![item_id])
-            .await?;
-        for tid in tag_ids {
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let res = async {
             self.conn
                 .execute(
-                    "INSERT OR IGNORE INTO media_item_tag (item_id, tag_id) VALUES (?1, ?2)",
-                    params![item_id, *tid],
+                    "DELETE FROM media_item_tag WHERE item_id = ?1",
+                    params![item_id],
                 )
                 .await?;
+            for tid in tag_ids {
+                self.conn
+                    .execute(
+                        "INSERT OR IGNORE INTO media_item_tag (item_id, tag_id) VALUES (?1, ?2)",
+                        params![item_id, *tid],
+                    )
+                    .await?;
+            }
+            Ok::<(), libsql::Error>(())
         }
-        Ok(())
+        .await;
+        match res {
+            Ok(()) => match self.conn.execute("COMMIT", ()).await {
+                Ok(_) => Ok(()),
+                // COMMIT 失败同样要回滚（await 不能省：execute 返回 Future，
+                // 不 poll 就不会执行 —— ROLLBACK 不 await 等于没回滚）。
+                Err(e) => {
+                    let _ = self.conn.execute("ROLLBACK", ()).await;
+                    Err(e)
+                }
+            },
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
-    /// 全量重设某剧集的标签集合。
+    /// 全量重设某剧集的标签集合（BUG-259 现象 4）。
+    ///
+    /// 事务语义同 [`Store::set_item_tags`]：先清后写在同一个 `BEGIN IMMEDIATE` 内，
+    /// 中途失败整体 `ROLLBACK`，不留半套标签。
     pub async fn set_series_tags(&self, series_id: i64, tag_ids: &[i64]) -> libsql::Result<()> {
-        self.conn
-            .execute(
-                "DELETE FROM media_series_tag WHERE series_id = ?1",
-                params![series_id],
-            )
-            .await?;
-        for tid in tag_ids {
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let res = async {
             self.conn
                 .execute(
-                    "INSERT OR IGNORE INTO media_series_tag (series_id, tag_id) VALUES (?1, ?2)",
-                    params![series_id, *tid],
+                    "DELETE FROM media_series_tag WHERE series_id = ?1",
+                    params![series_id],
                 )
                 .await?;
+            for tid in tag_ids {
+                self.conn
+                    .execute(
+                        "INSERT OR IGNORE INTO media_series_tag (series_id, tag_id) VALUES (?1, ?2)",
+                        params![series_id, *tid],
+                    )
+                    .await?;
+            }
+            Ok::<(), libsql::Error>(())
         }
-        Ok(())
+        .await;
+        match res {
+            Ok(()) => match self.conn.execute("COMMIT", ()).await {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let _ = self.conn.execute("ROLLBACK", ()).await;
+                    Err(e)
+                }
+            },
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
     }
 
     /// 从一批 TG 消息的 caption 中收集 `#标签`（按消息顺序、跨消息去重）。
@@ -5479,6 +5537,255 @@ mod tests {
 
         // 上限生效
         assert_eq!(s.collect_hash_tags(100, &[1, 2, 3], 2).await.unwrap().len(), 2);
+    }
+
+    /// 只统计「SQL 语句」事件的 Subscriber —— libsql 的 `Connection::prepare` /
+    /// `Connection::execute` 每分发一条 SQL 都会发一条 `tracing::trace!`
+    /// （消息以 `preparing` / `executing` 开头），数这类事件即语句数。
+    struct SqlCountingSubscriber(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl tracing::Subscriber for SqlCountingSubscriber {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut msg = String::new();
+            event.record(&mut MsgCapture(&mut msg));
+            if msg.starts_with("preparing") || msg.starts_with("executing") {
+                self.0
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _id: &tracing::span::Id) {}
+        fn exit(&self, _id: &tracing::span::Id) {}
+    }
+
+    /// 抓 `tracing::Event` 的 message 字段。
+    struct MsgCapture<'a>(&'a mut String);
+
+    impl tracing::field::Visit for MsgCapture<'_> {
+        fn record_debug(
+            &mut self,
+            field: &tracing::field::Field,
+            value: &dyn std::fmt::Debug,
+        ) {
+            if field.name() == "message" {
+                self.0.push_str(&format!("{value:?}"));
+            }
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.0.push_str(value);
+            }
+        }
+    }
+
+    /// 在计数 Subscriber 作用域内执行一个 future，返回 `(输出, SQL 语句数)`。
+    ///
+    /// 注意 `#[test]`（非 `#[tokio::test]`）：future 必须在本函数自建的 runtime 上
+    /// 被 poll，且 poll 必须发生在 `with_default` 的**同步作用域内** ——
+    /// tracing 的 dispatcher 是 thread-local 的，事件只有在本线程才有订阅者；
+    /// 而在另一个 runtime 的上下文里再起 `block_on` 会被 tokio 拒绝。
+    fn sql_statements_during_sync<F: std::future::Future>(fut: F) -> (F::Output, usize) {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out =
+            tracing::subscriber::with_default(SqlCountingSubscriber(count.clone()), || {
+                rt.block_on(fut)
+            });
+        (out, count.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// 取一整列 i64（测试辅助，与 `scalar_i64` 同风格）。
+    async fn i64_column(conn: &libsql::Connection, sql: &str) -> Vec<i64> {
+        let stmt = conn.prepare(sql).await.unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await.unwrap() {
+            let v: i64 = r.get(0).unwrap();
+            out.push(v);
+        }
+        out
+    }
+
+    /// BUG-259 判据 4：`list_tags` 的 SQL 语句数与标签数 N 无关（常数条），
+    /// 且 **0 计数标签必须出现在结果里**（BUG-068 的「0 计数不渲染」是展示层
+    /// 行为，SQL 层不得丢行）。
+    ///
+    /// N=8 与 N=64 两个规模各数一次语句数并断言相等 —— 旧实现（1 + 2N）下
+    /// 该断言必 FAIL（33 条 vs 129 条），新实现（单条 LEFT JOIN 聚合）恒等。
+    ///
+    /// `#[test]` + 自建 runtime：语句计数依赖 thread-local tracing dispatcher，
+    /// 见 `sql_statements_during_sync` 的说明。
+    #[test]
+    fn list_tags_statement_count_constant_and_zero_count_kept_bug259() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (s, sid, iid, mut ids) = rt.block_on(async {
+            let s = Store::open(tmp_db("bug259_list_tags")).await.unwrap();
+            let sid = s.create_series("剧", None, "series", None, None).await.unwrap();
+            let iid = s
+                .upsert_media_item("tg", "ref:bug259", "t", "video", None, None, None, None)
+                .await
+                .unwrap();
+
+            // N1 = 8：前 3 个挂条目、第 4~5 个挂剧集、其余 3 个 0 计数
+            let name = |i: usize| format!("标签{i:03}");
+            let mut ids = Vec::new();
+            for i in 0..8 {
+                ids.push(s.create_tag(&name(i), None).await.unwrap());
+            }
+            s.set_item_tags(iid, &ids[0..3]).await.unwrap();
+            s.set_series_tags(sid, &ids[3..5]).await.unwrap();
+            (s, sid, iid, ids)
+        });
+        drop(rt);
+
+        let (res8, stmt8) = sql_statements_during_sync(s.list_tags());
+        let tags8 = res8.unwrap();
+        assert!(stmt8 >= 1, "list_tags 至少发一条语句");
+        assert_eq!(tags8.len(), 8, "0 计数标签必须出现在结果里（SQL 层不得丢行）");
+        let by_id: std::collections::HashMap<i64, &TagView> =
+            tags8.iter().map(|t| (t.id, t)).collect();
+        assert_eq!(by_id[&ids[0]].item_count, 1);
+        assert_eq!(by_id[&ids[0]].series_count, 0);
+        assert_eq!(by_id[&ids[3]].item_count, 0);
+        assert_eq!(by_id[&ids[3]].series_count, 1);
+        assert_eq!(by_id[&ids[5]].item_count, 0);
+        assert_eq!(by_id[&ids[5]].series_count, 0);
+        drop(by_id);
+        drop(tags8);
+
+        // N2 = 64：再灌 56 个标签，部分挂载，其余 0 计数
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let name = |i: usize| format!("标签{i:03}");
+            let mut item_attached = ids[0..3].to_vec();
+            let mut series_attached = ids[3..5].to_vec();
+            for i in 8..64 {
+                let id = s.create_tag(&name(i), None).await.unwrap();
+                ids.push(id);
+                if i % 4 == 0 {
+                    item_attached.push(id);
+                }
+                if i % 5 == 0 {
+                    series_attached.push(id);
+                }
+            }
+            s.set_item_tags(iid, &item_attached).await.unwrap();
+            s.set_series_tags(sid, &series_attached).await.unwrap();
+        });
+        drop(rt);
+
+        let (res64, stmt64) = sql_statements_during_sync(s.list_tags());
+        let tags64 = res64.unwrap();
+        assert_eq!(tags64.len(), 64, "0 计数标签仍然一个不丢");
+        assert_eq!(
+            stmt64, stmt8,
+            "语句数必须与 N 无关（旧实现 1+2N：33 条 vs 129 条）"
+        );
+        let by_id: std::collections::HashMap<i64, &TagView> =
+            tags64.iter().map(|t| (t.id, t)).collect();
+        // 计数正确性随规模复核：条目侧 / 剧集侧 / 0 计数各抽一个
+        assert_eq!(by_id[&ids[2]].item_count, 1);
+        assert_eq!(by_id[&ids[4]].series_count, 1);
+        assert_eq!(by_id[&ids[9]].item_count, 0, "9 % 4 != 0 未挂条目");
+        assert_eq!(by_id[&ids[9]].series_count, 0, "9 % 5 != 0 未挂剧集");
+        assert_eq!(by_id[&ids[8]].item_count, 1, "8 % 4 == 0 已挂条目");
+        assert_eq!(by_id[&ids[8]].series_count, 0, "8 % 5 != 0 未挂剧集");
+        assert_eq!(by_id[&ids[10]].series_count, 1, "10 % 5 == 0 已挂剧集");
+        assert_eq!(by_id[&ids[10]].item_count, 0, "10 % 4 != 0 未挂条目");
+    }
+
+    /// BUG-259 判据 5：写入原子性 —— `set_item_tags` / `set_series_tags` 中途
+    /// 注入失败（触发器 `RAISE(ABORT)` 只拦「写到 C」那一条 INSERT，精确制造
+    /// 「先清后写、写一半就断」），标签集合必须保持**全旧** {X, Y}。
+    ///
+    /// 反向证伪已实跑：去掉 `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK` 后本测试
+    /// FAIL（DELETE 与前半 INSERT 以自动提交各自落盘，剩半套 {A, B}）。
+    /// 证据登记见 BUG-259.md「验收证据」。
+
+    #[tokio::test]
+    async fn set_tags_atomic_on_midway_failure_bug259() {
+        let s = Store::open(tmp_db("bug259_atomic")).await.unwrap();
+        let sid = s.create_series("剧", None, "series", None, None).await.unwrap();
+        let iid = s
+            .upsert_media_item("tg", "ref:bug259a", "t", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let a = s.create_tag("A", None).await.unwrap();
+        let b = s.create_tag("B", None).await.unwrap();
+        let c = s.create_tag("C", None).await.unwrap();
+        let d = s.create_tag("D", None).await.unwrap();
+        let x = s.create_tag("X", None).await.unwrap();
+        let y = s.create_tag("Y", None).await.unwrap();
+
+        // 注入点：只拦「tag_id = C」的 INSERT —— 之前的 DELETE（清旧）与前两条
+        // INSERT（写 A/B）都会成功，失败恰好发生在中途。
+        // （触发器体内不绑参：SQLite 不保证 CREATE TRIGGER 语句里保留参数值，故内联。）
+        let trg_item = format!(
+            "CREATE TRIGGER trg_bug259_boom_item BEFORE INSERT ON media_item_tag
+             WHEN NEW.tag_id = {c} BEGIN SELECT RAISE(ABORT, 'bug259 boom'); END",
+            c = c
+        );
+        s.conn.execute(&trg_item, ()).await.unwrap();
+        let trg_series = format!(
+            "CREATE TRIGGER trg_bug259_boom_series BEFORE INSERT ON media_series_tag
+             WHEN NEW.tag_id = {c} BEGIN SELECT RAISE(ABORT, 'bug259 boom'); END",
+            c = c
+        );
+        s.conn.execute(&trg_series, ()).await.unwrap();
+
+        // 全旧基线：{X, Y}（X/Y 建在后，id 必大于 A~D）
+        s.set_item_tags(iid, &[x, y]).await.unwrap();
+        s.set_series_tags(sid, &[x, y]).await.unwrap();
+
+        // 中途失败：目标集合含 C，写到 C 必炸
+        assert!(
+            s.set_item_tags(iid, &[a, b, c, d]).await.is_err(),
+            "C 的拦截触发器应使中途 INSERT 失败"
+        );
+        assert!(
+            s.set_series_tags(sid, &[a, b, c, d]).await.is_err(),
+            "剧集侧同判据"
+        );
+
+        // 判据：要么全旧要么全新 —— 失败前是 {X, Y}，必须仍是 {X, Y}（全旧），
+        // 不得出现 {A, B} / {A, B, X, Y} 等半套。
+        let item_set = i64_column(
+            &s.conn,
+            &format!("SELECT tag_id FROM media_item_tag WHERE item_id = {iid} ORDER BY tag_id"),
+        )
+        .await;
+        assert_eq!(item_set, vec![x, y], "set_item_tags 中途失败必须整体回滚（全旧）");
+        let series_set = i64_column(
+            &s.conn,
+            &format!("SELECT tag_id FROM media_series_tag WHERE series_id = {sid} ORDER BY tag_id"),
+        )
+        .await;
+        assert_eq!(series_set, vec![x, y], "set_series_tags 中途失败必须整体回滚（全旧）");
+
+        // 回滚后连接照常可用：正常写入不受影响
+        s.set_item_tags(iid, &[a, b]).await.unwrap();
+        let after = i64_column(
+            &s.conn,
+            &format!("SELECT tag_id FROM media_item_tag WHERE item_id = {iid} ORDER BY tag_id"),
+        )
+        .await;
+        assert_eq!(after, vec![a, b], "失败回滚后下一次正常写入照常生效");
     }
 
     /// BUG-039 冲突2：caption 集号区间解析——合集 / 单集 / 歧义拒绝。
