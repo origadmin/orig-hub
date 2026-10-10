@@ -577,17 +577,25 @@ async function main() {
     )
 
     // B3：422 契约 —— 非法类型枚举不得进列（活体门已用同一探针验过，这里复核夹具已复位）
+    // 「未被改动」必须与 **PATCH 前实测到的那个值** 逐字比对，不能硬编码 'series'：
+    // A1 已通过真实 UI 把夹具设成 album 且 A2/A3 证明它挺过了重启，硬编码会假失败。
+    const beforeGarbage = await httpJson('GET', `${TG}/api/media/series/${fx.seriesId}`)
+    const kindBefore = beforeGarbage.json && beforeGarbage.json.kind
     const garbage = await httpJson('PATCH', `${TG}/api/media/series/${fx.seriesId}`, {
       kind: 'garbage',
     })
     const afterGarbage = await httpJson('GET', `${TG}/api/media/series/${fx.seriesId}`)
-    const b3ok = garbage.status === 422 && afterGarbage.json && afterGarbage.json.kind === 'series'
+    const b3ok =
+      garbage.status === 422 &&
+      typeof kindBefore === 'string' &&
+      afterGarbage.json &&
+      afterGarbage.json.kind === kindBefore
     // 无论成败都复位夹具类型（修复前的引擎已经把脏值写进去了）。
     await httpJson('PATCH', `${TG}/api/media/series/${fx.seriesId}`, { kind: 'series' })
     check(
       'B3: PATCH {"kind":"garbage"} → 422 且列值未被改动',
       b3ok,
-      `status=${garbage.status} body=${JSON.stringify(garbage.json)} kindAfter=${JSON.stringify(afterGarbage.json && afterGarbage.json.kind)}` +
+      `status=${garbage.status} body=${JSON.stringify(garbage.json)} kindBefore=${JSON.stringify(kindBefore)} kindAfter=${JSON.stringify(afterGarbage.json && afterGarbage.json.kind)}` +
         (b3ok ? '' : staleEngine ? '  （引擎未重建：修复前无枚举校验 —— 不可归因于代码）' : ''),
       'B3',
     )

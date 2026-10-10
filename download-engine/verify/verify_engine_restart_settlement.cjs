@@ -50,16 +50,37 @@
  * ## 用法（不依赖任何机器绝对路径；base url 从 env 读）
  *
  *   node download-engine/verify/verify_engine_restart_settlement.cjs
- *   ORIG_TG_BASE=http://127.0.0.1:19788 ORIG_DAEMON_BASE=http://127.0.0.1:19786 \
+ *   ORIG_TG_BASE=http://127.0.0.1:19787 ORIG_DAEMON_BASE=http://127.0.0.1:19786 \
  *     node download-engine/verify/verify_engine_restart_settlement.cjs
+ *
+ *   ⚠️ 不设 ORIG_TG_BASE 时**从 daemon /api/config 的 tg_port 运行时解析**（不再写死
+ *   19788 —— 端口由 `python scripts/dev_services.py` 下发，写死会让 orig-tg 侧判据
+ *   全部打到空端口、报 `HTTP null`，被误读成「修复未随重启生效」）。
  */
 
-// ---- base url：env 优先，绝不写死机器路径（沿用仓库既有脚本 ORIG_TG_BASE 约定）----
+// ---- base url：env 优先；orig-tg 端口运行时解析，绝不写死 ----
 const stripSlash = (s) => String(s || '').replace(/\/+$/, '')
-// orig-tg 引擎（媒体库、缓存任务面）；本会话 live 实例监听 19788。
-const ORIG_TG_BASE = stripSlash(process.env.ORIG_TG_BASE || 'http://127.0.0.1:19788')
-// orig-daemon（配置面：/api/config、/api/config/download）；本会话 live 实例监听 19786。
+// orig-daemon（配置面：/api/config、/api/config/download）；引擎默认端口 19786。
 const ORIG_DAEMON_BASE = stripSlash(process.env.ORIG_DAEMON_BASE || 'http://127.0.0.1:19786')
+// orig-tg 引擎（媒体库、缓存任务面）：env 优先，否则读 daemon /api/config 的 tg_port。
+let ORIG_TG_BASE = stripSlash(process.env.ORIG_TG_BASE || '')
+
+/** 从 daemon /api/config 解析真实 tg_port 并回填 ORIG_TG_BASE。解析不到则保留原值。 */
+async function resolveTgBase() {
+  if (ORIG_TG_BASE) return ORIG_TG_BASE
+  try {
+    const r = await req('GET', `${ORIG_DAEMON_BASE}/api/config`)
+    const port = r && r.json && (r.json.tg_port || r.json.tgPort)
+    if (port) {
+      ORIG_TG_BASE = `http://127.0.0.1:${port}`
+      console.log(`${C.dim}  [resolve] tg_port=${port} → ${ORIG_TG_BASE}${C.reset}`)
+    }
+  } catch (_) {
+    /* 解析失败不致命：下面的判据会各自报 HTTP null */
+  }
+  if (!ORIG_TG_BASE) ORIG_TG_BASE = 'http://127.0.0.1:19787'
+  return ORIG_TG_BASE
+}
 
 const TIMEOUT_MS = Number(process.env.ORIG_VERIFY_TIMEOUT_MS || 8000)
 
@@ -218,6 +239,7 @@ async function checkBug249() {
 
 async function main() {
   console.log(`${C.bold}[verify-engine-restart] 引擎重启结算探针${C.reset}`)
+  await resolveTgBase()
   console.log(`${C.dim}  orig-tg   = ${ORIG_TG_BASE}${C.reset}`)
   console.log(`${C.dim}  orig-daemon = ${ORIG_DAEMON_BASE}${C.reset}`)
   console.log(`${C.dim}  说明：BUG-248 的运行时判据在隔离 A/B 脚本 ` +
