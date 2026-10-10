@@ -1310,6 +1310,16 @@ fn cache_task_title<'a>(
 ///    由前端回退链如实呈现，不属于本自愈能解决的。
 static TITLE_SELFHEAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// BUG-220：标题回填的**尝试次数上限**（按 (chat,msg) 计）。
+///
+/// 判据改成「有行但无标题」后，真正既无 caption 也无 file_name 的消息每轮都会被
+/// 重取；面板在开着时 1s 轮询 ⇒ 不封顶就是持续 MTProto 压力。封顶 3 次后不再打扰：
+/// 补到了就自然退出（`message_has_title` 命中），补不到就不再来。
+static TITLE_BACKFILL_ATTEMPTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(i64, i64), u8>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+const MAX_TITLE_BACKFILL_ATTEMPTS: u8 = 3;
+
 fn spawn_title_selfheal(
     st: &Arc<AppState>,
     tasks: &[CacheTask],
@@ -1337,7 +1347,7 @@ fn spawn_title_selfheal(
     let st2 = st.clone();
     tokio::spawn(async move {
         for (chat, msgs) in by_chat {
-            ensure_message_rows(&st2, chat, &msgs).await;
+            backfill_message_titles(&st2, chat, &msgs).await;
         }
         TITLE_SELFHEAL.store(false, Ordering::SeqCst);
     });
@@ -1635,6 +1645,48 @@ async fn ensure_message_rows(st: &Arc<AppState>, chat_id: i64, msg_ids: &[i64]) 
                     m.group_id,
 
                     m.file_name.as_deref(),
+                )
+                .await;
+        }
+    }
+}
+
+/// BUG-220：**标题回填**（与上面的登记是**两件事**，判据不同）。
+///
+/// 登记 `ensure_message_rows` 的判据是「行是否存在」——只要行在就跳过（BUG-246 的语义，
+/// 不能改：改了会让增量登记反复打 MTProto）。但标题要的判据是「**有没有标题来源**」：
+/// 一条 caption 为空、file_name 也还没补的行，对登记而言「已完成」，对标题而言「仍缺」。
+///
+/// 所以这里单列一个只管标题的补齐：缺标题就重取一次元数据（把 file_name 补上），
+/// 按 (chat,msg) 最多 `MAX_TITLE_BACKFILL_ATTEMPTS` 次——补到即止（`message_has_title`
+/// 命中），补不到就永久放弃，绝不每轮轮询都去打扰 MTProto。
+async fn backfill_message_titles(st: &Arc<AppState>, chat_id: i64, msg_ids: &[i64]) {
+    for msg_id in msg_ids {
+        if matches!(st.store.message_has_title(chat_id, *msg_id).await, Ok(true)) {
+            continue;
+        }
+        {
+            let mut m = TITLE_BACKFILL_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner());
+            let n = m.entry((chat_id, *msg_id)).or_insert(0);
+            if *n >= MAX_TITLE_BACKFILL_ATTEMPTS {
+                continue;
+            }
+            *n += 1;
+        }
+        if let Ok(Some(meta)) = st.client.message_meta(chat_id, *msg_id).await {
+            let _ = st
+                .store
+                .upsert_message(
+                    chat_id,
+                    *msg_id,
+                    meta.caption.as_deref(),
+                    meta.mime_type.as_deref(),
+                    meta.size,
+                    meta.media_type.as_deref(),
+                    meta.date,
+                    meta.duration,
+                    meta.group_id,
+                    meta.file_name.as_deref(),
                 )
                 .await;
         }

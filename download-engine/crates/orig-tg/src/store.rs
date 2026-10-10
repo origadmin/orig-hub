@@ -565,6 +565,22 @@ impl Store {
     /// failed/queued 的任务同样有标题可显示；按媒体库条目查只覆盖已出成品的任务，
     /// 且把「一次 SQL」变成「每行一次 HTTP + 渲染期补数据」。
     /// 频道数是个位数（任务只跨少数频道），逐频道一次查询，不做 N 次行级查询。
+    /// 该消息是否已有**标题来源**（caption 或 file_name 任一非空）。
+    ///
+    /// BUG-220：`ensure_message_rows` 原先只看「行是否存在」，而 caption 为空的
+    /// 行早就存在 ⇒ 永远被跳过 ⇒ 新增的 file_name 补不上。本判据让自愈能识别
+    /// 「有行但无标题」，把 file_name 补齐。
+    pub async fn message_has_title(&self, channel_id: i64, message_id: i64) -> libsql::Result<bool> {
+        let row = self
+            .row_opt(
+                "SELECT 1 FROM media_message WHERE channel_id = ?1 AND message_id = ?2 \
+                 AND (caption IS NOT NULL AND caption <> '' OR file_name IS NOT NULL AND file_name <> '')",
+                params![channel_id, message_id],
+            )
+            .await?;
+        Ok(row.is_some())
+    }
+
     pub async fn message_captions_for_channels(
         &self,
         channels: &[i64],
