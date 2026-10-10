@@ -46,6 +46,9 @@ const EPISODE_TEXT_MIG: &str = "mig.episode_text_to_item_v1";
 /// [`ITEM_TEXT_SPLIT_MIG`] / [`EPISODE_TEXT_MIG`] 同一套 `app_setting` 机制。
 const SERIES_KIND_NORMALIZE_MIG: &str = "mig.series_kind_normalize_v1";
 
+/// 「title 存了落盘原始文件名」存量行的**一次性**回填标记（`app_setting`，BUG-256）。
+const RAW_TITLE_BACKFILL_MIG: &str = "mig.raw_title_backfill_v1";
+
 /// `media_series.kind` 的**合法取值全集**。
 ///
 /// 前端下拉（`SeriesEditPanel` 的 `KINDS`）与后端校验共用这一份定义，
@@ -307,6 +310,118 @@ async fn normalize_series_kind_once(conn: &Connection) -> libsql::Result<usize> 
     Ok(fixed as usize)
 }
 
+/// 判定 `title` 是否为下载器落盘的原始文件名形态（BUG-256）。
+///
+/// 与前端 `isRawFileName`（`tauri-shell/src/lib/tgmedia.ts:60`，`/^[a-z]+--\d+_\d+/i`）
+/// 同规则的 Rust 侧等价实现。手写而不用 `regex` crate：只此一处使用，
+/// 为它引一整个依赖不值得。
+fn is_raw_file_title(title: &str) -> bool {
+    let t = title.trim();
+    let Some((head, rest)) = t.split_once("--") else {
+        return false;
+    };
+    // 头段：非空、全 ASCII 字母（`[a-z]+`，大小写不敏感）。
+    if head.is_empty() || !head.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    // 尾段：`\d+_\d+` 前缀（`\d` 与 JS 正则一致，仅 ASCII 数字）。
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 || i >= bytes.len() || bytes[i] != b'_' {
+        return false;
+    }
+    i += 1;
+    i < bytes.len() && bytes[i].is_ascii_digit()
+}
+
+/// 一次性回填（BUG-256）：把**存量**「title = 落盘原始文件名」的 TG 条目纠正为
+/// `media_message.caption` 的首行，返回实际回填的条数。
+///
+/// ## 为什么必须是回填，而不是改写入逻辑
+///
+/// BUG-154 之前，`import_cached_file` 在无 caption 时拿落盘文件名当标题写库
+/// （`doc--<chat>_<msg>` 这类）；而 [`upsert_media_item`] 写的是
+/// `title = COALESCE(NULLIF(excluded.title,''), media_item.title)` ——
+/// **空串永远不覆盖旧值**。所以这些存量行改写入逻辑救不回来（重新缓存也不会被
+/// 修正），只能一次性回填，或在展示层兜底。这里做前者，展示层兜底（前端
+/// `isRawFileName` 守卫）同时存在，两道防线互不依赖。
+///
+/// ## 规则（保守，宁少动不多动）
+///
+/// - 只动 `source='tg'` 且 `title` 命中 [`is_raw_file_title`] 的行，其余一律不碰；
+/// - 新标题取 `media_message.caption` **首行**（trim 后非空才写，绝不写空标题）；
+/// - caption 缺失/为空的行**如实跳过**（不可恢复），不计入回填数；
+///   受影响 id 由 BUG-256 文档登记的取数 SQL 交代，不静默、不编造。
+///
+/// ## 为什么是一次性
+///
+/// 回填后行不再命中原始文件名形态，重跑天然幂等；但「命中且 caption 恰好非空」
+/// 的窗口是开放的（理论上未来还可能写入这种行），而写入路径已由 BUG-154 修正
+/// 为「无 caption ⇒ title 取空串」，不该再产生脏行 —— 用标记键收口，
+/// 语义与 [`ITEM_TEXT_SPLIT_MIG`] 一致：迁移只负责**存量**。
+async fn backfill_raw_file_titles(conn: &Connection) -> libsql::Result<usize> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS app_setting (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    )
+    .await?;
+    let stmt = conn
+        .prepare("SELECT 1 FROM app_setting WHERE key = ?1")
+        .await?;
+    let mut rows = stmt.query(params![RAW_TITLE_BACKFILL_MIG]).await?;
+    let already = rows.next().await?.is_some();
+    drop(rows);
+    if already {
+        return Ok(0);
+    }
+
+    // 粗筛缩小扫描面（LIKE 里 `-` 是字面量），精确判定在 Rust 侧做。
+    let candidates = {
+        let stmt = conn
+            .prepare(
+                "SELECT id, ref, title FROM media_item
+                  WHERE source = 'tg' AND title LIKE '%--%'",
+            )
+            .await?;
+        let mut rows = stmt.query(()).await?;
+        let mut out: Vec<(i64, String, String)> = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push((r.get(0)?, r.get(1)?, r.get(2)?));
+        }
+        out
+    };
+
+    let mut fixed = 0usize;
+    for (id, ref_key, title) in candidates {
+        if !is_raw_file_title(&title) {
+            continue;
+        }
+        let Some(text) = caption_of_ref(conn, &ref_key).await? else {
+            continue; // 流水里没有原文：不可恢复，如实跳过（不计入回填数）
+        };
+        // 首行、trim；空行不写 —— 宁留原始文件名（展示层有守卫兜底）也不写空标题。
+        let first = text.lines().next().map(str::trim).unwrap_or("");
+        if first.is_empty() {
+            continue;
+        }
+        conn.execute(
+            "UPDATE media_item SET title = ?1 WHERE id = ?2",
+            params![first, id],
+        )
+        .await?;
+        fixed += 1;
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO app_setting (key, value) VALUES (?1, '1')",
+        params![RAW_TITLE_BACKFILL_MIG],
+    )
+    .await?;
+    Ok(fixed)
+}
+
 /// 建表（幂等）。与 TG 流水表同库，表名统一 `media_*` 前缀但语义独立。
 pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
     conn.execute_batch(
@@ -442,6 +557,17 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
     }
     // 一次性回填历史行（见 `backfill_item_text`）。必须在补列**之后**。
     backfill_item_text(conn).await?;
+
+    // BUG-256：存量「title = 落盘原始文件名」的行，写入逻辑改了也救不回
+    // （COALESCE 让空串永不覆盖），只能一次性回填（源：media_message.caption 首行）。
+    // 必须在 `backfill_item_text` **之后**：先让「整段原文」行被切成干净标题，
+    // 避免同一行被两条迁移先后改写。
+    let raw_fixed = backfill_raw_file_titles(conn).await?;
+    if raw_fixed > 0 {
+        eprintln!(
+            "[media] raw file-name titles backfilled from caption first line (one-time): {raw_fixed} row(s)"
+        );
+    }
 
     // 分集行上的内容文案搬进条目、死列腾空（见 `collapse_episode_text`）。
     // 必须在 `backfill_item_text` **之后**：先让条目的介绍位就位（含从 caption 切出来的），
@@ -5797,6 +5923,129 @@ mod tests {
             assert_eq!(
                 got, "album",
                 "标记键存在后归一不得再跑（否则用户选择仍被撤销 = 缺陷仍在）"
+            );
+        }
+    }
+
+    /// BUG-256：存量「title = 落盘原始文件名」的 TG 行，一次性回填成 caption 首行。
+    ///
+    /// 覆盖：
+    /// ① 命中形态且有 caption → 回填为 caption **首行**（不是整段）；
+    /// ② 命中形态但 caption 缺失 / 纯空白 → 原样保留（不可恢复，绝不编造、绝不写空）；
+    /// ③ 非命中形态（真标题带内部号后缀、`Big_Buck_Bunny_*` 测试语料）→ 不动；
+    /// ④ 一次性：标记键落库，二次启动不再改写（新增的脏行也不会被洗 ——
+    ///    写入路径已由 BUG-154 修正，迁移只负责存量）。
+    ///
+    /// 夹具用临时库（与真库无关），形态判定走与前端同规则的 [`is_raw_file_title`]。
+    #[tokio::test]
+    async fn raw_title_backfill_runs_once_from_caption() {
+        async fn title_of(s: &Store, id: i64) -> String {
+            let stmt = s
+                .conn
+                .prepare("SELECT title FROM media_item WHERE id = ?1")
+                .await
+                .unwrap();
+            let mut rows = stmt.query(params![id]).await.unwrap();
+            rows.next()
+                .await
+                .unwrap()
+                .expect("fixture row must exist")
+                .get::<String>(0)
+                .unwrap()
+        }
+
+        let path = tmp_db("raw_title_backfill");
+        {
+            let conn = libsql::Builder::new_local(&path).build().await.unwrap().connect().unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE media_message (
+                    channel_id INTEGER NOT NULL, message_id INTEGER NOT NULL, caption TEXT,
+                    downloaded INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                    PRIMARY KEY (channel_id, message_id)
+                );
+                CREATE TABLE media_item (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, ref TEXT NOT NULL,
+                    title TEXT NOT NULL, kind TEXT NOT NULL, file_path TEXT, poster TEXT,
+                    size INTEGER, duration INTEGER, width INTEGER, height INTEGER,
+                    added_at INTEGER NOT NULL, UNIQUE(source, ref)
+                );
+                INSERT INTO media_message VALUES (-1001, 11, '《遥控器》 第1集
+第二行介绍', 0, 1);
+                INSERT INTO media_message VALUES (-1001, 12, NULL, 0, 1);
+                INSERT INTO media_message VALUES (-1001, 13, '   ', 0, 1);
+                INSERT INTO media_item (source, ref, title, kind, added_at)
+                    VALUES ('tg','-1001:11','doc--1001_11','file',1);
+                INSERT INTO media_item (source, ref, title, kind, added_at)
+                    VALUES ('tg','-1001:12','doc--1001_12','file',1);
+                INSERT INTO media_item (source, ref, title, kind, added_at)
+                    VALUES ('tg','-1001:13','photo--1001_13','photo',1);
+                INSERT INTO media_item (source, ref, title, kind, added_at)
+                    VALUES ('tg','-1001:14','《真标题》--1001-14','video',1);
+                INSERT INTO media_item (source, ref, title, kind, added_at)
+                    VALUES ('tg','-1001:15','Big_Buck_Bunny_1','video',1);
+                "#,
+            )
+            .await
+            .unwrap();
+        }
+
+        // 首启：①回填、②③④如实不动。
+        {
+            let s = Store::open(&path).await.unwrap();
+            assert_eq!(
+                title_of(&s, 1).await,
+                "《遥控器》 第1集",
+                "① 命中形态 + caption 非空 → 回填为 caption 首行（不含后续行）"
+            );
+            assert_eq!(
+                title_of(&s, 2).await,
+                "doc--1001_12",
+                "② caption 缺失 → 不可恢复，原样保留（绝不写空）"
+            );
+            assert_eq!(
+                title_of(&s, 3).await,
+                "photo--1001_13",
+                "② caption 纯空白 → 不可恢复，原样保留"
+            );
+            assert_eq!(
+                title_of(&s, 4).await,
+                "《真标题》--1001-14",
+                "③ 真标题带内部号后缀不命中 ^[a-z]+-- 形态 → 不动"
+            );
+            assert_eq!(
+                title_of(&s, 5).await,
+                "Big_Buck_Bunny_1",
+                "③ 测试语料形态不命中 → 不动"
+            );
+            assert_eq!(
+                scalar_i64(
+                    &s.conn,
+                    &format!("SELECT COUNT(*) FROM app_setting WHERE key = '{RAW_TITLE_BACKFILL_MIG}'")
+                )
+                .await,
+                1,
+                "④ 首次启动必须写入一次性标记键"
+            );
+        }
+
+        // 二次启动：标记键已存在，迁移不再执行 —— 之后新写入的原始文件名行也不被洗。
+        {
+            let conn = libsql::Builder::new_local(&path).build().await.unwrap().connect().unwrap();
+            conn.execute(
+                "INSERT INTO media_item (source, ref, title, kind, added_at)
+                     VALUES ('tg','-1001:16','doc--1001_16','file',2)",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        {
+            let s = Store::open(&path).await.unwrap();
+            assert_eq!(
+                title_of(&s, 6).await,
+                "doc--1001_16",
+                "④ 标记键存在后迁移不得再跑（一次性语义）"
             );
         }
     }

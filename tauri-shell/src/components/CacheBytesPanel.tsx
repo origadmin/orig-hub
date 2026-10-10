@@ -2,9 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CheckSquare, HardDrive, Square } from 'lucide-react'
 import { Button } from './ui/button'
 import { cn } from '../lib/utils'
-import { fmtSize } from '../lib/tgmedia'
+import { fmtSize, isRawFileName } from '../lib/tgmedia'
 import { useTranslation } from '../i18n'
 import { clearCacheBytes, getCacheClearPreview } from '../api/tg'
+import { getMediaItem, kindLabelKey } from '../api/media'
 import type { CacheClearPreview } from '../api/tg'
 
 /**
@@ -31,6 +32,53 @@ type Pending = { kind: 'scope'; scope: ScopeKey } | { kind: 'ids'; ids: number[]
 /** 陈旧档阈值（天）。写死为常量而非输入框：多一个自由输入就多一种误清刚下内容的方式。 */
 const STALE_DAYS = 30
 
+/**
+ * 行内可辨识元数据（BUG-256）：预览明细只带 id/title/chatId/bytes，**消息号、类型、
+ * 时间**要靠同一条目的媒体库记录补齐 —— 预览的 `id` 就是 `media_item.id`
+ * （两处同库同表，`/api/media/items/:id` 与 clear/preview 同进程），按 id 逐条取即可：
+ * 不需要新端点，更不需要动后端（`cache.rs` 是只读参考）。
+ */
+type RowMeta = {
+  /** `media_item.kind`（video/photo/audio/file） */
+  kind?: string
+  /** TG 引用尾段（消息号；相册引用是 group id，同样足以指认这一条） */
+  msgId?: number | null
+  /** 入库时间（Unix 秒） */
+  addedAt?: number | null
+}
+
+/** 从 TG 引用（`{chat}:{msg}` / `m:{chat}:{msg}` / `g:{chat}:{group}`）取尾段数字。 */
+function parseTgRefTail(ref?: string | null): number | null {
+  if (!ref) return null
+  const parts = ref.split(':')
+  if (parts.length < 2) return null
+  const n = Number(parts[parts.length - 1])
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+
+/**
+ * 原始文件名形态的**解析**（不是判定 —— 「该不该显示标题」的唯一判定走
+ * [`isRawFileName`]，与媒体库同源，此处只负责从形态里取号/取型作降级数据源）。
+ * `doc--1004493170102_6896` → `{ kind: 'file', msgId: 6896 }`。
+ */
+const RAW_PREFIX_RE = /^([a-z]+)--(\d+)_(\d+)/i
+
+function rawMetaOf(title?: string | null): { kind: string; msgId: number } | null {
+  const m = RAW_PREFIX_RE.exec((title ?? '').trim())
+  if (!m) return null
+  const k = m[1].toLowerCase()
+  const kind = k === 'photo' ? 'photo' : k === 'video' ? 'video' : k === 'audio' ? 'audio' : 'file'
+  return { kind, msgId: Number(m[2]) }
+}
+
+/** 入库时间 → `YYYY-MM-DD`（行内只要对得上「哪天进的库」就够了）。 */
+function fmtDate(sec?: number | null): string {
+  if (!sec || sec <= 0) return ''
+  const d = new Date(sec * 1000)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
 export function CacheBytesPanel(props: {
   onChanged?: () => void
   /** chatId → 频道标题。缺失时退回 `#<chatId>`，绝不把「未知」渲染成空串。 */
@@ -39,6 +87,7 @@ export function CacheBytesPanel(props: {
   const { onChanged, chatTitleOf } = props
   const { t } = useTranslation()
   const [preview, setPreview] = useState<CacheClearPreview | null>(null)
+  const [meta, setMeta] = useState<Map<number, RowMeta>>(new Map())
   const [sel, setSel] = useState<Set<number>>(new Set())
   const [pending, setPending] = useState<Pending>(null)
   const [busy, setBusy] = useState(false)
@@ -46,11 +95,31 @@ export function CacheBytesPanel(props: {
   const [err, setErr] = useState('')
   const aliveRef = useRef(true)
 
+  /**
+   * 逐条补齐行内元数据（BUG-256）。单个失败（条目刚被删等）留空 —— 行内按缺失
+   * 降级显示，绝不编造；每次 load 重取，清理后不残留旧读数。
+   */
+  const enrich = useCallback(async (rows: CacheClearPreview['items']) => {
+    const next = new Map<number, RowMeta>()
+    await Promise.all(
+      rows.map(async (x) => {
+        try {
+          const m = await getMediaItem(x.id)
+          next.set(x.id, { kind: m.kind, msgId: parseTgRefTail(m.ref), addedAt: m.addedAt })
+        } catch {
+          /* 条目可能已被删：留空，行内降级显示 */
+        }
+      }),
+    )
+    if (aliveRef.current) setMeta(next)
+  }, [])
+
   const load = useCallback(async () => {
     try {
       const p = await getCacheClearPreview(STALE_DAYS)
       if (!aliveRef.current) return
       setPreview(p)
+      void enrich(p.items ?? [])
       // 勾选只保留仍然存在的条目：清理后行会消失，脏勾选会让下一次「清理所选」少清几条
       // （而且界面上看不出来 —— 这是最难查的一类不一致）。
       const alive = new Set((p.items ?? []).map((x) => x.id))
@@ -59,7 +128,7 @@ export function CacheBytesPanel(props: {
     } catch (e) {
       if (aliveRef.current) setErr(e instanceof Error ? e.message : String(e))
     }
-  }, [])
+  }, [enrich])
 
   useEffect(() => {
     aliveRef.current = true
@@ -220,6 +289,7 @@ export function CacheBytesPanel(props: {
         ) : null}
       </div>
 
+      {/* BUG-256 曾试过把本行并入上方影响面条：读数折行后总高不减反增，实测无收益 —— 维持独立一行。 */}
       <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[11px] text-fg-muted">
         <span data-testid="cache-bytes-stale">
           {t('tg.bytesStale', {
@@ -400,10 +470,26 @@ export function CacheBytesPanel(props: {
       ) : null}
       {err ? <p className="mt-2 text-xs text-red-500">{err}</p> : null}
 
-      {/* 条目清单：认得出「删的是哪几条」，才能判断该不该删 */}
+      {/* 条目清单：认得出「删的是哪几条」，才能判断该不该删。
+          BUG-256：每行给出「频道 + 消息号 + 类型 (+ 时间)」的可辨识标识；
+          title 只在**非原始文件名**时显示（守卫 isRawFileName 与媒体库同源，
+          禁止另写第二套判定），原始文件名行靠标识行指认。 */}
       <div className="mt-3 min-h-0 flex-1 space-y-1.5 overflow-y-auto">
         {items.map((x) => {
           const on = sel.has(x.id)
+          const m = meta.get(x.id)
+          const raw = rawMetaOf(x.title)
+          // 原始文件名不是标题：直接渲染就是 `doc--1004493170102_6896` 满屏。
+          // 判定唯一走 isRawFileName（tgmedia.ts:60，媒体库 MediaLibraryPanel 同源）。
+          const cleanTitle = isRawFileName(x.title) ? '' : (x.title ?? '').trim()
+          const chatLabel =
+            x.chatId == null ? t('tg.bytesChatNone') : chatTitleOf?.(x.chatId) || `#${x.chatId}`
+          // 类型 / 消息号：媒体库记录优先，取不到时退回原始文件名形态解析；再取不到则如实报「未知」。
+          const kind = m?.kind ?? raw?.kind ?? null
+          const kindKey = kind ? kindLabelKey(kind) : null
+          const kindLabel = kindKey ? t(kindKey) : t('tg.bytesKindUnknown')
+          const msgId = m?.msgId ?? raw?.msgId ?? null
+          const when = fmtDate(m?.addedAt)
           return (
             <div
               key={x.id}
@@ -428,9 +514,43 @@ export function CacheBytesPanel(props: {
                   <Square className="h-3.5 w-3.5" />
                 )}
               </button>
-              <span className="min-w-0 flex-1 truncate text-xs text-fg-strong" title={x.title}>
-                {x.title}
-              </span>
+              <div className="min-w-0 flex-1">
+                <div className="flex min-w-0 items-center gap-1.5 text-xs text-fg-strong">
+                  <span
+                    className="min-w-0 truncate"
+                    title={chatLabel}
+                    data-testid="cache-bytes-row-chat"
+                  >
+                    {chatLabel}
+                  </span>
+                  <span
+                    className="shrink-0 tabular-nums text-fg-muted"
+                    title={msgId != null ? `#${msgId}` : t('tg.bytesRowEntry', { id: x.id })}
+                    data-testid="cache-bytes-row-msg"
+                  >
+                    {msgId != null ? `#${msgId}` : t('tg.bytesRowEntry', { id: x.id })}
+                  </span>
+                  <span
+                    className="shrink-0 rounded bg-surface-2 px-1 py-px text-[10px] text-fg-muted"
+                    data-testid="cache-bytes-row-kind"
+                  >
+                    {kindLabel}
+                  </span>
+                  {when ? (
+                    <span
+                      className="shrink-0 text-[11px] tabular-nums text-fg-muted"
+                      data-testid="cache-bytes-row-date"
+                    >
+                      {when}
+                    </span>
+                  ) : null}
+                </div>
+                {cleanTitle ? (
+                  <div className="mt-0.5 min-w-0 truncate text-[11px] text-fg-muted" title={cleanTitle}>
+                    {cleanTitle}
+                  </div>
+                ) : null}
+              </div>
               <span className="shrink-0 text-[11px] tabular-nums text-fg-muted">
                 {fmtSize(x.bytes)}
               </span>

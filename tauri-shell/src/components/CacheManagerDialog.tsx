@@ -1010,28 +1010,33 @@ export function CacheManagerDialog(props: {
 
         {/* 入库统计条：三段读数（已入库 / 入库中 / 失败）。
             原先是「已缓存 {size} · {n} 个文件」—— 那是把字节当资产的口径；流水线的
-            主视角是**进度**，字节的释放归「回收临时文件」页签（那里自带占用读数）。 */}
-        <div
-          className="mt-2.5 flex flex-wrap items-center gap-1.5 rounded-md border border-border-subtle bg-surface-2/40 px-2.5 py-2 text-xs text-fg-muted"
-          aria-label={t('tg.ingestSummary', {
-            done: groups.ingested,
-            active: groups.ingesting,
-            failed: groups.failed,
-          })}
-          data-testid="cache-ingest-summary"
-        >
-          <span className="shrink-0" data-testid="ingest-summary-done">
-            {t('tg.ingestStatusIngested')} {groups.ingested}
-          </span>
-          <span className="shrink-0 text-muted">·</span>
-          <span className="shrink-0" data-testid="ingest-summary-active">
-            {t('tg.ingestStatusIngesting')} {groups.ingesting}
-          </span>
-          <span className="shrink-0 text-muted">·</span>
-          <span className="shrink-0" data-testid="ingest-summary-failed">
-            {t('tg.ingestStatusFailed')} {groups.failed}
-          </span>
-        </div>
+            主视角是**进度**，字节的释放归「回收临时文件」页签（那里自带占用读数）。
+            BUG-256：它回答的是「入库进度」，只属于本页签 —— 曾跨页签常驻，在回收
+            页签上是一组与用户此刻操作无关的跳动计数，纯占位。挂在 view 分支内，
+            回收页签的 DOM 里不再存在（判据 1）。 */}
+        {view === 'tasks' ? (
+          <div
+            className="mt-2.5 flex flex-wrap items-center gap-1.5 rounded-md border border-border-subtle bg-surface-2/40 px-2.5 py-2 text-xs text-fg-muted"
+            aria-label={t('tg.ingestSummary', {
+              done: groups.ingested,
+              active: groups.ingesting,
+              failed: groups.failed,
+            })}
+            data-testid="cache-ingest-summary"
+          >
+            <span className="shrink-0" data-testid="ingest-summary-done">
+              {t('tg.ingestStatusIngested')} {groups.ingested}
+            </span>
+            <span className="shrink-0 text-muted">·</span>
+            <span className="shrink-0" data-testid="ingest-summary-active">
+              {t('tg.ingestStatusIngesting')} {groups.ingesting}
+            </span>
+            <span className="shrink-0 text-muted">·</span>
+            <span className="shrink-0" data-testid="ingest-summary-failed">
+              {t('tg.ingestStatusFailed')} {groups.failed}
+            </span>
+          </div>
+        ) : null}
 
         {view === 'tasks' ? (
           <>
@@ -1268,15 +1273,10 @@ export function CacheManagerDialog(props: {
         ) : (
           <div className="mt-3 flex min-h-0 flex-1 flex-col">
             {/* 回收临时文件（原「缓存字节」）：字节**必须**能回收，只是读起来应当是
-                「回收入库准备物的临时文件」，而不是「管理缓存资产」。 */}
-            <div className="shrink-0 rounded-md border border-border-subtle/70 bg-surface-2/25 px-2.5 py-2">
-              <p className="text-[12px] font-medium text-fg-strong">
-                {t('tg.ingestCleanupSection')}
-              </p>
-              <p className="mt-0.5 text-[11px] leading-relaxed text-fg-muted">
-                {t('tg.ingestCleanupHint')}
-              </p>
-            </div>
+                「回收入库准备物的临时文件」，而不是「管理缓存资产」。
+                BUG-256：删掉与页签同义的分区卡片（标题「回收临时文件」+ 说明段，
+                与页签名各说一遍同一件事，纯占位）—— 页签名本身就是标题，
+                影响面读数由 CacheBytesPanel 自带。 */}
             <CacheBytesPanel
               // 频道标题：条目明细只带 chatId（数字），不给标题就只能显示 `#-1002533442302`。
               chatTitleOf={titleOf}
