@@ -1,0 +1,32 @@
+{
+  "bug": "BUG-101",
+  "viewport": "1440x900",
+  "browser": "Edge (headful, real compositing)",
+  "shell": "http://127.0.0.1:5180/",
+  "assertions": {
+    "hotZone": "24x24 (>=24x24 required)",
+    "icon": {
+      "isSvg": true,
+      "pathD": "m6 9 6 6 6-6",
+      "strokeWidth": "2",
+      "ownText": ""
+    },
+    "titleDecoupled": {
+      "found": true,
+      "insideButton": false,
+      "insideAnyButton": false,
+      "titleText": "⭐ 监控中 (1)"
+    },
+    "titleClickChangedState": false,
+    "toggleCollapses": true,
+    "restoredExpanded": true,
+    "aria": {
+      "expanded": "true",
+      "label": "收起监控列表"
+    }
+  },
+  "consoleErrors": [],
+  "pageErrors": [],
+  "problems": [],
+  "verdict": "PASS"
+}

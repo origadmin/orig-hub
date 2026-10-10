@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
+import { ChevronDown, ChevronRight } from 'lucide-react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { Switch } from './ui/switch'
@@ -1475,24 +1476,19 @@ export function TgPanel(
             type="button"
             aria-label={monitorOpen ? t('tg.monitorCollapse') : t('tg.monitorExpand')}
             aria-expanded={monitorOpen}
+            aria-controls="tg-monitor-list"
             data-testid="monitor-collapse-toggle"
             onClick={() => setMonitorOpen((v) => !v)}
-            className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted hover:bg-surface-2 hover:text-fg-strong"
+            className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted transition-colors hover:bg-surface-2 hover:text-fg-strong"
           >
-            <svg
-              className="h-3.5 w-3.5"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth={2}
-              aria-hidden="true"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d={monitorOpen ? 'M6 9l6 6 6-6' : 'M9 6l6 6-6 6'}
-              />
-            </svg>
+            {/* BUG-101：折叠指示器此前是 10px 纯文本字符 `▾`/`▸`（读起来像装饰），
+                且与标题共用同一个 <button> → 点标题就折叠。现改为独立的 lucide
+                chevron 按钮（热区 24×24），标题不再是折叠入口。 */}
+            {monitorOpen ? (
+              <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+            ) : (
+              <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+            )}
           </button>
           <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold text-fg-strong">
             ⭐ {t('tg.navMonitor')} ({monitoredList.length})
@@ -1510,7 +1506,11 @@ export function TgPanel(
 
         {/* 监控行（离线也可读：本地存储的监控列表；随标题行折叠/展开） */}
         {monitorOpen && (
-          <div className="max-h-56 shrink-0 overflow-y-auto border-b border-border-subtle/60 p-1.5">
+          <div
+            id="tg-monitor-list"
+            data-testid="tg-monitor-list"
+            className="max-h-56 shrink-0 overflow-y-auto border-b border-border-subtle/60 p-1.5"
+          >
             {monitoredRows.length === 0 ? (
               <p className="px-2 py-4 text-center text-xs text-muted">{t('tg.monitorEmpty')}</p>
             ) : (
