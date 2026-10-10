@@ -3157,12 +3157,19 @@ impl Store {
         }
         .await;
         match res {
-            Ok(()) => self.conn.execute("COMMIT", ()).await.map(|_| ()).map_err(|e| {
-                let _ = self.conn.execute("ROLLBACK", ());
-                e
-            }),
+            // BUG-275：回滚必须 `.await` —— `execute` 返回 Future，不 poll 就不执行；
+            // 原写法（map_err 同步闭包里无 await 的 ROLLBACK）等于从未回滚，
+            // 失败后 `BEGIN IMMEDIATE` 的写事务悬挂持锁。改写为可 await 的
+            // match 分支，语义与 :2560/:2628 的正确先例对齐；成功路径不变。
+            Ok(()) => match self.conn.execute("COMMIT", ()).await {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let _ = self.conn.execute("ROLLBACK", ()).await;
+                    Err(e)
+                }
+            },
             Err(e) => {
-                let _ = self.conn.execute("ROLLBACK", ());
+                let _ = self.conn.execute("ROLLBACK", ()).await;
                 Err(e)
             }
         }
@@ -3218,17 +3225,17 @@ impl Store {
         }
         .await;
         match res {
-            Ok(n) => self
-                .conn
-                .execute("COMMIT", ())
-                .await
-                .map(|_| n)
-                .map_err(|e| {
-                    let _ = self.conn.execute("ROLLBACK", ());
-                    e
-                }),
+            // BUG-275：同 switch_episode_source —— ROLLBACK 必须 `.await`，
+            // 否则 Future 从未 poll、事务悬挂持锁。成功路径（返回 n）不变。
+            Ok(n) => match self.conn.execute("COMMIT", ()).await {
+                Ok(_) => Ok(n),
+                Err(e) => {
+                    let _ = self.conn.execute("ROLLBACK", ()).await;
+                    Err(e)
+                }
+            },
             Err(e) => {
-                let _ = self.conn.execute("ROLLBACK", ());
+                let _ = self.conn.execute("ROLLBACK", ()).await;
                 Err(e)
             }
         }
@@ -6566,6 +6573,129 @@ mod tests {
         s.detach_episode_source(ep, a).await.unwrap();
         let detail = s.get_series(sid).await.unwrap().unwrap();
         assert!(detail.episodes[0].sources.is_empty());
+    }
+
+    /// BUG-275 判据 1（`switch_episode_source`）：事务错误路径的 `ROLLBACK`
+    /// 必须真正执行 —— `.await` 不能省（`execute` 返回 Future，不 poll 就不执行）。
+    ///
+    /// 注入手法同 BUG-259 原子性单测：触发器 `RAISE(ABORT)` 精确拦「把备用源写上
+    /// 主位」的那步 UPDATE（此刻 DELETE/INSERT 已成功，正是「写一半」的中间态）。
+    /// 判据：Err 返回后**同连接立即再次 `BEGIN IMMEDIATE` 必须成功** ——
+    /// 原缺陷（ROLLBACK 未 await）下会得到
+    /// `cannot start a transaction within a transaction`。
+    /// **反向证伪已实跑**：去掉 Err 分支的 `.await` 本测试必 FAIL（证据见 BUG-275.md）。
+    #[tokio::test]
+    async fn switch_episode_source_rollback_awaited_bug275() {
+        let s = Store::open(tmp_db("bug275_switch")).await.unwrap();
+        let sid = s.create_series("剧", None, "series", None, None).await.unwrap();
+        let main = s
+            .upsert_media_item("tg", "v:main", "主", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let alt = s
+            .upsert_media_item("tg", "v:alt", "备", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let ep = s.add_episode(sid, main, 1, 1).await.unwrap();
+        assert!(s.attach_episode_source(ep, alt).await.unwrap());
+
+        // 注入点（触发器体内不绑参，见 BUG-259 同款说明，故内联 id）
+        let trg = format!(
+            "CREATE TRIGGER trg_bug275_switch BEFORE UPDATE ON media_episode
+             WHEN NEW.item_id = {alt} BEGIN SELECT RAISE(ABORT, 'bug275 boom'); END",
+            alt = alt
+        );
+        s.conn.execute(&trg, ()).await.unwrap();
+
+        assert!(
+            s.switch_episode_source(ep, alt).await.is_err(),
+            "注入的 UPDATE 应使事务中途失败"
+        );
+
+        // 判据 1：回滚真正发生 —— 同连接立即再开写事务必须成功
+        s.conn
+            .execute("BEGIN IMMEDIATE", ())
+            .await
+            .expect("失败后同连接必须能立即再开写事务（BUG-275：ROLLBACK 已真正执行）");
+        s.conn.execute("COMMIT", ()).await.unwrap();
+
+        // 判据 2：状态全旧 —— 主条目仍是 main，备用行原样
+        let detail = s.get_series(sid).await.unwrap().unwrap();
+        assert_eq!(
+            detail.episodes[0].item_id, main,
+            "中途失败必须整体回滚（全旧）"
+        );
+        assert_eq!(detail.episodes[0].sources.len(), 1);
+        assert_eq!(detail.episodes[0].sources[0].item_id, alt);
+    }
+
+    /// BUG-275 判据 2（`attach_episode_images`）：同上 —— replace-all 挂图的
+    /// 错误路径 ROLLBACK 必须真正执行。注入点拦第二批图片的 INSERT
+    /// （DELETE 旧挂图已成功，「清完写一半」中间态），断言 Err 返回后同连接
+    /// 可立即再开写事务，且挂图集合回到全旧 [图0]。
+    #[tokio::test]
+    async fn attach_episode_images_rollback_awaited_bug275() {
+        let s = Store::open(tmp_db("bug275_attach")).await.unwrap();
+        let sid = s.create_series("剧", None, "series", None, None).await.unwrap();
+        let main = s
+            .upsert_media_item("tg", "v:main", "主", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let mut photos = Vec::new();
+        for i in 0..3 {
+            photos.push(
+                s.upsert_media_item(
+                    "tg",
+                    &format!("p:{i}"),
+                    &format!("图{i}"),
+                    "photo",
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let ep = s.add_episode(sid, main, 1, 1).await.unwrap();
+        // 预置一张旧挂图：失败回滚后必须仍在（全旧基线）
+        assert_eq!(s.attach_episode_images(ep, &[photos[0]]).await.unwrap(), 1);
+
+        let blocker = photos[1];
+        let trg = format!(
+            "CREATE TRIGGER trg_bug275_attach BEFORE INSERT ON media_episode_image
+             WHEN NEW.item_id = {blocker} BEGIN SELECT RAISE(ABORT, 'bug275 boom'); END",
+            blocker = blocker
+        );
+        s.conn.execute(&trg, ()).await.unwrap();
+
+        assert!(
+            s.attach_episode_images(ep, &[photos[0], photos[1], photos[2]])
+                .await
+                .is_err(),
+            "注入的 INSERT 应使事务中途失败"
+        );
+
+        s.conn
+            .execute("BEGIN IMMEDIATE", ())
+            .await
+            .expect("失败后同连接必须能立即再开写事务（BUG-275：ROLLBACK 已真正执行）");
+        s.conn.execute("COMMIT", ()).await.unwrap();
+
+        // 全旧：挂图集合回到 [图0]
+        let stmt = s
+            .conn
+            .prepare("SELECT item_id FROM media_episode_image WHERE episode_id = ?1 ORDER BY sort_no")
+            .await
+            .unwrap();
+        let mut rows = stmt.query(params![ep]).await.unwrap();
+        let mut got: Vec<i64> = Vec::new();
+        while let Some(r) = rows.next().await.unwrap() {
+            let v: i64 = r.get(0).unwrap();
+            got.push(v);
+        }
+        assert_eq!(got, vec![photos[0]], "中途失败必须整体回滚（全旧挂图）");
     }
 
     /// D1=B 第一步：统一挂载读模型 `list_episode_bindings`。
