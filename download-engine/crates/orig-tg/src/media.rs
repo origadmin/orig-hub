@@ -1472,7 +1472,18 @@ impl Store {
             .prepare(
                 "SELECT s.id, s.title, s.description, s.kind, s.poster, s.year,
                         s.created_at, s.updated_at,
-                        (SELECT COUNT(*) FROM media_episode e WHERE e.series_id = s.id),
+                        -- BUG-255：集数 = 本剧集内**全部媒体条目**的去重计数。
+                        -- 既含「分集主条目」（`media_episode`），也含混编组挂在分集上的
+                        -- 「集级挂图」（`media_episode_image`，BUG-168）——否则典型的
+                        -- 「1 预告片 + N 海报/截图」相册只数到 1 集，与真实媒体数不符。
+                        -- 备用源（`media_episode_source`）是同一内容的另一缓存副本，不计入。
+                        (SELECT COUNT(DISTINCT item_id) FROM (
+                            SELECT item_id FROM media_episode WHERE series_id = s.id
+                            UNION
+                            SELECT m.item_id FROM media_episode_image m
+                              JOIN media_episode e ON e.id = m.episode_id
+                             WHERE e.series_id = s.id
+                        )),
                         (SELECT COUNT(DISTINCT e.season) FROM media_episode e WHERE e.series_id = s.id),
                         -- 封面条目：优先任一**图片集**（photo 文件即封面，免抽帧），回退首集。
                         COALESCE(
@@ -1493,10 +1504,20 @@ impl Store {
                             WHERE e.series_id = s.id
                             ORDER BY e.season, e.episode_no, e.id LIMIT 1)),
                         -- BUG-250：内容构成（主页剧集卡要能看出有没有视频/图片）。
+                        -- BUG-255：照片数 = 分集主条目里的照片 **+** 集级挂图里的照片，
+                        -- 否则混编组的照片既不在 `media_episode` 也不被计入。
                         (SELECT COUNT(*) FROM media_episode e JOIN media_item i ON i.id = e.item_id
                           WHERE e.series_id = s.id AND i.kind = 'video'),
-                        (SELECT COUNT(*) FROM media_episode e JOIN media_item i ON i.id = e.item_id
-                          WHERE e.series_id = s.id AND i.kind = 'photo'),
+                        (SELECT COUNT(DISTINCT item_id) FROM (
+                            SELECT e.item_id FROM media_episode e
+                              JOIN media_item i ON i.id = e.item_id
+                             WHERE e.series_id = s.id AND i.kind = 'photo'
+                            UNION
+                            SELECT m.item_id FROM media_episode_image m
+                              JOIN media_episode e ON e.id = m.episode_id
+                              JOIN media_item i ON i.id = m.item_id
+                             WHERE e.series_id = s.id AND i.kind = 'photo'
+                        )),
                         -- BUG-250：封面条目是否有字节。与上面的 cover_item_id 同优先级
                         -- （photo 优先、回退首集），避免「封面判了 A、可用性判了 B」。
                         COALESCE(
@@ -7254,5 +7275,91 @@ mod tests {
             matches!(err, BundleError::NotReady(_)),
             "不完备剧集应被闸口拦下"
         );
+    }
+
+    /// BUG-255 复现：混编组（1 视频 + N 照片）的 `episodeCount` / `photoCount` 必须把
+    /// 挂在视频集上的「集级挂图」（`media_episode_image`）算进去——否则典型的
+    /// 「1 预告片 + N 海报/截图」相册在媒体库卡片上显示「1 集」，与真实媒体数不符。
+    ///
+    /// 复现（当前 bug）：`list_series_filtered` 的 `episode_count` 只数 `media_episode`
+    /// 行，`photo_count` 只数 `media_episode JOIN media_item WHERE kind='photo'`；混编组
+    /// 的照片走 `media_episode_image`（BUG-168 的集级挂图，不是独立集），两者都不计数。
+    #[tokio::test]
+    async fn bug255_mixed_group_counts_gallery_photos_as_episodes() {
+        let path = tmp_db("bug255_mixed");
+        let s = Store::open(&path).await.unwrap();
+
+        let sid = s
+            .create_series("混编组", None, "series", None, None)
+            .await
+            .unwrap();
+
+        // 1 个视频（主条目）+ 3 张照片（混编组挂在视频集上的集级挂图）。
+        let v = s
+            .upsert_media_item("tg", "v:1", "预告片", "video", Some("c/1.mp4"), Some(10), Some(60), None)
+            .await
+            .unwrap();
+        let p1 = s
+            .upsert_media_item("tg", "p:1", "海报1", "photo", None, None, None, None)
+            .await
+            .unwrap();
+        let p2 = s
+            .upsert_media_item("tg", "p:2", "海报2", "photo", None, None, None, None)
+            .await
+            .unwrap();
+        let p3 = s
+            .upsert_media_item("tg", "p:3", "截图3", "photo", None, None, None, None)
+            .await
+            .unwrap();
+
+        // 视频自成 1 集（混编组的非照片条目各占 1 槽）。
+        let ep = s.add_episode(sid, v, 1, 1).await.unwrap();
+        // 3 张照片作为集级挂图挂到该集（混编组语义，不是独立集）。
+        s.attach_episode_images(ep, &[p1, p2, p3]).await.unwrap();
+
+        let list = s.list_series_filtered(None).await.unwrap();
+        assert_eq!(list.len(), 1, "应只有一部剧集");
+        let view = &list[0];
+        // 真实媒体数 = 1 视频 + 3 照片 = 4；当前 bug 只数到 1。
+        assert_eq!(view.episode_count, 4, "混编组必须把集级挂图计入集数");
+        assert_eq!(view.video_count, 1, "视频数应为 1");
+        assert_eq!(view.photo_count, 3, "照片数必须把集级挂图算进去");
+    }
+
+    /// BUG-255 回归：纯照片组（photo-only）每张照片本身就是独立集，集数仍应等于照片数，
+    /// 且不得被上面的修正误伤（不能因引入 `media_episode_image` 计数而重复或漏算）。
+    #[tokio::test]
+    async fn bug255_photo_only_group_counts_each_photo_as_episode() {
+        let path = tmp_db("bug255_photo_only");
+        let s = Store::open(&path).await.unwrap();
+
+        let sid = s
+            .create_series("纯照片组", None, "series", None, None)
+            .await
+            .unwrap();
+
+        let p1 = s
+            .upsert_media_item("tg", "p:1", "图1", "photo", None, None, None, None)
+            .await
+            .unwrap();
+        let p2 = s
+            .upsert_media_item("tg", "p:2", "图2", "photo", None, None, None, None)
+            .await
+            .unwrap();
+        let p3 = s
+            .upsert_media_item("tg", "p:3", "图3", "photo", None, None, None, None)
+            .await
+            .unwrap();
+        // 纯照片组：每张照片各自成集（append_slot 在 !has_video 时逐张建集）。
+        s.add_episode(sid, p1, 1, 1).await.unwrap();
+        s.add_episode(sid, p2, 1, 2).await.unwrap();
+        s.add_episode(sid, p3, 1, 3).await.unwrap();
+
+        let list = s.list_series_filtered(None).await.unwrap();
+        assert_eq!(list.len(), 1);
+        let view = &list[0];
+        assert_eq!(view.episode_count, 3, "纯照片组集数应等于照片数");
+        assert_eq!(view.photo_count, 3, "照片数应等于照片数");
+        assert_eq!(view.video_count, 0);
     }
 }
