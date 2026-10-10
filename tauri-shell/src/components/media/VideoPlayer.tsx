@@ -78,6 +78,15 @@ export interface VideoPlayerProps {
    * H.264）。缺省或兼容流也失败时回退 BUG-207 停载遮罩。
    */
   compatSrc?: string
+  /**
+   * 真源总时长（秒，BUG-253）：来自 `GET /api/media/items/<id>` 的 `duration` 字段，
+   * 是片长的唯一可靠真值（实测对照 ffprobe 一致，本仓库一条 242s 条目已确认）。
+   * `<video>` 元素在 live 转码流上的 `duration` 仍在随转码推进而增长（12s 内抖动 85
+   * 次、瞬时仅 1~14s），绝不能用来当总数显示。挂载时直接用它初始化
+   * `contentDurationRef`，元素 `durationchange` / `loadedmetadata` 一律不得覆盖。
+   * 缺省（上游未提供）时退回元素 duration 作最后一次兜底。
+   */
+  duration?: number | null
 }
 
 /** 可选倍速档位（与 EE 一致；3x/4x 为 BUG-209 新增——用户要求高倍速审看，
@@ -543,6 +552,7 @@ export function VideoPlayer({
   onFatal,
   hasVideoTrack = true,
   compatSrc,
+  duration,
 }: VideoPlayerProps) {
   const { t } = useTranslation()
   const {
@@ -560,12 +570,13 @@ export function VideoPlayer({
   const hideTimer = useRef<number | null>(null)
   const centerTimer = useRef<number | null>(null)
   /**
-   * 源内容总时长（秒，BUG-226）：探针在换档时先于元素元数据拿到；
-   * 元素自己学会 duration 后兜底换算。挂载时为 null（未知）。
-   * 旧 `durationRef`（BUG-216）已并入此处——它在 live 流上永远停在 0，
-   * 正是 BUG-225 位置被钳回 0:00 的帮凶。
+   * 源内容总时长（秒）：**真源优先 `item.duration`**（BUG-253），其次换档探针
+   * `probe.duration`，最后才退回元素 `duration`（live 转码流上仍在抖动增长，绝不当真）。
+   * 挂载即用真源初始化——元素 `durationchange` / `loadedmetadata` 只在真源缺失
+   * （null）时才兜底一次，绝不覆盖已由真源确立的总数（不会再出现 0:32/0:01）。
+   * 旧 `durationRef`（BUG-216）永远停在 0，是 BUG-225 位置被钳回 0:00 的帮凶。
    */
-  const contentDurationRef = useRef<number | null>(null)
+  const contentDurationRef = useRef<number | null>(duration ?? null)
   /** BUG-226：当前流 0:00 对应的内容位置（锚点流 > 0，其余为 0）。 */
   const contentOffsetRef = useRef(0)
 
@@ -645,8 +656,11 @@ export function VideoPlayer({
    */
   const pendingRateSwitchRef = useRef<{ contentTime: number; wasPlaying: boolean; offset: number } | null>(null)
   /** BUG-226：当前 src 是否支持任意位置 Range seek（原生源 / 完整代理 = true）。
-   *  挂载即 FRC（未探针）时保守按 live 处理。 */
-  const streamSeekableRef = useRef(!initialFrc)
+   *  BUG-253 修正冷缓存语义：FRC/live 冷流在管道确认可服务 Range 之前**不可 seek**——
+   *  初始值按「是否走了 /stream 转码端点」判定：原生 /raw 源 = true（浏览器自己管），
+   *  转码流 = false（保守按 live，待 `commit()` 借 `probeStream` 的 `ready` 信号翻转，
+   *  沿用 BUG-229 既有的 seekability 信号，不再误判冷流为「可任意 seek」把位置钳回片头）。 */
+  const streamSeekableRef = useRef(!activeSrcAtMountRef.current.includes('/stream'))
   /** 已停载（退无可退）：渲染 BUG-207 的诚实失败遮罩 */
   const [halted, setHalted] = useState(false)
 
@@ -708,7 +722,10 @@ export function VideoPlayer({
     }
     void (async () => {
       const probe = await probeStream(targetSrc)
-      if (probe?.duration != null) contentDurationRef.current = probe.duration
+      // 真源 `duration`（挂载即确立）优先：探针只补真源缺失时的兜底，绝不回写覆盖。
+      if (probe?.duration != null && contentDurationRef.current == null) {
+        contentDurationRef.current = probe.duration
+      }
       if (probe?.ready) {
         // 代理已在盘上：完整文件，任意位置 Range 可拖。
         commit(0, true)
@@ -961,9 +978,10 @@ export function VideoPlayer({
   )
 
   // ---------- 媒体事件 ----------
-  /** durationchange 上同步源内容时长（BUG-225）：live fMP4 的 loadedmetadata
-   *  常带 NaN duration，元素要等 fragment 流推进后才学会真实 duration——只靠
-   *  loadedmetadata 记录会让 skip/恢复永远看到 0。 */
+  /** durationchange 兜底（BUG-225/BUG-253）：仅当真源 `contentDurationRef` 仍为空
+   *  （上游未提供 item.duration、且换档探针也未给出）时才用元素 duration 兜底一次——
+   *  真源一旦确立（挂载即由 item.duration 初始化），此处**绝不覆盖**，否则又会把
+   *  总数回写成 live 转码流那个仍在抖动的瞬时时长（0:32/0:01 的根因）。 */
   const onDurationChange = useCallback(() => {
     const v = videoRef.current
     if (!v) return

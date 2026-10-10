@@ -76,6 +76,8 @@ function toViewerItem(i: MediaItem): ViewerItem {
     src: mediaItemUrl(i.id),
     poster: i.poster ?? null,
     seriesId: i.seriesId ?? null,
+    // BUG-253：真源总时长随条目下发，播放器据此显示正确总数（不取 live 转码流的瞬时 duration）。
+    duration: i.duration,
   }
 }
 

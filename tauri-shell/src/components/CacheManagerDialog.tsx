@@ -772,6 +772,8 @@ export function CacheManagerDialog(props: {
         src: mediaItemUrl(item.id),
         poster: item.poster ?? null,
         seriesId: item.seriesId ?? null,
+        // BUG-253：真源总时长随条目下发，播放器据此显示正确总数。
+        duration: item.duration,
       }
       setPendingMediaFocus(ref)
       openViewer({ items: [viewerItem], index: 0, title: item.title || undefined })

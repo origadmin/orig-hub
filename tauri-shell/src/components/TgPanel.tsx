@@ -1169,6 +1169,8 @@ export function TgPanel(
         caption: u.caption,
         src: local ? tgLocalFileUrl(u.chatId, u.messageId) : tgFileUrl(u.chatId, u.messageId),
         fallbackSrc: local ? tgFileUrl(u.chatId, u.messageId) : undefined,
+        // BUG-253：真源总时长随条目下发，播放器据此显示正确总数。
+        duration: u.duration,
       }
     })
 

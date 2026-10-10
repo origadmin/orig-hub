@@ -233,6 +233,9 @@ export function MediaViewer(props: {
               hasVideoTrack={cur.kind === 'video'}
               // 兼容流（BUG-208）：视频条目解码不支持时自动切服务端实时转码
               compatSrc={cur.kind === 'video' ? mediaItemStreamUrl(cur.messageId) : undefined}
+              // BUG-253：真源总时长（来自 `GET /api/media/items/<id>` 的 duration 字段），
+              // 播放器据此显示正确总数，不取 live 转码流的瞬时 `video.duration`。
+              duration={cur.duration ?? undefined}
             />
           ) : (
             <p className="max-w-[80%] rounded-md border border-white/20 bg-white/5 px-3 py-2 text-center text-xs text-white/85">

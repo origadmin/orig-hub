@@ -403,4 +403,10 @@ export interface ViewerItem {
   poster?: string | null
   /** 本条在所属剧集中的集号（1 起）：用于「第 N 集」标注 */
   episodeNo?: number | null
+  /**
+   * 真源总时长（秒，BUG-253）：来自 `GET /api/media/items/<id>` 的 `duration`，
+   * 是片长的唯一可靠真值。播放器据此显示正确总数，不取 live 转码流的瞬时
+   * `video.duration`（会随转码推进抖动增长，绝不能当总数）。
+   */
+  duration?: number | null
 }
