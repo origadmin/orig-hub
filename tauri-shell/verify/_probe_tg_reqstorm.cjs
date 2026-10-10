@@ -189,7 +189,11 @@ async function main() {
     const win = records.slice(mark)
     const sum = summarize(win, `进入「${TITLE}」后 ${WINDOW_MS / 1000}s`, WINDOW_MS)
     console.log('\n[VERDICT] /api 总数=' + sum.total + ' peak/s=' + sum.peak + ' 重复URL数=' + sum.dupes)
-    ep.assertTgTraffic(sum.total, `进入「${TITLE}」${WINDOW_MS / 1000}s`)
+    // 本窗口的期望是**状态相关**的：面板挂载时会自动选中首个监控频道，若点中的是同一行
+    // 就是幂等重选，修好的构建正确地**不发**新请求（BUG-241 要消掉的就是这批重复请求）。
+    // 所以此处断言「非零」= 把修复前的行为当成基线 ⇒ 修好的构建反而假失败。
+    // 端点失活由两处独立覆盖：resolve() 的 /health 探针 + 此处的运行中复核。
+    await ep.assertTgAlive(`进入「${TITLE}」${WINDOW_MS / 1000}s`)
   } finally {
     await browser.close()
   }
