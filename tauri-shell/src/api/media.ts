@@ -574,9 +574,15 @@ export async function setSeriesTags(id: number, tagIds: number[]): Promise<{ ok:
   })
 }
 
+/**
+ * 按槽位加入单集（`episodeNo` 缺省 1 = S1E1）。
+ *
+ * BUG-129：槽位已被占用且未传 `overwrite: true` 时后端返回 **409**，不覆盖原条目。
+ * 「加入剧集」请用 {@link appendEpisodes} —— 顺序追加，不挤占已有槽位。
+ */
 export async function addEpisode(
   seriesId: number,
-  body: { itemId: number; season?: number; episodeNo?: number },
+  body: { itemId: number; season?: number; episodeNo?: number; overwrite?: boolean },
 ): Promise<{ id: number }> {
   return request(`/api/media/series/${seriesId}/episodes`, {
     method: 'POST',

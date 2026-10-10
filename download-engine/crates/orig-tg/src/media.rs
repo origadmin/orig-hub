@@ -1117,6 +1117,25 @@ pub struct SourceRef {
     pub has_bytes: bool,
 }
 
+/// BUG-129：某槽位当前的**占用者**（`None` = 空槽）。
+///
+/// 存在的意义：槽位 upsert（[`Store::add_episode`] 的
+/// `ON CONFLICT(series_id, season, episode_no) DO UPDATE`）**不留任何痕迹** ——
+/// 顶掉原条目时不报错、不提示，被顶掉者的去向从返回值里看不出来。调用方要
+/// 「不覆盖就得先知道有没有人占着」，只能自己问一句。
+///
+/// 与 upsert 的冲突键**逐字对齐**（`(series_id, season, episode_no)`）：只看这三个字段，
+/// 因此合集（`episode_no_end`，BUG-039）展开占用的中间号**不算**占用 ——
+/// 那不是 upsert 会撞到的键，判定口径必须与真正会发生覆盖的那次写入一致，
+/// 否则就会出现「报 409 但其实没覆盖」或「覆盖了却不报」的错位。
+#[derive(Debug, Clone, Copy)]
+pub struct EpisodeSlotOccupant {
+    /// 被占用槽位所在的那行 `media_episode.id`。
+    pub episode_id: i64,
+    /// 该槽位当前指向的条目。
+    pub item_id: i64,
+}
+
 /// 集级「挂载」统一读模型的一项（D1=B 第一步：统一读模型）。
 ///
 /// 把「一集 ↔ 多文件」的多种角色（主条目 / 备用源 / 挂图 / 片段）收敛成**一个**结构，
@@ -2999,9 +3018,14 @@ impl Store {
         Ok(())
     }
 
-    /// 加入分集。同 (series, season, episode_no) 已存在则更新指向的条目。
+/// 加入分集。同 (series, season, episode_no) 已存在则更新指向的条目。
     ///
     /// 不收标题：分集的标题永远等于它指向条目的标题（见 [`EpisodeView::title`]）。
+    ///
+    /// ⚠️ 这是**低层原语**，自带槽位 upsert 语义（BUG-129）—— 覆盖既有槽位时**不报错**。
+    /// 只应由「已确认槽位可写」的调用方使用（如带 `overwrite` 确认的 REST 入口）；
+    /// 任何面向用户的入口都必须**先**用 [`Store::episode_slot_occupant`] 查一次，
+    /// 否则就会复现 BUG-129 的静默覆盖。
     ///
     /// 这是**用户显式**的单条加入入口 → 先清掉该内容的墓碑（BUG-126）。
     /// 清墓碑**不能**下沉到 `add_episode_ranged`：`append_episodes_ranged`（自动路径）
@@ -3016,6 +3040,33 @@ impl Store {
         self.clear_episode_tombstones(series_id, &[item_id]).await?;
         self.add_episode_ranged(series_id, item_id, season, episode_no, None)
             .await
+    }
+
+    /// BUG-129：查 `(series_id, season, episode_no)` 槽位当前被谁占着（`None` = 空槽）。
+    ///
+    /// 给「按槽位写入」的入口用：先问占用者，再决定是写入、还是拒绝并告知占用者。
+    /// 判定键与 [`Store::add_episode`] 的 upsert 冲突键逐字一致（见
+    /// [`EpisodeSlotOccupant`] 的说明），所以「查出来有人」⇒「不覆盖就一定会撞上」。
+    pub async fn episode_slot_occupant(
+        &self,
+        series_id: i64,
+        season: i64,
+        episode_no: i64,
+    ) -> libsql::Result<Option<EpisodeSlotOccupant>> {
+        let row = self
+            .row_opt(
+                "SELECT id, item_id FROM media_episode
+                  WHERE series_id = ?1 AND season = ?2 AND episode_no = ?3",
+                params![series_id, season, episode_no],
+            )
+            .await?;
+        match row {
+            Some(r) => Ok(Some(EpisodeSlotOccupant {
+                episode_id: r.get(0)?,
+                item_id: r.get(1)?,
+            })),
+            None => Ok(None),
+        }
     }
 
     /// 同 `add_episode`，但支持合集范围（BUG-039）：`episode_no_end` 记录该条目
@@ -8719,5 +8770,132 @@ mod tests {
         assert_eq!(view.episode_count, 3, "纯照片组集数应等于照片数");
         assert_eq!(view.photo_count, 3, "照片数应等于照片数");
         assert_eq!(view.video_count, 0);
+    }
+
+    /// BUG-129：`episode_slot_occupant` 必须**如实**报出槽位占用者，且与 upsert
+    /// 的冲突键逐字对齐 —— 这是「不覆盖就得先知道有没有人占着」的唯一依据。
+    ///
+    /// 覆盖三件事：① 空槽返回 `None`（否则空槽也会被误拒）；② 占用时返回
+    /// `episode_id` + `item_id`（409 的错误信息要靠 `item_id` 告知占用者）；
+    /// ③ 季是键的一部分 —— S2E1 与 S1E1 是两个不同的槽，各报各的。
+    #[tokio::test]
+    async fn episode_slot_occupant_reports_occupant_bug129() {
+        let s = Store::open(tmp_db("bug129_occupant")).await.unwrap();
+        let sid = s
+            .create_series("S", None, "series", None, None)
+            .await
+            .unwrap();
+        let a = s
+            .upsert_media_item("tg", "o:1", "a", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let b = s
+            .upsert_media_item("tg", "o:2", "b", "video", None, None, None, None)
+            .await
+            .unwrap();
+
+        // ① 空槽 ⇒ None（否则 handler 会把第一次加入也拒掉）
+        assert!(
+            s.episode_slot_occupant(sid, 1, 1).await.unwrap().is_none(),
+            "空槽必须报 None，否则正常加入会被误判成冲突"
+        );
+
+        // ② 占用 ⇒ 报出占用者，且 episode_id 就是被写入的那行
+        let ep = s.add_episode(sid, a, 1, 1).await.unwrap();
+        let occ = s
+            .episode_slot_occupant(sid, 1, 1)
+            .await
+            .unwrap()
+            .expect("S1E1 已占用，必须报出占用者");
+        assert_eq!(occ.item_id, a, "占用者必须是当前指向的条目");
+        assert_eq!(occ.episode_id, ep, "episode_id 必须是占用槽位那一行");
+
+        // ③ 季参与键：S2E1 是另一个槽，仍是空的
+        assert!(
+            s.episode_slot_occupant(sid, 2, 1).await.unwrap().is_none(),
+            "S2E1 与 S1E1 是不同的槽，不得串味"
+        );
+
+        // ④ 占用者跟着**槽位当前的指向**走（不是「第一个进来的」）：upsert 换掉
+        //    item_id 后，409 的错误信息必须报新的占用者，否则告知的是过时信息。
+        s.add_episode(sid, b, 1, 1).await.unwrap();
+        let moved = s.episode_slot_occupant(sid, 1, 1).await.unwrap().unwrap();
+        assert_eq!(moved.item_id, b, "占用者必须反映槽位当前指向，不能是首次写入的那个");
+        assert_eq!(moved.episode_id, ep, "换的只是指向，行仍是同一行");
+    }
+
+    /// BUG-129 回归（store 原语层）：**槽位 upsert 的破坏性必须可控**。
+    ///
+    /// ⚠️ 判据「未传 overwrite ⇒ 409 且原条目仍在」本身是**路由层**的命题
+    /// （见 `routes.rs::add_episode_occupied_slot_conflicts_and_keeps_original_bug129`）。
+    /// 本测试锁的是它依赖的两条 store 事实：查占用者查得准；显式覆盖后仍**真的能覆盖**
+    /// —— 否则 handler 那道闸只是把按槽位写入整个焊死，比原缺陷更难用。
+    #[tokio::test]
+    async fn add_episode_overwrites_only_when_intent_is_explicit_bug129() {
+        let s = Store::open(tmp_db("bug129_guard")).await.unwrap();
+        let sid = s
+            .create_series("S", None, "series", None, None)
+            .await
+            .unwrap();
+        let original = s
+            .upsert_media_item("tg", "g:390", "原条目", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let newcomer = s
+            .upsert_media_item("tg", "g:389", "新条目", "video", None, None, None, None)
+            .await
+            .unwrap();
+
+        // 前置：S1E1 已被「原条目」占住（复刻 BUG-129 里 390 被顶掉的那个现场）
+        s.add_episode(sid, original, 1, 1).await.unwrap();
+        let occ = s.episode_slot_occupant(sid, 1, 1).await.unwrap().unwrap();
+        assert_eq!(occ.item_id, original, "前置：S1E1 先归原条目");
+
+        // ① 在「不覆盖」这条路上，handler 一律 409 放行不到 store；
+        //    这里能观测到的前提是 —— 读到的占用者必须一路指回原条目、原行。
+        let still = s.episode_slot_occupant(sid, 1, 1).await.unwrap().unwrap();
+        assert_eq!(
+            still.item_id, original,
+            "判据前提：被占用槽位报出的占用者必须是原条目"
+        );
+        assert_eq!(still.episode_id, occ.episode_id, "原行本身也不该被换掉");
+
+        // ② 槽位行数不变（顶掉 ≠ 删旧建新），且新条目尚未入剧
+        assert_eq!(
+            s.count_one(
+                "SELECT COUNT(*) FROM media_episode WHERE series_id = ?1 AND season = ?2",
+                params![sid, 1_i64],
+            )
+            .await
+            .unwrap(),
+            1,
+            "判据：槽位行数不变，覆盖必须是覆盖而不是删旧建新"
+        );
+        assert_eq!(
+            s.count_one(
+                "SELECT COUNT(*) FROM media_episode WHERE series_id = ?1 AND item_id = ?2",
+                params![sid, original],
+            )
+            .await
+            .unwrap(),
+            1,
+            "判据：原条目仍挂在剧集上"
+        );
+        assert_eq!(
+            s.count_one(
+                "SELECT COUNT(*) FROM media_episode WHERE series_id = ?1 AND item_id = ?2",
+                params![sid, newcomer],
+            )
+            .await
+            .unwrap(),
+            0,
+            "判据：新条目不得在未获准时被写进任何槽位"
+        );
+
+        // ③ 显式表达覆盖意图后（handler 放行 200 的那条路）必须**真的能覆盖**。
+        let eid = s.add_episode(sid, newcomer, 1, 1).await.unwrap();
+        let after = s.episode_slot_occupant(sid, 1, 1).await.unwrap().unwrap();
+        assert_eq!(after.item_id, newcomer, "显式覆盖必须生效");
+        assert_eq!(after.episode_id, eid, "覆盖落在同一行上（upsert，不是换行）");
     }
 }

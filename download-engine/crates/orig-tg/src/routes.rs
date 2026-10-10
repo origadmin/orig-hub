@@ -4888,9 +4888,20 @@ struct EpisodeReq {
     season: Option<i64>,
     #[serde(rename = "episodeNo")]
     episode_no: Option<i64>,
+    /// BUG-129：**显式**覆盖意图。缺省即「不覆盖」。
+    ///
+    /// 这个端点是**按槽位写入**（`episodeNo` 缺省 1 = S1E1），而底层
+    /// `add_episode` 带 `ON CONFLICT ... DO UPDATE` —— 槽位被占时它会**静默顶掉**
+    /// 原条目：不报错、不提示，被顶掉者的去向从返回值里看不出来（实测 `389` 顶掉 `390`）。
+    /// 于是「覆盖」这个**破坏性**动作必须由调用方显式表达：没说不覆盖，就不许覆盖。
+    overwrite: Option<bool>,
 }
 
 /// `POST /api/media/series/:id/episodes`
+///
+/// BUG-129：按槽位写入，**槽位已被占用且未传 `overwrite: true` 时返回 409**，
+/// 并在错误信息里告知占用者（`itemId`）—— 由调用方决定是换槽、换条目，还是显式覆盖。
+/// 此前是直接覆盖，用户只会发现「我的一集不见了」，且无从归因。
 async fn add_media_episode(
     State(st): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -4912,14 +4923,32 @@ async fn add_media_episode(
             "only video or photo items can be episodes",
         ));
     }
+    let season = body.season.unwrap_or(1);
+    let episode_no = body.episode_no.unwrap_or(1);
+    // BUG-129：写之前先问槽位。**必须查在写之前** —— 若先写后判，「原条目仍在」
+    // 就不成立了（BUG-129 判据 2 专门盯这条：「先删后报错」也能骗过只断言 409 的测试）。
+    let occupant = st
+        .store
+        .episode_slot_occupant(id, season, episode_no)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if let Some(occ) = occupant {
+        // 「指向的就是同一条目」不算冲突：那是无副作用的幂等重放（调用方重试同一次请求），
+        // 报 409 反而会逼调用方去开 `overwrite` —— 而那正是本条要拦的危险动作。
+        if !body.overwrite.unwrap_or(false) && occ.item_id != body.item_id {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                &format!(
+                    "S{season}E{episode_no} is already occupied by item {}; \
+                     pass \"overwrite\": true to replace it, or choose another episodeNo",
+                    occ.item_id
+                ),
+            ));
+        }
+    }
     let eid = st
         .store
-        .add_episode(
-            id,
-            body.item_id,
-            body.season.unwrap_or(1),
-            body.episode_no.unwrap_or(1),
-        )
+        .add_episode(id, body.item_id, season, episode_no)
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     Ok(Json(json!({"id": eid})))
@@ -5550,6 +5579,9 @@ mod tests {
     use super::router;
     use super::serve_local_file;
     use super::MergeSeriesReq;
+    // BUG-129：409 判据要直接调 handler（状态码与错误信息都只在 handler 层可见）。
+    use super::add_media_episode;
+    use super::EpisodeReq;
 
     // ── BUG-257：取消可达在途 IO（判据 1） ────────────────────────────────
 
@@ -8520,6 +8552,158 @@ mod tests {
             .query(
                 "SELECT COUNT(*) FROM media_item WHERE source = 'tg' AND ref = ?1",
                 libsql::params![ref_key.to_string()],
+            )
+            .await
+            .expect("count must run");
+        let row = rows.next().await.expect("count row").expect("count row exists");
+        row.get(0).expect("count column")
+    }
+
+    // ── BUG-129：`addEpisode` 按槽位静默覆盖 ─────────────────────────────
+    //
+    // 判据（`docs/bugs/BUG-129.md` 方案 B）：槽位已被占用且未传 `overwrite` 时
+    // 返回 **409**，且**原条目仍在**。
+    //
+    // 「原条目仍在」是本测试的**重点**，不是「返回了 409」：先删后报错、或报错前
+    // 先动过原条目，都能骗过只断言状态码的测试。所以每条 409 之后都重新读库，
+    // 断言槽位仍指向原条目、原行 id 未变、行数未变。
+
+    /// BUG-129 判据：`POST /api/media/series/:id/episodes` 在槽位被占用且
+    /// **未传 `overwrite`** 时必须 409，且**原条目仍在**（顶掉 `390` 那个现场的回归）。
+    #[tokio::test]
+    async fn add_episode_occupied_slot_conflicts_and_keeps_original_bug129() {
+        use crate::unavailable::UnavailableClient;
+
+        let store = Store::open(":memory:").await.expect("store");
+        let st = Arc::new(AppState::new(
+            Arc::new(UnavailableClient::new("test: link down")),
+            Config::default(),
+            Availability::Unavailable("test".to_string()),
+            false,
+            store,
+        ));
+        let sid = st
+            .store
+            .create_series("剧", None, "series", None, None)
+            .await
+            .unwrap();
+        // 复刻 BUG-129 现场：390 已占住 S1E1，389 随后带着默认 episodeNo(=1) 进来。
+        let original = st
+            .store
+            .upsert_media_item("tg", "v:390", "原条目", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let newcomer = st
+            .store
+            .upsert_media_item("tg", "v:389", "新条目", "video", None, None, None, None)
+            .await
+            .unwrap();
+        st.store.add_episode(sid, original, 1, 1).await.unwrap();
+        let before = st.store.episode_slot_occupant(sid, 1, 1).await.unwrap().unwrap();
+        assert_eq!(before.item_id, original, "前置：S1E1 先归原条目 390");
+
+        // ① 默认槽位 + 未传 overwrite ⇒ 409，且错误信息要告知占用者
+        let err = match add_media_episode(
+            State(st.clone()),
+            Path(sid),
+            Json(EpisodeReq {
+                item_id: newcomer,
+                season: None,
+                episode_no: None,
+                overwrite: None,
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("BUG-129: 槽位被占用且未传 overwrite 时不得静默覆盖"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.status,
+            StatusCode::CONFLICT,
+            "BUG-129 判据：槽位被占用且未传 overwrite 必须是 409"
+        );
+        assert!(
+            err.message().contains(&original.to_string()),
+            "409 必须告知占用者是谁（期望含 itemId {original}），实得：{}",
+            err.message()
+        );
+
+        // ② 判据核心：**原条目仍在**，且原行 id 未变（不是删旧建新）
+        let after = st.store.episode_slot_occupant(sid, 1, 1).await.unwrap().unwrap();
+        assert_eq!(
+            after.item_id, original,
+            "BUG-129 判据：原条目仍在 —— 409 不得伴随任何写入"
+        );
+        assert_eq!(after.episode_id, before.episode_id, "原行 id 不得改变");
+        assert_eq!(
+            count_episode_rows(&st, sid).await,
+            1,
+            "BUG-129 判据：槽位行数不变（顶掉 ≠ 删旧建新）"
+        );
+
+        // ③ 显式 `overwrite: true` ⇒ 放行，且**真的**覆盖（否则修复等于把端点焊死）
+        let ok = add_media_episode(
+            State(st.clone()),
+            Path(sid),
+            Json(EpisodeReq {
+                item_id: newcomer,
+                season: None,
+                episode_no: None,
+                overwrite: Some(true),
+            }),
+        )
+        .await
+        .expect("BUG-129: 显式 overwrite 必须放行 —— 修复不能把按槽位写入整个禁掉");
+        let resp = ok.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body must be readable");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("must be JSON");
+        assert!(v["id"].is_i64(), "响应契约仍是 {{\"id\": <episodeId>}}");
+        let overwritten = st.store.episode_slot_occupant(sid, 1, 1).await.unwrap().unwrap();
+        assert_eq!(overwritten.item_id, newcomer, "显式覆盖必须生效");
+        assert_eq!(overwritten.episode_id, before.episode_id, "覆盖落在同一行（upsert）");
+
+        // ④ 空槽不受影响：BUG-129 的闸只拦「已占用」，不得把正常加入一起拦掉
+        let fresh = add_media_episode(
+            State(st.clone()),
+            Path(sid),
+            Json(EpisodeReq {
+                item_id: newcomer,
+                season: None,
+                episode_no: Some(9), // 空槽
+                overwrite: None,
+            }),
+        )
+        .await
+        .expect("BUG-129: 空槽必须照常写入 —— 闸只拦已占用槽位");
+        assert_eq!(fresh.into_response().status(), StatusCode::OK);
+
+        // ⑤ 季参与键：S2E1 是另一个槽，即使 S1E1 被占也不该报冲突
+        let _ = add_media_episode(
+            State(st.clone()),
+            Path(sid),
+            Json(EpisodeReq {
+                item_id: original,
+                season: Some(2),
+                episode_no: Some(1),
+                overwrite: None,
+            }),
+        )
+        .await
+        .expect("BUG-129: S2E1 未被占用，不得被 S1E1 的占用误判成冲突");
+    }
+
+    /// 某剧集某季的分集行数（BUG-129 判据用：顶掉 ≠ 删旧建新）。
+    async fn count_episode_rows(st: &AppState, series_id: i64) -> i64 {
+        let mut rows = st
+            .store
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM media_episode WHERE series_id = ?1 AND season = 1",
+                libsql::params![series_id],
             )
             .await
             .expect("count must run");
