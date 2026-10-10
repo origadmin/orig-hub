@@ -1824,10 +1824,19 @@ mod tests {
     // ── BUG-249：批量 retry / cancel（一动词一端点，差异走参数） ─────────────
 
     /// 造一条指定状态的任务（终态要先转 running —— `finish_cache_task` 只对活跃态生效）。
+    ///
+    /// BUG-220：消息号必须**随 key 变**。此前这里写死 `[11]`，于是同一 chat 里造的每条
+    /// 任务都覆盖同一条消息 —— 入队去重（按消息重叠判据，BUG-220）会正确地把它们合并成
+    /// 一条，测试随即拿到同一个 id 而崩。真实任务的消息各不相同，故按 key 末段取消息号。
     async fn seeded_task(st: &Arc<AppState>, key: &str, status: &str) -> i64 {
+        let msg: i64 = key
+            .rsplit(':')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(11);
         let (task, _created) = st
             .store
-            .enqueue_cache_task(7, None, key, &[11], "D:/dl")
+            .enqueue_cache_task(7, None, key, &[msg], "D:/dl")
             .await
             .expect("enqueue must succeed")
             .expect("task must be created");

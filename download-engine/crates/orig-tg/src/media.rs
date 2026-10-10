@@ -7497,11 +7497,12 @@ mod tests {
     #[tokio::test]
     async fn delete_cache_tasks_by_ids_removes_only_selected() {
         let s = Store::open(&tmp_db("del_task_ids")).await.unwrap();
-        let mk = |key: &str| {
+        let mk = |key: &str, msg: i64| {
             let s = &s;
             let key = key.to_string();
             async move {
-                s.enqueue_cache_task(1, None, &key, &[1, 2], "D:/tmp")
+                // BUG-220：消息号随任务变 —— 写死会让入队去重（按消息重叠）把三条合并成一条。
+                s.enqueue_cache_task(1, None, &key, &[msg], "D:/tmp")
                     .await
                     .unwrap()
                     .unwrap()
@@ -7509,7 +7510,7 @@ mod tests {
                     .id
             }
         };
-        let (a, b, c) = (mk("k1").await, mk("k2").await, mk("k3").await);
+        let (a, b, c) = (mk("k1", 1).await, mk("k2", 2).await, mk("k3", 3).await);
         // 让 b 处于活跃态：挑中它是为了验证「先 cancelled 再删行」
         s.mark_cache_task_running(b).await.unwrap();
 

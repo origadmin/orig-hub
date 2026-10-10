@@ -951,8 +951,7 @@ impl Store {
     /// `last_insert_rowid()` 是**连接级且不区分表**的值，Store 用单一共享连接，并发交错时
     /// 会返回他人（甚至别的表）的 rowid（同 `media::create_series`/`create_tag` 的根因）。
     /// RETURNING 由 SQLite 在**同一语句内**返回本行 id，从根本上消除该窗口。
-    pub async fn enqueue_cache_task(
-        &self,
+    pub async fn enqueue_cache_task(        &self,
         chat_id: i64,
         group_id: Option<i64>,
         item_key: &str,
@@ -960,7 +959,13 @@ impl Store {
         dir: &str,
     ) -> libsql::Result<Option<(CacheTask, bool)>> {
         // 先读活跃任务：命中即复用（正常路径，避免无谓的写入冲突）。
-        if let Some(t) = self.active_cache_task(item_key).await? {
+        // BUG-220：判据是「**消息集合重叠**」而非 item_key 相等 —— 同一批内容会经
+        // `m:` / `g:` / `b:` 三条路径进来，key 字符串不等但消息重叠；只比 key 会让
+        // 同一批消息被建多个任务（实测同一 8 条同时存在 g:/m:/b: 三个任务）。
+        if let Some(t) = self
+            .active_cache_task_covering(chat_id, message_ids)
+            .await?
+        {
             return Ok(Some((t, false)));
         }
         let items = serde_json::to_string(message_ids).unwrap_or_else(|_| "[]".to_string());
@@ -1022,6 +1027,48 @@ impl Store {
         .await?
             .map(|r| cache_task_from_row(&r))
             .transpose()
+    }
+
+    /// 查**覆盖了给定任一消息**的活跃任务（BUG-220 数据错乱修复）。
+    ///
+    /// 为什么不能只比 `item_key`：同一批内容会从三条入队路径进来，而 key 格式不同 ——
+    /// 单条/相册是 `m:{chat}:{msg}` / `g:{chat}:{group}`（`routes.rs` 手工构造），
+    /// 「缓存缺失 N 集」批量补缺是 `b:{chat}:{first}`。`item_key` 字符串不等 ⇒
+    /// 旧的 `active_cache_task(item_key)` 完全命中不了 ⇒ **同一批消息被建多个任务**
+    /// （实测同一 8 条消息同时存在 `g:` / `m:` / `b:` 三个任务，队列里重复且标题互相干扰）。
+    ///
+    /// 判据改为「消息集合是否重叠」，与 key 形态无关：任一消息已被活跃任务覆盖即复用。
+    pub async fn active_cache_task_covering(
+        &self,
+        chat_id: i64,
+        message_ids: &[i64],
+    ) -> libsql::Result<Option<CacheTask>> {
+        if message_ids.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = message_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT {CACHE_TASK_COLS} FROM cache_task \
+             WHERE chat_id = ? AND status IN {CACHE_TASK_ACTIVE_STATES} \
+               AND EXISTS (SELECT 1 FROM json_each(cache_task.items) \
+                            WHERE json_each.value IN ({placeholders})) \
+             ORDER BY id ASC LIMIT 1"
+        );
+        let mut params: Vec<libsql::Value> = Vec::with_capacity(message_ids.len() + 1);
+        params.push(chat_id.into());
+        for m in message_ids {
+            params.push((*m).into());
+        }
+        let row = self.conn.query(&sql, params).await?;
+        let mut rows = row;
+        match rows.next().await? {
+            Some(r) => Ok(Some(cache_task_from_row(&r)?)),
+            None => Ok(None),
+        }
     }
 
     /// 按条目查其缓存任务态（BUG-279）。
@@ -2230,6 +2277,57 @@ mod tests {
             N,
             "并发 16 个不同 key 应恰好落 16 行"
         );
+    }
+
+    /// BUG-220 数据错乱：同一批消息经**三种 key 形态**（`g:`/`m:`/`b:`）入队时，
+    /// 必须复用同一个任务，而不是建出三个重复任务。旧实现只比 item_key 字符串，
+    /// 三者互不相等 ⇒ 实测同一 8 条消息同时存在三个任务（队列重复、标题互相干扰）。
+    #[tokio::test]
+    async fn enqueue_dedupes_across_key_shapes_by_message_overlap_bug220() {
+        let s = store("bug220dedup").await;
+        let msgs = vec![3373_i64, 3374, 3375];
+        // 1) 相册路径 `g:` 建任务。
+        let (t1, created1) = s
+            .enqueue_cache_task(-100, Some(555), "g:-100:555", &msgs, "D:/dl")
+            .await
+            .unwrap()
+            .expect("g enqueue");
+        assert!(created1, "首个应新建");
+        // 2) 批量补缺路径 `b:` 传**同一批消息** ⇒ 必须复用，不得新建。
+        let (t2, created2) = s
+            .enqueue_cache_task(-100, None, "b:-100:3373", &msgs, "D:/dl")
+            .await
+            .unwrap()
+            .expect("b enqueue");
+        assert!(!created2, "b: 与 g: 覆盖同一批消息，必须复用");
+        assert_eq!(t1.id, t2.id, "应指向同一个任务");
+        // 3) 单条路径 `m:` 只带首条消息（重叠）⇒ 同样复用。
+        let (t3, created3) = s
+            .enqueue_cache_task(-100, None, "m:-100:3373", &[3373], "D:/dl")
+            .await
+            .unwrap()
+            .expect("m enqueue");
+        assert!(!created3, "m: 与 g: 消息重叠，必须复用");
+        assert_eq!(t1.id, t3.id);
+        // 库里该 chat 只应有 1 个活跃任务。
+        assert_eq!(
+            s.list_cache_tasks(50)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|t| t.chat_id == -100 && t.status == "queued")
+                .count(),
+            1,
+            "同一批消息只允许存在一个活跃任务"
+        );
+        // 4) 不重叠的消息 ⇒ 正常新建（去重不能误伤）。
+        let (t4, created4) = s
+            .enqueue_cache_task(-100, None, "m:-100:9999", &[9999], "D:/dl")
+            .await
+            .unwrap()
+            .expect("unrelated enqueue");
+        assert!(created4, "不重叠的消息必须能正常新建");
+        assert_ne!(t1.id, t4.id);
     }
 
     /// BUG-279：按条目查任务态——单条（m:）精确匹配、组任务（g:）按 items JSON 包含，
