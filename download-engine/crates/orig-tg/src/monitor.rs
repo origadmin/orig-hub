@@ -120,6 +120,8 @@ async fn run_sync_pass(state: &Arc<AppState>) -> Result<u64, String> {
                     it.date,
                     it.duration,
                     it.group_id,
+
+                    it.file_name.as_deref(),
                 )
                 .await
                 .map_err(|e| e.to_string())?;

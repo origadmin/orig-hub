@@ -1082,6 +1082,8 @@ async fn cache_one_bytes(
                 m.date,
                 m.duration,
                 m.group_id,
+
+                m.file_name.as_deref(),
             )
             .await;
     }
@@ -1631,6 +1633,8 @@ async fn ensure_message_rows(st: &Arc<AppState>, chat_id: i64, msg_ids: &[i64]) 
                     m.date,
                     m.duration,
                     m.group_id,
+
+                    m.file_name.as_deref(),
                 )
                 .await;
         }
@@ -2680,6 +2684,8 @@ async fn monitor_messages(
                             it.date,
                             it.duration,
                             it.group_id,
+
+                            it.file_name.as_deref(),
                         )
                         .await
                         .map_err(db_err)?;
@@ -5743,7 +5749,7 @@ mod tests {
 
         // 入队一条真实会走下载路径的任务（媒体类型非 photo ⇒ 不走「图片不缓存」分支）。
         st.store
-            .upsert_message(-1001, 55, Some("hangs"), Some("video/mp4"), Some(9_000), Some("video".into()), Some(0), None, None)
+            .upsert_message(-1001, 55, Some("hangs"), Some("video/mp4"), Some(9_000), Some("video".into()), Some(0), None, None, None)
             .await
             .unwrap();
         let (task, created) = st
@@ -7521,6 +7527,8 @@ mod tests {
                         m.date,
                         m.duration,
                         m.group_id,
+
+                        m.file_name.as_deref(),
                     )
                     .await;
             }

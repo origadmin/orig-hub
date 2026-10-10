@@ -239,6 +239,7 @@ async fn migrate_media_message(conn: &Connection) -> libsql::Result<()> {
     let mut have_duration = false;
     let mut have_path = false;
     let mut have_group = false;
+    let mut have_file_name = false;
     while let Some(r) = rows.next().await? {
         let name: String = r.get(1)?;
         if name == "media_type" {
@@ -255,6 +256,9 @@ async fn migrate_media_message(conn: &Connection) -> libsql::Result<()> {
         }
         if name == "group_id" {
             have_group = true;
+        }
+        if name == "file_name" {
+            have_file_name = true;
         }
     }
     if !have_type {
@@ -275,6 +279,13 @@ async fn migrate_media_message(conn: &Connection) -> libsql::Result<()> {
     }
     if !have_group {
         conn.execute("ALTER TABLE media_message ADD COLUMN group_id INTEGER", ())
+            .await?;
+    }
+    // BUG-220：消息在 TG 上的原始文件名。入库队列的标题事实源此前只有 caption，
+    // 而实测大量视频消息**没有 caption、只有文件名**（`妻善3.mp4`）⇒ 标题恒空 ⇒
+    // 前端退回频道名。存下 file_name 后，标题链可 caption → file_name 回退。
+    if !have_file_name {
+        conn.execute("ALTER TABLE media_message ADD COLUMN file_name TEXT", ())
             .await?;
     }
     Ok(())
@@ -366,6 +377,7 @@ impl Store {
                 duration   INTEGER,
                 file_path  TEXT,
                 group_id   INTEGER,
+                file_name  TEXT,
                 PRIMARY KEY (channel_id, message_id)
             );
             CREATE TABLE IF NOT EXISTS sync_cursor (
@@ -522,13 +534,14 @@ impl Store {
         msg_date: Option<i64>,
         duration: Option<i64>,
         group_id: Option<i64>,
+        file_name: Option<&str>,
     ) -> libsql::Result<()> {
         let t = now();
         self.conn
             .execute(
                 "INSERT INTO media_message
-                   (channel_id, message_id, caption, mime_type, size, downloaded, created_at, media_type, msg_date, duration, group_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10)
+                   (channel_id, message_id, caption, mime_type, size, downloaded, created_at, media_type, msg_date, duration, group_id, file_name)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(channel_id, message_id) DO UPDATE SET
                    caption = excluded.caption,
                    mime_type = excluded.mime_type,
@@ -536,8 +549,9 @@ impl Store {
                    media_type = COALESCE(excluded.media_type, media_message.media_type),
                    msg_date = COALESCE(excluded.msg_date, media_message.msg_date),
                    duration = COALESCE(excluded.duration, media_message.duration),
-                   group_id = COALESCE(excluded.group_id, media_message.group_id)",
-                params![channel_id, message_id, caption, mime_type, size, t, media_type, msg_date, duration, group_id],
+                   group_id = COALESCE(excluded.group_id, media_message.group_id),
+                   file_name = COALESCE(excluded.file_name, media_message.file_name)",
+                params![channel_id, message_id, caption, mime_type, size, t, media_type, msg_date, duration, group_id, file_name],
             )
             .await?;
         Ok(())
@@ -557,11 +571,17 @@ impl Store {
     ) -> libsql::Result<std::collections::HashMap<(i64, i64), String>> {
         let mut out = std::collections::HashMap::new();
         for ch in channels {
+            // BUG-220：标题 = caption 优先，**无 caption 时回退 file_name**。
+            // 实测大量视频消息在 TG 上没有说明文案、只有文件名（`妻善3.mp4`），
+            // 此前只看 caption ⇒ 这类任务标题恒空 ⇒ 前端退回频道名（用户看到
+            // 「又是频道名不是内容」）。文件名就是内容名，回退到它才是「显示内容」。
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT message_id, caption FROM media_message \
-                     WHERE channel_id = ?1 AND caption IS NOT NULL AND caption <> ''",
+                    "SELECT message_id, COALESCE(NULLIF(caption, ''), NULLIF(file_name, '')) AS title \
+                     FROM media_message \
+                     WHERE channel_id = ?1 \
+                       AND (caption IS NOT NULL AND caption <> '' OR file_name IS NOT NULL AND file_name <> '')",
                     params![*ch],
                 )
                 .await?;
@@ -1628,14 +1648,14 @@ mod tests {
     #[tokio::test]
     async fn message_upsert_and_query() {
         let s = store("message").await;
-        s.upsert_message(1, 100, Some("hello"), Some("video/mp4"), Some(1234), Some("video"), Some(1000), Some(95), Some(777))
+        s.upsert_message(1, 100, Some("hello"), Some("video/mp4"), Some(1234), Some("video"), Some(1000), Some(95), Some(777), None)
             .await
             .unwrap();
         // 幂等 upsert：更新 caption，不新增行。
-        s.upsert_message(1, 100, Some("dup"), Some("video/mp4"), Some(1234), Some("video"), Some(1000), None, None)
+        s.upsert_message(1, 100, Some("dup"), Some("video/mp4"), Some(1234), Some("video"), Some(1000), None, None, None)
             .await
             .unwrap();
-        s.upsert_message(1, 101, None, Some("image/jpeg"), None, Some("photo"), Some(1001), None, None)
+        s.upsert_message(1, 101, None, Some("image/jpeg"), None, Some("photo"), Some(1001), None, None, None)
             .await
             .unwrap();
         let msgs = s.list_messages(1, None, 10).await.unwrap();
@@ -1705,13 +1725,13 @@ mod tests {
     async fn stored_library_query() {
         let s = store("stored_lib").await;
         s.add_channel(1, "Movies", None).await.unwrap();
-        s.upsert_message(1, 10, Some("ep1"), Some("video/mp4"), Some(100), Some("video"), Some(900), Some(60), None)
+        s.upsert_message(1, 10, Some("ep1"), Some("video/mp4"), Some(100), Some("video"), Some(900), Some(60), None, None)
             .await
             .unwrap();
-        s.upsert_message(1, 11, Some("ep2"), Some("video/mp4"), Some(200), Some("video"), Some(901), Some(120), None)
+        s.upsert_message(1, 11, Some("ep2"), Some("video/mp4"), Some(200), Some("video"), Some(901), Some(120), None, None)
             .await
             .unwrap();
-        s.upsert_message(2, 20, Some("song"), Some("audio/mpeg"), Some(30), Some("audio"), Some(902), Some(180), None)
+        s.upsert_message(2, 20, Some("song"), Some("audio/mpeg"), Some(30), Some("audio"), Some(902), Some(180), None, None)
             .await
             .unwrap();
         s.mark_downloaded(1, 10, Some(r#"C:\cache\ep1.mp4"#)).await.unwrap();
@@ -2093,7 +2113,7 @@ mod tests {
         let s = store("dup_paths").await;
 
         // 各不相同的路径：不得误报。
-        s.upsert_message(11, 1, Some("a"), Some("video/mp4"), Some(1), Some("video"), Some(1), None, None)
+        s.upsert_message(11, 1, Some("a"), Some("video/mp4"), Some(1), Some("video"), Some(1), None, None, None)
             .await
             .unwrap();
         s.mark_downloaded(11, 1, Some(r#"C:\cache\unique-a.mp4"#)).await.unwrap();
@@ -2103,10 +2123,10 @@ mod tests {
         );
 
         // 两个**不同频道**落到同一路径 = BUG-100 的存量撞名。
-        s.upsert_message(11, 2, Some("b"), Some("video/mp4"), Some(1), Some("video"), Some(2), None, None)
+        s.upsert_message(11, 2, Some("b"), Some("video/mp4"), Some(1), Some("video"), Some(2), None, None, None)
             .await
             .unwrap();
-        s.upsert_message(22, 3, Some("c"), Some("video/mp4"), Some(1), Some("video"), Some(3), None, None)
+        s.upsert_message(22, 3, Some("c"), Some("video/mp4"), Some(1), Some("video"), Some(3), None, None, None)
             .await
             .unwrap();
         s.mark_downloaded(11, 2, Some(r#"C:\cache\video_2024.mp4"#)).await.unwrap();
@@ -2265,5 +2285,31 @@ mod tests {
         assert_eq!(s.data_dir(), dir);
         assert_eq!(s.proxy_dir(), dir.join("proxies"));
         assert_ne!(s.data_dir(), s.proxy_dir());
+    }
+
+    /// BUG-220：入库队列标题 = **caption 优先，无 caption 时回退 file_name**。
+    ///
+    /// 实测大量视频消息在 TG 上没有说明文案、只有文件名（`妻善3.mp4`）；此前标题链
+    /// 只认 caption ⇒ 这类任务标题恒空 ⇒ 前端退回频道名（用户看到「又是频道名不是
+    /// 内容」）。本测试钉住三态：有 caption 用 caption / 无 caption 用 file_name /
+    /// 两者皆无不进标题表。
+    #[tokio::test]
+    async fn message_title_falls_back_to_file_name_bug220() {
+        let s = store("bug220title").await;
+        s.upsert_message(7, 1, Some("有文案的标题"), Some("video/mp4"), Some(1), Some("video"), Some(1), None, None, Some("ignored.mp4")).await.unwrap();
+        s.upsert_message(7, 2, None, Some("video/mp4"), Some(1), Some("video"), Some(1), None, None, Some("妻善3.mp4")).await.unwrap();
+        s.upsert_message(7, 3, None, Some("video/mp4"), Some(1), Some("video"), Some(1), None, None, None).await.unwrap();
+        let m = s.message_captions_for_channels(&[7]).await.unwrap();
+        assert_eq!(
+            m.get(&(7, 1)).map(String::as_str),
+            Some("有文案的标题"),
+            "有 caption 时必须用 caption，不能被文件名盖掉"
+        );
+        assert_eq!(
+            m.get(&(7, 2)).map(String::as_str),
+            Some("妻善3.mp4"),
+            "无 caption 时必须回退 file_name（这才是「显示内容」而非频道名）"
+        );
+        assert!(!m.contains_key(&(7, 3)), "既无 caption 也无 file_name 的消息不进标题表");
     }
 }

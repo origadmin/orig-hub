@@ -5685,17 +5685,17 @@ mod tests {
     async fn collect_hash_tags_reads_captions_and_caps() {
         let s = Store::open(tmp_db("collect_tags")).await.unwrap();
         s.upsert_message(
-            100, 1, Some("第1集 #短剧 #推荐"), None, None, None, None, None, None,
+            100, 1, Some("第1集 #短剧 #推荐"), None, None, None, None, None, None, None,
         )
         .await
         .unwrap();
         s.upsert_message(
-            100, 2, Some("#推荐 #新剧"), None, None, None, None, None, None,
+            100, 2, Some("#推荐 #新剧"), None, None, None, None, None, None, None,
         )
         .await
         .unwrap();
         // 无 caption 的消息只是跳过，不报错
-        s.upsert_message(100, 3, None, None, None, None, None, None, None)
+        s.upsert_message(100, 3, None, None, None, None, None, None, None, None)
             .await
             .unwrap();
 
