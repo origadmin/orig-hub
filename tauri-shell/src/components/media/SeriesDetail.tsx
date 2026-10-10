@@ -737,9 +737,9 @@ export function SeriesDetail(props: {
                                   : ''
                               }`
                             case 'failed':
-                              return t('media.episode.cacheFailed', { reason: st.reason })
+                              return t('media.episode.cacheFailed')
                             case 'interrupted':
-                              return t('media.episode.cacheInterrupted', { reason: st.reason })
+                              return t('media.episode.cacheInterrupted')
                             case 'cancelled':
                               return t('media.episode.cacheCancelled')
                             case 'done-no-bytes':
@@ -797,17 +797,9 @@ export function SeriesDetail(props: {
                             ) : (
                               <CloudOff className="h-3 w-3" />
                             )}
-                            {/* 标签只放**短**原因（shortReason 已截断）；完整错误原文
-                                放 title，需要时可查 —— 绝不把多 KB 错误渲染成行内文本。 */}
-                            <span
-                              className="truncate"
-                              data-testid="episode-nobytes-cache"
-                              title={
-                                st.kind === 'failed' || st.kind === 'interrupted'
-                                  ? (st.task.error ?? label)
-                                  : label
-                              }
-                            >
+                            {/* 只显示状态短标签。失败详情（多 KB 原文）只进日志与
+                                cache_task.error，不在正常列表里呈现（BUG-220）。 */}
+                            <span className="truncate" data-testid="episode-nobytes-cache">
                               {label}
                             </span>
                           </span>

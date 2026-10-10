@@ -160,25 +160,6 @@ export function episodeRecacheCandidates(
 }
 
 /**
- * 把任务 `error` 压成**一行短标签**（BUG-220 回归修复）。
- *
- * `cache_task.error` 是给「诊断」看的完整原文：条目级失败汇总是多 KB 的
- * `8/8 item(s) failed: chat:msg 原因; chat:msg 原因; …`。此前 `episodeCacheStatus`
- * 把它**原样**塞进剧集行的状态标签，于是「缓存失败：」后面拖着整屏错误 —— 一行
- * 变成几百行，剧集列表直接被错误文本淹没（用户报「标题被显示成错误」）。
- *
- * 这里在**源头**截断：只取第一行（错误汇总里第一行已含 `N/M item(s) failed:`），
- * 再限长。完整原文仍在 `task.error`，需要时由 title/详情取，不丢信息。
- */
-function shortReason(error: string | null | undefined, fallback: string): string {
-  const raw = (error ?? '').trim()
-  if (!raw) return fallback
-  const firstLine = raw.split('\n')[0].trim()
-  const oneLine = firstLine.length > 80 ? `${firstLine.slice(0, 80)}…` : firstLine
-  return oneLine || fallback
-}
-
-/**
  * 集级缓存任务态判别（BUG-279）——与字节态（hasMediaBytes，lib/tgmedia.ts）分别
  * 判定后再合并：**任务态只答「它在队列 / 正在下 / 上次失败（原因）/ 被取消 /
  * 已完成但无字节」，不答「有没有字节」**。
@@ -192,10 +173,10 @@ export type EpisodeCacheStatus =
   | { kind: 'no-task' }
   | { kind: 'queued'; task: TgCacheTask }
   | { kind: 'running'; task: TgCacheTask }
-  | { kind: 'failed'; task: TgCacheTask; reason: string }
+  | { kind: 'failed'; task: TgCacheTask }
   | { kind: 'cancelled'; task: TgCacheTask }
   | { kind: 'done-no-bytes'; task: TgCacheTask }
-  | { kind: 'interrupted'; task: TgCacheTask; reason: string }
+  | { kind: 'interrupted'; task: TgCacheTask }
 
 export function episodeCacheStatus(task: TgCacheTask | null): EpisodeCacheStatus {
   if (!task) return { kind: 'no-task' }
@@ -205,9 +186,12 @@ export function episodeCacheStatus(task: TgCacheTask | null): EpisodeCacheStatus
     case 'running':
       return { kind: 'running', task }
     case 'failed':
-      return { kind: 'failed', task, reason: shortReason(task.error, 'failed') }
+      // BUG-220：状态判别**不再携带失败原因**。失败详情（条目级汇总是多 KB 原文）
+      // 属于诊断信息，只进日志（引擎逐条 `item failed` 已记）与 cache_task.error，
+      // 界面只呈现「缓存失败」——错误长文本不该污染正常列表。
+      return { kind: 'failed', task }
     case 'interrupted':
-      return { kind: 'interrupted', task, reason: shortReason(task.error, 'interrupted') }
+      return { kind: 'interrupted', task }
     case 'cancelled':
       return { kind: 'cancelled', task }
     case 'done':
