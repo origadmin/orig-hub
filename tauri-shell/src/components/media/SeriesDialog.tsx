@@ -208,8 +208,8 @@ export function MergeSeriesDialog(props: {
   const { target, series, onClose, onDone, onError } = props
   // 订阅 UI 语言（BUG-251）：seriesLabel 在函数内部读 `getLanguage()` 决定标记形态，
   // 本组件渲染的两处剧名依赖它 —— 不订阅 `settings.language` 则语言切换后标记不更新。
-  // （本对话框文案为既有的中文硬编码，此处只补订阅，不改文案。）
-  useTranslation()
+  // 文案全部走 i18n（BUG-252）：与 MergeSeriesMultiDialog 共用同一套 `media.seriesMerge*` 键。
+  const { t } = useTranslation()
   // 目标自己不能当源
   const candidates = series.filter((s) => s.id !== target.id)
   const [sourceId, setSourceId] = useState<number | null>(candidates[0]?.id ?? null)
@@ -243,16 +243,16 @@ export function MergeSeriesDialog(props: {
       >
         <h4 className="flex items-center gap-1.5 text-[13px] font-semibold text-fg-strong">
           <GitMerge className="h-3.5 w-3.5 shrink-0" />
-          合并剧集
+          {t('media.seriesMergeOpen')}
         </h4>
         <p className="mt-1 text-[11px] text-muted">
-          把另一个剧集的内容并入
-          <span className="font-medium text-fg-strong">{seriesLabel(target.title)}</span>（
-          {target.episodeCount} 集），源剧集随后被删除。
+          {t('media.seriesMergeTargetPrefix')}
+          <span className="font-medium text-fg-strong">{seriesLabel(target.title)}</span>
+          {t('media.seriesMergeTargetSuffix', { n: target.episodeCount })}
         </p>
 
         {candidates.length === 0 ? (
-          <p className="py-6 text-center text-xs text-muted">没有其他剧集可供合并</p>
+          <p className="py-6 text-center text-xs text-muted">{t('media.seriesMergeEmpty')}</p>
         ) : (
           <div className="mt-3 space-y-2">
             <select
@@ -265,26 +265,25 @@ export function MergeSeriesDialog(props: {
             >
               {candidates.map((s) => (
                 <option key={s.id} value={s.id}>
-                  {s.title}（{s.episodeCount} 集）
+                  {t('media.seriesMergeOption', { title: s.title, n: s.episodeCount })}
                 </option>
               ))}
             </select>
             <p className="text-[10px] leading-relaxed text-muted">
-              内容按原有顺序接到目标各季末尾并重新编号；已在目标里的同一条目不会重复加入。
-              文件名相同但内容不同的条目、同一内容的不同来源，都会原样保留 ——
-              本功能不做内容合并判断。
+              {t('media.seriesMergeOrderHint')}
             </p>
             <p className="text-[10px] leading-relaxed text-muted">
-              集号规则：目标各季从
-              <span className="font-medium text-fg-mid">现有最大集号往后</span>
-              续编（不会覆盖已有编号）；并入的每一集保留「合并自《源剧集》· 原 E&lt;n&gt;」
-              溯源标注，之后可在详情里改号或上下移动。两个剧集的标签会合并去重，
-              不会丢也不会重复。
+              {t('media.seriesMergeNumberPrefix')}
+              <span className="font-medium text-fg-mid">{t('media.seriesMergeNumberEmph')}</span>
+              {t('media.seriesMergeNumberSuffix')}
             </p>
             {confirming && source && (
               <p className="rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-[11px] leading-relaxed text-destructive">
-                将把{seriesLabel(source.title)}的 {source.episodeCount} 个分集并入{seriesLabel(target.title)}，
-                源剧集会被删除，此操作无法撤销。
+                {t('media.seriesMergeConfirmBodySingle', {
+                  source: seriesLabel(source.title),
+                  n: source.episodeCount,
+                  target: seriesLabel(target.title),
+                })}
               </p>
             )}
           </div>
@@ -292,7 +291,7 @@ export function MergeSeriesDialog(props: {
 
         <div className="mt-4 flex justify-end gap-2">
           <Button variant="outline" size="sm" className="h-8 px-3 text-xs" onClick={onClose}>
-            取消
+            {t('media.cancel')}
           </Button>
           {confirming ? (
             <Button
@@ -302,7 +301,7 @@ export function MergeSeriesDialog(props: {
               disabled={busy}
               onClick={() => void submit()}
             >
-              {busy ? '合并中…' : '确认合并'}
+              {busy ? t('media.seriesMergeBusy') : t('media.seriesMergeDone')}
             </Button>
           ) : (
             <Button
@@ -311,7 +310,7 @@ export function MergeSeriesDialog(props: {
               disabled={sourceId === null}
               onClick={() => setConfirming(true)}
             >
-              下一步
+              {t('media.seriesMergeNext')}
             </Button>
           )}
         </div>

@@ -23,13 +23,51 @@ import { mediaItemUrl } from '../api/media'
  * **介绍**；标题一侧当时仍恒显，于是「剧集标题 == 单集标题」（TG 自动成剧常见）时
  * 用户读到两遍同一个名字。本函数把标题去重补上（R5）。
  *
- * 判定：标题 trim 后非空，**且**与剧集标题 trim 后的结果不逐字相等。
- * 注意这里是 `!==`，不是「不包含」——`第 1 集 序章` 相对 `序章` 是有信息量的补充，
- * 不该被判为重复。
+ * 判定（三条全部满足才渲染）：
+ *   1. 标题 trim 后非空；
+ *   2. 与剧集标题 trim 后的结果不逐字相等；
+ *   3. **与槽位标签不逐字相等**（BUG-260）。
+ *
+ * 第 3 条的由来：分集选择行的左列已经渲染槽位标签（`episodeSlotLabel`），中列若再
+ * 渲染一个逐字等于槽位标签的「标题」，用户就读到两遍同一个 `S1E3` —— BUG-260 的
+ * 报障原象 `S1E3S1E3未缓存`。槽位标签的唯一展位在左列；「标题恰好等于槽位标签」
+ * 是无信息量的展示，判据直接拒绝（让错误状态不可表达）。
+ *
+ * 注意 2/3 都是 `!==` 全等判定，不是「不包含」——`第 1 集 序章` 相对 `序章`、
+ * `S1E3 重制版` 相对 `S1E3` 都是有信息量的补充，不该被判为重复。
  */
 export function shouldRenderEpisodeTitle(ep: MediaEpisode, series: MediaSeriesDetail): boolean {
   const epTitle = (ep.title ?? '').trim()
-  return epTitle.length > 0 && epTitle !== (series.title ?? '').trim()
+  return (
+    epTitle.length > 0 &&
+    epTitle !== (series.title ?? '').trim() &&
+    epTitle !== episodeSlotLabel(ep)
+  )
+}
+
+/**
+ * 分集选择行**中列**应渲染的标题文本（BUG-260）。
+ *
+ * 门控为真（`shouldRenderEpisodeTitle`）⇒ 返回 `ep.title`；为假 ⇒ 返回 `null`
+ * （React 渲染 nothing）—— **绝不回退槽位标签**。
+ *
+ * 裁定背景（活体取证，2026-10-12）：BUG-260 文档原根因假设「BUG-246/BUG-200 把
+ * 无标题分集的 ep.title 回填成槽位标签」——该前提不成立：BUG-200 的裁定恰是
+ * 「集可以没有标题、空标题可显式清空」，实测 series 315 的 8 集里 7 集
+ * `media_item.title` 就是空串。真正的重复机制是**中列回退**：旧代码
+ * `shouldRenderEpisodeTitle(ep, detail) ? ep.title : episodeSlotLabel(ep)`
+ * 在标题为空时把槽位标签渲进中列，与左列逐字重复（实测行文本 `S1E3S1E3未缓存`）。
+ *
+ * 修复 = 双保险：中列不再回退（本函数）+ 门控增加「标题 != 槽位标签」判据
+ * （`shouldRenderEpisodeTitle` 第 3 条）。数据侧零改动：标题回填行为、
+ * `episodeSlotLabel`、编辑入口（R3：标题/介绍恒可读写）全部原样。
+ *
+ * ⚠️ 右栏聚焦面板的 `episode-focus-title` **不**用本函数：面板内没有左列，
+ * 不存在重复；其「同名时退化为槽位标签」的回退是布局回归断言（TL-21 R5）的
+ * 既定行为，保持原样。
+ */
+export function episodeRowTitle(ep: MediaEpisode, series: MediaSeriesDetail): string | null {
+  return shouldRenderEpisodeTitle(ep, series) ? ep.title ?? null : null
 }
 
 /**

@@ -121,7 +121,7 @@ export function ItemEditDialog(props: {
         onClick={(e) => e.stopPropagation()}
         data-testid="item-edit-dialog"
       >
-        <h4 className="text-[13px] font-semibold text-fg-strong">编辑内容</h4>
+        <h4 className="text-[13px] font-semibold text-fg-strong">{t('media.item.editMeta')}</h4>
 
         <div className="mt-3 flex gap-3">
           <div className="h-20 w-36 shrink-0 overflow-hidden rounded-md bg-surface-2">
@@ -149,7 +149,7 @@ export function ItemEditDialog(props: {
              * 任何手改都会在下一次字节变更时无声回退。
              */}
             <label className="flex items-center gap-1.5" title={t('media.episode.editAffectsAll')}>
-              <span className="shrink-0">类型</span>
+              <span className="shrink-0">{t('media.item.kind')}</span>
               <select
                 value={item.kind}
                 disabled
@@ -162,20 +162,22 @@ export function ItemEditDialog(props: {
             </label>
             {/* 来源（S2）：库只存 `source` 这个可扩展的来源类型，展示层问 mediaSources 拿标签 */}
             <p className="truncate" data-testid="item-edit-source">
-              来源：{t(sourceLabelKey(item.source))}
+              {t('media.fromSource', { source: t(sourceLabelKey(item.source)) })}
             </p>
-            <p className="truncate">大小：{fmtSize(item.size)}</p>
+            <p className="truncate">{t('media.item.size', { size: fmtSize(item.size) })}</p>
             {/* P2：filePath 是库内规范形式（相对路径），展示用后端解析好的绝对路径 */}
             <p className="truncate" title={item.absolutePath ?? item.filePath ?? ''}>
-              路径：{item.absolutePath ?? item.filePath ?? '—'}
+              {t('media.item.path', { path: item.absolutePath ?? item.filePath ?? '—' })}
             </p>
-            {item.seriesTitle ? <p className="truncate">归属：{item.seriesTitle}</p> : null}
+            {item.seriesTitle ? (
+              <p className="truncate">{t('media.item.series', { series: item.seriesTitle })}</p>
+            ) : null}
           </div>
         </div>
 
         <div className="mt-3 space-y-2">
           <label className="block text-[11px] text-muted" htmlFor="item-edit-title">
-            标题
+            {t('media.item.title')}
           </label>
           <Input
             id="item-edit-title"
@@ -186,9 +188,9 @@ export function ItemEditDialog(props: {
             data-testid="item-edit-title"
           />
           <label className="block text-[11px] text-muted" htmlFor="item-edit-desc">
-            介绍
+            {t('media.item.desc')}
             <span className="ml-1 text-[10px] text-muted/70">
-              （来自原消息标题之外的部分，与剧集介绍同一字段）
+              {t('media.item.descHint')}
             </span>
           </label>
           {/* 介绍天然是多行内容：单行 Input 会把长介绍截成一行（用户实测反馈） */}
@@ -196,7 +198,7 @@ export function ItemEditDialog(props: {
             id="item-edit-desc"
             value={desc}
             onChange={(e) => setDesc(e.target.value)}
-            placeholder="留空则清除介绍"
+            placeholder={t('media.item.descPlaceholder')}
             rows={4}
             className="w-full resize-none rounded-md border border-border-subtle bg-surface px-2.5 py-1.5 text-xs text-fg-strong placeholder:text-muted"
             data-testid="item-edit-desc"
@@ -218,7 +220,7 @@ export function ItemEditDialog(props: {
           <div className="flex min-w-0 items-center gap-2" data-testid="item-cache-zone">
             {!canClear ? (
               <span className="text-[10.5px] text-muted" data-testid="item-clear-cache-na">
-                无已缓存文件
+                {t('media.item.cacheNone')}
               </span>
             ) : confirmClear ? (
               <>
@@ -226,7 +228,7 @@ export function ItemEditDialog(props: {
                   className="min-w-0 flex-1 truncate text-[10.5px] text-muted"
                   data-testid="item-clear-cache-confirm"
                 >
-                  确定清除已缓存文件？记录保留，可重新缓存
+                  {t('media.item.cacheConfirm')}
                 </span>
                 <Button
                   variant="destructive"
@@ -236,7 +238,7 @@ export function ItemEditDialog(props: {
                   onClick={() => void doClearCache()}
                   data-testid="item-clear-cache-yes"
                 >
-                  确定
+                  {t('media.confirm')}
                 </Button>
                 <Button
                   variant="ghost"
@@ -245,7 +247,7 @@ export function ItemEditDialog(props: {
                   onClick={() => setConfirmClear(false)}
                   data-testid="item-clear-cache-no"
                 >
-                  不清了
+                  {t('media.item.cacheKeep')}
                 </Button>
               </>
             ) : (
@@ -256,13 +258,13 @@ export function ItemEditDialog(props: {
                 onClick={() => setConfirmClear(true)}
                 data-testid="item-clear-cache"
               >
-                清除缓存文件
+                {t('media.item.cacheClear')}
               </Button>
             )}
           </div>
           <div className="flex justify-end gap-2">
             <Button variant="outline" size="sm" className="h-8 px-3 text-xs" onClick={onClose}>
-              取消
+              {t('media.cancel')}
             </Button>
             <Button
               size="sm"
@@ -271,7 +273,7 @@ export function ItemEditDialog(props: {
               onClick={() => void save()}
               data-testid="item-edit-save"
             >
-              {busy ? '保存中…' : '保存'}
+              {busy ? t('media.item.saving') : t('media.save')}
             </Button>
           </div>
         </div>

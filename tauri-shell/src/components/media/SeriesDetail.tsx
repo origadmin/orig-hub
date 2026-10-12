@@ -63,6 +63,7 @@ import {
 } from '../../lib/mediaSources'
 import {
   episodeDescriptionIsSeriesLevel,
+  episodeRowTitle,
   episodeSlotLabel,
   isPhotoEpisode,
   partitionEpisodes,
@@ -692,13 +693,17 @@ export function SeriesDetail(props: {
                     >
                       {photo ? '🖼' : episodeSlotLabel(ep)}
                     </span>
-                    <span
-                      className={`min-w-0 truncate text-[12.5px] ${
-                        on ? 'font-semibold text-accent' : 'text-fg-mid'
-                      }`}
-                    >
-                      {shouldRenderEpisodeTitle(ep, detail) ? ep.title : episodeSlotLabel(ep)}
-                    </span>
+                  {/* BUG-260：中列只渲标题，**不回退槽位标签** —— 槽位标签的展位是
+                      左列，回退会让无标题分集渲染出 `S1E3S1E3`（与左列逐字重复）。
+                      门控为假（标题为空 / 等于剧集标题 / 等于槽位标签）时本函数返回
+                      null，React 渲染 nothing，中列留空而非重复。 */}
+                  <span
+                    className={`min-w-0 truncate text-[12.5px] ${
+                      on ? 'font-semibold text-accent' : 'text-fg-mid'
+                    }`}
+                  >
+                    {episodeRowTitle(ep, detail)}
+                  </span>
                     {/* BUG-254：有字节 → 显示时长；无字节 → 显示「未缓存」标记（不显时长）。
                         BUG-261（用户裁定「点击缺失内容直接进行缓存」）：标记直接发起缓存。
                         行本身是 `<button episode-pick>`（点击=切右栏），HTML 不允许嵌套
