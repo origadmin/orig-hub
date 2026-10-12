@@ -68,8 +68,11 @@ const ITEMS = (process.env.JUDDER_ITEMS || '472,673')
   .split(',')
   .map((s) => Number(s.trim()))
   .filter((n) => Number.isFinite(n) && n > 0)
-/** 8 个倍速档（与 VideoPlayer.tsx 的 RATES 对齐） */
-const RATES = [0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4]
+/** 8 个倍速档（与 VideoPlayer.tsx 的 RATES 对齐）；可用 JUDDER_RATES 子集化（如 "1,2,3,4"） */
+const RATES = (process.env.JUDDER_RATES || '0.5,0.75,1,1.25,1.5,2,3,4')
+  .split(',')
+  .map((s) => Number(s.trim()))
+  .filter((n) => Number.isFinite(n) && n > 0)
 /** 裸 video 对照的倍速档（用户报的痛点档） */
 const BARE_RATES = [2, 4]
 /** 每个采样窗口（秒） */
@@ -144,6 +147,9 @@ async function measureRefreshHz(page) {
 
 /** 把倍速写进播放器偏好（下次挂载即生效），并打开条目（stream-first）。 */
 async function openAtRate(page, item, rate) {
+  // headful 下窗口若被其它窗口遮挡，合成器会停止上屏、rVFC 不再回调（实测 673 全 0 帧）。
+  // bringToFront 把该 target 提到前台，保证 headful 采样期间持续合成；headless 下是 no-op。
+  await page.conn.send('Page.bringToFront', {}, { sessionId: page.sessionId }).catch(() => {})
   await page.evaluate(
     (tg, it, r) => {
       try {
@@ -369,7 +375,19 @@ async function main() {
 
   let browser
   try {
-    browser = await cdp.launch()
+    // BUG-213：本仪器的判读**完全依赖 rVFC 上屏节奏**，而 headless 走软件合成、rVFC 被
+    // 钉在假 ~60Hz 天花板上 → 数字失真。因此这里显式支持 headful（JUDDER_HEADFUL=1），
+    // 且未开 headful 时**大声告警**：headless 的 jitterShare/直方图仅供形状参考。
+    const headful = process.env.JUDDER_HEADFUL === '1'
+    if (!headful) {
+      console.log('[judder] WARN: headless mode — rVFC cadence may be distorted (BUG-213); set JUDDER_HEADFUL=1 for faithful numbers')
+    }
+    // Windows 会对「被遮挡」的窗口停止合成 → rVFC 不再回调（实测 headful 下后段采样全 0 帧 /
+    // Runtime.evaluate 超时）。禁用原生遮挡检测，让 headful 窗口即便被其它窗口盖住也持续上屏。
+    browser = await cdp.launch({
+      headless: !headful,
+      args: headful ? ['--disable-features=CalculateNativeWinOcclusion'] : [],
+    })
   } catch (e) {
     console.error(`[judder] ENV: browser launch failed: ${e && e.message ? e.message : e}`)
     process.exit(2)
@@ -477,6 +495,7 @@ async function main() {
 
     // ---- 裸 video 对照：基础代理流 + 原生 playbackRate ----
     console.log('\n[judder] ===== bare video controls (base /stream + native rate) =====')
+    await page.conn.send('Page.bringToFront', {}, { sessionId: page.sessionId }).catch(() => {})
     await page.evaluate(
       (tg, item) => {
         const old = document.getElementById('__bare_video')
