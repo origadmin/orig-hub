@@ -504,7 +504,9 @@ impl GrammersClient {
 
         if !input_channels.is_empty() {
             let n = input_channels.len();
-            let request = tl::functions::channels::GetChannels { id: input_channels };
+            let request = tl::functions::channels::GetChannels {
+                id: input_channels.clone(),
+            };
             match self.inner.invoke(&request).await {
                 // `Chats::Chats` 与 `Chats::Slice` 载荷类型不同，用 grammers 的
                 // `.chats()` 访问器统一取出 `Vec<Chat>`（两变体都实现了它）。
@@ -518,7 +520,36 @@ impl GrammersClient {
                         }
                     }
                 }
-                Err(e) => eprintln!("[tg] BUG-193: getChannels failed for {n} channel(s): {e}"),
+                Err(e) => {
+                    eprintln!(
+                        "[tg] BUG-193: getChannels batch failed for {n} channel(s): {e}; retrying per-peer"
+                    );
+                    // **整批失败 ≠ 全部不可用**：官方客户端对分组成员就是**逐个**解析的，
+                    // 而 `channels.getChannels` 是整批 400 —— 批里只要有一个坏
+                    // access_hash（移出/被踢后分组配置里的陈旧引用），服务端就对
+                    // **整批**返回 CHANNEL_PRIVATE。2026-10-12 实测：66 个打包一次，
+                    // 批量视角 resolved=0；逐个重试才能把「被冤枉的好成员」捞回来。
+                    let mut ok = 0usize;
+                    let mut bad = 0usize;
+                    for one in input_channels {
+                        let single = tl::functions::channels::GetChannels { id: vec![one] };
+                        match self.inner.invoke(&single).await {
+                            Ok(r) => {
+                                for chat in r.chats() {
+                                    if let Some((ch, pr)) = channel_from_chat(&chat, folder_of) {
+                                        if let Some(pr) = pr {
+                                            cache.insert(ch.id, pr);
+                                        }
+                                        out.push(ch);
+                                    }
+                                }
+                                ok += 1;
+                            }
+                            Err(_) => bad += 1,
+                        }
+                    }
+                    eprintln!("[tg] BUG-193: per-peer retry ok={ok} bad={bad}");
+                }
             }
         }
 
