@@ -65,6 +65,12 @@ const SERIES_KIND_NORMALIZE_MIG: &str = "mig.series_kind_normalize_v1";
 /// 「title 存了落盘原始文件名」存量行的**一次性**回填标记（`app_setting`，BUG-256）。
 const RAW_TITLE_BACKFILL_MIG: &str = "mig.raw_title_backfill_v1";
 
+/// 分集介绍继承剧集介绍的**一次性**回填标记（`app_setting`，BUG-281）。
+///
+/// 与 [`ITEM_TEXT_SPLIT_MIG`] / [`RAW_TITLE_BACKFILL_MIG`] 同一套机制：存量库
+/// 修一次即收口，此后用户的显式清空（BUG-054 三态）不被反复复活。
+const EPISODE_DESC_INHERIT_MIG: &str = "mig.episode_desc_inherit_v1";
+
 /// `media_series.kind` 的**合法取值全集**。
 ///
 /// 前端下拉（`SeriesEditPanel` 的 `KINDS`）与后端校验共用这一份定义，
@@ -438,6 +444,98 @@ async fn backfill_raw_file_titles(conn: &Connection) -> libsql::Result<usize> {
     Ok(fixed)
 }
 
+/// 一次性回填（BUG-281）：**自己的 caption 没有正文**的分集，继承所属剧集的介绍
+/// （`media_series.description`）。
+///
+/// ## 为什么必须回填
+///
+/// BUG-281 之前 `routes::register_media_item_t0` 只取「该消息自己的 caption」，
+/// 而相册组的 caption 在 TG 上通常只挂在**一条**消息上（实测组 3373-3380 只有
+/// 3378 有）⇒ 实测 149 个分集里 118 个介绍全空，只有带 caption 的那条有，
+/// 剧集级介绍却几乎总有值。写入路径的修复（组级正文分发）只救新数据，
+/// 存量行必须回填 —— 与 [`backfill_item_text`] 同一条理由。
+///
+/// ## 规则（保守，宁少动不多动）
+///
+/// - 只动 `source='tg'` 且**是分集**（JOIN `media_episode`）、介绍为 NULL/空白的条目；
+/// - 来源 = 所属剧集的 `media_series.description`（trim 后非空才填，绝不写空介绍）；
+/// - 已有介绍的条目一律不动（用户编辑过的值不被覆盖 —— BUG-054 三态契约）。
+///   ⚠ 已知边界：「用户显式清空」与「从未设置」在 DB 里都塌缩成 NULL，无持久区分信号，
+///   故**这一次**回填会把历史清空行一并补上；标记键保证的是**此后**每一次清空都被尊重
+///   （重跑不再发生）。若要「清空永不被填回」需 schema 外新信号，见 BUG-281 档。
+///
+/// ## 为什么是一次性
+///
+/// 「补空位」若每次启动都跑，用户**主动清空**的介绍会被重新填回 ——
+/// 「我不要这段介绍」就成了无法表达的意图。故用 [`EPISODE_DESC_INHERIT_MIG`]
+/// 标记键收口：存量库修一次，此后每一次清空都被尊重（与既有测试
+/// `backfill_runs_once_so_cleared_description_stays_cleared` 同一契约）。
+///
+/// ## 返回值
+///
+/// `(回填条数, 每剧集回填数)`：每一条回填都追得到来源剧集（BUG-281 判据 5
+/// 禁止不可追溯的回填），调用方原样记入启动日志。
+async fn backfill_episode_desc_inherit(conn: &Connection) -> libsql::Result<(usize, Vec<(i64, usize)>)> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS app_setting (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    )
+    .await?;
+    let stmt = conn
+        .prepare("SELECT 1 FROM app_setting WHERE key = ?1")
+        .await?;
+    let mut rows = stmt.query(params![EPISODE_DESC_INHERIT_MIG]).await?;
+    let already = rows.next().await?.is_some();
+    drop(rows);
+    if already {
+        return Ok((0, Vec::new()));
+    }
+
+    let candidates = {
+        let stmt = conn
+            .prepare(
+                "SELECT i.id, s.id, s.description
+                   FROM media_item i
+                   JOIN media_episode e ON e.item_id = i.id
+                   JOIN media_series s ON s.id = e.series_id
+                  WHERE i.source = 'tg'
+                    AND (i.description IS NULL OR TRIM(i.description) = '')
+                    AND s.description IS NOT NULL AND TRIM(s.description) <> ''",
+            )
+            .await?;
+        let mut rows = stmt.query(()).await?;
+        let mut out: Vec<(i64, i64, String)> = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push((r.get(0)?, r.get(1)?, r.get(2)?));
+        }
+        out
+    };
+
+    let mut filled = 0usize;
+    // 同一条目理论上可出现在多个剧集里（`media_episode` 不强制 item_id 唯一）——
+    // 按条目去重、首条来源胜出，避免一次回填被重复计数/重复写入。
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut per_series: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+    for (item_id, series_id, desc) in candidates {
+        if !seen.insert(item_id) {
+            continue;
+        }
+        conn.execute(
+            "UPDATE media_item SET description = ?1 WHERE id = ?2",
+            params![desc, item_id],
+        )
+        .await?;
+        filled += 1;
+        *per_series.entry(series_id).or_insert(0) += 1;
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO app_setting (key, value) VALUES (?1, '1')",
+        params![EPISODE_DESC_INHERIT_MIG],
+    )
+    .await?;
+    Ok((filled, per_series.into_iter().collect()))
+}
+
 /// 建表（幂等）。与 TG 流水表同库，表名统一 `media_*` 前缀但语义独立。
 pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
     conn.execute_batch(
@@ -592,6 +690,19 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
     if filled > 0 || diverged > 0 {
         eprintln!(
             "[media] episode text collapsed into items: filled={filled} item_wins={diverged}"
+        );
+    }
+    // BUG-281：分集继承剧集介绍（相册组的 caption 只挂在一条消息上，其余分集
+    // 介绍全空）。必须在 `collapse_episode_text` **之后**：先处理「条目为空而
+    // 分集有」的搬运，再按「剧集有介绍」补剩下的空位，两条迁移互不覆盖。
+    // 每条回填都追得到来源剧集（返回值带 per-series 计数），日志原样留痕。
+    let (desc_filled, desc_series) = backfill_episode_desc_inherit(conn).await?;
+    if desc_filled > 0 {
+        eprintln!(
+            "[media] episode descriptions inherited from series (one-time): \
+             {desc_filled} episode(s) across {} series; per-series filled: {:?}",
+            desc_series.len(),
+            desc_series
         );
     }
     // 同槽多来源（BUG-039）：同一 (season, episode_no) 槽位的主条目之外的
@@ -7691,6 +7802,176 @@ mod tests {
         assert!(
             s2.get_media_item(id).await.unwrap().unwrap().description.is_none(),
             "清空过的介绍不得被迁移重新填回"
+        );
+    }
+
+    /// 造一个「BUG-281 之前」的存量库：一个相册组入库成 1 剧集 + N 分集，
+    /// 只有带 caption 的那条分集有介绍（实测 149 个分集仅 31 个有的原病），
+    /// 剧集级介绍却有值。返回 `([a1, a2, a3], b1)` 的条目 id
+    /// （a* 属剧集 A：a1/a3 介绍 NULL、a2 用户写的；b1 属介绍为空的剧集 B）。
+    async fn seed_bug281_legacy_episodes(path: &Path) -> ([i64; 3], i64) {
+        let conn = libsql::Builder::new_local(path)
+            .build()
+            .await
+            .unwrap()
+            .connect()
+            .unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE media_item (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                source      TEXT NOT NULL,
+                ref         TEXT NOT NULL,
+                title       TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                file_path   TEXT,
+                poster      TEXT,
+                size        INTEGER,
+                duration    INTEGER,
+                width       INTEGER,
+                height      INTEGER,
+                added_at    INTEGER NOT NULL,
+                description TEXT,
+                UNIQUE(source, ref)
+            );
+            CREATE TABLE media_series (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                title       TEXT NOT NULL,
+                description TEXT,
+                kind        TEXT NOT NULL DEFAULT 'series',
+                poster      TEXT,
+                year        INTEGER,
+                source_key  TEXT,
+                created_at  INTEGER NOT NULL,
+                updated_at  INTEGER NOT NULL
+            );
+            CREATE TABLE media_episode (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                series_id            INTEGER NOT NULL,
+                item_id              INTEGER NOT NULL,
+                season               INTEGER NOT NULL DEFAULT 1,
+                episode_no           INTEGER NOT NULL DEFAULT 1,
+                title                TEXT,
+                description          TEXT,
+                origin_series_title  TEXT,
+                origin_episode_no    INTEGER,
+                episode_no_end       INTEGER,
+                UNIQUE(series_id, season, episode_no)
+            );
+            "#,
+        )
+        .await
+        .unwrap();
+        // 剧集 A：组级介绍有值（BUG-152 的 first_caption 正文）。
+        conn.execute(
+            "INSERT INTO media_series (title, description, kind, source_key, created_at, updated_at)
+             VALUES ('温柔的妈妈被我弄哭了', '她披着最乖巧温顺的皮。', 'series', 'tg:group:-100:3373', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        let series_a = conn.last_insert_rowid();
+        // 剧集 B：剧集级介绍为空 ⇒ 其分集没有可继承的来源。
+        conn.execute(
+            "INSERT INTO media_series (title, description, kind, source_key, created_at, updated_at)
+             VALUES ('另一部', NULL, 'series', 'tg:group:-100:9999', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        let series_b = conn.last_insert_rowid();
+        let mut items = [0i64; 3];
+        // a1 / a3：介绍为 NULL（自己的 caption 没有正文 —— 相册组的常态）。
+        // a2：用户写过的介绍（不得被覆盖）。
+        for (idx, desc) in [(1i64, None), (2, Some("用户写的介绍")), (3, None)] {
+            conn.execute(
+                "INSERT INTO media_item (source, ref, title, kind, added_at, description)
+                 VALUES ('tg', ?1, '', 'video', 1, ?2)",
+                libsql::params![format!("-100:{idx}"), desc],
+            )
+            .await
+            .unwrap();
+            let item = conn.last_insert_rowid();
+            items[(idx - 1) as usize] = item;
+            conn.execute(
+                "INSERT INTO media_episode (series_id, item_id, season, episode_no) VALUES (?1, ?2, 1, ?3)",
+                libsql::params![series_a, item, idx],
+            )
+            .await
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO media_item (source, ref, title, kind, added_at, description)
+             VALUES ('tg', '-100:4', '', 'video', 1, NULL)",
+            (),
+        )
+        .await
+        .unwrap();
+        let b1 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO media_episode (series_id, item_id, season, episode_no) VALUES (?1, ?2, 1, 1)",
+            libsql::params![series_b, b1],
+        )
+        .await
+        .unwrap();
+        (items, b1)
+    }
+
+    /// BUG-281 判据 3（**可证伪**）：存量分集介绍回填 —— 只补「介绍为空 + 所属
+    /// 剧集有介绍」的格子；用户写过的、剧集没介绍的一律不补；且只跑一次
+    /// （清空过的不会被填回，与 `backfill_runs_once_so_cleared_description_stays_cleared`
+    /// 同一契约）。
+    ///
+    /// 反向证伪：把 `backfill_episode_desc_inherit` 的 UPDATE 去掉（回填空转）
+    /// ⇒ a1/a3 的介绍保持 NULL ⇒ 本断言 FAIL（实测 118/149 分集全空的原病）。
+    #[tokio::test]
+    async fn backfill_episode_desc_inherit_fills_only_eligible_empty_slots_bug281() {
+        let path = tmp_db("bug281_episode_desc_inherit");
+        let ([a1, a2, a3], b1) = seed_bug281_legacy_episodes(&path).await;
+
+        let s = Store::open(&path).await.unwrap();
+        assert_eq!(
+            s.get_media_item(a1).await.unwrap().unwrap().description.as_deref(),
+            Some("她披着最乖巧温顺的皮。"),
+            "介绍为空 + 剧集有介绍 ⇒ 继承剧集介绍"
+        );
+        assert_eq!(
+            s.get_media_item(a3).await.unwrap().unwrap().description.as_deref(),
+            Some("她披着最乖巧温顺的皮。"),
+            "同组另一条空介绍分集同样继承"
+        );
+        assert_eq!(
+            s.get_media_item(a2).await.unwrap().unwrap().description.as_deref(),
+            Some("用户写的介绍"),
+            "用户写过的介绍不得被覆盖（BUG-054）"
+        );
+        assert_eq!(
+            s.get_media_item(b1).await.unwrap().unwrap().description,
+            None,
+            "剧集级介绍为空 ⇒ 无可继承的来源，不得编造（BUG-281 判据 5）"
+        );
+
+        // 一次性：回填后用户显式清空，重启不得填回。
+        s.update_media_item(
+            a1,
+            &ItemPatch {
+                description: Some(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        drop(s);
+
+        let s2 = Store::open(&path).await.unwrap();
+        assert!(
+            s2.get_media_item(a1).await.unwrap().unwrap().description.is_none(),
+            "标记键收口：第二次启动不得把清空过的介绍填回"
+        );
+        assert_eq!(
+            s2.get_media_item(a3).await.unwrap().unwrap().description.as_deref(),
+            Some("她披着最乖巧温顺的皮。"),
+            "没被清空的那条保持回填值"
         );
     }
 

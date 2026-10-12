@@ -1290,7 +1290,7 @@ async fn enqueue_cache_task(
 async fn cache_task_titles(
     st: &AppState,
     tasks: &[CacheTask],
-) -> std::collections::HashMap<(i64, i64), String> {
+) -> std::collections::HashMap<(i64, i64), crate::store::MsgTitleSources> {
     let mut chans: Vec<i64> = tasks.iter().map(|t| t.chat_id).collect();
     chans.sort_unstable();
     chans.dedup();
@@ -1300,18 +1300,38 @@ async fn cache_task_titles(
         .unwrap_or_default()
 }
 
-/// 取任务的标题：覆盖消息里**第一条有 caption 的**（无则 None → 前端退回频道链）。
+/// 取任务的标题（BUG-280 两遍选取）：**先**扫全组找第一条有非空 caption 的消息；
+/// 全组都无 caption 才退回 file_name（BUG-220 兜底，不得退回频道名）。
+/// 两者皆无 ⇒ None（前端退回 `频道名 #<msg>` 链）。
 ///
-/// 为什么不是「第一条消息的 caption」：相册/合集的**首条往往是图片或空说明**
-/// （实测：某任务 10 条消息里首条 caption 为空、第 3 条才是文案），
-/// 只认首条会让大量任务白拿不到标题、退化成裸频道 ID —— 这正是用户看到「频道 -100…」的形态。
+/// 为什么不是 first-match：相册组的 caption 常只挂在**靠后**的一条消息上
+/// （实测组 3373-3380：3373-3377 只有 file_name，3378 才是真 caption），
+/// 而靠前消息的 file_name（`manifest.mp4`）会在 first-match 里抢在它前面 ——
+/// 用户看到的就是「队列标题是个无意义的文件名」。caption 与 file_name 分两遍
+/// 选取后，「有 caption」才真正优先于「有文件名」。
 fn cache_task_title<'a>(
     t: &CacheTask,
-    titles: &'a std::collections::HashMap<(i64, i64), String>,
+    titles: &'a std::collections::HashMap<(i64, i64), crate::store::MsgTitleSources>,
 ) -> Option<&'a str> {
-    t.message_ids
+    // 第一遍：caption 优先（按 message_ids 序的第一条非空 caption）。
+    let caption = t
+        .message_ids
         .iter()
-        .find_map(|m| titles.get(&(t.chat_id, *m)).map(|s| s.as_str()))
+        .filter_map(|m| titles.get(&(t.chat_id, *m)))
+        .find_map(|s| non_empty(&s.caption));
+    caption.or_else(|| {
+        // 第二遍：全组无 caption 才回退 file_name（BUG-220：文件名就是内容名，
+        // 回退到它才是「显示内容」而非退回裸频道名）。
+        t.message_ids
+            .iter()
+            .filter_map(|m| titles.get(&(t.chat_id, *m)))
+            .find_map(|s| non_empty(&s.file_name))
+    })
+}
+
+/// 非空（trim 后）才认——空串等价于「没有这个来源」。
+fn non_empty(s: &str) -> Option<&str> {
+    (!s.trim().is_empty()).then_some(s)
 }
 
 /// 标题自愈（BUG-220 + BUG-246 合流根因）：队列读到**无标题**任务 ⇒ 后台补登记其消息
@@ -1340,7 +1360,7 @@ const MAX_TITLE_BACKFILL_ATTEMPTS: u8 = 3;
 fn spawn_title_selfheal(
     st: &Arc<AppState>,
     tasks: &[CacheTask],
-    titles: &std::collections::HashMap<(i64, i64), String>,
+    titles: &std::collections::HashMap<(i64, i64), crate::store::MsgTitleSources>,
 ) {
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
@@ -1757,11 +1777,18 @@ fn path_ext(path: &str) -> String {
 /// kind 以**库中值**为准：重复登记（重试/幂等重跑）的旧条目保留既有 kind——
 /// 与旧实现 `item_kinds` 取数同源；新建条目写入 T0 判定的 kind（字节未落，
 /// 无扩展名可判）。登记失败返回 `None`（不阻断调用方——**登记是加速，不是字节的前提**）。
+///
+/// BUG-281：`group_desc` = 组级 caption 的**正文**（`split_caption(first_caption(...)).1`，
+/// 与 [`IngestCtx::ensure_series`] 同一来源）。相册组的 caption 在 TG 上通常只挂在
+/// **一条**消息上（实测组 3373-3380 只有 3378 有），该消息自己的 caption 没有正文时
+/// （无 caption / 单行 caption / 行未到位），分集介绍继承组级正文 —— 否则 79% 的
+/// 分集介绍全空。**标题不继承**（BUG-154：不拿内部文件名/别条文案伪造标题）。
 async fn register_media_item_t0(
     st: &Arc<AppState>,
     chat_id: i64,
     msg_id: i64,
     photo_rule: bool,
+    group_desc: Option<&str>,
 ) -> Option<(i64, String)> {
     let ref_key = format!("{}:{}", chat_id, msg_id);
     let row = st.store.get_message(chat_id, msg_id).await.ok().flatten();
@@ -1772,7 +1799,8 @@ async fn register_media_item_t0(
     let id = match st.store.item_id_by_ref("tg", &ref_key).await {
         Ok(Some(id)) => {
             // 已在库：只做补强（同一事实的更完整版本），不再开口重新 upsert。
-            strengthen_registered_item(st, id, &row, kind.as_str(), msg_id, photo_rule).await;
+            strengthen_registered_item(st, id, &row, kind.as_str(), msg_id, photo_rule, group_desc)
+                .await;
             id
         }
         _ => {
@@ -1784,6 +1812,9 @@ async fn register_media_item_t0(
                 .and_then(|m| m.caption.as_deref())
                 .map(crate::media::split_caption)
                 .unwrap_or((None, None));
+            // BUG-281：自己的 caption 没有正文时，继承组级 caption 正文
+            // （相册组只有一条消息带 caption；标题不继承，见函数文档）。
+            let desc = desc.or_else(|| group_desc.map(str::to_string));
             // BUG-049 照片条目的可读兜底标题（旧 import_photo_item 同款）；
             // 非照片维持空串（BUG-154：不拿内部文件名伪装标题）。
             let title = match title {
@@ -1836,6 +1867,12 @@ async fn register_media_item_t0(
 ///   - kind：只做**单向升级**（`file` → `video`/`photo`/`audio`），不降级。字节落盘后
 ///     由 `backfill_item_bytes` 按扩展名再校正一次，这里不与它抢判；
 ///   - 介绍/时长/尺寸：结构性缺失（NULL）才补，已有值不动。
+///
+/// BUG-281：`group_desc` = 组级 caption 正文（同 [`register_media_item_t0`] 的来源）。
+/// 该消息自己的 caption 没有正文、且条目介绍位仍为 NULL/空白时，用组级正文补位
+/// （fill-empty guard）：用户写过的介绍不覆盖；有自有正文时走既有 own-caption 写法
+/// （本条不改其行为）。组级补填**单独**就能触发一次写入——监控同步会预填
+/// `media_message` 行，入队时条目已带完整 kind/时长，只有介绍位是空的。
 async fn strengthen_registered_item(
     st: &Arc<AppState>,
     id: i64,
@@ -1843,6 +1880,7 @@ async fn strengthen_registered_item(
     derived_kind: &str,
     msg_id: i64,
     photo_rule: bool,
+    group_desc: Option<&str>,
 ) {
     let Some(msg) = row.as_ref() else {
         // 元数据仍未到位：此刻没有任何更强的事实，什么都不写（下一次登记会再来）。
@@ -1870,12 +1908,35 @@ async fn strengthen_registered_item(
         _ => None,
     };
     let patch_duration = msg.duration.filter(|_| existing.duration.is_none());
-    if patch_title.is_none() && patch_kind.is_none() && patch_duration.is_none() {
+    // BUG-281：组级介绍补填（fill-empty guard）——自己的 caption 没有正文、
+    // 且介绍位仍为空（NULL/空白）时才继承组级正文；非空即用户的事实，不覆盖。
+    let existing_desc_blank = existing
+        .description
+        .as_deref()
+        .is_none_or(|d| d.trim().is_empty());
+    let group_fill: Option<Option<String>> = if desc.is_some() {
+        // 有自有正文：走既有 own-caption 写法，不重复补（两者同源时值也相同）。
+        None
+    } else if existing_desc_blank {
+        group_desc
+            .map(str::to_string)
+            .filter(|d| !d.trim().is_empty())
+            .map(Some)
+    } else {
+        None
+    };
+    // 早退条件：既有三件套**原样**（own-caption 介绍的写入时机因此不变），
+    // 外加组级补填——它必须能单独触发一次写入（见函数文档的监控预填行场景）。
+    if patch_title.is_none()
+        && patch_kind.is_none()
+        && patch_duration.is_none()
+        && group_fill.is_none()
+    {
         return;
     }
     let patch = crate::media::ItemPatch {
         title: patch_title,
-        description: desc.map(Some),
+        description: desc.map(Some).or(group_fill),
         poster: None,
         duration: patch_duration,
         width: None,
@@ -1895,7 +1956,8 @@ async fn strengthen_registered_item(
 ///      「加入媒体库」的瞬间条目就该在媒体库里，排队期间看得见是本条的全部要义；
 ///   ② 补 `media_message` 行（BUG-246 的同一件事，慢路径，MTProto RT）；
 ///   ③ 再登记一次：①建的条目此时被 [`strengthen_registered_item`] 用真标题/kind 补强，
-///      **不必等 worker 轮到这条任务**（队列可能要排几十分钟）。
+///      **不必等 worker 轮到这条任务**（队列可能要排几十分钟）；组级 caption 的正文
+///      也在这一步分发给组内各分集（BUG-281：相册组的 caption 只挂在一条消息上）。
 ///
 /// 剧集槽位**不在这里登记**——入队时刻没有剧集/归属上下文（那份目标池来自全组预扫
 /// [`IngestCtx::prepare`]），槽位仍由 worker 处理时建立。
@@ -1903,19 +1965,32 @@ async fn strengthen_registered_item(
 /// 容错与 BUG-246 一致（**登记失败不阻断入队**）：登记只影响「先在」，字节搬运由
 /// worker 负责；把一次 DB 故障变成「加入媒体库失败」比不做更糟。
 async fn register_enqueued_items(st: &Arc<AppState>, chat_id: i64, msg_ids: &[i64]) {
-    // ① T0 事实登记：快路径，不为元数据行等待。
+    // ① T0 事实登记：快路径，不为元数据行等待。此刻 `media_message` 行一般还没落
+    // （监控同步 / worker 才会补），组级 caption 取不到 ⇒ 传 None，留给 ③ 补。
     for msg_id in msg_ids {
-        register_media_item_t0(st, chat_id, *msg_id, false).await;
+        register_media_item_t0(st, chat_id, *msg_id, false, None).await;
     }
     // ② 元数据登记（BUG-246 的唯一真源，幂等、缺黄豆几百毫秒到几十秒都可能）。
     ensure_message_rows(st, chat_id, msg_ids).await;
-    // ③ 元数据到位后补强既有条目（标题 / kind / 时长）。
+    // BUG-281：组级 caption 只取一次（与 `IngestCtx::ensure_series` 同一来源）——
+    // 首行标题、其余正文。相册组的 caption 通常只挂在一条消息上，正文在这里
+    // 分发给组内其余分集（标题不分发：BUG-154 不伪造标题）。
+    let group_desc = st
+        .store
+        .first_caption(chat_id, msg_ids)
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        .map(crate::media::split_caption)
+        .and_then(|(_title, body)| body);
+    // ③ 元数据到位后补强既有条目（标题 / kind / 时长 / 组级介绍）。
     for msg_id in msg_ids {
         let photo_rule = matches!(
             st.store.get_message(chat_id, *msg_id).await,
             Ok(Some(m)) if m.media_type.as_deref() == Some("photo")
         );
-        register_media_item_t0(st, chat_id, *msg_id, photo_rule).await;
+        register_media_item_t0(st, chat_id, *msg_id, photo_rule, group_desc.as_deref()).await;
     }
 }
 
@@ -1954,6 +2029,9 @@ struct IngestCtx {
     series_fresh: bool,
     /// 剧集建立失败/回滚后不再重试（旧实现整批只尝试一次，逐条路径等价为一次）。
     series_blocked: bool,
+    /// BUG-281：组级 caption 的**正文**（`prepare` 时取一次，与 `ensure_series`
+    /// 同源）——自己的 caption 没有正文的分集继承它；标题不继承（BUG-154）。
+    group_desc: Option<String>,
 }
 
 impl IngestCtx {
@@ -1966,6 +2044,18 @@ impl IngestCtx {
     // 元数据登记走唯一真源（BUG-246）：入队时通常已补过行，这里重跑是幂等的
     // 安全网——历史任务、入队时登记失败的消息、以及升级前入队的任务都靠它兜底。
     ensure_message_rows(st, task.chat_id, &task.message_ids).await;
+    // BUG-281：组级 caption 正文只取一次（与 `ensure_series` 同一来源）——相册组
+    // 的 caption 通常只挂在一条消息上，正文分发给组内自己的 caption 没有正文的
+    // 分集；标题不分发（BUG-154：不伪造标题）。
+    let group_desc = st
+        .store
+        .first_caption(task.chat_id, &task.message_ids)
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        .map(crate::media::split_caption)
+        .and_then(|(_title, body)| body);
     let mut slot_msgs = Vec::new();
     let mut has_video = false;
         for msg_id in &task.message_ids {
@@ -1992,6 +2082,7 @@ impl IngestCtx {
             series: None,
             series_fresh: false,
             series_blocked: false,
+            group_desc,
         }
     }
 
@@ -2000,14 +2091,22 @@ impl IngestCtx {
     /// 逻辑本体在上方的 [`register_media_item_t0`] —— 它是登记的唯一真源，入队时刻
     /// （BUG-248）与本 worker 路径共用同一份实现，语义不变：**含 `item_id_by_ref`
     /// 复用、失败只记日志、返回 `(item_id, 库中 kind)`**。这里的 `&self` 只提供
-    /// `chat_id`（剧集上下文在 `register_slot`，与条目登记无关）。
+    /// `chat_id`（剧集上下文在 `register_slot`，与条目登记无关）与 `group_desc`
+    /// （BUG-281：组级 caption 正文，`prepare` 时取一次）。
     async fn register_item(
         &self,
         st: &Arc<AppState>,
         msg_id: i64,
         photo_rule: bool,
     ) -> Option<(i64, String)> {
-        register_media_item_t0(st, self.chat_id, msg_id, photo_rule).await
+        register_media_item_t0(
+            st,
+            self.chat_id,
+            msg_id,
+            photo_rule,
+            self.group_desc.as_deref(),
+        )
+        .await
     }
 
     /// T0 槽位登记：非照片条目编入剧集；混编组照片挂目标集图片位；
@@ -8637,7 +8736,11 @@ mod tests {
 
     // ---- BUG-248：入队即登记条目（「先入信息、再入字节」） ----
 
-    use super::{enqueue_cache_task, register_enqueued_items, register_media_item_t0, EnqueueCacheReq};
+    use super::{
+        cache_task_title, cache_task_titles, enqueue_cache_task, ensure_message_rows,
+        register_enqueued_items, register_media_item_t0, strengthen_registered_item,
+        EnqueueCacheReq,
+    };
 
     /// 元数据**迟到**的客户端：`message_meta` 先睡 `delay_ms` 再给真值。
     ///
@@ -8943,7 +9046,7 @@ mod tests {
             );
         }
         // 直接再打一次登记内核（幂等性的最低层 Likewise 由 `item_id_by_ref` 命中保证）。
-        let again_id = register_media_item_t0(&st, CACHE_FIXTURE_CHAT, 21, false)
+        let again_id = register_media_item_t0(&st, CACHE_FIXTURE_CHAT, 21, false, None)
             .await
             .expect("重复登记必须返回既有条目")
             .0;
@@ -8981,7 +9084,7 @@ mod tests {
 
         // 内核层：故障必须表现为 `None`（无可奉告），不得 panic / 不得谎报成功。
         assert_eq!(
-            register_media_item_t0(&st, CACHE_FIXTURE_CHAT, 31, false).await,
+            register_media_item_t0(&st, CACHE_FIXTURE_CHAT, 31, false, None).await,
             None,
             "登记失败必须返回 None（调用方据此不阻断）"
         );
@@ -9014,6 +9117,341 @@ mod tests {
             "登记失败 ⇒ 条目确实没建成（不得假装登记成功）"
         );
         wait_log(&st, "cache ingest failed", noted_before).await;
+    }
+
+    // ── BUG-280：队列标题 = caption 优先（两遍选取），file_name 只兜底 ──────────
+
+    /// BUG-280 判据 1（**可证伪**）：组内**靠前**消息只有 file_name（`manifest.mp4`）、
+    /// **靠后**消息带多行 caption ⇒ 任务标题 = 靠后那条 caption 的**首行**。
+    ///
+    /// 复刻实测任务 176（组 3373-3380）的形状：3374 只有 `manifest.mp4`，
+    /// 3378 才是真 caption。反向证伪：把选取改回 first-match（旧
+    /// `COALESCE(caption, file_name)` 语义）⇒ 首命中停在 `manifest.mp4`
+    /// ⇒ 本断言 FAIL（用户原病的原样）。
+    #[tokio::test]
+    async fn task_title_prefers_later_caption_over_earlier_file_name_bug280() {
+        let dir = scratch_dir("bug280_title_caption_first");
+        let st = cache_fixture_state(&dir, vec![], vec![]).await;
+        st.store
+            .upsert_message(
+                CACHE_FIXTURE_CHAT,
+                81,
+                None,
+                Some("video/mp4"),
+                Some(1),
+                Some("video"),
+                Some(1),
+                None,
+                None,
+                Some("manifest.mp4"),
+            )
+            .await
+            .unwrap();
+        st.store
+            .upsert_message(
+                CACHE_FIXTURE_CHAT,
+                82,
+                None,
+                Some("video/mp4"),
+                Some(1),
+                Some("video"),
+                Some(1),
+                None,
+                None,
+                Some("manifest (2).mp4"),
+            )
+            .await
+            .unwrap();
+        st.store
+            .upsert_message(
+                CACHE_FIXTURE_CHAT,
+                83,
+                Some("🌟《温柔的妈妈被我弄哭了》EP1-8 频道连载中\n剧情介绍：她披着最乖巧温顺的皮。"),
+                Some("video/mp4"),
+                Some(1),
+                Some("video"),
+                Some(1),
+                None,
+                None,
+                Some("温柔妈妈被我弄哭了6.mp4"),
+            )
+            .await
+            .unwrap();
+        let task = enqueue_fixture_task(&st, &[81, 82, 83], Some(CACHE_FIXTURE_GROUP)).await;
+        let titles = cache_task_titles(&st, std::slice::from_ref(&task)).await;
+        assert_eq!(
+            cache_task_title(&task, &titles),
+            Some("🌟《温柔的妈妈被我弄哭了》EP1-8 频道连载中"),
+            "靠后的真 caption 必须赢过靠前的 file_name，且只取首行（不得是 manifest.mp4）"
+        );
+    }
+
+    /// BUG-280 判据 2：全组无 caption ⇒ 标题 = 第一个 file_name
+    /// （BUG-220 兜底不得推翻 —— 不回退裸频道名）。
+    #[tokio::test]
+    async fn task_title_falls_back_to_first_file_name_bug280() {
+        let dir = scratch_dir("bug280_title_file_name_fallback");
+        let st = cache_fixture_state(&dir, vec![], vec![]).await;
+        st.store
+            .upsert_message(
+                CACHE_FIXTURE_CHAT,
+                84,
+                None,
+                Some("video/mp4"),
+                Some(1),
+                Some("video"),
+                Some(1),
+                None,
+                None,
+                Some("妻善3.mp4"),
+            )
+            .await
+            .unwrap();
+        st.store
+            .upsert_message(
+                CACHE_FIXTURE_CHAT,
+                85,
+                None,
+                Some("video/mp4"),
+                Some(1),
+                Some("video"),
+                Some(1),
+                None,
+                None,
+                Some("妻善4.mp4"),
+            )
+            .await
+            .unwrap();
+        let task = enqueue_fixture_task(&st, &[84, 85], Some(CACHE_FIXTURE_GROUP)).await;
+        let titles = cache_task_titles(&st, std::slice::from_ref(&task)).await;
+        assert_eq!(
+            cache_task_title(&task, &titles),
+            Some("妻善3.mp4"),
+            "全组无 caption 时必须回退第一个 file_name（BUG-220）"
+        );
+    }
+
+    /// BUG-280 判据 3：caption 与 file_name 皆空 ⇒ `None`
+    /// （前端据此退回 `频道名 #<msg>`，不得出现空串或裸 `#`）。
+    #[tokio::test]
+    async fn task_title_is_none_when_neither_caption_nor_file_name_bug280() {
+        let dir = scratch_dir("bug280_title_none");
+        let st = cache_fixture_state(&dir, vec![], vec![]).await;
+        // 行存在但两个来源都空（WHERE 谓词把它挡在标题表外）。
+        st.store
+            .upsert_message(
+                CACHE_FIXTURE_CHAT,
+                86,
+                None,
+                Some("video/mp4"),
+                Some(1),
+                Some("video"),
+                Some(1),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        // 另一条连行都没有（登记尚未发生的排队任务）。
+        let task = enqueue_fixture_task(&st, &[86, 87], Some(CACHE_FIXTURE_GROUP)).await;
+        let titles = cache_task_titles(&st, std::slice::from_ref(&task)).await;
+        assert_eq!(
+            cache_task_title(&task, &titles),
+            None,
+            "两者皆空必须是 None（前端回退链的触发条件）"
+        );
+    }
+
+    // ── BUG-281：相册组的分集介绍继承组级 caption 正文 ───────────────────────
+
+    /// BUG-281 判据 1（**可证伪**）：组里只有一条消息带多行 caption ⇒ 入库后
+    /// **每个分集**的介绍都等于组级正文；caption 所有者保留自己的；无 caption 的
+    /// 视频标题仍空（BUG-154：不拿内部文件名伪造标题）。
+    ///
+    /// 反向证伪：把 `register_enqueued_items` 传给 ③ 的 `group_desc` 改回 None
+    /// （移除继承）⇒ 非所有者的介绍回到 NULL ⇒ 本断言 FAIL（实测 118/149 的原病）。
+    #[tokio::test]
+    async fn enqueue_group_inherits_caption_body_for_every_episode_bug281() {
+        let dir = scratch_dir("bug281_group_inherit");
+        let st = cache_fixture_state(
+            &dir,
+            vec![],
+            vec![
+                fixture_msg(91, "video", "video/mp4", None, Some(CACHE_FIXTURE_GROUP)),
+                fixture_msg(
+                    92,
+                    "video",
+                    "video/mp4",
+                    Some("组剧标题\n组级介绍：她披着最乖巧温顺的皮。"),
+                    Some(CACHE_FIXTURE_GROUP),
+                ),
+                fixture_msg(93, "video", "video/mp4", None, Some(CACHE_FIXTURE_GROUP)),
+            ],
+        )
+        .await;
+        register_enqueued_items(&st, CACHE_FIXTURE_CHAT, &[91, 92, 93]).await;
+
+        let body = "组级介绍：她披着最乖巧温顺的皮。";
+        for msg in [91, 92, 93] {
+            let id = st
+                .store
+                .item_id_by_ref("tg", &format!("{CACHE_FIXTURE_CHAT}:{msg}"))
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("msg {msg} 的条目必须已登记"));
+            let it = st.store.get_media_item(id).await.unwrap().unwrap();
+            assert_eq!(
+                it.description.as_deref(),
+                Some(body),
+                "msg {msg} 的介绍必须是组级正文（BUG-281：组内共享，实测原病下只有 92 有）"
+            );
+            assert_eq!(it.kind, "video", "msg {msg} 的 kind 必须被补强");
+        }
+        // BUG-154：无 caption 的视频不伪造标题 ⇒ 保持空串。
+        for msg in [91, 93] {
+            let id = st
+                .store
+                .item_id_by_ref("tg", &format!("{CACHE_FIXTURE_CHAT}:{msg}"))
+                .await
+                .unwrap()
+                .unwrap();
+            let it = st.store.get_media_item(id).await.unwrap().unwrap();
+            assert!(
+                it.title.trim().is_empty(),
+                "无 caption 的视频标题必须保持空（BUG-154），实得 {:?}",
+                it.title
+            );
+        }
+        // caption 所有者：标题取自己 caption 的首行（不继承别条、不伪造）。
+        let owner = st
+            .store
+            .item_id_by_ref("tg", &format!("{CACHE_FIXTURE_CHAT}:92"))
+            .await
+            .unwrap()
+            .unwrap();
+        let owner = st.store.get_media_item(owner).await.unwrap().unwrap();
+        assert_eq!(owner.title, "组剧标题", "caption 所有者保留自己的标题");
+    }
+
+    /// BUG-281 判据 2：`strengthen_registered_item` 的组级介绍补填 =
+    /// **fill-empty guard**（BUG-054 三态契约）。
+    ///
+    /// 三态各钉一条：空介绍位补组级正文 / 用户写过的介绍不动 /
+    /// 显式清空过的介绍不被 own-caption 路径写回。
+    #[tokio::test]
+    async fn strengthen_fills_group_desc_only_into_empty_slot_bug281() {
+        let dir = scratch_dir("bug281_strengthen_guard");
+        let st = cache_fixture_state(
+            &dir,
+            vec![],
+            vec![
+                fixture_msg(101, "video", "video/mp4", None, None),
+                fixture_msg(102, "video", "video/mp4", Some("自有标题\n自有正文"), None),
+                fixture_msg(103, "video", "video/mp4", None, None),
+            ],
+        )
+        .await;
+        ensure_message_rows(&st, CACHE_FIXTURE_CHAT, &[101, 102, 103]).await;
+        let group = "组级介绍正文";
+
+        // ① 空介绍位（T0 形态：元数据未到位时建的 kind=file、无时长）⇒ 补组级正文。
+        let id_empty = st
+            .store
+            .upsert_media_item(
+                "tg",
+                &format!("{CACHE_FIXTURE_CHAT}:101"),
+                "",
+                "file",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let row101 = st.store.get_message(CACHE_FIXTURE_CHAT, 101).await.unwrap();
+        strengthen_registered_item(&st, id_empty, &row101, "video", 101, false, Some(group)).await;
+        assert_eq!(
+            st.store
+                .get_media_item(id_empty)
+                .await
+                .unwrap()
+                .unwrap()
+                .description
+                .as_deref(),
+            Some(group),
+            "空介绍位必须补上组级正文"
+        );
+
+        // ② 用户写过的介绍 ⇒ 不动（fill-empty guard）。
+        let id_user = st
+            .store
+            .upsert_media_item(
+                "tg",
+                &format!("{CACHE_FIXTURE_CHAT}:103"),
+                "用户标题",
+                "video",
+                None,
+                None,
+                Some(12),
+                Some("用户写的介绍"),
+            )
+            .await
+            .unwrap();
+        let row103 = st.store.get_message(CACHE_FIXTURE_CHAT, 103).await.unwrap();
+        strengthen_registered_item(&st, id_user, &row103, "video", 103, false, Some(group)).await;
+        assert_eq!(
+            st.store
+                .get_media_item(id_user)
+                .await
+                .unwrap()
+                .unwrap()
+                .description
+                .as_deref(),
+            Some("用户写的介绍"),
+            "用户写过的介绍不得被组级正文覆盖"
+        );
+
+        // ③ 显式清空过的介绍（BUG-054 三态：NULL = 合法意图）⇒ own-caption 路径
+        //    保持既有写法（早退不写），清空不被复活。
+        let id_cleared = st
+            .store
+            .upsert_media_item(
+                "tg",
+                &format!("{CACHE_FIXTURE_CHAT}:102"),
+                "自有标题",
+                "video",
+                None,
+                None,
+                Some(12),
+                None,
+            )
+            .await
+            .unwrap();
+        st.store
+            .update_media_item(
+                id_cleared,
+                &crate::media::ItemPatch {
+                    description: Some(None),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let row102 = st.store.get_message(CACHE_FIXTURE_CHAT, 102).await.unwrap();
+        strengthen_registered_item(&st, id_cleared, &row102, "video", 102, false, Some(group))
+            .await;
+        assert!(
+            st.store
+                .get_media_item(id_cleared)
+                .await
+                .unwrap()
+                .unwrap()
+                .description
+                .is_none(),
+            "显式清空的介绍不得被 strengthen 写回（既有 own-caption 行为原样保留）"
+        );
     }
 
     /// 调用入队端点并解构为 `(状态码, 任务 JSON)`。

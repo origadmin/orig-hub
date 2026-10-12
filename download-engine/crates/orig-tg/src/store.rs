@@ -382,6 +382,28 @@ fn stored_message_from_row(r: &Row) -> libsql::Result<StoredMessage> {
     })
 }
 
+/// 一条消息的两个**标题来源**（BUG-280）：caption 与 file_name 分开带回。
+///
+/// 为什么不再 COALESCE 成一个值：相册组里 caption 常只挂在靠后的一条消息上
+/// （实测组 3373-3380 只有 3378 有），而靠前消息的 `file_name`（`manifest.mp4`）
+/// 会在 first-match 选取时抢在真 caption 之前（BUG-280 根因）。调用方需要
+/// 「caption 优先、全组都无 caption 才回退 file_name」的**两遍选取**，
+/// 两个来源必须分别可读才排得了序。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MsgTitleSources {
+    /// caption 的**首行**（队列行直接渲染这段文本；多行 caption 只取首行，
+    /// 否则一整段原文会顶在队列标题上）。
+    pub caption: String,
+    /// 落盘文件名（无 caption 时的兜底，BUG-220）。
+    pub file_name: String,
+}
+
+/// 取文本首行并 trim（空值/全空白归一为空串）。
+fn first_line(s: Option<&str>) -> String {
+    s.map(|v| v.split('\n').next().unwrap_or("").trim().to_string())
+        .unwrap_or_default()
+}
+
 impl Store {
     /// 打开（不存在则创建）数据库并建表。`path` 传 `":memory:"` 使用纯内存库。
     pub async fn open(path: impl AsRef<Path>) -> libsql::Result<Self> {
@@ -617,20 +639,31 @@ impl Store {
         Ok(row.is_some())
     }
 
+    /// 消息 caption 批量取（BUG-232 v2）：按频道一次性取回标题来源，
+    /// 供任务列表在**服务端**拼出行标题。
+    ///
+    /// 为什么是这里、而不是壳按媒体库条目 by-ref 反查（v1 的错误修法）：
+    /// caption 在**消息同步时**就已落 `media_message`，与任务成败无关 ——
+    /// failed/queued 的任务同样有标题可显示；按媒体库条目查只覆盖已出成品的任务，
+    /// 且把「一次 SQL」变成「每行一次 HTTP + 渲染期补数据」。
+    /// 频道数是个位数（任务只跨少数频道），逐频道一次查询，不做 N 次行级查询。
+    ///
+    /// BUG-280：caption 与 file_name **分开返回**（见 [`MsgTitleSources`]），
+    /// 由调用方做「caption 优先、file_name 兜底」的两遍选取；两者各取**首行**
+    /// （队列标题渲染的是单行文本）。
+    ///
+    /// BUG-220：选取规则仍保留「无 caption 时回退 file_name」——回退发生在
+    /// 调用方（`routes::cache_task_title`），这里只负责把两个来源都带回去。
     pub async fn message_captions_for_channels(
         &self,
         channels: &[i64],
-    ) -> libsql::Result<std::collections::HashMap<(i64, i64), String>> {
+    ) -> libsql::Result<std::collections::HashMap<(i64, i64), MsgTitleSources>> {
         let mut out = std::collections::HashMap::new();
         for ch in channels {
-            // BUG-220：标题 = caption 优先，**无 caption 时回退 file_name**。
-            // 实测大量视频消息在 TG 上没有说明文案、只有文件名（`妻善3.mp4`），
-            // 此前只看 caption ⇒ 这类任务标题恒空 ⇒ 前端退回频道名（用户看到
-            // 「又是频道名不是内容」）。文件名就是内容名，回退到它才是「显示内容」。
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT message_id, COALESCE(NULLIF(caption, ''), NULLIF(file_name, '')) AS title \
+                    "SELECT message_id, caption, file_name \
                      FROM media_message \
                      WHERE channel_id = ?1 \
                        AND (caption IS NOT NULL AND caption <> '' OR file_name IS NOT NULL AND file_name <> '')",
@@ -639,8 +672,15 @@ impl Store {
                 .await?;
             while let Some(r) = rows.next().await? {
                 let mid: i64 = r.get(0)?;
-                let cap: String = r.get(1)?;
-                out.insert((*ch, mid), cap);
+                let cap: Option<String> = r.get(1)?;
+                let fname: Option<String> = r.get(2)?;
+                out.insert(
+                    (*ch, mid),
+                    MsgTitleSources {
+                        caption: first_line(cap.as_deref()),
+                        file_name: first_line(fname.as_deref()),
+                    },
+                );
             }
         }
         Ok(out)
@@ -2609,29 +2649,62 @@ mod tests {
         assert_ne!(s.data_dir(), s.proxy_dir());
     }
 
-    /// BUG-220：入库队列标题 = **caption 优先，无 caption 时回退 file_name**。
+    /// BUG-220 + BUG-280：标题映射把 caption 与 file_name **分开**带回，
+    /// 选取规则（caption 优先、无 caption 回退 file_name）由调用方两遍完成。
     ///
     /// 实测大量视频消息在 TG 上没有说明文案、只有文件名（`妻善3.mp4`）；此前标题链
     /// 只认 caption ⇒ 这类任务标题恒空 ⇒ 前端退回频道名（用户看到「又是频道名不是
-    /// 内容」）。本测试钉住三态：有 caption 用 caption / 无 caption 用 file_name /
-    /// 两者皆无不进标题表。
+    /// 内容」）。本测试钉住映射侧三态：caption 与 file_name 各自可读 / 无 caption 时
+    /// file_name 仍在（供调用方兜底）/ 两者皆无不进标题表。
     #[tokio::test]
-    async fn message_title_falls_back_to_file_name_bug220() {
-        let s = store("bug220title").await;
+    async fn message_title_sources_are_split_caption_and_file_name_bug280() {
+        let s = store("bug280title").await;
         s.upsert_message(7, 1, Some("有文案的标题"), Some("video/mp4"), Some(1), Some("video"), Some(1), None, None, Some("ignored.mp4")).await.unwrap();
         s.upsert_message(7, 2, None, Some("video/mp4"), Some(1), Some("video"), Some(1), None, None, Some("妻善3.mp4")).await.unwrap();
         s.upsert_message(7, 3, None, Some("video/mp4"), Some(1), Some("video"), Some(1), None, None, None).await.unwrap();
         let m = s.message_captions_for_channels(&[7]).await.unwrap();
+        let s1 = m.get(&(7, 1)).expect("msg 1 must be in the map");
         assert_eq!(
-            m.get(&(7, 1)).map(String::as_str),
-            Some("有文案的标题"),
+            s1.caption, "有文案的标题",
             "有 caption 时必须用 caption，不能被文件名盖掉"
         );
         assert_eq!(
-            m.get(&(7, 2)).map(String::as_str),
-            Some("妻善3.mp4"),
+            s1.file_name, "ignored.mp4",
+            "BUG-280：两个来源分开带回，排序交给调用方（此前被 COALESCE 吞掉）"
+        );
+        let s2 = m.get(&(7, 2)).expect("msg 2 must be in the map");
+        assert_eq!(s2.caption, "", "无 caption ⇒ caption 为空串");
+        assert_eq!(
+            s2.file_name, "妻善3.mp4",
             "无 caption 时必须回退 file_name（这才是「显示内容」而非频道名）"
         );
         assert!(!m.contains_key(&(7, 3)), "既无 caption 也无 file_name 的消息不进标题表");
+    }
+
+    /// BUG-280：多行 caption 只取**首行**——队列行直接渲染这段文本，
+    /// 整段原文（232 字符）顶在标题上不可读（实测任务 163）。
+    #[tokio::test]
+    async fn message_title_sources_take_first_line_only_bug280() {
+        let s = store("bug280firstline").await;
+        s.upsert_message(
+            7,
+            1,
+            Some("首行标题\n第二行正文\n第三行标签 #短剧"),
+            Some("video/mp4"),
+            Some(1),
+            Some("video"),
+            Some(1),
+            None,
+            None,
+            Some("ignored.mp4"),
+        )
+        .await
+        .unwrap();
+        let m = s.message_captions_for_channels(&[7]).await.unwrap();
+        assert_eq!(
+            m.get(&(7, 1)).map(|s| s.caption.as_str()),
+            Some("首行标题"),
+            "caption 多行时只取首行（队列标题是单行文本）"
+        );
     }
 }
