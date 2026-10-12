@@ -651,6 +651,7 @@
   "media.episode.detachImage": "Detach image",
   "media.episode.editImages": "Manage episode images",
   "media.episode.sectionDesc": "Episode description",
+  "media.episode.sectionDescSeries": "Show intro",
   "media.episode.editDesc": "Edit description",
   "media.episode.actions": "Actions",
   "media.episode.imagesMore": "{n} more",

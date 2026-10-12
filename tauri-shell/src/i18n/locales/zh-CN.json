@@ -651,6 +651,7 @@
   "media.episode.detachImage": "摘除图片",
   "media.episode.editImages": "管理本集图片",
   "media.episode.sectionDesc": "本集介绍",
+  "media.episode.sectionDescSeries": "剧集介绍",
   "media.episode.editDesc": "编辑介绍",
   "media.episode.actions": "操作",
   "media.episode.imagesMore": "还有 {n} 张",

@@ -62,6 +62,7 @@ import {
   sourceLabelKey,
 } from '../../lib/mediaSources'
 import {
+  episodeDescriptionIsSeriesLevel,
   episodeSlotLabel,
   isPhotoEpisode,
   partitionEpisodes,
@@ -935,12 +936,23 @@ export function SeriesDetail(props: {
                 {t('media.episode.play')}
               </Button>
 
-              {/* 本集介绍（R2 门控：与剧集介绍逐字相同则不重复渲染）。规范：块标题 + 编辑介绍按钮
+              {/* 本集介绍（BUG-281 产品裁定：**按来源贴标签，不再按文本隐藏**）。
+                  非空即渲染：与剧集介绍逐字相同 ⇒ 贴「剧集介绍」标签（TG 相册组
+                  共拥一条组级 caption，重复是显式的、有说明的）；不同 ⇒ 「本集介绍」。
+                  旧门控「逐字相同即隐藏」把 36/44 条有介绍的分集藏成了空态，
+                  即 BUG-281 报障的「大部分集是没有内容的」。
                   BUG-203：编辑态隐藏 —— 介绍正在编辑面板的 textarea 里，正文再渲染一份
                   就是第二处重复（与标题的 2 行重叠同根因）。 */}
               {!editingEpisode ? (
                 <div className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5">
-                  <span className="text-[11px] font-medium text-fg-strong">{t('media.episode.sectionDesc')}</span>
+                  <span
+                    className="text-[11px] font-medium text-fg-strong"
+                    data-testid="episode-focus-desc-label"
+                  >
+                    {episodeDescriptionIsSeriesLevel(cur, detail)
+                      ? t('media.episode.sectionDescSeries')
+                      : t('media.episode.sectionDesc')}
+                  </span>
                   {shouldRenderEpisodeDescription(cur, detail) ? (
                     <p
                       className="min-w-0 whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[12.5px] leading-relaxed text-muted"

@@ -35,19 +35,50 @@ export function shouldRenderEpisodeTitle(ep: MediaEpisode, series: MediaSeriesDe
 /**
  * 单集介绍是否需要在单集层渲染。
  *
- * 判定逻辑与 `SeriesDetail.tsx:705-707` 的内联 `showEpDesc` **一字不改**，只换了位置
- * —— 保证已修复的行为不回退（R2）。
+ * BUG-281 产品裁定（2026-10-12，用户定）：**按来源贴标签，不再按文本隐藏**。
  *
- * TG 抓取的剧集会把整段剧集简介逐字复制进每一集（实测 series 101：单集、简介与
- * 剧集简介 120 字完全相同）。剧集简介已在全剧层常驻显示，单集层再渲染一次就是
- * 同一段文案出现两遍。逐字相同才隐藏，真有独立本集介绍时照常显示。
+ * 旧规则（BUG-171 / series 101 实测）是「与剧集介绍逐字相同 ⇒ 隐藏」，理由是
+ * 「同一段文案在剧集层与单集层各显示一遍」。但 TG 相册组只带**一条**组级
+ * caption：实测全库 44 条有介绍的分集里 **36 条逐字等于剧集介绍**（series 315
+ * EP6 即 232 字全等）⇒ 旧门控把唯一的内容入口也隐藏了，用户在几乎每一集上
+ * 读到空态「本集暂无介绍」—— 这正是 BUG-281 的报障原话「大部分集是没有内容的」。
+ *
+ * 新规则：单集介绍 **trim 后非空即渲染**。与剧集介绍逐字相同的那部分不再消失，
+ * 而是由渲染层按 `episodeDescriptionIsSeriesLevel` 贴上「剧集介绍」标签 ——
+ * 与剧集头那段重复现在是**可见的、有说明的**，而不是被藏掉。只有连文本都没有时
+ * 才走空态 `media.descEmptyEp`。
+ *
+ * 设计约束（文件头）不变：编辑入口从不问这些函数；这是**渲染期规则**；
+ * 绝不为了去重去改数据（P5 单一真源）。
+ *
+ * `_series` 保留在签名里（下划线 = 不再参与判定）：两层展示判定的 (ep, series)
+ * 参数对是模块的既有契约，调用点（`SeriesDetail` / `EpisodeExpanded`）不因本次
+ * 裁定而改形；来源判定已移交给 `episodeDescriptionIsSeriesLevel`。
  */
 export function shouldRenderEpisodeDescription(
+  ep: MediaEpisode,
+  _series: MediaSeriesDetail,
+): boolean {
+  return (ep.description ?? '').trim().length > 0
+}
+
+/**
+ * 单集介绍是**剧集级**文案：非空**且**与剧集介绍 trim 后逐字相等。
+ *
+ * BUG-281：TG 相册组共拥一条组级 caption（`first_caption` 同时喂给剧集级与
+ * 带 caption 的那条分集，其余分集经引擎回填继承），逐字相等即「剧集级」。
+ * 渲染层据此把区块标签从「本集介绍」换成「剧集介绍」—— 重复被标注，不被隐藏。
+ *
+ * 与 `shouldRenderEpisodeDescription` 的旧判据是同一个比较，但语义相反：
+ * 那里曾经用它**隐藏**，这里用它**说明来源**。只判 trim 后逐字全等，
+ * 绝不做模糊 / 包含匹配（会误杀真有独立内容的集）。
+ */
+export function episodeDescriptionIsSeriesLevel(
   ep: MediaEpisode,
   series: MediaSeriesDetail,
 ): boolean {
   const epDesc = (ep.description ?? '').trim()
-  return epDesc.length > 0 && epDesc !== (series.description ?? '').trim()
+  return epDesc.length > 0 && epDesc === (series.description ?? '').trim()
 }
 
 /**

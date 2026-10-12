@@ -11,6 +11,7 @@ import {
   sourceLabelKey,
 } from '../../lib/mediaSources'
 import {
+  episodeDescriptionIsSeriesLevel,
   episodeSlotLabel,
   shouldRenderEpisodeDescription,
   shouldRenderEpisodeTitle,
@@ -29,7 +30,7 @@ const IMAGE_INLINE = 3
  * 单集**展开态**：这一集的全部信息位 + 全部操作。
  *
  * 块序**固定写死**（设计 §3.2 / 回归点 #11）：
- *   大封面 → 本集标题（R5 门控）→ 本集介绍（R2 门控）→ 挂图区 → 多源区 →
+ *   大封面 → 本集标题（R5 门控）→ 本集介绍（BUG-281 起按来源贴标签）→ 挂图区 → 多源区 →
  *   操作区 → 来源 / 溯源
  *
  * 手风琴 ≤ 1 集 ⇒ 展开态是单集的**唯一焦点**；若块序随布局漂移，用户每次都要
@@ -75,6 +76,8 @@ export function EpisodeExpanded(props: {
   const recacheable = canRecacheFromSource(ep.source)
   const showTitle = shouldRenderEpisodeTitle(ep, series)
   const showDesc = shouldRenderEpisodeDescription(ep, series)
+  // BUG-281：与剧集介绍逐字相同 = 剧集级文案（组级 caption 共享）⇒ 标签换「剧集介绍」。
+  const descIsSeriesLevel = episodeDescriptionIsSeriesLevel(ep, series)
 
   return (
     <div className="flex flex-col gap-4" data-testid="episode-expanded">
@@ -106,14 +109,21 @@ export function EpisodeExpanded(props: {
         <h4 className="text-[13px] font-semibold text-muted">{episodeSlotLabel(ep)}</h4>
       )}
 
-      {/* ③ 本集介绍（R2 门控）。被隐藏 = 与剧集介绍逐字相同，剧集头那份承担显示。 */}
-      {showDesc ? (
-        <p className="max-w-prose whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[11.5px] leading-relaxed text-muted">
-          {ep.description}
-        </p>
-      ) : (
-        <p className="text-[11.5px] text-muted/70">{t('media.descEmptyEp')}</p>
-      )}
+      {/* ③ 本集介绍（BUG-281 产品裁定：按来源贴标签，不再按文本隐藏）。非空即渲染；
+          与剧集介绍逐字相同 ⇒ 「剧集介绍」标签（TG 相册组共拥一条组级 caption，
+          重复被标注而非隐藏），不同 ⇒ 「本集介绍」。连文本都没有才走空态。 */}
+      <div className="flex flex-col gap-1">
+        <span className="text-[11px] font-medium text-fg-strong">
+          {descIsSeriesLevel ? t('media.episode.sectionDescSeries') : t('media.episode.sectionDesc')}
+        </span>
+        {showDesc ? (
+          <p className="max-w-prose whitespace-pre-wrap break-words [overflow-wrap:anywhere] text-[11.5px] leading-relaxed text-muted">
+            {ep.description}
+          </p>
+        ) : (
+          <p className="text-[11.5px] text-muted/70">{t('media.descEmptyEp')}</p>
+        )}
+      </div>
 
       {/* ④ 挂图区：横滚瓦片；点某张开灯箱（范围 = 本集全部挂图，R6）。
           「挂图」入口**只在操作区**（§3.2）—— 同一 handler 挂两个按钮会产生

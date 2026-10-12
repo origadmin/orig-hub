@@ -16,22 +16,33 @@
  *
  *   - 左栏总览新增**剧集介绍展示位** `[data-testid="series-description"]`（BUG-183 补回）。
  *   - 右栏本集介绍由 `shouldRenderEpisodeDescription(ep, series)`（`episodePresentation.ts`）
- *     门控：与剧集简介**逐字相同**则不重复渲染。
+ *     门控。**BUG-281 产品裁定（2026-10-12，用户定）改变了这道门控的语义**：
+ *     旧规「与剧集简介逐字相同 ⇒ 隐藏」（本脚本判据 1 的原口径：整页恰 1 次）；
+ *     新规「trim 后非空即渲染，按来源贴标签」—— 逐字相同的那部分不再消失，而是由
+ *     `episodeDescriptionIsSeriesLevel` 判为**剧集级**，在单集层带
+ *     `[data-testid="episode-focus-desc-label"]` = 「剧集介绍」标签渲染。
+ *     依据：TG 相册组只带一条组级 caption，旧门控把 36/44 条有介绍的分集藏成
+ *     空态（BUG-281 报障「大部分集是没有内容的」）；重复从「被隐藏」改为「被标注」。
  *   - 左栏海报 `[data-testid="series-cover"]` 带 `aspect-video w-full self-start`。
  *   - 旧 `SeriesHero.tsx` 已是零 importer 孤儿（其海报问题不可达）。
  *
  * ## 判据（对**真实渲染的 DOM**，逐条打印实测值）
  *
- *   1 简介唯一性：取一部**单集**且 `ep.description.trim() === series.description.trim()`
- *     的剧集，把剧集简介原文在**整页可见文本**（`document.body.innerText`）里统计出现
- *     次数 —— 必须 **恰为 1 次**（左栏剧集介绍位）。`>= 2` ⇒ 根因 1 仍成立。
+ *   1 简介双现+标注（BUG-281 新裁定）：取一部**单集**且 `ep.description.trim() ===
+ *     series.description.trim()` 的剧集，把剧集简介原文在**整页可见文本**
+ *     （`document.body.innerText`）里统计出现次数 —— 必须 **恰为 2 次**
+ *     （左栏剧集介绍位 1 + 右栏单集层 1）。`1` ⇒ 退回旧门控（隐藏）；
+ *     `>= 3` ⇒ 多出一处未标注的重复（失去对「第三处」的牙齿）。
+ *     且第二处必须**可归属**：`episode-focus-desc` 存在、规范化文本 === 剧集简介
+ *     原文、其标签 `episode-focus-desc-label` === 「剧集介绍」。
  *     `0` ⇒ 展示位缺失（如实记录，不判 BUG-171 未修）。
  *   2 海报比例：720 / 820 / 1280px 三视口下读 `[data-testid="series-cover"]` 的
  *     `getBoundingClientRect()`，宽高比须 ≈ 16:9（±3%）。**读 rect，不读 className。**
  *   3 编辑能力未受损：`episode-edit` 存在，点击后出现 `episode-title-input`。
- *   4 反向证伪：临时去掉 `episodePresentation.ts` 的去重项（`&& epDesc !== ...`）→
- *     判据 1 **必须 FAIL**（简介出现 ≥2 次）；还原后 sha256 相等、`git diff --name-only`
- *     不含该文件。**绝不改断言去迎合代码。**
+ *   4 反向证伪：把 `shouldRenderEpisodeDescription` **换回旧门控**（逐字相同即隐藏）
+ *     → 判据 1 **必须 FAIL**（次数跌到 1、`episode-focus-desc` 消失）；
+ *     还原后 sha256 相等、且 BUG-281 新门控与 `episodeDescriptionIsSeriesLevel`
+ *     均在位。**绝不改断言去迎合代码。**
  *   5 收集 `pageerror` / console error。
  *
  * Usage:  node verify/verify_bug171_status.cjs            # 正常跑判据
@@ -46,7 +57,6 @@ const os = require('node:os')
 const path = require('node:path')
 const http = require('node:http')
 const crypto = require('node:crypto')
-const { execFileSync } = require('node:child_process')
 
 const cdp = require('./lib/cdp.cjs')
 
@@ -57,6 +67,10 @@ const PROBE = process.env.PROBE === '1'
 const OUT = path.resolve(
   process.env.ORIG_VERIFY_OUT || path.join(os.tmpdir(), 'orighub-verify-bug171'),
 )
+
+/** BUG-281 新裁定下的「剧集介绍」标签文案（与 zh-CN.json 同源，不硬编码）。 */
+const ZH = require(path.resolve(__dirname, '..', 'src', 'i18n', 'locales', 'zh-CN.json'))
+const LABEL_SERIES = ZH['media.episode.sectionDescSeries']
 
 /** BUG-171 的两个缺陷面都在「窄视口」最明显：三视口逐一实测。 */
 const VIEWPORTS = [
@@ -72,9 +86,16 @@ const RATIO_TOL = 0.03
 const REPO_ROOT = path.resolve(__dirname, '..', '..')
 const TARGET_REL = 'tauri-shell/src/lib/episodePresentation.ts'
 const TARGET_FILE = path.join(REPO_ROOT, TARGET_REL)
-/** 反向证伪锚点：BUG-171 修法里要求的去重项（逐字全等才隐藏）。 */
-const DEDUP_ANCHOR = ' && epDesc !== (series.description ?? \'\').trim()'
-const DEDUP_DEFECT = ''
+/**
+ * 反向证伪锚点（BUG-281 新裁定门控的**当前源码正文**）：trim 后非空即渲染。
+ * 注入 = 把它换回旧门控（逐字相同即隐藏）—— 正是 BUG-281 取代的那个行为。
+ */
+const NEW_GATE_BODY = "  return (ep.description ?? '').trim().length > 0"
+const OLD_GATE_BODY =
+  "  const epDesc = (ep.description ?? '').trim()\n" +
+  "  return epDesc.length > 0 && epDesc !== (_series.description ?? '').trim()"
+/** 新裁定的另一半：来源判定函数必须在位（只换门控不换判定 = 半截修复）。 */
+const RULING_MARK = 'episodeDescriptionIsSeriesLevel'
 /** 关注并发编辑：核验期间若该文件被他人改写，结果不稳定，需标记。 */
 const WATCH_REL = 'tauri-shell/src/components/media/SeriesDetail.tsx'
 const WATCH_FILE = path.join(REPO_ROOT, WATCH_REL)
@@ -223,6 +244,9 @@ const GATHER = (seriesDesc) => {
 
   const slot = document.querySelector('[data-testid="series-description"]')
   const focusDesc = document.querySelector('[data-testid="episode-focus-desc"]')
+  // BUG-281：单集层介绍的区块标签（剧集级 = 「剧集介绍」，本集级 = 「本集介绍」）。
+  // 旧代码无此 testid —— 取不到即证明跑在旧裁定代码上，判据 1 应 FAIL 而非静默。
+  const focusLabel = document.querySelector('[data-testid="episode-focus-desc-label"]')
   const cover = document.querySelector('[data-testid="series-cover"]')
   const aside = cover ? cover.closest('aside') : null
 
@@ -251,6 +275,9 @@ const GATHER = (seriesDesc) => {
     },
     focusDescExists: !!focusDesc,
     focusDescTextLen: focusDesc ? norm(focusDesc.textContent || '').length : 0,
+    /** 单集层那段是否就是剧集简介原文（规范化后相等）—— 「第二处」的归属证明。 */
+    focusDescMatchesNeedle: focusDesc ? norm(focusDesc.textContent || '') === needle : false,
+    focusLabel: focusLabel ? String(focusLabel.textContent || '').trim() : null,
     cover: rectOf(cover),
     asideW: aside ? Math.round(aside.getBoundingClientRect().width * 100) / 100 : null,
     hasEdit: !!document.querySelector('[data-testid="episode-edit"]'),
@@ -270,31 +297,25 @@ const fileHash = (p) => {
     return null
   }
 }
-function gitDiffNames() {
-  try {
-    return execFileSync('git', ['-C', REPO_ROOT, 'diff', '--name-only'], { encoding: 'utf8' })
-      .split(/\r?\n/)
-      .map((s) => s.trim())
-      .filter(Boolean)
-  } catch (_e) {
-    return []
-  }
-}
 
 /**
- * 注入缺陷态（去掉去重项）→ 重跑判据 1 → 还原 → 自证未污染工作区。
+ * 注入旧门控（逐字相同即隐藏）→ 重跑判据 1 → 还原 → 自证未污染工作区。
+ *
+ * BUG-281 语义：旧门控下剧集级介绍被藏成空态 ⇒ 次数跌到 1、`episode-focus-desc`
+ * 消失 ⇒ 判据 1 FAIL。还原**只走字节写回**：工作树带着 BUG-281 的未提交改动，
+ * `git checkout --` 会把裁定一起冲掉（旧版脚本的兜底路径已删除）。
  * @returns {Promise<object>}
  */
 async function reverseFalsify(page, fixture) {
   const orig = fs.readFileSync(TARGET_FILE, 'utf8')
   const origHash = sha256(orig)
-  const result = { restored: false, shaMatch: false, gitClean: false, forcedRestore: false }
-  if (!orig.includes(DEDUP_ANCHOR)) {
-    result.error = `anchor not found in ${TARGET_REL}: ${JSON.stringify(DEDUP_ANCHOR)}`
+  const result = { restored: false, shaMatch: false, rulingIntact: false }
+  if (!orig.includes(NEW_GATE_BODY)) {
+    result.error = `BUG-281 gate anchor not found in ${TARGET_REL}: ${JSON.stringify(NEW_GATE_BODY)}`
     return result
   }
   try {
-    const injected = orig.replace(DEDUP_ANCHOR, DEDUP_DEFECT)
+    const injected = orig.replace(NEW_GATE_BODY, OLD_GATE_BODY)
     if (injected === orig) {
       result.error = 'injection produced no textual change'
       return result
@@ -305,11 +326,13 @@ async function reverseFalsify(page, fixture) {
     const g = await gather(page, fixture.seriesDesc)
     result.injectedInnerCount = g.innerCount
     result.injectedDomCount = g.domCount
-    result.injectedSlot = g.slot
+    result.injectedFocusDescExists = g.focusDescExists
+    result.injectedLabel = g.focusLabel
+    await shot(page, 'F-injected-old-gate.png') // 红态：旧门控把剧集级介绍藏成空态
   } catch (e) {
     result.error = e && e.message ? e.message : String(e)
   } finally {
-    // ★ 无论如何先还原
+    // ★ 无论如何先还原（字节写回；绝不用 git checkout）
     try {
       fs.writeFileSync(TARGET_FILE, orig, 'utf8')
       await delay(1500)
@@ -322,19 +345,9 @@ async function reverseFalsify(page, fixture) {
     } catch (_e) {}
     result.restored = now === orig
     result.shaMatch = now != null && sha256(now) === origHash
-    result.gitClean = !gitDiffNames().includes(TARGET_REL)
-    if (!result.restored) {
-      // 二次兜底：git 强制还原
-      try {
-        execFileSync('git', ['-C', REPO_ROOT, 'checkout', '--', TARGET_REL], { stdio: 'ignore' })
-        result.forcedRestore = true
-        result.restored = fs.readFileSync(TARGET_FILE, 'utf8') === orig
-        result.shaMatch = fs.readFileSync(TARGET_FILE, 'utf8') === orig
-        result.gitClean = !gitDiffNames().includes(TARGET_REL)
-      } catch (_e) {
-        result.forcedRestore = true
-      }
-    }
+    // 还原必须回到**新裁定**态：新门控 + 来源判定函数都在位
+    result.rulingIntact =
+      now != null && now.includes(NEW_GATE_BODY) && now.includes(RULING_MARK)
   }
   return result
 }
@@ -397,26 +410,30 @@ async function main() {
 
     // ───────────── 打开真实页面（默认 1440） ─────────────
     await openSeriesDetail(page, fixture.seriesId)
-    await shot(page, 'A-series-detail-1440.png')
     const g0 = await gather(page, fixture.seriesDesc)
     info('gathered@1440', JSON.stringify(g0))
+    await shot(page, '05-bug171-updated.png') // BUG-281 新裁定下的双现+标注态
 
     // 自证扫的是活页面
     check('0: series description slot rendered (live DOM)', g0.slot.exists, `slotExists=${g0.slot.exists} textLen=${g0.slot.textLen}`)
 
-    // ───────────── 判据 1：简介唯一性 ─────────────
+    // ───────────── 判据 1：简介双现 + 单集层带「剧集介绍」标签（BUG-281 新裁定） ─────────────
     const baseCount = g0.innerCount
     const domCount = g0.domCount
     info('desc occurrences', `innerText=${baseCount} textContent=${domCount} (needleLen=${g0.descLen})`)
     check(
-      '171-1: series description appears EXACTLY ONCE in visible page text',
-      baseCount === 1,
-      `innerCount=${baseCount} (expected 1) | textContentCount=${domCount}`,
+      `171-1 (BUG-281 ruling): series description appears EXACTLY TWICE — hero once + episode level once`,
+      baseCount === 2 && domCount === 2,
+      `innerCount=2 且 textContentCount=2（1 ⇒ 退回旧门控「隐藏」；>=3 ⇒ 多出一处未标注重复）`,
+      `innerCount=${baseCount} textContentCount=${domCount}`,
     )
     check(
-      '171-1: NO duplication (count <= 1) — root cause 1 absent',
-      baseCount <= 1,
-      `innerCount=${baseCount}`,
+      `171-1 (BUG-281 ruling): the episode-level occurrence is attributed — episode-focus-desc matches the series description AND carries the "${LABEL_SERIES}" label`,
+      g0.focusDescExists === true &&
+        g0.focusDescMatchesNeedle === true &&
+        g0.focusLabel === LABEL_SERIES,
+      `episode-focus-desc 存在、规范化文本 === 剧集简介原文（len=${g0.descLen}）、label === "${LABEL_SERIES}"`,
+      `focusDescExists=${g0.focusDescExists} focusDescTextLen=${g0.focusDescTextLen} matchesNeedle=${g0.focusDescMatchesNeedle} label=${JSON.stringify(g0.focusLabel)}`,
     )
 
     // ───────────── 判据 2：海报比例（三视口） ─────────────
@@ -459,30 +476,42 @@ async function main() {
     // ───────────── 判据 4：反向证伪 ─────────────
     console.log('\n[verify] ===== REVERSE FALSIFICATION =====')
     const rf = await reverseFalsify(page, fixture)
-    info('injected (dedup removed) counts', `innerCount=${rf.injectedInnerCount} domCount=${rf.injectedDomCount} err=${rf.error || '-'}`)
+    info(
+      'injected (old gate restored) counts',
+      `innerCount=${rf.injectedInnerCount} domCount=${rf.injectedDomCount} focusDescExists=${rf.injectedFocusDescExists} label=${JSON.stringify(rf.injectedLabel)} err=${rf.error || '-'}`,
+    )
     check(
-      'RF: removing the dedup gate makes description appear >= 2 times (assertion 1 FAILS)',
-      rf.injectedInnerCount != null && rf.injectedInnerCount >= 2 && rf.injectedInnerCount > baseCount,
-      `injectedInnerCount=${rf.injectedInnerCount} base=${baseCount} (expected injected >= 2 and > base)`,
+      'RF: restoring the OLD gate (hide verbatim-equal) drops the count to 1 and hides episode-focus-desc (assertion 1 FAILS)',
+      rf.injectedInnerCount === 1 &&
+        rf.injectedInnerCount < baseCount &&
+        rf.injectedFocusDescExists === false,
+      `injectedInnerCount=1（< base ${baseCount}）且注入态 episode-focus-desc 消失（被藏成空态）`,
+      `injectedInnerCount=${rf.injectedInnerCount} base=${baseCount} focusDescExists=${rf.injectedFocusDescExists} err=${rf.error || '-'}`,
     )
     check(
       'RF: target file restored byte-identical (sha256 match)',
       rf.restored === true && rf.shaMatch === true,
       `restored=${rf.restored} shaMatch=${rf.shaMatch}`,
+      `restored=${rf.restored} shaMatch=${rf.shaMatch} forcedRestore=${rf.forcedRestore === true}`,
     )
     check(
-      `RF: ${TARGET_REL} NOT in \`git diff --name-only\``,
-      rf.gitClean === true,
-      `gitClean=${rf.gitClean} forcedRestore=${rf.forcedRestore}`,
+      'RF: BUG-281 ruling intact after restore (new gate body + episodeDescriptionIsSeriesLevel present)',
+      rf.rulingIntact === true,
+      `还原后仍含新门控正文与 ${RULING_MARK}（不是回到旧裁定）`,
+      `rulingIntact=${rf.rulingIntact}`,
     )
 
-    // 还原后再跑一次主判据，证明还原后的真实代码仍「不重复」
+    // 还原后再跑一次主判据，证明还原后的真实代码仍是「双现 + 剧集介绍标签」
     await openSeriesDetail(page, fixture.seriesId)
     const gFinal = await gather(page, fixture.seriesDesc)
+    await shot(page, 'Z-final.png')
     check(
-      'RF: after restore, description count is back to <= 1 on real code',
-      gFinal.innerCount <= 1,
-      `innerCount=${gFinal.innerCount}`,
+      `RF: after restore, count is back to EXACTLY 2 with the "${LABEL_SERIES}" label on real code`,
+      gFinal.innerCount === 2 &&
+        gFinal.focusDescMatchesNeedle === true &&
+        gFinal.focusLabel === LABEL_SERIES,
+      `innerCount=2 且第二处可归属（episode-focus-desc === 剧集简介原文、label === "${LABEL_SERIES}"）`,
+      `innerCount=${gFinal.innerCount} matchesNeedle=${gFinal.focusDescMatchesNeedle} label=${JSON.stringify(gFinal.focusLabel)}`,
     )
 
     // ───────────── 并发编辑护栏 ─────────────
@@ -503,11 +532,8 @@ async function main() {
       console.log('[verify] ALL CHECKS PASSED')
     }
   } finally {
-    if (page) {
-      try {
-        await shot(page, 'Z-final.png')
-      } catch (_e) {}
-    }
+    // 末态截图已在「还原后复跑」处显式拍摄（Z-final.png = 新裁定真实代码态）；
+    // 这里不再补拍 —— 异常路径下页面可能停留在注入态，补拍会覆盖权威证据。
     await browser.close()
   }
 }
