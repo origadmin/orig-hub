@@ -2027,6 +2027,75 @@ mod tests {
         migrate_dialog_cache_blank_titles(&conn).await.unwrap()
     }
 
+    /// BUG-193 存储层判据：**归档（非主文件夹）里的会话必须真的落进缓存**。
+    ///
+    /// doc 的验收口径是「`folders` 声明的 `channel_ids` 与 `dialog_cache`
+    /// 取到的 id 集合**差集为空**」。这条测试就是那个差集判据的存储侧钉子：
+    /// 先写入一个只有归档频道才有的 id，再断言它能被 `read_dialogs` 取回、
+    /// 且带 `folder` 标注。
+    ///
+    /// 为什么钉在存储层而不是只钉枚举层：`dialog_cache.id` 是主键，写入路径若
+    /// （将来）漏了某一类来源，这里会红；反之若有人「顺手」把归档会话过滤掉，
+    /// 枚举层的单测未必覆盖得到落库这一步。
+    #[tokio::test]
+    async fn archived_folder_dialog_is_cached_bug193() {
+        let s = store("dialog_cache_bug193_archive").await;
+        // 归档频道的 id 形态：-1000000000000 - channel_id（负数，落在频道区间）。
+        let archived_id: i64 = -1_000_000_004_493_170_102i64;
+        let archived = Channel {
+            id: archived_id,
+            title: "归档里的频道".to_string(),
+            username: Some("archivedchan".to_string()),
+            folder: Some("‼️全网分组中心A‼️".to_string()),
+        };
+        // 主文件夹的一条，用来证明两者共存而不是互相覆盖。
+        let primary = Channel {
+            id: 777_000,
+            title: "Telegram".to_string(),
+            username: Some("telegram".to_string()),
+            folder: Some("MyTop".to_string()),
+        };
+        s.upsert_dialog(&archived).await.unwrap();
+        s.upsert_dialog(&primary).await.unwrap();
+
+        // 归档那条必须真的在库里，且 folder 标注如实带回。
+        let all = s.read_dialogs(0, 100).await.unwrap();
+        let got = all
+            .iter()
+            .find(|c| c.id == archived_id)
+            .expect("归档会话必须落进 dialog_cache（BUG-193）");
+        assert_eq!(got.title, "归档里的频道");
+        assert_eq!(got.folder.as_deref(), Some("‼️全网分组中心A‼️"));
+        assert_eq!(got.username.as_deref(), Some("archivedchan"));
+
+        // 主文件夹那条不回归（doc 验收：MyTop 保持 20/20 的同类判据）。
+        let p = all.iter().find(|c| c.id == 777_000).unwrap();
+        assert_eq!(p.folder.as_deref(), Some("MyTop"));
+
+        // 幂等：重复写入不新增行，且 folder 标注不被冲掉。
+        s.upsert_dialog(&archived).await.unwrap();
+        assert_eq!(s.count_dialogs().await.unwrap(), 2);
+        let again = s.read_dialogs(0, 100).await.unwrap();
+        assert_eq!(
+            again.iter().find(|c| c.id == archived_id).unwrap().folder.as_deref(),
+            Some("‼️全网分组中心A‼️"),
+            "重复 upsert 不得把归档会话的分组标注冲成 NULL"
+        );
+
+        // 对账判据的存储侧形态：声明集合与缓存集合差集为空。
+        let declared = [archived_id, 777_000];
+        let cached: std::collections::HashSet<i64> = all.iter().map(|c| c.id).collect();
+        let missing: Vec<i64> = declared
+            .iter()
+            .copied()
+            .filter(|id| !cached.contains(id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "分组声明的会话必须全在缓存里，差集须为空（BUG-193）: {missing:?}"
+        );
+    }
+
     /// 缓存任务状态机：入队 → 复用 → 进度 → 终态 → 取消 → 僵尸降级。
     #[tokio::test]
     async fn cache_task_lifecycle() {

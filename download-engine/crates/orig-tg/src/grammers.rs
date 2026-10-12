@@ -15,7 +15,7 @@
 //! 服务以 `Availability::Unavailable(原因)` 启动，相关端点诚实返回 503，
 //! 由 `unavailable.rs::UnavailableClient` 承载（只返回错误、绝不返回数据）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -28,7 +28,7 @@ use grammers_client::client::{LoginToken, PasswordToken};
 use grammers_client::media::{Media, PhotoSize};
 use grammers_client::sender::ConnectionParams;
 use grammers_client::session::storages::SqliteSession;
-use grammers_client::session::types::PeerRef;
+use grammers_client::session::types::{PeerAuth, PeerId, PeerRef};
 use grammers_client::{Client as TgClient, SenderPool, SignInError, tl};
 use tokio::sync::Mutex;
 
@@ -85,6 +85,35 @@ static MEDIA_RAW_SCAN_CAP: usize = 600;
 /// Bot API 频道/超级群对话 id 前缀（-100 拼接，数值上为 -1000000000000 - channel_id）。
 static BOT_API_CHANNEL_MARK: i64 = -1_000_000_000_000;
 
+/// BUG-193：Telegram 的**归档**文件夹 id。
+///
+/// `messages.getDialogs` 的 `folder_id` 语义：`None` = 主文件夹，`Some(1)` = 归档。
+/// grammers-client 0.10.0 的 `DialogIter` 把该字段硬编码成 `None`
+/// （`src/client/dialogs.rs:29`），因此 `iter_dialogs()` **只枚举主文件夹** ——
+/// 归档对话永远拿不到。本实现改为自建分页器并显式传 `folder_id`。
+const ARCHIVE_FOLDER_ID: i32 = 1;
+
+/// 自建 `messages.getDialogs` 分页器的单页条数（Telegram 上限 100）。
+///
+/// 与 grammers `DialogIter::MAX_LIMIT` 取值一致：调大不生效，只会引入分页死循环。
+const DIALOG_PAGE_LIMIT: i32 = 100;
+
+/// 自建分页器的最大页数（≈ 20000 条对话，远超实测 519 条）。
+///
+/// 纯防御：游标若因任何原因不前进，兜底停机而不是无限打 Telegram。
+const DIALOG_PAGE_CAP: usize = 200;
+
+/// 会话枚举必须覆盖的 `folder_id` 全集（BUG-193 判据钉子）。
+///
+/// **为什么把它写成数据而不是散在代码里**：BUG-193 的验收要求「注掉归档枚举，
+/// 判据必须变红」。若 `None` / `Some(1)` 是两处各写一遍的字面量，删掉任何一处
+/// 都不会触发任何编译期或运行期信号 —— 判据只能靠人眼比对 diff。
+/// 声明成一份**被测试断言的常量**后，「少枚举一个文件夹」就成了可测的差异。
+///
+/// `None` = 主文件夹，`Some(1)` = 归档。**两者都不可省**：grammers 的
+/// `iter_dialogs()` 只覆盖 `None`（BUG-193 根因）。
+const ENUMERATED_FOLDER_IDS: [Option<i32>; 2] = [None, Some(ARCHIVE_FOLDER_ID)];
+
 /// 登录中间态（在多次 HTTP 请求之间保留 Telegram 返回的 token）。
 struct Pending {
     phase: LoginPhase,
@@ -92,6 +121,41 @@ struct Pending {
     user_id: Option<i64>,
     login_token: Option<LoginToken>,
     password_token: Option<PasswordToken>,
+}
+
+/// `GetDialogFilters` 的解析产物：公开 DTO + 对账用的成员表（BUG-193）。
+///
+/// 两者并存而不是只留 `Vec<Folder>`：`Folder::channel_ids` 只有裸 `i64`，而
+/// `DialogFilter` 成员是 `InputPeer`，**自带 `access_hash`** —— 那是把裸 id 换回
+/// 实体的唯一凭据，对账补齐（`resolve_folder_gaps`）离不开它。
+#[derive(Default)]
+struct FolderIndex {
+    /// 对外暴露的分组 DTO（`/api/tg/folders` 的数据源，行为不变）。
+    folders: Vec<Folder>,
+    /// 去重后的分组成员（跨分组去重，取首个命中分组）。
+    members: Vec<FolderMember>,
+}
+
+/// 一条分组成员声明：Bot API 对话 id + 所属分组 + 原始 `InputPeer`。
+struct FolderMember {
+    /// Bot API 对话 id（与 `Channel::id` 同空间）。
+    id: i64,
+    /// 所属分组标题（一个频道可属多组，取首个命中）。
+    folder: String,
+    /// `DialogFilter` 里的原始 `InputPeer`，保留 `access_hash` 供补齐查询使用。
+    peer: tl::enums::InputPeer,
+}
+
+/// `messages.getDialogs` 一页响应里某个 peer 的展示信息与访问凭据。
+///
+/// 由响应自带的 `users` / `chats` 向量建索引 —— grammers 的 `PeerMap` 是
+/// `pub(crate)`，外部拿不到，故自建。
+struct RawPeerInfo {
+    /// 展示名（`None` = 解析不到，按 BUG-194 走可辨识兜底名）。
+    title: Option<String>,
+    username: Option<String>,
+    /// 带 `access_hash` 的引用；缺 `access_hash` 的实体为 `None`。
+    peer_ref: Option<PeerRef>,
 }
 
 /// 缓存的媒体解析结果（BUG-028）。
@@ -290,6 +354,318 @@ impl GrammersClient {
         }
         found.ok_or_else(|| ClientError::Other("chat not found in subscribed dialogs".into()))
     }
+
+    /// 自建分页器：枚举指定 `folder_id` 的全部对话（BUG-193）。
+    ///
+    /// grammers 0.10 的 `DialogIter::new` 把 `folder_id` 硬编码成 `None`，且
+    /// `IterBuffer::from_request` 是 `pub(crate)` —— 高层 API **无法**表达归档
+    /// 文件夹。故此处直接发 `messages.getDialogs`，翻页语义与 grammers 的
+    /// `DialogIter::next` 逐条对齐（首屏 `exclude_pinned=false`、其后置 `true`：
+    /// 置顶只在首屏返回一次，置顶对话不会因此丢失）。
+    ///
+    /// 返回的每条同时写入 `peer_cache`，使归档频道的媒体/消息接口可直接命中。
+    async fn dialogs_in_folder(
+        &self,
+        folder_id: i32,
+        folder_of: &HashMap<i64, String>,
+    ) -> Result<Vec<Channel>, ClientError> {
+        let mut out: Vec<Channel> = Vec::new();
+        let mut request = tl::functions::messages::GetDialogs {
+            exclude_pinned: false,
+            folder_id: Some(folder_id),
+            offset_date: 0,
+            offset_id: 0,
+            offset_peer: tl::enums::InputPeer::Empty,
+            limit: DIALOG_PAGE_LIMIT,
+            hash: 0,
+        };
+        let mut pages = 0usize;
+        loop {
+            // 翻页游标必须严格前进，否则服务端会无限返回同一页。
+            pages += 1;
+            if pages > DIALOG_PAGE_CAP {
+                eprintln!(
+                    "[tg] BUG-193: archive enumeration hit page cap ({DIALOG_PAGE_CAP}); \
+                     stopping to avoid an unbounded loop"
+                );
+                break;
+            }
+            let (dialogs, messages, users, chats, last_chunk) =
+                match self.inner.invoke(&request).await.map_err(|e| self.rpc_err(e))? {
+                    tl::enums::messages::Dialogs::Dialogs(d) => {
+                        (d.dialogs, d.messages, d.users, d.chats, true)
+                    }
+                    tl::enums::messages::Dialogs::Slice(d) => {
+                        let last = (d.dialogs.len() as i32) < DIALOG_PAGE_LIMIT;
+                        (d.dialogs, d.messages, d.users, d.chats, last)
+                    }
+                    // `hash` 恒为 0，服务端不可能回 NotModified；真回了也不当空列表。
+                    tl::enums::messages::Dialogs::NotModified(_) => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), true),
+                };
+            if dialogs.is_empty() {
+                break;
+            }
+            let peers = raw_peer_index(&users, &chats);
+            // 下一页的游标：末条会话的 peer + 其末条消息（date/id），缺一不可。
+            let mut cursor: Option<(i32, i32, tl::enums::InputPeer)> = None;
+            for d in &dialogs {
+                let peer = d.peer();
+                let peer_ref = PeerId::from(&peer);
+                let Some(id) = peer_ref.bot_api_dialog_id() else {
+                    continue;
+                };
+                let info = peers.get(&id);
+                // PeerRef 回填：让归档频道后续的媒体/消息请求零额外枚举。
+                if let Some(pr) = info.and_then(|i| i.peer_ref) {
+                    self.peer_cache.lock().await.insert(id, pr);
+                }
+                out.push(Channel {
+                    id,
+                    title: dialog_display_title(
+                        info.and_then(|i| i.title.as_deref()),
+                        id,
+                    ),
+                    username: info.and_then(|i| i.username.clone()),
+                    folder: folder_of.get(&id).cloned(),
+                });
+                let top = d.top_message();
+                let date = messages
+                    .iter()
+                    .find_map(|m| match m {
+                        tl::enums::Message::Message(x) if x.id == top => Some(x.date),
+                        tl::enums::Message::Service(x) if x.id == top => Some(x.date),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                cursor = info
+                    .and_then(|i| i.peer_ref)
+                    .map(|pr| (date, top, (&pr).into()));
+            }
+            if last_chunk {
+                break;
+            }
+            match cursor {
+                Some((date, id, peer)) => {
+                    request.exclude_pinned = true;
+                    request.offset_date = date;
+                    request.offset_id = id;
+                    request.offset_peer = peer;
+                }
+                // 拿不到游标就无法安全翻页（再请求一次只会重复同一页）。
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// 为「分组声明了、但两轮文件夹枚举都没取到」的频道补齐最小记录。
+    ///
+    /// BUG-193 修复项 2。`DialogFilter` 的成员是 `InputPeer`，其中
+    /// `InputPeerChannel` / `InputPeerUser` **自带 `access_hash`** —— 这正是把裸 id
+    /// 换回实体的凭据。凭它分别调 `channels.getChannels` / `messages.getChats` /
+    /// `users.getUsers`，一次每类批量取回真实标题。
+    ///
+    /// 取回的实体同时写入 `peer_cache`：只补列表不补凭据的话，这些频道会变成
+    /// 「看得见、点进去什么都拉不到」的死行。
+    async fn resolve_folder_gaps(
+        &self,
+        wanted: &[&FolderMember],
+        folder_of: &HashMap<i64, String>,
+    ) -> Vec<Channel> {
+        // 按 peer 种类分桶：三个 RPC 的入参类型互不相同。
+        let mut input_channels: Vec<tl::enums::InputChannel> = Vec::new();
+        let mut chat_ids: Vec<i64> = Vec::new();
+        let mut input_users: Vec<tl::enums::InputUser> = Vec::new();
+        let mut unusable = 0usize;
+        for m in wanted {
+            match unwrap_from_message_peer(&m.peer) {
+                tl::enums::InputPeer::Channel(c) => {
+                    input_channels.push(tl::enums::InputChannel::Channel(
+                        tl::types::InputChannel {
+                            channel_id: c.channel_id,
+                            access_hash: c.access_hash,
+                        },
+                    ));
+                }
+                tl::enums::InputPeer::Chat(c) => chat_ids.push(c.chat_id),
+                tl::enums::InputPeer::User(u) => {
+                    input_users.push(tl::enums::InputUser::User(tl::types::InputUser {
+                        user_id: u.user_id,
+                        access_hash: u.access_hash,
+                    }));
+                }
+                // Self / Empty：不是可解析的 peer。
+                _ => unusable += 1,
+            }
+        }
+
+        let mut out: Vec<Channel> = Vec::new();
+        let mut cache = self.peer_cache.lock().await;
+
+        if !input_channels.is_empty() {
+            let n = input_channels.len();
+            let request = tl::functions::channels::GetChannels { id: input_channels };
+            match self.inner.invoke(&request).await {
+                // `Chats::Chats` 与 `Chats::Slice` 载荷类型不同，用 grammers 的
+                // `.chats()` 访问器统一取出 `Vec<Chat>`（两变体都实现了它）。
+                Ok(r) => {
+                    for chat in r.chats() {
+                        if let Some((ch, pr)) = channel_from_chat(&chat, folder_of) {
+                            if let Some(pr) = pr {
+                                cache.insert(ch.id, pr);
+                            }
+                            out.push(ch);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("[tg] BUG-193: getChannels failed for {n} channel(s): {e}"),
+            }
+        }
+
+        if !chat_ids.is_empty() {
+            let n = chat_ids.len();
+            // 基本群不需要 access_hash，`messages.getChats` 只收裸 chat_id。
+            let request = tl::functions::messages::GetChats { id: chat_ids };
+            match self.inner.invoke(&request).await {
+                Ok(r) => {
+                    for chat in r.chats() {
+                        if let Some((ch, pr)) = channel_from_chat(&chat, folder_of) {
+                            if let Some(pr) = pr {
+                                cache.insert(ch.id, pr);
+                            }
+                            out.push(ch);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("[tg] BUG-193: getChats failed for {n} chat(s): {e}"),
+            }
+        }
+
+        if !input_users.is_empty() {
+            let n = input_users.len();
+            let request = tl::functions::users::GetUsers { id: input_users };
+            match self.inner.invoke(&request).await {
+                // `users.getUsers` 直接返回 `Vec<User>`（无 Slice 变体），无需拆包。
+                Ok(users) => {
+                    for user in &users {
+                        if let Some((ch, pr)) = channel_from_user(user, folder_of) {
+                            if let Some(pr) = pr {
+                                cache.insert(ch.id, pr);
+                            }
+                            out.push(ch);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("[tg] BUG-193: getUsers failed for {n} user(s): {e}"),
+            }
+        }
+
+        if unusable > 0 {
+            eprintln!(
+                "[tg] BUG-193: {unusable} folder-declared peer(s) were Self/Empty and stay uncached"
+            );
+        }
+        out
+    }
+
+    /// 拉取并解析 `GetDialogFilters`，同时产出公开 DTO 与对账用的成员表。
+    ///
+    /// **为什么不再只返回 `Folder`**：`Folder::channel_ids` 只有 `i64`，而
+    /// `DialogFilter` 里的 `InputPeer` **自带 `access_hash`**。此前把 `InputPeer`
+    /// 当场折成 id 丢掉，等于扔掉了「把裸 id 换回实体」的唯一凭据 ——
+    /// BUG-193 的对账补齐（`resolve_folder_gaps`）正需要它。
+    async fn folder_index(&self) -> Result<FolderIndex, ClientError> {
+        // 走原始 TL 调用拉取自定义分组（grammers 高层未暴露 DialogFilter）。
+        let result = self
+            .inner
+            .invoke(&tl::functions::messages::GetDialogFilters {})
+            .await
+            .map_err(|e| self.rpc_err(e))?;
+        let filters = match result {
+            tl::enums::messages::DialogFilters::Filters(f) => f.filters,
+        };
+
+        // 诊断日志（BUG-013 实证）：原始 filters 数量与每个变体，定位空响应来源。
+        eprintln!(
+            "[tg] GetDialogFilters raw count={} variants=[{}]",
+            filters.len(),
+            filters
+                .iter()
+                .map(|f| match f {
+                    tl::enums::DialogFilter::Filter(_) => "filter",
+                    tl::enums::DialogFilter::Chatlist(_) => "chatlist",
+                    tl::enums::DialogFilter::Default => "default",
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        let mut index = FolderIndex::default();
+        for f in filters {
+            // 普通自定义文件夹 Filter 与共享聊天列表 Chatlist 都对用户可见，统一接受。
+            //
+            // BUG-195：`DialogFilter` 的成员是**两个**独立字段 ——
+            // `pinned_peers`（文件夹内置顶的）与 `include_peers`（其余成员）。
+            // 只读 `include_peers` 会把置顶成员整个丢掉（实测 MyTop 应为 24 却只读到 20，
+            // 差的正是 4 个 pinned）。两者都要取，且要去重（同一 peer 可能两处都在）。
+            let (id, title, peers, pinned_len) = match f {
+                tl::enums::DialogFilter::Filter(filter) => {
+                    let pinned_len = filter.pinned_peers.len();
+                    let mut peers = filter.pinned_peers;
+                    peers.extend(filter.include_peers);
+                    (filter.id, filter.title, peers, pinned_len)
+                }
+                tl::enums::DialogFilter::Chatlist(filter) => {
+                    let pinned_len = filter.pinned_peers.len();
+                    let mut peers = filter.pinned_peers;
+                    peers.extend(filter.include_peers);
+                    (filter.id, filter.title, peers, pinned_len)
+                }
+                tl::enums::DialogFilter::Default => continue,
+            };
+            let title = match title {
+                tl::enums::TextWithEntities::Entities(t) => t.text,
+            };
+            // 统一转换为 Bot API 对话 id（与 dialogs 的 id 同空间，否则映射永不命中）。
+            // 去重：置顶成员可能同时出现在 `include_peers` 里，重复会污染后续对账。
+            let mut seen_in_folder: HashSet<i64> = HashSet::new();
+            let mut ids: Vec<i64> = Vec::new();
+            for p in peers.iter() {
+                if let Some(v) = input_peer_bot_api_id(p) {
+                    if seen_in_folder.insert(v) {
+                        ids.push(v);
+                        index.members.push(FolderMember {
+                            id: v,
+                            folder: title.clone(),
+                            peer: p.clone(),
+                        });
+                    }
+                }
+            }
+            eprintln!(
+                "[tg] folder id={id} title={title:?} pinned={pinned_len} peers={} mapped={}",
+                peers.len(),
+                ids.len()
+            );
+            index.folders.push(Folder {
+                id,
+                title,
+                channel_ids: ids,
+            });
+        }
+        // 同一频道可属多个分组；`folder_of()` 取首个命中，这里同步去重，
+        // 使「declared 基准集」与实际标注口径一致（否则同一个 id 会被补齐两次）。
+        let mut deduped: Vec<FolderMember> = Vec::new();
+        let mut member_ids: HashSet<i64> = HashSet::new();
+        for m in index.members {
+            if member_ids.insert(m.id) {
+                deduped.push(m);
+            }
+        }
+        index.members = deduped;
+        Ok(index)
+    }
+
 }
 
 #[async_trait::async_trait]
@@ -362,11 +738,23 @@ impl Client for GrammersClient {
     }
 
     async fn dialogs(&self) -> Result<Vec<Channel>, ClientError> {
-        // 先读分组，建立 频道id -> 分组标题 映射（一个频道可属多组，取首个命中）。
-        // 分组读取失败（如代理连接抖动被断）不阻塞频道枚举：仅降级为「未分组」。
-        let folder_of = self.folder_of().await;
-        let mut out = Vec::new();
+        // 先读分组：既是「频道 -> 分组标题」标注的来源，也是 BUG-193 对账的基准集。
+        // 分组读取失败（如代理连接抖动被断）不阻塞频道枚举：降级为「未分组 + 无对账」。
+        let index = self.folder_index().await.unwrap_or_else(|e| {
+            eprintln!("[tg] BUG-193: dialog folder index unavailable, degraded: {e}");
+            FolderIndex::default()
+        });
+        let folder_of: HashMap<i64, String> = index
+            .members
+            .iter()
+            .map(|m| (m.id, m.folder.clone()))
+            .collect();
+
+        let mut seen: HashSet<i64> = HashSet::new();
         let mut skipped_unidentifiable = 0usize;
+
+        // ---- 主文件夹（grammers 高层枚举，folder_id = None）----
+        let mut primary = Vec::new();
         let mut iter = self.inner.iter_dialogs();
         while let Some(dialog) = iter
             .next()
@@ -379,7 +767,7 @@ impl Client for GrammersClient {
             // BUG-194：身份不可判定的 Dialog（id 解析失败）不入库，
             // 否则会以 id=0 撞主键、覆盖出一条假会话。
             match channel_from_dialog(&dialog, &folder_of) {
-                Some(ch) => out.push(ch),
+                Some(ch) => primary.push(ch),
                 None => skipped_unidentifiable += 1,
             }
         }
@@ -389,84 +777,64 @@ impl Client for GrammersClient {
                 "[tg] dialog scan: skipped {skipped_unidentifiable} dialogs with unidentifiable peer"
             );
         }
+
+        // ---- 归档文件夹（folder_id = 1）----
+        // BUG-193 根因修复。grammers 0.10 的 `DialogIter` 把 `folder_id` 写死为
+        // `None`（`client/dialogs.rs:29`），`iter_dialogs()` **只枚举主文件夹** ——
+        // 归档对话永远拿不到，于是归档频道虽进了 TG 分组，应用会话列表里却根本没
+        // 这一行（doc 实测 66 个）。故自建分页器显式传 `folder_id`。
+        //
+        // 失败**不得**连累主文件夹结果：降级为空并留下可对账日志。
+        let archived = if ENUMERATED_FOLDER_IDS.contains(&Some(ARCHIVE_FOLDER_ID)) {
+            match self.dialogs_in_folder(ARCHIVE_FOLDER_ID, &folder_of).await {
+                Ok(list) => list,
+                Err(e) => {
+                    eprintln!("[tg] BUG-193: archive folder enumeration failed, degraded: {e}");
+                    Vec::new()
+                }
+            }
+        } else {
+            // 不可达分支：显式保留，使「枚举范围」与 `ENUMERATED_FOLDER_IDS` 单一真源绑定。
+            Vec::new()
+        };
+        let archived_len = archived.len();
+        let mut out = merge_dialog_folders(primary, archived);
+        for ch in out.iter() {
+            seen.insert(ch.id);
+        }
+        eprintln!(
+            "[tg] BUG-193: dialogs merged primary+archive total={} (archive contributed {archived_len})",
+            out.len()
+        );
+
+        // ---- 以分组声明为基准对账（BUG-193 修复项 2）----
+        // 归档枚举补的是「归档文件夹里的对话」；但分组声明里还可能有**既不在主文件夹、
+        // 也不在归档文件夹**的频道（被移出/已退群却仍被分组引用的历史成员）。
+        // 它们在列表里同样缺席，故按需解析后各补一条最小记录。
+        let missing = missing_from_declaration(&seen, index.members.iter().map(|m| m.id));
+        if !missing.is_empty() {
+            let wanted: Vec<&FolderMember> = index
+                .members
+                .iter()
+                .filter(|m| missing.binary_search(&m.id).is_ok())
+                .collect();
+            let resolved = self.resolve_folder_gaps(&wanted, &folder_of).await;
+            let resolved_len = resolved.len();
+            out.extend(resolved);
+            eprintln!(
+                "[tg] BUG-193: folder reconciliation declared={} missing={} resolved={} still_missing={}",
+                index.members.len(),
+                missing.len(),
+                resolved_len,
+                missing.len().saturating_sub(resolved_len)
+            );
+        }
+
         Ok(out)
     }
 
     async fn folders(&self) -> Result<Vec<Folder>, ClientError> {
-        // 走原始 TL 调用拉取自定义分组（grammers 高层未暴露 DialogFilter）。
-        let result = self
-            .inner
-            .invoke(&tl::functions::messages::GetDialogFilters {})
-            .await
-            .map_err(|e| self.rpc_err(e))?;
-        let filters = match result {
-            tl::enums::messages::DialogFilters::Filters(f) => f.filters,
-        };
-
-        // 诊断日志（BUG-013 实证）：原始 filters 数量与每个变体，定位空响应来源。
-        eprintln!(
-            "[tg] GetDialogFilters raw count={} variants=[{}]",
-            filters.len(),
-            filters
-                .iter()
-                .map(|f| match f {
-                    tl::enums::DialogFilter::Filter(_) => "filter",
-                    tl::enums::DialogFilter::Chatlist(_) => "chatlist",
-                    tl::enums::DialogFilter::Default => "default",
-                })
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-
-        let mut out = Vec::new();
-        for f in filters {
-            // 普通自定义文件夹 Filter 与共享聊天列表 Chatlist 都对用户可见，统一接受。
-            //
-            // BUG-195：`DialogFilter` 的成员是**两个**独立字段 ——
-            // `pinned_peers`（文件夹内置顶的）与 `include_peers`（其余成员）。
-            // 只读 `include_peers` 会把置顶成员整个丢掉（实测 MyTop 应为 24 却只读到 20，
-            // 差的正是 4 个 pinned）。两者都要取，且要去重（同一 peer 可能两处都在）。
-            let (id, title, peers, pinned_len) = match f {
-                tl::enums::DialogFilter::Filter(filter) => {
-                    let pinned_len = filter.pinned_peers.len();
-                    let mut peers = filter.pinned_peers;
-                    peers.extend(filter.include_peers);
-                    (filter.id, filter.title, peers, pinned_len)
-                }
-                tl::enums::DialogFilter::Chatlist(filter) => {
-                    let pinned_len = filter.pinned_peers.len();
-                    let mut peers = filter.pinned_peers;
-                    peers.extend(filter.include_peers);
-                    (filter.id, filter.title, peers, pinned_len)
-                }
-                tl::enums::DialogFilter::Default => continue,
-            };
-            let title = match title {
-                tl::enums::TextWithEntities::Entities(t) => t.text,
-            };
-            // 统一转换为 Bot API 对话 id（与 dialogs 的 id 同空间，否则映射永不命中）。
-            // 去重：置顶成员可能同时出现在 `include_peers` 里，重复会污染后续对账。
-            let mut seen = std::collections::HashSet::new();
-            let mut ids: Vec<i64> = Vec::new();
-            for p in peers.iter() {
-                if let Some(v) = input_peer_bot_api_id(p) {
-                    if seen.insert(v) {
-                        ids.push(v)
-                    }
-                }
-            }
-            eprintln!(
-                "[tg] folder id={id} title={title:?} pinned={pinned_len} peers={} mapped={}",
-                peers.len(),
-                ids.len()
-            );
-            out.push(Folder {
-                id,
-                title,
-                channel_ids: ids,
-            });
-        }
-        Ok(out)
+        Ok(self.folder_index().await?.folders)
     }
 
     /// 链路活性（BUG-106）：sender runner 还在跑才算活着。
@@ -932,19 +1300,6 @@ impl GrammersClient {
             bytes,
         }))
     }
-
-    async fn folder_of(&self) -> std::collections::HashMap<i64, String> {
-        let mut folder_of: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
-        if let Ok(folders) = self.folders().await {
-            for folder in folders {
-                let title = folder.title.clone();
-                for id in folder.channel_ids {
-                    folder_of.entry(id).or_insert_with(|| title.clone());
-                }
-            }
-        }
-        folder_of
-    }
 }
 
 /// 将一条 Dialog 转换为公共 Channel DTO（含分组标题映射）。
@@ -973,6 +1328,225 @@ fn channel_from_dialog(
         username: peer.username().map(str::to_string),
         folder: folder_of.get(&id).cloned(),
     })
+}
+
+/// 合并主文件夹与归档文件夹的枚举结果，按 id 去重（BUG-193）。
+///
+/// **主文件夹优先**：同一频道若两处都出现，以主文件夹那条为准 —— 它带 grammers
+/// 已解析好的 `Peer`（名称/用户名），而归档那条走的是本文件的 TL 直解路径。
+/// 保留「先到先得」而不是排序，保证主文件夹结果整体顺序不变（不回归既有列表）。
+fn merge_dialog_folders(primary: Vec<Channel>, archived: Vec<Channel>) -> Vec<Channel> {
+    let mut seen: HashSet<i64> = HashSet::with_capacity(primary.len() + archived.len());
+    let mut out: Vec<Channel> = Vec::with_capacity(primary.len() + archived.len());
+    for ch in primary.into_iter().chain(archived) {
+        if seen.insert(ch.id) {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// 分组声明了、但枚举没取到的频道 id（升序、去重）—— BUG-193 对账判据。
+///
+/// 返回**升序**数组，使调用方的补齐顺序与日志可复现（`HashSet` 迭代序不确定）。
+fn missing_from_declaration<I>(seen: &HashSet<i64>, declared: I) -> Vec<i64>
+where
+    I: IntoIterator<Item = i64>,
+{
+    let mut missing: Vec<i64> = declared
+        .into_iter()
+        .filter(|id| !seen.contains(id))
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    missing
+}
+
+/// 剥掉 `inputPeer*FromMessage` 外壳，取其内层真正带 `access_hash` 的 peer。
+///
+/// `inputPeerChannelFromMessage` / `inputPeerUserFromMessage` 自身**不带**
+/// `access_hash`（只有 `peer` + `msg_id` + `channel_id`/`user_id`），而内层
+/// `peer` 才是完整的 `InputPeer`。不剥壳就拿不到补齐所需的凭据。
+fn unwrap_from_message_peer(peer: &tl::enums::InputPeer) -> &tl::enums::InputPeer {
+    match peer {
+        tl::enums::InputPeer::UserFromMessage(u) => unwrap_from_message_peer(&u.peer),
+        tl::enums::InputPeer::ChannelFromMessage(c) => unwrap_from_message_peer(&c.peer),
+        other => other,
+    }
+}
+
+/// 由 `messages.getDialogs` 响应自带的 `users` / `chats` 建 `Bot API id -> 实体信息` 索引。
+///
+/// grammers 的 `build_peer_map` 是 `pub(crate)`，外部无法复用，故自建。键用
+/// `PeerId::bot_api_dialog_id()` —— 与 `Channel::id` 同一空间，保证后续查表命中。
+fn raw_peer_index(
+    users: &[tl::enums::User],
+    chats: &[tl::enums::Chat],
+) -> HashMap<i64, RawPeerInfo> {
+    let mut out: HashMap<i64, RawPeerInfo> = HashMap::with_capacity(users.len() + chats.len());
+    for u in users {
+        let tl::enums::User::User(x) = u else {
+            continue; // UserEmpty：无实体信息。
+        };
+        let Some(id) = PeerId::user(x.id).and_then(|p| p.bot_api_dialog_id()) else {
+            continue;
+        };
+        // 名称口径与 grammers `Peer::name()` 对齐：用户只取 `first_name`
+        // （grammers 同款），空则由 `dialog_display_title` 兜底。
+        let title = x
+            .first_name
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| x.username.clone());
+        let peer_ref = x.access_hash.and_then(|h| {
+            PeerId::user(x.id).map(|p| PeerRef {
+                id: p,
+                auth: PeerAuth::from_hash(h),
+            })
+        });
+        out.insert(
+            id,
+            RawPeerInfo {
+                title,
+                username: x.username.clone(),
+                peer_ref,
+            },
+        );
+    }
+    for c in chats {
+        // 先算出 `PeerId` 再取展示字段：把「是频道还是基本群」的判定收敛到一处，
+        // 避免两处各判一次而漂移（`PeerId::chat` 与 `PeerId::channel` 是不同
+        // 类型的函数项，不能放进同一个元组）。
+        let peer_id = match c {
+            tl::enums::Chat::Chat(x) => PeerId::chat(x.id),
+            tl::enums::Chat::Forbidden(x) => PeerId::chat(x.id),
+            tl::enums::Chat::Channel(x) => PeerId::channel(x.id),
+            tl::enums::Chat::ChannelForbidden(x) => PeerId::channel(x.id),
+            // ChatEmpty：Telegram 只确认 id 存在，无名称。
+            tl::enums::Chat::Empty(_) => continue,
+        };
+        let Some(peer_id) = peer_id else {
+            continue;
+        };
+        let Some(id) = peer_id.bot_api_dialog_id() else {
+            continue;
+        };
+        let (title, username, access_hash) = match c {
+            tl::enums::Chat::Chat(x) => (x.title.clone(), None, None),
+            tl::enums::Chat::Forbidden(x) => (x.title.clone(), None, None),
+            tl::enums::Chat::Channel(x) => {
+                (x.title.clone(), x.username.clone(), x.access_hash)
+            }
+            tl::enums::Chat::ChannelForbidden(x) => (x.title.clone(), None, Some(x.access_hash)),
+            tl::enums::Chat::Empty(_) => continue,
+        };
+        // 基本群不需要 access_hash（与 grammers `PeerInfo::Chat` 一致），给 ambient 权限。
+        let peer_ref = Some(PeerRef {
+            id: peer_id,
+            auth: match access_hash {
+                Some(h) => PeerAuth::from_hash(h),
+                None => PeerAuth::default(),
+            },
+        });
+        out.insert(
+            id,
+            RawPeerInfo {
+                title: Some(title),
+                username,
+                peer_ref,
+            },
+        );
+    }
+    out
+}
+
+/// `tl::enums::Chat` -> 公共 `Channel` DTO（补齐路径专用）。
+///
+/// 返回 `(Channel, PeerRef?)`：peer 引用为 `None` 表示该实体没带 `access_hash`
+/// （`chatForbidden` 等），此时**仍入库**（列表可见）但不入 `peer_cache` ——
+/// 写一个必然失败的 PeerRef 只会污染缓存并掩盖「确实没有凭据」这一事实。
+fn channel_from_chat(
+    chat: &tl::enums::Chat,
+    folder_of: &HashMap<i64, String>,
+) -> Option<(Channel, Option<PeerRef>)> {
+    if matches!(chat, tl::enums::Chat::Empty(_)) {
+        return None;
+    }
+    let peer_id = match chat {
+        tl::enums::Chat::Chat(x) => PeerId::chat(x.id),
+        tl::enums::Chat::Forbidden(x) => PeerId::chat(x.id),
+        tl::enums::Chat::Channel(x) => PeerId::channel(x.id),
+        tl::enums::Chat::ChannelForbidden(x) => PeerId::channel(x.id),
+        tl::enums::Chat::Empty(_) => None,
+    }?;
+    let id = peer_id.bot_api_dialog_id()?;
+    let title = match chat {
+        tl::enums::Chat::Chat(x) => Some(x.title.clone()),
+        tl::enums::Chat::Forbidden(x) => Some(x.title.clone()),
+        tl::enums::Chat::Channel(x) => Some(x.title.clone()),
+        tl::enums::Chat::ChannelForbidden(x) => Some(x.title.clone()),
+        tl::enums::Chat::Empty(_) => None,
+    };
+    let username = match chat {
+        tl::enums::Chat::Channel(x) => x.username.clone(),
+        _ => None,
+    };
+    let peer_ref = match chat {
+        tl::enums::Chat::Channel(x) => x.access_hash.map(|h| PeerRef {
+            id: peer_id,
+            auth: PeerAuth::from_hash(h),
+        }),
+        tl::enums::Chat::ChannelForbidden(x) => Some(PeerRef {
+            id: peer_id,
+            auth: PeerAuth::from_hash(x.access_hash),
+        }),
+        // 基本群不需要 access_hash，用 ambient 权限（与 grammers `PeerInfo::Chat` 一致）。
+        tl::enums::Chat::Chat(_) | tl::enums::Chat::Forbidden(_) => Some(PeerRef {
+            id: peer_id,
+            auth: PeerAuth::default(),
+        }),
+        tl::enums::Chat::Empty(_) => None,
+    };
+    Some((
+        Channel {
+            id,
+            title: dialog_display_title(title.as_deref(), id),
+            username,
+            folder: folder_of.get(&id).cloned(),
+        },
+        peer_ref,
+    ))
+}
+
+/// `tl::enums::User` -> 公共 `Channel` DTO（补齐路径专用）。
+fn channel_from_user(
+    user: &tl::enums::User,
+    folder_of: &HashMap<i64, String>,
+) -> Option<(Channel, Option<PeerRef>)> {
+    let tl::enums::User::User(x) = user else {
+        return None; // UserEmpty：无实体信息。
+    };
+    let peer_id = PeerId::user(x.id)?;
+    let id = peer_id.bot_api_dialog_id()?;
+    // 名称口径与 grammers `Peer::name()` 对齐（只取 first_name），空则走兜底名。
+    let name = x
+        .first_name
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| x.username.clone());
+    let peer_ref = x.access_hash.map(|h| PeerRef {
+        id: peer_id,
+        auth: PeerAuth::from_hash(h),
+    });
+    Some((
+        Channel {
+            id,
+            title: dialog_display_title(name.as_deref(), id),
+            username: x.username.clone(),
+            folder: folder_of.get(&id).cloned(),
+        },
+        peer_ref,
+    ))
 }
 
 /// 清洗文件名：Windows 非法字符/控制字符替换为 `_`，去尾部 `.`/空格（NTFS 拒绝），
@@ -1533,6 +2107,306 @@ mod tests {
             res.status(),
             503,
             "链路已断是依赖故障，绝不能报成 4xx（会被读成用户操作失误）"
+        );
+    }
+
+    // ---- BUG-193：归档（非主文件夹）会话必须进入枚举结果 ----
+
+    fn ch(id: i64, title: &str, folder: Option<&str>) -> Channel {
+        Channel {
+            id,
+            title: title.to_string(),
+            username: None,
+            folder: folder.map(str::to_string),
+        }
+    }
+
+    /// 构造一个字段齐全的 `tl::types::User`，供测试用 `..base_user()` 只覆盖关心的字段。
+    ///
+    /// 该类型有 50 个字段且**没有 `Default` derive**，逐个在每个测试里写全既啰嗦
+    /// 又容易随 TL 层升级而失效。其余字段一律取零值 —— 被断言的只有
+    /// `id` / `access_hash` / `first_name` / `username`，其余本就与本组测试无关。
+    fn base_user() -> tl::types::User {
+        tl::types::User {
+            is_self: false,
+            contact: false,
+            mutual_contact: false,
+            deleted: false,
+            bot: false,
+            bot_chat_history: false,
+            bot_nochats: false,
+            verified: false,
+            restricted: false,
+            min: false,
+            bot_inline_geo: false,
+            support: false,
+            scam: false,
+            apply_min_photo: false,
+            fake: false,
+            bot_attach_menu: false,
+            premium: false,
+            attach_menu_enabled: false,
+            bot_can_edit: false,
+            close_friend: false,
+            stories_hidden: false,
+            stories_unavailable: false,
+            contact_require_premium: false,
+            bot_business: false,
+            bot_has_main_app: false,
+            bot_forum_view: false,
+            bot_forum_can_manage_topics: false,
+            bot_can_manage_bots: false,
+            bot_guestchat: false,
+            bot_guard: false,
+            id: 0,
+            access_hash: None,
+            first_name: None,
+            last_name: None,
+            username: None,
+            phone: None,
+            photo: None,
+            status: None,
+            bot_info_version: None,
+            restriction_reason: None,
+            bot_inline_placeholder: None,
+            lang_code: None,
+            emoji_status: None,
+            usernames: None,
+            stories_max_id: None,
+            color: None,
+            profile_color: None,
+            bot_active_users: None,
+            bot_verification_icon: None,
+            send_paid_messages_stars: None,
+        }
+    }
+
+    /// BUG-193 的**核心判据**：枚举范围必须同时含主文件夹与归档文件夹。
+    ///
+    /// 这是 doc「反向证伪」要求能成立的关键：把 `ENUMERATED_FOLDER_IDS` 里的
+    /// 归档项去掉（或把 `ARCHIVE_FOLDER_ID` 改错），本条立刻变红。
+    /// 没有这条时，删掉归档枚举不会有任何测试信号 —— 判据形同虚设。
+    #[test]
+    fn enumeration_covers_the_archive_folder_bug193() {
+        assert!(
+            ENUMERATED_FOLDER_IDS.contains(&Some(ARCHIVE_FOLDER_ID)),
+            "BUG-193：枚举范围必须含归档文件夹（folder_id=1），否则归档频道永不进缓存"
+        );
+        assert!(
+            ENUMERATED_FOLDER_IDS.contains(&None),
+            "主文件夹（folder_id=None）必须仍在枚举范围内，不得回归"
+        );
+        // 归档 id 必须真的是 Telegram 的 Archive（1），不是随手写的数。
+        assert_eq!(ARCHIVE_FOLDER_ID, 1, "Telegram 的归档文件夹 id 恒为 1");
+        // 恰好两个来源：多出来的只会是无谓 RPC，少了就是缺陷。
+        assert_eq!(ENUMERATED_FOLDER_IDS.len(), 2);
+    }
+
+    /// 反向证伪：把归档从枚举范围里摘掉（= BUG-193 修复前的状态）判据必须变红。
+    ///
+    /// 用真实的枚举范围常量跑一遍判定逻辑，证明上面那条断言真的会失败 ——
+    /// 否则「测试通过」可能只是断言写得太松。
+    #[test]
+    fn removing_archive_from_enumeration_turns_the_criterion_red_bug193() {
+        // 模拟「注掉归档枚举」：范围里只剩主文件夹。
+        let without_archive: Vec<Option<i32>> = ENUMERATED_FOLDER_IDS
+            .iter()
+            .copied()
+            .filter(|id| *id != Some(ARCHIVE_FOLDER_ID))
+            .collect();
+        assert!(
+            !without_archive.contains(&Some(ARCHIVE_FOLDER_ID)),
+            "对照组前提：摘掉归档后枚举范围确实不含归档文件夹"
+        );
+        // 这正是 `archive_folder_dialogs_survive_the_merge_bug193` 的判据：
+        // 没有归档来源，归档频道就无从进入列表。
+        let merged = merge_dialog_folders(vec![ch(777_000, "Telegram", None)], vec![]);
+        assert!(
+            !merged
+                .iter()
+                .any(|c| c.id == -1_000_000_004_493_170_102),
+            "归档来源缺席时，归档频道必然缺失（这正是 BUG-193 的现象）"
+        );
+    }
+
+    /// 归档文件夹的对话必须真的进合并结果（BUG-193 根因判据）。
+    ///
+    /// 本条锁的是 doc 实测的缺陷形状：66 个频道在 TG 分组里声明了，却因为
+    /// `iter_dialogs()` 只枚举主文件夹而不在应用会话列表中。合并函数一旦
+    /// 漏掉归档侧（或去重写错），这里立刻变红。
+    #[test]
+    fn archive_folder_dialogs_survive_the_merge_bug193() {
+        let primary = vec![ch(777_000, "Telegram", Some("MyTop"))];
+        // 归档频道：负 id（-100 前缀），带自定义分组标注。
+        let archived = vec![
+            ch(-1_000_000_004_493_170_102, "归档频道 A", Some("‼️全网分组中心A‼️")),
+            ch(-1_000_000_004_493_170_103, "归档频道 B", None),
+        ];
+        let merged = merge_dialog_folders(primary, archived);
+
+        let ids: std::collections::HashSet<i64> = merged.iter().map(|c| c.id).collect();
+        assert!(
+            ids.contains(&-1_000_000_004_493_170_102),
+            "归档频道必须出现在会话列表里（BUG-193）"
+        );
+        assert!(ids.contains(&-1_000_000_004_493_170_103));
+        assert!(ids.contains(&777_000), "主文件夹会话不得被归档侧挤掉");
+        assert_eq!(merged.len(), 3, "主 + 归档求并集，不重不漏");
+        // 分组标注要跟着一起过来（UI 靠它分组）。
+        assert_eq!(
+            merged
+                .iter()
+                .find(|c| c.id == -1_000_000_004_493_170_102)
+                .unwrap()
+                .folder
+                .as_deref(),
+            Some("‼️全网分组中心A‼️")
+        );
+    }
+
+    /// 反向证伪：归档侧若被丢弃（BUG-193 修复前 的形状），上面那条必须失败。
+    ///
+    /// 这条把「不合并归档」的写法直接跑一遍，证明判据真的会红 ——
+    /// 否则「测试通过」可能只是断言写得太松。
+    #[test]
+    fn dropping_the_archive_side_fails_the_bug193_assertion() {
+        let primary = vec![ch(777_000, "Telegram", Some("MyTop"))];
+        let archived = [ch(-1_000_000_004_493_170_102, "归档频道 A", None)];
+        // 只取主文件夹（即修复前的行为）。
+        let merged = merge_dialog_folders(primary, vec![]);
+        let ids: std::collections::HashSet<i64> = merged.iter().map(|c| c.id).collect();
+        assert!(
+            !ids.contains(&-1_000_000_004_493_170_102),
+            "对照组前提：主文件夹单独枚举时归档频道确实缺席"
+        );
+        assert!(!ids.contains(&archived[0].id));
+    }
+
+    /// 同一频道同属主/归档两处时只留一条，且**以主文件夹那条为准**。
+    #[test]
+    fn merge_prefers_the_primary_folder_record_bug193() {
+        let primary = vec![ch(-1_000_000_004_493_170_102, "主文件夹版本", Some("MyTop"))];
+        let archived = vec![ch(-1_000_000_004_493_170_102, "归档版本", None)];
+        let merged = merge_dialog_folders(primary, archived);
+        assert_eq!(merged.len(), 1, "同 id 不得产生重复行");
+        assert_eq!(merged[0].title, "主文件夹版本");
+        assert_eq!(merged[0].folder.as_deref(), Some("MyTop"));
+    }
+
+    /// 对账：分组声明了但两轮枚举都没取到的 id，正是要补齐的那一批。
+    #[test]
+    fn missing_from_declaration_picks_the_gap_bug193() {
+        let declared = vec![
+            -1_000_000_004_493_170_102i64,
+            777_000,
+            -1_000_000_004_493_170_103,
+            555,
+        ];
+        // 模拟枚举结果：主文件夹 + 归档文件夹共覆盖 3 个，555 缺席。
+        let seen: std::collections::HashSet<i64> = [
+            -1_000_000_004_493_170_102i64,
+            777_000,
+            -1_000_000_004_493_170_103,
+        ]
+        .into_iter()
+        .collect();
+        let missing = missing_from_declaration(&seen, declared);
+        assert_eq!(missing, vec![555], "只报真正缺席的 id，且升序可复现");
+    }
+
+    /// 对账为空时不得触发补齐（避免每次扫描都白发一轮 RPC）。
+    #[test]
+    fn missing_is_empty_when_enumeration_is_complete_bug193() {
+        let seen: std::collections::HashSet<i64> = [777_000, -1_000_000_004_493_170_102]
+            .into_iter()
+            .collect();
+        let missing = missing_from_declaration(&seen, vec![777_000, -1_000_000_004_493_170_102]);
+        assert!(missing.is_empty(), "枚举齐了就不该有缺口");
+    }
+
+    /// `inputPeer*FromMessage` 外壳必须剥掉：外壳本身不带 `access_hash`，
+    /// 不剥就拿不到补齐所需凭据（`resolve_folder_gaps` 会静默漏掉这些频道）。
+    #[test]
+    fn from_message_shell_is_unwrapped_for_access_hash_bug193() {
+        use tl::enums::InputPeer;
+        let inner = InputPeer::Channel(tl::types::InputPeerChannel {
+            channel_id: 4_493_170_102,
+            access_hash: 12_345,
+        });
+        let wrapped = InputPeer::ChannelFromMessage(Box::new(
+            tl::types::InputPeerChannelFromMessage {
+                peer: inner,
+                msg_id: 7,
+                channel_id: 4_493_170_102,
+            },
+        ));
+        match unwrap_from_message_peer(&wrapped) {
+            InputPeer::Channel(c) => assert_eq!(
+                c.access_hash, 12_345,
+                "剥壳后必须拿得到 access_hash，否则补齐无从下手"
+            ),
+            other => panic!("剥壳后应是 InputPeer::Channel，实际 {other:?}"),
+        }
+        // 非 FromMessage 变体原样返回。
+        assert!(matches!(
+            unwrap_from_message_peer(&wrapped),
+            InputPeer::Channel(_)
+        ));
+    }
+
+    /// 归档枚举/补齐共用的实体转换：`channelFromMessage` 频道必须被转成
+/// 带标题与分组标注的 `Channel`，并带出 `access_hash` 以便回填 `peer_cache`。
+    ///
+    /// 这里**不**构造完整 `tl::types::Channel`（40+ 必填字段、无 `Default`），
+    /// 而改测 `channel_from_user` —— 它入参小、走的仍是同一条「实体 -> Channel
+    /// + PeerRef」逻辑（`id` 换算 / 标题兜底 / `access_hash` 带出三处都在）。
+    #[test]
+    fn channel_from_entity_carries_identity_and_credentials_bug193() {
+        let user = tl::enums::User::User(tl::types::User {
+            id: 777_000,
+            access_hash: Some(998_877),
+            first_name: Some("归档里的用户".to_string()),
+            username: Some("archuser".to_string()),
+            ..base_user()
+        });
+        let folder_of: HashMap<i64, String> =
+            [(777_000i64, "‼️全网分组中心A‼️".to_string())].into_iter().collect();
+        let (c, pr) = channel_from_user(&user, &folder_of).expect("用户实体必须能转成 Channel");
+        assert_eq!(c.id, 777_000);
+        assert_eq!(c.title, "归档里的用户");
+        assert_eq!(c.username.as_deref(), Some("archuser"));
+        assert_eq!(
+            c.folder.as_deref(),
+            Some("‼️全网分组中心A‼️"),
+            "分组标注必须一起带出"
+        );
+        assert_eq!(
+            pr.expect("用户实体应带出 PeerRef").auth.hash(),
+            998_877,
+            "access_hash 必须原样带出，否则补齐出来的行点进去拉不到东西"
+        );
+    }
+
+    /// 无名实体必须拿到**可辨识**兜底名（复用 BUG-194 的收敛函数，不得留空）。
+    #[test]
+    fn channel_from_entity_falls_back_to_identifiable_title_bug193() {
+        let user = tl::enums::User::User(tl::types::User {
+            id: 424_242,
+            access_hash: None,
+            first_name: Some("   ".to_string()),
+            username: None,
+            ..base_user()
+        });
+        let (c, pr) =
+            channel_from_user(&user, &HashMap::new()).expect("无名用户也应入库（可见性优先）");
+        assert!(
+            !c.title.trim().is_empty(),
+            "落库标题不得为空（BUG-194 不变量）"
+        );
+        assert!(c.title.contains("424242"), "兜底名须带 id: {}", c.title);
+        assert!(
+            pr.is_none(),
+            "无 access_hash 时不得凭空造 PeerRef —— 会把必然失败的凭据写进缓存"
         );
     }
 }
