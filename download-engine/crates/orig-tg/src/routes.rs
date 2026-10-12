@@ -1484,6 +1484,10 @@ async fn list_cache_tasks(State(st): State<Arc<AppState>>) -> Result<impl IntoRe
 
 /// GET /api/tg/cache/tasks/all — 全量任务列表 + 各状态计数（缓存管理面板）。
 /// 活跃优先、新→旧，上限 500；counts 覆盖全部状态（未出现为 0）。
+// BUG-085：移除无用的全表 count。daemon 侧的 `TgTasksPayload`
+// （download-engine/crates/orig-daemon/src/activity.rs:157-161）只反序列化 `tasks`，
+// 从不读取 `counts`——原 `count_cache_tasks()` 的结果每次 5s 轮询都被丢弃，纯属白跑一条
+// 全表 count。这里直接砍掉 counts 字段与其查询，保留 tasks 本身即可。
 async fn list_all_cache_tasks(State(st): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     let tasks = st
         .store
@@ -1497,19 +1501,7 @@ async fn list_all_cache_tasks(State(st): State<Arc<AppState>>) -> Result<impl In
         .iter()
         .map(|t| task_with_progress(&st, t, cache_task_title(t, &titles)))
         .collect();
-    let mut counts = serde_json::Map::new();
-    for s in ["queued", "running", "done", "failed", "cancelled", "interrupted"] {
-        counts.insert(s.to_string(), json!(0));
-    }
-    for (s, n) in st
-        .store
-        .count_cache_tasks()
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
-    {
-        counts.insert(s, json!(n));
-    }
-    Ok(Json(json!({ "tasks": tasks, "counts": counts })))
+    Ok(Json(json!({ "tasks": tasks })))
 }
 
 /// GET /api/tg/cache/tasks/:id — 读取单个任务（轮询用，避免每次拉全量列表）。
@@ -5866,6 +5858,7 @@ mod tests {
     use super::delivery_due_secs;
     use super::cache_tasks_payload;
     use super::create_media_series;
+    use super::list_all_cache_tasks;
     use super::list_episode_bindings;
     use super::merge_media_series;
     use super::normalized_series_name;
@@ -9669,6 +9662,57 @@ mod tests {
             .expect("count must run");
         let row = rows.next().await.expect("count row").expect("count row exists");
         row.get(0).expect("count column")
+    }
+
+    // ── BUG-085：全量端点不再跑那条被丢弃的全表 count ─────────────────────
+    //
+    // 判据（docs/bugs/BUG-085.md）：`/api/tg/cache/tasks/all` 历史上在返回 `tasks` 之外还会
+    // 多算一份 `counts`，而 daemon 侧 `TgTasksPayload`（orig-daemon/src/activity.rs:157-161）
+    // 从不反序列化 `counts`——等于每次 5s 轮询白跑一条全表 count。修复把 `counts` 字段连同
+    // `count_cache_tasks()` 调用一起砍掉。本测试锁住修复成果：返回体**必须**含 `tasks`、
+    // **必须不**含 `counts`（即那条无用查询已消失）。
+
+    /// BUG-085 判据：`list_all_cache_tasks` 的响应必须含 `tasks` 且**不含** `counts`。
+    #[tokio::test]
+    async fn list_all_cache_tasks_omits_discarded_counts_bug085() {
+        let st = crate::state::AppState::new(
+            std::sync::Arc::new(crate::unavailable::UnavailableClient::new("bug085")),
+            crate::config::Config::default(),
+            crate::state::Availability::Unavailable("bug085".to_string()),
+            false,
+            crate::store::Store::open(":memory:").await.expect("store"),
+        );
+        let st = std::sync::Arc::new(st);
+
+        // 放一条任务行，证明 `tasks` 仍正常返回（不是把整个接口删了）。
+        st.store
+            .upsert_message(-1001, 55, Some("t"), Some("video/mp4"), Some(9_000), Some("video".into()), Some(0), None, None, None)
+            .await
+            .unwrap();
+        st.store
+            .enqueue_cache_task(-1001, None, "m:-1001:55", &[55], &std::env::temp_dir().to_string_lossy())
+            .await
+            .unwrap();
+
+        let resp = list_all_cache_tasks(State(st.clone()))
+            .await
+            .expect("list_all_cache_tasks 必须成功")
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body must be readable");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("must be JSON");
+
+        assert!(v.get("tasks").is_some(), "BUG-085: 响应必须仍含 tasks 字段");
+        assert!(
+            v["tasks"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+            "BUG-085: tasks 应有刚入队的任务"
+        );
+        assert!(
+            v.get("counts").is_none(),
+            "BUG-085: 被 daemon 丢弃的 counts 字段必须消失（否则仍白跑全表 count）"
+        );
     }
 }
 
