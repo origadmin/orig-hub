@@ -212,20 +212,28 @@ export function EpisodeEditPanel(props: {
       ) : (
         <div className="flex flex-wrap gap-2" data-testid="episode-edit-images">
           {(ep.images ?? []).map((img) => (
-            <span key={img.itemId} className="relative inline-block">
+            <span key={img.itemId} className="group relative inline-block">
               <img
                 src={img.poster ?? mediaItemUrl(img.itemId)}
                 alt=""
                 loading="lazy"
                 className="h-14 w-20 rounded border border-border-subtle object-cover"
               />
+              {/* M0-T04 / BUG-040 / BUG-112：× **常驻半透明**，禁纯 hover 显露
+                  （原型 `.sd-remove` 口径：22×22 圆钮、rgba(0,0,0,.65)、opacity .65；
+                  悬停卡片或按钮本身 → 1，悬停 × → danger 红（主题令牌 --color-danger））。
+                  入口从「纯 hover 才显形」改为「一直可见」—— 触屏/键盘/刚拖完窗口
+                  等场景下 opacity-0 等于没有入口，用户看不到就发现不了能力。
+                  注：用 `bg-danger` 而非 `bg-destructive` —— 后者本仓未定义（死类，
+                  编译不出任何规则），原型 hover 色 `#f43f5e` 由 danger 承担。 */}
               <button
                 type="button"
                 disabled={imgBusy}
                 onClick={() => void detachImage(img.itemId)}
                 aria-label={t('media.episode.detachImage')}
+                title={t('media.episode.detachImage')}
                 data-testid="episode-image-detach"
-                className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full border border-border-subtle bg-surface text-[11px] leading-none text-muted hover:bg-destructive/10 hover:text-destructive"
+                className="absolute right-1.5 top-1.5 z-10 flex h-[22px] w-[22px] items-center justify-center rounded-full bg-black/65 text-[13px] leading-none text-white opacity-[.65] transition-opacity duration-150 hover:bg-danger hover:opacity-100 focus-visible:opacity-100 group-hover:opacity-100"
               >
                 ×
               </button>
