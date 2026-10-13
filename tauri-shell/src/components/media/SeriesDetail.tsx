@@ -10,6 +10,7 @@ import {
   ImagePlus,
   Pencil,
   Play,
+  Send,
   Tag,
   Trash2,
 } from 'lucide-react'
@@ -58,6 +59,7 @@ import {
   episodeRecacheCandidates,
   fmtDuration,
   hasMediaBytes,
+  parseSourceRef,
   recacheFromSource,
   sourceLabelKey,
   sourceMessageUrl,
@@ -136,6 +138,14 @@ export function SeriesDetail(props: {
   onGotoItem?: (itemId: number) => void
   /** 打开导出预览对话框（能力 #21 的迁移落位） */
   onExport?: () => void
+  /**
+   * 「在 TG 中查看」（BUG-305）：应用内跳到 TG 插件面板并定位来源消息。
+   *
+   * 入口出现在三处：选集器行、来源块主版本行、每个备用源行 —— 只有来源自身
+   * 能解释定位符（tg + 可解析 ref）时渲染。由 `MediaLibraryPanel` 接线：
+   * 设 store 正向焦点 `pendingTgFocus` + `navigate('tg')`（不离开应用）。
+   */
+  onViewInTg?: (coords: { chatId: number; messageId: number }) => void
   /** 就地新建标签（与 `TagPicker.onCreate` 同契约） */
   onCreateTag: (name: string) => Promise<number | null>
 }) {
@@ -226,6 +236,12 @@ export function SeriesDetail(props: {
    * 只在来源自身能解释定位符时非空（本地来源 ⇒ null ⇒ 不渲染入口）。
    */
   const curTgUrl = cur ? sourceMessageUrl(cur.source, cur.ref) : null
+  /**
+   * BUG-305：当前集的 TG 源坐标（应用内跳转用）。
+   * 与 `curTgUrl` 同源同判据（解析不出 ⇒ null ⇒ 不渲染入口），
+   * 一个是 t.me 外链（次要出口），一个是应用内跳转（主入口）。
+   */
+  const curTgAt = cur ? parseSourceRef(cur.ref, cur.source) : null
 
   // 换剧集时清空所有编辑态 —— 否则上一部剧的面板会「挂着」新剧的数据。
   useEffect(() => {
@@ -672,6 +688,8 @@ export function SeriesDetail(props: {
               detail.episodes.map((ep, i) => {
               const on = ep.id === cur?.id
               const photo = isPhotoEpisode(ep)
+              // BUG-305：本行的 TG 源坐标（应用内跳转用；解析不出 ⇒ 不渲染入口）。
+              const epTgAt = parseSourceRef(ep.ref, ep.source)
               // BUG-254：字节态决定这一行尾列是「时长」还是「未缓存」。无字节分集不显示时长
               // （那是假信息，会误导用户以为可播），改用 `episode-nobytes` 标记。
               const withBytes = hasMediaBytes(ep)
@@ -717,7 +735,10 @@ export function SeriesDetail(props: {
                         button —— 标记保持 span，可缓存时以 role="button" 承载点击并
                         stopPropagation（不触发行聚焦切换）；无可缓存来源时禁用并在
                         title 里说明原因，不得静默。`episode-nobytes` 外壳逐字保留
-                        （BUG-254 的回归锚），可点击语义由内层 `episode-nobytes-cache` 承载。 */}
+                        （BUG-254 的回归锚），可点击语义由内层 `episode-nobytes-cache` 承载。
+                        BUG-305：右列外包一层 flex，行内「在 TG 中查看」入口与既有内容
+                        同行并列（同为 span+role=button+stopPropagation 模式）。 */}
+                    <span className="flex items-center gap-1.5">
                     {withBytes ? (
                       <span className="font-mono text-[10.5px] text-muted">
                         {!photo && ep.duration != null ? fmtDuration(ep.duration) : ''}
@@ -834,6 +855,34 @@ export function SeriesDetail(props: {
                         )
                       })()
                     )}
+                    {/* BUG-305：行内「在 TG 中查看」（媒体库列表行级入口）。
+                        行本身是 button，嵌套 button 非法 ⇒ 与上方 `episode-nobytes`
+                        同构：span + role="button" + stopPropagation（不切右栏焦点）。
+                        坐标缺失/本地来源 ⇒ 不渲染（无 TG 消息可跳）。 */}
+                    {epTgAt && props.onViewInTg ? (
+                      <span
+                        role="button"
+                        tabIndex={0}
+                        onClick={(e: ReactMouseEvent) => {
+                          e.stopPropagation()
+                          props.onViewInTg?.(epTgAt)
+                        }}
+                        onKeyDown={(e: ReactKeyboardEvent) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.stopPropagation()
+                            e.preventDefault()
+                            props.onViewInTg?.(epTgAt)
+                          }
+                        }}
+                        className="flex max-w-[120px] shrink-0 cursor-pointer items-center rounded px-1 py-0.5 text-[10px] text-accent hover:bg-accent/10"
+                        title={t('media.viewInTg')}
+                        data-testid="episode-row-view-tg"
+                      >
+                        <Send className="mr-0.5 h-3 w-3 shrink-0" />
+                        <span className="truncate">{t('media.viewInTg')}</span>
+                      </span>
+                    ) : null}
+                    </span>
                   </button>
                 </div>
               )
@@ -1007,13 +1056,28 @@ export function SeriesDetail(props: {
                   {/* BUG-285：「跳回 TG 源消息」入口 —— 贴着它所解释的那条来源（同一行）。
                       坐标是入库时记下的 `ref`（TG 即 `<chat>:<msg>`），数据一直在、
                       只是没有出口；无标内容（占位标题）靠它才能被人工辨认。
-                      本地来源解析不出 TG 消息 ⇒ 无入口（点了也没有可跳的坐标）。 */}
+                      本地来源解析不出 TG 消息 ⇒ 无入口（点了也没有可跳的坐标）。
+                      BUG-305：应用内跳转升级为**主入口**（不离开 OrigHub，
+                      切到 TG 插件面板并定位到该频道该消息）；t.me 外链保留为
+                      **次要出口**（`episode-source-view-tg` 原样不改名 ——
+                      BUG-285 判据①a 依赖该 testid 与 href 形状）。 */}
+                  {curTgAt && props.onViewInTg ? (
+                    <button
+                      type="button"
+                      onClick={() => props.onViewInTg?.(curTgAt)}
+                      className="shrink-0 rounded border border-accent/60 bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent hover:bg-accent/20"
+                      title={t('media.viewInTg')}
+                      data-testid="episode-source-jump-tg"
+                    >
+                      {t('media.viewInTg')}
+                    </button>
+                  ) : null}
                   {curTgUrl ? (
                     <a
                       href={curTgUrl}
                       target="_blank"
                       rel="noreferrer"
-                      className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-accent hover:bg-surface-2"
+                      className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-muted hover:bg-surface-2"
                       title={curTgUrl}
                       data-testid="episode-source-view-tg"
                     >
@@ -1025,6 +1089,9 @@ export function SeriesDetail(props: {
                   <ul className="flex flex-col gap-1">
                     {(cur.sources ?? []).map((s) => {
                       const sTgUrl = sourceMessageUrl(s.source, s.ref)
+                      // BUG-305：备用源行同样给应用内跳转（主入口）+ t.me 外链（次要出口）；
+                      // 判据同主版本行 —— 解析不出坐标 ⇒ 两个都不渲染。
+                      const sTgAt = parseSourceRef(s.ref, s.source)
                       return (
                         <li
                           key={s.itemId}
@@ -1048,13 +1115,25 @@ export function SeriesDetail(props: {
                             {t('media.episode.detachSource')}
                           </button>
                           {/* BUG-285：备用源行同样贴一个「跳回 TG 源消息」——入口跟着
-                              它解释的那条来源走；本地备用源无坐标 ⇒ 不渲染。 */}
+                              它解释的那条来源走；本地备用源无坐标 ⇒ 不渲染。
+                              BUG-305：应用内跳转为主入口，t.me 外链为次要出口。 */}
+                          {sTgAt && props.onViewInTg ? (
+                            <button
+                              type="button"
+                              onClick={() => props.onViewInTg?.(sTgAt)}
+                              className="shrink-0 rounded border border-accent/60 bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent hover:bg-accent/20"
+                              title={t('media.viewInTg')}
+                              data-testid="episode-source-jump-tg"
+                            >
+                              {t('media.viewInTg')}
+                            </button>
+                          ) : null}
                           {sTgUrl ? (
                             <a
                               href={sTgUrl}
                               target="_blank"
                               rel="noreferrer"
-                              className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-accent hover:bg-surface-2"
+                              className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-muted hover:bg-surface-2"
                               title={sTgUrl}
                               data-testid="episode-source-view-tg"
                             >

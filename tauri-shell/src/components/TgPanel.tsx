@@ -67,6 +67,16 @@ const ALL_KEY = '__all__'
 const PAGE_SIZE = 30
 
 /**
+ * BUG-305：定位循环参数 —— 轮询间隔（ms）与有界翻页上限（每页 30 条）。
+ *
+ * 为什么有上限：源消息可能已被删除或早于可加载范围，无界翻页会把「定位」
+ * 变成一次拉全历史的请求风暴；有界放弃 + 如实反馈（`tg.locateFailed`）
+ * 好过无限转圈（BUG-239 的预算纪律同源）。
+ */
+const LOCATE_TICK_MS = 300
+const LOCATE_MAX_PAGES = 20
+
+/**
  * 相册级缓存进度（BUG-181 扩展）：
  * - `queued`：该组在单飞队列中排队（本轮跑不到它，呈现「排队中」而非「缓存中」）；
  * - `itemBytes/itemBytesTotal`：当前条目内字节进度（一条 200MB 视频下载数分钟，
@@ -289,6 +299,15 @@ export function TgPanel(
   const { t } = useTranslation()
   const { setError, openViewer, tgService, tgLink, accounts, refreshTgState } = useStore()
   /**
+   * BUG-305：媒体库 → TG 面板的跳转焦点（`pendingMediaFocus` 的正向对应）。
+   *
+   * 入口（媒体库卡片 / 列表行 / 剧集详情来源块）解析出 `(chatId, messageId)` 后
+   * 设本焦点并 `navigate('tg')`；本面板可见时消费它：选频道 → 定位消息 → 高亮。
+   * 消费与清理都只此一处（单一真源，不允许第二支 effect 也去清它）。
+   */
+  const pendingTgFocus = useStore((s) => s.pendingTgFocus)
+  const setPendingTgFocus = useStore((s) => s.setPendingTgFocus)
+  /**
    * 链路真断了才叫故障（BUG-178）。
    *
    * 分层是这次的核心：以前「没配凭证 / 没登录 / 连不上」塌成一个 `available=false`，
@@ -353,6 +372,13 @@ export function TgPanel(
   const [detail, setDetail] = useState(false)
   const [search, setSearch] = useState('')
   const [selectedId, setSelectedId] = useState<number | null>(null)
+  /**
+   * BUG-305：待定位的源消息（频道已选，但目标消息可能还没随 feed 到达）。
+   * 用 state 而非 ref：定位循环的启停由它驱动（见下方定位 effect）。
+   */
+  const [locateReq, setLocateReq] = useState<{ chatId: number; messageId: number } | null>(null)
+  /** BUG-305：当前高亮的消息 key（定位成功后滚进可视区并高亮；null = 无高亮） */
+  const [highlightKey, setHighlightKey] = useState<string | null>(null)
 
   const [feed, setFeed] = useState<FeedItem[]>([])
   const [feedLoading, setFeedLoading] = useState(false)
@@ -979,6 +1005,9 @@ export function TgPanel(
     setHasMore(true)
     setPendingNew(0)
     stickBottomRef.current = true
+    // BUG-305：切频道即清高亮 —— 上一条频道的定位高亮不该跟到新频道来
+    // （新频道的定位由 locateReq 重新驱动，见下方定位循环）。
+    setHighlightKey(null)
     void (async () => {
       try {
         if (monitored) {
@@ -1118,6 +1147,17 @@ export function TgPanel(
     }
   }, [feed, loadingOlder, hasMore, setError, applyStoredSnapshot])
 
+  /*
+   * BUG-305：定位循环要读「最新一版」的 hasMore 与 loadOlder —— 它按 interval
+   * 轮询，闭包若捕获旧值会对着上一页的 hasMore 翻页（陈旧闭包）。用 ref 转发，
+   * 每体渲染更新一次，值永远是最新的，而 loadOlder 的身份不必进 effect 依赖
+   * （否则每翻一页 feed 变、loadOlder 变、定位循环重启，永远找不到东西）。
+   */
+  const hasMoreRef = useRef(hasMore)
+  hasMoreRef.current = hasMore
+  const loadOlderRef = useRef(loadOlder)
+  loadOlderRef.current = loadOlder
+
   const handleScroll = useCallback(() => {
     const el = scrollRef.current
     if (!el) return
@@ -1226,6 +1266,113 @@ export function TgPanel(
       setError(e instanceof Error ? e.message : String(e))
     }
   }
+
+  /**
+   * BUG-305：消费「媒体库 → TG 面板」的跳转焦点。
+   *
+   * 与 `MediaLibraryPanel` 消费 `pendingMediaFocus`（流水线 → 媒体库）同构，
+   * 方向相反：媒体库的「在 TG 中查看」入口把 `ref` 解析成 `(chatId, messageId)`
+   * 设进 store，再 `navigate('tg')` 切来；本 effect 负责落地：
+   *   ① 频道未监控 ⇒ 先从订阅（dialogs）列表找到它并加监控 —— 监控频道的
+   *      消息流是本地真列表（键 `s-<chat>-<msg>`），可定位；
+   *   ② 选中该频道并进内容态；
+   *   ③ 把消息坐标交给定位循环（下一个 effect）滚动 + 高亮；
+   *   ④ 焦点置回 null（一次性契约：迟到/重复焦点不二次消费）。
+   *
+   * 订阅列表尚未加载完（`channels` 为空）时**不判失败** —— `channels` 是本 effect
+   * 的依赖，加载完成会自动重跑；列表已加载却没有该频道 ⇒ 坐标无效，清焦点并如实
+   * 反馈（`tg.locateNoChannel`），不静默假装成功。
+   */
+  useEffect(() => {
+    const focus = pendingTgFocus
+    if (!focus) return
+    const { chatId, messageId } = focus
+    let cancelled = false
+    void (async () => {
+      if (!monitoredSet.has(chatId)) {
+        const ch = channels.find((c) => c.id === chatId)
+        if (!ch) {
+          if (channels.length > 0) {
+            setPendingTgFocus(null)
+            setError(t('tg.locateNoChannel'))
+          }
+          return
+        }
+        try {
+          await addTgMonitoredChannel({ channelId: ch.id, title: ch.title, username: ch.username })
+          await refreshMonitored()
+        } catch (e) {
+          if (!cancelled) {
+            setPendingTgFocus(null)
+            setError(e instanceof Error ? e.message : String(e))
+          }
+          return
+        }
+      }
+      if (cancelled) return
+      setDetail(true)
+      setSelectedId(chatId)
+      setHighlightKey(null)
+      setLocateReq({ chatId, messageId })
+      setPendingTgFocus(null)
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [pendingTgFocus, monitoredSet, channels, refreshMonitored, setError, setPendingTgFocus, t])
+
+  /**
+   * BUG-305：定位循环 —— 在消息流里找 `s-/l-<chatId>-<messageId>`，
+   * 命中即滚进可视区并高亮；不在当前页且仍有更早历史时有界翻页（每页 30 条，
+   * 上限 `LOCATE_MAX_PAGES` 页）；翻完仍没有 ⇒ 停表、清状态并如实反馈
+   * （`tg.locateFailed`）—— 不无限轮询、不静默。
+   *
+   * 为什么是轮询而不是「等 feed 变化」：切频道后 feed 异步到达，且目标消息
+   * 可能不在第一页（要连续翻几页）；一个循环同时覆盖「等加载 / 翻页 / 命中」。
+   */
+  useEffect(() => {
+    if (!locateReq) return
+    const { chatId, messageId } = locateReq
+    const keys = [`s-${chatId}-${messageId}`, `l-${chatId}-${messageId}`]
+    let cancelled = false
+    let busy = false
+    let pages = 0
+    const findHit = () => {
+      for (const k of keys) {
+        const el = document.querySelector(`[data-message-key="${k}"]`)
+        if (el) return { k, el }
+      }
+      return null
+    }
+    const tick = async () => {
+      if (cancelled || busy) return
+      busy = true
+      try {
+        const hit = findHit()
+        if (hit) {
+          setHighlightKey(hit.k)
+          setLocateReq(null)
+          // 下一帧再滚：等高亮态渲染进 DOM，滚动目标才是最终形态
+          requestAnimationFrame(() => hit.el.scrollIntoView({ block: 'center' }))
+          return
+        }
+        if (hasMoreRef.current && pages < LOCATE_MAX_PAGES) {
+          pages += 1
+          await loadOlderRef.current()
+          return
+        }
+        setLocateReq(null)
+        setError(t('tg.locateFailed'))
+      } finally {
+        busy = false
+      }
+    }
+    const h = setInterval(() => void tick(), LOCATE_TICK_MS)
+    return () => {
+      cancelled = true
+      clearInterval(h)
+    }
+  }, [locateReq, setError, t])
 
   const doSync = async () => {
     if (syncing) return
@@ -1825,7 +1972,13 @@ export function TgPanel(
         ) : selectedChannel ? (
           <>
             {/* 频道标题栏 */}
-            <header className="flex shrink-0 items-center gap-3 border-b border-border-subtle/60 px-4 py-2.5">
+            <header
+              className="flex shrink-0 items-center gap-3 border-b border-border-subtle/60 px-4 py-2.5"
+              /* BUG-305：当前频道的 DOM 事实（供跨视图跳转验收断言
+                 `selectedChannel.channelId === chatId`，不读 className 推断）。 */
+              data-testid="tg-channel-header"
+              data-channel-id={selectedChannel.id}
+            >
               {groupMode !== null && (
                 <Button
                   variant="ghost"
@@ -1899,6 +2052,7 @@ export function TgPanel(
                         downloadedPath={downloadedPaths.get(unit[0].key)}
                         photoInLibrary={photoLibRefs.has(`${unit[0].chatId}:${unit[0].messageId}`)}
                         progress={singleProgress.get(unit[0].messageId)}
+                        highlighted={highlightKey === unit[0].key}
                         onDownload={onBubbleDownload}
                         onImportPhoto={onBubbleImportPhoto}
                         onOpenDownloaded={onBubbleOpen}
@@ -1908,6 +2062,7 @@ export function TgPanel(
                       <AlbumBubble
                         key={`album-${unit[0].key}`}
                         items={unit}
+                        highlighted={unit.some((u) => u.key === highlightKey)}
                         cacheTargets={
                           /* BUG-184：分母 = 组内**需要落盘**的条目数。TG 图片不落盘
                              （BUG-049：raw 端点现场代理字节），把它计入会让混合相册
@@ -2020,6 +2175,12 @@ const MessageBubble = memo(function MessageBubble(props: {
   photoInLibrary: boolean
   /** 条目内字节进度（BUG-181）：单条任务下载中时展示 `已传/总量`，避免长下载全程冻结 */
   progress?: { itemBytes?: number; itemBytesTotal?: number }
+  /**
+   * BUG-305：是否是「媒体库 → TG 面板」跳转的定位目标。
+   * 高亮是**给用户看**的落点确认；DOM 事实走 `data-tg-highlight` 属性
+   * （验收断言读属性，不读 className 推断语义）。
+   */
+  highlighted?: boolean
   onDownload: (item: FeedItem) => void
   onImportPhoto: (item: FeedItem) => void
   onOpenDownloaded: (item: FeedItem) => void
@@ -2031,6 +2192,7 @@ const MessageBubble = memo(function MessageBubble(props: {
     downloadedPath,
     photoInLibrary,
     progress,
+    highlighted = false,
     onDownload,
     onImportPhoto,
     onOpenDownloaded,
@@ -2041,8 +2203,19 @@ const MessageBubble = memo(function MessageBubble(props: {
   const caching = state === 'caching'
   const queued = state === 'queued'
   return (
-    <div className="flex flex-col">
-      <div className="max-w-[88%] rounded-2xl rounded-tl-md border border-border-subtle bg-surface p-2.5 shadow-sm">
+    <div
+      className="flex flex-col"
+      /* BUG-305：消息 key 的 DOM 事实（定位锚点 = `s-/l-<chatId>-<messageId>`）。 */
+      data-message-key={m.key}
+      data-tg-highlight={highlighted ? 'true' : undefined}
+    >
+      <div
+        className={cn(
+          'max-w-[88%] rounded-2xl rounded-tl-md border bg-surface p-2.5 shadow-sm',
+          // BUG-305：定位高亮只做「描边」一层 —— 不改布局、不抢内容的戏
+          highlighted ? 'border-accent ring-2 ring-accent/70' : 'border-border-subtle',
+        )}
+      >
         {m.type === 'photo' && <PhotoBlock item={m} onPreview={() => onPreview(m)} />}
         {m.type === 'video' && (
           <VideoBlock
@@ -2195,6 +2368,12 @@ const AlbumBubble = memo(function AlbumBubble(props: {
   groupHasVideo: boolean
   /** BUG-049：组内图片是否全部已入库（纯图组全入库后按钮收起） */
   groupInLibrary: boolean
+  /**
+   * BUG-305：组内是否含「媒体库 → TG 面板」跳转的定位目标消息。
+   * 相册是多个消息的聚合气泡：命中组内任一条即高亮整组（用户要的是
+   * 「回到这条内容」，它在哪个相册里就该亮哪个相册）。
+   */
+  highlighted?: boolean
   onDownload: (items: FeedItem[]) => void
   /** BUG-188：整组加入媒体库 —— 纯图组走编目（批量入库），不进字节传输队列 */
   onImportAlbum: (items: FeedItem[]) => void
@@ -2209,6 +2388,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
     progress,
     groupHasVideo,
     groupInLibrary,
+    highlighted = false,
     onDownload,
     onImportAlbum,
     onCancel,
@@ -2225,8 +2405,14 @@ const AlbumBubble = memo(function AlbumBubble(props: {
   const caption = items.find((it) => it.caption?.trim())?.caption
   const totalSize = items.reduce((s, it) => s + (it.size ?? 0), 0)
   return (
-    <div className="flex flex-col">
-      <div className="max-w-[88%] rounded-2xl rounded-tl-md border border-border-subtle bg-surface p-2.5 shadow-sm">
+    <div className="flex flex-col" data-tg-highlight={highlighted ? 'true' : undefined}>
+      <div
+        className={cn(
+          'max-w-[88%] rounded-2xl rounded-tl-md border bg-surface p-2.5 shadow-sm',
+          // BUG-305：定位高亮只做「描边」一层（同 MessageBubble）
+          highlighted ? 'border-accent ring-2 ring-accent/70' : 'border-border-subtle',
+        )}
+      >
         {/* 状态行：相册计数 + 缓存进度（纯文本弱化，文字归文字、按钮归按钮） */}
         <div className="mb-1.5 flex items-center gap-2 text-[10px]">
           <span className="font-medium text-accent">{t('tg.albumN', { n: items.length })}</span>
@@ -2275,6 +2461,8 @@ const AlbumBubble = memo(function AlbumBubble(props: {
                 onClick={() => onPreview(i, items)}
                 data-testid={`tg-album-tile-${i}`}
                 data-message-id={it.messageId}
+                /* BUG-305：瓦片也带消息 key —— 相册内单条消息同样是定位锚点 */
+                data-message-key={it.key}
                 className={cn(
                   'relative block w-full overflow-hidden rounded-lg bg-surface-2',
                   // 单图给自然比例（整幅呈现）；多图用方形格保证网格整齐

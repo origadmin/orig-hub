@@ -193,6 +193,20 @@ interface DownloadState {
   setPendingMediaFocus: (ref: string | null) => void
 
   /**
+   * 媒体库 → TG 面板的跳转焦点（BUG-305：`pendingMediaFocus` 的**正向对应**）。
+   *
+   * 上面那个焦点解决「流水线 → 媒体库」（内容成品在库里）；本焦点解决反方向：
+   * 用户在媒体库看到一条 TG 来源的内容，想回到「它来自哪个频道、哪条消息」时，
+   * 入口把 `ref`（`<chat>:<msg>`）解析成坐标记在这里，再经 `navigate('tg')`
+   * 切到 TG 面板 —— 面板挂载/可见时消费它（选频道 + 定位消息 + 高亮），
+   * 消费完即置回 null。null = 无待消费的焦点。
+   *
+   * 与 `pendingMediaFocus` 是同构的两半，**不得**互相改名/删除（BUG-285 判据⑤）。
+   */
+  pendingTgFocus: { chatId: number; messageId: number } | null
+  setPendingTgFocus: (focus: { chatId: number; messageId: number } | null) => void
+
+  /**
    * TG **服务层**状态（orig-tg 进程）：真源是 daemon `/api/config`（BUG-178）。
    *
    * 「服务在不在」只由 daemon 回答 —— 前端不再自己探测 orig-tg 端口：那是把
@@ -277,6 +291,8 @@ export const useStore = create<DownloadState>((set, get) => ({
   categories: [],
   categoryFilter: null,
   pendingMediaFocus: null,
+  // BUG-305：媒体库 → TG 面板的正向跳转焦点（与上一行反向对应；null = 无待消费焦点）。
+  pendingTgFocus: null,
   // 入口级门控（`resolveTgFeatureReady`）只由服务层决定：开关开着 **且** daemon 说
   // 进程在服务才显示。daemon 不可达 / 插件关闭 / 拉起失败时入口保持隐藏 ——
   // 不可用就不展示（不呈现死按钮，违反设计）。
@@ -536,6 +552,7 @@ export const useStore = create<DownloadState>((set, get) => ({
   closeViewer: () => set({ viewer: null }),
   setCategoryFilter: (c) => set({ categoryFilter: c }),
   setPendingMediaFocus: (ref) => set({ pendingMediaFocus: ref }),
+  setPendingTgFocus: (focus) => set({ pendingTgFocus: focus }),
   tgCacheManagerOpen: false,
   setTgCacheManagerOpen: (v) => set({ tgCacheManagerOpen: v }),
 

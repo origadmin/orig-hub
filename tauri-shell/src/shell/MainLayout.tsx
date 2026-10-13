@@ -178,6 +178,15 @@ export function MainLayout() {
    * 视图 state 在本组件（局部），接线只能是这一个回调 —— 组件间不另开通道。
    */
   const handleOpenMedia = useEvent(() => handleNavigate('files', { fmode: 'lib-series' }))
+  /**
+   * BUG-305：媒体库 → TG 面板的跨域出口（`handleOpenMedia` 的反向对应）。
+   *
+   * 「在 TG 中查看」的应用内落点：入口先把来源坐标设进 store 正向焦点
+   * （`setPendingTgFocus`），这里只负责经 nav 契约切到 tg 域 —— TgPanel 挂载/
+   * 可见时消费焦点（选频道 + 定位消息）。视图 state 在本组件（局部），
+   * 接线只能是这一个回调（组件间不另开通道，域间零直接 import）。
+   */
+  const handleOpenTg = useEvent(() => handleNavigate('tg'))
 
   // 下载档位过滤已随 M0-T02 移入 `domains/download/DownloadPanel`（读 nav.dlFilter）。
   // 本组件只保留**状态栏/徽标口径**用的三个桶（BUG-082 三处同源纪律）。
@@ -275,6 +284,7 @@ export function MainLayout() {
                   nav={nav}
                   onFmodeChange={(m) => setNav((prev) => navigate(prev, 'files', { fmode: m }))}
                   onCounts={setFilesCounts}
+                  onOpenTg={handleOpenTg}
                 />
               </ErrorBoundary>
             )}

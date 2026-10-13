@@ -25,8 +25,20 @@ interface Props {
   onFmodeChange: (m: FileMode) => void
   /** 侧栏徽标的事实计数上报（同源纪律，见 nav/index.ts） */
   onCounts: (c: SidebarCounts) => void
+  /**
+   * 「在 TG 中查看」（BUG-305）：切到 TG 域的应用内出口。
+   * MainLayout 的 `navigate('tg')` 通道；域间零直接 import，故由宿主接线。
+   */
+  onOpenTg: () => void
 }
 
-export function FilesPanel({ nav, onFmodeChange, onCounts }: Props) {
-  return <MediaLibraryPanel fmode={nav.fmode} onFmodeChange={onFmodeChange} onCounts={onCounts} />
+export function FilesPanel({ nav, onFmodeChange, onCounts, onOpenTg }: Props) {
+  return (
+    <MediaLibraryPanel
+      fmode={nav.fmode}
+      onFmodeChange={onFmodeChange}
+      onCounts={onCounts}
+      onOpenTg={onOpenTg}
+    />
+  )
 }

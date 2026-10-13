@@ -7,6 +7,7 @@ import {
   Music,
   Pencil,
   Play,
+  Send,
   Trash2,
   ZoomIn,
 } from 'lucide-react'
@@ -18,6 +19,7 @@ import {
   fmtDuration,
   fmtSize,
   hasMediaBytes,
+  parseSourceRef,
   sourceLabelKey,
 } from '../../lib/mediaSources'
 import {
@@ -116,6 +118,15 @@ function MediaCardBase(props: {
    * 也不给一个点了必然报错的活按钮。
    */
   recacheBlockedReason?: string | null
+  /**
+   * 「在 TG 中查看」（BUG-305）：应用内跳到 TG 插件面板并定位这条内容的来源消息。
+   *
+   * 只有**来源自身能解释定位符**（`source='tg'` 且 `ref` 可解析出 `chat:msg`）时
+   * 才渲染入口 —— 本地来源没有 TG 消息可跳，给了也是死按钮（判据：无坐标 ⇒ 无入口）。
+   * 坐标由卡片自行解析后回传（与 `SeriesDetail` 的入口同一签名）；
+   * 由 `MediaLibraryPanel` 接线：设 store 正向焦点 + `navigate('tg')`。
+   */
+  onViewInTg?: (coords: { chatId: number; messageId: number }) => void
 }) {
   const {
     item,
@@ -128,6 +139,7 @@ function MediaCardBase(props: {
     onPosterReady,
     onRecache,
     recacheBlockedReason = null,
+    onViewInTg,
   } = props
   const [poster, setPoster] = useState<string | null>(item.poster ?? null)
   const [genFailed, setGenFailed] = useState(false)
@@ -284,6 +296,14 @@ function MediaCardBase(props: {
     playable && item.kind === 'photo' ? poster ?? mediaItemUrl(item.id) : poster
 
   const recacheable = !playable && Boolean(onRecache)
+
+  /**
+   * BUG-305：这条内容的 TG 源坐标（`<chat>:<msg>` 解析结果）。
+   * 本地来源 / 坐标缺失或不可解析 ⇒ null ⇒ 不渲染「在 TG 中查看」入口
+   * （没有可跳的消息，就不给一个点了没反应的按钮）。
+   */
+  const tgCoords = parseSourceRef(item.ref, item.source)
+  const canViewInTg = tgCoords !== null && Boolean(onViewInTg)
 
   /** 悬浮图标按类型取（BUG-123），未知类型退回中性「打开」 */
   const ActionIcon = KIND_ACTION_ICON[item.kind] ?? FALLBACK_ACTION_ICON
@@ -486,8 +506,21 @@ function MediaCardBase(props: {
        * 功能存在但入口不可发现，等于没有。删除入口同理，且它比编辑更依赖「一眼看到」：
        * 找不到删除的人会去勾选，于是又把「选择」当成删除的前置仪式。
        */}
-      {onEdit || onDelete ? (
+      {onEdit || onDelete || canViewInTg ? (
         <div className="absolute bottom-1 right-1 flex items-center gap-1">
+          {tgCoords && onViewInTg ? (
+            <button
+              type="button"
+              onClick={() => onViewInTg?.(tgCoords)}
+              className="flex items-center gap-1 rounded bg-black/65 px-1.5 py-0.5 text-[10px] text-white/90 backdrop-blur-sm transition-colors hover:bg-black/85 hover:text-white"
+              title={t('media.viewInTg')}
+              aria-label={t('media.viewInTg')}
+              data-testid="item-view-tg"
+            >
+              <Send className="h-3 w-3" />
+              {t('media.viewInTg')}
+            </button>
+          ) : null}
           {onDelete ? (
             <button
               type="button"

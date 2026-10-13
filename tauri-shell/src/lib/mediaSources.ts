@@ -301,11 +301,18 @@ export function sourceLabelKey(source?: string | null): string {
   return getSourceAdapter(source)?.labelKey ?? `source.${source ?? 'local'}`
 }
 
-/** 解析来源内定位符；来源无适配器或不支持时返回 null（调用方据 `canRecacheFromSource` 判） */
+/**
+ * 解析来源内定位符；来源无适配器或不支持时返回 null（调用方据 `canRecacheFromSource` 判）。
+ *
+ * 入参容忍 `null`/`undefined`（分集与条目的 `ref` / `source` 在旧数据里可能缺席）：
+ * 缺席一律按「无坐标」处理并返回 null —— 调用方（BUG-305 的「在 TG 中查看」入口）
+ * 据此**不渲染**入口，而不是抛错或渲染一个跳不动的按钮。
+ */
 export function parseSourceRef(
-  ref: string,
-  source: string,
+  ref: string | null | undefined,
+  source: string | null | undefined,
 ): { chatId: number; messageId: number } | null {
+  if (!ref || !source) return null
   return getSourceAdapter(source)?.parseRef?.(ref) ?? null
 }
 

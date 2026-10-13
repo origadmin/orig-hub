@@ -80,6 +80,11 @@ interface Props {
   onFmodeChange?: (m: FileMode) => void
   /** 侧栏树的事实计数上报（M0-T01）：徽标数必须与面板里的数是同一个数 */
   onCounts?: (c: SidebarCounts) => void
+  /**
+   * 「在 TG 中查看」（BUG-305）：切到 TG 域的应用内出口。
+   * 由 MainLayout 经 FilesPanel 接线（域间只走 `navigate()`，组件不直改 view）。
+   */
+  onOpenTg?: () => void
 }
 
 const PAGE = 120
@@ -135,9 +140,10 @@ function toViewerItem(i: MediaItem): ViewerItem {
  * 能力：本地目录导入、剧集（季/集）编排、标签交叉归类、图片（图集）管理、多选批量操作。
  * 播放统一交给全局播放器页（openViewer），不在本面板内嵌。
  */
-export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}) {
+export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: Props = {}) {
   const { t } = useTranslation()
-  const { setError, openViewer, pendingMediaFocus, setPendingMediaFocus } = useStore()
+  const { setError, openViewer, pendingMediaFocus, setPendingMediaFocus, setPendingTgFocus } =
+    useStore()
 
   // ---- 资料库后端探活（**不探 TG**：TG 只是来源之一，挂了不影响库）----
   const [alive, setAlive] = useState(false)
@@ -607,6 +613,25 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
       void playItems(items, Math.max(0, idx), item.title)
     },
     [items, playItems],
+  )
+
+  /**
+   * BUG-305：「在 TG 中查看」—— 媒体库 → TG 面板的应用内跳转（`pendingMediaFocus`
+   * 的正向对应）。
+   *
+   * 两步：①把来源坐标设进 store 正向焦点（TgPanel 消费它：选频道 + 定位消息 +
+   * 高亮）；②经 nav 契约切到 tg 域（`onOpenTg` 是 MainLayout 的唯一跨域通道，
+   * 域间零直接 import —— 组件自己 `setView('tg')` 是设计原则 4 明令禁止的）。
+   *
+   * 稳定引用（useCallback）：`MediaCard` / `SeriesDetail` 都 memo，每次渲染新函数
+   * 会让它们的浅比较白做（AGENTS.md §5）。
+   */
+  const viewInTg = useCallback(
+    (coords: { chatId: number; messageId: number }) => {
+      setPendingTgFocus(coords)
+      onOpenTg?.()
+    },
+    [setPendingTgFocus, onOpenTg],
   )
   /** 逐条删除入口（稳定引用，同上）。 */
   const deleteItem = useCallback((item: MediaItem) => {
@@ -1420,6 +1445,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
               }
             }}
             onExport={() => setExportOpen(true)}
+            onViewInTg={viewInTg}
             onGotoItem={(itemId) => {
               // BUG-191：按钮文案是「在媒体库中查看该内容」（`media.episode.gotoItem`），
               // 行为就必须是**查看** —— 原实现 `setEditing(...)` 打开的是 `ItemEditDialog`
@@ -1518,6 +1544,8 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
                     // 无字节且来源支持原路取回时给「重新缓存」（BUG-080）
                     onRecache={recacheItem}
                     recacheBlockedReason={recacheBlockedReason(item.source, item.ref)}
+                    // BUG-305：tg 来源且坐标可解析时才渲染「在 TG 中查看」
+                    onViewInTg={viewInTg}
                   />
                 ))}
               </div>

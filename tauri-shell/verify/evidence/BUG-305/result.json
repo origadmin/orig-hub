@@ -1,0 +1,346 @@
+{
+  "bug": "BUG-305",
+  "passed": 66,
+  "total": 66,
+  "all_passed": true,
+  "target": {
+    "itemId": 1449,
+    "seriesId": 336,
+    "chatId": -1001341930464,
+    "messageId": 208606,
+    "expectedKey": "s--1001341930464-208606",
+    "monitorPagesToTarget": 4
+  },
+  "checks": [
+    {
+      "name": "⓪ 监控频道列表非空（活栈确有可定位目标）",
+      "ok": true,
+      "detail": "channels=-1001341930464:每日沙雕墙"
+    },
+    {
+      "name": "⓪ 目标消息确实存在于监控消息流（翻页可达，定位判据有对象）",
+      "ok": true,
+      "detail": "item=1449 ref=-1001341930464:208606 pages=4"
+    },
+    {
+      "name": "⓪ 目标条目所属剧集含同坐标分集（剧集级判据有对象）",
+      "ok": true,
+      "detail": "series=336 title=这狗上辈子可能是个小海豹😅 episodes=1"
+    },
+    {
+      "name": "⓪ 搜索词可从标题派生且在 API 上命中目标（搜索框判据的对象）",
+      "ok": true,
+      "detail": "term=\"这狗\" total=1 item=1449"
+    },
+    {
+      "name": "⓪ 负样本齐备：本地条目 + 本地剧集（判据4 的反向有对象）",
+      "ok": true,
+      "detail": "localItem=254(scene_12_city_night) localSeries=427(scene_12_city_night)"
+    },
+    {
+      "name": "⓪ 订阅（dialogs）列表可加载（频道切换牙的前提）",
+      "ok": true,
+      "detail": "dialogs page0=200 hasMore=true"
+    },
+    {
+      "name": "i18n 四个新键在两个 locale 均存在且非空",
+      "ok": true,
+      "detail": "media.viewInTg,media.episode.viewInTg,tg.locateFailed,tg.locateNoChannel"
+    },
+    {
+      "name": "i18n 入口文案两语言不同（zh=在 TG 中查看 / en=View in TG，非同一份硬编码）",
+      "ok": true,
+      "detail": "zh=在 TG 中查看 en=View in TG"
+    },
+    {
+      "name": "⓪b zh-CN 已生效（<html lang>）",
+      "ok": true,
+      "detail": "lang=zh-CN"
+    },
+    {
+      "name": "判据4 TG 来源条目卡片渲染「在 TG 中查看」入口（有坐标就给入口）",
+      "ok": true,
+      "detail": "cards=1 entry={\"tag\":\"BUTTON\",\"href\":null,\"target\":null,\"text\":\"在 TG 中查看\"}"
+    },
+    {
+      "name": "判据4 入口文案走 i18n（zh-CN = 在 TG 中查看）",
+      "ok": true,
+      "detail": "text=在 TG 中查看"
+    },
+    {
+      "name": "判据2 应用内入口是 button（无 href / target，本身不离开应用）",
+      "ok": true,
+      "detail": "entry={\"tag\":\"BUTTON\",\"href\":null,\"target\":null,\"text\":\"在 TG 中查看\"}"
+    },
+    {
+      "name": "判据4 本地来源条目卡片不渲染入口（点了也没有坐标可跳）",
+      "ok": true,
+      "detail": "cards=14 cardEntries=0 anyEntry=0"
+    },
+    {
+      "name": "判据1（牙）跳转前频道已被预切到非目标频道（频道断言非空转）",
+      "ok": true,
+      "detail": "preswitched=-1004493170102 target=-1001341930464"
+    },
+    {
+      "name": "判据1 条目级：入口可点且定位到目标消息",
+      "ok": true,
+      "detail": "clicked=true key=s--1001341930464-208606 expected=s--1001341930464-208606"
+    },
+    {
+      "name": "判据1 条目级：应用切到 TG 面板（tg-panel-root，非 t.me 网页）",
+      "ok": true,
+      "detail": "panelRoot=1"
+    },
+    {
+      "name": "判据1 条目级：当前频道 = 来源频道（tg-channel-header data-channel-id）",
+      "ok": true,
+      "detail": "header=-1001341930464 expected=-1001341930464"
+    },
+    {
+      "name": "判据1 条目级：来源消息存在于消息流（data-message-key）",
+      "ok": true,
+      "detail": "keyCount=1 key=s--1001341930464-208606"
+    },
+    {
+      "name": "判据1 条目级：来源消息被高亮（data-tg-highlight）",
+      "ok": true,
+      "detail": "highlightedKey=true highlights=[{\"key\":\"s--1001341930464-208606\",\"inViewport\":true}]"
+    },
+    {
+      "name": "判据1 条目级：来源消息已滚进可视区",
+      "ok": true,
+      "detail": "inViewport=true"
+    },
+    {
+      "name": "判据2 条目级：未发生框架导航 / 新标签（不离开 OrigHub）",
+      "ok": true,
+      "detail": "navEvents=[]"
+    },
+    {
+      "name": "判据2 条目级：URL 未变且页面保持可见",
+      "ok": true,
+      "detail": "url http://127.0.0.1:5180/ -> http://127.0.0.1:5180/ visibility=visible"
+    },
+    {
+      "name": "判据7 条目级：频道事实为 data-channel-id 属性逐字相等（非类名推断）",
+      "ok": true,
+      "detail": "header=-1001341930464"
+    },
+    {
+      "name": "判据7 条目级：消息事实为 data-message-key / data-tg-highlight 属性值",
+      "ok": true,
+      "detail": "key=s--1001341930464-208606 highlight=true"
+    },
+    {
+      "name": "判据1 条目级：定位后焦点被一次性消费（pendingTgFocus 回 null）",
+      "ok": true,
+      "detail": "focus=null"
+    },
+    {
+      "name": "判据4 本地剧集来源块不渲染应用内入口（episode-source-jump-tg = 0）",
+      "ok": true,
+      "detail": "jump=0 link=0 row=0"
+    },
+    {
+      "name": "判据4 本地剧集来源块也不渲染 t.me 外链（无坐标 ⇒ 两个出口都没有）",
+      "ok": true,
+      "detail": "link=0"
+    },
+    {
+      "name": "判据4 本地剧集列表行不渲染入口（episode-row-view-tg = 0）",
+      "ok": true,
+      "detail": "row=0"
+    },
+    {
+      "name": "判据3 剧集来源块有应用内主入口（episode-source-jump-tg，button）",
+      "ok": true,
+      "detail": "jump={\"tag\":\"BUTTON\",\"href\":null,\"target\":null,\"text\":\"在 TG 中查看\"}"
+    },
+    {
+      "name": "判据3 剧集列表行也有入口（episode-row-view-tg）",
+      "ok": true,
+      "detail": "row={\"tag\":\"SPAN\",\"href\":null,\"target\":null,\"text\":\"在 TG 中查看\"}"
+    },
+    {
+      "name": "判据2 BUG-285 回归：t.me 外链保留为次要出口（独立 <a target=\"_blank\">）",
+      "ok": true,
+      "detail": "link={\"tag\":\"A\",\"href\":\"https://t.me/c/-1001341930464/208606\",\"target\":\"_blank\",\"text\":\"在 TG 中查看\"}"
+    },
+    {
+      "name": "判据3 剧集级：入口可点且定位到同一频道同一消息",
+      "ok": true,
+      "detail": "clicked=true key=s--1001341930464-208606 expected=s--1001341930464-208606"
+    },
+    {
+      "name": "判据1 剧集级：应用切到 TG 面板（tg-panel-root，非 t.me 网页）",
+      "ok": true,
+      "detail": "panelRoot=1"
+    },
+    {
+      "name": "判据1 剧集级：当前频道 = 来源频道（tg-channel-header data-channel-id）",
+      "ok": true,
+      "detail": "header=-1001341930464 expected=-1001341930464"
+    },
+    {
+      "name": "判据1 剧集级：来源消息存在于消息流（data-message-key）",
+      "ok": true,
+      "detail": "keyCount=1 key=s--1001341930464-208606"
+    },
+    {
+      "name": "判据1 剧集级：来源消息被高亮（data-tg-highlight）",
+      "ok": true,
+      "detail": "highlightedKey=true highlights=[{\"key\":\"s--1001341930464-208606\",\"inViewport\":true}]"
+    },
+    {
+      "name": "判据1 剧集级：来源消息已滚进可视区",
+      "ok": true,
+      "detail": "inViewport=true"
+    },
+    {
+      "name": "判据2 剧集级：未发生框架导航 / 新标签（不离开 OrigHub）",
+      "ok": true,
+      "detail": "navEvents=[]"
+    },
+    {
+      "name": "判据2 剧集级：URL 未变且页面保持可见",
+      "ok": true,
+      "detail": "url http://127.0.0.1:5180/ -> http://127.0.0.1:5180/ visibility=visible"
+    },
+    {
+      "name": "判据7 剧集级：频道事实为 data-channel-id 属性逐字相等（非类名推断）",
+      "ok": true,
+      "detail": "header=-1001341930464"
+    },
+    {
+      "name": "判据7 剧集级：消息事实为 data-message-key / data-tg-highlight 属性值",
+      "ok": true,
+      "detail": "key=s--1001341930464-208606 highlight=true"
+    },
+    {
+      "name": "判据3 剧集级：定位后焦点被一次性消费（pendingTgFocus 回 null）",
+      "ok": true,
+      "detail": "focus=null"
+    },
+    {
+      "name": "判据5（前置）切频道后旧高亮被清除（伪坐标判据的干净起点）",
+      "ok": true,
+      "detail": "highlights=[]"
+    },
+    {
+      "name": "判据5 伪 messageId：焦点被一次性消费（未挂起重复触发）",
+      "ok": true,
+      "detail": "focus=null"
+    },
+    {
+      "name": "判据5 伪 messageId：全程无任何高亮（未静默「定位成功」）",
+      "ok": true,
+      "detail": "highlights=[]"
+    },
+    {
+      "name": "判据5 伪 messageId：消息流中不存在该 key",
+      "ok": true,
+      "detail": "key=s--1001341930464-999999999"
+    },
+    {
+      "name": "判据5 伪 messageId：定位失败有如实反馈（global-toast 明说未定位到）",
+      "ok": true,
+      "detail": "toast=\"未能在 TG 面板定位到对应的来源消息（可能已被删除或不在可加载范围内）\""
+    },
+    {
+      "name": "判据5 伪 chatId：焦点被消费且未挂起",
+      "ok": true,
+      "detail": "focus=null"
+    },
+    {
+      "name": "判据5 伪 chatId：无任何高亮",
+      "ok": true,
+      "detail": "highlights=[]"
+    },
+    {
+      "name": "判据5 伪 chatId：频道未被切到伪值（header 保持原频道）",
+      "ok": true,
+      "detail": "before=-1001341930464 after=-1001341930464"
+    },
+    {
+      "name": "判据5 伪 chatId：失败有如实反馈（订阅列表里没有该频道）",
+      "ok": true,
+      "detail": "toast=\"TG 订阅列表里没有这条内容的来源频道，无法定位\""
+    },
+    {
+      "name": "判据6 运行时：pendingMediaFocus 字段与 setter 仍在（未被改名/删除）",
+      "ok": true,
+      "detail": "store={\"ok\":true,\"pendingTgFocus\":null,\"hasMediaFocusField\":true,\"hasMediaFocusSetter\":true,\"hasTgFocusSetter\":true}"
+    },
+    {
+      "name": "判据6 源码：useStore.ts 仍定义 pendingMediaFocus 与 setPendingMediaFocus",
+      "ok": true,
+      "detail": "pendingMediaFocus hits=5"
+    },
+    {
+      "name": "判据6 BUG-285 母档锚点仍在（SeriesDetail 主版本行 t.me 链接构造未被改掉）",
+      "ok": true,
+      "detail": "anchor=curTgUrl"
+    },
+    {
+      "name": "判据7 脚本自身不含类名推断（全文无读取元素类名的代码）",
+      "ok": true,
+      "detail": "self-scan of this file"
+    },
+    {
+      "name": "无未捕获页面错误（zh-CN 会话）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "⓪c en-US 已生效（<html lang>）",
+      "ok": true,
+      "detail": "lang=en-US"
+    },
+    {
+      "name": "i18n en-US 会话入口文案 === \"View in TG\"（非中文硬编码）",
+      "ok": true,
+      "detail": "entry={\"tag\":\"BUTTON\",\"href\":null,\"target\":null,\"text\":\"View in TG\"}"
+    },
+    {
+      "name": "无未捕获页面错误（en-US 会话）",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "④P 证伪锚点存在（MediaLibraryPanel.tsx 含目标行）",
+      "ok": true,
+      "detail": "setPendingTgFocus(coords)"
+    },
+    {
+      "name": "④a 红态：入口仍在且可点（证明红的不是「按钮没了」）",
+      "ok": true,
+      "detail": "entry={\"tag\":\"BUTTON\",\"href\":null,\"target\":null,\"text\":\"在 TG 中查看\"}"
+    },
+    {
+      "name": "④b 红态：点击后无高亮、无定位（判据1 按预期失败）",
+      "ok": true,
+      "detail": "key=null highlights=[]"
+    },
+    {
+      "name": "④c 红态：目标消息未被高亮（判据7 的 DOM 事实按预期失败）",
+      "ok": true,
+      "detail": "highlightedKey=null"
+    },
+    {
+      "name": "④d 红态：面板仍被打开（隔离证伪面 —— 只摘了焦点，没摘导航）",
+      "ok": true,
+      "detail": "panelRoot=1"
+    },
+    {
+      "name": "④e 字节级还原：sha256 与改前一致",
+      "ok": true,
+      "detail": "before=0357bb36557f after=0357bb36557f"
+    },
+    {
+      "name": "④f 还原后复跑：条目级跳转重新定位到目标消息并高亮",
+      "ok": true,
+      "detail": "key=s--1001341930464-208606 channel=-1001341930464 highlight=true"
+    }
+  ]
+}
