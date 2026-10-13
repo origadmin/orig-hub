@@ -11,6 +11,7 @@ import {
 import { useTranslation } from '../../i18n'
 import { cn } from '../../lib/utils'
 import { DirectoryPicker } from '../DirectoryPicker'
+import { isTauri, copyToClipboard } from '../../lib/env'
 
 /** issue 类型 → 徽标样式（颜色即语义：红=字节阻断，橙=元数据缺失） */
 const ISSUE_STYLE: Record<string, string> = {
@@ -77,6 +78,16 @@ export function ExportPreviewDialog(props: {
   }
 
   const openExportDir = async (dir: string) => {
+    // BUG-286：纯浏览器里没有 opener 通道，裸调会把 raw invoke 异常经 onError 上屏。
+    if (!isTauri()) {
+      const copied = await copyToClipboard(dir)
+      onError(
+        copied
+          ? '网页调试模式不支持打开系统文件夹，已复制导出目录路径'
+          : `网页调试模式不支持打开系统文件夹，导出目录：${dir}`,
+      )
+      return
+    }
     try {
       const { openPath } = await import('@tauri-apps/plugin-opener')
       await openPath(dir)

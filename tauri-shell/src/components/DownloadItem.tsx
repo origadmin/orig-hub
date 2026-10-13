@@ -10,10 +10,7 @@ import {
 import type { DownloadStatus } from '../types'
 import { useStore } from '../store/useStore'
 import { DownloadDetailSheet } from './DownloadDetailSheet'
-
-// Tauri 环境可用时才加载 opener（浏览器 dev 环境降级为不显示）
-const isTauri = () =>
-  typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+import { isTauri } from '../lib/env'
 
 const statusMeta: Record<
   string,
@@ -40,6 +37,11 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
       setError('文件尚未就绪：路径缺失，无法打开')
       return
     }
+    // BUG-286：纯浏览器里 plugin-shell 的 IPC 桥是 undefined，裸调会把 raw 异常上屏。
+    if (!isTauri()) {
+      setError('打开文件需在桌面客户端中使用（网页调试模式不支持调用默认应用）')
+      return
+    }
     try {
       // shell:allow-open（与 daemon sidecar 同套授权，已验证可用）——直接打开文件本体，无需解析路径
       const { open } = await import('@tauri-apps/plugin-shell')
@@ -54,6 +56,11 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
   const handleOpenDir = async () => {
     if (!item.dest_path) {
       setError('文件尚未就绪：路径缺失，无法打开目录')
+      return
+    }
+    // BUG-286：同上 —— 没有 opener 通道时不调 revealItemInDir。
+    if (!isTauri()) {
+      setError('打开目录需在桌面客户端中使用（网页调试模式不支持调用系统文件管理器）')
       return
     }
     try {

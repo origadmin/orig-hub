@@ -34,7 +34,23 @@ export function DirectoryPicker({
   const [localErr, setLocalErr] = useState<string | null>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   // 网页调试模式（纯浏览器、无 Tauri 运行时）不支持系统原生目录对话框。
-  const inTauri = isTauri()
+  // BUG-286：IPC 桥可能晚于首帧注入，若把这一判定冻结成首帧常量，下面「浏览…」
+  // 按钮的 disabled 会一直停在首帧结论上。故挂载后复测一次，让组件响应运行期变化。
+  const [inTauri, setInTauri] = useState(isTauri())
+
+  // 上面只是首帧初值；IPC 桥的注入时机由壳决定（理论上早于业务脚本，但不做假设）：
+  // 挂载后复测一次，并在页面重新可见/获得焦点时再测一遍 —— 让 :126 的禁用态
+  // 跟着运行期环境走，而不是冻结在首帧结论上（BUG-286）。
+  useEffect(() => {
+    const sync = () => setInTauri(isTauri())
+    sync()
+    window.addEventListener('focus', sync)
+    document.addEventListener('visibilitychange', sync)
+    return () => {
+      window.removeEventListener('focus', sync)
+      document.removeEventListener('visibilitychange', sync)
+    }
+  }, [])
 
   useEffect(() => {
     setRecent(getRecentDirs())
@@ -124,6 +140,7 @@ export function DirectoryPicker({
           variant="secondary"
           onClick={pick}
           disabled={disabled || !inTauri}
+          data-testid="dir-picker-browse"
           title={inTauri ? undefined : '网页调试模式不支持系统原生目录对话框（可直接输入路径或选历史）'}
           className="shrink-0"
         >

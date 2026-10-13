@@ -39,6 +39,7 @@ import type {
   TgStoredMessage,
 } from '../types'
 import { tgSaveConfig } from '../api/tauri'
+import { isTauri, copyToClipboard } from '../lib/env'
 import { CacheManagerDialog } from './CacheManagerDialog'
 import { useStore } from '../store/useStore'
 import { useTgSearch } from '../store/tgSearch'
@@ -467,6 +468,12 @@ export function TgPanel(
    * 前端不碰进程（BUG-178）—— 凭证只在 orig-tg 启动时读取，重启这一步由 daemon 执行。
    */
   const saveSetup = useCallback(async () => {
+    // BUG-286：写壳配置 + 请 daemon 重启两步都只在桌面客户端存在。纯浏览器里
+    // `invoke('tg_save_config')` 直接抛 raw undefined.invoke，这里先拦掉，换成一句人话。
+    if (!isTauri()) {
+      setError('保存 Telegram 配置需在桌面客户端中完成（网页调试模式无法写入壳配置并重启服务）')
+      return
+    }
     setSavingCfg(true)
     try {
       await tgSaveConfig(cfgId.trim(), cfgHash.trim(), cfgProxy.trim())
@@ -1278,10 +1285,15 @@ export function TgPanel(
     }
   }
 
-  /** 用系统默认播放器打开已下载文件（Tauri 壳内；浏览器调试环境静默失败） */
+  /** 用系统默认播放器打开已下载文件（Tauri 壳内；网页调试环境降级为复制路径，BUG-286） */
   const openDownloaded = async (item: FeedItem) => {
     const path = downloadedPaths.get(item.key)
     if (!path) return
+    if (!isTauri()) {
+      // 没有 opener 通道 ⇒ 至少把文件所在路径交到用户手上（失败即静默：这条入口本来就只在壳内有意义）。
+      await copyToClipboard(path)
+      return
+    }
     try {
       const { openPath } = await import('@tauri-apps/plugin-opener')
       await openPath(path)

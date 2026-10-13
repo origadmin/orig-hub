@@ -324,7 +324,10 @@ export function MainLayout() {
 
       {/* 全局错误 toast（按钮/操作失败可见反馈） */}
       {toast && (
-        <div className="pointer-events-none fixed left-1/2 top-4 z-[100] -translate-x-1/2 rounded-lg border border-danger/40 bg-danger/15 px-4 py-2 text-sm text-danger shadow-lg backdrop-blur-sm">
+        <div
+          className="pointer-events-none fixed left-1/2 top-4 z-[100] -translate-x-1/2 rounded-lg border border-danger/40 bg-danger/15 px-4 py-2 text-sm text-danger shadow-lg backdrop-blur-sm"
+          data-testid="global-toast"
+        >
           {toast}
         </div>
       )}

@@ -16,6 +16,7 @@ import {
   verifyProxy,
 } from '../api/daemon'
 import { getCacheClearPreview, getCacheStats, getTgConfig, setTgLibraryDir } from '../api/tg'
+import { isTauri, copyToClipboard } from '../lib/env'
 import { CacheManagerDialog } from './CacheManagerDialog'
 import { useStore } from '../store/useStore'
 import { useTranslation } from '../i18n'
@@ -144,6 +145,9 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
   const [logPaths, setLogPaths] = useState<{ dir: string; orig_tg: string; errors: string } | null>(
     null,
   )
+  /** 网页调试模式降级提示（BUG-286）：原生入口不可用时的替代动作说明。
+   *  这是**能力边界陈述**，不是错误 —— 故走 muted 内联文案，不走全局 setError。 */
+  const [nativeHint, setNativeHint] = useState<string | null>(null)
   /** TG 拉起/自愈失败原因：单一真源是服务层（daemon `tg_last_error`），不另存一份 state */
   const tgError = tgService.lastError
 
@@ -383,10 +387,31 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
     }
   }
 
-  /** 打开库根文件夹（tauri opener 通道；浏览器 dev 下无插件 —— 记录后静默） */
+  /**
+   * 网页调试模式降级（BUG-286）：没有 Tauri opener 通道 ⇒ 复制路径 + 内联提示。
+   *
+   * 不碰原生、不上错误 —— raw `Cannot read properties of undefined (reading 'invoke')`
+   * 正是从这里被剥掉的最后一条路径（改之前：裸 `openPath` + `setError(e.message)`）。
+   * `copyToClipboard` 尽力而为；复制失败也要出提示（退化成展示路径），
+   * 否则按钮点了没反应，等于把报错换成了另一种沉默。
+   */
+  const degradeToCopyPath = async (target: string) => {
+    const copied = await copyToClipboard(target)
+    setNativeHint(
+      copied
+        ? `网页调试模式不支持打开系统文件夹，路径已复制：${target}`
+        : `网页调试模式不支持打开系统文件夹，路径：${target}`,
+    )
+  }
+
+  /** 打开库根文件夹：桌面走 tauri opener 通道；网页调试模式降级为「复制路径 + 内联提示」（BUG-286）。 */
   const openLibraryFolder = async () => {
     const target = libDirSaved || libDir
     if (!target) return
+    if (!isTauri()) {
+      await degradeToCopyPath(target)
+      return
+    }
     try {
       const { openPath } = await import('@tauri-apps/plugin-opener')
       await openPath(target)
@@ -396,10 +421,14 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
     }
   }
 
-  /** 打开调试日志目录（BUG-243；tauri opener 通道，浏览器 dev 下无插件 —— 记录后静默） */
+  /** 打开调试日志目录（BUG-243；同上：网页调试模式降级为「复制路径 + 内联提示」）。 */
   const openLogFolder = async () => {
     const target = logPaths?.dir
     if (!target) return
+    if (!isTauri()) {
+      await degradeToCopyPath(target)
+      return
+    }
     try {
       const { openPath } = await import('@tauri-apps/plugin-opener')
       await openPath(target)
@@ -538,7 +567,7 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
                     <p className="text-[11px] text-muted">{t('downloads.libDirHint')}</p>
                   </div>
                   <div className="mt-2 flex items-start gap-2">
-                    <div className="min-w-0 flex-1">
+                    <div className="min-w-0 flex-1" data-testid="lib-dir-picker">
                       <DirectoryPicker value={libDir} onChange={setLibDir} placeholder={libDir || defaultDir || t('downloads.dirPlaceholder')} onError={setError} />
                     </div>
                     <Button
@@ -547,10 +576,19 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
                       className="h-8 shrink-0 px-2 text-xs"
                       disabled={!libDir && !libDirSaved}
                       onClick={openLibraryFolder}
+                      data-testid="settings-lib-open"
                     >
                       {t('downloads.openFolder')}
                     </Button>
                   </div>
+                  {nativeHint && (
+                    <p
+                      className="mt-1.5 text-[11px] leading-relaxed text-muted"
+                      data-testid="settings-lib-hint"
+                    >
+                      {nativeHint}
+                    </p>
+                  )}
                   <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
                     {t('downloads.libDirNote')}
                   </p>
@@ -1204,6 +1242,14 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
                 >
                   {logPaths?.dir ?? t('about.logsUnavailable')}
                 </p>
+                {nativeHint && (
+                  <p
+                    className="mt-1.5 text-[11px] leading-relaxed text-muted"
+                    data-testid="about-logs-hint"
+                  >
+                    {nativeHint}
+                  </p>
+                )}
                 <ul className="space-y-1 text-[11px] text-muted">
                   <li>
                     <span className="font-mono text-fg-mid">orig-tg.log</span> ·{' '}
