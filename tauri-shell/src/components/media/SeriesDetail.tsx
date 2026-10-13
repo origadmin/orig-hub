@@ -60,6 +60,7 @@ import {
   hasMediaBytes,
   recacheFromSource,
   sourceLabelKey,
+  sourceMessageUrl,
 } from '../../lib/mediaSources'
 import {
   episodeDescriptionIsSeriesLevel,
@@ -219,6 +220,12 @@ export function SeriesDetail(props: {
     effectiveFocusedId != null
       ? detail.episodes.find((e) => e.id === effectiveFocusedId) ?? null
       : null
+
+  /**
+   * BUG-285：当前集的「跳回 TG 源消息」深链。
+   * 只在来源自身能解释定位符时非空（本地来源 ⇒ null ⇒ 不渲染入口）。
+   */
+  const curTgUrl = cur ? sourceMessageUrl(cur.source, cur.ref) : null
 
   // 换剧集时清空所有编辑态 —— 否则上一部剧的面板会「挂着」新剧的数据。
   useEffect(() => {
@@ -997,33 +1004,66 @@ export function SeriesDetail(props: {
                     {/* BUG-265：无来源回退走 i18n（source.local = 本地 / Local），不再用裸字符串 */}
                     {cur.source ? t(sourceLabelKey(cur.source)) : t('source.local')}
                   </span>
+                  {/* BUG-285：「跳回 TG 源消息」入口 —— 贴着它所解释的那条来源（同一行）。
+                      坐标是入库时记下的 `ref`（TG 即 `<chat>:<msg>`），数据一直在、
+                      只是没有出口；无标内容（占位标题）靠它才能被人工辨认。
+                      本地来源解析不出 TG 消息 ⇒ 无入口（点了也没有可跳的坐标）。 */}
+                  {curTgUrl ? (
+                    <a
+                      href={curTgUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-accent hover:bg-surface-2"
+                      title={curTgUrl}
+                      data-testid="episode-source-view-tg"
+                    >
+                      {t('media.episode.viewInTg')}
+                    </a>
+                  ) : null}
                 </div>
                 {(cur.sources ?? []).length > 0 ? (
                   <ul className="flex flex-col gap-1">
-                    {(cur.sources ?? []).map((s) => (
-                      <li
-                        key={s.itemId}
-                        className="flex items-center gap-2 rounded border border-border-subtle/70 px-2 py-1 text-[11px]"
-                      >
-                        <span className="min-w-0 flex-1 truncate text-fg-mid">{s.title || `#${s.itemId}`}</span>
-                        <button
-                          type="button"
-                          onClick={() => switchSource(cur, s.itemId)}
-                          className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-muted hover:bg-surface-2 hover:text-fg-mid"
-                          data-testid="episode-source-switch"
+                    {(cur.sources ?? []).map((s) => {
+                      const sTgUrl = sourceMessageUrl(s.source, s.ref)
+                      return (
+                        <li
+                          key={s.itemId}
+                          className="flex items-center gap-2 rounded border border-border-subtle/70 px-2 py-1 text-[11px]"
                         >
-                          {t('media.episode.switchPrimary')}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => detachSource(cur.id, s.itemId)}
-                          className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-destructive hover:bg-destructive/10"
-                          data-testid="episode-source-detach"
-                        >
-                          {t('media.episode.detachSource')}
-                        </button>
-                      </li>
-                    ))}
+                          <span className="min-w-0 flex-1 truncate text-fg-mid">{s.title || `#${s.itemId}`}</span>
+                          <button
+                            type="button"
+                            onClick={() => switchSource(cur, s.itemId)}
+                            className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-muted hover:bg-surface-2 hover:text-fg-mid"
+                            data-testid="episode-source-switch"
+                          >
+                            {t('media.episode.switchPrimary')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => detachSource(cur.id, s.itemId)}
+                            className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-destructive hover:bg-destructive/10"
+                            data-testid="episode-source-detach"
+                          >
+                            {t('media.episode.detachSource')}
+                          </button>
+                          {/* BUG-285：备用源行同样贴一个「跳回 TG 源消息」——入口跟着
+                              它解释的那条来源走；本地备用源无坐标 ⇒ 不渲染。 */}
+                          {sTgUrl ? (
+                            <a
+                              href={sTgUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-accent hover:bg-surface-2"
+                              title={sTgUrl}
+                              data-testid="episode-source-view-tg"
+                            >
+                              {t('media.episode.viewInTg')}
+                            </a>
+                          ) : null}
+                        </li>
+                      )
+                    })}
                   </ul>
                 ) : null}
               </div>

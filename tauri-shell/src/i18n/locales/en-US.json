@@ -673,6 +673,7 @@
   "media.episode.sourcePrimary": "Primary",
   "media.episode.switchPrimary": "Make primary",
   "media.episode.detachSource": "Detach",
+  "media.episode.viewInTg": "View in TG",
   "media.episode.moveUp": "Move up one (swap with previous episode)",
   "media.episode.moveDown": "Move down one (swap with next episode)",
   "media.episode.firstInSeason": "Already the first episode of this season",

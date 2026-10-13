@@ -309,6 +309,26 @@ export function parseSourceRef(
   return getSourceAdapter(source)?.parseRef?.(ref) ?? null
 }
 
+/**
+ * 「跳回源消息」深链（BUG-285）——把来源定位符还原成一条人类可点的地址。
+ *
+ * 入库坐标（`MediaEpisode.ref` / `EpisodeSourceRef.ref`，TG 即 `<chat>:<msg>`）
+ * 一直存在，但前端零入口把它交给用户：无标内容（标题是占位名）就此永久沉积，
+ * 用户既看不出它是什么，也没有任何通道回源头辨认。本函数把坐标翻成 t.me 深链。
+ *
+ * 只有**来源自身能解释该定位符**时才产出地址（`parseSourceRef` 判据）：
+ * 本地来源没有 TG 消息可跳 ⇒ null，调用方据此**不渲染**入口。
+ *
+ * 注意：本文件是唯一 import `lib/tgmedia` 的地方，深链形状（t.me/c/...）作为
+ * TG 知识封死在此；组件只见「来源 → 可点地址」这一层接口。
+ */
+export function sourceMessageUrl(source?: string | null, ref?: string | null): string | null {
+  if (!source || !ref) return null
+  const at = parseSourceRef(ref, source)
+  if (!at) return null
+  return `https://t.me/c/${at.chatId}/${at.messageId}`
+}
+
 // 泛型展示工具：实现源自 `lib/tgmedia`，但媒体库只当通用工具用（不引入 TG 语义）。
 // 集中在这里 re-export，媒体库组件统一从本文件取，避免再 import `lib/tgmedia`。
 export { coverFit, fmtDuration, fmtSize, hasMediaBytes, isRawFileName }

@@ -673,6 +673,7 @@
   "media.episode.sourcePrimary": "主版本",
   "media.episode.switchPrimary": "切为主版本",
   "media.episode.detachSource": "摘除",
+  "media.episode.viewInTg": "在 TG 中查看",
   "media.episode.moveUp": "上移一位（与本季上一集换位）",
   "media.episode.moveDown": "下移一位（与本季下一集换位）",
   "media.episode.firstInSeason": "已经是本季第一集",
