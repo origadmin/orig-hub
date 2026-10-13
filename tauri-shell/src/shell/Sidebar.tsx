@@ -37,8 +37,6 @@ interface Props {
     completed: number
     series: number
     tags: number
-    /** 未归档数：**可空**（后端无该统计，禁止编造；见 nav/index.ts） */
-    unfiled?: number
   }
 }
 
@@ -95,11 +93,14 @@ const DL_KEY: Record<Exclude<DlFilter, 'all'>, string> = {
   done: 'download.done',
 }
 
-const LIB_KEY: Record<'series' | 'tags' | 'unfiled', string> = {
-  series: 'files.lib.series',
-  tags: 'files.lib.tags',
-  unfiled: 'files.lib.unfiled',
-}
+/**
+ * 资料库组只剩「剧集」（BUG-304 / D18）：
+ *   - 原 `lib-tags` 树项删除 —— 它与 `lib-series` 落同一视图，是**空转入口**；
+ *     标签是过滤维度，标签云与筛选框留在剧集墙顶部。
+ *   - 原 `lib-unfiled` 树项删除 —— 「未归档」状态本身取消（视频=剧集 ⇒ 单集即单集剧集）。
+ * 树项减少不改组标签（`files.group.library`）：资料库仍是「分类之外的第二组」。
+ */
+const LIB_SERIES_KEY = 'files.lib.series'
 
 export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props) {
   const { t } = useTranslation()
@@ -237,25 +238,23 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
               <p className="px-2 pb-0.5 pl-9 pt-1.5 text-[10px] font-medium uppercase tracking-wide text-muted">
                 {t('files.group.library')}
               </p>
-              {(['series', 'tags', 'unfiled'] as const).map((g) => (
-                <button
-                  key={g}
-                  type="button"
-                  data-testid={`nav-child-lib-${g}`}
-                  onClick={() => onNavigate('files', { fmode: `lib-${g}` as FileMode })}
-                  title={t(LIB_KEY[g])}
-                  className={childCls(isNavChildActive(view, fmode, dlFilter, { fmode: `lib-${g}` as FileMode }))}
-                >
-                  <span className="min-w-0 flex-1 truncate text-left">{t(LIB_KEY[g])}</span>
-                  {(() => {
-                    // 未归档计数可空：没有就不显示，**不补 0**（0 = 「确认没有」，
-                    // 与「不知道」是两件事，侧栏徽标不允许把后者伪装成前者）。
-                    const n =
-                      g === 'series' ? counts.series : g === 'tags' ? counts.tags : counts.unfiled
-                    return n == null ? null : <span className="shrink-0 text-[10px] text-muted">{n}</span>
-                  })()}
-                </button>
-              ))}
+              {/* 资料库组当前只有「剧集」一项（BUG-304 / D18 删除了「标签」「未归档」）。
+                  不再用 `.map` 铺枚举：一个组一个子项时，循环只剩噪音，且会诱使后人
+                  「顺手补一个枚举值」而不先回答「它是不是一个目的地」。 */}
+              <button
+                type="button"
+                data-testid="nav-child-lib-series"
+                onClick={() => onNavigate('files', { fmode: 'lib-series' })}
+                title={t(LIB_SERIES_KEY)}
+                className={childCls(isNavChildActive(view, fmode, dlFilter, { fmode: 'lib-series' }))}
+              >
+                <span className="min-w-0 flex-1 truncate text-left">{t(LIB_SERIES_KEY)}</span>
+                {/* 徽标数与剧集墙同源（BUG-125 / BUG-133：不许侧栏另算一套）。
+                    0 不渲染 —— 0 = 「确认没有」，与「不知道」是两件事。 */}
+                {counts.series > 0 ? (
+                  <span className="shrink-0 text-[10px] text-muted">{counts.series}</span>
+                ) : null}
+              </button>
             </div>
           )}
         </div>

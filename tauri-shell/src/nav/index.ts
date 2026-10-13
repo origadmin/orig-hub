@@ -38,18 +38,33 @@ export const FILE_CATEGORIES: readonly FileCategory[] = [
   'other',
 ]
 
-/** 文件树「资料库（策划）」组。 */
-export type LibraryGroup = 'series' | 'tags' | 'unfiled'
+/**
+ * 文件树「资料库（策划）」组。
+ *
+ * **只剩「剧集」**（BUG-304 / D18，2026-10-14 用户四点裁定）：
+ *   - `tags` 被移除 —— 标签是**过滤维度**不是目的地。实测 `lib-tags` 与 `lib-series`
+ *     落在完全相同的视图（`MediaLibraryPanel` 里两个分支都 `setView('series')`），
+ *     树项是**空转入口**。标签云与筛选框留在剧集墙顶部即可。
+ *   - `unfiled` 被移除 —— **「未归档」状态本身取消**。用户口径「视频=剧集，单集必然是
+ *     一个单集剧集」⇒「有条目但无剧集归属」是**缺陷症状**而非正常态，把它做成一等入口
+ *     等于把缺陷固化成功能（原 D13-③ 已由 D18 修订）。
+ *
+ * 保留 `LibraryGroup` 这个类型名而不是删掉：资料库组仍是「分类组之外的第二个组」，
+ * 组标签（`files.group.library`）与侧栏结构都依赖这个划分；将来若再长出策划轴子项，
+ * 在这里加枚举值即可。
+ */
+export type LibraryGroup = 'series'
 
 /**
  * 文件域树选择。
  *
  * - `cat-all`               父行「全部文件」= 成品媒体墙全部（`tab: 'all'`）
  * - `cat:<category>`        分类组子项（按 kind 过滤，`tab: <kind>`）
- * - `lib-series`            剧集栅格
- * - `lib-tags`              标签云 + 点选结果
- * - `lib-unfiled`           未归档（`series_id == null`）
+ * - `lib-series`            剧集栅格（标签云与筛选框同屏，标签是过滤维度不是目的地）
  * - `series:<id>`           剧集下钻（drill-in；返回即回到 `lib-series`）
+ *
+ * **已移除**（BUG-304 / D18）：`lib-tags`（空转入口，与 `lib-series` 同视图）、
+ * `lib-unfiled`（「未归档」状态取消：视频=剧集 ⇒ 单集即单集剧集）。
  *
  * 设计取舍：用**字符串模板**而非嵌套对象 —— 它要进 React state、要能直接当
  * `key`/比较值，嵌套对象每次渲染都是新引用，`memo` 会失效。
@@ -58,8 +73,6 @@ export type FileMode =
   | 'cat-all'
   | `cat:${FileCategory}`
   | 'lib-series'
-  | 'lib-tags'
-  | 'lib-unfiled'
   | `series:${number}`
 
 /** 全局导航状态（单一真源在 MainLayout；禁止组件各存一份 view）。 */
@@ -83,10 +96,6 @@ export interface NavState {
  *
  * 纪律（BUG-125 / BUG-133）：徽标数必须与域面板里的数是**同一个数**，
  * 不许侧栏自己再算一套。故这些数由各域面板经回调上报，`MainLayout` 只中转。
- *
- * `unfiled` **可空**：`LibraryStats` 没有「未归档」字段，而 items 列表是
- * 分页/筛选后的结果 —— 拿列表长度当总数属于编造。缺失时侧栏该子项不显示计数，
- * 等 M2-T03（BUG-299）的 `series_id IS NULL` 参数化查询落地后补。
  */
 export interface SidebarCounts {
   /** 成品总数（文件父行徽标） */
@@ -95,8 +104,6 @@ export interface SidebarCounts {
   series: number
   /** 标签数（资料库组） */
   tags: number
-  /** 未归档数（可空，见上） */
-  unfiled?: number
 }
 
 /** 默认落地：文件域 · 全部成品。原 `useState<ViewId>('all')` 的等价物。 */
@@ -161,18 +168,9 @@ export function fileCategoryOf(fmode: FileMode): FileCategory | null {
   return (FILE_CATEGORIES as readonly string[]).includes(c) ? (c as FileCategory) : null
 }
 
-/** 是否资料库组选择。 */
+/** 是否资料库组选择。当前只有「剧集」（BUG-304 / D18 移除了 tags 与 unfiled）。 */
 export function libraryGroupOf(fmode: FileMode): LibraryGroup | null {
-  switch (fmode) {
-    case 'lib-series':
-      return 'series'
-    case 'lib-tags':
-      return 'tags'
-    case 'lib-unfiled':
-      return 'unfiled'
-    default:
-      return null
-  }
+  return fmode === 'lib-series' ? 'series' : null
 }
 
 /** 从 `series:<id>` 取剧集 id；非下钻返回 null。 */

@@ -220,7 +220,6 @@ export function MainLayout() {
             completed: completed.length,
             series: filesCounts.series,
             tags: filesCounts.tags,
-            unfiled: filesCounts.unfiled,
           }}
         />
 

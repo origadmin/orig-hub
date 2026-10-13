@@ -238,7 +238,6 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
      展开后显示全部并出现过滤框。 */
   const [tagExpanded, setTagExpanded] = useState(false)
   const [tagFilter, setTagFilter] = useState('')
-  const [unassignedOnly, setUnassignedOnly] = useState(false)
 
   /**
    * 侧栏分类（6 类）→ 资料库 kind（4 值）的过渡映射（M0-T03）。
@@ -281,15 +280,19 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
     }
     setDetail(null)
     setActiveSeriesId(null)
-    const lib = libraryGroupOf(fmode)
-    if (lib === 'series' || lib === 'tags') {
+    /*
+     * 资料库组只剩「剧集」（BUG-304 / D18）。
+     * 原 `lib === 'tags'` 分支与 `lib === 'series'` 落同一视图，是**空转入口**（已删）；
+     * 原 `lib === 'unfiled'` 会把 items 视图切成「只看散片」——「未归档」状态本身取消，
+     * 因为**视频=剧集**（单集即单集剧集），「有条目无剧集归属」是缺陷症状而非正常态。
+     */
+    if (libraryGroupOf(fmode) === 'series') {
       setView('series')
       return
     }
     const cat = fileCategoryOf(fmode)
     setView('items')
     setTab(cat ? CATEGORY_TO_KIND[cat] : 'all')
-    setUnassignedOnly(lib === 'unfiled')
   }, [fmode])
 
   /**
@@ -298,9 +301,9 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
    * 侧栏徽标要的是**同一个数**（BUG-125 / BUG-133 的同源纪律：不许两处各算一套）。
    * 只在取值变化时上报，避免每次渲染都往顶层推 state。
    *
-   * **未归档计数不上报**：`LibraryStats` 没有该字段，而 `items` 是分页/筛选后的
-   * 结果，拿它的长度当总数属于编造。⇒ 侧栏该子项的计数留空，等 M2-T03 的
-   * `series_id IS NULL` 参数化查询落地后补（已知残余，登记在 BUG-298 §实施记录）。
+   * 「未归档」计数随状态取消一并移除（BUG-304 / D18）—— 原来它是**留空**的
+   * （`LibraryStats` 无该字段，拿分页列表长度当总数属于编造），现在连侧栏那一项都不存在了，
+   * BUG-298 残余②「未归档计数缺位」由此关闭。
    */
   const countsKey = `${stats?.items ?? ''}|${seriesTotal}|${stats?.tags ?? ''}`
   useEffect(() => {
@@ -309,7 +312,6 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
       files: stats?.items ?? 0,
       series: seriesTotal,
       tags: stats?.tags ?? 0,
-      unfiled: undefined,
     })
     // countsKey 是上面三个值的组合：变了的才推（eslint 需要显式依赖）
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -430,7 +432,6 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
         kind: tab === 'all' ? '' : tab,
         q: search.trim() || undefined,
         tagId: activeTagId ?? undefined,
-        unassigned: unassignedOnly,
         sort,
         limit: PAGE,
         offset: 0,
@@ -445,7 +446,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
     } finally {
       setLoading(false)
     }
-  }, [tab, search, activeTagId, unassignedOnly, sort, setError])
+  }, [tab, search, activeTagId, sort, setError])
 
   const loadSeries = useCallback(async () => {
     try {
@@ -778,7 +779,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
    * 在渲染期 setState 是 React 官方的「按 prop 变化调整 state」写法，会在本次渲染
    * 落地前重渲染，不会有「先画一帧旧选择态」的闪烁。
    */
-  const selectScope = `${view}|${tab}|${activeTagId ?? ''}|${search.trim()}|${unassignedOnly ? 1 : 0}`
+  const selectScope = `${view}|${tab}|${activeTagId ?? ''}|${search.trim()}`
   const [selectionScope, setSelectionScope] = useState(selectScope)
   if (selectionScope !== selectScope) {
     setSelectionScope(selectScope)
@@ -872,14 +873,12 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
   const clearFilters = useCallback(() => {
     setActiveTagId(null)
     setSearch('')
-    setUnassignedOnly(false)
   }, [])
 
   // BUG-131：`activeTagId` 对 series 视图同样生效（`loadSeries` 消费它），故不加视图条件；
-  // `unassignedOnly` 只在 items 视图渲染；`search` 只在 items 视图真正参与过滤 ——
+  // `search` 只在 items 视图真正参与过滤 ——
   // 否则 series 视图会呈现「已过滤」的假象（显示「清除筛选」却没有过滤发生）。
-  const filterActive =
-    activeTagId !== null || (view === 'items' && search.trim() !== '') || unassignedOnly
+  const filterActive = activeTagId !== null || (view === 'items' && search.trim() !== '')
 
   /**
    * 删除确认的目标集：卡片逐条 = `[id]`，工具栏批量 = 当前勾选。
@@ -1052,17 +1051,9 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
               <option value="size">{t('media.sortSize')}</option>
             </select>
           ) : null}
-          {view === 'items' ? (
-            <label className="flex items-center gap-1 text-[11px] text-muted">
-              <input
-                type="checkbox"
-                checked={unassignedOnly}
-                onChange={(e) => setUnassignedOnly(e.target.checked)}
-                className="h-3 w-3"
-              />
-              {t('media.unassignedOnly')}
-            </label>
-          ) : null}
+          {/* BUG-304 / D18：原「只看散片（未归入剧集）」勾选框删除 —— 「未归档」状态本身
+              取消（视频=剧集 ⇒ 单集即单集剧集），该筛选永远只会返回空集。
+              后端 `?unassigned=` 参数保留（BUG-138 缓存键判据仍在用），只是前端不再有入口。 */}
 
           {/*
             M0-T03：占用空间读数从左栏底部**原样搬到工具条**（左栏已删）。
@@ -1201,15 +1192,29 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
           </div>
         </header>
         {/*
-         * M0-T03：标签云从左栏搬迁到内容区 —— 导航归侧栏树（`lib-tags`/`lib-series`），
-         * 能力不丢：BUG-259 的截断/展开/过滤三条规则原样保留，testid 不变。
+         * M0-T03：标签云从左栏搬迁到内容区。
+         * BUG-304 / D18：导航不再有「标签」树项（标签是**过滤维度**不是目的地），
+         * 标签云与筛选框都留在剧集墙顶部；筛选框从「列表下方、仅展开态」改为
+         * **列表上方、常态可见** —— 原位置自相矛盾（要筛就得先滚过全部标签，
+         * 而滚完已经看见了全部）。BUG-259 的截断/展开两条规则保留，testid 不变。
          */}
         {view === "series" && (
           <>
-                    <p className="px-2 pb-1 pt-3 text-[10px] font-medium uppercase tracking-wide text-muted">
-                      {t('media.tags')}
-                    </p>
-                    <div className="flex flex-wrap gap-1 px-1" data-testid="media-tag-list">
+                    <div className="flex items-center gap-2 px-2 pt-3">
+                      <p className="shrink-0 text-[10px] font-medium uppercase tracking-wide text-muted">
+                        {t('media.tags')}
+                      </p>
+                      {/* BUG-304 / D18：常态可见，不再等 `tagExpanded`；且必须在 chip 列表
+                          **之前** —— 筛选框与它筛选的对象必须同屏。 */}
+                      <Input
+                        data-testid="media-tag-filter"
+                        value={tagFilter}
+                        onChange={(e) => setTagFilter(e.target.value)}
+                        placeholder={t('media.tag.filterPlaceholder')}
+                        className="h-6 flex-1 text-[10.5px]"
+                      />
+                    </div>
+                    <div className="mt-1 flex flex-wrap gap-1 px-1" data-testid="media-tag-list">
                       {(() => {
                         /*
                          * 标签 chip 的两条规则（BUG-068）：
@@ -1244,10 +1249,12 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
                           ? visible.filter(({ tag }) => tag.name.toLowerCase().includes(q))
                           : visible
                         /* BUG-259：收起态**截断**（只渲染片数最多的前 RAIL_TAG_LIMIT 个），
-                           不是「限高 + 滚动」—— 左栏不允许出现任何滚动容器。展开态渲染全部
-                           （配合下方过滤框）。选中的标签**永远渲染**，否则用户看不到自己在
-                           筛什么、也没有可点的取消入口（同 BUG-068 的例外规则）。 */
-                        const shown = tagExpanded
+                           不是「限高 + 滚动」—— 左栏不允许出现任何滚动容器。展开态渲染全部；
+                           **过滤生效时也渲染全部匹配**（BUG-304 / D18：筛选框在列表上方，
+                           用户输入后若只看到前 N 个匹配，会以为「就这些」）。选中的标签
+                           **永远渲染**，否则用户看不到自己在筛什么、也没有可点的取消入口
+                           （同 BUG-068 的例外规则）。 */
+                        const shown = tagExpanded || q
                           ? searched
                           : searched
                               .slice(0, RAIL_TAG_LIMIT)
@@ -1265,9 +1272,9 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
                               data-testid={`media-tag-chip-${tag.id}`}
                               onClick={() => {
                                 setActiveTagId(on ? null : tag.id)
-                                // M0-T03：标签云已只在 `view === 'series'` 渲染（导航归侧栏树 `lib-series`/`lib-tags`），
-// 故原「内容侧点标签 → 切 items 网格」的分支**不可达**，与 `switchTab` 一并移除。
-// 留下的行为与原 else 分支逐字相同。
+                                // BUG-304 / D18：标签云只在 `view === 'series'` 渲染（树里已无
+                                // 「标签」项），故原「内容侧点标签 → 切 items 网格」的分支**不可达**，
+                                // 与 `switchTab` 一并移除。留下的行为与原 else 分支逐字相同。
                                   setDetail(null)
                                   clearSelection()
                               }}
@@ -1291,7 +1298,8 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
                       })()}
                     </div>
                     {/* BUG-259：收起态是**截断**（不是限高 + 滚动），所以必须给出「还有 N 个」
-                        的可点出口 —— 否则被截掉的标签在界面上无从发现。展开态额外给过滤框。 */}
+                        的可点出口 —— 否则被截掉的标签在界面上无从发现。
+                        BUG-304 / D18：过滤框已移到**列表上方**（常态可见），这里只剩展开/收起。 */}
                     {railTagTotal > RAIL_TAG_LIMIT || tagExpanded ? (
                       <div className="mt-1 flex items-center gap-1 px-1">
                         <button
@@ -1308,15 +1316,6 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
                             ? t('media.tag.collapse')
                             : t('media.tag.showAll', { n: Math.max(0, railTagTotal - RAIL_TAG_LIMIT) })}
                         </button>
-                        {tagExpanded ? (
-                          <Input
-                            data-testid="media-tag-filter"
-                            value={tagFilter}
-                            onChange={(e) => setTagFilter(e.target.value)}
-                            placeholder={t('media.tag.filterPlaceholder')}
-                            className="h-6 flex-1 text-[10.5px]"
-                          />
-                        ) : null}
                       </div>
                     ) : null}
           </>

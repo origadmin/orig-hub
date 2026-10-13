@@ -22,7 +22,9 @@
  *      「小滚动条必然禁止」是无条件的，原对象（剧集列表）已不存在，故改锚到这里；
  *   ③ 标签块不得落在任何滚动容器内（不得是 `series-wall-scroll` 的后代，其祖先链上
  *      也不得有活动滚动容器）—— 否则标签会随内容滚走，重新构成嵌套滚动对；
- *   ④ 展开态 chip 数 > 收起态且出现 `media-tag-filter`，输入过滤词后 chip 数减少；
+ *   ④ 展开态 chip 数 > 收起态，输入过滤词后 chip 数减少；
+ *      `media-tag-filter` **自 BUG-304 / D18 起常态可见**（不再依赖展开态），
+ *      且必须在标签列表**上方** —— 见判据④b'（收起态）与④b（展开态）；
  *   ⑤ 再点一次 `media-tag-toggle` 回到收起态；
  *   ⑥ `media-cat-*` 全仓 0 个（用户裁定「先删，整体在重新架构」—— 未建替代入口）。
  *
@@ -249,6 +251,27 @@ async function main() {
     await new Promise((r) => setTimeout(r, 400))
 
     const collapsed = await page.evaluate(() => window.__tags.measure())
+
+    /* BUG-304 / D18：过滤框移到标签列表**上方**且**常态可见**。
+       故在**收起态**就必须存在，且几何 top 必须小于标签列表的 top ——
+       原实现把过滤框放在列表下方、且只在展开态渲染，于是「要筛得先滚过全部标签，
+       而滚完已经看见了全部」（用户原话）。这里把它钉成可证伪判据。 */
+    const filterGeo = await page.evaluate(() => {
+      const f = document.querySelector('[data-testid="media-tag-filter"]')
+      const l = document.querySelector('[data-testid="media-tag-list"]')
+      if (!f || !l) return { exists: !!f, list: !!l, above: null }
+      return {
+        exists: true,
+        list: true,
+        above: f.getBoundingClientRect().top < l.getBoundingClientRect().top,
+      }
+    })
+    check(
+      "判据④b' 收起态过滤框已存在且在标签列表上方（BUG-304）",
+      filterGeo.exists === true && filterGeo.list === true && filterGeo.above === true,
+      `exists=${filterGeo.exists} above=${filterGeo.above}`,
+    )
+
     const clicked = await page.evaluate(() => {
       const el = document.querySelector('[data-testid="media-tag-toggle"]')
       if (!el) return false
@@ -267,7 +290,7 @@ async function main() {
       mExp.tagBoxScrollbarPx === 0 && mExp.tagBoxOver <= TOL,
       `滚动条 ${mExp.tagBoxScrollbarPx}px / 溢出 ${mExp.tagBoxOver}px`,
     )
-    check('判据④b 展开态出现 media-tag-filter', mExp.hasFilter === true, `hasFilter=${mExp.hasFilter}`)
+    check('判据④b 展开态过滤框仍在（常态可见，非「展开才出现」）', mExp.hasFilter === true, `hasFilter=${mExp.hasFilter}`)
 
     // 过滤：用第一个 chip 名字的首字符当过滤词（必然命中，不依赖具体标签名）
     const word = await page.evaluate(() => {
