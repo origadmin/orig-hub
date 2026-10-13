@@ -60,6 +60,20 @@ type View = 'items' | 'series' | 'seriesDetail'
 
 const PAGE = 120
 
+/* ── 左栏（Navi）规模上限（BUG-259）─────────────────────────────────────────
+ * 左栏**不是**滚动容器：剧集与标签都必须截断到固定条数，否则矮窗口下会与 `nav`
+ * 自身形成「两条同时生效且嵌套」的滚动条（小滚动条无条件禁止）。
+ * 完整列表各有出口：剧集 → 上方「全部剧集 N」按钮；标签 → 下方展开控件。
+ *
+ * 取值依据（2026-10-13 CDP 注入式实测，两档视口共 12 组数据，见 BUG-259.md）：
+ *   · 剧集行高 30px + gap 2px ⇒ 9 行 = 288px，正是原 `max-h-72` 容器的可见高度，
+ *     即用户裁定的「剧集当前 9 合适」；
+ *   · 标签行高 20px + gap 4px ⇒ 8 个 ≈ 115px（5 行），默认窗口 780 高下 nav 仍余
+ *     ≈100px 不溢出；窗口高降到 ≈680 以下才出现唯一一条大滚动条（用户裁定允许）。
+ */
+const RAIL_SERIES_LIMIT = 9
+const RAIL_TAG_LIMIT = 8
+
 /**
  * 单个内容条目 → 播放项。
  *
@@ -197,6 +211,10 @@ export function MediaLibraryPanel() {
   const [activeTagId, setActiveTagId] = useState<number | null>(null)
   const [search, setSearch] = useState('')
   const [sort, setSort] = useState<'recent' | 'oldest' | 'title' | 'duration' | 'size'>('recent')
+  /* 左栏标签区（BUG-259）：默认收起 —— 只显示片数最多的 RAIL_TAG_LIMIT 个；
+     展开后显示全部并出现过滤框。 */
+  const [tagExpanded, setTagExpanded] = useState(false)
+  const [tagFilter, setTagFilter] = useState('')
   const [unassignedOnly, setUnassignedOnly] = useState(false)
   const [selected, setSelected] = useState<Set<number>>(new Set())
   /**
@@ -827,6 +845,20 @@ export function MediaLibraryPanel() {
   const libraryEmpty = (stats?.items ?? 0) === 0
 
   /**
+   * 左栏标签区（BUG-259）：当前是否「剧集侧」—— 决定标签计数取 `itemCount` 还是
+   * `seriesCount`。左栏 chip 与下方展开控件的计数必须同源，故提到组件体只算一次。
+   */
+  const railSeriesSide = view === 'series' || view === 'seriesDetail'
+  /**
+   * 非零标签总数（与 chip 渲染同一条 0 计数规则，BUG-068）。收起态只渲染前
+   * `RAIL_TAG_LIMIT` 个，展开控件靠这个数给出「还有 N 个」—— 没有它用户无法
+   * 知道发生过截断。**不含**「选中项例外」（那个例外只服务 chip 的取消入口）。
+   */
+  const railTagTotal = tags.filter((tag) =>
+    railSeriesSide ? (tag.seriesCount ?? 0) > 0 : (tag.itemCount ?? 0) > 0,
+  ).length
+
+  /**
    * 占用空间的主口径与是否有两个口径（BUG-133）。
    *
    * `diskBytes` 缺失 = 后端还没提供磁盘真值，此时**回退登记值**并改口径说明，
@@ -923,12 +955,14 @@ export function MediaLibraryPanel() {
 
         <nav className="min-h-0 flex-1 overflow-y-auto p-2">
           {/*
-           * 层级：**剧集 = 一级，内容 = 二级**（此前相反 —— 内容四个类型在最上，
-           * 剧集只是并列的第二个分组，于是「库」的主语变成了散条目，剧集反而像筛选器）。
+           * 层级：**剧集 = 一级实体**。全部剧集 → 剧集墙；下列每个剧集直接进它的内容。
            *
-           * 一级（剧集）：全部剧集 → 剧集墙；下列每个剧集直接进它的内容（二级）。
-           * 二级（内容）：按类型看**全局内容**（含未归档散片）——这是「兜底视角」，
-           *   故下沉到剧集之后，并用 `media.contentAll` 明确其范围。
+           * BUG-259（2026-10-13 用户裁定）：原先夹在中间的「内容（全部 / 散片）」二级
+           * 分组**已删除** —— 外 Navi 的下载侧已拥有完整的内容分类，且媒体库将并入整体
+           * 文件管理。按 `docs/design/module-restructure-2026-10-13/spec.md` §3.2，
+           * 「文件」模块的二级 rail 改为 内容 / 剧集 / 标签 / 文件夹，默认进「内容·全部」；
+           * 类型筛选入口（原 `media-cat-*`）随 M0 重整在新 rail 落位。
+           * ⇒ 本档只登记「该能力在当前版本暂时不可达」，不在本组件里另造替代入口。
            */}
           <p className="px-2 pb-1 pt-1 text-[10px] font-medium uppercase tracking-wide text-muted">
             {t('media.series')}
@@ -951,9 +985,11 @@ export function MediaLibraryPanel() {
             <span className="shrink-0 text-[10px] text-muted">{seriesTotal}</span>
           </button>
           {series.length > 0 && (
-            /* 剧集列表有界滚动：剧集可能很多，不能把下面「内容/标签」挤出可视区 */
-            <div className="mt-0.5 max-h-72 space-y-0.5 overflow-y-auto">
-              {series.map((s) => (
+            /* BUG-259：左栏**不是**滚动容器 —— 固定渲染前 RAIL_SERIES_LIMIT 条，
+               其余由上方「全部剧集」按钮进入。原先的 `max-h-72 + overflow-y-auto`
+               兜底会在矮窗口下与 `nav` 自身形成「两条同时生效且嵌套」的滚动条。 */
+            <div className="mt-0.5 space-y-0.5">
+              {series.slice(0, RAIL_SERIES_LIMIT).map((s) => (
                 <button
                   key={s.id}
                   type="button"
@@ -978,45 +1014,6 @@ export function MediaLibraryPanel() {
           )}
 
           <p className="px-2 pb-1 pt-3 text-[10px] font-medium uppercase tracking-wide text-muted">
-            {t('media.contentAll')}
-          </p>
-          {(() => {
-            const rows: [Tab, string, number][] = [
-              ['all', t('media.all'), stats?.items ?? 0],
-              ['video', t('media.videos'), stats?.videos ?? 0],
-              ['photo', t('media.photos'), stats?.photos ?? 0],
-              ['audio', t('media.audios'), stats?.audios ?? 0],
-            ]
-            const all = rows
-            const on = view === 'items' && activeTagId === null
-            /*
-             * 计数 0 的分类**不渲染**（BUG-068）：
-             * 点它必然得到空列表 —— 渲染等于向用户承诺一个兑现不了的入口。
-             * 例外：当前选中的那一项即使降为 0 也要留着，否则「选中态」在界面上
-             * 消失，用户既看不到自己在筛什么、也没有可点的取消入口。
-             */
-            const visible = all.filter(([key, , count]) => count > 0 || (on && tab === key))
-            if (visible.length === 0) {
-              return <p className="px-2 text-[10px] text-muted">—</p>
-            }
-            return visible.map(([key, label, count]) => (
-              <button
-                key={key}
-                type="button"
-                data-testid={`media-cat-${key}`}
-                className={railBtn(on && tab === key)}
-                onClick={() => {
-                  setActiveTagId(null)
-                  switchTab(key)
-                }}
-              >
-                <span className="min-w-0 flex-1 truncate">{label}</span>
-                <span className="shrink-0 text-[10px] tabular-nums text-muted">{count}</span>
-              </button>
-            ))
-          })()}
-
-          <p className="px-2 pb-1 pt-3 text-[10px] font-medium uppercase tracking-wide text-muted">
             {t('media.tags')}
           </p>
           <div className="flex flex-wrap gap-1 px-1" data-testid="media-tag-list">
@@ -1034,18 +1031,37 @@ export function MediaLibraryPanel() {
                *    6 条。现在两侧各算各的（内容=itemCount，剧集=seriesCount），
                *    「显示的数 = 点下去得到的数」。
                */
-              const seriesSide = view === 'series' || view === 'seriesDetail'
-              const withCount = tags.map((tag) => ({
-                tag,
-                count: seriesSide ? (tag.seriesCount ?? 0) : (tag.itemCount ?? 0),
-              }))
+              const seriesSide = railSeriesSide
+              const withCount = tags
+                .map((tag) => ({
+                  tag,
+                  count: seriesSide ? (tag.seriesCount ?? 0) : (tag.itemCount ?? 0),
+                }))
+                /* BUG-259：按片数降序 —— 用户 2026-10-13 裁定「显示应该显示最多片的
+                   标签」。同数按名称定序，避免刷新后顺序抖动。 */
+                .sort((a, b) => b.count - a.count || a.tag.name.localeCompare(b.tag.name))
               const visible = withCount.filter(
                 ({ tag, count }) => count > 0 || activeTagId === tag.id,
               )
               if (visible.length === 0) {
                 return <p className="px-1 text-[10px] text-muted">—</p>
               }
-              return visible.map(({ tag, count }) => {
+              const q = tagFilter.trim().toLowerCase()
+              const searched = q
+                ? visible.filter(({ tag }) => tag.name.toLowerCase().includes(q))
+                : visible
+              /* BUG-259：收起态**截断**（只渲染片数最多的前 RAIL_TAG_LIMIT 个），
+                 不是「限高 + 滚动」—— 左栏不允许出现任何滚动容器。展开态渲染全部
+                 （配合下方过滤框）。选中的标签**永远渲染**，否则用户看不到自己在
+                 筛什么、也没有可点的取消入口（同 BUG-068 的例外规则）。 */
+              const shown = tagExpanded
+                ? searched
+                : searched
+                    .slice(0, RAIL_TAG_LIMIT)
+                    .concat(
+                      searched.slice(RAIL_TAG_LIMIT).filter(({ tag }) => tag.id === activeTagId),
+                    )
+              return shown.map(({ tag, count }) => {
                 const on = activeTagId === tag.id
                 const title = `${t('media.items')} ${tag.itemCount ?? 0} · ${t('media.series')} ${tag.seriesCount ?? 0}`
                 return (
@@ -1057,10 +1073,14 @@ export function MediaLibraryPanel() {
                     onClick={() => {
                       setActiveTagId(on ? null : tag.id)
                       if (!seriesSide) {
-                        setView('items')
+                        // 内容侧点标签 = 留在内容网格。`switchTab(tab)` 里的
+                        // `setTab(tab)` 是幂等赋值，等价于原先的 `setView('items')`，
+                        // 同时收尾 detail 与选择态 —— 与 `switchTab` 单一实现同源。
+                        switchTab(tab)
+                      } else {
+                        setDetail(null)
+                        clearSelection()
                       }
-                      setDetail(null)
-                      clearSelection()
                     }}
                     className={[
                       // 单行原语：`whitespace-nowrap` 禁折行、名称 `truncate`（需 min-w-0）
@@ -1081,6 +1101,35 @@ export function MediaLibraryPanel() {
               })
             })()}
           </div>
+          {/* BUG-259：收起态是**截断**（不是限高 + 滚动），所以必须给出「还有 N 个」
+              的可点出口 —— 否则被截掉的标签在界面上无从发现。展开态额外给过滤框。 */}
+          {railTagTotal > RAIL_TAG_LIMIT || tagExpanded ? (
+            <div className="mt-1 flex items-center gap-1 px-1">
+              <button
+                type="button"
+                data-testid="media-tag-toggle"
+                aria-expanded={tagExpanded}
+                className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] text-accent transition-colors hover:bg-accent/10"
+                onClick={() => {
+                  setTagExpanded((v) => !v)
+                  setTagFilter('')
+                }}
+              >
+                {tagExpanded
+                  ? t('media.tag.collapse')
+                  : t('media.tag.showAll', { n: Math.max(0, railTagTotal - RAIL_TAG_LIMIT) })}
+              </button>
+              {tagExpanded ? (
+                <Input
+                  data-testid="media-tag-filter"
+                  value={tagFilter}
+                  onChange={(e) => setTagFilter(e.target.value)}
+                  placeholder={t('media.tag.filterPlaceholder')}
+                  className="h-6 flex-1 text-[10.5px]"
+                />
+              ) : null}
+            </div>
+          ) : null}
         </nav>
       </aside>
 
