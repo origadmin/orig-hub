@@ -6,6 +6,8 @@
  * 判据（全部来自 docs/bugs/BUG-304.md「出口判据」，可反向证伪）：
  *   ② 侧栏不存在 `nav-child-lib-tags` / `nav-child-lib-unfiled`（空转入口 + 缺陷固化口）；
  *   ③ 文件域列表 `[data-testid="item-nobytes"]` = 0、剧集墙 `[data-testid="series-nobytes"]` = 0；
+ *      （2026-10-14 BUG-306 修订：视频分类墙入口被合并裁定移除 ⇒ 改验「全部成品墙」
+ *        + 图片分类墙；API 级 kind=video 牙齿见 verify_bug304_engine_runtime.py）
  *   ④ `media-tag-filter` 的 top < `media-tag-list` 的 top，且**收起态就可见**
  *      （筛选项出现在列表之后 = 功能自相矛盾）；
  *   ⑤ 剧集详情内缺失分集仍可见且带 `episode-nobytes` 标记（用户补充口径：
@@ -137,10 +139,14 @@ async function main() {
     check('判据③（牙）存在「封面无字节但剧集有内容」的剧集（新旧谓词分叉）',
       wall.diverge > 0, `coverHasBytes=false && hasBytes=true: ${wall.diverge}`)
 
-    // ── 判据③（分类墙）：视频 + 图片 ──
+    // ── 判据③（分类墙）：图片 ──
     // 分类 → API kind 映射（MediaLibraryPanel CATEGORY_TO_KIND）：image→photo。
-    const CAT_KIND = { video: 'video', image: 'photo' }
-    for (const cat of ['video', 'image']) {
+    // 为什么没有 video：BUG-306 / D19-⑦（2026-10-14）把视频分类入口与剧集合并为单一
+    // 「视频」入口（fmode=lib-series）⇒ `cat:video` 墙不再可达。其 UI 判据由
+    // 「剧集墙无 series-nobytes」（上方）+「全部成品墙无 item-nobytes」（下方）接替；
+    // API 级 hasBytes 过滤（kind=video 0/309）仍由 verify_bug304_engine_runtime.py 验收。
+    const CAT_KIND = { image: 'photo' }
+    for (const cat of Object.keys(CAT_KIND)) {
       const kind = CAT_KIND[cat]
       const ok = await page.evaluate((c) => window.__b304.enterCategory(c), cat)
       check(`进入分类 ${cat}`, ok === true)
@@ -168,6 +174,34 @@ async function main() {
       check(`判据③（牙）${cat} hasBytes=true 时无字节条目为 0`,
         r.filteredMissing === 0, `filtered ${r.filteredMissing}/${r.filteredTotal}`)
     }
+
+    // ── 判据③（全部成品墙 cat-all）：混合墙同样不得混入无字节条目 ──
+    // 这颗牙接替被 BUG-306 合并裁定移除的 video 分类墙：全部成品墙混合渲染各 kind
+    // （含视频扁平条目），不过滤时确有大量无字节条目，过滤后必须为 0。
+    const allWall = await page.evaluate(async () => {
+      document.querySelector('[data-testid="nav-files"]')?.click()
+      await new Promise((r) => setTimeout(r, 1200))
+      const ui = window.__b304.present('[data-testid="item-nobytes"]')
+      const cards = window.__b304.present('[data-testid="media-grid"] > *')
+      const unfiltered = await window.__b304.api('/api/media/items?limit=500')
+      const filtered = await window.__b304.api('/api/media/items?hasBytes=true&limit=500')
+      const missing = (it) => it.bytesPresence != null
+        ? it.bytesPresence !== 'present'
+        : (it.hasBytes === false || (!it.filePath && it.hasBytes == null))
+      return {
+        ui,
+        cards,
+        unfilteredMissing: (unfiltered.items || []).filter(missing).length,
+        unfilteredTotal: unfiltered.total,
+        filteredMissing: (filtered.items || []).filter(missing).length,
+        filteredTotal: filtered.total,
+      }
+    })
+    check('判据③ 全部成品墙无 item-nobytes 占位', allWall.ui === 0, `ui=${allWall.ui} / cards=${allWall.cards}`)
+    check('判据③（牙）全部成品不过滤时确有无字节条目', allWall.unfilteredMissing > 0,
+      `unfiltered ${allWall.unfilteredMissing}/${allWall.unfilteredTotal}`)
+    check('判据③（牙）全部成品 hasBytes=true 时无字节条目为 0',
+      allWall.filteredMissing === 0, `filtered ${allWall.filteredMissing}/${allWall.filteredTotal}`)
 
     // ── 判据④：标签筛选框置顶 + 收起态可见 ──
     await page.evaluate(() => window.__b304.enterFiles())

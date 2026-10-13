@@ -65,13 +65,15 @@ export const ViewTitle = memo(function ViewTitle({ nav }: ViewTitleProps) {
   const { t } = useTranslation()
   const { view, fmode, dlFilter } = nav
 
-  // 副标题 = 当前树选择的标签（文件域取分类/资料库组；下载域取档位）
+  // 副标题 = 当前树选择的标签（文件域取分类/合并视频入口；下载域取档位）
   let sub: string | null = null
   if (view === 'files') {
     const cat = fileCategoryOf(fmode)
     const lib = libraryGroupOf(fmode)
     if (cat) sub = t(`files.cat.${cat}`)
-    else if (lib) sub = t(`files.lib.${lib}`)
+    // BUG-306 / D19-⑦：剧集与视频合并为单一「视频」入口 ⇒ 副标题与侧栏同源，
+    // 不许侧栏叫「视频」、顶栏叫「剧集」（一个入口两个名 = 用户视角的分裂）。
+    else if (lib) sub = t('files.cat.video')
   } else if (view === 'download' && dlFilter !== 'all') {
     sub = t(`download.${dlFilter}`)
   }

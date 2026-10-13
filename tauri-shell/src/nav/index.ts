@@ -26,7 +26,15 @@ export type DlFilter = 'all' | 'running' | 'paused' | 'done'
 
 export const DL_FILTERS: readonly DlFilter[] = ['all', 'running', 'paused', 'done']
 
-/** 文件树「分类（成品内容）」组：六类成品。 */
+/**
+ * 文件树分类：六类成品。
+ *
+ * `video` 的侧栏入口已与剧集合并为单一「视频」入口（BUG-306 / D19-⑦，2026-10-14
+ * 用户续裁「剧集可以放视频上面或者和视频合并」⇒ 已选合并）——侧栏只渲染其余五项，
+ * 视频内容经 `lib-series` 剧集栅格到达（D18：视频=剧集 ⇒ 栅格覆盖全部视频）。
+ * `cat:video` 这个 fmode 仍合法（MediaLibraryPanel 的 items 视图照旧支持），
+ * 只是不再有侧栏入口。
+ */
 export type FileCategory = 'video' | 'music' | 'image' | 'doc' | 'archive' | 'other'
 
 export const FILE_CATEGORIES: readonly FileCategory[] = [
@@ -39,7 +47,7 @@ export const FILE_CATEGORIES: readonly FileCategory[] = [
 ]
 
 /**
- * 文件树「资料库（策划）」组。
+ * 资料库组（BUG-306 / D19 后只剩一个入口，且组标签已删）。
  *
  * **只剩「剧集」**（BUG-304 / D18，2026-10-14 用户四点裁定）：
  *   - `tags` 被移除 —— 标签是**过滤维度**不是目的地。实测 `lib-tags` 与 `lib-series`
@@ -49,9 +57,11 @@ export const FILE_CATEGORIES: readonly FileCategory[] = [
  *     一个单集剧集」⇒「有条目但无剧集归属」是**缺陷症状**而非正常态，把它做成一等入口
  *     等于把缺陷固化成功能（原 D13-③ 已由 D18 修订）。
  *
- * 保留 `LibraryGroup` 这个类型名而不是删掉：资料库组仍是「分类组之外的第二个组」，
- * 组标签（`files.group.library`）与侧栏结构都依赖这个划分；将来若再长出策划轴子项，
- * 在这里加枚举值即可。
+ * **组标签删除、入口置顶并改名「视频」**（BUG-306 / D19，2026-10-14 续裁）：
+ * 「资料库（策划）」组标签与「管理」「分类（成品内容）」同批裁定冗余（各包 0~1 个
+ * 有意义子项）；剧集入口与视频分类合并为单一「视频」入口置于文件树子项最上方。
+ * 保留 `LibraryGroup` 类型与 `libraryGroupOf()`：`lib-series` 仍是 MediaLibraryPanel /
+ * ContextBar 的落点判据，与侧栏渲染形态解耦。
  */
 export type LibraryGroup = 'series'
 
@@ -59,8 +69,10 @@ export type LibraryGroup = 'series'
  * 文件域树选择。
  *
  * - `cat-all`               父行「全部文件」= 成品媒体墙全部（`tab: 'all'`）
- * - `cat:<category>`        分类组子项（按 kind 过滤，`tab: <kind>`）
- * - `lib-series`            剧集栅格（标签云与筛选框同屏，标签是过滤维度不是目的地）
+ * - `cat:<category>`        分类组子项（按 kind 过滤，`tab: <kind>`；`cat:video`
+ *                            已无侧栏入口 —— 视频走 `lib-series`，BUG-306 / D19-⑦）
+ * - `lib-series`            剧集栅格（标签云与筛选框同屏，标签是过滤维度不是目的地）；
+ *                            侧栏入口标签为「视频」（BUG-306 / D19-⑦ 合并）
  * - `series:<id>`           剧集下钻（drill-in；返回即回到 `lib-series`）
  *
  * **已移除**（BUG-304 / D18）：`lib-tags`（空转入口，与 `lib-series` 同视图）、
@@ -186,9 +198,9 @@ export function seriesMode(seriesId: number): FileMode {
 }
 
 /**
- * 高亮判据（逐条对应 prototype `syncNav()`）：
- *   - 父行：`nav.files` 在 `view==='files'` 时点亮；
- *           `nav.download` 在 `view==='download'` 时点亮；
+ * 高亮判据（逐条对应 prototype `syncNav()`，2026-10-14 BUG-306 / D19 起父子排他）：
+ *   - 父行：`nav.files` 仅在 `cat-all` 或剧集下钻（`series:<id>`）时点亮；
+ *           `nav.download` 仅在 `dlFilter==='all'` 时点亮（排他：选中子项时父行熄灭）；
  *   - 一级项（tg/share/settings）：`dataset.view === currentView`；
  *   - 子项：文件子项在 `view==='files' && fmode` 相等时点亮；
  *           下载子项在 `view==='download' && dlFilter` 相等时点亮；

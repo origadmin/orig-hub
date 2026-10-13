@@ -5,6 +5,7 @@ import {
   DL_FILTERS,
   FILE_CATEGORIES,
   isNavChildActive,
+  seriesIdOf,
   type DlFilter,
   type FileCategory,
   type FileMode,
@@ -94,13 +95,16 @@ const DL_KEY: Record<Exclude<DlFilter, 'all'>, string> = {
 }
 
 /**
- * 资料库组只剩「剧集」（BUG-304 / D18）：
- *   - 原 `lib-tags` 树项删除 —— 它与 `lib-series` 落同一视图，是**空转入口**；
- *     标签是过滤维度，标签云与筛选框留在剧集墙顶部。
- *   - 原 `lib-unfiled` 树项删除 —— 「未归档」状态本身取消（视频=剧集 ⇒ 单集即单集剧集）。
- * 树项减少不改组标签（`files.group.library`）：资料库仍是「分类之外的第二组」。
+ * 视频入口（BUG-306 / D19-⑦：剧集与视频合并为单一「视频」入口）。
+ *
+ * 标签复用 `files.cat.video`（「视频」/"Videos"），落点仍是 `lib-series` 剧集栅格 ——
+ * D18「视频=剧集」不变量下，单集视频即 S1E1 剧集，剧集栅格覆盖全部视频内容，
+ * 无需第二个扁平视频分类。置于文件树子项最上方；不再渲染 `cat:video` 分类子项，
+ * 也不再有独立「剧集」树项（原 `lib-tags` / `lib-unfiled` 已于 BUG-304 删除）。
+ *
+ * testid 沿用 `nav-child-lib-series`：入口还是那个入口（同视图、同行为），
+ * 改的只是标签与位置 —— BUG-304 判据②「剧集树项仍在」因此继续成立。
  */
-const LIB_SERIES_KEY = 'files.lib.series'
 
 export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props) {
   const { t } = useTranslation()
@@ -108,8 +112,15 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
   const [dlOpen, setDlOpen] = useState(true)
 
   const { view, fmode, dlFilter } = nav
-  const filesActive = view === 'files'
-  const dlActive = view === 'download'
+  /**
+   * 父子排他选中（BUG-306 / D19-⑤）。
+   *
+   * 父行只在「父自身被选中」时点亮：文件父行 = `cat-all`（全部）或剧集下钻
+   * （`series:<id>`，D18 / 原型「剧集下钻只留父行」规则）；下载父行 = `all` 档。
+   * 选中任一子项时父行熄灭 —— 父=容器、子=当前位置，二者同亮语义冲突。
+   */
+  const filesActive = view === 'files' && (fmode === 'cat-all' || seriesIdOf(fmode) !== null)
+  const dlActive = view === 'download' && dlFilter === 'all'
 
   /** 父行底色（与一级项同一原语，保证「父行/子项/一级项」三态视觉一致）。 */
   const rowCls = (active: boolean) =>
@@ -178,9 +189,7 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
       )}
 
       <nav className="min-h-0 flex-1 space-y-0.5 overflow-hidden px-2">
-        <GroupLabel>{t('nav.group.manage')}</GroupLabel>
-
-        {/* ── 文件树 ───────────────────────────────────────────── */}
+        {/* ── 文件树（BUG-306 / D19-②：「管理」组标签删除 —— 文件就是管理顶层）─── */}
         <div>
           {collapsed ? (
             <button
@@ -219,10 +228,26 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
 
           {filesOpen && !collapsed && (
             <div className="mt-0.5 space-y-0.5">
-              <p className="px-2 pb-0.5 pl-9 text-[10px] font-medium uppercase tracking-wide text-muted">
-                {t('files.group.category')}
-              </p>
-              {FILE_CATEGORIES.map((cat) => (
+              {/* 视频 / 剧集合并入口（BUG-306 / D19-⑦）：标签「视频」，落点 lib-series
+                  剧集栅格（D18：视频=剧集 ⇒ 栅格覆盖全部视频内容）。置于子项最上方，
+                  取代原平级「剧集」项与原 `cat:video` 扁平分类项。
+                  testid 沿用 nav-child-lib-series —— 同一个入口，只改标签与位置。 */}
+              <button
+                type="button"
+                data-testid="nav-child-lib-series"
+                onClick={() => onNavigate('files', { fmode: 'lib-series' })}
+                title={t('files.cat.video')}
+                className={childCls(isNavChildActive(view, fmode, dlFilter, { fmode: 'lib-series' }))}
+              >
+                <span className="min-w-0 flex-1 truncate text-left">{t('files.cat.video')}</span>
+                {/* 徽标数与剧集墙同源（BUG-125 / BUG-133：不许侧栏另算一套）。
+                    0 不渲染 —— 0 = 「确认没有」，与「不知道」是两件事。 */}
+                {counts.series > 0 ? (
+                  <span className="shrink-0 text-[10px] text-muted">{counts.series}</span>
+                ) : null}
+              </button>
+              {/* 分类子项：`video` 已被上方合并入口吸收（BUG-306），不再单独渲染。 */}
+              {FILE_CATEGORIES.filter((cat) => cat !== 'video').map((cat) => (
                 <button
                   key={cat}
                   type="button"
@@ -234,27 +259,6 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
                   <span className="min-w-0 flex-1 truncate text-left">{t(CATEGORY_KEY[cat])}</span>
                 </button>
               ))}
-
-              <p className="px-2 pb-0.5 pl-9 pt-1.5 text-[10px] font-medium uppercase tracking-wide text-muted">
-                {t('files.group.library')}
-              </p>
-              {/* 资料库组当前只有「剧集」一项（BUG-304 / D18 删除了「标签」「未归档」）。
-                  不再用 `.map` 铺枚举：一个组一个子项时，循环只剩噪音，且会诱使后人
-                  「顺手补一个枚举值」而不先回答「它是不是一个目的地」。 */}
-              <button
-                type="button"
-                data-testid="nav-child-lib-series"
-                onClick={() => onNavigate('files', { fmode: 'lib-series' })}
-                title={t(LIB_SERIES_KEY)}
-                className={childCls(isNavChildActive(view, fmode, dlFilter, { fmode: 'lib-series' }))}
-              >
-                <span className="min-w-0 flex-1 truncate text-left">{t(LIB_SERIES_KEY)}</span>
-                {/* 徽标数与剧集墙同源（BUG-125 / BUG-133：不许侧栏另算一套）。
-                    0 不渲染 —— 0 = 「确认没有」，与「不知道」是两件事。 */}
-                {counts.series > 0 ? (
-                  <span className="shrink-0 text-[10px] text-muted">{counts.series}</span>
-                ) : null}
-              </button>
             </div>
           )}
         </div>
