@@ -1,5 +1,12 @@
 # 前端架构与模块划分
 
+> **⚠️ 最高效力（2026-10-13 三轮/四轮，见 [09](09-revision-2026-10-13-v2.md) §9/§10 与 [tasks.md](tasks.md)）**：
+> 终态为**五项一级 + 两棵树**（文件 / 下载 / Telegram / 共享 / 设置）；「媒体库」不独立成域，
+> 拆解为 `domains/files/` 内的分类 pane（成品媒体墙）+ 资料库 pane（剧集/标签/未归档）+ 剧集详情；
+> 下载域保留现状组件，仅状态来源改由侧栏树驱动（**无页内 tabs**），来源 chips 在 M3 接 /api/activity 时引入；
+> 域为 `files/download/tg/share/settings` 五个；插件品牌位在 M7 动态加入（D17）。
+> 本文以下目录结构/组件命名与 09 §9.5、tasks.md 冲突处，以后者为准。
+
 - 配套：[spec.md](spec.md)（为什么）、[05-ui-wireframes.md](05-ui-wireframes.md)（长什么样）、[04-api-contracts.md](04-api-contracts.md)（调什么）
 - 范围：`tauri-shell/src/`（React 前端，77 个 ts/tsx 文件）
 - 结论先行：**按五个功能域重组目录；状态只分「全局 SSE 单一源」与「域内局部态」两层；域间只允许经导航契约与全局覆盖层通信。**

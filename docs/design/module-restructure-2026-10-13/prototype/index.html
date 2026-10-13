@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Orig Hub · 模块重整原型 v2（2026-10-13 六项导航）</title>
+<title>Orig Hub · 模块重整原型 v3（2026-10-13 五项导航 · 双树）</title>
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -12,23 +12,58 @@
   <!-- TitleBar -->
   <header class="topbar">
     <div class="tb-logo"><span class="mark">OH</span> Orig Hub</div>
-    <span class="tb-sub">模块重整高保真原型 v2 · 六项导航 · 静态 mock，无后端</span>
+    <span class="tb-sub">模块重整高保真原型 v3 · 五项导航 + 全部文件/下载两棵树 · 静态 mock，无后端</span>
     <div class="tb-win"><span>─</span><span>▢</span><span>✕</span></div>
   </header>
 
   <div class="body">
-    <!-- Sidebar（六项一级导航；模块内 tabs/筛选不占导航层级，禁止第三级钻取） -->
+    <!-- Sidebar（五项一级；两棵树：全部文件[分类+资料库] / 下载[全部任务+三档可缩起]） -->
     <nav class="sidebar">
       <div class="nav-group-label">管理</div>
-      <button class="nav-item active" data-view="files">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="ic-cy"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/></svg>
-        <span class="nav-title">文件</span></button>
-      <button class="nav-item" data-view="download">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="ic-em"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg>
-        <span class="nav-title">下载</span><span class="nav-badge" id="nav-dl-cnt">3</span></button>
-      <button class="nav-item" data-view="media">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="ic-vi"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M3 17l5-5 4 4 3-3 6 6"/></svg>
-        <span class="nav-title">媒体库</span></button>
+
+      <!-- ===== 全部文件（成品内容；chevron 双点击区原语沿用现状 Sidebar） ===== -->
+      <div class="nav-tree">
+        <div class="nav-row active" id="nav-files-row">
+          <button class="nv-main" data-view="files" data-fmode="cat-all">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="ic-cy"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/></svg>
+            <span class="nav-title">全部文件</span><span class="nav-badge" id="nav-files-cnt">128</span>
+          </button>
+          <button class="nv-chev" id="files-chev" title="展开/收起" aria-expanded="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg>
+          </button>
+        </div>
+        <div class="nav-sub" id="files-sub">
+          <div class="nav-sub-label">分类（成品内容）</div>
+          <button class="nav-child" data-view="files" data-fmode="cat-video">视频</button>
+          <button class="nav-child" data-view="files" data-fmode="cat-audio">音乐</button>
+          <button class="nav-child" data-view="files" data-fmode="cat-image">图片</button>
+          <button class="nav-child" data-view="files" data-fmode="cat-doc">文档</button>
+          <button class="nav-child" data-view="files" data-fmode="cat-archive">压缩</button>
+          <button class="nav-child" data-view="files" data-fmode="cat-other">其他</button>
+          <div class="nav-sub-label">资料库（策划）</div>
+          <button class="nav-child" data-view="files" data-fmode="lib-series">剧集<span class="nchild-cnt">86</span></button>
+          <button class="nav-child" data-view="files" data-fmode="lib-tags">标签<span class="nchild-cnt">24</span></button>
+          <button class="nav-child" data-view="files" data-fmode="lib-unfiled">未归档<span class="nchild-cnt">37</span></button>
+        </div>
+      </div>
+
+      <!-- ===== 下载（父行=全部任务·全局监控；三档可整组缩起） ===== -->
+      <div class="nav-tree">
+        <div class="nav-row" id="nav-dl-row">
+          <button class="nv-main" data-view="download" data-dltab="all">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="ic-em"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg>
+            <span class="nav-title">下载</span><span class="nav-badge" id="nav-dl-cnt">3</span>
+          </button>
+          <button class="nv-chev" id="dl-chev" title="展开/收起" aria-expanded="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg>
+          </button>
+        </div>
+        <div class="nav-sub" id="dl-sub">
+          <button class="nav-child" data-view="download" data-dltab="running">下载中<span class="nchild-cnt" id="nc-running">3</span></button>
+          <button class="nav-child" data-view="download" data-dltab="paused">已暂停<span class="nchild-cnt" id="nc-paused">1</span></button>
+          <button class="nav-child" data-view="download" data-dltab="done">已完成<span class="nchild-cnt" id="nc-done">5</span></button>
+        </div>
+      </div>
 
       <div class="nav-group-label">采集插件</div>
       <button class="nav-item" data-view="tg">
@@ -64,37 +99,78 @@
       <div class="ctxbar" id="ctxbar"><!-- 由 app.js 渲染 --></div>
       <div class="content">
 
-        <!-- ============ 文件（事实层 · 默认首页） ============ -->
+        <!-- ============ 全部文件（成品内容；分类=内容墙，资料库=剧集/标签/未归档） ============ -->
         <section class="view on" id="view-files">
-          <div class="subtabs" id="file-cats">
-            <button class="subtab on" data-cat="all">全部</button>
-            <button class="subtab" data-cat="video">视频</button>
-            <button class="subtab" data-cat="audio">音乐</button>
-            <button class="subtab" data-cat="image">图片</button>
-            <button class="subtab" data-cat="doc">文档</button>
-            <button class="subtab" data-cat="archive">压缩</button>
-            <button class="subtab" data-cat="other">其他</button>
+
+          <!-- 分类模式：真的内容（媒体海报墙 + 非媒体文件行） -->
+          <div class="files-pane" id="pane-cat">
+            <div class="root-tabs" id="files-roots">
+              <button class="chip em">库根 · OrigHubLibrary</button>
+              <button class="chip">下载-Videos</button>
+              <button class="chip">下载-Music</button>
+              <button class="chip">下载-Others</button>
+              <span class="chip am" style="margin-left:auto">只显示成品 · 进行中/失败任务在「下载 → 全部任务」</span>
+            </div>
+            <div class="cards" id="files-cards"><!-- app.js：媒体成品墙 --></div>
+            <div id="files-nonmedia-wrap">
+              <div class="sec-label">非媒体文件</div>
+              <div class="panel" style="margin:0 16px">
+                <div id="files-nonmedia"><!-- app.js：pdf/zip 等成品文件行 --></div>
+              </div>
+            </div>
           </div>
-          <div class="root-tabs">
-            <button class="chip em">库根 · OrigHubLibrary</button>
-            <button class="chip">下载-Videos</button>
-            <button class="chip">下载-Music</button>
-            <button class="chip">下载-Others</button>
-            <span class="chip am" style="margin-left:auto">事实层：含非媒体文件；策划与播放在「媒体库」</span>
+
+          <!-- 资料库 · 剧集（去内容化：本页只有剧集，不铺开全部内容） -->
+          <div class="files-pane" id="pane-series" style="display:none">
+            <div class="lib-head">
+              <div><div class="lib-title">剧集</div>
+              <div class="lib-sub">策划层：季/集编排与成员管理；点剧集进入成员详情（内容浏览请走分类）</div></div>
+            </div>
+            <div class="cards" id="files-series-grid"></div>
           </div>
-          <div style="margin:6px 0">
-            <div class="fact-row fact-head"><span></span><span>名称</span><span>大小</span><span>来源</span><span>操作</span></div>
-            <div id="fact-rows"></div>
+
+          <!-- 资料库 · 标签 -->
+          <div class="files-pane" id="pane-tags" style="display:none">
+            <div class="lib-head">
+              <div><div class="lib-title">标签</div>
+              <div class="lib-sub">交叉分类，不改变归档状态；点标签查看该标签下的成品内容</div></div>
+            </div>
+            <div class="pad chips-row" id="files-tag-cloud" style="padding:8px 16px"></div>
+            <div class="sec-label" id="files-tag-result-label" style="display:none">#<span id="files-tag-name"></span> 的内容</div>
+            <div class="cards" id="files-tag-results" style="padding-top:6px"></div>
           </div>
+
+          <!-- 资料库 · 未归档（新口：series_id IS NULL） -->
+          <div class="files-pane" id="pane-unfiled" style="display:none">
+            <div class="lib-head">
+              <div><div class="lib-title">未归档</div>
+              <div class="lib-sub">已入库但未归入任何剧集的媒体；标签不影响归档判定</div></div>
+              <button class="btn sm primary">批量归入剧集</button>
+            </div>
+            <div class="cards" id="files-unfiled-grid"></div>
+          </div>
+
+          <!-- 剧集详情：主区全屏 drill-in（成员管理保留；补 BUG-112 图片移除入口） -->
+          <div class="files-pane series-detail" id="pane-series-detail" style="display:none">
+            <div class="sd-head">
+              <button class="btn sm" id="sd-back">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px"><path d="M15 6l-6 6 6 6"/></svg>返回剧集</button>
+              <div style="flex:1;min-width:0;margin-left:8px">
+                <div class="lib-title" id="sd-title">纪录片精选</div>
+                <div class="lib-sub" id="sd-sub">12 个成员 · 3 季 · 成员只从剧集移除，不删除字节/条目</div>
+              </div>
+              <button class="btn sm primary">+ 添加成员</button>
+            </div>
+            <div class="cards" id="sd-members"></div>
+          </div>
+
         </section>
 
-        <!-- ============ 下载（全局任务监控：引擎 + 全部插件） ============ -->
+        <!-- ============ 下载（全部任务·全局监控：引擎 + 全部插件） ============ -->
         <section class="view" id="view-download">
-          <div class="tabs" id="dl-tabs">
-            <button class="tab on" data-dltab="all">全部<span class="cnt" data-cnt="all">0</span></button>
-            <button class="tab" data-dltab="running">下载中<span class="cnt" data-cnt="running">0</span></button>
-            <button class="tab" data-dltab="paused">暂停<span class="cnt" data-cnt="paused">0</span></button>
-            <button class="tab" data-dltab="done">完成<span class="cnt" data-cnt="done">0</span></button>
+          <div class="sel-line" id="dl-selline">
+            当前选择 <b id="dl-selname">全部任务</b><span class="cnt" id="dl-selcnt">0</span>
+            <span class="sel-hint">状态切换在左侧「下载」树（页内不设状态标签页）</span>
           </div>
           <div class="mon-filters">
             <div class="chips-row" id="src-chips">
@@ -102,41 +178,12 @@
               <button class="chip" data-src="core">下载引擎</button>
               <button class="chip cy" data-src="tg">TG 缓存</button>
               <button class="chip" data-src="other" disabled>更多插件…</button>
+              <span class="no-act" style="margin-left:auto">失败/中断任务只在「全部任务」显示，行内处理</span>
             </div>
             <div class="health-banner" id="dl-health"></div>
           </div>
           <div class="pad" style="padding-top:10px">
             <div class="panel dl" id="dl-list"><!-- app.js --></div>
-          </div>
-        </section>
-
-        <!-- ============ 媒体库（策划层：内容/剧集/标签；播放器唯一出口） ============ -->
-        <section class="view" id="view-media">
-          <div class="files-grid" style="height:100%">
-            <aside class="rail">
-              <button class="rail-item on" data-rail="contents">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>内容<span class="rc">1,320</span></button>
-              <button class="rail-item" data-rail="series">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M10 9l5 3-5 3V9z"/></svg>剧集<span class="rc">86</span></button>
-              <button class="rail-item" data-rail="tags">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.6 13.4L12 22l-9-9V3h10l7.6 7.6a2 2 0 010 2.8z"/><circle cx="7.5" cy="7.5" r="1.2"/></svg>标签<span class="rc">24</span></button>
-              <div class="rail-note">策划层：剧集 / 标签 / 播放<br>字节事实在「文件」</div>
-            </aside>
-            <div style="min-width:0;overflow:auto">
-              <div class="rail-pane" id="pane-contents">
-                <div class="subtabs">
-                  <button class="subtab on">全部</button><button class="subtab">视频</button>
-                  <button class="subtab">图片</button><button class="subtab">音频</button>
-                </div>
-                <div class="cards" id="media-cards"></div>
-              </div>
-              <div class="rail-pane" id="pane-series" style="display:none">
-                <div class="cards" id="series-cards"></div>
-              </div>
-              <div class="rail-pane" id="pane-tags" style="display:none">
-                <div class="pad chips-row" id="tag-cloud"></div>
-              </div>
-            </div>
           </div>
         </section>
 
@@ -174,7 +221,7 @@
                   <div class="tgh-title" id="tg-head-title">影视频道 X</div>
                   <div class="tgh-sub">1,284 媒体 · 监控中 · 增量同步 60s</div>
                 </div>
-                <span class="chip am" style="margin-left:auto">缓存任务统一在「下载」监控</span>
+                <span class="chip am" style="margin-left:auto">缓存任务统一在「下载 → 全部任务」监控</span>
                 <button class="btn sm" id="btn-go-download">去查看</button>
               </div>
               <div class="tg2-stream">
@@ -308,7 +355,7 @@
                 <div class="set-h"><span class="t-ic" style="background:rgba(16,185,129,.15);color:var(--emerald)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg></span>下载与存储</div>
                 <div class="set-desc">下载目录、自动分类与媒体库根目录（库根持有字节所有权）</div>
                 <div class="panel set-list">
-                  <div class="set-row"><div><div class="rk">默认下载目录</div><div class="rd">未命中分类规则时的落点</div></div>
+                  <div class="set-row"><div><div class="rk">默认下载目录</div><div class="rd">未命中分类规则时的落点；进行中任务不出现在「全部文件」</div></div>
                     <div class="path-box"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2" style="vertical-align:-2px;margin-right:6px;flex:none"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/></svg>D:\Downloads <button class="btn sm">更改</button></div></div>
                   <div class="set-row"><div><div class="rk">媒体库根目录（library_dir）</div><div class="rd">归仓字节的唯一所有权位置；TG 缓存与导入均归此</div></div>
                     <div class="path-box"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2" style="vertical-align:-2px;margin-right:6px;flex:none"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/></svg>C:\Users\Godcong\OrigHubLibrary <button class="btn sm">更改</button></div></div>

@@ -311,3 +311,56 @@ button{font-family:inherit;color:inherit;background:none;border:none;cursor:poin
 .plugin-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}
 .install-tile{border-style:dashed;background:var(--bg-2)}
 .acct-row .av{margin-right:4px;display:inline-grid;place-items:center;vertical-align:middle}
+
+/* ===== v3 追加（五项导航 + 双树，2026-10-13）：只追加不改既有规则 ===== */
+/* 侧栏树行：父行 = 主按钮（导航）+ chevron（只翻转展开），双点击区沿用现状 Sidebar 原语 */
+.nav-row{display:flex;align-items:center;width:100%;border-radius:var(--radius-sm);
+  padding:0 6px 0 10px;height:37px;color:var(--text-2);position:relative;transition:.12s}
+.nav-row:hover{background:var(--panel-2);color:var(--text)}
+.nav-row.active{background:linear-gradient(90deg,rgba(16,185,129,.16),rgba(34,211,238,.06));color:var(--text)}
+.nav-row.active::before{content:"";position:absolute;left:-10px;top:7px;bottom:7px;width:3px;border-radius:0 3px 3px 0;
+  background:linear-gradient(180deg,var(--emerald),var(--cyan))}
+.nv-main{flex:1;display:flex;align-items:center;gap:10px;min-width:0;background:none;border:none;
+  color:inherit;font-size:13px;font-weight:500;text-align:left;cursor:pointer;padding:0}
+.nv-main svg{width:17px;height:17px;flex:none}
+.nv-chev{width:24px;height:26px;display:grid;place-items:center;border-radius:5px;color:var(--text-3);
+  background:none;border:none;cursor:pointer;flex:none;opacity:.7}
+.nv-chev:hover{opacity:1;color:var(--text);background:var(--panel-3)}
+.nv-chev svg{width:13px;height:13px;transition:transform .15s}
+.nv-chev.open svg{transform:rotate(90deg)}
+.nav-sub{margin:1px 0 5px 18px;padding:2px 0 2px 10px;border-left:1px dashed var(--border);
+  display:flex;flex-direction:column;gap:1px}
+.nav-sub-label{font-size:9.5px;color:var(--text-3);letter-spacing:1px;padding:7px 10px 3px}
+.nav-child{display:flex;align-items:center;gap:6px;padding:5px 10px;border-radius:5px;font-size:12px;
+  color:var(--text-3);background:none;border:none;text-align:left;cursor:pointer;width:100%}
+.nav-child:hover{background:var(--panel-2);color:var(--text)}
+.nav-child.on{background:rgba(16,185,129,.13);color:#6ee7b7;font-weight:600}
+.nchild-cnt{margin-left:auto;font-size:10px;color:var(--text-3);font-family:var(--mono)}
+.nav-child.on .nchild-cnt{color:#6ee7b7}
+
+/* 全部文件域 */
+.files-pane{min-height:100%}
+.sec-label{font-size:11px;color:var(--text-3);padding:16px 18px 6px;font-weight:600;letter-spacing:.5px}
+.lib-head{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:16px 18px 2px}
+.lib-title{font-size:15px;font-weight:700}
+.lib-sub{font-size:11px;color:var(--text-3);margin-top:3px;line-height:1.6}
+.series-card{cursor:pointer}
+.unfiled-badge{position:absolute;right:7px;top:7px;font-size:9.5px;padding:2px 7px;border-radius:4px;
+  background:rgba(245,158,11,.85);color:#1f1a0f}
+.tag-badge{position:absolute;left:7px;bottom:7px;font-size:9.5px;padding:2px 7px;border-radius:4px;background:rgba(0,0,0,.6)}
+.chip.tag-on{outline:1.5px solid var(--cyan);outline-offset:1px}
+
+/* 剧集详情（主区 drill-in） */
+.sd-head{display:flex;align-items:center;padding:11px 16px;border-bottom:1px solid var(--border);
+  position:sticky;top:0;background:var(--bg-2);z-index:2}
+.sd-remove{position:absolute;right:6px;top:6px;width:22px;height:22px;border-radius:50%;border:none;
+  background:rgba(0,0,0,.65);color:#fff;font-size:13px;line-height:1;cursor:pointer;opacity:.65;
+  transition:.12s;z-index:2}
+.sd-member:hover .sd-remove{opacity:1}
+.sd-remove:hover{background:#f43f5e;opacity:1}
+
+/* 四轮：下载页无页内 tabs，树选择回显行 */
+.sel-line{display:flex;align-items:center;gap:8px;padding:14px 18px 0;font-size:12.5px;color:var(--text-3)}
+.sel-line b{font-size:13.5px;color:var(--text-1)}
+.sel-line .cnt{background:var(--bg-3);border-radius:9px;padding:1px 8px;font-size:11px;color:var(--text-2)}
+.sel-hint{font-size:11px;color:var(--text-3);opacity:.8;margin-left:4px}

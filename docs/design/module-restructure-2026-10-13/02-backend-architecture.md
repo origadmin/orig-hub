@@ -1,5 +1,9 @@
 # 后端架构与模块划分
 
+> **⚠️ 里程碑编号以 [tasks.md](tasks.md)（四轮版）为准**：M1=媒体拆库迁入 daemon（即本文结论，D2=A，关闭 BUG-172）；
+> M2=文件成品化（完成即入库 D16）；M3=/api/activity 注册表泛化与前端接线（D7）；
+> ffmpeg 诊断/设置/受管安装 = M5；共享 = M6；插件化 = M7。本文正文若出现旧编号（M3=迁媒体等）以 tasks.md 映射为准。
+
 - 配套：[spec.md](spec.md) §6（拓扑演进）、[03-data-model-and-migration.md](03-data-model-and-migration.md)（拆库细节）、[04-api-contracts.md](04-api-contracts.md)（端点契约）
 - 范围：`download-engine/` Cargo workspace，7 个 crate / 33 个 Rust 文件
 - 结论先行：**不新增 sidecar、不新增二进制。把 orig-tg 从「TG + 缓存 + 整个媒体库 + ffmpeg 转码」收缩为「TG 采集插件面」；媒体/文件/ffmpeg/共享全部归无凭证必启动的 orig-daemon 核心面。投递能力抽共享 crate 供两服共用。**

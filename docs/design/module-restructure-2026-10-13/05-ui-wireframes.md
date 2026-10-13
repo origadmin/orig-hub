@@ -1,5 +1,12 @@
 # 界面框架与线框（UI Wireframes）
 
+> **⚠️ 最高效力（2026-10-13 三轮/四轮）**：界面真值以可交互原型 **[`prototype/`](prototype/index.html) v3**
+> 与 [09](09-revision-2026-10-13-v2.md) §9/§10 为准——**五项一级 + 两棵树**：
+> 「文件」树（分类组：视频/音乐/图片/文档/压缩/其他；资料库组：剧集/标签/未归档 + 剧集详情 drill-in）、
+> 「下载」树（父行=全部任务全局监控；下载中/已暂停/已完成三档；**页内无状态 tabs**，仅来源筛选 chips）；
+> 命名 文件/下载/Telegram（D14）；媒体库无独立入口；共享 L2 为内容区 segmented（非侧栏树）。
+> 本文以下 ASCII 线框与原型/09 冲突处（含「TG 采集」旧称、六/七域、文件页 subtabs/rail 旧形态）一律以后者为准。
+
 - 配套：[01-frontend-architecture.md](01-frontend-architecture.md)
 - 视觉基线（沿用现状，不换风格）：dark-first，zinc/slate 底 + emerald/cyan 主色；侧栏展开 w-48 / 折叠 w-12；
   顶 ContextBar h-12；底部状态栏 h-8（连接点唯一渲染点仍在右下）。

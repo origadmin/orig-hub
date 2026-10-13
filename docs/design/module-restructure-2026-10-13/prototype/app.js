@@ -1,15 +1,13 @@
-/* Orig Hub 模块重整原型 v2 — 六项导航 / 纯静态 mock */
+/* Orig Hub 模块重整原型 v3 — 五项导航 + 双树 / 纯静态 mock */
 (function () {
   'use strict';
 
-  /* ---------------- 顶部标题栏（各模块元数据） ---------------- */
+  /* ================= 顶部上下文栏 ================= */
   var META = {
     files:    { icon: 'M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z', tint: 'rgba(34,211,238,.12)', color: '#22d3ee',
-                title: '文件', sub: '受管字节事实层 · 默认首页（含非媒体文件）', actions: '<button class="btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 15V3m0 0L8 7m4-4l4 4M5 21h14"/></svg>导入</button>' },
+                title: '全部文件', actions: '<button class="btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 15V3m0 0L8 7m4-4l4 4M5 21h14"/></svg>导入</button>' },
     download: { icon: 'M12 3v12m0 0l-4-4m4 4l4-4M5 21h14', tint: 'rgba(16,185,129,.15)', color: '#10b981',
-                title: '下载', sub: '全局任务监控 · 引擎 + 全部插件唯一任务列表', actions: '<button class="btn primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 5v14M5 12h14"/></svg>新建下载</button>' },
-    media:    { icon: 'M3 5h18v14H3z M9 10l5 3-5 3z', tint: 'rgba(167,139,250,.14)', color: '#a78bfa',
-                title: '媒体库', sub: '策划层：内容 / 剧集 / 标签 · 播放器唯一出口', actions: '' },
+                title: '下载', sub: '全部任务 · 全局监控（引擎 + 全部插件）', actions: '<button class="btn primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 5v14M5 12h14"/></svg>新建下载</button>' },
     tg:       { icon: 'M22 3L2 10.5l7 2.5 3 7 3-4.5 5 4L22 3z', tint: 'rgba(56,189,248,.13)', color: '#38bdf8',
                 title: 'TG 采集', sub: 'source-browser 标准屏 · 两级（无第三列）', actions: '' },
     share:    { icon: 'M10 13a5 5 0 007 0l3-3a5 5 0 00-7-7l-1 1', tint: 'rgba(245,158,11,.14)', color: '#f59e0b',
@@ -17,44 +15,111 @@
     settings: { icon: 'M12 15V3', tint: 'rgba(148,163,184,.13)', color: '#94a3b8',
                 title: '设置', sub: '通用 / 下载存储 / 网络 / 播放引擎 / 账号 / 插件 / 共享服务', actions: '' }
   };
+  var FILE_SUBS = {
+    'cat-all': '全部成品内容（媒体 + 非媒体文件）· 只显示成品，任务在「下载」',
+    'cat-video': '分类 · 视频（成品内容）',
+    'cat-audio': '分类 · 音乐（成品内容）',
+    'cat-image': '分类 · 图片（成品内容）',
+    'cat-doc': '分类 · 文档（非媒体文件）',
+    'cat-archive': '分类 · 压缩包（非媒体文件）',
+    'cat-other': '分类 · 其他文件',
+    'lib-series': '资料库 · 剧集（策划层：本页不铺开内容，点剧集管理成员）',
+    'lib-tags': '资料库 · 标签（交叉分类，不改变归档状态）',
+    'lib-unfiled': '资料库 · 未归档（有条目但未归入任何剧集）'
+  };
 
   var currentView = 'files';
+  function filesSub() {
+    if (currentView !== 'files') return null;
+    if (sdSeries) return '剧集详情 · 成员管理（从剧集移除 ≠ 删除字节/条目，BUG-112）';
+    return FILE_SUBS[fmode] || FILE_SUBS['cat-all'];
+  }
+  var DL_SUBS = {
+    all: '全部任务 · 全局监控（引擎 + 全部插件）',
+    running: '下载中（侧栏预设过滤）',
+    paused: '已暂停（侧栏预设过滤；TG 无暂停能力，不出现 TG 行）',
+    done: '已完成（侧栏预设过滤）'
+  };
   function renderCtx() {
     var m = META[currentView];
+    var sub = currentView === 'files' ? filesSub()
+      : currentView === 'download' ? DL_SUBS[dlTab]
+      : m.sub;
     document.getElementById('ctxbar').innerHTML =
       '<div class="ctx-title"><span class="t-ic" style="background:' + m.tint + ';color:' + m.color + '">' +
       '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="' + m.icon + '"/></svg></span>' +
-      m.title + '<span class="ctx-sub">' + m.sub + '</span></div>' +
+      m.title + '<span class="ctx-sub">' + sub + '</span></div>' +
       '<div class="ctx-actions">' + m.actions + '</div>';
+  }
+
+  /* ================= 视图切换 & 两棵树 ================= */
+  function syncNav() {
+    document.querySelectorAll('.nav-item').forEach(function (n) {
+      n.classList.toggle('active', n.dataset.view === currentView);
+    });
+    document.getElementById('nav-files-row').classList.toggle('active', currentView === 'files');
+    document.getElementById('nav-dl-row').classList.toggle('active', currentView === 'download');
+    document.querySelectorAll('.nav-child').forEach(function (c) {
+      var on = false;
+      if (c.dataset.fmode) on = currentView === 'files' && !sdSeries && c.dataset.fmode === fmode;
+      if (c.dataset.dltab) on = currentView === 'download' && c.dataset.dltab === dlTab;
+      c.classList.toggle('on', on);
+    });
   }
   function switchView(view, opts) {
     currentView = view;
-    document.querySelectorAll('.nav-item').forEach(function (n) {
-      n.classList.toggle('active', n.dataset.view === view);
-    });
     document.querySelectorAll('.view').forEach(function (v) {
       v.classList.toggle('on', v.id === 'view-' + view);
     });
     if (view === 'settings' && opts && opts.sec) showSection(opts.sec);
+    if (view === 'download' && opts && opts.dltab) setDlTab(opts.dltab);
+    if (view === 'files' && opts && opts.fmode) setFmode(opts.fmode);
     var sb = document.getElementById('sb-msg');
-    sb.textContent = { files: '文件：库根 12,482 项', download: '监控聚合中（5s · 有活才轮）', media: '媒体库 1,320 条目',
-      tg: tgEnabled ? 'TG 插件已连接' : 'TG 插件未启用', share: shareOn ? '共享服务运行中' : '共享服务关闭', settings: '' }[view] || '就绪';
-    renderCtx();
+    sb.textContent = {
+      files: '全部文件：128 个成品（媒体 121 · 文件 7）',
+      download: '监控聚合中（5s · 有活才轮）',
+      tg: tgEnabled ? 'TG 插件已连接' : 'TG 插件未启用',
+      share: shareOn ? '共享服务运行中' : '共享服务关闭',
+      settings: ''
+    }[view] || '就绪';
+    syncNav(); renderCtx();
   }
-  document.querySelectorAll('.nav-item').forEach(function (btn) {
-    btn.addEventListener('click', function () { switchView(btn.dataset.view, { sec: btn.dataset.sec }); });
+  // 父行主按钮（data-view）与普通一级项
+  document.querySelectorAll('.nv-main, .nav-item').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      switchView(btn.dataset.view, { sec: btn.dataset.sec, dltab: btn.dataset.dltab, fmode: btn.dataset.fmode });
+    });
   });
+  // 树子项（侧栏预设过滤）
+  document.querySelectorAll('.nav-child').forEach(function (c) {
+    c.addEventListener('click', function () {
+      if (c.dataset.fmode) switchView('files', { fmode: c.dataset.fmode });
+      if (c.dataset.dltab) switchView('download', { dltab: c.dataset.dltab });
+    });
+  });
+  // chevron：只翻转展开态，不导航（沿用现状 Sidebar 双点击原语）
+  function bindChevron(btnId, subId, key) {
+    document.getElementById(btnId).addEventListener('click', function () {
+      treeOpen[key] = !treeOpen[key];
+      document.getElementById(subId).style.display = treeOpen[key] ? '' : 'none';
+      btnId && document.getElementById(btnId).setAttribute('aria-expanded', String(treeOpen[key]));
+      document.getElementById(btnId).classList.toggle('open', treeOpen[key]);
+    });
+    document.getElementById(btnId).classList.add('open');
+  }
+  var treeOpen = { files: true, dl: true };
+  bindChevron('files-chev', 'files-sub', 'files');
+  bindChevron('dl-chev', 'dl-sub', 'dl');
 
-  /* ---------------- 下载：全局任务监控（引擎 + 插件） ---------------- */
-  // kind=core 引擎任务（字节）；kind=tg TG 缓存任务（条目数，无真暂停——协议铁律）
+  /* ================= 下载：全部任务 · 全局监控 ================= */
   var JOBS = [
     { gid: 'core:TRC-00012-1', source: 'core', name: 'archive-demo.mkv', meta: '视频 · 482 MB · HEVC', tab: 'running', pct: 62, line: '2.4 MB/s · 剩余 1:20' },
-    { gid: 'tg:31', source: 'tg', name: '影视频道 X · 4K 原盘分享', meta: '缓存任务 · 30 条消息 · 2 相册组', tab: 'running', pct: 40, line: '12 / 30 条 · 当前条目 48 / 210 MB', unit: 'items' },
+    { gid: 'tg:31', source: 'tg', name: '影视频道 X · 4K 原盘分享', meta: '缓存任务 · 30 条消息 · 2 相册组', tab: 'running', pct: 40, line: '12 / 30 条 · 当前条目 48 / 210 MB' },
     { gid: 'core:TRC-00009-1', source: 'core', name: 'lesson-12.mp4', meta: '视频 · 210 MB · H.264', tab: 'running', pct: 88, line: '5.1 MB/s · 剩余 0:05' },
     { gid: 'core:TRC-00010-1', source: 'core', name: 'paused-thing.zip', meta: '压缩包 · 12 MB', tab: 'paused', pct: 28, line: '已暂停' },
-    { gid: 'tg:30', source: 'tg', name: '纪录片频道 Y · 批量缓存', meta: '缓存任务 · 20 条 · interrupted', tab: 'failed', pct: 40, line: '中断（网络） · TG 无续传，只能整任务重试', unit: 'items', failed: true },
+    { gid: 'tg:30', source: 'tg', name: '纪录片频道 Y · 批量缓存', meta: '缓存任务 · 20 条 · interrupted', tab: 'failed', pct: 40, line: '中断（网络） · TG 无续传，只能整任务重试', failed: true },
     { gid: 'core:TRC-00011-1', source: 'core', name: 'song.flac', meta: '音频 · 38 MB', tab: 'done', pct: 100, line: '校验通过 · 完成于 11:42' },
-    { gid: 'tg:29', source: 'tg', name: '摄影频道 Z · 九月合集', meta: '缓存任务 · 86 张图片', tab: 'done', pct: 100, line: '已归库 · 完成于 10:20', unit: 'items' },
+    { gid: 'tg:29', source: 'tg', name: '摄影频道 Z · 九月合集', meta: '缓存任务 · 86 张图片', tab: 'done', pct: 100, line: '已归库 · 完成于 10:20' },
     { gid: 'core:TRC-00008-1', source: 'core', name: 'manual.pdf', meta: '文档 · 3.4 MB', tab: 'done', pct: 100, line: '完成于 昨天' },
     { gid: 'core:TRC-00007-1', source: 'core', name: 'photo-batch.zip', meta: '压缩包 · 88 MB', tab: 'done', pct: 100, line: '完成于 周二' }
   ];
@@ -74,9 +139,7 @@
       return true;
     });
     document.getElementById('dl-list').innerHTML = rows.map(function (j) {
-      var srcChip = j.source === 'tg'
-        ? '<span class="chip cy">TG 缓存</span>'
-        : '<span class="chip">引擎</span>';
+      var srcChip = j.source === 'tg' ? '<span class="chip cy">TG 缓存</span>' : '<span class="chip">引擎</span>';
       var stateChip = j.tab === 'running' ? '<span class="chip em">下载中</span>'
         : j.tab === 'paused' ? '<span class="chip am">已暂停</span>'
         : j.tab === 'failed' ? '<span class="chip ro">需处理</span>'
@@ -84,7 +147,7 @@
       var bar = j.source === 'tg' ? 'background:linear-gradient(90deg,#38bdf8,#22d3ee)' : '';
       var actions;
       if (j.source === 'tg' && j.tab === 'running') actions = '<span class="no-act">运行中不可暂停（无真续传）</span>';
-      else if (j.tab === 'failed') actions = '<button class="btn sm primary">整任务重试</button>';
+      else if (j.tab === 'failed') actions = '<button class="btn sm primary">整任务重试</button><button class="btn sm danger">删除</button>';
       else if (j.tab === 'running') actions = '<button class="btn sm">暂停</button><button class="btn sm">详情</button>';
       else if (j.tab === 'paused') actions = '<button class="btn sm primary">继续</button><button class="btn sm">详情</button>';
       else actions = '<button class="btn sm">定位文件</button><button class="btn sm">详情</button>';
@@ -95,7 +158,6 @@
         '<div class="dl-actions">' + actions + '</div></div>';
     }).join('') || '<div class="empty-hint">该筛选下没有任务</div>';
 
-    // 健康条：插件不可用时聚合降级（引擎任务恒显示）
     document.getElementById('dl-health').style.display = tgEnabled ? 'none' : 'block';
     document.getElementById('dl-health').textContent = tgEnabled ? ''
       : 'TG 插件未启用/不可达：其任务本次不参与聚合（来源：tg unavailable），下载引擎任务不受影响。';
@@ -111,16 +173,26 @@
       var el = document.querySelector('[data-cnt="' + k + '"]');
       if (el) el.textContent = cnt[k];
     });
-    var inTransit = cnt.running;
+    var selCnt = document.getElementById('dl-selcnt');
+    if (selCnt) selCnt.textContent = cnt[dlTab];
+    ['running', 'paused', 'done'].forEach(function (k) {
+      var nc = document.getElementById('nc-' + k);
+      if (nc) nc.textContent = cnt[k];
+    });
     var badge = document.getElementById('nav-dl-cnt');
-    badge.textContent = inTransit; badge.style.display = inTransit ? '' : 'none';
+    badge.textContent = cnt.running; badge.style.display = cnt.running ? '' : 'none';
   }
-  document.getElementById('dl-tabs').addEventListener('click', function (e) {
-    var t = e.target.closest('.tab'); if (!t) return;
-    dlTab = t.dataset.dltab;
-    document.querySelectorAll('#dl-tabs .tab').forEach(function (x) { x.classList.toggle('on', x === t); });
+  var DL_NAMES = { all: '全部任务', running: '下载中', paused: '已暂停', done: '已完成' };
+  function setDlTab(t) {
+    dlTab = t;
+    var n = document.getElementById('dl-selname');
+    if (n) n.textContent = DL_NAMES[t];
+    syncNav();
     renderDownloads();
-  });
+    renderCtx();
+    var nc2 = document.getElementById('dl-selcnt');
+    if (nc2) nc2.textContent = document.querySelectorAll('#dl-list .dl-row').length;
+  }
   document.getElementById('src-chips').addEventListener('click', function (e) {
     var b = e.target.closest('.chip'); if (!b || b.disabled) return;
     dlSrc = b.dataset.src;
@@ -132,91 +204,166 @@
   });
   refreshCounts(); renderDownloads();
 
-  /* ---------------- 文件：事实层（分类筛选 + 事实行） ---------------- */
+  /* ================= 全部文件：成品内容浏览器 ================= */
+  function playIcon() { return '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>'; }
+  function audioIcon() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M9 18V5l10-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="16" cy="16" r="3"/></svg>'; }
+  function imageIcon() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M3 17l5-5 4 4 3-3 6 6"/></svg>'; }
+
+  // 成品媒体（已完成下载 / 已入库 / 已导入；进行中任务绝不出现于此）
+  var MEDIA = [
+    { t: '演示片段 4K Demo', m: '视频 · 12′ · 482 MB', c: 'v', d: '12:03', src: 'TG', cat: 'video', series: false },
+    { t: '城市夜景延时', m: '视频 · 3′06″ · 118 MB', c: 'v', d: '3:06', src: '导入', cat: 'video', series: true },
+    { t: '纪录片 S02E03', m: '视频 · 52′ · 4.2 GB', c: 'v', d: '52:41', src: 'TG', cat: 'video', series: true, sname: '纪录片精选' },
+    { t: '产品演示 2026', m: '视频 · 8′ · 260 MB', c: 'v', d: '8:12', src: '导入', cat: 'video', series: false },
+    { t: '科幻短片 · 雾港', m: '视频 · 17′ · 920 MB', c: 'v', d: '17:20', src: '下载', cat: 'video', series: true, sname: '科幻短片季' },
+    { t: '讲座录音 EP12', m: '音频 · 48′ · 46 MB', c: 'a', src: '导入', cat: 'audio', series: false },
+    { t: '电影配乐合集', m: '音频 · 12 首 · 320 MB', c: 'a', src: 'TG', cat: 'audio', series: true, sname: '古典音乐会' },
+    { t: '封面素材组', m: '图片 · 12 张 · 36 MB', c: 'p', src: 'TG', cat: 'image', series: false },
+    { t: '旅行相册', m: '图片 · 86 张', c: 'p', src: '导入', cat: 'image', series: true, sname: '旅行 Vlog 合集' },
+    { t: 'RAW 原片选集', m: '图片 · 240 张', c: 'p', src: 'TG', cat: 'image', series: false }
+  ];
   var GLYPH = {
-    folder: '<svg viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/></svg>',
-    video: '<svg viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9l5 3-5 3V9z"/></svg>',
-    image: '<svg viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M3 17l5-5 4 4 3-3 6 6"/></svg>',
-    audio: '<svg viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2"><path d="M9 18V5l10-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="16" cy="16" r="3"/></svg>',
     doc: '<svg viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2"><path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8l-5-5z"/></svg>',
     archive: '<svg viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M10 8h4M10 12h4M10 16h4"/></svg>',
+    other: '<svg viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2"><path d="M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8l-5-5z"/></svg>',
     warn: '<svg viewBox="0 0 24 24" fill="none" stroke="#f43f5e" stroke-width="2"><path d="M12 9v4m0 4h.01M10.3 3.9L1.8 18a2 2 0 001.7 3h17a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg>'
   };
-  var FACTS = [
-    { g: 'folder', cat: 'all', name: '2026/', sub: '12 项 · 8.4 GB', size: '', origin: '', otype: '', act: '' },
-    { g: 'video', cat: 'video', name: 'demo.mkv', sub: '2026/ · 修改于 10-12', size: '482 MB', origin: 'TG', otype: 'cy', act: '定位' },
-    { g: 'video', cat: 'video', name: 'lesson-12.mp4', sub: '下载任务 core:TRC-00009-1', size: '210 MB', origin: '下载', otype: 'em', act: '定位' },
-    { g: 'image', cat: 'image', name: 'cover-set/', sub: '12 张图片', size: '36 MB', origin: 'TG', otype: 'cy', act: '定位' },
-    { g: 'audio', cat: 'audio', name: 'song.flac', sub: '下载任务 core:TRC-00011-1', size: '38 MB', origin: '下载', otype: 'em', act: '定位' },
-    { g: 'doc', cat: 'doc', name: 'manual.pdf', sub: '非媒体 · 不出现在媒体库', size: '3.4 MB', origin: '下载', otype: 'em', act: '打开位置' },
-    { g: 'archive', cat: 'archive', name: 'photo-batch.zip', sub: '非媒体 · 仅文件层可见', size: '88 MB', origin: '下载', otype: 'em', act: '打开位置' },
-    { g: 'warn', cat: 'video', name: 'old-deleted.mp4', sub: '有条目但文件缺失（孤儿条目）', size: '—', origin: 'TG', otype: 'cy', act: '移除条目' }
+  // 成品非媒体文件（完成的下载/导入；pdf/zip/字幕等）
+  var NONMEDIA = [
+    { g: 'doc', cat: 'doc', name: 'manual.pdf', sub: '完成于 昨天 · 下载来源', size: '3.4 MB', origin: '下载', otype: 'em' },
+    { g: 'doc', cat: 'doc', name: '说明书扫描件.pdf', sub: '本地导入', size: '18 MB', origin: '导入', otype: '' },
+    { g: 'archive', cat: 'archive', name: 'photo-batch.zip', sub: '完成于 周二 · 下载来源', size: '88 MB', origin: '下载', otype: 'em' },
+    { g: 'archive', cat: 'archive', name: '素材包-2026Q3.zip', sub: '本地导入', size: '1.4 GB', origin: '导入', otype: '' },
+    { g: 'other', cat: 'other', name: '纪录片-S02E03.zh.srt', sub: '随片字幕 · 已入库', size: '62 KB', origin: 'TG', otype: 'cy' },
+    { g: 'warn', cat: 'other', name: 'old-deleted.mp4（缺失）', sub: '有条目但文件缺失（孤儿条目）', size: '—', origin: 'TG', otype: 'cy', act: '移除条目' }
   ];
-  var fileCat = 'all';
-  function renderFacts() {
-    document.getElementById('fact-rows').innerHTML = FACTS.filter(function (f) {
-      return fileCat === 'all' || f.cat === fileCat;
-    }).map(function (f) {
-      return '<div class="fact-row"><div class="fi" style="background:var(--panel-3)">' + GLYPH[f.g] + '</div>' +
-        '<div class="fr-path">' + f.name + '<small>' + f.sub + '</small></div>' +
-        '<span class="fr-size">' + f.size + '</span>' +
-        '<span class="origin-tag">' + (f.otype ? '<span class="chip ' + f.otype + '">' + f.origin + '</span>' : '') + '</span>' +
-        '<span>' + (f.act ? '<button class="btn sm">' + f.act + '</button>' : '') + '</span></div>';
+
+  var fmode = 'cat-all', tagSel = null, sdSeries = null;
+
+  function mediaCard(x, extraChip) {
+    var icon = x.c === 'v' ? playIcon() : x.c === 'a' ? audioIcon() : imageIcon();
+    return '<div class="mcard"><div class="thumb ' + x.c + '"><span class="badge-src">' + x.src + '</span>' +
+      icon +
+      (x.d ? '<span class="dur">' + x.d + '</span>' : '') +
+      (extraChip || '') + '</div>' +
+      '<div class="mc-body"><div class="mc-t">' + x.t + '</div><div class="mc-m"><span>' + x.m + '</span></div></div></div>';
+  }
+  function fileRow(f) {
+    return '<div class="fact-row"><div class="fi" style="background:var(--panel-3)">' + GLYPH[f.g] + '</div>' +
+      '<div class="fr-path">' + f.name + '<small>' + f.sub + '</small></div>' +
+      '<span class="fr-size">' + f.size + '</span>' +
+      '<span class="origin-tag">' + (f.otype ? '<span class="chip ' + f.otype + '">' + f.origin + '</span>' : '') + '</span>' +
+      '<span>' + (f.act ? '<button class="btn sm danger">' + f.act + '</button>' : '<button class="btn sm">打开位置</button>') + '</span></div>';
+  }
+  function renderCat() {
+    var cat = fmode.split('-')[1];
+    var media = MEDIA.filter(function (x) { return cat === 'all' || x.cat === cat; });
+    var files = NONMEDIA.filter(function (x) { return cat === 'all' || x.cat === cat; });
+    document.getElementById('files-cards').innerHTML = media.length
+      ? media.map(function (x) {
+          var chip = !x.series ? '<span class="chip am unfiled-badge">未归档</span>' : '';
+          return mediaCard(x, chip);
+        }).join('')
+      : '<div class="empty-hint">该分类下没有成品媒体</div>';
+    var wrap = document.getElementById('files-nonmedia-wrap');
+    wrap.style.display = files.length ? '' : 'none';
+    document.getElementById('files-nonmedia').innerHTML = files.map(fileRow).join('');
+  }
+
+  var SERIES = ['纪录片精选', '科幻短片季', '摄影教程合集', '2026 新剧', '古典音乐会', '旅行 Vlog 合集', 'BBC 自然系列', '动画短篇'];
+  function renderSeriesGrid() {
+    document.getElementById('files-series-grid').innerHTML = SERIES.map(function (s, i) {
+      return '<div class="mcard series-card" data-series="' + s + '"><div class="thumb v" style="background:linear-gradient(135deg,#1d2a3a,#13202c)">' + playIcon() +
+        '<span class="dur">' + (6 + i) + ' 集</span></div><div class="mc-body"><div class="mc-t">' + s + '</div>' +
+        '<div class="mc-m"><span>剧集 · 2026 · 点击管理成员</span></div></div></div>';
     }).join('');
   }
-  document.getElementById('file-cats').addEventListener('click', function (e) {
-    var b = e.target.closest('.subtab'); if (!b) return;
-    fileCat = b.dataset.cat;
-    document.querySelectorAll('#file-cats .subtab').forEach(function (x) { x.classList.toggle('on', x === b); });
-    renderFacts();
+  document.getElementById('files-series-grid').addEventListener('click', function (e) {
+    var card = e.target.closest('.series-card'); if (!card) return;
+    openSeries(card.dataset.series);
   });
-  renderFacts();
 
-  /* ---------------- 媒体库：内容 / 剧集 / 标签 ---------------- */
-  function playIcon() { return '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>'; }
-  var MEDIA = [
-    { t: '演示片段 4K Demo', m: '视频 · 12′ · 482 MB', c: 'v', d: '12:03', src: 'TG' },
-    { t: '城市夜景延时', m: '视频 · 3′06″ · 118 MB', c: 'v', d: '3:06', src: '下载' },
-    { t: '讲座录音 EP12', m: '音频 · 48′ · 46 MB', c: 'a', d: '48:10', src: '导入' },
-    { t: '封面素材组', m: '图片 · 12 张', c: 'p', d: '', src: 'TG' },
-    { t: '纪录片 S02E03', m: '视频 · 52′ · 4.2 GB', c: 'v', d: '52:41', src: 'TG' },
-    { t: '产品演示 2026', m: '视频 · 8′ · 260 MB', c: 'v', d: '8:12', src: '导入' },
-    { t: '电影配乐合集', m: '音频 · 12 首 · 320 MB', c: 'a', d: '', src: 'TG' },
-    { t: '旅行相册', m: '图片 · 86 张', c: 'p', d: '', src: '导入' }
-  ];
-  document.getElementById('media-cards').innerHTML = MEDIA.map(function (x) {
-    return '<div class="mcard"><div class="thumb ' + x.c + '"><span class="badge-src">' + x.src + '</span>' +
-      (x.c === 'v' ? playIcon() : x.c === 'a'
-        ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M9 18V5l10-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="16" cy="16" r="3"/></svg>'
-        : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M3 17l5-5 4 4 3-3 6 6"/></svg>') +
-      (x.d ? '<span class="dur">' + x.d + '</span>' : '') + '</div>' +
-      '<div class="mc-body"><div class="mc-t">' + x.t + '</div><div class="mc-m"><span>' + x.m + '</span></div></div></div>';
-  }).join('');
-  var SERIES = ['纪录片精选', '科幻短片季', '摄影教程合集', '2026 新剧', '古典音乐会', '旅行 Vlog 合集', 'BBC 自然系列', '动画短篇'];
-  document.getElementById('series-cards').innerHTML = SERIES.map(function (s, i) {
-    return '<div class="mcard"><div class="thumb v" style="background:linear-gradient(135deg,#1d2a3a,#13202c)">' + playIcon() +
-      '<span class="dur">' + (6 + i) + ' 集</span></div><div class="mc-body"><div class="mc-t">' + s + '</div>' +
-      '<div class="mc-m"><span>剧集 · 2026</span></div></div></div>';
-  }).join('');
   var TAGS = ['4K', 'HEVC', '纪录片', '讲座', '合集', '待整理', '已归档', '音乐现场', '延时摄影', '中英字幕', '无损音频', '短视频', 'RAW', '精选'];
-  document.getElementById('tag-cloud').innerHTML = TAGS.map(function (t, i) {
-    return '<button class="chip ' + (i % 4 === 0 ? 'em' : i % 4 === 1 ? 'cy' : '') + '">#' + t + '</button>';
-  }).join('');
-  document.querySelectorAll('.rail-item').forEach(function (r) {
-    r.addEventListener('click', function () {
-      document.querySelectorAll('.rail-item').forEach(function (x) { x.classList.toggle('on', x === r); });
-      ['contents', 'series', 'tags'].forEach(function (p) {
-        document.getElementById('pane-' + p).style.display = p === r.dataset.rail ? '' : 'none';
-      });
-    });
-  });
-  document.querySelectorAll('#pane-contents .subtab').forEach(function (t) {
-    t.addEventListener('click', function () {
-      document.querySelectorAll('#pane-contents .subtab').forEach(function (x) { x.classList.toggle('on', x === t); });
-    });
+  function renderTags() {
+    document.getElementById('files-tag-cloud').innerHTML = TAGS.map(function (t, i) {
+      var cls = i % 4 === 0 ? 'em' : i % 4 === 1 ? 'cy' : '';
+      var on = tagSel === t ? ' tag-on' : '';
+      return '<button class="chip ' + cls + on + '" data-tag="' + t + '">#' + t + '</button>';
+    }).join('');
+    var lab = document.getElementById('files-tag-result-label');
+    lab.style.display = tagSel ? '' : 'none';
+    if (tagSel) {
+      document.getElementById('files-tag-name').textContent = tagSel;
+      // mock：标签结果集（真实实现为按 tag 过滤的成品内容查询）
+      document.getElementById('files-tag-results').innerHTML = MEDIA.slice(0, 6).map(function (x) {
+        return mediaCard(x, '<span class="chip cy tag-badge">#' + tagSel + '</span>');
+      }).join('');
+    } else {
+      document.getElementById('files-tag-results').innerHTML = '';
+    }
+  }
+  document.getElementById('files-tag-cloud').addEventListener('click', function (e) {
+    var b = e.target.closest('.chip'); if (!b) return;
+    var t = b.dataset.tag;
+    tagSel = tagSel === t ? null : t;
+    renderTags();
   });
 
-  /* ---------------- TG：两级 source-browser ---------------- */
+  function renderUnfiled() {
+    var list = MEDIA.filter(function (x) { return !x.series; });
+    document.getElementById('files-unfiled-grid').innerHTML = list.length
+      ? list.map(function (x) { return mediaCard(x, '<span class="chip am unfiled-badge">未归档</span>'); }).join('')
+      : '<div class="empty-hint">所有媒体都已归档</div>';
+  }
+
+  /* 剧集详情：成员管理（从剧集移除成员，不删字节/条目；BUG-112 图片入口在此） */
+  var SD_MEMBERS = [];
+  function openSeries(name) {
+    sdSeries = name;
+    SD_MEMBERS = MEDIA.filter(function (x) { return x.series; }).concat(MEDIA.slice(0, 2)).map(function (x, i) {
+      return { key: name + '-' + i, x: x };
+    });
+    document.getElementById('sd-title').textContent = name;
+    renderSd();
+    renderFiles();
+  }
+  function renderSd() {
+    document.getElementById('sd-sub').textContent = SD_MEMBERS.length + ' 个成员 · 移除只断开剧集归属，字节与条目保留（可在未归档重新归入）';
+    document.getElementById('sd-members').innerHTML = SD_MEMBERS.map(function (m) {
+      var card = mediaCard(m.x, '<button class="sd-remove" data-key="' + m.key + '" title="从剧集移除（不删除文件）">×</button>');
+      return card.replace('class="mcard', 'class="mcard sd-member" data-key="' + m.key + '"');
+    }).join('') || '<div class="empty-hint">该剧集还没有成员</div>';
+  }
+  document.getElementById('sd-members').addEventListener('click', function (e) {
+    var b = e.target.closest('.sd-remove'); if (!b) return;
+    SD_MEMBERS = SD_MEMBERS.filter(function (m) { return m.key !== b.dataset.key; });
+    renderSd();
+  });
+  document.getElementById('sd-back').addEventListener('click', function () {
+    sdSeries = null;
+    renderFiles();
+  });
+
+  function setFmode(mode) {
+    fmode = mode;
+    sdSeries = null;
+    tagSel = null;
+    renderFiles();
+  }
+  function renderFiles() {
+    ['pane-cat', 'pane-series', 'pane-tags', 'pane-unfiled', 'pane-series-detail'].forEach(function (id) {
+      document.getElementById(id).style.display = 'none';
+    });
+    if (sdSeries) { document.getElementById('pane-series-detail').style.display = ''; renderSd(); syncNav(); renderCtx(); return; }
+    if (fmode.indexOf('cat-') === 0) { document.getElementById('pane-cat').style.display = ''; renderCat(); }
+    else if (fmode === 'lib-series') { document.getElementById('pane-series').style.display = ''; renderSeriesGrid(); }
+    else if (fmode === 'lib-tags') { document.getElementById('pane-tags').style.display = ''; renderTags(); }
+    else if (fmode === 'lib-unfiled') { document.getElementById('pane-unfiled').style.display = ''; renderUnfiled(); }
+    syncNav(); renderCtx();
+  }
+  renderFiles();
+
+  /* ================= TG：两级 source-browser ================= */
   var DIALOGS = [
     { id: 1, name: '影视频道 X', flt: 'mon', folder: 'all', monitored: true, count: 1284, active: true },
     { id: 2, name: '纪录片频道 Y', flt: 'mon', folder: 'study', monitored: true, count: 860 },
@@ -270,10 +417,10 @@
   document.getElementById('btn-tg-manage').addEventListener('click', function () {
     switchView('settings', { sec: 'accounts' });
   });
-  document.getElementById('btn-go-download').addEventListener('click', function () { switchView('download'); });
+  document.getElementById('btn-go-download').addEventListener('click', function () { switchView('download', { dltab: 'all' }); });
   renderDialogs();
 
-  /* ---------------- 全局状态：TG 启用 / 共享服务 ---------------- */
+  /* ================= 全局状态：TG 启用 / 共享服务 ================= */
   var tgEnabled = true, shareOn = false;
   function applyTg() {
     document.getElementById('tg-active').style.display = tgEnabled ? '' : 'none';
@@ -352,7 +499,7 @@
     document.getElementById('qr').innerHTML = cells;
   })();
 
-  /* ---------------- 设置分区 ---------------- */
+  /* ================= 设置分区 ================= */
   function showSection(sec) {
     document.querySelectorAll('.set-nav-item').forEach(function (n) { n.classList.toggle('on', n.dataset.sec === sec); });
     document.querySelectorAll('.set-section').forEach(function (s) { s.classList.toggle('on', s.id === 'sec-' + sec); });
@@ -365,5 +512,5 @@
     sw.addEventListener('click', function (e) { e.stopPropagation(); sw.classList.toggle('on'); });
   });
 
-  applyTg(); applyShare(); renderCtx();
+  applyTg(); applyShare(); syncNav(); renderCtx();
 })();

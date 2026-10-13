@@ -1,5 +1,13 @@
 # HTTP API 契约（新增/迁移）
 
+> **⚠️ 四轮订正（2026-10-13，最高效力，编号以 [tasks.md](tasks.md) 为准）**：
+> ①媒体（含 ffmpeg 现状能力）**M1 即随库迁入 daemon**，不存在「先落 orig-tg 再迁」的过渡期——
+> 本文 §1 ffmpeg 端点直接按 daemon 归属实现（M5 填充设置/安装面）；
+> ②**v1 不做物理目录树浏览**（D16-C4），本文中文件夹/roots 浏览类端点与「TG 关闭时 partial 文件夹视图」
+> 描述全部降级为「未来增强」，M2 文件事实端只服务六分类成品墙 + 资料库；
+> ③新增/调整端点：daemon 完成即入库（M2-T01）、未归档过滤参数（M2-T03）、
+> `/api/activity` 注册表泛化 + `POST /api/activity/jobs/:gid/:action` 控制代理（M3，D7）。
+
 - 配套：[02-backend-architecture.md](02-backend-architecture.md)
 - 约定：
   - 鉴权沿用现状：管理面 Bearer token 或 `?token=`（仅绑环回）；M5 共享面独立令牌（见 §6）。
