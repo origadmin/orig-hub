@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Orig Hub · 模块重整原型 v2（2026-10-13 六项导航）</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- TitleBar -->
+  <header class="topbar">
+    <div class="tb-logo"><span class="mark">OH</span> Orig Hub</div>
+    <span class="tb-sub">模块重整高保真原型 v2 · 六项导航 · 静态 mock，无后端</span>
+    <div class="tb-win"><span>─</span><span>▢</span><span>✕</span></div>
+  </header>
+
+  <div class="body">
+    <!-- Sidebar（六项一级导航；模块内 tabs/筛选不占导航层级，禁止第三级钻取） -->
+    <nav class="sidebar">
+      <div class="nav-group-label">管理</div>
+      <button class="nav-item active" data-view="files">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="ic-cy"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/></svg>
+        <span class="nav-title">文件</span></button>
+      <button class="nav-item" data-view="download">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="ic-em"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg>
+        <span class="nav-title">下载</span><span class="nav-badge" id="nav-dl-cnt">3</span></button>
+      <button class="nav-item" data-view="media">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="ic-vi"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M3 17l5-5 4 4 3-3 6 6"/></svg>
+        <span class="nav-title">媒体库</span></button>
+
+      <div class="nav-group-label">采集插件</div>
+      <button class="nav-item" data-view="tg">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="ic-sk"><path d="M22 3L2 10.5l7 2.5 3 7 3-4.5 5 4L22 3z"/></svg>
+        <span class="nav-title">TG 采集</span><span class="nav-dot on" id="tg-nav-dot"></span></button>
+
+      <div class="nav-group-label">对外</div>
+      <button class="nav-item" data-view="share">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="ic-am"><path d="M10 13a5 5 0 007 0l3-3a5 5 0 00-7-7l-1 1M14 11a5 5 0 00-7 0l-3 3a5 5 0 007 7l1-1"/></svg>
+        <span class="nav-title">共享</span><span class="nav-dot off" id="share-nav-dot"></span></button>
+
+      <div class="nav-sep"></div>
+      <button class="nav-item settings" data-view="settings" data-sec="general">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.6 1.6 0 00-2.7 1.1V21a2 2 0 11-4 0v-.1A1.6 1.6 0 007 19.4a1.6 1.6 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1A1.6 1.6 0 004.6 15H4.5a1.6 1.6 0 00-1.5-1.6H3a2 2 0 110-4h.1A1.6 1.6 0 004.6 7a1.6 1.6 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1A1.6 1.6 0 009 2.6V2.5a1.6 1.6 0 003.2 0V2.5a1.6 1.6 0 002.7 1.1l.1-.1a2 2 0 112.8 2.8l-.1.1a1.6 1.6 0 00-.4 4.4v.1"/></svg>
+        <span class="nav-title">设置</span></button>
+
+      <!-- 原型专用：状态切换（真实产品无此控件） -->
+      <div class="proto-switch">
+        <div class="ps-lab">原型演示开关</div>
+        <div class="seg" id="tg-state-seg">
+          <button data-tg="on" class="on">TG 已启用</button>
+          <button data-tg="off">未启用</button>
+        </div>
+        <div class="seg" id="share-state-seg" style="margin-top:6px">
+          <button data-share="on">共享服务开</button>
+          <button data-share="off" class="on">服务关</button>
+        </div>
+      </div>
+    </nav>
+
+    <!-- Main -->
+    <main class="main">
+      <div class="ctxbar" id="ctxbar"><!-- 由 app.js 渲染 --></div>
+      <div class="content">
+
+        <!-- ============ 文件（事实层 · 默认首页） ============ -->
+        <section class="view on" id="view-files">
+          <div class="subtabs" id="file-cats">
+            <button class="subtab on" data-cat="all">全部</button>
+            <button class="subtab" data-cat="video">视频</button>
+            <button class="subtab" data-cat="audio">音乐</button>
+            <button class="subtab" data-cat="image">图片</button>
+            <button class="subtab" data-cat="doc">文档</button>
+            <button class="subtab" data-cat="archive">压缩</button>
+            <button class="subtab" data-cat="other">其他</button>
+          </div>
+          <div class="root-tabs">
+            <button class="chip em">库根 · OrigHubLibrary</button>
+            <button class="chip">下载-Videos</button>
+            <button class="chip">下载-Music</button>
+            <button class="chip">下载-Others</button>
+            <span class="chip am" style="margin-left:auto">事实层：含非媒体文件；策划与播放在「媒体库」</span>
+          </div>
+          <div style="margin:6px 0">
+            <div class="fact-row fact-head"><span></span><span>名称</span><span>大小</span><span>来源</span><span>操作</span></div>
+            <div id="fact-rows"></div>
+          </div>
+        </section>
+
+        <!-- ============ 下载（全局任务监控：引擎 + 全部插件） ============ -->
+        <section class="view" id="view-download">
+          <div class="tabs" id="dl-tabs">
+            <button class="tab on" data-dltab="all">全部<span class="cnt" data-cnt="all">0</span></button>
+            <button class="tab" data-dltab="running">下载中<span class="cnt" data-cnt="running">0</span></button>
+            <button class="tab" data-dltab="paused">暂停<span class="cnt" data-cnt="paused">0</span></button>
+            <button class="tab" data-dltab="done">完成<span class="cnt" data-cnt="done">0</span></button>
+          </div>
+          <div class="mon-filters">
+            <div class="chips-row" id="src-chips">
+              <button class="chip em" data-src="all">全部来源</button>
+              <button class="chip" data-src="core">下载引擎</button>
+              <button class="chip cy" data-src="tg">TG 缓存</button>
+              <button class="chip" data-src="other" disabled>更多插件…</button>
+            </div>
+            <div class="health-banner" id="dl-health"></div>
+          </div>
+          <div class="pad" style="padding-top:10px">
+            <div class="panel dl" id="dl-list"><!-- app.js --></div>
+          </div>
+        </section>
+
+        <!-- ============ 媒体库（策划层：内容/剧集/标签；播放器唯一出口） ============ -->
+        <section class="view" id="view-media">
+          <div class="files-grid" style="height:100%">
+            <aside class="rail">
+              <button class="rail-item on" data-rail="contents">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>内容<span class="rc">1,320</span></button>
+              <button class="rail-item" data-rail="series">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M10 9l5 3-5 3V9z"/></svg>剧集<span class="rc">86</span></button>
+              <button class="rail-item" data-rail="tags">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.6 13.4L12 22l-9-9V3h10l7.6 7.6a2 2 0 010 2.8z"/><circle cx="7.5" cy="7.5" r="1.2"/></svg>标签<span class="rc">24</span></button>
+              <div class="rail-note">策划层：剧集 / 标签 / 播放<br>字节事实在「文件」</div>
+            </aside>
+            <div style="min-width:0;overflow:auto">
+              <div class="rail-pane" id="pane-contents">
+                <div class="subtabs">
+                  <button class="subtab on">全部</button><button class="subtab">视频</button>
+                  <button class="subtab">图片</button><button class="subtab">音频</button>
+                </div>
+                <div class="cards" id="media-cards"></div>
+              </div>
+              <div class="rail-pane" id="pane-series" style="display:none">
+                <div class="cards" id="series-cards"></div>
+              </div>
+              <div class="rail-pane" id="pane-tags" style="display:none">
+                <div class="pad chips-row" id="tag-cloud"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ TG 采集（source-browser 标准屏：两级，无第三列） ============ -->
+        <section class="view" id="view-tg">
+          <div id="tg-active" class="tg2">
+            <!-- 左：账号只读条 + 过滤 + 收藏夹 chips + 单一会话列表 -->
+            <div class="tg2-left">
+              <div class="tg-acct" id="tg-acct-readonly">
+                <span class="av">G</span>
+                <div style="min-width:0">
+                  <div style="font-size:12px;font-weight:600">Godcong</div>
+                  <div style="font-size:10px;color:var(--text-3)">+86 ******21 · 当前账户</div>
+                </div>
+                <button class="btn sm ghost" style="margin-left:auto" id="btn-tg-manage">管理</button>
+              </div>
+              <div class="seg tg-seg" id="tg-filter">
+                <button class="on" data-flt="all">全部</button>
+                <button data-flt="mon">监控</button>
+                <button data-flt="group">群组</button>
+                <button data-flt="private">私聊</button>
+              </div>
+              <div class="chips-row" id="tg-folders">
+                <button class="chip em" data-folder="all">全部收藏</button>
+                <button class="chip" data-folder="photo">摄影</button>
+                <button class="chip" data-folder="study">学习</button>
+              </div>
+              <div class="tg-search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><input placeholder="搜索会话 / 全局媒体查找在顶栏"></div>
+              <div id="tg-dialogs"><!-- app.js --></div>
+            </div>
+            <!-- 右：选中会话的媒体流（两级到此为止） -->
+            <div class="tg2-right">
+              <div class="tg2-head">
+                <div style="min-width:0">
+                  <div class="tgh-title" id="tg-head-title">影视频道 X</div>
+                  <div class="tgh-sub">1,284 媒体 · 监控中 · 增量同步 60s</div>
+                </div>
+                <span class="chip am" style="margin-left:auto">缓存任务统一在「下载」监控</span>
+                <button class="btn sm" id="btn-go-download">去查看</button>
+              </div>
+              <div class="tg2-stream">
+                <div class="stream">
+                  <div class="msg-media">
+                    <span class="av msg-av" style="background:linear-gradient(135deg,#64748b,#475569)"></span>
+                    <div class="msg-bubble">
+                      <div class="msg-media-grid"><div class="ph"></div><div class="ph"></div></div>
+                      <div class="msg-cap"><span>4K 演示片段 ×2 · HEVC</span>
+                        <span><button class="btn sm">缓存</button> <button class="btn sm primary">入库并打开</button></span></div>
+                    </div>
+                  </div>
+                  <div class="msg-media me">
+                    <span class="av msg-av" style="background:linear-gradient(135deg,var(--sky),var(--cyan-dim))"></span>
+                    <div class="msg-bubble">
+                      <div class="ph" style="aspect-ratio:16/9;background:linear-gradient(135deg,#1b2c3c,#13202c);border-radius:8px"></div>
+                      <div class="msg-cap"><span>纪录片 S02E03.mkv · 4.2 GB</span>
+                        <span><button class="btn sm primary">缓存到库</button></span></div>
+                    </div>
+                  </div>
+                  <div class="msg-media">
+                    <span class="av msg-av" style="background:linear-gradient(135deg,#a78bfa,#7c3aed)"></span>
+                    <div class="msg-bubble">
+                      <div class="msg-media-grid"><div class="ph"></div><div class="ph"></div><div class="ph"></div><div class="ph"></div></div>
+                      <div class="msg-cap"><span>相册组（4 图）</span>
+                        <span><button class="btn sm">缓存</button></span></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <!-- 未启用：引导态（入口常驻，只看服务不看登录态，沿用 BUG-094 门控） -->
+          <div id="tg-onboarding" class="tg-onboard" style="display:none">
+            <div class="tg-ob-card">
+              <div class="tg-ob-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M22 3L2 10.5l7 2.5 3 7 3-4.5 5 4L22 3z"/></svg></div>
+              <h2>TG 采集插件当前未启用</h2>
+              <p>启用后可以：监听频道媒体流、全局搜索媒体、把字节缓存到本地并自动归入文件库。<br>
+              TG 是第一个参考采集插件（独立二进制 + 稳定接口）；不启用不影响下载、文件库、播放与共享。</p>
+              <div class="tg-ob-feats">
+                <span class="chip cy">频道监控</span><span class="chip cy">全局搜索</span>
+                <span class="chip cy">自动入库</span><span class="chip cy">相册组支持</span>
+              </div>
+              <button class="btn primary" id="go-tg-settings">去设置 · 插件启用</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ 共享（两级：服务在设置；本页管目标） ============ -->
+        <section class="view" id="view-share">
+          <!-- 服务关：引导态 -->
+          <div id="share-off" class="tg-onboard">
+            <div class="tg-ob-card">
+              <div class="tg-ob-ico" style="background:linear-gradient(135deg,rgba(245,158,11,.16),rgba(245,158,11,.05));border-color:rgba(245,158,11,.3);color:var(--amber)">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M10 13a5 5 0 007 0l3-3a5 5 0 00-7-7l-1 1M14 11a5 5 0 00-7 0l-3 3a5 5 0 007 7l1-1"/></svg></div>
+              <h2>共享服务未启用</h2>
+              <p>第一级：在「设置 · 共享服务」开启服务（网卡 / 端口 / 令牌根）。<br>
+              第二级：服务开启后，在本页选择共享「整个库 / 剧集 / 标签 / 条目集」，每个目标独立令牌、可单独撤销。<br>
+              全程只读、无令牌不出字节。</p>
+              <button class="btn primary" id="go-share-settings">去设置开启共享服务</button>
+            </div>
+          </div>
+          <!-- 服务开：目标管理 -->
+          <div id="share-on" class="share-wrap" style="display:none">
+            <div class="panel">
+              <div class="kv-list">
+                <div class="kv-row">
+                  <span class="kv-k">服务状态</span>
+                  <span class="kv-v"><span class="chip em">运行中</span> 以太网 · 192.168.1.20:8080 · 无令牌一律 401 · 只读</span>
+                  <span><button class="btn sm" id="share-goto-svc">服务设置</button></span>
+                </div>
+                <div class="kv-row">
+                  <span class="kv-k">服务地址</span>
+                  <span class="kv-v"><code>http://192.168.1.20:8080/s/</code></span>
+                  <span style="display:flex;gap:6px;align-items:center"><button class="btn sm">复制</button><span class="qr" id="qr"></span></span>
+                </div>
+              </div>
+            </div>
+
+            <div class="panel" style="margin-top:14px">
+              <div class="targets-head">
+                <span>共享目标（每个目标独立令牌 / 二维码 / 有效期 / 访问记录）</span>
+                <button class="btn sm primary">+ 新建共享目标</button>
+              </div>
+              <div id="share-targets"><!-- app.js --></div>
+            </div>
+
+            <div class="panel" style="margin-top:14px">
+              <div class="tg-col-h" style="padding:12px 16px">访问记录（最近）</div>
+              <div class="logline"><span>12:01:33</span><span>192.168.1.45</span><span class="ok">200</span><span>/s/tok-demo/browse</span></div>
+              <div class="logline"><span>11:58:09</span><span>192.168.1.45</span><span class="deny">401</span><span>令牌错误</span></div>
+              <div class="logline"><span>11:55:41</span><span>192.168.1.62</span><span class="ok">206</span><span>/s/tok-kids/items/331/raw</span></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============ 设置（八分区） ============ -->
+        <section class="view" id="view-settings">
+          <div class="settings-grid">
+            <aside class="set-nav" id="set-nav">
+              <button class="set-nav-item on" data-sec="general">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg>通用</button>
+              <button class="set-nav-item" data-sec="downloads">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg>下载与存储</button>
+              <button class="set-nav-item" data-sec="network">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18"/></svg>网络与代理</button>
+              <button class="set-nav-item" data-sec="engine">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="6" width="14" height="12" rx="2"/><path d="M9 6v12M15 6v12"/></svg>播放引擎</button>
+              <button class="set-nav-item" data-sec="accounts">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg>账号</button>
+              <button class="set-nav-item" data-sec="plugins">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>插件</button>
+              <button class="set-nav-item" data-sec="share">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 007 0l3-3a5 5 0 00-7-7l-1 1"/></svg>共享服务</button>
+              <button class="set-nav-item" data-sec="about">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>关于</button>
+            </aside>
+            <div class="set-body">
+
+              <div class="set-section on" id="sec-general">
+                <div class="set-h"><span class="t-ic" style="background:rgba(167,139,250,.15);color:var(--violet)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg></span>通用</div>
+                <div class="set-desc">界面与启动行为</div>
+                <div class="panel set-list">
+                  <div class="set-row"><div><div class="rk">语言</div></div><select class="select"><option>简体中文</option><option>English</option></select></div>
+                  <div class="set-row"><div><div class="rk">主题</div></div><select class="select"><option>深色</option><option>浅色</option><option>跟随系统</option></select></div>
+                  <div class="set-row"><div><div class="rk">开机自动启动</div><div class="rd">登录系统后在后台启动守护服务</div></div><button class="switch on"></button></div>
+                </div>
+              </div>
+
+              <div class="set-section" id="sec-downloads">
+                <div class="set-h"><span class="t-ic" style="background:rgba(16,185,129,.15);color:var(--emerald)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14"/></svg></span>下载与存储</div>
+                <div class="set-desc">下载目录、自动分类与媒体库根目录（库根持有字节所有权）</div>
+                <div class="panel set-list">
+                  <div class="set-row"><div><div class="rk">默认下载目录</div><div class="rd">未命中分类规则时的落点</div></div>
+                    <div class="path-box"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2" style="vertical-align:-2px;margin-right:6px;flex:none"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/></svg>D:\Downloads <button class="btn sm">更改</button></div></div>
+                  <div class="set-row"><div><div class="rk">媒体库根目录（library_dir）</div><div class="rd">归仓字节的唯一所有权位置；TG 缓存与导入均归此</div></div>
+                    <div class="path-box"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="2" style="vertical-align:-2px;margin-right:6px;flex:none"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/></svg>C:\Users\Godcong\OrigHubLibrary <button class="btn sm">更改</button></div></div>
+                  <div class="set-row"><div><div class="rk">自动分类目录</div><div class="rd">视频 / 音乐 / 图片 / 文档 / 压缩 / 其他</div></div><button class="btn sm">编辑规则</button></div>
+                  <div class="set-row"><div><div class="rk">最大并发任务</div></div><select class="select"><option>1</option><option selected>3</option><option>5</option></select></div>
+                </div>
+              </div>
+
+              <div class="set-section" id="sec-network">
+                <div class="set-h"><span class="t-ic" style="background:rgba(56,189,248,.15);color:var(--sky)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/></svg></span>网络与代理</div>
+                <div class="set-desc">监听接口、代理与连通性验证</div>
+                <div class="panel set-list">
+                  <div class="set-row"><div><div class="rk">服务监听接口</div><div class="rd">默认仅环回；共享开启时才会绑定选定网卡</div></div><div class="path-box">127.0.0.1 : 19786</div></div>
+                  <div class="set-row"><div><div class="rk">代理</div><div class="rd">下载、插件安装与 ffmpeg 受管安装共用</div></div>
+                    <span style="display:flex;gap:8px;align-items:center"><span class="tag-state on">已启用</span><button class="switch on"></button></span></div>
+                  <div class="set-row"><div><div class="rk">代理地址</div></div><div class="path-box">http://127.0.0.1:7897 <button class="btn sm">测试</button></div></div>
+                </div>
+              </div>
+
+              <div class="set-section" id="sec-engine">
+                <div class="set-h"><span class="t-ic" style="background:rgba(34,211,238,.13);color:var(--cyan)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="6" width="14" height="12" rx="2"/><path d="M9 6v12M15 6v12"/></svg></span>播放引擎（ffmpeg）</div>
+                <div class="set-desc">外部编译二进制，仅通过应用接口调用；用于不兼容片源的重封装/转码。能原生直出的片源永远不启动 ffmpeg。</div>
+                <div class="panel set-list">
+                  <div class="set-row"><div><div class="rk ff-status">安装状态
+                    <span class="ff-pill" style="margin-top:6px">● 已安装 · ffmpeg 9.0.2（官方静态构建 / GPLv3）</span></div>
+                    <div class="rd" style="margin-top:5px"><code style="font-family:var(--mono)">C:\Users\Godcong\AppData\Local\OrigHub\bin\ffmpeg.exe</code></div></div>
+                    <span><button class="btn sm">重新检测</button></span></div>
+                  <div class="set-row"><div><div class="rk">解码加速</div><div class="rd">自动探测优先级：NVIDIA NVDEC → Intel/AMD QSV → D3D11VA → 软解</div></div>
+                    <select class="select"><option>自动（推荐）</option><option>软件解码</option><option>手动指定后端</option></select></div>
+                  <div class="set-row"><div><div class="rk">显卡设备</div></div>
+                    <select class="select"><option>#0 NVIDIA GeForce RTX 4060（推荐）</option><option>#1 Intel UHD Graphics 770</option></select></div>
+                  <div class="set-row"><div><div class="rk">手动指定二进制</div><div class="rd">用于无网络/自带 ffmpeg 的环境；选择后会回读版本与能力</div></div>
+                    <span style="display:flex;gap:8px"><button class="btn sm">选择 exe…</button><button class="btn sm">一键安装</button></span></div>
+                </div>
+                <div class="ff-grid">
+                  <div class="gpu-card"><div class="gn">NVIDIA RTX 4060</div><div class="gm">NVDEC / NVENC · H.264 HEVC AV1</div>
+                    <div class="gt"><span class="chip em">推荐启用</span></div></div>
+                  <div class="gpu-card"><div class="gn">Intel UHD 770</div><div class="gm">QSV · H.264 HEVC</div>
+                    <div class="gt"><span class="chip">备选</span></div></div>
+                </div>
+                <div class="ff-warn"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:-2px;margin-right:5px;flex:none"><path d="M12 9v4m0 4h.01M10.3 3.9L1.8 18a2 2 0 001.7 3h17a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg>当环境变量 ORIG_TG_HWACCEL=off 存在时，以上选择被环境变量覆盖（只读提示）。</div>
+              </div>
+
+              <!-- 账号：所有插件账户的唯一管理位置（多账户） -->
+              <div class="set-section" id="sec-accounts">
+                <div class="set-h"><span class="t-ic" style="background:rgba(56,189,248,.15);color:var(--sky)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg></span>账号</div>
+                <div class="set-desc">各采集插件的账号统一在此绑定；TG 支持多账户（M6 冻结契约，多会话激活随 M7）。</div>
+                <div class="panel set-list">
+                  <div class="set-row acct-row">
+                    <div><div class="rk"><span class="av" style="width:24px;height:24px;font-size:11px">G</span>Godcong · +86 ******21
+                      <span class="chip em" style="margin-left:4px">当前</span><span class="chip cy" style="margin-left:4px">TG</span></div>
+                      <div class="rd">监控 12 频道 · 缓存 8.4 GB · 已授权</div></div>
+                    <span style="display:flex;gap:6px"><button class="btn sm">设为当前</button><button class="btn sm danger">登出</button></span></div>
+                  <div class="set-row acct-row">
+                    <div><div class="rk"><span class="av" style="width:24px;height:24px;font-size:11px;background:linear-gradient(135deg,#a78bfa,#7c3aed)">A</span>Alt-Account · +852 ****8899
+                      <span class="chip cy" style="margin-left:4px">TG</span><span class="chip" style="margin-left:4px">M7 激活</span></div>
+                      <div class="rd">监控 3 频道 · 会话独立存储 sessions/&lt;account_id&gt;.session</div></div>
+                    <span style="display:flex;gap:6px"><button class="btn sm">设为当前</button><button class="btn sm danger">登出</button></span></div>
+                  <div class="set-row">
+                    <div><div class="rk">添加 Telegram 账户</div><div class="rd">手机号 → 验证码 → 两步验证（如启用）；每账户监控与缓存独立作用域</div></div>
+                    <button class="btn sm primary">+ 添加账户</button></div>
+                </div>
+              </div>
+
+              <!-- 插件：安装/注册/启停/启动模式 -->
+              <div class="set-section" id="sec-plugins">
+                <div class="set-h"><span class="t-ic" style="background:rgba(34,211,238,.13);color:var(--cyan)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span>插件</div>
+                <div class="set-desc">独立二进制 + 稳定接口；在线 / 本地包 / 离线目录三路径安装，sha256+签名校验；启动模式 always / on-demand / manual。</div>
+
+                <div class="plugin-card">
+                  <div class="plg-main">
+                    <div class="plg-ic" style="background:rgba(56,189,248,.14);color:var(--sky)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M22 3L2 10.5l7 2.5 3 7 3-4.5 5 4L22 3z"/></svg></div>
+                    <div style="min-width:0">
+                      <div class="plg-name">TG 采集 <span class="chip cy">source</span>
+                        <span class="tag-state on" id="tg-state-tag">已启用</span></div>
+                      <div class="plg-meta">id: tg · v1.4.0 · contract /plugin/v1 · 启动模式
+                        <select class="select" style="padding:2px 8px;font-size:11px"><option selected>always（常驻）</option><option>on-demand（按需）</option><option>manual（手动）</option></select></div>
+                    </div>
+                  </div>
+                  <div class="plg-actions">
+                    <button class="switch on" id="tg-en-switch"></button>
+                    <button class="btn sm">字节清理</button>
+                  </div>
+                </div>
+
+                <div class="plugin-grid">
+                  <div class="plugin-card sm">
+                    <div class="plg-name">yt-dlp <span class="chip">fetcher</span></div>
+                    <div class="plg-meta">1000+ 视频站 · 2026.08 · Unlicense<br>on-demand · 粘贴 URL 即任务</div>
+                    <button class="btn sm">安装</button>
+                  </div>
+                  <div class="plugin-card sm">
+                    <div class="plg-name">gallery-dl <span class="chip">fetcher</span></div>
+                    <div class="plg-meta">200+ 图站 · 1.32.x · GPLv2 进程隔离<br>on-demand</div>
+                    <button class="btn sm">安装</button>
+                  </div>
+                  <div class="plugin-card sm">
+                    <div class="plg-name">aliyunpan <span class="chip">drive</span></div>
+                    <div class="plg-meta">阿里云盘文件树 · v0.4.0 · Apache-2.0<br>always / on-demand</div>
+                    <button class="btn sm">安装</button>
+                  </div>
+                  <div class="plugin-card sm install-tile">
+                    <div class="plg-name">从本地 / 离线目录安装</div>
+                    <div class="plg-meta">选择包含 manifest.json 的插件目录，校验通过后注册</div>
+                    <button class="btn sm primary">选择目录…</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 共享服务（第一级：服务生命周期） -->
+              <div class="set-section" id="sec-share">
+                <div class="set-h"><span class="t-ic" style="background:rgba(245,158,11,.15);color:var(--amber)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 007 0l3-3a5 5 0 00-7-7l-1 1"/></svg></span>共享服务</div>
+                <div class="set-desc">第一级开关：内置只读服务的监听生命周期；「共享什么」在共享域逐目标管理。停用后端口立即关闭、全部目标不可达。</div>
+                <div class="panel set-list">
+                  <div class="set-row"><div><div class="rk">启用局域网只读共享服务</div><div class="rd">关闭时任何外部请求被拒绝；不影响本机使用</div></div>
+                    <button class="switch" id="share-en-switch"></button></div>
+                  <div class="set-row"><div><div class="rk">绑定网卡</div></div>
+                    <select class="select"><option>请先选择网卡</option><option>以太网 192.168.1.20</option><option>WLAN 192.168.1.31</option></select></div>
+                  <div class="set-row"><div><div class="rk">端口</div></div><select class="select"><option>8080</option><option>8081</option><option>9000</option></select></div>
+                  <div class="set-row"><div><div class="rk">令牌根</div><div class="rd">目标令牌由此根签发；重置后全部旧令牌失效</div></div>
+                    <button class="btn sm danger">重置令牌根</button></div>
+                </div>
+              </div>
+
+              <div class="set-section" id="sec-about">
+                <div class="set-h"><span class="t-ic" style="background:rgba(148,163,184,.15);color:#94a3b8"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg></span>关于</div>
+                <div class="set-desc">版本、数据目录与开源声明</div>
+                <div class="panel set-list">
+                  <div class="set-row"><div><div class="rk">Orig Hub</div><div class="rd">tauri-shell 1.4.0 · orig-daemon 1.4.0 · orig-tg(plugin) 1.4.0</div></div></div>
+                  <div class="set-row"><div><div class="rk">数据目录</div><div class="rd">%LocalAppData%\OrigHub\（tg / library.db / bin / plugins）</div></div><button class="btn sm">打开</button></div>
+                  <div class="set-row"><div><div class="rk">ffmpeg 声明</div><div class="rd">gyan.dev/BtbN GPLv3 静态构建，独立进程调用、未修改；yt-dlp(Unlicense) / gallery-dl(GPLv2) 等插件同为进程隔离。</div></div><button class="btn sm">查看</button></div>
+                </div>
+              </div>
+
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </main>
+  </div>
+
+  <!-- Status bar -->
+  <footer class="statusbar">
+    <span id="sb-msg">就绪</span>
+    <span class="sb-right"><span class="conn-dot"></span><span id="sb-conn">实时连接 · daemon 19786</span></span>
+  </footer>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
