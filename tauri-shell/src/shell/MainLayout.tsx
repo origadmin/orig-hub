@@ -1,50 +1,57 @@
 import { useEffect, useState } from 'react'
-import { Sidebar, type ViewId } from './Sidebar'
-import { DownloadList } from './DownloadList'
-import { AddDownloadDialog } from './AddDownloadDialog'
-import { SettingsPanel } from './SettingsPanel'
-import { TgPanel } from './TgPanel'
-import { MediaLibraryPanel } from './MediaLibraryPanel'
-import { MediaViewer } from './MediaViewer'
-import { ErrorBoundary } from './ui/ErrorBoundary'
+import { Sidebar } from './Sidebar'
+import { DownloadPanel } from '../domains/download/DownloadPanel'
+import { AddDownloadDialog } from '../domains/download/AddDownloadDialog'
+import { SettingsPanel } from '../components/SettingsPanel'
+import { TgPanel } from '../components/TgPanel'
+import { FilesPanel } from '../domains/files/FilesPanel'
+import { MediaViewer } from '../components/MediaViewer'
+import { ErrorBoundary } from '../components/ui/ErrorBoundary'
 import { TitleBar } from './TitleBar'
 import { ContextBar } from './ContextBar'
 import { useStore } from '../store/useStore'
-import {
-  resolveTgFeatureReady,
-  selectActiveSpeedLabel,
-  selectHasActiveSpeed,
-} from '../store/selectors'
+import { selectActiveSpeedLabel, selectHasActiveSpeed } from '../store/selectors'
 import { CONN_DOT, CONN_LABEL, useConnState } from '../store/connState'
 import { useEvent } from '../hooks/useEvent'
 import { useTranslation } from '../i18n'
+import {
+  DEFAULT_NAV,
+  navigate,
+  type NavState,
+  type SidebarCounts,
+  type ViewId,
+} from '../nav'
+import { SharePanel } from '../domains/share/SharePanel'
 import { ensureDaemon, daemonStatus } from '../api/tauri'
 import { health, setDaemonPort } from '../api/daemon'
 import { cn } from '../lib/utils'
 
 export function MainLayout() {
-  // APP 核心是下载工具，默认落地全部下载
-  const [view, setView] = useState<ViewId>('all')
+  /**
+   * 全局导航状态（M0-T01）：五项域 + 两棵树，单一真源。
+   *
+   * M0 前这里是 `useState<ViewId>('all')`（七值自由枚举，把「下载三档」与
+   * 「文件/TG/设置」混在一层）。现在 `view` 只表示**域**，树选择在
+   * `dlFilter` / `fmode` 里 —— 域间只经 `navigate()` 切换（见 nav/index.ts）。
+   */
+  const [nav, setNav] = useState<NavState>(DEFAULT_NAV)
+  /** 当前域（`nav` 的五个值之一）：渲染分配额与 CSS 分支都只读它 */
+  const { view } = nav
   const [collapsed, setCollapsed] = useState(false)
   const [addOpen, setAddOpen] = useState(false)
+  /** 侧栏徽标的事实计数（各域面板上报，不在此处另算） */
+  const [filesCounts, setFilesCounts] = useState<SidebarCounts>({
+    files: 0,
+    series: 0,
+    tags: 0,
+  })
   const { t } = useTranslation()
   /** 连接状态点唯一渲染点（BUG-169 终裁=右下角）：真源 `store/connState.ts`。 */
   const connState = useConnState()
   // BUG-134: 状态栏下载速度改读全局选择器，与全局速度文案同源（不再用 active.reduce 自算一套）
   const activeSpeedLabel = useStore(selectActiveSpeedLabel)
   const hasActiveSpeed = useStore(selectHasActiveSpeed)
-  const { downloads, init, setDaemon, setDaemonAlive, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, categories, categoryFilter, setCategoryFilter, viewer, setViewerIndex, closeViewer, tgService, refreshTgState, probeTg } = useStore()
-
-  /**
-   * TG 入口级门控（用户裁定：常规 TG 开关控制整个 TG 内容）：
-   *  开关关 OR daemon 说 orig-tg 没在服务 → 侧栏 TG 导航整体隐藏。
-   *
-   *  判据**唯一来源**是 `store/selectors.ts::resolveTgFeatureReady`（BUG-087 / BUG-097 / BUG-178）：
-   *  Sidebar 经 `tgReady` prop、AccountsPanel 直接调用，都读同一处，不再各写一份；
-   *  且它只问**服务层**（daemon 托管），不再掺链路探测 —— 掺了就会出现
-   *  「设置页说运行中、面板说不可用」的自相矛盾。
-   */
-  const tgFeatureReady = resolveTgFeatureReady(tgService)
+  const { downloads, init, setDaemon, setDaemonAlive, refresh, pauseAll, resumeAll, clearCompleted, toast, clearToast, viewer, setViewerIndex, closeViewer, tgService, refreshTgState, probeTg } = useStore()
 
   useEffect(() => {
     init()
@@ -78,19 +85,18 @@ export function MainLayout() {
     return () => clearInterval(timer)
   }, [init, refresh, setDaemon, setDaemonAlive])
 
-  // 服务被摘除时（开关关 / orig-tg 进程不可达）把用户从 TG 视图送回全部下载，
-  // 避免停留在已被门控隐藏的面板上。探测未返回（null）不算不可用。
-  //
-  // 注意：**未绑定不再弹回**（BUG-094）。此前还有一段「未绑定 → 退回 all」，
-  // 它与「服务可用即显示」的新门控直接冲突：入口放行了，进来又被弹走，等于没改；
-  // 而 `unavailable`（连不上 Telegram）正是必须让用户留下来修的状态。
-  useEffect(() => {
-    if (view !== 'tg') return
-    // 判据与侧栏门控**同一处**（`resolveTgFeatureReady`），不再另写一份
-    // `status === 'unreachable'` —— 两份判据迟早分叉，分叉就会出现
-    // 「入口还在、进来却被弹走」或反过来（BUG-177）。
-    if (!tgFeatureReady) setView('all')
-  }, [tgFeatureReady, view])
+  /*
+   * M0-T01 / M0-T05：**删除「TG 不可用就把用户弹回」的 effect**。
+   *
+   * 这个 effect 与「入口常驻 + 面板内引导空态」直接冲突：入口放行了，用户进来
+   * 又被踢走，等于没改。而 `unavailable`（连不上 Telegram）正是**必须让用户
+   * 留下来修**的状态（BUG-094 的原话）。
+   *
+   * 门控没有消失，只是换了位置：`resolveTgFeatureReady(tgService)` 现在由
+   * `TgPanel` 自己算（判据仍是同一处选择器，不写第二份 —— BUG-177），
+   * 未启用/未登录时渲染 `TgOnboarding` 引导卡，其中「启用 Telegram 插件」
+   * 跳到设置·Telegram。**入口在任何状态下都不消失。**
+   */
 
   // TG 开关变化 / 启动期重探测（BUG-097）：退避探测已抽成 store 的 `probeTg` 复用 ——
   // 开启侧 daemon 拉起 orig-tg 需要时间，最多重试 5 次、就绪即停；关闭侧探一次即可
@@ -136,11 +142,16 @@ export function MainLayout() {
   const aggTotal = aggregate.reduce((sum, d) => sum + (d.total_size || 0), 0)
   const globalProgress = aggTotal > 0 ? Math.min(100, (aggDownloaded / aggTotal) * 100) : 0
 
-  // 切换视图时清空分类筛选；保持「全部文件」下钻与顶层视图互斥。
-  const handleView = (v: ViewId) => {
-    setCategoryFilter(null)
-    setView(v)
-  }
+  /**
+   * 唯一的域间通道（M0-T01）：`navigate()` 是跨域跳转的唯一真源，
+   * 禁止在组件里各自 `setView('tg')`（域间零直接 import，设计原则 4）。
+   *
+   * 切域时**保留**另一域的树选择（用户切走再回来不该丢上下文）；
+   * 显式传入的树选择覆盖。规则见 `nav/index.ts::navigate`。
+   */
+  const handleNavigate = useEvent((view: ViewId, opts?: Parameters<typeof navigate>[2]) =>
+    setNav((prev) => navigate(prev, view, opts)),
+  )
 
   /**
    * 上下文栏的四个操作回调：必须 `useEvent` 恒定引用。
@@ -157,7 +168,7 @@ export function MainLayout() {
    * TG 未绑定引导区的出口：跳到设置页（→ 账号 Tab）复用已有的绑定入口。
    * 不在此处另起一套登录流程 —— 登录表单归 `AccountsPanel`，只有一份实现。
    */
-  const handleGoAccounts = useEvent(() => handleView('settings'))
+  const handleGoAccounts = useEvent(() => handleNavigate('settings', { section: 'telegram' }))
   /**
    * 入库流水线 → 媒体库的跨视图出口。
    *
@@ -166,27 +177,10 @@ export function MainLayout() {
    * 否则「查看」只是一次播放器弹出，用户从没到达过成品所在的地方。
    * 视图 state 在本组件（局部），接线只能是这一个回调 —— 组件间不另开通道。
    */
-  const handleOpenMedia = useEvent(() => handleView('media'))
+  const handleOpenMedia = useEvent(() => handleNavigate('files', { fmode: 'lib-series' }))
 
-  /**
-   * 档位过滤（BUG-082）：下载三档（下载中 / 已暂停 / 已完成）各对应一组状态，
-   * `idle` 归入下载中档（否则它三档皆不可见）。
-   * `error | cancelled` **没有专属档位**（失败·已取消导航档已移除）：它们落在最后的
-   * `downloads` 兜底分支，即只在「全部文件」里可见，靠行内红色错误文字 + 行内「删除」处理。
-   */
-  const baseVisible =
-    view === 'settings'
-      ? downloads
-      : view === 'completed'
-        ? completed
-        : view === 'paused'
-          ? paused
-          : view === 'downloading'
-            ? downloadingBucket
-            : downloads
-  const visible = categoryFilter
-    ? baseVisible.filter((d) => d.category === categoryFilter)
-    : baseVisible
+  // 下载档位过滤已随 M0-T02 移入 `domains/download/DownloadPanel`（读 nav.dlFilter）。
+  // 本组件只保留**状态栏/徽标口径**用的三个桶（BUG-082 三处同源纪律）。
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background">
@@ -207,21 +201,27 @@ export function MainLayout() {
             />
           </div>
         )}
+        {/*
+          侧栏（M0-T01）：五项域 + 两棵树。
+          - `nav` 是单一真源；`onNavigate` 是唯一入口；
+          - counts 由各域面板上报（`filesCounts` / 下载三桶），不在此处另算一套；
+          - **不再传 `tgReady`**：入口常驻，门控移入 TgPanel 内部空状态（M0-T05）。
+            这是 BUG-094 口径的改变 —— 只影响面板内容，不影响导航位。
+        */}
         <Sidebar
-          view={view}
-          onViewChange={handleView}
-          categories={categories}
-          categoryFilter={categoryFilter}
-          onCategoryChange={setCategoryFilter}
+          nav={nav}
+          onNavigate={handleNavigate}
           collapsed={collapsed}
           onToggle={() => setCollapsed((c) => !c)}
           counts={{
+            files: filesCounts.files,
             downloading: downloadingBucket.length,
             paused: paused.length,
             completed: completed.length,
-            total: downloads.length,
+            series: filesCounts.series,
+            tags: filesCounts.tags,
+            unfiled: filesCounts.unfiled,
           }}
-          tgReady={tgFeatureReady}
         />
 
         <div className="flex min-w-0 flex-1 flex-col">
@@ -234,8 +234,7 @@ export function MainLayout() {
             data-testid="context-bar-header"
           >
             <ContextBar
-              view={view}
-              categoryFilter={categoryFilter}
+              nav={nav}
               onNewDownload={handleNewDownload}
               onPauseAll={handlePauseAll}
               onResumeAll={handleResumeAll}
@@ -247,25 +246,38 @@ export function MainLayout() {
           <main
             className={cn(
               'flex-1 overflow-hidden',
-              (view === 'tg' || view === 'media') && 'flex',
-              view !== 'settings' &&
-                view !== 'tg' &&
-                view !== 'media' &&
-                'overflow-y-auto p-4',
+              // tg / files 两域自带内滚动与分栏，外层不再套滚动（M0 前 media 同理）
+              (view === 'tg' || view === 'files') && 'flex',
+              // 只有下载域用外层滚动 + 页面留白（卡片流现状不变）
+              view === 'download' && 'overflow-y-auto p-4',
             )}
           >
             {view === 'settings' ? (
-              <SettingsPanel onOpenMedia={handleOpenMedia} />
+              <SettingsPanel
+                onOpenMedia={handleOpenMedia}
+                section={nav.section}
+                onSectionChange={(s) => setNav((prev) => navigate(prev, 'settings', { section: s }))}
+              />
             ) : view === 'tg' ? (
               <ErrorBoundary>
                 <TgPanel onOpenAccounts={handleGoAccounts} onOpenMedia={handleOpenMedia} />
               </ErrorBoundary>
-            ) : view === 'media' ? (
+            ) : view === 'share' ? (
               <ErrorBoundary>
-                <MediaLibraryPanel />
+                <SharePanel />
+              </ErrorBoundary>
+            ) : view === 'download' ? (
+              <ErrorBoundary>
+                <DownloadPanel dlFilter={nav.dlFilter} items={downloads} />
               </ErrorBoundary>
             ) : (
-              <DownloadList items={visible} />
+              <ErrorBoundary>
+                <FilesPanel
+                  nav={nav}
+                  onFmodeChange={(m) => setNav((prev) => navigate(prev, 'files', { fmode: m }))}
+                  onCounts={setFilesCounts}
+                />
+              </ErrorBoundary>
             )}
           </main>
 

@@ -22,16 +22,30 @@ import { useStore } from '../store/useStore'
 import { useTranslation } from '../i18n'
 import { fmtSize } from '../lib/tgmedia'
 import { cn } from '../lib/utils'
+import type { SettingsSection } from '../nav'
 
-type SettingsTab = 'general' | 'downloads' | 'network' | 'proxy' | 'accounts' | 'about'
-
-const TABS: { id: SettingsTab; labelKey: string; descKey: string }[] = [
-  { id: 'general', labelKey: 'tab.general', descKey: 'tab.general.desc' },
-  { id: 'downloads', labelKey: 'tab.downloads', descKey: 'tab.downloads.desc' },
-  { id: 'network', labelKey: 'tab.network', descKey: 'tab.network.desc' },
-  { id: 'proxy', labelKey: 'tab.proxy', descKey: 'tab.proxy.desc' },
-  { id: 'accounts', labelKey: 'tab.accounts', descKey: 'tab.accounts.desc' },
-  { id: 'about', labelKey: 'tab.about', descKey: 'tab.about.desc' },
+/**
+ * 设置域七区块（模块重整 M0 · BUG-298 / M0-T07）。
+ *
+ * 权威形态：`05-ui-wireframes.md` §6「左锚点 + 右 divider 列表」。
+ * 本阶段**只移动，不改读写**（tasks.md 原文）：每个控件的作用端点与保存语义
+ * 逐一保持原状，变的只是它落在哪个区块。分区 id 与 `nav/index.ts::SettingsSection`
+ * 同一个联合（单一真源，不另写一份枚举）。
+ *
+ * 与 M0 前的两处硬差异：
+ *  1. 通用区**不再放 TG 控件** —— TG 的启停/状态/缓存入口连同账号区一起归
+ *     「Telegram 插件」区块（入口与它的数据在同一个家）；
+ *  2. libDir（媒体库根目录）从下载区移入「下载与存储」，写入端点仍走
+ *     `setTgLibraryDir`（M0 不换端点；M3 随库迁 daemon）。
+ */
+const SECTIONS: { id: SettingsSection; labelKey: string; descKey: string }[] = [
+  { id: 'general', labelKey: 'sec.general', descKey: 'sec.general.desc' },
+  { id: 'downloads', labelKey: 'sec.downloads', descKey: 'sec.downloads.desc' },
+  { id: 'network', labelKey: 'sec.network', descKey: 'sec.network.desc' },
+  { id: 'engine', labelKey: 'sec.engine', descKey: 'sec.engine.desc' },
+  { id: 'telegram', labelKey: 'sec.telegram', descKey: 'sec.telegram.desc' },
+  { id: 'share', labelKey: 'sec.share', descKey: 'sec.share.desc' },
+  { id: 'about', labelKey: 'sec.about', descKey: 'sec.about.desc' },
 ]
 
 /** 内置分类默认值：必须与 daemon `ClassifyConfig::defaults()` 完全对齐。
@@ -82,13 +96,23 @@ interface CategoryRow {
 }
 
 /**
- * 设置页（左侧导航 + 全局保存/恢复默认 + 设置标题专门样式）：
- * 常规 / 下载 / 多网卡 / 关于。
- * - 「保存」「恢复默认」为全局按钮，作用于整个设置页（所有 Tab 的编辑态）
- * - 下载 Tab：默认目录全宽排版 + 自动分类规则编辑（可增删后缀规则）
- * - 多网卡 Tab：参与列表 + 公式权重展示（主 2 份 / 附属 1 份）
+ * 设置页（左侧锚点 + 全局保存/恢复默认 + 分区标题）：
+ * 七区块 = 通用 / 下载与存储 / 网络与代理 / 播放引擎 / Telegram 插件 / 共享 / 关于。
+ *
+ * 「保存」「恢复默认」为全局按钮，作用于整个设置页（所有区块的编辑态）——
+ * 端点与保存语义保持 M0 前原状（tasks.md：只移动，不改读写）。
  */
-export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}) {
+export function SettingsPanel({
+  onOpenMedia,
+  section,
+  onSectionChange,
+}: {
+  onOpenMedia?: () => void
+  /** 当前分区锚点（单一真源在 MainLayout 的 `nav.section`） */
+  section?: SettingsSection
+  /** 用户在面板内切换分区时回写真源，避免两处各存一份 */
+  onSectionChange?: (s: SettingsSection) => void
+} = {}) {
   const { t, language, setLanguage, supported } = useTranslation()
   const { settings, updateSettings, daemon, setError, tgService, tgLink, setTgEnabled, refreshTgState } =
     useStore()
@@ -96,7 +120,15 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
   // 不再掺链路状态 —— 掺了就会出现「插件：运行中」与「Telegram 不可用」同屏打架。
   const tgEnabled = tgService.enabled
   const tgRunning = tgService.running
-  const [activeTab, setActiveTab] = useState<SettingsTab>('downloads')
+  const [activeTab, setActiveTab] = useState<SettingsSection>(section ?? 'general')
+  /**
+   * 分区锚点受控同步（M0-T07）：外部（`navigate('settings',{section})`）改分区时
+   * 面板跟着走。用 `!==` 比较而非无条件 setState —— 无条件 set 每次渲染都写一次，
+   * 与「state 未变也要重新渲染」同义，白白打乱 memo。
+   */
+  useEffect(() => {
+    if (section && section !== activeTab) setActiveTab(section)
+  }, [section, activeTab])
   const [maxConnections, setMaxConnections] = useState(settings.maxConnections)
   const [dir, setDir] = useState(settings.downloadDirectory)
   // 自动分类（R3）：编辑态，保存时写入
@@ -512,11 +544,15 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
           <p className="mt-0.5 text-[11px] text-muted">{t('settings.subtitle')}</p>
         </div>
         <nav className="flex flex-1 flex-col gap-0.5 p-3">
-          {TABS.map((tab) => (
+          {SECTIONS.map((tab) => (
             <button
               key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
+              onClick={() => {
+                setActiveTab(tab.id)
+                onSectionChange?.(tab.id)
+              }}
               data-testid={`settings-tab-${tab.id}`}
+              data-sec={tab.id}
               className={cn(
                 'flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors',
                 activeTab === tab.id
@@ -537,7 +573,7 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
       <div className="flex flex-1 flex-col overflow-hidden">
         <div className="flex-1 overflow-y-auto p-6">
           {activeTab === 'downloads' && (
-            <div className="mx-auto max-w-2xl space-y-6">
+            <div className="mx-auto max-w-2xl space-y-6" data-sec="downloads">
               <div>
                 <h3 className="text-lg font-semibold text-fg-strong">{t('downloads.heading')}</h3>
                 <p className="mt-0.5 text-xs text-muted">{t('downloads.sub')}</p>
@@ -734,8 +770,124 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
             </div>
           )}
 
+          {activeTab === 'telegram' && (
+            <div className="mx-auto max-w-2xl space-y-6" data-sec="telegram">
+              <div>
+                <h3 className="text-lg font-semibold text-fg-strong">{t('tg.sectionHeading')}</h3>
+                <p className="mt-0.5 text-xs text-muted">{t('tg.sectionSub')}</p>
+              </div>
+
+              {/* 启停 + 状态 + 失败原因（M0-T07：自「通用」区迁入本区块）。
+                  旧注释「TG 不可用时侧栏入口被摘除」随 M0-T05 作废（入口常驻），
+                  但**这里的呈现仍是必要的**：入口只负责让人进得来，原因说明仍在设置里。 */}
+              <div className="space-y-5 rounded-xl border border-border-subtle bg-surface p-5">
+                  {/* TG 模块：启停开关 + 状态 + 清理缓存（属「通用」，不归「账号」） */}
+                  <div>
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="min-w-0">
+                        <p className="text-[13px] font-medium text-fg-strong">{t('tg.toggle')}</p>
+                        <p className="mt-0.5 text-[11px] text-muted">{t('tg.toggleHint')}</p>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2">
+                        <span
+                          className={cn(
+                            'text-[11px]',
+                            // 开了却没在跑 = 拉起失败（danger），**不是**「启动中」：
+                            // 旧文案在永久失败（如端口落在系统保留区）时会一直显示「启动中」，
+                            // 把 daemon 的失职伪装成「再等等就好了」（BUG-177）。
+                            tgEnabled && !tgRunning
+                              ? 'text-danger'
+                              : tgRunning
+                                ? 'text-success'
+                                : 'text-muted',
+                          )}
+                          data-testid="tg-toggle-status"
+                        >
+                          {tgEnabled
+                            ? tgRunning
+                              ? t('tg.running')
+                              : t('tg.startFailed')
+                            : t('tg.stopped')}
+                        </span>
+                        <Switch
+                          checked={tgEnabled}
+                          onChange={(v) => {
+                            void setTgEnabled(v).then(() => {
+                              // 回写后立刻取一次失败原因：拉起失败时用户需要当场看到为什么，
+                              // 而不是「开关打开了但 TG 没了」。
+                              void refreshTgState()
+                            })
+                          }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* 失败原因可见（BUG-177）：TG 不可用时侧栏入口被摘除，
+                        这里是用户唯一能知道「为什么没有 TG」的地方。 */}
+                    {tgEnabled && !tgRunning && tgError ? (
+                      <p
+                        className="mt-2 rounded-md bg-danger/10 px-3 py-2 text-[11px] leading-relaxed text-danger"
+                        data-testid="tg-toggle-error"
+                      >
+                        {t('tg.startFailedHint', { reason: tgError })}
+                      </p>
+                    ) : null}
+
+                    <div className="mt-3 flex items-center justify-between gap-4 rounded-lg bg-surface-2/40 px-3 py-2.5">
+                      <div className="min-w-0">
+                        <p className="text-[13px] font-medium text-fg-strong">
+                          {t('tg.clearCacheFile')}
+                        </p>
+                        <p className="mt-0.5 text-[11px] text-muted">{t('tg.clearCacheFileHint')}</p>
+                        {/* 占用读数与按钮同屏：释放磁盘不可逆，盲操作不可接受 */}
+                        <p className="mt-0.5 text-[11px] text-muted" data-testid="clear-cache-usage">
+                          {cacheUsage
+                            ? t('tg.clearCacheUsage', {
+                                size: fmtSize(cacheUsage.bytes),
+                                n: cacheUsage.files,
+                              })
+                            : t('tg.clearCacheUsageUnknown')}
+                          {/* 孤儿字节单独如实报出：它是**可清理**的，但不计入 stats.bytes
+                              （stats 只算条目背书的字节）。漏了就是读数低估。 */}
+                          {orphanBytes > 0 ? (
+                            <span data-testid="clear-cache-orphan-hint">
+                              {' '}
+                              {t('tg.clearCacheUsageOrphan', { size: fmtSize(orphanBytes) })}
+                            </span>
+                          ) : null}
+                        </p>
+                      </div>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        className="shrink-0"
+                        // 无可清理内容时禁用：点开一个空面板只会让人以为功能坏了。
+                        // 但**读回判据之前不禁用** —— 那时「正在读取占用…」与灰按钮同屏，
+                        // 等于谎报「没什么可清」（转瞬即逝，却正是用户第一眼看到的那一帧）。
+                        disabled={cacheUsageLoaded && clearableCount === 0}
+                        onClick={() => setCacheManagerOpen(true)}
+                        data-testid="clear-cache-files"
+                        title={t('tg.ingestCleanupSection')}
+                      >
+                        {t('tg.clearCacheFile')}
+                      </Button>
+                    </div>
+                  </div>
+              </div>
+
+              {/*
+                账号管理区（M0-T07：原「账号」页签整体迁入）。
+                `AccountsPanel` 自带布局与横幅，此处只提供容器与分区归属。
+                M7（BUG-238）多账户化时数据契约预留 `account_id`，UI 仍单账户。
+              */}
+              <div className="rounded-xl border border-border-subtle bg-surface" data-sec="telegram-accounts">
+                <AccountsPanel />
+              </div>
+            </div>
+          )}
+
           {activeTab === 'network' && (
-            <div className="mx-auto max-w-2xl space-y-6">
+            <div className="mx-auto max-w-2xl space-y-6" data-sec="network-nics">
               <div>
                 <h3 className="text-lg font-semibold text-fg-strong">{t('network.heading')}</h3>
                 <p className="mt-0.5 text-xs text-muted">{t('network.sub')}</p>
@@ -806,13 +958,19 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
             </div>
           )}
 
-          {activeTab === 'proxy' && (
-            <div className="mx-auto max-w-2xl space-y-6">
+          {/*
+            网络与代理 = 一个区块两块（M0-T07：原 network + proxy 两个页签合并展示，
+            任务书原文「proxy+network 合并展示，存储仍各自端点」）。
+            两块各自的读写端点与保存语义保持原状，未做任何合并改写。
+            条件写 `'network'`：nics 块（上一段）与代理块同属这一个分区，
+            同时渲染即为「合并展示」；`'proxy'` 已从分区联合里移除。
+          */}
+          {activeTab === 'network' && (
+            <div className="mx-auto max-w-2xl space-y-6" data-sec="network-proxy">
               <div>
                 <h3 className="text-lg font-semibold text-fg-strong">{t('proxy.heading')}</h3>
                 <p className="mt-0.5 text-xs text-muted">{t('proxy.sub')}</p>
               </div>
-
               <div className="space-y-5 rounded-xl border border-border-subtle bg-surface p-5">
                 {/* 模式选择 */}
                 <div>
@@ -927,7 +1085,7 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
           )}
 
           {activeTab === 'general' && (
-            <div className="mx-auto max-w-2xl space-y-6">
+            <div className="mx-auto max-w-2xl space-y-6" data-sec="general">
               <div>
                 <h3 className="text-lg font-semibold text-fg-strong">{t('general.heading')}</h3>
                 <p className="mt-0.5 text-xs text-muted">{t('general.sub')}</p>
@@ -1003,101 +1161,6 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
 
                 <div className="h-px bg-border-subtle/60" />
 
-                {/* TG 模块：启停开关 + 状态 + 清理缓存（属「通用」，不归「账号」） */}
-                <div>
-                  <div className="flex items-center justify-between gap-4">
-                    <div className="min-w-0">
-                      <p className="text-[13px] font-medium text-fg-strong">{t('tg.toggle')}</p>
-                      <p className="mt-0.5 text-[11px] text-muted">{t('tg.toggleHint')}</p>
-                    </div>
-                    <div className="flex shrink-0 items-center gap-2">
-                      <span
-                        className={cn(
-                          'text-[11px]',
-                          // 开了却没在跑 = 拉起失败（danger），**不是**「启动中」：
-                          // 旧文案在永久失败（如端口落在系统保留区）时会一直显示「启动中」，
-                          // 把 daemon 的失职伪装成「再等等就好了」（BUG-177）。
-                          tgEnabled && !tgRunning
-                            ? 'text-danger'
-                            : tgRunning
-                              ? 'text-success'
-                              : 'text-muted',
-                        )}
-                        data-testid="tg-toggle-status"
-                      >
-                        {tgEnabled
-                          ? tgRunning
-                            ? t('tg.running')
-                            : t('tg.startFailed')
-                          : t('tg.stopped')}
-                      </span>
-                      <Switch
-                        checked={tgEnabled}
-                        onChange={(v) => {
-                          void setTgEnabled(v).then(() => {
-                            // 回写后立刻取一次失败原因：拉起失败时用户需要当场看到为什么，
-                            // 而不是「开关打开了但 TG 没了」。
-                            void refreshTgState()
-                          })
-                        }}
-                      />
-                    </div>
-                  </div>
-
-                  {/* 失败原因可见（BUG-177）：TG 不可用时侧栏入口被摘除，
-                      这里是用户唯一能知道「为什么没有 TG」的地方。 */}
-                  {tgEnabled && !tgRunning && tgError ? (
-                    <p
-                      className="mt-2 rounded-md bg-danger/10 px-3 py-2 text-[11px] leading-relaxed text-danger"
-                      data-testid="tg-toggle-error"
-                    >
-                      {t('tg.startFailedHint', { reason: tgError })}
-                    </p>
-                  ) : null}
-
-                  <div className="mt-3 flex items-center justify-between gap-4 rounded-lg bg-surface-2/40 px-3 py-2.5">
-                    <div className="min-w-0">
-                      <p className="text-[13px] font-medium text-fg-strong">
-                        {t('tg.clearCacheFile')}
-                      </p>
-                      <p className="mt-0.5 text-[11px] text-muted">{t('tg.clearCacheFileHint')}</p>
-                      {/* 占用读数与按钮同屏：释放磁盘不可逆，盲操作不可接受 */}
-                      <p className="mt-0.5 text-[11px] text-muted" data-testid="clear-cache-usage">
-                        {cacheUsage
-                          ? t('tg.clearCacheUsage', {
-                              size: fmtSize(cacheUsage.bytes),
-                              n: cacheUsage.files,
-                            })
-                          : t('tg.clearCacheUsageUnknown')}
-                        {/* 孤儿字节单独如实报出：它是**可清理**的，但不计入 stats.bytes
-                            （stats 只算条目背书的字节）。漏了就是读数低估。 */}
-                        {orphanBytes > 0 ? (
-                          <span data-testid="clear-cache-orphan-hint">
-                            {' '}
-                            {t('tg.clearCacheUsageOrphan', { size: fmtSize(orphanBytes) })}
-                          </span>
-                        ) : null}
-                      </p>
-                    </div>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      className="shrink-0"
-                      // 无可清理内容时禁用：点开一个空面板只会让人以为功能坏了。
-                      // 但**读回判据之前不禁用** —— 那时「正在读取占用…」与灰按钮同屏，
-                      // 等于谎报「没什么可清」（转瞬即逝，却正是用户第一眼看到的那一帧）。
-                      disabled={cacheUsageLoaded && clearableCount === 0}
-                      onClick={() => setCacheManagerOpen(true)}
-                      data-testid="clear-cache-files"
-                      title={t('tg.ingestCleanupSection')}
-                    >
-                      {t('tg.clearCacheFile')}
-                    </Button>
-                  </div>
-                </div>
-
-                <div className="h-px bg-border-subtle/60" />
-
                 {/* 启动行为 */}
                 <div className="flex items-center justify-between gap-4">
                   <div className="min-w-0">
@@ -1124,12 +1187,43 @@ export function SettingsPanel({ onOpenMedia }: { onOpenMedia?: () => void } = {}
             </div>
           )}
 
-          {activeTab === 'accounts' && (
-            <AccountsPanel />
+          {/*
+            播放引擎区块占位（M0-T07；M5 = BUG-302 填充）。
+            **只放说明、不放控件**：没有探测/安装能力时摆一排开关与下拉，等于给用户
+            一堆点了不动的假控件（BUG-148：实现约束不做成常驻 UI）。
+          */}
+          {activeTab === 'engine' && (
+            <div className="mx-auto max-w-2xl space-y-6" data-sec="engine">
+              <div>
+                <h3 className="text-lg font-semibold text-fg-strong">{t('engine.heading')}</h3>
+                <p className="mt-0.5 text-xs text-muted">{t('engine.sub')}</p>
+              </div>
+              <div className="rounded-xl border border-border-subtle bg-surface p-5">
+                <p className="text-[13px] font-medium text-fg-strong">{t('engine.placeholderTitle')}</p>
+                <p className="mt-1 text-[11px] leading-relaxed text-muted">{t('engine.placeholderHint')}</p>
+              </div>
+            </div>
+          )}
+
+          {/*
+            共享区块占位（M0-T07；M6 = BUG-303 填充）。
+            与侧栏「共享」域的 SharePanel 同一口径：**无控件、无请求** ——
+            受管绑定面与 `/s/*` 未在 daemon 侧成立前，前端提前做只会得到一个假界面。
+          */}
+          {activeTab === 'share' && (
+            <div className="mx-auto max-w-2xl space-y-6" data-sec="share">
+              <div>
+                <h3 className="text-lg font-semibold text-fg-strong">{t('share.title')}</h3>
+                <p className="mt-0.5 text-xs text-muted">{t('share.comingSoon')}</p>
+              </div>
+              <div className="rounded-xl border border-border-subtle bg-surface p-5">
+                <p className="text-[11px] leading-relaxed text-muted">{t('share.scopeHint')}</p>
+              </div>
+            </div>
           )}
 
           {activeTab === 'about' && (
-            <div className="mx-auto max-w-2xl space-y-6">
+            <div className="mx-auto max-w-2xl space-y-6" data-sec="about">
               <div>
                 <h3 className="text-lg font-semibold text-fg-strong">{t('about.heading')}</h3>
                 <p className="mt-0.5 text-xs text-muted">{t('about.sub')}</p>

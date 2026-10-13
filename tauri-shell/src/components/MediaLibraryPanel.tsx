@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { useTranslation } from '../i18n'
@@ -54,9 +54,33 @@ import {
   sourceLabelKey,
 } from '../lib/mediaSources'
 import type { ViewerItem } from '../types'
+import {
+  fileCategoryOf,
+  libraryGroupOf,
+  seriesIdOf,
+  seriesMode,
+  type FileMode,
+  type SidebarCounts,
+} from '../nav'
 
 type Tab = 'all' | MediaKind
 type View = 'items' | 'series' | 'seriesDetail'
+
+/**
+ * 文件域树选择（M0-T03，来自 `nav/index.ts`）。
+ *
+ * **受控/非受控两用**：`fmode` 缺省（老调用方，如直接渲染本面板的路径）= 面板自管导航态；
+ * 传入 = 侧栏树是导航单一真源，本面板只保留数据态。
+ * 之所以不做成「纯受控」：M0 的边界是**搬运不改写**，把 1850 行里的导航 setter 全部
+ * 改成 props 回调属于重写，风险不在本阶段承担（那属于 M2 的「拆成 Contents/Series/Tags
+ * 三视图」）。受控同步只新增一条 effect，不动任何数据流。
+ */
+interface Props {
+  fmode?: FileMode
+  onFmodeChange?: (m: FileMode) => void
+  /** 侧栏树的事实计数上报（M0-T01）：徽标数必须与面板里的数是同一个数 */
+  onCounts?: (c: SidebarCounts) => void
+}
 
 const PAGE = 120
 
@@ -71,7 +95,6 @@ const PAGE = 120
  *   · 标签行高 20px + gap 4px ⇒ 8 个 ≈ 115px（5 行），默认窗口 780 高下 nav 仍余
  *     ≈100px 不溢出；窗口高降到 ≈680 以下才出现唯一一条大滚动条（用户裁定允许）。
  */
-const RAIL_SERIES_LIMIT = 9
 const RAIL_TAG_LIMIT = 8
 
 /**
@@ -112,7 +135,7 @@ function toViewerItem(i: MediaItem): ViewerItem {
  * 能力：本地目录导入、剧集（季/集）编排、标签交叉归类、图片（图集）管理、多选批量操作。
  * 播放统一交给全局播放器页（openViewer），不在本面板内嵌。
  */
-export function MediaLibraryPanel() {
+export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}) {
   const { t } = useTranslation()
   const { setError, openViewer, pendingMediaFocus, setPendingMediaFocus } = useStore()
 
@@ -216,6 +239,81 @@ export function MediaLibraryPanel() {
   const [tagExpanded, setTagExpanded] = useState(false)
   const [tagFilter, setTagFilter] = useState('')
   const [unassignedOnly, setUnassignedOnly] = useState(false)
+
+  /**
+   * 侧栏分类（6 类）→ 资料库 kind（4 值）的过渡映射（M0-T03）。
+   *
+   * **这是有损映射，必须写明**：侧栏六分类来自文件/下载世界的分类法
+   * （`nav::FILE_CATEGORIES`），而 `MediaKind` 只有 `video | photo | audio | file`
+   * 四个值 —— `doc` / `archive` / `other` 三类在当前库里**没有 distinguishable 的 kind**，
+   * 一律落 `file`。⇒ M0 期这三个树子项会显示**同一份内容**。
+   *
+   * 不做假数据、不提前造 kind：真正的区分在 M2（BUG-299 / M2-T02「成品浏览器扩面」）
+   * 由文件事实层给出「文档/压缩/其他」的非媒体文件行。本映射只保证
+   * 「点了有正确子集、且不显示不存在的能力」。
+   */
+  const CATEGORY_TO_KIND: Record<string, Tab> = {
+    video: 'video',
+    music: 'audio',
+    image: 'photo',
+    doc: 'file',
+    archive: 'file',
+    other: 'file',
+  }
+
+  /**
+   * 导航受控同步（M0-T03）：侧栏树 → 本面板的导航态。
+   *
+   * 只写 state、**不发请求**（加载由既有的 `view`/`tab`/`activeTagId` effect 触发）；
+   * `appliedFmode` 记录「已应用」，避免面板内部导航后回流的 fmode 重复触发加载 effect。
+   * 这是**单向**的：fmode 变了才应用；面板内部导航不写 fmode，由各回调经
+   * `onFmodeChange` 上报（见 openSeries / series-back / 未归档勾选）。
+   */
+  const appliedFmode = useRef<FileMode | null>(null)
+  useEffect(() => {
+    if (!fmode || appliedFmode.current === fmode) return
+    appliedFmode.current = fmode
+    const sid = seriesIdOf(fmode)
+    if (sid !== null) {
+      setActiveSeriesId(sid)
+      setView('seriesDetail')
+      return
+    }
+    setDetail(null)
+    setActiveSeriesId(null)
+    const lib = libraryGroupOf(fmode)
+    if (lib === 'series' || lib === 'tags') {
+      setView('series')
+      return
+    }
+    const cat = fileCategoryOf(fmode)
+    setView('items')
+    setTab(cat ? CATEGORY_TO_KIND[cat] : 'all')
+    setUnassignedOnly(lib === 'unfiled')
+  }, [fmode])
+
+  /**
+   * 侧栏树的事实计数上报（M0-T01）。
+   *
+   * 侧栏徽标要的是**同一个数**（BUG-125 / BUG-133 的同源纪律：不许两处各算一套）。
+   * 只在取值变化时上报，避免每次渲染都往顶层推 state。
+   *
+   * **未归档计数不上报**：`LibraryStats` 没有该字段，而 `items` 是分页/筛选后的
+   * 结果，拿它的长度当总数属于编造。⇒ 侧栏该子项的计数留空，等 M2-T03 的
+   * `series_id IS NULL` 参数化查询落地后补（已知残余，登记在 BUG-298 §实施记录）。
+   */
+  const countsKey = `${stats?.items ?? ''}|${seriesTotal}|${stats?.tags ?? ''}`
+  useEffect(() => {
+    if (!onCounts) return
+    onCounts({
+      files: stats?.items ?? 0,
+      series: seriesTotal,
+      tags: stats?.tags ?? 0,
+      unfiled: undefined,
+    })
+    // countsKey 是上面三个值的组合：变了的才推（eslint 需要显式依赖）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onCounts, countsKey])
   const [selected, setSelected] = useState<Set<number>>(new Set())
   /**
    * 剧集墙的多选（BUG-186）：装的是**剧集 id**。
@@ -385,6 +483,9 @@ export function MediaLibraryPanel() {
         setDetail(d)
         setActiveSeriesId(id)
         setView('seriesDetail')
+        // 上报侧栏树（M0-T03）：下钻是**导航**，单一真源在 nav state。
+        appliedFmode.current = seriesMode(id)
+        onFmodeChange?.(seriesMode(id))
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
         // 剧集已被删除/合并：清掉死缓存、退回剧集墙并给语义提示，而不是卡在 404。
@@ -400,6 +501,8 @@ export function MediaLibraryPanel() {
         setDetail(null)
         setActiveSeriesId(null)
         setView('series')
+        appliedFmode.current = 'lib-series'
+        onFmodeChange?.('lib-series')
         void loadSeries()
         setError(t('media.seriesGone'))
         return
@@ -757,28 +860,15 @@ export function MediaLibraryPanel() {
       setView('series')
       setDetail(null)
       setActiveSeriesId(null)
+        appliedFmode.current = 'lib-series'
+        onFmodeChange?.('lib-series')
       await refreshAll()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
   }
 
-  const switchTab = (next: Tab) => {
-    setTab(next)
-    setView('items')
-    setDetail(null)
-    clearSelection()
-  }
-
   // ---------- 渲染 ----------
-  const railBtn = (active: boolean) =>
-    [
-      'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] transition-colors',
-      active
-        ? 'bg-accent/10 font-medium text-accent'
-        : 'text-fg-strong hover:bg-surface-2/70',
-    ].join(' ')
-
   const clearFilters = useCallback(() => {
     setActiveTagId(null)
     setSearch('')
@@ -907,231 +997,6 @@ export function MediaLibraryPanel() {
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-1 bg-surface/20">
       {/* ───────── 左栏导航 ───────── */}
-      <aside className="flex w-52 shrink-0 flex-col border-r border-border-subtle/60">
-        <div className="shrink-0 border-b border-border-subtle/60 px-3 py-2.5">
-          <h3
-            className="truncate text-[13px] font-semibold text-fg-strong"
-            data-testid="media-panel-title"
-          >
-            {'🎬 ' + t('media.title')}
-          </h3>
-          {stats ? (
-            <p className="mt-0.5 truncate text-[10px] text-muted">
-              {stats.items} 项 ·{' '}
-              {/*
-               * BUG-133：**主口径 = 磁盘真值**。
-               * 此前这里直接展示 `totalSize`（登记值）且无任何标注，用户清缓存后
-               * 数字不动 → 误判「没删成功」。字节其实已经回收，是口径在骗人。
-               * 现在主数字是「实际占盘」，并在 title 里**写明口径**，
-               * 两个口径同时可查（BUG-133 判据 2：不得只给一个未加说明的数字）。
-               *
-               * 后端未下发磁盘口径时回退登记值，并把口径写进 title ——
-               * 不把一个来路不明的数当磁盘占用展示。
-               */}
-              <span
-                title={
-                  hasDiskBasis
-                    ? '占用空间 = 资料库在本机实际占用的磁盘字节（清缓存后会下降）'
-                    : '占用空间 = 媒体库登记的内容大小（后端未提供磁盘占用读数；清缓存后此值不变）'
-                }
-                data-testid="media-disk-usage"
-              >
-                占用 {fmtOccupancy(leadingBytes)}
-                {stats.diskBytesTruncated ? '（已截断）' : ''}
-              </span>
-              {/* 次口径：明确标注它**不是**本地占用，否则两个数字仍会被读成一回事。 */}
-              {hasDiskBasis ? (
-                <span
-                  className="ml-1"
-                  title="登记值 = 内容在源头的大小之和（未落盘/字节已清的内容仍计入），不是本地磁盘占用"
-                  data-testid="media-registered-size"
-                >
-                  · 登记 {fmtSize(stats.totalSize)}
-                </span>
-              ) : null}
-            </p>
-          ) : null}
-        </div>
-
-        <nav className="min-h-0 flex-1 overflow-y-auto p-2">
-          {/*
-           * 层级：**剧集 = 一级实体**。全部剧集 → 剧集墙；下列每个剧集直接进它的内容。
-           *
-           * BUG-259（2026-10-13 用户裁定）：原先夹在中间的「内容（全部 / 散片）」二级
-           * 分组**已删除** —— 外 Navi 的下载侧已拥有完整的内容分类，且媒体库将并入整体
-           * 文件管理。按 `docs/design/module-restructure-2026-10-13/spec.md` §3.2，
-           * 「文件」模块的二级 rail 改为 内容 / 剧集 / 标签 / 文件夹，默认进「内容·全部」；
-           * 类型筛选入口（原 `media-cat-*`）随 M0 重整在新 rail 落位。
-           * ⇒ 本档只登记「该能力在当前版本暂时不可达」，不在本组件里另造替代入口。
-           */}
-          <p className="px-2 pb-1 pt-1 text-[10px] font-medium uppercase tracking-wide text-muted">
-            {t('media.series')}
-          </p>
-          <button
-            type="button"
-            data-testid="media-rail-series-all"
-            className={railBtn(view === 'series' && activeTagId === null)}
-            onClick={() => {
-              setView('series')
-              setDetail(null)
-              // 只清筛选，重取交给跟随 `activeTagId` 的 effect —— 在此直接
-              // `loadSeries()` 会用到本次 setState **之前**的旧 tagId（闭包快照），
-              // 白跑一次被筛过的请求。
-              setActiveTagId(null)
-              clearSelection()
-            }}
-          >
-            <span className="min-w-0 flex-1 truncate">{t('media.allSeries')}</span>
-            <span className="shrink-0 text-[10px] text-muted">{seriesTotal}</span>
-          </button>
-          {series.length > 0 && (
-            /* BUG-259：左栏**不是**滚动容器 —— 固定渲染前 RAIL_SERIES_LIMIT 条，
-               其余由上方「全部剧集」按钮进入。原先的 `max-h-72 + overflow-y-auto`
-               兜底会在矮窗口下与 `nav` 自身形成「两条同时生效且嵌套」的滚动条。 */
-            <div className="mt-0.5 space-y-0.5">
-              {series.slice(0, RAIL_SERIES_LIMIT).map((s) => (
-                <button
-                  key={s.id}
-                  type="button"
-                  onClick={() => {
-                    setActiveTagId(null)
-                    clearSelection()
-                    void openSeries(s.id)
-                  }}
-                  title={s.title}
-                  className={railBtn(view === 'seriesDetail' && activeSeriesId === s.id)}
-                >
-                  <span className="min-w-0 flex-1 truncate pl-3">{s.title}</span>
-                  {/* BUG-220：原先是裸 `episodeCount`（集数、不分 kind）——纯图片专辑
-                      会显示成「10」，读作视频数就是「图片被算成视频」。改为视频数；
-                      老后端不下发时回退集数（保持旧行为，不编造）。 */}
-                  <span className="shrink-0 text-[10px] text-muted">
-                    {s.videoCount != null ? s.videoCount : s.episodeCount}
-                  </span>
-                </button>
-              ))}
-            </div>
-          )}
-
-          <p className="px-2 pb-1 pt-3 text-[10px] font-medium uppercase tracking-wide text-muted">
-            {t('media.tags')}
-          </p>
-          <div className="flex flex-wrap gap-1 px-1" data-testid="media-tag-list">
-            {(() => {
-              /*
-               * 标签 chip 的两条规则（BUG-068）：
-               *
-               * 1) **0 计数不渲染**。删除条目/剧集只清关联表、不 GC `media_tag` 行，
-               *    于是每次删除都会留下一批 0/0 孤儿标签，越积越多 —— 界面上表现为
-               *    「底部一大片全是 0」。孤儿在数据层无害，但**渲染它们等于给出一排
-               *    点了必空的入口**，所以过滤放在渲染层。例外的只有当前选中项（同上）。
-               *
-               * 2) **当前侧的计数必须就是筛选结果的条数**。旧式 `itemCount + seriesCount`
-               *    在内容侧把剧集挂载也算进去，而内容侧筛选只匹配条目 —— 显示 8、点开
-               *    6 条。现在两侧各算各的（内容=itemCount，剧集=seriesCount），
-               *    「显示的数 = 点下去得到的数」。
-               */
-              const seriesSide = railSeriesSide
-              const withCount = tags
-                .map((tag) => ({
-                  tag,
-                  count: seriesSide ? (tag.seriesCount ?? 0) : (tag.itemCount ?? 0),
-                }))
-                /* BUG-259：按片数降序 —— 用户 2026-10-13 裁定「显示应该显示最多片的
-                   标签」。同数按名称定序，避免刷新后顺序抖动。 */
-                .sort((a, b) => b.count - a.count || a.tag.name.localeCompare(b.tag.name))
-              const visible = withCount.filter(
-                ({ tag, count }) => count > 0 || activeTagId === tag.id,
-              )
-              if (visible.length === 0) {
-                return <p className="px-1 text-[10px] text-muted">—</p>
-              }
-              const q = tagFilter.trim().toLowerCase()
-              const searched = q
-                ? visible.filter(({ tag }) => tag.name.toLowerCase().includes(q))
-                : visible
-              /* BUG-259：收起态**截断**（只渲染片数最多的前 RAIL_TAG_LIMIT 个），
-                 不是「限高 + 滚动」—— 左栏不允许出现任何滚动容器。展开态渲染全部
-                 （配合下方过滤框）。选中的标签**永远渲染**，否则用户看不到自己在
-                 筛什么、也没有可点的取消入口（同 BUG-068 的例外规则）。 */
-              const shown = tagExpanded
-                ? searched
-                : searched
-                    .slice(0, RAIL_TAG_LIMIT)
-                    .concat(
-                      searched.slice(RAIL_TAG_LIMIT).filter(({ tag }) => tag.id === activeTagId),
-                    )
-              return shown.map(({ tag, count }) => {
-                const on = activeTagId === tag.id
-                const title = `${t('media.items')} ${tag.itemCount ?? 0} · ${t('media.series')} ${tag.seriesCount ?? 0}`
-                return (
-                  <button
-                    key={tag.id}
-                    type="button"
-                    title={title}
-                    data-testid={`media-tag-chip-${tag.id}`}
-                    onClick={() => {
-                      setActiveTagId(on ? null : tag.id)
-                      if (!seriesSide) {
-                        // 内容侧点标签 = 留在内容网格。`switchTab(tab)` 里的
-                        // `setTab(tab)` 是幂等赋值，等价于原先的 `setView('items')`，
-                        // 同时收尾 detail 与选择态 —— 与 `switchTab` 单一实现同源。
-                        switchTab(tab)
-                      } else {
-                        setDetail(null)
-                        clearSelection()
-                      }
-                    }}
-                    className={[
-                      // 单行原语：`whitespace-nowrap` 禁折行、名称 `truncate`（需 min-w-0）
-                      // 允许截断、计数 `shrink-0` 永不先被压掉、`max-w-full` 封顶不撑破容器。
-                      // 形状 `rounded` 且**不带边框/底色**：标签不再有颜色语义，选中靠
-                      // 实心强调底表达（与 TagToken 的 `active` 同一套视觉）。
-                      'inline-flex max-w-full items-baseline gap-1 whitespace-nowrap rounded px-1.5 py-0.5 text-[10.5px] transition-colors',
-                      on
-                        ? 'bg-accent text-white'
-                        : 'text-muted hover:bg-surface-2 hover:text-fg-strong',
-                    ].join(' ')}
-                  >
-                    <span className={on ? 'text-white/70' : 'text-accent/80'}>#</span>
-                    <span className="min-w-0 truncate">{tag.name}</span>
-                    <span className="shrink-0 tabular-nums opacity-70">{count}</span>
-                  </button>
-                )
-              })
-            })()}
-          </div>
-          {/* BUG-259：收起态是**截断**（不是限高 + 滚动），所以必须给出「还有 N 个」
-              的可点出口 —— 否则被截掉的标签在界面上无从发现。展开态额外给过滤框。 */}
-          {railTagTotal > RAIL_TAG_LIMIT || tagExpanded ? (
-            <div className="mt-1 flex items-center gap-1 px-1">
-              <button
-                type="button"
-                data-testid="media-tag-toggle"
-                aria-expanded={tagExpanded}
-                className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] text-accent transition-colors hover:bg-accent/10"
-                onClick={() => {
-                  setTagExpanded((v) => !v)
-                  setTagFilter('')
-                }}
-              >
-                {tagExpanded
-                  ? t('media.tag.collapse')
-                  : t('media.tag.showAll', { n: Math.max(0, railTagTotal - RAIL_TAG_LIMIT) })}
-              </button>
-              {tagExpanded ? (
-                <Input
-                  data-testid="media-tag-filter"
-                  value={tagFilter}
-                  onChange={(e) => setTagFilter(e.target.value)}
-                  placeholder={t('media.tag.filterPlaceholder')}
-                  className="h-6 flex-1 text-[10.5px]"
-                />
-              ) : null}
-            </div>
-          ) : null}
-        </nav>
-      </aside>
 
       {/* ───────── 主区 ───────── */}
       {/* `relative` 是动作条（BUG-214）的定位锚：动作条 `absolute bottom-4` 相对**内容区**
@@ -1152,6 +1017,8 @@ export function MediaLibraryPanel() {
                 setView('series')
                 setDetail(null)
                 setActiveSeriesId(null)
+                appliedFmode.current = 'lib-series'
+                onFmodeChange?.('lib-series')
                 void loadSeries()
               }}
             >
@@ -1196,6 +1063,28 @@ export function MediaLibraryPanel() {
               {t('media.unassignedOnly')}
             </label>
           ) : null}
+
+          {/*
+            M0-T03：占用空间读数从左栏底部**原样搬到工具条**（左栏已删）。
+            BUG-149：重构不是删能力的授权 —— 用户能看到的读数不随导航重整静默消失。
+            两个口径仍同时可查（BUG-133 判据 2，缺陷仍 open，此处只做位置迁移、
+            不改口径语义）：主口径 = 磁盘真值（清缓存后下降）；登记值显式标注
+            「不是本地磁盘占用」。`diskBytes` 缺失时主口径回退登记值并改说明，
+            不显示 0、不假装它是磁盘占用。
+          */}
+          {stats && (
+            <span
+              className="shrink-0 text-[11px] text-muted"
+              data-testid="media-occupancy"
+              title={`${hasDiskBasis
+                ? '占用空间 = 资料库在本机实际占用的磁盘字节（清缓存后会下降）'
+                : '占用空间 = 媒体库登记的内容大小（后端未提供磁盘占用读数；清缓存后此值不变）'}\n登记值 = 内容在源头的大小之和（未落盘/字节已清的内容仍计入），不是本地磁盘占用`}
+            >
+              占用 {fmtOccupancy(leadingBytes)}
+              {stats.diskBytesTruncated ? '（已截断）' : ''} · 登记{' '}
+              {typeof stats.totalSize === 'number' ? fmtSize(stats.totalSize) : '—'}
+            </span>
+          )}
 
           <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-1.5">
             {/*
@@ -1311,6 +1200,127 @@ export function MediaLibraryPanel() {
             )}
           </div>
         </header>
+        {/*
+         * M0-T03：标签云从左栏搬迁到内容区 —— 导航归侧栏树（`lib-tags`/`lib-series`），
+         * 能力不丢：BUG-259 的截断/展开/过滤三条规则原样保留，testid 不变。
+         */}
+        {view === "series" && (
+          <>
+                    <p className="px-2 pb-1 pt-3 text-[10px] font-medium uppercase tracking-wide text-muted">
+                      {t('media.tags')}
+                    </p>
+                    <div className="flex flex-wrap gap-1 px-1" data-testid="media-tag-list">
+                      {(() => {
+                        /*
+                         * 标签 chip 的两条规则（BUG-068）：
+                         *
+                         * 1) **0 计数不渲染**。删除条目/剧集只清关联表、不 GC `media_tag` 行，
+                         *    于是每次删除都会留下一批 0/0 孤儿标签，越积越多 —— 界面上表现为
+                         *    「底部一大片全是 0」。孤儿在数据层无害，但**渲染它们等于给出一排
+                         *    点了必空的入口**，所以过滤放在渲染层。例外的只有当前选中项（同上）。
+                         *
+                         * 2) **当前侧的计数必须就是筛选结果的条数**。旧式 `itemCount + seriesCount`
+                         *    在内容侧把剧集挂载也算进去，而内容侧筛选只匹配条目 —— 显示 8、点开
+                         *    6 条。现在两侧各算各的（内容=itemCount，剧集=seriesCount），
+                         *    「显示的数 = 点下去得到的数」。
+                         */
+                        const seriesSide = railSeriesSide
+                        const withCount = tags
+                          .map((tag) => ({
+                            tag,
+                            count: seriesSide ? (tag.seriesCount ?? 0) : (tag.itemCount ?? 0),
+                          }))
+                          /* BUG-259：按片数降序 —— 用户 2026-10-13 裁定「显示应该显示最多片的
+                             标签」。同数按名称定序，避免刷新后顺序抖动。 */
+                          .sort((a, b) => b.count - a.count || a.tag.name.localeCompare(b.tag.name))
+                        const visible = withCount.filter(
+                          ({ tag, count }) => count > 0 || activeTagId === tag.id,
+                        )
+                        if (visible.length === 0) {
+                          return <p className="px-1 text-[10px] text-muted">—</p>
+                        }
+                        const q = tagFilter.trim().toLowerCase()
+                        const searched = q
+                          ? visible.filter(({ tag }) => tag.name.toLowerCase().includes(q))
+                          : visible
+                        /* BUG-259：收起态**截断**（只渲染片数最多的前 RAIL_TAG_LIMIT 个），
+                           不是「限高 + 滚动」—— 左栏不允许出现任何滚动容器。展开态渲染全部
+                           （配合下方过滤框）。选中的标签**永远渲染**，否则用户看不到自己在
+                           筛什么、也没有可点的取消入口（同 BUG-068 的例外规则）。 */
+                        const shown = tagExpanded
+                          ? searched
+                          : searched
+                              .slice(0, RAIL_TAG_LIMIT)
+                              .concat(
+                                searched.slice(RAIL_TAG_LIMIT).filter(({ tag }) => tag.id === activeTagId),
+                              )
+                        return shown.map(({ tag, count }) => {
+                          const on = activeTagId === tag.id
+                          const title = `${t('media.items')} ${tag.itemCount ?? 0} · ${t('media.series')} ${tag.seriesCount ?? 0}`
+                          return (
+                            <button
+                              key={tag.id}
+                              type="button"
+                              title={title}
+                              data-testid={`media-tag-chip-${tag.id}`}
+                              onClick={() => {
+                                setActiveTagId(on ? null : tag.id)
+                                // M0-T03：标签云已只在 `view === 'series'` 渲染（导航归侧栏树 `lib-series`/`lib-tags`），
+// 故原「内容侧点标签 → 切 items 网格」的分支**不可达**，与 `switchTab` 一并移除。
+// 留下的行为与原 else 分支逐字相同。
+                                  setDetail(null)
+                                  clearSelection()
+                              }}
+                              className={[
+                                // 单行原语：`whitespace-nowrap` 禁折行、名称 `truncate`（需 min-w-0）
+                                // 允许截断、计数 `shrink-0` 永不先被压掉、`max-w-full` 封顶不撑破容器。
+                                // 形状 `rounded` 且**不带边框/底色**：标签不再有颜色语义，选中靠
+                                // 实心强调底表达（与 TagToken 的 `active` 同一套视觉）。
+                                'inline-flex max-w-full items-baseline gap-1 whitespace-nowrap rounded px-1.5 py-0.5 text-[10.5px] transition-colors',
+                                on
+                                  ? 'bg-accent text-white'
+                                  : 'text-muted hover:bg-surface-2 hover:text-fg-strong',
+                              ].join(' ')}
+                            >
+                              <span className={on ? 'text-white/70' : 'text-accent/80'}>#</span>
+                              <span className="min-w-0 truncate">{tag.name}</span>
+                              <span className="shrink-0 tabular-nums opacity-70">{count}</span>
+                            </button>
+                          )
+                        })
+                      })()}
+                    </div>
+                    {/* BUG-259：收起态是**截断**（不是限高 + 滚动），所以必须给出「还有 N 个」
+                        的可点出口 —— 否则被截掉的标签在界面上无从发现。展开态额外给过滤框。 */}
+                    {railTagTotal > RAIL_TAG_LIMIT || tagExpanded ? (
+                      <div className="mt-1 flex items-center gap-1 px-1">
+                        <button
+                          type="button"
+                          data-testid="media-tag-toggle"
+                          aria-expanded={tagExpanded}
+                          className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] text-accent transition-colors hover:bg-accent/10"
+                          onClick={() => {
+                            setTagExpanded((v) => !v)
+                            setTagFilter('')
+                          }}
+                        >
+                          {tagExpanded
+                            ? t('media.tag.collapse')
+                            : t('media.tag.showAll', { n: Math.max(0, railTagTotal - RAIL_TAG_LIMIT) })}
+                        </button>
+                        {tagExpanded ? (
+                          <Input
+                            data-testid="media-tag-filter"
+                            value={tagFilter}
+                            onChange={(e) => setTagFilter(e.target.value)}
+                            placeholder={t('media.tag.filterPlaceholder')}
+                            className="h-6 flex-1 text-[10.5px]"
+                          />
+                        ) : null}
+                      </div>
+                    ) : null}
+          </>
+        )}
 
         {/*
           来源后端不可用的**非阻断**提示（S3）：
@@ -1380,6 +1390,8 @@ export function MediaLibraryPanel() {
             onBack={() => {
               setView('series')
               setDetail(null)
+        appliedFmode.current = 'lib-series'
+        onFmodeChange?.('lib-series')
               setActiveSeriesId(null)
               void loadSeries()
             }}

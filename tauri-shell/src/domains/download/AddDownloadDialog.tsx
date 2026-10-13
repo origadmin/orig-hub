@@ -1,16 +1,16 @@
 import { useEffect, useState } from 'react'
-import { Button } from './ui/button'
-import { Input } from './ui/input'
-import { Stepper } from './ui/stepper'
-import { DirectoryPicker } from './DirectoryPicker'
+import { Button } from '../../components/ui/button'
+import { Input } from '../../components/ui/input'
+import { Stepper } from '../../components/ui/stepper'
+import { DirectoryPicker } from '../../components/DirectoryPicker'
 import {
   InterfacePickerDialog,
   type InterfaceSelection,
-} from './InterfacePickerDialog'
-import { Switch } from './ui/switch'
-import { useStore } from '../store/useStore'
-import { getConfig } from '../api/daemon'
-import { filenameFromUrl, cn } from '../lib/utils'
+} from '../../components/InterfacePickerDialog'
+import { Switch } from '../../components/ui/switch'
+import { useStore } from '../../store/useStore'
+import { getConfig } from '../../api/daemon'
+import { filenameFromUrl, cn } from '../../lib/utils'
 
 interface Props {
   open: boolean

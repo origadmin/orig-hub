@@ -1,5 +1,5 @@
 import { DownloadItem } from './DownloadItem'
-import type { DownloadStatus } from '../types'
+import type { DownloadStatus } from '../../types'
 
 interface Props {
   items: DownloadStatus[]

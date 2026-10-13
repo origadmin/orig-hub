@@ -1,16 +1,16 @@
 import { useState } from 'react'
-import { Badge } from './ui/badge'
-import { Button } from './ui/button'
-import { Progress } from './ui/progress'
+import { Badge } from '../../components/ui/badge'
+import { Button } from '../../components/ui/button'
+import { Progress } from '../../components/ui/progress'
 import {
   formatBytes,
   formatEta,
   formatSpeed,
-} from '../lib/utils'
-import type { DownloadStatus } from '../types'
-import { useStore } from '../store/useStore'
+} from '../../lib/utils'
+import type { DownloadStatus } from '../../types'
+import { useStore } from '../../store/useStore'
 import { DownloadDetailSheet } from './DownloadDetailSheet'
-import { isTauri } from '../lib/env'
+import { isTauri } from '../../lib/env'
 
 const statusMeta: Record<
   string,

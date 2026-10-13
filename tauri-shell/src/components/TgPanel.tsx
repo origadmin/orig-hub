@@ -41,7 +41,9 @@ import type {
 import { tgSaveConfig } from '../api/tauri'
 import { isTauri, copyToClipboard } from '../lib/env'
 import { CacheManagerDialog } from './CacheManagerDialog'
+import { TgOnboarding } from '../domains/tg/TgOnboarding'
 import { useStore } from '../store/useStore'
+import { resolveTgFeatureReady } from '../store/selectors'
 import { useTgSearch } from '../store/tgSearch'
 import { classifyTgReason, describeTgFailure, logTgReason } from '../lib/tgReason'
 import { deriveEntryState } from '../lib/entryState'
@@ -302,6 +304,16 @@ export function TgPanel(
    * 空列表会把「没登录 / 连不上」伪装成「没有内容」。
    */
   const tgUnbound = tgServiceUp && !accounts.tg.bound && tgLink.state !== 'needs_config'
+  /**
+   * M0-T05：**入口常驻**（BUG-094 口径改变）后，门控判据移入本面板自己算。
+   *
+   * 判据仍是同一处选择器 `resolveTgFeatureReady`（BUG-177：不写第二份），
+   * 但拆成两个读数 ——「开着」与「开着且起来了」必须分开呈现：
+   * 「主动关着」要劝用户去启用，「正在拉起」只需要等（daemon 独占进程
+   * 生命周期，无手动重试入口，BUG-178）。二者混为空面板就是假象。
+   */
+  const tgEnabled = tgService.enabled
+  const tgReady = resolveTgFeatureReady(tgService)
   /** 后端原文（仅用于日志与分类），绝不直接渲染 */
   const rawReason = tgBroken ? tgLink.reason : null
   const showReason = Boolean(rawReason && rawReason.trim())
@@ -1398,46 +1410,25 @@ export function TgPanel(
         （`TgCacheEntry`，与连接态/速度同处一行），本行整条删除，不留空 div 占位。
       */}
       <div className="flex min-h-0 flex-1">
+      {/*
+        M0-T05：五路分流（按优先级从上到下）。
+        1. `tgUnbound`：服务在跑、没有登录会话 → 未绑定引导（判据见上）。
+        2. `tgBroken`：链路真断 → 红色故障卡（这是「配好了但连不上」，
+           与「没启用」不是一类事，故排在启用态之前）。
+        3. `!tgEnabled`：用户主动关着插件 → 引导去启用。
+        4. `needConfig && !alive`：APP 首启缺凭证 → 原有配置表单。
+        5. `!tgReady`：开着但 daemon 还没拉起 → 「正在启动」。
+        6. 其余：正常两栏。
+        历史：「TG 不可用就把用户弹回文件域」的 effect 已删（见 MainLayout），
+        入口在任何状态下都不消失，改由这里的空态把原因说清。
+      */}
       {tgUnbound ? (
-        /*
-         * 未绑定引导区（BUG-094）：入口已按「服务可用即显示」放行，这里必须说清
-         * 「没登录 / 为什么连不上」并给出可行动出口 —— 否则点进来是一个空面板，
-         * 用户既不知道发生了什么，也没有任何路径把它修回来。
-         *
-         * 原因走 `classifyTgReason` 分类降级（BUG-088）：后端原文是传输层报文，
-         * 只进日志，界面上是中文可行动文案。
-         */
-        <div
-          className="flex flex-1 items-center justify-center p-6"
-          data-testid="tg-unbound-guide"
-        >
-          <div className="w-full max-w-md rounded-lg border border-border-subtle bg-surface/60 p-5">
-            <h3 className="text-[14px] font-semibold text-fg-strong">
-              {t('tg.unboundTitle')}
-            </h3>
-            <p className="mt-1 text-[11px] leading-relaxed text-muted">
-              {t('tg.unboundHint')}
-            </p>
-            {showReason && (
-              <p className="mt-3 rounded-md bg-background px-2 py-1.5 text-[11px] leading-relaxed text-fg-mid">
-                {t(reasonKey)}
-              </p>
-            )}
-            {/*
-              只留「去绑定」一个出口：**没有重连按钮**（BUG-178）。
-              重启服务是 daemon 的职责，不是用户的手动项。
-            */}
-            <div className="mt-5 flex gap-2">
-              <Button
-                size="sm"
-                className="h-8 flex-1 text-xs"
-                onClick={() => onOpenAccounts?.()}
-              >
-                {t('tg.unboundAction')}
-              </Button>
-            </div>
-          </div>
-        </div>
+        <TgOnboarding
+          mode="unbound"
+          onBind={onOpenAccounts}
+          reasonKey={reasonKey}
+          showReason={showReason}
+        />
       ) : tgBroken ? (
         /* 链路故障：说明「为什么用不了」，而不是给一个空列表 */
         <div className="flex flex-1 items-center justify-center p-6" data-testid="tg-panel-broken">
@@ -1457,6 +1448,13 @@ export function TgPanel(
             )}
           </div>
         </div>
+      ) : !tgEnabled ? (
+        /*
+         * 插件未启用（M0-T05）：入口常驻后这里必须给出行动出口。
+         * 「启用 Telegram 采集」跳到设置·Telegram —— 复用唯一的开关实现，
+         * 不在这里另起一套启停逻辑。
+         */
+        <TgOnboarding mode="disabled" onEnable={onOpenAccounts} />
       ) : needConfig && !alive ? (
         /* APP 首启：Telegram 凭证配置（保存后由 Tauri 壳持久化并拉起服务） */
         <div className="flex flex-1 items-center justify-center p-6">
@@ -1479,6 +1477,13 @@ export function TgPanel(
             </Button>
           </div>
         </div>
+      ) : !tgReady ? (
+        /*
+         * 开着但还没起来（M0-T05）：daemon 正在拉起 orig-tg（`probeTg` 有界重试）。
+         * **刻意无按钮** —— 手动重试入口曾让 TG 进程有两个主人互相 kill（BUG-178）。
+         * 这一态以前会直接落到下面那个空的两栏面板，看起来像「没有内容」。
+         */
+        <TgOnboarding mode="starting" />
       ) : (
         <>
       <aside className="flex w-72 shrink-0 flex-col border-r border-border-subtle bg-surface/30">

@@ -1,8 +1,8 @@
 import { useEffect } from 'react'
-import { Badge } from './ui/badge'
-import { useStore } from '../store/useStore'
-import { cn, formatBytes, formatSpeed, formatEta } from '../lib/utils'
-import type { DownloadStatus } from '../types'
+import { Badge } from '../../components/ui/badge'
+import { useStore } from '../../store/useStore'
+import { cn, formatBytes, formatSpeed, formatEta } from '../../lib/utils'
+import type { DownloadStatus } from '../../types'
 
 /** 状态词 → 中文（统一语言，避免英文/中文混搭） */
 const STATUS_LABEL: Record<string, string> = {

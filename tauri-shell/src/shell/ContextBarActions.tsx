@@ -1,5 +1,5 @@
 import { memo } from 'react'
-import { Button } from './ui/button'
+import { Button } from '../components/ui/button'
 import { SpeedChip } from './ContextBarStatus'
 import { useStore } from '../store/useStore'
 import {

@@ -1,9 +1,10 @@
 import { memo } from 'react'
-import type { ViewId } from './Sidebar'
+import type { NavState, ViewId } from '../nav'
+import { libraryGroupOf, fileCategoryOf } from '../nav'
 import { ContextBarActions } from './ContextBarActions'
 import { ContextBarStatus } from './ContextBarStatus'
-import { TgGlobalSearch } from './TgGlobalSearch'
-import { TgCacheEntry } from './TgCacheEntry'
+import { TgGlobalSearch } from '../components/TgGlobalSearch'
+import { TgCacheEntry } from '../components/TgCacheEntry'
 import { useTranslation } from '../i18n'
 
 /**
@@ -30,80 +31,83 @@ export type ContextKind = 'download' | 'status'
 export type OnAction = () => void
 
 export interface ContextBarProps {
-  /** 当前视图（MainLayout 本地 state，低频） */
-  view: ViewId
-  /** 「全部文件」分类下钻值（null = 未下钻）；仅用于标题面包屑 */
-  categoryFilter: string | null
+  /** 全局导航状态（MainLayout 单一真源，低频） */
+  nav: NavState
   onNewDownload: OnAction
   onPauseAll: OnAction
   onResumeAll: OnAction
   onClearCompleted: OnAction
 }
 
-/** 视图 → 形态（唯一真源，禁止在 JSX 里散写三元） */
+/** 视图 → 形态（唯一真源，禁止在 JSX 里散写三元）。
+ *  M0 起只有「下载」域给操作组；文件/TG/共享/设置都给全局态 ——
+ *  原 `all/downloading/paused/completed` 四个下载态收成一个 `download` 域，
+ *  三档改由侧栏树驱动（模块重整 BUG-298 / M0-T02）。 */
 export function resolveContextKind(view: ViewId): ContextKind {
-  return view === 'all' ||
-    view === 'downloading' ||
-    view === 'paused' ||
-    view === 'completed'
-    ? 'download'
-    : 'status'
+  return view === 'download' ? 'download' : 'status'
 }
 
-/** 视图 → 标题 i18n key（复用既有 `nav.*`，不重复造标题文案） */
+/** 视图 → 标题 i18n key（五项一级域） */
 export const TITLE_KEY: Record<ViewId, string> = {
-  all: 'nav.all',
-  downloading: 'nav.downloading',
-  paused: 'nav.paused',
-  completed: 'nav.completed',
-  media: 'nav.media',
+  files: 'nav.all',
+  download: 'nav.download',
   tg: 'nav.tg',
+  share: 'nav.share',
   settings: 'nav.settings',
 }
 
 interface ViewTitleProps {
-  view: ViewId
-  categoryFilter: string | null
+  nav: NavState
 }
 
-/** 左槽：当前视图标题（所有视图都渲染 → 这一栏不再留白） */
-export const ViewTitle = memo(function ViewTitle({
-  view,
-  categoryFilter,
-}: ViewTitleProps) {
+/** 左槽：域标题 + 树选择副标题（对应 prototype `renderCtx()` 的 `ctx-sub`）。 */
+export const ViewTitle = memo(function ViewTitle({ nav }: ViewTitleProps) {
   const { t } = useTranslation()
-  // 「全部文件」下钻时补一级面包屑；分类名本身可翻译，缺失时回退到分类 key 本身
-  const title =
-    view === 'all' && categoryFilter
-      ? t('ctx.allCategory', {
-          cat: t(`category.${categoryFilter}`, undefined, categoryFilter),
-        })
-      : t(TITLE_KEY[view])
+  const { view, fmode, dlFilter } = nav
+
+  // 副标题 = 当前树选择的标签（文件域取分类/资料库组；下载域取档位）
+  let sub: string | null = null
+  if (view === 'files') {
+    const cat = fileCategoryOf(fmode)
+    const lib = libraryGroupOf(fmode)
+    if (cat) sub = t(`files.cat.${cat}`)
+    else if (lib) sub = t(`files.lib.${lib}`)
+  } else if (view === 'download' && dlFilter !== 'all') {
+    sub = t(`download.${dlFilter}`)
+  }
+
   return (
-    <span
-      className="min-w-0 truncate text-sm font-semibold text-fg-strong"
-      title={title}
-      data-testid="context-bar-title"
-    >
-      {title}
+    <span className="flex min-w-0 items-baseline gap-2">
+      <span
+        className="min-w-0 truncate text-sm font-semibold text-fg-strong"
+        title={t(TITLE_KEY[view])}
+        data-testid="context-bar-title"
+      >
+        {t(TITLE_KEY[view])}
+      </span>
+      {sub && (
+        <span className="min-w-0 truncate text-[13px] text-muted" data-testid="context-bar-sub">
+          {sub}
+        </span>
+      )}
     </span>
   )
 })
 
 export const ContextBar = memo(function ContextBar({
-  view,
-  categoryFilter,
+  nav,
   onNewDownload,
   onPauseAll,
   onResumeAll,
   onClearCompleted,
 }: ContextBarProps) {
   const { t } = useTranslation()
+  const { view, dlFilter } = nav
   const kind = resolveContextKind(view)
 
-  /** 只有「已完成」档挂「清空」：失败·已取消档已移除，失败项不再有独立导航页，
+  /** 只有「已完成」档挂「清空」：失败·已取消没有专属档位（树里没有它），
    *  其单条清理走 `DownloadItem` 行内的「删除」按钮（覆盖 completed | error | cancelled）。 */
-  const showClear = view === 'completed'
+  const showClear = view === 'download' && dlFilter === 'done'
 
   return (
     <div
@@ -111,7 +115,7 @@ export const ContextBar = memo(function ContextBar({
       aria-label={t('ctx.barLabel')}
       data-testid="context-bar"
     >
-      <ViewTitle view={view} categoryFilter={categoryFilter} />
+      <ViewTitle nav={nav} />
       {/* 中槽：TG 视图的全局监控查找（BUG-100 方案 A）。
           只在 tg 视图挂载；组件内部自判可用性与自持高频输入 state，本栏不订阅。
           三列网格而非 flex：左右两列同为 `1fr`，中槽才是**真正的居中** ——
