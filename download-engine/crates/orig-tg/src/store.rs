@@ -228,6 +228,14 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// 同 [`now`]，毫秒分辨率——条目级墙钟累计的时基（秒级分辨不出亚秒测试档）。
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// v0.4.0 迁移：为已存在的 `media_message` 表补 `media_type` / `msg_date` 列。
 ///
 /// 用 PRAGMA table_info 检查列名后再 ALTER（SQLite 的 ADD COLUMN 不支持 IF NOT EXISTS）。
@@ -468,6 +476,24 @@ impl Store {
             );
             CREATE UNIQUE INDEX IF NOT EXISTS cache_task_active_uniq
                 ON cache_task(item_key) WHERE status IN ('queued', 'running');
+            -- BUG-276：条目级墙钟累计。**跨进程存活**是这张表存在的全部理由 ——
+            -- 路由层的 `tokio::time::timeout` 量到的是「这一次尝试」，而 `Instant`
+            -- 是进程本地时钟 ⇒ 进程一退，量到的东西就没了；启动恢复又会把任务重新
+            -- 入队、重新起一次尝试 ⇒ 每重启一次白送一整个 `wall` 窗口。
+            -- 语义：一个「条目」= 一个任务里的一条消息；累计值**不随重启清零**，
+            -- 只随任务离开队列（终态 / 取消）回收。
+            CREATE TABLE IF NOT EXISTS cache_task_item_wall (
+                task_id    INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                -- 已**结束**的尝试累计烧掉的墙钟（毫秒）。
+                accum_ms   INTEGER NOT NULL DEFAULT 0,
+                -- 在途尝试的起始时间戳；NULL = 当前没有在途尝试。
+                -- 崩在途中的那一次没有「结束事件」，它的时长**不会**并进 accum_ms，
+                -- 但会因为 started_at 仍在而继续被算作「在途时长」—— 所以「崩掉」
+                -- 不等于「免费重来」。
+                started_at INTEGER,
+                PRIMARY KEY (task_id, message_id)
+            );
             "#,
         )
         .await?;
@@ -1339,6 +1365,96 @@ impl Store {
         Ok(())
     }
 
+    // ── BUG-276：条目级墙钟累计（跨重启） ───────────────────────────────────
+
+    /// 该条目**已经烧掉的墙钟**（毫秒）= 已结束尝试的累计 + 在途尝试的已耗时。
+    ///
+    /// 这是「每条目 30 分钟」这条死线的**唯一时基**。把它放在库里而不是进程里，
+    /// 是因为缺陷原形把计时交给了 `tokio::time::timeout` + `Instant`：后者是
+    /// 进程本地时钟，进程一退，已烧掉的时间随之蒸发，重启后的新尝试又拿到一整个
+    /// 完整的 `wall` 窗口 ⇒ 「重启比 30min 频繁」的环境里这条死线**永不到期**。
+    pub async fn item_wall_elapsed_ms(
+        &self,
+        task_id: i64,
+        message_id: i64,
+    ) -> libsql::Result<i64> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT accum_ms, started_at FROM cache_task_item_wall \
+                  WHERE task_id = ?1 AND message_id = ?2",
+                params![task_id, message_id],
+            )
+            .await?;
+        let Some(r) = rows.next().await? else {
+            return Ok(0);
+        };
+        let accum: i64 = r.get(0)?;
+        let started: Option<i64> = r.get(1)?;
+        let inflight = started.map(|s| (now_ms() - s).max(0)).unwrap_or(0);
+        Ok(accum.saturating_add(inflight))
+    }
+
+    /// 标记一次尝试开始：**只在没有在途尝试时**落时间戳（幂等）。
+    ///
+    /// 为什么是幂等而不是覆盖：一次尝试若崩在中途，它的 `started_at` 仍留在库里，
+    /// 下一次尝试起点必须**接着上一次的起点**算（而不是重新起算），否则就退回了
+    /// 「崩一次白赚一个 `wall`」的缺陷原形。
+    pub async fn begin_item_wall_attempt(
+        &self,
+        task_id: i64,
+        message_id: i64,
+    ) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO cache_task_item_wall \
+                   (task_id, message_id, accum_ms, started_at) \
+                 VALUES (?1, ?2, 0, NULL)",
+                params![task_id, message_id],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "UPDATE cache_task_item_wall SET started_at = ?3 \
+                  WHERE task_id = ?1 AND message_id = ?2 AND started_at IS NULL",
+                params![task_id, message_id, now_ms()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// 结束一次尝试：把在途时长并入累计并清掉时间戳。
+    ///
+    /// 超时掐断、下载报错、正常完成**三路都要调**——三者都真的烧掉了墙钟。
+    /// 崩在中途的那一次没有结束事件 ⇒ 不计入 `accum_ms`，但它的 `started_at`
+    /// 仍在 ⇒ 时长继续以「在途」形式累加（见 [`Store::item_wall_elapsed_ms`]）。
+    pub async fn end_item_wall_attempt(
+        &self,
+        task_id: i64,
+        message_id: i64,
+    ) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE cache_task_item_wall \
+                    SET accum_ms = accum_ms + MAX(0, ?3 - started_at), started_at = NULL \
+                  WHERE task_id = ?1 AND message_id = ?2 AND started_at IS NOT NULL",
+                params![task_id, message_id, now_ms()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// 丢弃**整个任务**的条目累计（任务离开队列时回收，避免表随任务数单调增长）。
+    pub async fn clear_task_item_walls(&self, task_id: i64) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM cache_task_item_wall WHERE task_id = ?1",
+                params![task_id],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// 更新进度（已完成条数 + 正在处理的条目）。
     ///
     /// BUG-257：**只在活跃态时写入**。此前 WHERE 只有 `id`，于是任务被取消后，
@@ -1381,6 +1497,9 @@ impl Store {
                 params![id, status, error, now()],
             )
             .await?;
+        // BUG-276：任务离开队列 ⇒ 条目级墙钟累计失去载体，回收（否则表随任务数单调增长）。
+        // 这也是「重试即重新计」的落点：重试会新起一个任务 id ⇒ 天然是干净的累计。
+        self.clear_task_item_walls(id).await?;
         Ok(())
     }
 

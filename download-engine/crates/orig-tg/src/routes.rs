@@ -1027,7 +1027,44 @@ async fn cache_one_bytes(
     // 空闲永不触发，这里必触发。超墙钟走 [`Client::download_limited`] 携带的同一
     // 限额结构，墙钟计时放在路由层：限额从 app_setting 运行时解析（见上），
     // 且超时取消与 BUG-257 的取消语义同构——future 被 drop，`.part` 随之清理。
+    //
+    // BUG-276：传给 `timeout` 的必须是**剩余额度**，不是每次尝试都重新拿满的一整档。
+    // `started`（`Instant`）只能量到「这一次尝试」，而它是**进程本地**时钟 ⇒ 进程一退，
+    // 已烧掉的时间随之蒸发；`main.rs` 的重启恢复又把任务重新入队、重新起一次尝试
+    // ⇒ 旧实现下**每重启一次就白送一整个 `wall` 窗口**（实测 3.6h 内重启 16 次
+    // ⇒ 30min 死线从未到期，同一条目占住队首 21h）。
+    // 现在已烧掉的墙钟从库里读（`cache_task_item_wall`），**跨进程存活、重启不清零**。
     let limits = download_limits(st).await;
+    // 单条下载端点（`task_id = None`）没有任务载体 ⇒ 退回「每次尝试一整档」的原语义。
+    let burned = match task_id {
+        None => std::time::Duration::ZERO,
+        Some(id) => {
+            let ms = st.store.item_wall_elapsed_ms(id, message_id).await.unwrap_or(0);
+            std::time::Duration::from_millis(ms.max(0) as u64)
+        }
+    };
+    if burned >= limits.wall {
+        if task_id.is_some() {
+            st.cache_dl_end();
+        }
+        // 累计已经超 ⇒ 连新尝试都不开：再开一次只是再烧一遍（缺陷原形的形态）。
+        // 原因串与「no bytes for 90s」逐字可区分（BUG-271 判据 4 同款纪律）。
+        let reason = format!(
+            "download too slow: {:.1}s spent across attempts for chat {chat_id} msg {message_id}; \
+             cumulative wall-clock limit {}s exceeded, aborted to keep the cache queue moving",
+            burned.as_secs_f64(),
+            limits.wall.as_secs()
+        );
+        st.push_log(&format!(
+            "cache_one({chat_id},{message_id}): too slow -> {reason}"
+        ));
+        return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, &reason));
+    }
+    let remaining = limits.wall - burned;
+    // 落「本次尝试起点」（幂等：已有在途起点就不覆盖）——崩在途中的那一次正是靠它继续计数。
+    if let Some(id) = task_id {
+        let _ = st.store.begin_item_wall_attempt(id, message_id).await;
+    }
     let started = std::time::Instant::now();
     let download = st.client.download_limited(
         chat_id,
@@ -1036,25 +1073,22 @@ async fn cache_one_bytes(
         Some(&st.cache_dl),
         &limits,
     );
-    let outcome = match tokio::time::timeout(limits.wall, download).await {
-        Ok(Ok(o)) => o,
+    let outcome = match tokio::time::timeout(remaining, download).await {
+        Ok(Ok(o)) => Ok(o),
         Ok(Err(e)) => {
-            if task_id.is_some() {
-                st.cache_dl_end();
-            }
             let reason = e.to_string();
             let hint = if st.client.link_alive() {
                 "download failed"
             } else {
                 "MTProto link is down; restart orig-tg to recover"
             };
-            st.push_log(&format!(
-                "cache_one({chat_id},{message_id}): failed -> {reason} ({hint})"
-            ));
-            return Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &format!("{hint}: {reason}"),
-            ));
+            Err((
+                format!("cache_one({chat_id},{message_id}): failed -> {reason} ({hint})"),
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &format!("{hint}: {reason}"),
+                ),
+            ))
         }
         Err(_elapsed) => {
             // 超墙钟：**原因串必须与「no bytes for 90s」逐字可区分**（BUG-271 判据 4）。
@@ -1062,24 +1096,35 @@ async fn cache_one_bytes(
             // stalled），否则会被 `tg.reasonNetwork` 吃掉——BUG-257 点 3 同款坑。
             // 该条目由调用方（`run_one_cache_task` 的失败隔离）记入汇总并继续跑
             // 剩余条目，不弃单。
-            if task_id.is_some() {
-                st.cache_dl_end();
-            }
+            //
+            // BUG-276：报数带上**之前尝试已烧掉的**部分——用户看到的应该是
+            // 「这条一共耗了多久」，而不是「最后一次尝试耗了多久」。
             let reason = format!(
                 "download too slow: {:.1}s for chat {chat_id} msg {message_id}; \
                  wall-clock limit {}s exceeded, aborted to keep the cache queue moving",
-                started.elapsed().as_secs_f64(),
+                (burned + started.elapsed()).as_secs_f64(),
                 limits.wall.as_secs()
             );
-            st.push_log(&format!(
-                "cache_one({chat_id},{message_id}): too slow -> {reason}"
-            ));
-            return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, &reason));
+            Err((
+                format!("cache_one({chat_id},{message_id}): too slow -> {reason}"),
+                ApiError::new(StatusCode::SERVICE_UNAVAILABLE, &reason),
+            ))
         }
     };
+    // 成败两路都要把这次尝试烧掉的墙钟并进累计：被掐断与报错同样真的耗了时间。
     if task_id.is_some() {
         st.cache_dl_end();
     }
+    if let Some(id) = task_id {
+        let _ = st.store.end_item_wall_attempt(id, message_id).await;
+    }
+    let outcome = match outcome {
+        Ok(o) => o,
+        Err((line, err)) => {
+            st.push_log(&line);
+            return Err(err);
+        }
+    };
     // 缓存状态入库（BUG-016 根因：此前从未标记，列表永远显示未缓存）。
     // 元数据回填（D1 根因）：mark_downloaded 的兜底 upsert 只写 downloaded/file_path，
     // 未监控频道的行缺 type/mime/size/date/duration/group_id → 缓存库显 📄、聚合失效。
@@ -3983,6 +4028,131 @@ fn transcode_inflight() -> &'static std::sync::Mutex<HashMap<TranscodeKey, Trans
     TRANSCODE_INFLIGHT.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+/// 单飞表的**占坑守卫**（BUG-288）：`Drop` 即出表。
+///
+/// 修复前，出表只发生在 `transcode_pump` 里的 `finish()` 闭包中；于是存在两条
+/// 「条目进了表、却永无 pump 为它 `finish`」的窗口：
+///
+/// 1. **spawn 前取消**（BUG-288 取证补充二「路径 A」）：`insert` 之后、
+///    `tokio::spawn(pump)` 之前还有 `.part` metadata / `serve_local_file` /
+///    `ffmpeg_config()` 三个 await，客户端断开 ⇒ hyper 丢弃 handler future ⇒
+///    条目永久残留（实测：≈0.01 s 恒 503、ffmpeg 进程数 0，只能重启进程才解）。
+/// 2. **pump 自身异常终止**：future 被 drop 或 panic ⇒ `finish` 永不执行。
+///
+/// 本守卫把「出表」上移为**作用域语义**：它在 `insert` 的**同一处**诞生，之后
+/// 任何出口（正常 spawn、Range 早退、handler 被取消、panic）都必然出表。
+/// 所有权随后随 pump future 一起 move，于是上述两条窗口一并兜住。
+struct TranscodeSlot {
+    key: TranscodeKey,
+    /// 尚未出表。`finish()` 走正常收尾时置 `false`，`Drop` 便不再重复 remove。
+    armed: bool,
+}
+
+impl TranscodeSlot {
+    fn new(key: TranscodeKey) -> Self {
+        Self { key, armed: true }
+    }
+
+    /// 显式出表（正常收尾）：之后 `Drop` 不再动表。幂等。
+    fn disarm(&mut self) {
+        if self.armed {
+            self.armed = false;
+            Self::remove(&self.key);
+        }
+    }
+
+    fn remove(key: &TranscodeKey) {
+        // 持锁区内只有 `HashMap::remove`——无 await、无 IO、不 panic（BUG-288
+        // 取证补充二「结论 1」）。这里用 `if let Ok` 而非 `expect`：万一别处真把
+        // 互斥锁毒化，宁可不出表，也不要让每个 handler / 每次收尾都 panic
+        // （毒化后全站 500 远比一次泄漏严重）。
+        if let Ok(mut m) = transcode_inflight().lock() {
+            m.remove(key);
+        }
+    }
+}
+
+impl Drop for TranscodeSlot {
+    fn drop(&mut self) {
+        if self.armed {
+            self.armed = false;
+            Self::remove(&self.key);
+        }
+    }
+}
+
+/// 单飞角色：抢到坑 = 冷启动（带出表守卫）；没抢到 = 挂在 watch 上等。
+enum Role {
+    /// `(发送端, 出表守卫)`。守卫为 `None` ⇒ 锚点 live-only 流（BUG-226：没占过坑，
+    /// 绝不能把可能属于别人的同键条目顶掉）。
+    Start(tokio::sync::watch::Sender<bool>, Option<TranscodeSlot>),
+    Wait(TranscodeDone),
+}
+
+/// 单飞占坑（BUG-288）。
+///
+/// 抢到 ⇒ `Role::Start`，且**守卫与 insert 同一处诞生**，故「insert 之后、spawn
+/// 之前」这段窗口的任何出口都会出表；没抢到 ⇒ `Role::Wait`。
+fn acquire_transcode_role(key: TranscodeKey) -> Role {
+    // BUG-293/L1：**毒化不得 panic**。原为 `.expect("transcode map poisoned")`，而
+    // `std::sync::Mutex` 在持锁线程 panic 后永久毒化 ⇒ 此后**每一次** `/stream` 请求
+    // 都在这里 panic（全站播放永久失败，只能重启）。与本文件 `TITLE_BACKFILL_ATTEMPTS`
+    // 同策略：取回内部值继续用，不让一次 panic 变成全局不可用。
+    let mut m = transcode_inflight().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(rx) = m.get(&key) {
+        return Role::Wait(rx.clone());
+    }
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    m.insert(key, rx);
+    Role::Start(tx, Some(TranscodeSlot::new(key)))
+}
+
+/// 孤儿键接管（BUG-288）：**覆盖**已有条目并重新占坑。
+///
+/// 与 `acquire_transcode_role` 的差别是允许覆盖——被覆盖的那个条目已经被判定为
+/// 孤儿（watch 发送端已死、代理未产出），若只 remove 不 insert，该键会在「无人
+/// 认领」的状态下被后续请求再次撞上；必须**当场重新占坑**才能既恢复该变体、
+/// 又保持单飞（后续请求仍走 `Wait`，不会各起一条 ffmpeg）。
+fn reclaim_transcode_slot(
+    key: TranscodeKey,
+) -> (tokio::sync::watch::Sender<bool>, Option<TranscodeSlot>) {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    if let Ok(mut m) = transcode_inflight().lock() {
+        m.insert(key, rx);
+    }
+    (tx, Some(TranscodeSlot::new(key)))
+}
+
+/// 挂在 watch 上等一次在途转码（BUG-288）。
+///
+/// 返回 `(proxy_ready, orphan)`：
+/// - `proxy_ready`：`final_p` 已落盘 ⇒ 调用方直接 serve 代理；
+/// - `orphan`：代理**未**落盘**且** watch 发送端已关闭 ⇒ 表里的这个键已经没有
+///   任何 pump 会为它 `finish`（即路径 A 的孤儿条目）。调用方据此回收该键并
+///   重新起转码，而不是把该变体永久钉死在 503。
+///
+/// 修复前这里只判「有没有文件」：无文件即 503，且从不删条目 ⇒ 孤儿键既出不去、
+/// 也没人能再 Start，只能重启进程。
+async fn wait_for_transcode(rx: &mut TranscodeDone, final_p: &std::path::Path) -> (bool, bool) {
+    let sender_gone = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = sender_gone.clone();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(600), async {
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                // 发送端已关闭：pump 从未启动 / 已被 drop / 已 panic。
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                break;
+            }
+        }
+    })
+    .await;
+    let ready = tokio::fs::metadata(final_p).await.is_ok();
+    (
+        ready,
+        !ready && sender_gone.load(std::sync::atomic::Ordering::SeqCst),
+    )
+}
+
 /// Only accept declared player rates; never interpolate arbitrary input into FFmpeg filters.
 fn parse_stream_speed(speed: Option<&str>) -> Result<Option<u16>, ApiError> {
     match speed {
@@ -4058,6 +4228,17 @@ fn transformed_duration(duration_secs: Option<i64>, speed_hundredths: Option<u16
 
 /// H.264 编码档位（BUG: 高倍速实时转码 veryfast 跟不上 → 直播流被播放器反超而卡死）。
 /// ≥3x 退让画质保“跟得上实时”：ultrafast + 更高 crf + 更低 fps。
+///
+/// **BUG-289 修正（2026-10-13，实测）**：`fps` **不得取 24**。
+/// 24 fps 在 60 Hz 显示上不是整数倍刷新（60/24=2.5）⇒ 每帧交替占 2 或 3 个刷新周期
+/// （3:2 pulldown）⇒ **规则性顿挫**。实测 4x 冷直播：`presented=24fps`、
+/// 帧间隔 p50 = **49.8 ms**（=3 刷新）、`gt50 = 168` —— 即约 1/3 的帧多占一个刷新周期，
+/// 肉眼就是「一顿一顿」。改为 **30**（60 与 120 的公约数 ⇒ 每帧恰好 2/4 个刷新周期）后
+/// 帧间隔应回到 ~33.3 ms 且 `gt50`≈0。
+///
+/// **为何降 fps 并不换来性能**：输出时间轴被 `setpts/速度` 压缩，总输出帧数 =
+/// `时长/速度 × fps`。4x@30fps 的总帧数只有 1x@30fps 的 1/4 ⇒ 高倍速的**编码负载更低**
+/// （解码帧数不随速度变），故「≥3x 降 fps 保实时」的前提不成立；24 fps 纯属白白引入抖动。
 #[derive(Clone, Copy)]
 struct EncodeProfile {
     preset: &'static str,
@@ -4067,10 +4248,59 @@ struct EncodeProfile {
 
 fn encode_profile(speed_hundredths: u16) -> EncodeProfile {
     if speed_hundredths >= 300 {
-        EncodeProfile { preset: "ultrafast", crf: 28, fps: 24 }
+        // BUG-289：30（而非 24）—— 60 Hz/120 Hz 的公约数，避免 3:2 pulldown 抖动。
+        EncodeProfile { preset: "ultrafast", crf: 28, fps: 30 }
     } else {
         EncodeProfile { preset: "veryfast", crf: 23, fps: 30 }
     }
+}
+
+/// 无倍速（兼容代理，BUG-208）所用档位。
+///
+/// 必须与 pump 中 `speed_hundredths = None` 时的历史默认值**逐字一致**
+/// （`veryfast` / `crf 23` / `fpsmax 30`）——抽成常量是为了让「文件名里写的指纹」
+/// 与「pump 真正下给 ffmpeg 的参数」同源，不再两处各写一份魔数。
+const COMPAT_ENCODE_PROFILE: EncodeProfile = EncodeProfile {
+    preset: "veryfast",
+    crf: 23,
+    fps: 30,
+};
+
+fn encode_profile_for(speed_hundredths: Option<u16>) -> EncodeProfile {
+    speed_hundredths
+        .map(encode_profile)
+        .unwrap_or(COMPAT_ENCODE_PROFILE)
+}
+
+/// 编码档位指纹（BUG-291）。
+///
+/// 把档位的实质参数（`preset` / `crf` / `fps`）折叠成一个**确定性**、文件系统安全
+/// 的短标记。必须确定性：不得用 `DefaultHasher` 之类运行期不稳定的哈希，否则同一
+/// 档位两次请求会算出不同名字 ⇒ 每次都重转，「秒开」就没了。
+fn encode_profile_fingerprint(p: EncodeProfile) -> String {
+    format!("{}-crf{}-{}fps", p.preset, p.crf, p.fps)
+}
+
+/// 代理变体文件名（BUG-291）：**带档位指纹**。
+///
+/// 旧命名只有 `(item_id, speed)`，改了 `encode_profile` 之后文件名不变 ⇒
+/// 命中判据（`metadata(final_p)` 只判存在）会永久沿用旧档位产出的陈旧代理
+/// （BUG-289 实测某 4x 代理仍是旧档 30 fps）。把指纹折进名字后，档位一改 ⇒
+/// 名字变 ⇒ 旧代理自然失效、不可能再被命中。
+///
+/// `speed_hundredths = None`（兼容代理）同样带指纹：它的档位由
+/// `COMPAT_ENCODE_PROFILE` 定义，改了也应失效重建。
+fn proxy_variant_for(id: i64, speed_hundredths: Option<u16>, profile: EncodeProfile) -> String {
+    let fp = encode_profile_fingerprint(profile);
+    match speed_hundredths {
+        Some(speed) => format!("{id}-speed-{speed}-{fp}.mp4"),
+        None => format!("{id}-{fp}.mp4"),
+    }
+}
+
+/// 当前档位下的代理变体文件名（BUG-291）。
+fn proxy_variant(id: i64, speed_hundredths: Option<u16>) -> String {
+    proxy_variant_for(id, speed_hundredths, encode_profile_for(speed_hundredths))
 }
 
 fn speed_video_filter(speed_hundredths: u16, fps: u16) -> String {
@@ -4220,7 +4450,8 @@ async fn ffmpeg_config(ffmpeg: &std::path::Path) -> FfmpegConfig {
 /// 行为：
 ///   0. **探针**（`?probe=1`，BUG-226）→ 只答 `{"ready":bool,"duration":s}`，
 ///      不占坑、不起 ffmpeg——前端换档前据此决定直连代理还是带 `t` 锚点。
-///   1. **代理命中**（`<id>.mp4` 或 `<id>-speed-<百分之一倍速>.mp4` 已存在）→ 直接
+///   1. **代理命中**（`<id>-<档位指纹>.mp4` 或 `<id>-speed-<百分之一倍速>-<档位指纹>.mp4`
+///      已存在）→ 直接
 ///      `serve_local_file`（Range / ETag / MIME / 背压一处定义，不重造）；FRC 响应头标记 `decimate=S`。
 ///   2. **同一变体转码在途** → 挂在 watch 上等完成再服务代理（单飞），不同速度有独立缓存/任务键。
 ///   3. **冷启动** → spawn ffmpeg 实时转 **fMP4**（`frag_keyframe+empty_moov`，
@@ -4260,9 +4491,8 @@ async fn media_item_stream(
     }
     let proxy_dir = st.store.proxy_dir();
     let key = TranscodeKey { item_id: id, speed_hundredths };
-    let variant = speed_hundredths
-        .map(|speed| format!("{id}-speed-{speed}.mp4"))
-        .unwrap_or_else(|| format!("{id}.mp4"));
+    // BUG-291：变体名带编码档位指纹，档位变更 ⇒ 旧代理不再可能被命中。
+    let variant = proxy_variant(id, speed_hundredths);
     let final_p = proxy_dir.join(&variant);
     let part_p = proxy_dir.join(format!("{variant}.part"));
     let stream_duration = transformed_duration(item.duration, speed_hundredths);
@@ -4317,43 +4547,25 @@ async fn media_item_stream(
     // BUG-226：带 `t` 锚点的请求**不进单飞表**——锚点流是 live-only（不落盘、
     // 不改名、不可被后续请求命中），每次请求各起一条；若与正式代理转码共用
     // 一个键，锚点流的 finish 会把别人的占坑顶掉。
-    enum Role {
-        Start(tokio::sync::watch::Sender<bool>),
-        Wait(TranscodeDone),
-    }
     let registered = start_secs.is_none();
     let role = if !registered {
         let (tx, _rx) = tokio::sync::watch::channel(false);
-        Role::Start(tx)
+        Role::Start(tx, None)
     } else {
-        let mut m = transcode_inflight().lock().expect("transcode map poisoned");
-        match m.get(&key) {
-            Some(rx) => Role::Wait(rx.clone()),
-            None => {
-                let (tx, rx) = tokio::sync::watch::channel(false);
-                m.insert(key, rx);
-                Role::Start(tx)
-            }
-        }
+        acquire_transcode_role(key)
     };
 
-    match role {
-        Role::Wait(rx) => {
-            // 在途等待：完成（或发送端消失=任务以任意方式结束）后代理应已就位。
-            let mut rx = rx;
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(600), async move {
-                while !*rx.borrow_and_update() {
-                    if rx.changed().await.is_err() {
-                        break;
-                    }
-                }
-            })
-            .await;
-            if tokio::fs::metadata(&final_p).await.is_ok() {
+    // BUG-288：**先**做孤儿自愈判定。`Role::Wait` 要么直接返回响应 / 503，要么把
+    // 「无 pump 认领的孤儿条目」降级为冷启动（重新占坑）⇒ 此后恒为 Start。
+    let (tx, slot) = match role {
+        Role::Wait(mut rx) => {
+            let (ready, orphan) = wait_for_transcode(&mut rx, &final_p).await;
+            if ready {
+                // 命中即「最近使用」：与上面的代理命中分支同一套 LRU 语义。
                 let _ = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&final_p)
-            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+                    .write(true)
+                    .open(&final_p)
+                    .and_then(|f| f.set_modified(std::time::SystemTime::now()));
                 let mut res = serve_local_file(
                     final_p.to_string_lossy().as_ref(),
                     Some("video"),
@@ -4365,68 +4577,89 @@ async fn media_item_stream(
                     .insert("x-orig-stream", stream_mode_header(speed_hundredths, "proxy"));
                 return Ok(res);
             }
-            Err(ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "transcode in flight but proxy not ready; retry later",
-            ))
+            if !orphan {
+                // 真·在途（pump 还活着）：保留既有语义——请客户端稍后重试。
+                // 修复前**孤儿也走这条**，且条目永不出表 ⇒ 该变体被永久钉死在 503。
+                return Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "transcode in flight but proxy not ready; retry later",
+                ));
+            }
+            // 孤儿条目：表里有键、却没有任何 pump 会为它 `finish`
+            // （BUG-288 取证补充二「路径 A」：handler 在 insert 之后、spawn 之前被
+            // 取消）。出表 + **当场重新占坑** ⇒ 该变体立刻可恢复，且后续请求仍走
+            // Wait（单飞不破，不会各起一条 ffmpeg）。
+            tracing::warn!(
+                target: "orig_tg::transcode",
+                "item {}: orphaned transcode slot (no live pump); reclaiming and restarting",
+                id
+            );
+            reclaim_transcode_slot(key)
         }
-        Role::Start(tx) => {
-            // B：可寻址化——若客户端带 Range 且同键转码的 `.part` 已落盘足够字节，
-            // 直接从增长中的 `.part` 回 206（serve_local_file 按当前实际长度给 Content-Range），
-            // 浏览器缺多少再要多少。这样 4x 暂停后再播不必等整片转完、也不必重新起直播流。
-            // 该分支只发响应；transcode_pump 仍在后台把 `.part` 写完整并重命名为正式代理。
-            if registered {
-                if let Some(rstr) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-                    if let Some(start) = range_start_only(rstr) {
-                        if let Ok(meta) = tokio::fs::metadata(&part_p).await {
-                            if meta.len() > start {
-                                let mut res = serve_local_file(
-                                    part_p.to_string_lossy().as_ref(),
-                                    Some("video"),
-                                    None,
-                                    &headers,
-                                )
-                                .await?;
-                                res.headers_mut().insert(
-                                    "x-orig-stream",
-                                    stream_mode_header(speed_hundredths, "part"),
-                                );
-                                return Ok(res);
-                            }
+        Role::Start(tx, slot) => (tx, slot),
+    };
+
+    {
+        // B：可寻址化——若客户端带 Range 且同键转码的 `.part` 已落盘足够字节，
+        // 直接从增长中的 `.part` 回 206（serve_local_file 按当前实际长度给 Content-Range），
+        // 浏览器缺多少再要多少。这样 4x 暂停后再播不必等整片转完、也不必重新起直播流。
+        //
+        // BUG-288：这条分支只发响应、**不会** spawn pump，所以修复前它会留下一个
+        // 无 pump 认领的孤儿条目（与「路径 A」同源的变体）。现在守卫 `slot` 随
+        // `return` 一起 drop ⇒ 出表，不会污染单飞表。
+        if registered {
+            if let Some(rstr) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
+                if let Some(start) = range_start_only(rstr) {
+                    if let Ok(meta) = tokio::fs::metadata(&part_p).await {
+                        if meta.len() > start {
+                            let mut res = serve_local_file(
+                                part_p.to_string_lossy().as_ref(),
+                                Some("video"),
+                                None,
+                                &headers,
+                            )
+                            .await?;
+                            res.headers_mut().insert(
+                                "x-orig-stream",
+                                stream_mode_header(speed_hundredths, "part"),
+                            );
+                            return Ok(res);
                         }
                     }
                 }
             }
-            let (resp_tx, resp_rx) =
-                tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
-            let cfg = ffmpeg_config(&ffmpeg).await;
-            tokio::spawn(transcode_pump(
-                ffmpeg,
-                src,
-                part_p,
-                final_p,
-                key,
-                speed_hundredths,
-                start_secs,
-                registered,
-                tx,
-                resp_tx,
-                cfg,
-            ));
-            let body = axum::body::Body::from_stream(ReceiverStream::new(resp_rx));
-            let mut res = Response::new(body);
-            res.headers_mut()
-                .insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
-            // 仅可缓存路径（registered）声明可 Range：完成代理与增长中 `.part` 都能 206 服务；
-            // 锚点 live-only 流不落盘、不可 Range。
-            if registered {
-                res.headers_mut()
-                    .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-            }
-            res.headers_mut()
-                .insert("x-orig-stream", stream_mode_header(speed_hundredths, "live"));
-            Ok(res)
         }
+        let (resp_tx, resp_rx) =
+            tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
+        let cfg = ffmpeg_config(&ffmpeg).await;
+        // BUG-288：守卫的所有权**随 pump future 一起 move** ⇒ pump 被 drop / panic
+        // 也必然出表（原先只有 pump 走到 `finish()` 才出表）。
+        tokio::spawn(transcode_pump(
+            ffmpeg,
+            src,
+            part_p,
+            final_p,
+            key,
+            speed_hundredths,
+            start_secs,
+            slot,
+            tx,
+            resp_tx,
+            cfg,
+        ));
+        let body = axum::body::Body::from_stream(ReceiverStream::new(resp_rx));
+        let mut res = Response::new(body);
+        res.headers_mut()
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
+        // 仅可缓存路径（registered）声明可 Range：完成代理与增长中 `.part` 都能 206 服务；
+        // 锚点 live-only 流不落盘、不可 Range。
+        if registered {
+            res.headers_mut()
+                .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        }
+        res.headers_mut()
+            .insert("x-orig-stream", stream_mode_header(speed_hundredths, "live"));
+        Ok(res)
     }
 }
 
@@ -4437,8 +4670,11 @@ async fn media_item_stream(
 ///
 /// BUG-226：`start_secs = Some(t)` 时是**锚点 live-only 流**——`-ss t` 从指定
 /// 内容位置起转，字节流与正式代理（从 0:00 起）不是同一份字节，因此**不落盘、
-/// 不改名、不进单飞表**（`registered=false`，finish 不得出别人的坑），客户端
+/// 不改名、不进单飞表**（`slot = None`，finish 不得出别人的坑），客户端
 /// 断开即杀 ffmpeg。
+///
+/// BUG-288：`slot` 是单飞表的**出表守卫**，所有权随本 future 一起 move：
+/// panic / 任务被 drop 时 `Drop` 也会出表，不再依赖「必须走到 `finish()`」。
 #[allow(clippy::too_many_arguments)]
 async fn transcode_pump(
     ffmpeg: PathBuf,
@@ -4448,22 +4684,20 @@ async fn transcode_pump(
     key: TranscodeKey,
     speed_hundredths: Option<u16>,
     start_secs: Option<f64>,
-    registered: bool,
+    mut slot: Option<TranscodeSlot>,
     done_tx: tokio::sync::watch::Sender<bool>,
     resp_tx: tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
     cfg: FfmpegConfig,
 ) {
     let id = key.item_id;
     let persist = start_secs.is_none();
-    let finish = |completed: bool| {
-        // 出表 + 唤醒等待者（drop done_tx 兜底：panic 路径也会关闭 watch）。
-        // 锚点流没占过坑，绝不能把（可能属于别人的）同键条目顶掉。
-        if registered {
-            transcode_inflight()
-                .lock()
-                .expect("transcode map poisoned")
-                .remove(&key);
+    let mut finish = |completed: bool| {
+        // BUG-288：出表交给守卫（`disarm` = 显式出表，之后 `Drop` 不再重复 remove）。
+        // 守卫为 `None` ⇒ 锚点流没占过坑，绝不能把（可能属于别人的）同键条目顶掉。
+        if let Some(slot) = slot.as_mut() {
+            slot.disarm();
         }
+        // 唤醒等待者（drop done_tx 兜底：panic 路径也会关闭 watch）。
         let _ = done_tx.send(completed);
     };
 
@@ -4497,10 +4731,12 @@ async fn transcode_pump(
         "-map",
         "0:a:0?",
     ]);
-    let profile = speed_hundredths.map(encode_profile);
-    let preset = profile.map(|p| p.preset).unwrap_or("veryfast");
-    let crf = profile.map(|p| p.crf.to_string()).unwrap_or_else(|| "23".to_string());
-    let fpsmax = profile.map(|p| p.fps.to_string()).unwrap_or_else(|| "30".to_string());
+    // BUG-291：档位只在一处定义（`encode_profile_for`），代理文件名与下给 ffmpeg
+    // 的 `-preset/-crf/-fpsmax` 同源，杜绝「文件名说一套、编码做一套」。
+    let profile = encode_profile_for(speed_hundredths);
+    let preset = profile.preset;
+    let crf = profile.crf.to_string();
+    let fpsmax = profile.fps.to_string();
     if let Some(speed) = speed_hundredths {
         // Retimestamp then sample CFR N fps; supports fractional speed, VFR and any source fps.
         //
@@ -4510,7 +4746,7 @@ async fn transcode_pump(
         // 两者同时出现会让 ffmpeg **拒绝打开输出文件** → 整条 FRC 流 0 字节，
         // 浏览器端表现为「切了倍速就再也出不了画面」。高倍速（≥3x）改用更低 fps
         // （见 `encode_profile`）以换取实时余量。
-        let fps = profile.map(|p| p.fps).unwrap_or(30);
+        let fps = profile.fps;
         command
             .arg("-vf")
             .arg(speed_video_filter(speed, fps))
@@ -4592,47 +4828,57 @@ async fn transcode_pump(
 
     let mut buf = vec![0u8; 256 * 1024];
     let mut client_gone = false;
-    // C：单飞防饿死——转码若长时间无输出（ffmpeg 卡死/源损坏），超过时限即杀进程并出坑，
-    // 避免同一条目被一个僵死的 4x 转码永久占用（原先最长阻塞 600s）。
+    // C：单飞防饿死（**BUG-293 修正**）。原实现把「无进展」判定挂在**循环顶部**，而循环体
+    // 会阻塞在 `stdout.read()` / `resp_tx.send()` 里 ⇒ 守卫**永远轮不到执行**：实测客户端停读后
+    // ffmpeg 被反压顶到 **0% CPU**、`.part` 冻结 50 s 仍未触发（阈值 30 s），该 `(item, speed)`
+    // 变体从此**永久卡死**，后续请求挂到 `wait_for_transcode` 的 600 s 才 503。
+    // 现改为给**两处阻塞点各自加时限**，使「整轮无进展」必被检出：
+    //   · `stdout.read` 超时 ⇒ ffmpeg 僵死（被反压顶住）⇒ 杀进程 + 清 `.part` + 出坑。
+    //     不再依赖 `ever_read`：**从未产出任何字节**的僵死同样要清。
+    //   · `resp_tx.send` 超时 ⇒ 客户端不再消费（停读 / 暂停）⇒ 判 `client_gone`：
+    //     FRC 变体**继续**把 `.part` 写完落盘（保住可 seek 的代理），live-only（1x / 锚点）收尾。
     let stall_limit = std::time::Duration::from_secs(30);
-    let mut last_progress = std::time::Instant::now();
-    let mut ever_read = false;
     loop {
-        if ever_read && last_progress.elapsed() > stall_limit {
-            tracing::warn!(target: "orig_tg::transcode", "item {id}: no ffmpeg output for {:.1}s; aborting wedged transcode", stall_limit.as_secs_f32());
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            if persist {
-                let _ = tokio::fs::remove_file(&part_p).await;
+        let read = match tokio::time::timeout(stall_limit, stdout.read(&mut buf)).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(target: "orig_tg::transcode", "item {id}: no ffmpeg output for {:.1}s; aborting wedged transcode", stall_limit.as_secs_f32());
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                if persist {
+                    let _ = tokio::fs::remove_file(&part_p).await;
+                }
+                finish(false);
+                return;
             }
-            finish(false);
-            return;
-        }
-        match stdout.read(&mut buf).await {
+        };
+        match read {
             Ok(0) => break,
             Ok(n) => {
                 use tokio::io::AsyncWriteExt;
-                last_progress = std::time::Instant::now();
-                ever_read = true;
                 if let Some(file) = file.as_mut() {
                     if file.write_all(&buf[..n]).await.is_err() {
                         // 落盘失败不影响直播给客户端（例如磁盘满时至少本次能看完）
                         tracing::warn!(target: "orig_tg::transcode", "item {id}: write .part failed; proxy will be skipped");
                     }
                 }
-                if !client_gone
-                    && resp_tx
-                        .send(Ok(axum::body::Bytes::copy_from_slice(&buf[..n])))
-                        .await
-                        .is_err()
-                {
-                    // Legacy compatibility requests and anchored live-only streams
-                    // (BUG-226) cancel immediately. Canonical FRC variants keep
-                    // transcoding to a seekable speed-specific proxy after client
-                    // disconnect.
-                    client_gone = true;
-                    if speed_hundredths.is_none() || !persist {
-                        break;
+                if !client_gone {
+                    // BUG-293：投递也必须有界 —— 客户端停读时不得让泵永久阻塞
+                    // （否则泵停 ⇒ 不再排空 ffmpeg stdout ⇒ ffmpeg 被反压顶死）。
+                    let sent = tokio::time::timeout(
+                        stall_limit,
+                        resp_tx.send(Ok(axum::body::Bytes::copy_from_slice(&buf[..n]))),
+                    )
+                    .await;
+                    if !matches!(sent, Ok(Ok(()))) {
+                        // Legacy compatibility requests and anchored live-only streams
+                        // (BUG-226) cancel immediately. Canonical FRC variants keep
+                        // transcoding to a seekable speed-specific proxy after client
+                        // disconnect.
+                        client_gone = true;
+                        if speed_hundredths.is_none() || !persist {
+                            break;
+                        }
                     }
                 }
             }
@@ -5864,6 +6110,16 @@ mod tests {
     use super::normalized_series_name;
     use super::parse_stream_speed;
     use super::parse_stream_start;
+    use super::encode_profile_for;
+    use super::proxy_variant;
+    use super::proxy_variant_for;
+    use super::EncodeProfile;
+    use super::acquire_transcode_role;
+    use super::reclaim_transcode_slot;
+    use super::transcode_inflight;
+    use super::wait_for_transcode;
+    use super::Role;
+    use super::TranscodeKey;
     use super::patch_media_series;
     use super::resolve_ffmpeg_from;
     use super::speed_video_filter;
@@ -5875,6 +6131,227 @@ mod tests {
     // BUG-129：409 判据要直接调 handler（状态码与错误信息都只在 handler 层可见）。
     use super::add_media_episode;
     use super::EpisodeReq;
+
+    // ── BUG-291：代理文件名必须带编码档位指纹 ─────────────────────────────
+
+    /// 判据 1（BUG-291）：**改编码档位 ⇒ 代理必失效**。
+    ///
+    /// 缺陷形态是「文件名只有 `(item_id, speed)`，命中判据只 `metadata()` 判存在」，
+    /// 于是旧档位产出的代理会被永久沿用（BUG-289 实测某 4x 代理仍是旧档 30 fps）。
+    /// 本测试锁住的是**可命中路径本身**：只要当前档位算出的名字与「旧档位 / 修复前
+    /// 旧命名」算出的名字不同，陈旧代理就**不可能**再被 `:4285` 的 `metadata()` 命中，
+    /// 也就必然重建。
+    ///
+    /// 反向证伪：把 `proxy_variant_for` 的函数体退回无指纹版本（签名不变）⇒
+    /// 下面第 ① 条断言立刻变红（`673-speed-400.mp4` 会被重新命中）。
+    #[test]
+    fn bug291_encode_profile_change_invalidates_stale_proxy() {
+        const ID: i64 = 673;
+        // BUG-291/BUG-289：「旧档位」= ≥3x 曾按 **24 fps** 编码（BUG-289 修复后现行档位为 30 fps）。
+        // 注意：这个值必须与 `encode_profile(400)` 至少差一个字段，否则下面的 `assert_ne!`
+        // 会因为「新旧档位撞名」而变红——这正是指纹机制该拦住的情形。
+        let stale_profile = EncodeProfile {
+            preset: "ultrafast",
+            crf: 28,
+            fps: 24,
+        };
+        let current_4x = proxy_variant(ID, Some(400));
+
+        // ① 修复前的旧命名（磁盘上真实存在的陈旧代理就是这个名字）绝不能被再命中。
+        assert_ne!(
+            current_4x,
+            format!("{ID}-speed-400.mp4"),
+            "BUG-291 回归：4x 代理名退化成无指纹的旧命名，陈旧代理会被 metadata() 命中沿用"
+        );
+        // ② 旧档位（30 fps）算出的名字 ≠ 现行档位名 ⇒ 改档位即失效重建。
+        assert_ne!(
+            current_4x,
+            proxy_variant_for(ID, Some(400), stale_profile),
+            "BUG-291 回归：改了 fps 之后代理名不变，旧档代理仍会被命中"
+        );
+        // ③ crf 变了名字也要变（指纹必须覆盖 crf，不只是 fps）。
+        assert_ne!(
+            current_4x,
+            proxy_variant_for(
+                ID,
+                Some(400),
+                EncodeProfile {
+                    preset: "ultrafast",
+                    crf: 20,
+                    fps: 24
+                }
+            ),
+            "BUG-291 回归：指纹未覆盖 crf"
+        );
+        // ④ preset 变了名字也要变。
+        assert_ne!(
+            current_4x,
+            proxy_variant_for(
+                ID,
+                Some(400),
+                EncodeProfile {
+                    preset: "veryfast",
+                    crf: 28,
+                    fps: 24
+                }
+            ),
+            "BUG-291 回归：指纹未覆盖 preset"
+        );
+        // ⑤ 形状断言：指纹必须落在倍速之后、扩展名之前，不得改变既有命名骨架。
+        assert!(
+            current_4x.starts_with(&format!("{ID}-speed-400-")) && current_4x.ends_with(".mp4"),
+            "代理名形状应为 `<id>-speed-<n>-<指纹>.mp4`，实际：{current_4x}"
+        );
+        // ⑥ 不回归秒开：指纹必须**确定性**（同参数两次调用同名），否则每次都重转。
+        assert_eq!(current_4x, proxy_variant(ID, Some(400)));
+        // ⑦ 不推翻 BUG-226：不同变体（1x 兼容代理 / 各倍速）仍各自独立成文件。
+        let compat = proxy_variant(ID, None);
+        assert_ne!(compat, current_4x);
+        assert_ne!(compat, proxy_variant(ID, Some(200)));
+        assert_ne!(proxy_variant(ID, Some(200)), proxy_variant(ID, Some(300)));
+        // ⑧ 兼容代理同样带指纹（其档位由 COMPAT_ENCODE_PROFILE 定义）。
+        assert_ne!(compat, format!("{ID}.mp4"));
+        assert_eq!(compat, proxy_variant_for(ID, None, encode_profile_for(None)));
+    }
+
+    // ── BUG-288：单飞表条目泄漏（孤儿条目永久 503） ───────────────────────
+
+    /// 判据 7（BUG-288 取证补充二「路径 A」）：**在 insert 之后、spawn 之前注入取消**
+    /// ⇒ 单飞表不得留下无 pump 认领的条目，且该键必须能被**重新** `Start`。
+    ///
+    /// 修复前的形态：条目进了表、`tx` 随被丢弃的 handler future 一起 drop ⇒
+    /// 此后每个请求进 `Role::Wait` 都瞬间 `changed()=Err` → 无代理 → **瞬间 503**，
+    /// 且永不出表（唯一出表口是 pump 的 `finish()`，而这里根本没有 pump），
+    /// 只能重启 orig-tg 才解。
+    ///
+    /// 注入方式是**真的取消一个持有守卫的 future**（`tokio::spawn` + `abort()`），
+    /// 而不是「手动调一次 remove」——后者会把自己要证的东西当成前提。
+    #[tokio::test]
+    async fn bug288_cancellation_between_insert_and_spawn_leaves_no_orphan_slot() {
+        let key = TranscodeKey {
+            item_id: 991_288,
+            speed_hundredths: Some(400),
+        };
+        // 本测试独占这个 key：先清场，收尾也清场（表是进程级 static）。
+        transcode_inflight().lock().expect("poisoned").remove(&key);
+
+        // ① 占坑：与 handler 走同一个 `acquire_transcode_role`（不是测试内重写的副本）。
+        let (tx, slot) = match acquire_transcode_role(key) {
+            Role::Start(tx, slot) => (tx, slot.expect("抢到坑必带出表守卫")),
+            Role::Wait(_) => panic!("首个请求必须抢到坑（Start），而不是 Wait"),
+        };
+        assert!(
+            transcode_inflight().lock().expect("poisoned").contains_key(&key),
+            "占坑后该键必须在表内——这正是「insert 之后、spawn 之前」的窗口"
+        );
+
+        // ② 注入取消：handler future 持有守卫，并在 `ffmpeg_config().await` 处
+        //    被客户端断开 ⇒ hyper 丢弃 future ⇒ 守卫 `Drop`。
+        let handler = tokio::spawn(async move {
+            let _slot = slot;
+            let _tx = tx;
+            std::future::pending::<()>().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        handler.abort();
+        let _ = handler.await; // 等 future 真正被 drop（守卫 Drop 生效）
+
+        // ③ 修复前：键残留 ⇒ 后续请求进 Wait ⇒ 瞬间 503、永不自愈。
+        //    修复后：守卫已出表 ⇒ 该键可以被**重新** Start（不再 503）。
+        assert!(
+            !transcode_inflight()
+                .lock()
+                .expect("poisoned")
+                .contains_key(&key),
+            "BUG-288 回归：handler 被取消后单飞表仍残留该键（无 pump 认领 ⇒ 该变体永久 503）"
+        );
+        match acquire_transcode_role(key) {
+            Role::Start(_, Some(_)) => {}
+            Role::Start(_, None) => panic!("重新抢到的坑必须带出表守卫"),
+            Role::Wait(_) => panic!("BUG-288 回归：取消之后该键仍被视为在途 ⇒ 请求会拿到 503"),
+        }
+
+        transcode_inflight().lock().expect("poisoned").remove(&key);
+    }
+
+    /// 判据 1（BUG-288）：等待方必须能**区分**「真·在途」与「孤儿」，
+    /// 只把孤儿交给自愈路径——否则要么泄漏照旧，要么在 pump 还在跑时重复起 ffmpeg。
+    #[tokio::test]
+    async fn bug288_wait_distinguishes_orphan_from_live_transcode() {
+        let dir = std::env::temp_dir().join(format!("orig-tg-bug288-{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let final_p = dir.join("991288-speed-400-ultrafast-crf28-30fps.mp4");
+        let _ = tokio::fs::remove_file(&final_p).await;
+
+        // ① 孤儿形态：pump 从未启动（发送端已 drop）+ 代理未落盘。
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        drop(tx);
+        let (ready, orphan) = wait_for_transcode(&mut rx, &final_p).await;
+        assert!(!ready, "代理未落盘时不得报告就绪");
+        assert!(
+            orphan,
+            "BUG-288 回归：发送端已死 + 无代理 ⇒ 必须判定为孤儿（进而回收重转），而不是恒 503"
+        );
+
+        // ② pump 已完成但代理未落盘：发送端仍活着 ⇒ **不是**孤儿，
+        //    保留既有 503 语义（不得误判成孤儿而在 pump 还在跑时重复起 ffmpeg）。
+        let (tx2, mut rx2) = tokio::sync::watch::channel(false);
+        let _ = tx2.send(true);
+        let (ready2, orphan2) = wait_for_transcode(&mut rx2, &final_p).await;
+        assert!(!ready2);
+        assert!(
+            !orphan2,
+            "发送端仍活着 ⇒ 不是孤儿（既有 503 语义必须保留，不得重复起 ffmpeg）"
+        );
+
+        // ③ 完成且代理已落盘 ⇒ 就绪可 serve（自愈的终态）。
+        let _ = tokio::fs::write(&final_p, b"fake-proxy-bytes").await;
+        let (tx3, mut rx3) = tokio::sync::watch::channel(false);
+        let _ = tx3.send(true);
+        let (ready3, orphan3) = wait_for_transcode(&mut rx3, &final_p).await;
+        assert!(ready3, "代理落盘后必须报告就绪（否则等待方不会去 serve）");
+        assert!(!orphan3);
+
+        let _ = tokio::fs::remove_file(&final_p).await;
+    }
+
+    /// 判据 3（BUG-288）：孤儿键被回收后**必须重新占坑** —— 只 remove 不 insert 会让
+    /// 该键处于无人认领状态，后续请求各起一条 ffmpeg，单飞就被打破了。
+    #[tokio::test]
+    async fn bug288_reclaim_of_orphan_slot_keeps_single_flight() {
+        let key = TranscodeKey {
+            item_id: 992_288,
+            speed_hundredths: Some(200),
+        };
+        transcode_inflight().lock().expect("poisoned").remove(&key);
+
+        // 人为制造 BUG-288 现场：条目在表内，但它的发送端已死（无任何 pump 认领）。
+        let (dead_tx, dead_rx) = tokio::sync::watch::channel(false);
+        transcode_inflight()
+            .lock()
+            .expect("poisoned")
+            .insert(key, dead_rx);
+        drop(dead_tx);
+        assert!(
+            matches!(acquire_transcode_role(key), Role::Wait(_)),
+            "孤儿条目在被回收前确实会让请求走 Wait —— 这正是恒 503 的来源"
+        );
+
+        // 回收：出表 + **重新**占坑（handler 在判定孤儿后走的就是这一步）。
+        let (_tx, slot) = reclaim_transcode_slot(key);
+        assert!(slot.is_some(), "回收后必须持有出表守卫");
+        assert!(
+            transcode_inflight().lock().expect("poisoned").contains_key(&key),
+            "BUG-288 回归：回收后表里没有该键 ⇒ 后续请求会各起一条 ffmpeg（单飞被打破）"
+        );
+        assert!(
+            matches!(acquire_transcode_role(key), Role::Wait(_)),
+            "BUG-288 回归：回收后该键没被占住 ⇒ 并发请求会各起一条 ffmpeg"
+        );
+
+        drop(slot);
+        transcode_inflight().lock().expect("poisoned").remove(&key);
+    }
 
     // ── BUG-257：取消可达在途 IO（判据 1） ────────────────────────────────
 
@@ -7066,13 +7543,43 @@ mod tests {
         Arc<AppState>,
         Arc<std::sync::Mutex<HashMap<i64, usize>>>,
     ) {
+        trickle_fixture_state_in(
+            dir,
+            ":memory:",
+            trickle,
+            interval,
+            chunks,
+            msgs,
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+        )
+        .await
+    }
+
+    /// 同 [`trickle_fixture_state`]，但**库位置与调用计数器由调用方给定**。
+    ///
+    /// BUG-276 用它模拟「重启」：每次重启都 `Store::open` **同一个文件库**并构造
+    /// 全新 `AppState`（新进程 ⇒ 新的 `Instant` 时基），唯一跨重启存活的东西只有
+    /// 那个 db 文件 —— 若累计墙钟落在进程里，本用例必 FAIL。
+    /// 计数器共享则是为了观测「第 N 次尝试到底有没有真的发起下载」。
+    #[allow(clippy::too_many_arguments)]
+    async fn trickle_fixture_state_in(
+        dir: &std::path::Path,
+        db: &str,
+        trickle: Vec<i64>,
+        interval: std::time::Duration,
+        chunks: usize,
+        msgs: Vec<TgMedia>,
+        calls: Arc<std::sync::Mutex<HashMap<i64, usize>>>,
+    ) -> (
+        Arc<AppState>,
+        Arc<std::sync::Mutex<HashMap<i64, usize>>>,
+    ) {
         let mut by_id = HashMap::new();
         for m in msgs {
             by_id.insert(m.id, m);
         }
         let mut cfg = Config::default();
         cfg.download_dir = dir.to_path_buf();
-        let calls = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let st = Arc::new(AppState::new(
             Arc::new(TrickleClient {
                 chat_id: CACHE_FIXTURE_CHAT,
@@ -7085,7 +7592,7 @@ mod tests {
             cfg,
             Availability::Ready,
             false,
-            Store::open(":memory:").await.expect("in-memory store must open"),
+            Store::open(db).await.expect("store must open"),
         ));
         (st, calls)
     }
@@ -7219,6 +7726,190 @@ mod tests {
         let d = download_limits(&st).await;
         assert!(d.wall.as_secs_f64() >= 0.1, "墙钟钳位下限 0.1s");
         assert!(d.idle.as_secs_f64() >= 5.0, "空闲钳位下限 5s");
+    }
+
+    /// BUG-276：**重启不清零** —— 条目级墙钟必须是「累计值」而不是「每次尝试重新计」。
+    ///
+    /// 生产形态的等比缩小：生产里「3.6h 重启 16 次 ⇒ 30min 死线永不到期」；
+    /// 这里是「墙钟 2s，每次尝试在 400ms 处被掐断」。两条硬约束：
+    ///
+    /// 1. **单次尝试够不着墙钟**：慢流一次跑完只要 1200ms（< 2000ms）⇒
+    ///    只要计时被重置，任何一次不被打断的尝试都能下完 —— 反向证伪的支点。
+    /// 2. **累计必须跨重启增长**：四次被掐断的尝试累计 ≈ 1.8s ⇒
+    ///    最后一次只剩约 200ms 额度，跑不完 1200ms ⇒ 判失败。
+    ///
+    /// 四次运行 = 首次尝试 + **3 次「重启」**；每次重启都 `Store::open` 同一个
+    /// **文件库**并构造全新 `AppState`（新进程 ⇒ 新的 `Instant` 时基），
+    /// 唯一跨重启存活的只有那个 db 文件。掐断前先等条目 2 的下载**真的起跑**
+    /// （夹具在 `download` 入口计数），否则机器一忙，掐断会落在启动开销上 ——
+    /// 测的就不再是「尝试」了。
+    ///
+    /// **反向证伪**：把 `cache_one_bytes` 的计时改回 `timeout(limits.wall, download)`
+    /// （= 每次尝试拿满一整档）⇒ 每次尝试只烧 400ms 就被掐断、累计永不达标
+    /// ⇒ 最后一次重新起一次完整下载、1200ms 后正常完成 ⇒ `status` 为 `done`、
+    /// `done` 为 3 ⇒ 下面两条断言必 FAIL。
+    #[tokio::test]
+    async fn wall_clock_accumulates_across_restarts_instead_of_resetting() {
+        let dir = scratch_dir("bug276_wall_accum");
+        let db = dir.join("bug276.db").to_string_lossy().into_owned();
+        let calls = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // 墙钟 2s；慢流 240ms × 5 块 = 1200ms 跑完（**<** 墙钟 ⇒ 不被打断就一定下得完，
+        // 这是反向证伪的支点）；每次尝试掐断在 400ms（≪ 1200ms ⇒ 单次够不着墙钟）。
+        const SLICE: std::time::Duration = std::time::Duration::from_millis(400);
+        const CHUNK: std::time::Duration = std::time::Duration::from_millis(240);
+        const CHUNKS: usize = 5;
+
+        /// 一次「进程启动」：全新 AppState（新 `Instant` 时基）+ 同一个文件库。
+        async fn trickle_boot(
+            dir: &std::path::Path,
+            db: &str,
+            calls: &Arc<std::sync::Mutex<HashMap<i64, usize>>>,
+        ) -> Arc<AppState> {
+            trickle_fixture_state_in(
+                dir,
+                db,
+                vec![2],
+                CHUNK,
+                CHUNKS,
+                trickle_msgs(),
+                calls.clone(),
+            )
+            .await
+            .0
+        }
+
+        // ① 入队 + 首次尝试：等条目 2 的下载**真的起跑**，再烧 `SLICE`，然后把整个
+        //    future drop（= 进程被杀，传输中断）。
+        let task_id = {
+            let st = trickle_boot(&dir, &db, &calls).await;
+            // 墙钟经 app_setting 注入（判据 4：阈值链 `app_setting > env > 默认` 不变）。
+            st.store.set_setting("download_item_max_secs", "2.0").await.unwrap();
+            let task = enqueue_fixture_task(&st, &[1, 2, 3], None).await;
+            let fut = run_one_cache_task(&st, task.id);
+            tokio::pin!(fut);
+            // 先等起跑：机器忙时启动开销可能吃掉整个 SLICE，掐断就会落空。
+            let started = loop {
+                let seen = calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&2)
+                    .copied()
+                    .unwrap_or(0);
+                if seen >= 1
+                    || !st.store.is_cache_task_active(task.id).await.unwrap_or(false)
+                {
+                    break seen >= 1;
+                }
+                tokio::select! {
+                    _ = &mut fut => break false,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                }
+            };
+            assert!(started, "首次尝试必须真的发起过下载");
+            tokio::time::sleep(SLICE).await;
+            drop(fut);
+            task.id
+        };
+
+        // ② 三次「重启」：每轮都掐断在 `SLICE` ⇒ 累计单调增长。
+        //    每轮先等本次尝试起跑，再读累计：只要任务还在队里，累计就必须**比上一轮
+        //    更大** —— 这是「重启没有把计时清零」的直接证据。
+        let mut prev: i64 = 0;
+        let mut restarts: usize = 0;
+        for i in 0..3 {
+            let attempt = i + 2;
+            let st = trickle_boot(&dir, &db, &calls).await;
+            let fut = run_one_cache_task(&st, task_id);
+            tokio::pin!(fut);
+            let started = loop {
+                let seen = calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&2)
+                    .copied()
+                    .unwrap_or(0);
+                if seen >= attempt
+                    || !st.store.is_cache_task_active(task_id).await.unwrap_or(false)
+                {
+                    break seen >= attempt;
+                }
+                tokio::select! {
+                    _ = &mut fut => break false,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                }
+            };
+            restarts += 1;
+            if started {
+                tokio::time::sleep(SLICE).await;
+            }
+            drop(fut);
+            if !started {
+                // 累计已在上一轮达标 ⇒ 条目已判失败；终态随即回收累计（读回 0）
+                // ⇒ 单调性无从比较，收尾即可。
+                break;
+            }
+            // 只在任务仍在队里时比较：一旦离队，`finish_cache_task` 已回收累计。
+            if st.store.is_cache_task_active(task_id).await.unwrap_or(false) {
+                let burned = st.store.item_wall_elapsed_ms(task_id, 2).await.unwrap_or(0);
+                assert!(
+                    burned > prev,
+                    "第 {} 次重启后累计墙钟必须比上一轮更大（上一轮 {prev}ms，本轮 {burned}ms）\
+                     —— 若被清零就退回了 BUG-276 的缺陷原形",
+                    i + 1
+                );
+                prev = burned;
+            }
+        }
+        assert!(restarts >= 3, "本用例必须重启 ≥3 次（实测 {restarts}）");
+        assert!(
+            prev >= 300,
+            "跨重启累计必须已显著增长（实测 {prev}ms）—— 若为 0 说明计时又落回进程内"
+        );
+
+        // ③ 最后一次「重启」后不再打断：跑到终态。
+        //    累计 ≈ 1.8s ⇒ 只剩约 200ms 额度，跑不完 1200ms 的慢流 ⇒ 判失败。
+        let st = trickle_boot(&dir, &db, &calls).await;
+        let t0 = std::time::Instant::now();
+        run_one_cache_task(&st, task_id).await;
+        let elapsed = t0.elapsed();
+
+        let t = st.store.get_cache_task(task_id).await.unwrap().unwrap();
+        assert_eq!(
+            t.status, "failed",
+            "累计超墙钟的条目必须判失败（走 BUG-271 失败隔离通道）"
+        );
+        assert_eq!(
+            t.done, 2,
+            "条目 2 累计超墙钟 ⇒ done 停在 2；若为 3 说明墙钟被重启清零了（判据 1 FAIL）"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "最后一次运行只应烧掉剩余额度（实测 {elapsed:?}）"
+        );
+        // 原因串：与「no bytes for 90s」逐字可区分（BUG-271 判据 4 的引擎侧）。
+        let err = t.error.expect("failed 任务须带汇总");
+        assert!(err.starts_with("1/3 item(s) failed:"), "{err}");
+        assert!(err.contains("424242:2"), "{err}");
+        assert!(!err.contains("424242:1") && !err.contains("424242:3"), "{err}");
+        assert!(err.contains("download too slow"), "{err}");
+        assert!(
+            !err.contains("no bytes for") && !err.contains("download stalled"),
+            "「慢」不得被说成「死」: {err}"
+        );
+        // 不弃单：失败条目**之后**的条目照常入库。
+        let id3 = st
+            .store
+            .item_id_by_ref("tg", "424242:3")
+            .await
+            .unwrap()
+            .expect("条目 3 必须被处理（不弃单）");
+        assert!(st.store.get_media_item(id3).await.unwrap().unwrap().file_path.is_some());
+        // 夹具前提：条目 2 确实被反复重试过（每次「重启」都真的重新发起了下载）。
+        let attempts = calls.lock().unwrap_or_else(|e| e.into_inner()).get(&2).copied().unwrap_or(0);
+        assert!(
+            attempts >= 2,
+            "条目 2 必须被多次重试（实测 {attempts} 次）—— 否则本用例没有在测重启路径"
+        );
     }
 
     /// BUG-181 判据 a：任务 1 在跑时入队任务 2，`/api/tg/cache/tasks` 必须同时给出
