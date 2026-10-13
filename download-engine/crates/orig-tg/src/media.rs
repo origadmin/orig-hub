@@ -1143,6 +1143,15 @@ pub struct SeriesView {
     /// （video 实测 404），抽帧只会在控制台刷错误。photo 封面不受此限——图片字节
     /// 由 raw 端点现场代理 TG 缩略图（BUG-049），那正是它唯一的图源。
     pub cover_has_bytes: bool,
+    /// 该剧集**是否至少有一个分集条目已落盘**（BUG-304 / D18）。
+    ///
+    /// 与 `cover_has_bytes` 的区别是判据的**主体**：后者只看封面那一条，
+    /// 于是「封面是张没缓存的图、正片全在」的剧集会被标成「未缓存」——
+    /// 与真实可播性不等价（用户报的「视频里居然存在未缓存」正是这条）。
+    /// 本字段回答的是「这部剧里有没有东西」，成品列表据此过滤。
+    ///
+    /// 谓词同样是 `file_path IS NOT NULL`（缓存承诺），理由见 `ItemQuery::has_bytes`。
+    pub has_bytes: bool,
     pub tags: Vec<TagRef>,
 }
 
@@ -1370,7 +1379,24 @@ pub struct ItemQuery {
     /// 仅返回属于该剧集的内容。
     pub series_id: Option<i64>,
     /// true = 仅返回**未归入任何剧集**的内容（散片）。
+    ///
+    /// 口径 = [`ZERO_CLAIM_SQL`]（三张认领表全空），与
+    /// [`Store::reconcile_unfiled_items`] 的归集范围逐字一致 —— 只看
+    /// `media_episode` 会把挂图（BUG-168）与备用源（BUG-039）误报成孤儿
+    /// （BUG-296 根因③）。
     pub unassigned: bool,
+    /// true = 仅返回**已落盘**（`file_path` 非空）的内容。
+    ///
+    /// **口径说明（BUG-304 / D18）**：文件域是「真的内容」，无字节条目不得出现在成品列表里。
+    /// 这里用 `file_path IS NOT NULL` 作过滤谓词，而不是 `probe_cached_bytes()` ——
+    /// 后者要逐条 stat，无法进 SQL，也就无法与 `count_media_items` 用同一条件
+    /// （`total` 与实际列表会各说各话，分页随之错位）。
+    ///
+    /// 它是**缓存承诺**而非字节真值：`file_path` 非空但文件被外部删除时，本过滤会放行。
+    /// 那种情况下**展示层仍以 `probe_cached_bytes` 为准**（`bytes_presence=Missing`，
+    /// 卡片走 BUG-080 的「缓存已清理 + 重新缓存」占位）—— 即 BUG-132 的裁定没有被推翻：
+    /// 真值只有一个（probe），本字段只决定**是否进入成品列表**。
+    pub has_bytes: bool,
     /// 排序：recent（默认）/ title / duration / size。
     pub sort: Option<String>,
     pub limit: u32,
@@ -1457,6 +1483,42 @@ fn order_by(sort: Option<&str>) -> &'static str {
     }
 }
 
+/// 「零认领」（未归档）谓词 —— **三张认领表全空**才算（BUG-304 / D18）。
+///
+/// 为什么不能只查 `media_episode`：集级挂图（`media_episode_image`，BUG-168）与
+/// 备用来源（`media_episode_source`，BUG-039）**也是认领**——只看一张表会把它们
+/// 误报成孤儿（BUG-296 根因③、BUG-255 同源：只看一张表就下结论）。
+///
+/// 本常量是**唯一真源**：`list_media_items` / `count_media_items` 的 `unassigned`
+/// 过滤与 [`Store::reconcile_unfiled_items`] 的归集范围必须逐字一致 ——
+/// 否则「查出来还有 N 条」与「归集范围是另外一批」各说各话，
+/// 「永远不存在未归档」这句不变量就无从检验。
+///
+/// 调用方包一层括号使用：`AND (?N IS NULL OR ({ZERO_CLAIM_SQL}))`。
+/// 表别名固定为 `i`（`media_item`）。
+pub(crate) const ZERO_CLAIM_SQL: &str = "NOT EXISTS (SELECT 1 FROM media_episode e WHERE e.item_id = i.id)
+                     AND NOT EXISTS (SELECT 1 FROM media_episode_image m WHERE m.item_id = i.id)
+                     AND NOT EXISTS (SELECT 1 FROM media_episode_source x WHERE x.item_id = i.id)";
+
+/// 归集孤儿条目时给新建剧集起名（BUG-304 / D18）。
+///
+/// 优先取条目自己的标题 —— 那是用户能认出的东西。空标题时才给可辨识兜底，
+/// 并且**如实说明这是哪一条**（`未命名视频 #12`），不是「拿内部标识伪装标题」
+/// （BUG-154 的裁定针对的是后者：把 `chat:msg` 或文件名当标题展示）。
+fn fallback_series_title(title: &str, kind: &str, item_id: i64) -> String {
+    let t = title.trim();
+    if !t.is_empty() {
+        return t.to_string();
+    }
+    let label = match kind {
+        "video" => "视频",
+        "photo" => "图片",
+        "audio" => "音频",
+        _ => "内容",
+    };
+    format!("未命名{label} #{item_id}")
+}
+
 // ────────────────────────────── Store 扩展 ──────────────────────────────
 
 impl Store {
@@ -1470,13 +1532,16 @@ impl Store {
         } else {
             None
         };
+        // BUG-304 / D18：`has_bytes` ⇒ 只列已落盘条目（成品列表不列无字节）。
+        let has_bytes = if q.has_bytes { Some(1i64) } else { None };
         let sql = format!(
             "{ITEM_SELECT}
              WHERE (?1 IS NULL OR i.kind = ?1)
                AND (?2 IS NULL OR i.title LIKE '%' || ?2 || '%')
                AND (?3 IS NULL OR i.id IN (SELECT item_id FROM media_item_tag WHERE tag_id = ?3))
                AND (?4 IS NULL OR i.id IN (SELECT item_id FROM media_episode WHERE series_id = ?4))
-               AND (?5 IS NULL OR i.id NOT IN (SELECT item_id FROM media_episode))
+               AND (?5 IS NULL OR ({ZERO_CLAIM_SQL}))
+               AND (?8 IS NULL OR i.file_path IS NOT NULL)
              ORDER BY {}
              LIMIT ?6 OFFSET ?7",
             order_by(q.sort.as_deref())
@@ -1491,6 +1556,7 @@ impl Store {
                 unassigned,
                 limit,
                 q.offset,
+                has_bytes,
             ])
             .await?;
         let mut out = Vec::new();
@@ -1504,22 +1570,27 @@ impl Store {
     }
 
     /// 统计满足同样过滤条件的总数（分页用）。
+    ///
+    /// **必须与 `list_media_items` 用逐字相同的谓词** —— 否则 `total` 与列表各说各话
+    /// （BUG-304 新增 `has_bytes` 时同规补上）。
     pub async fn count_media_items(&self, q: &ItemQuery) -> libsql::Result<i64> {
         let unassigned = if q.unassigned && q.series_id.is_none() {
             Some(1i64)
         } else {
             None
         };
+        let has_bytes = if q.has_bytes { Some(1i64) } else { None };
         let stmt = self
             .conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT COUNT(*) FROM media_item i
                   WHERE (?1 IS NULL OR i.kind = ?1)
                     AND (?2 IS NULL OR i.title LIKE '%' || ?2 || '%')
                     AND (?3 IS NULL OR i.id IN (SELECT item_id FROM media_item_tag WHERE tag_id = ?3))
                     AND (?4 IS NULL OR i.id IN (SELECT item_id FROM media_episode WHERE series_id = ?4))
-                    AND (?5 IS NULL OR i.id NOT IN (SELECT item_id FROM media_episode))",
-            )
+                    AND (?5 IS NULL OR ({ZERO_CLAIM_SQL}))
+                    AND (?6 IS NULL OR i.file_path IS NOT NULL)"
+            ))
             .await?;
         let mut rows = stmt
             .query(params![
@@ -1528,6 +1599,7 @@ impl Store {
                 q.tag_id,
                 q.series_id,
                 unassigned,
+                has_bytes,
             ])
             .await?;
         match rows.next().await? {
@@ -1934,7 +2006,14 @@ impl Store {
                           (SELECT (i.file_path IS NOT NULL) FROM media_episode e JOIN media_item i ON i.id = e.item_id
                             WHERE e.series_id = s.id
                             ORDER BY e.season, e.episode_no, e.id LIMIT 1),
-                          0)
+                          0),
+                        -- BUG-304 / D18：该剧集**是否至少有一个分集条目已落盘**。
+                        -- 与上一列（cover_has_bytes）的**主体**不同：后者只看封面那一条，
+                        -- 「封面是张没缓存的图、正片全在」会被标成「未缓存」，与真实可播性
+                        -- 不等价（用户报的「视频里居然存在未缓存」）。成品列表按本列过滤。
+                        EXISTS(
+                          SELECT 1 FROM media_episode e JOIN media_item i ON i.id = e.item_id
+                           WHERE e.series_id = s.id AND i.file_path IS NOT NULL)
                    FROM media_series s
                   WHERE (?1 IS NULL
                          OR s.id IN (SELECT series_id FROM media_series_tag WHERE tag_id = ?1))
@@ -1963,6 +2042,7 @@ impl Store {
                 video_count: r.get(13)?,
                 photo_count: r.get(14)?,
                 cover_has_bytes: r.get::<i64>(15)? != 0,
+                has_bytes: r.get::<i64>(16)? != 0,
                 tags: Vec::new(),
             });
         }
@@ -3658,6 +3738,187 @@ impl Store {
         }
     }
 
+    /// 给一批条目补剧集归属（**幂等**）。返回 `(新建剧集数, 挂上槽位数)`。
+    ///
+    /// ## 为什么需要它（BUG-304 / D18，2026-10-14 用户拍板）
+    ///
+    /// 用户口径：**视频 = 剧集，单集必然是一个单集剧集**。于是「有条目、无剧集归属」
+    /// 不是一种正常态，而是**缺陷症状** —— 把它做成一等入口（原 D13-③「新增未归档口」）
+    /// 等于把缺陷固化成功能。机制层见 **BUG-296**（三条入库路径里只有
+    /// `IngestCtx::ensure_series` 建剧；`register_media_item_t0` 与 `import_media_items`
+    /// 不建，且 worker 在走到第 k 条之前结束就留下永久孤儿）。
+    ///
+    /// ## 幂等键必须与自动路径**同一把**
+    ///
+    /// `tg` 条目从 `cache_task` 反查它属于哪个任务，用与 `ensure_series` **逐字相同**的键
+    /// （`tg:group:{chat}:{group_id}`，无 group 时退化 `tg:msgs:{chat}:{首条}`）。
+    /// 用另一把键（例如一律 `item:{id}`）会让同一条内容在自动路径重建时**裂成两个剧集**
+    /// —— 正是 BUG-292 的形态。其余来源（`local` / `http` / …）用 `item:{id}`：
+    /// 一次导入就是**一个单集剧集**（用户口径的直接翻译）。
+    ///
+    /// ## 与 BUG-126 墓碑的关系
+    ///
+    /// 槽位追加走 [`Store::append_episodes_ranged`]，它自带墓碑拦截（用户显式摘除过的内容
+    /// 不会被自动路径编回）。若因此**一条都没挂上**且剧集是本次新建的，则把空壳回滚 ——
+    /// 不留「为了归集而造出来的空剧集」。
+    pub async fn file_items_into_series(&self, item_ids: &[i64]) -> libsql::Result<(i64, i64)> {
+        if item_ids.is_empty() {
+            return Ok((0, 0));
+        }
+        let index = self.cache_task_msg_index().await?;
+        let mut created = 0i64;
+        let mut attached = 0i64;
+        for &item_id in item_ids {
+            // 条目事实（source / ref / title / kind）。
+            let Some(row) = self
+                .row_opt(
+                    "SELECT source, ref, title, kind FROM media_item WHERE id = ?1",
+                    params![item_id],
+                )
+                .await?
+            else {
+                continue;
+            };
+            let source: String = row.get(0)?;
+            let ref_key: String = row.get(1)?;
+            let title: String = row.get(2)?;
+            let kind: String = row.get(3)?;
+            let key = if source == "tg" {
+                match crate::routes::parse_tg_ref(&ref_key) {
+                    Some((chat, msg)) => match index.get(&(chat, msg)) {
+                        Some((Some(group), _)) => format!("tg:group:{chat}:{group}"),
+                        Some((None, first)) => format!("tg:msgs:{chat}:{first}"),
+                        // 不在任何任务里（客户端直传 / 老数据）：退化成「这一条自己一组」。
+                        None => format!("tg:msgs:{chat}:{msg}"),
+                    },
+                    None => format!("item:{item_id}"),
+                }
+            } else {
+                format!("item:{item_id}")
+            };
+            let (sid, fresh) = match self.find_series_by_source_key(&key).await? {
+                Some(sid) => (sid, false),
+                None => {
+                    let name = fallback_series_title(&title, &kind, item_id);
+                    match self.create_series(&name, None, "series", None, Some(&key)).await {
+                        Ok(sid) => {
+                            created += 1;
+                            (sid, true)
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            };
+            match self.append_episodes_ranged(sid, 1, &[(item_id, None)]).await {
+                Ok(0) if fresh => {
+                    // 墓碑拦下了它 —— 空壳没有存在理由（用户摘除的语义优先）。
+                    let _ = self.delete_series(sid).await;
+                    created -= 1;
+                }
+                Ok(n) => attached += n,
+                Err(_) => {
+                    if fresh {
+                        let _ = self.delete_series(sid).await;
+                        created -= 1;
+                    }
+                }
+            }
+        }
+        Ok((created, attached))
+    }
+
+    /// 找出**零认领**条目并把其中的**可分集条目**（video/photo）补进剧集。
+    /// 返回 `(可分集候选数, 新建剧集数, 挂上槽位数, 跳过的非可分集条目数)`。
+    ///
+    /// 「零认领」= 三张认领表**全空**：`media_episode`（分集主条目）、
+    /// `media_episode_image`（集级挂图，BUG-168）、`media_episode_source`（备用源，BUG-039）。
+    /// **只查 `media_episode` 会把挂图与备用源误报成未归档** —— 与 BUG-296 根因③、
+    /// BUG-255 同源（只看一张表就下结论）。
+    ///
+    /// **为什么按 kind 预切**：`media_episode` 有数据库层不变式
+    /// （`trg_media_episode_media_only`：分集条目必须是 video/photo，BUG-044 的入口
+    /// 过滤在 DDL 层的投影）。文档/音频等**永远**挂不上任何剧集 —— 它们的「家」是
+    /// 文件域的分类墙（`cat:doc` / `cat:music`…），不是剧集槽位。不预切的话，
+    /// 每次启动都要为这些条目白建一个剧集再被触发器 ABORT、再回滚（DB churn），
+    /// 且错误被 `Err(_)` 吞掉，只剩日志里一个对不上的数。
+    ///
+    /// 调用点：`Store::open()` 之后（启动自愈）。它使「永远不存在未归档」成为**不变量**
+    /// 而不是一次性清洗 —— 任何路径留下的孤儿，下次启动都会被收进来。
+    pub async fn reconcile_unfiled_items(&self) -> libsql::Result<(i64, i64, i64, i64)> {
+        // 与 `unassigned` 过滤共用同一谓词（ZERO_CLAIM_SQL）：归集范围与
+        // 「查出来的未归档」必须是同一批，否则不变量无从检验。
+        let stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT i.id, i.kind FROM media_item i
+                  WHERE {ZERO_CLAIM_SQL}
+                  ORDER BY i.id"
+            ))
+            .await?;
+        let mut rows = stmt.query(()).await?;
+        let mut episodic = Vec::new();
+        let mut skipped = 0i64;
+        while let Some(r) = rows.next().await? {
+            let id = r.get::<i64>(0)?;
+            let kind: String = r.get(1)?;
+            // 分集条目 = video/photo（与 trg_media_episode_media_only 逐字对齐）。
+            if kind == "video" || kind == "photo" {
+                episodic.push(id);
+            } else {
+                skipped += 1;
+            }
+        }
+        if episodic.is_empty() {
+            return Ok((0, 0, 0, skipped));
+        }
+        let found = episodic.len() as i64;
+        let (created, attached) = self.file_items_into_series(&episodic).await?;
+        Ok((found, created, attached, skipped))
+    }
+
+    /// `(chat_id, message_id) -> (group_id, 该任务的首条 message_id)` 索引。
+    ///
+    /// 用来给孤儿 `tg` 条目找回「它属于哪个相册」，从而与 [`crate::routes`] 里
+    /// `ensure_series` 用**同一把幂等键**。`cache_task.items` 是客户端扫描后发来的
+    /// 消息 id 数组（JSON），在内存里解析 —— 不在 SQL 里 `LIKE` 拼子串：
+    /// `'%1789%'` 会命中 `17890`，那是**静默错配**。
+    ///
+    /// 同一条消息被多个任务包含时（重复入队）：**优先带 group 的那个**（更具体），
+    /// 同为带 group 时取先创建的。
+    async fn cache_task_msg_index(
+        &self,
+    ) -> libsql::Result<std::collections::HashMap<(i64, i64), (Option<i64>, i64)>> {
+        let stmt = self
+            .conn
+            .prepare("SELECT id, chat_id, group_id, items FROM cache_task ORDER BY id ASC")
+            .await?;
+        let mut rows = stmt.query(()).await?;
+        let mut map: std::collections::HashMap<(i64, i64), (Option<i64>, i64)> =
+            std::collections::HashMap::new();
+        while let Some(r) = rows.next().await? {
+            let chat: i64 = r.get(1)?;
+            let group: Option<i64> = r.get(2)?;
+            let items: Option<String> = r.get(3)?;
+            let Some(raw) = items else { continue };
+            let Ok(list) = serde_json::from_str::<Vec<i64>>(&raw) else {
+                continue;
+            };
+            let Some(first) = list.first().copied() else {
+                continue;
+            };
+            for m in list {
+                match map.get(&(chat, m)) {
+                    Some((Some(_), _)) => {}
+                    Some((None, _)) if group.is_none() => {}
+                    _ => {
+                        map.insert((chat, m), (group, first));
+                    }
+                }
+            }
+        }
+        Ok(map)
+    }
+
     /// 移除分集（内容条目保留），并写下「已摘除」墓碑（BUG-126）。
     ///
     /// 墓碑拦住**自动路径**（同组重新缓存 / 自动成剧 / 同步重建）把它重新编回；
@@ -5287,9 +5548,13 @@ mod tests {
             .expect("旧库必须能被新代码打开（迁移顺序错误会让整批建表失败）");
 
         assert_eq!(
-            scalar_i64(&s.conn, "SELECT COUNT(*) FROM media_series").await,
+            scalar_i64(
+                &s.conn,
+                "SELECT COUNT(*) FROM media_series WHERE title = '旧剧集'"
+            )
+            .await,
             1,
-            "迁移不得丢数据"
+            "迁移不得丢数据（按标题点验旧行；总数可能含 BUG-304 启动自愈补建的剧集）"
         );
         assert_eq!(
             scalar_i64(
@@ -5403,9 +5668,13 @@ mod tests {
             .await
             .expect("旧库必须能被新代码打开（迁移失败=回落空库=数据全丢）");
         assert_eq!(
-            scalar_i64(&s.conn, "SELECT COUNT(*) FROM media_series").await,
+            scalar_i64(
+                &s.conn,
+                "SELECT COUNT(*) FROM media_series WHERE title = '旧剧'"
+            )
+            .await,
             1,
-            "迁移不得丢数据"
+            "迁移不得丢数据（按标题点验旧行；总数可能含 BUG-304 启动自愈补建的剧集）"
         );
         assert_eq!(
             scalar_i64(&s.conn, ORPHAN_SOURCE_SQL).await,
@@ -9455,5 +9724,433 @@ mod tests {
         let after = s.episode_slot_occupant(sid, 1, 1).await.unwrap().unwrap();
         assert_eq!(after.item_id, newcomer, "显式覆盖必须生效");
         assert_eq!(after.episode_id, eid, "覆盖落在同一行上（upsert，不是换行）");
+    }
+
+    // ────────────────────────────── BUG-304 / D18 ──────────────────────────────
+    //
+    // 用户 2026-10-14 拍板：「永远不存在未归档，视频=剧集，单集必然是一个单集剧集」。
+    // 本组测试覆盖三件事：`has_bytes` 过滤的 list/count 同谓词、`file_items_into_series`
+    // 的幂等与墓碑语义、`reconcile_unfiled_items` 的「零认领」判定。
+
+    /// BUG-304 判据 3（引擎半）：`has_bytes=true` 必须 **list 与 count 用同一谓词**。
+    ///
+    /// 分页错位只在「列表 2 条 / total 4 条」这种口径分裂时暴露，故两条路径一起断言。
+    /// 反向证伪：把任一条路径的谓词去掉 ⇒ 计数对不上 ⇒ 本测试红。
+    #[tokio::test]
+    async fn list_media_items_has_bytes_filter_is_shared_by_count_bug304() {
+        let s = Store::open(tmp_db("bug304_hasbytes")).await.unwrap();
+        let mut with_bytes = Vec::new();
+        for i in 0..2i64 {
+            let id = s
+                .upsert_media_item(
+                    "local",
+                    &format!("/v/{i}.mp4"),
+                    &format!("有字节{i}"),
+                    "video",
+                    Some("/v/x"),
+                    Some(10),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            with_bytes.push(id);
+        }
+        for i in 2..4i64 {
+            s.upsert_media_item(
+                "local",
+                &format!("/v/{i}.mp4"),
+                &format!("无字节{i}"),
+                "video",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let q = ItemQuery {
+            has_bytes: true,
+            limit: 100,
+            ..Default::default()
+        };
+        let list = s.list_media_items(&q).await.unwrap();
+        let ids: Vec<i64> = list.iter().map(|it| it.id).collect();
+        assert_eq!(ids.len(), 2, "has_bytes=true 只列已落盘条目");
+        for want in &with_bytes {
+            assert!(ids.contains(want), "已落盘条目 {want} 必须在列表里");
+        }
+        assert_eq!(
+            s.count_media_items(&q).await.unwrap(),
+            2,
+            "count 必须与 list 用同一谓词（否则 total 与列表各说各话，分页错位）"
+        );
+        // 缺省不过滤：全量 4 条（老前端不传该参数时行为不变）。
+        let all = s
+            .list_media_items(&ItemQuery {
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 4, "缺省 has_bytes=false 不得过滤");
+    }
+
+    /// BUG-304 任务 1（引擎半）：local 条目归集 = 「一次导入一个单集剧集」，
+    /// 键 `item:{id}`（稳定、幂等）；重复归集不得裂剧集、不得重复挂槽。
+    #[tokio::test]
+    async fn file_items_into_series_local_item_is_idempotent_bug304() {
+        let s = Store::open(tmp_db("bug304_local_idem")).await.unwrap();
+        let id = s
+            .upsert_media_item(
+                "local",
+                "/v/甲.mp4",
+                "甲",
+                "video",
+                Some("/v/甲.mp4"),
+                Some(10),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let (created, attached) = s.file_items_into_series(&[id]).await.unwrap();
+        assert_eq!((created, attached), (1, 1), "首次归集：建 1 剧集、挂 1 槽");
+        let sid = s
+            .find_series_by_source_key(&format!("item:{id}"))
+            .await
+            .unwrap()
+            .expect("键必须是 item:{id}（与导入/自愈同一把）");
+        // 幂等：再跑两次都不新建、不重复。
+        for round in 0..2 {
+            let (c, a) = s.file_items_into_series(&[id]).await.unwrap();
+            assert_eq!((c, a), (0, 0), "第 {round} 次重复归集必须全部为 0");
+        }
+        assert_eq!(
+            s.count_one(
+                "SELECT COUNT(*) FROM media_episode WHERE series_id = ?1 AND item_id = ?2",
+                params![sid, id],
+            )
+            .await
+            .unwrap(),
+            1,
+            "同一条目不得被编成两集"
+        );
+        assert_eq!(
+            s.count_one("SELECT COUNT(*) FROM media_series", ())
+                .await
+                .unwrap(),
+            1,
+            "幂等归集不得留下第二个剧集"
+        );
+    }
+
+    /// BUG-126 × BUG-304：用户摘除过的内容，**自动归集也不得把它编回** ——
+    /// 含「剧集已被剪枝后按 key 重建」这条隐蔽路径（墓碑带 source_key 快照，
+    /// 跨剪枝存活）。反向证伪：去掉墓碑拦截 ⇒ 第 3 步 attached=1 ⇒ 红。
+    #[tokio::test]
+    async fn file_items_into_series_respects_tombstone_across_prune_bug304() {
+        let s = Store::open(tmp_db("bug304_tombstone")).await.unwrap();
+        let id = s
+            .upsert_media_item("local", "/v/乙.mp4", "乙", "video", Some("/v/乙.mp4"), Some(10), None, None)
+            .await
+            .unwrap();
+        let (created, attached) = s.file_items_into_series(&[id]).await.unwrap();
+        assert_eq!((created, attached), (1, 1));
+        let eid = s
+            .count_one(
+                "SELECT id FROM media_episode WHERE item_id = ?1",
+                params![id],
+            )
+            .await
+            .unwrap();
+        // 用户显式摘除（remove_episode 自带墓碑 + 空剧集剪枝）。
+        s.remove_episode(eid).await.unwrap();
+        // 剧集已被剪枝（该集是最后一集）⇒ 只剩带键墓碑。
+        assert_eq!(
+            s.find_series_by_source_key(&format!("item:{id}"))
+                .await
+                .unwrap(),
+            None,
+            "空剧集应已被剪枝"
+        );
+        // 自动路径按同一把键重建 ⇒ 墓碑按 source_key 命中 ⇒ 槽挂不上
+        // ⇒ 新建的空壳剧集必须回滚（不留「为了归集而造出来的空剧集」）。
+        let (created2, attached2) = s.file_items_into_series(&[id]).await.unwrap();
+        assert_eq!(
+            (created2, attached2),
+            (0, 0),
+            "摘除过的内容不得被自动归集编回"
+        );
+        assert_eq!(
+            s.find_series_by_source_key(&format!("item:{id}"))
+                .await
+                .unwrap(),
+            None,
+            "回滚后不得留下空壳剧集"
+        );
+        assert_eq!(
+            s.count_one("SELECT COUNT(*) FROM media_series", ())
+                .await
+                .unwrap(),
+            0,
+            "全库不应存在任何剧集"
+        );
+    }
+
+    /// BUG-304 任务 3（引擎半）：tg 条目归集必须用与 `IngestCtx::ensure_series`
+    /// **逐字相同**的幂等键（`tg:group:{chat}:{group}`）—— 用另一把键会让同一条
+    /// 内容在 worker 走到时裂成两个剧集（BUG-292 形态）。
+    #[tokio::test]
+    async fn file_items_into_series_tg_item_uses_cache_task_group_key_bug304() {
+        let s = Store::open(tmp_db("bug304_tg_key")).await.unwrap();
+        let now = now_secs();
+        // 直接插一条 cache_task（不 spawn worker）：chat=777、group=99、两条消息。
+        s.conn
+            .execute(
+                "INSERT INTO cache_task (chat_id, group_id, item_key, items, total, done, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 2, 0, 'queued', ?5, ?5)",
+                params![777i64, 99i64, "g:777:99:bug304", "[501, 502]", now],
+            )
+            .await
+            .unwrap();
+        let id1 = s
+            .upsert_media_item("tg", "777:501", "组内视频", "video", Some("/v/1"), Some(10), None, None)
+            .await
+            .unwrap();
+        let id2 = s
+            .upsert_media_item("tg", "777:502", "组内图片", "photo", Some("/v/2"), Some(10), None, None)
+            .await
+            .unwrap();
+        let (created, attached) = s.file_items_into_series(&[id1, id2]).await.unwrap();
+        assert_eq!(
+            (created, attached),
+            (1, 2),
+            "同组两条目应进同一个剧集（相册组 = 一个剧集）"
+        );
+        let sid = s
+            .find_series_by_source_key("tg:group:777:99")
+            .await
+            .unwrap()
+            .expect("键必须是 tg:group:{chat}:{group}（与 ensure_series 同一把）");
+        for id in [id1, id2] {
+            assert_eq!(
+                s.count_one(
+                    "SELECT COUNT(*) FROM media_episode WHERE series_id = ?1 AND item_id = ?2",
+                    params![sid, id],
+                )
+                .await
+                .unwrap(),
+                1,
+                "条目 {id} 必须挂在组剧集里"
+            );
+        }
+        // 第二条目再次归集（模拟自愈重复跑）⇒ 幂等。
+        let (c, a) = s.file_items_into_series(&[id2]).await.unwrap();
+        assert_eq!((c, a), (0, 0));
+    }
+
+    /// BUG-304 判据 1（引擎半）：「零认领」的判定必须看**三张**认领表 ——
+    /// 只查 `media_episode` 会把「挂图 / 备用源」误报成未归档（BUG-296 根因③、
+    /// BUG-255 同源：只看一张表就下结论）。
+    #[tokio::test]
+    async fn reconcile_unfiled_items_counts_only_zero_claim_items_bug304() {
+        let s = Store::open(tmp_db("bug304_reconcile")).await.unwrap();
+        // A：真正零认领（应被找出并归集）。
+        let a = s
+            .upsert_media_item("local", "/v/散片.mp4", "散片", "video", Some("/v/散片.mp4"), Some(10), None, None)
+            .await
+            .unwrap();
+        // B：已是分集主条目（media_episode 认领）。
+        let b = s
+            .upsert_media_item("local", "/v/正片.mp4", "正片", "video", Some("/v/正片.mp4"), Some(10), None, None)
+            .await
+            .unwrap();
+        // C：只是某集的挂图（media_episode_image 认领，BUG-168）。
+        let c = s
+            .upsert_media_item("local", "/v/封面.jpg", "封面", "photo", Some("/v/封面.jpg"), Some(10), None, None)
+            .await
+            .unwrap();
+        // D：只是某集的备用来源（media_episode_source 认领，BUG-039）。
+        let d = s
+            .upsert_media_item("local", "/v/备用.mp4", "备用", "video", Some("/v/备用.mp4"), Some(10), None, None)
+            .await
+            .unwrap();
+        let sid = s.create_series("宿主剧", None, "series", None, None).await.unwrap();
+        let eid = s.add_episode(sid, b, 1, 1).await.unwrap();
+        s.add_episode_image(eid, c).await.unwrap();
+        s.attach_episode_source(eid, d).await.unwrap();
+
+        let (found, created, attached, skipped) = s.reconcile_unfiled_items().await.unwrap();
+        assert_eq!((found, skipped), (1, 0), "只有 A 是零认领；B/C/D 各有一张认领表；A 是 video（可分集）");
+        assert_eq!((created, attached), (1, 1), "A 应被归集成一个单集剧集");
+        // A 必须真的落进 `item:{id}` 键的剧集（不只是计数对）。
+        let a_sid = s
+            .find_series_by_source_key(&format!("item:{a}"))
+            .await
+            .unwrap()
+            .expect("A 应被归集进 item:{id} 键的剧集");
+        assert_eq!(
+            s.count_one(
+                "SELECT COUNT(*) FROM media_episode WHERE series_id = ?1 AND item_id = ?2",
+                params![a_sid, a],
+            )
+            .await
+            .unwrap(),
+            1,
+            "A 必须真的挂在剧集槽位上"
+        );
+        // A 归集后不再零认领 ⇒ 再跑一次 found=0（幂等，也是「不变量」的表述）。
+        let (found2, _c2, _a2, _s2) = s.reconcile_unfiled_items().await.unwrap();
+        assert_eq!(found2, 0, "归集后不得再报未归档（幂等）");
+        // B/C/D 未被移动：仍在原槽位 / 原挂图 / 原备用源上。
+        assert_eq!(
+            s.count_one(
+                "SELECT COUNT(*) FROM media_episode WHERE series_id = ?1 AND item_id = ?2",
+                params![sid, b],
+            )
+            .await
+            .unwrap(),
+            1,
+            "B 不得被归集逻辑搬走"
+        );
+        assert_eq!(
+            s.count_one(
+                "SELECT COUNT(*) FROM media_episode_image WHERE item_id = ?1",
+                params![c],
+            )
+            .await
+            .unwrap(),
+            1,
+            "C 的挂图认领不得被误判为未归档"
+        );
+        assert_eq!(
+            s.count_one(
+                "SELECT COUNT(*) FROM media_episode_source WHERE item_id = ?1",
+                params![d],
+            )
+            .await
+            .unwrap(),
+            1,
+            "D 的备用源认领不得被误判为未归档"
+        );
+    }
+
+    /// 非可分集 kind（文档/音频…）必须被**预先跳过**，而不是尝试后被触发器
+    /// ABORT 再回滚 —— `trg_media_episode_media_only` 决定它们永远挂不上剧集，
+    /// 它们的「家」是文件域分类墙。反向证伪：去掉 kind 预切 ⇒ found=2（把 file
+    /// 也算进候选）⇒ 本测试红。
+    #[tokio::test]
+    async fn reconcile_skips_non_episodic_kinds_bug304() {
+        let s = Store::open(tmp_db("bug304_nonepisodic")).await.unwrap();
+        let video = s
+            .upsert_media_item("local", "/v/a.mp4", "可归集", "video", Some("/v/a.mp4"), Some(10), None, None)
+            .await
+            .unwrap();
+        let doc = s
+            .upsert_media_item("local", "/v/a.pdf", "文档", "file", Some("/v/a.pdf"), Some(10), None, None)
+            .await
+            .unwrap();
+        let (found, created, attached, skipped) = s.reconcile_unfiled_items().await.unwrap();
+        assert_eq!(
+            (found, skipped),
+            (1, 1),
+            "只有 video/photo 进候选；file 记入 skipped，不尝试"
+        );
+        assert_eq!((created, attached), (1, 1), "video 正常归集");
+        // 文档不得被塞进任何剧集，也不得留下为它造的空壳剧集。
+        assert_eq!(
+            s.count_one(
+                "SELECT COUNT(*) FROM media_episode WHERE item_id = ?1",
+                params![doc],
+            )
+            .await
+            .unwrap(),
+            0,
+            "文档不是分集条目（trg_media_episode_media_only）"
+        );
+        assert_eq!(
+            s.count_one("SELECT COUNT(*) FROM media_series", ())
+                .await
+                .unwrap(),
+            1,
+            "不得为文档留下空壳剧集（只有 video 的那一个）"
+        );
+        let _ = video;
+    }
+
+    /// 兜底标题必须**如实说明这是哪一条**（`未命名视频 #12`），而不是拿内部标识
+    /// 伪装标题（BUG-154 裁定的是后者）。
+    #[test]
+    fn fallback_series_title_is_identifiable_bug304() {
+        assert_eq!(fallback_series_title("真实标题", "video", 12), "真实标题");
+        assert_eq!(fallback_series_title("  真实标题  ", "video", 12), "真实标题");
+        assert_eq!(fallback_series_title("", "video", 12), "未命名视频 #12");
+        assert_eq!(fallback_series_title("  ", "photo", 7), "未命名图片 #7");
+        assert_eq!(fallback_series_title("", "audio", 7), "未命名音频 #7");
+        assert_eq!(fallback_series_title("", "file", 7), "未命名内容 #7");
+    }
+
+    /// BUG-304 判据 1（查询半）：`unassigned=true` 必须报**三表全空**的条目 ——
+    /// 只查 `media_episode` 会把挂图 / 备用源误报成「未归档」（BUG-296 根因③）。
+    /// 反向证伪：谓词退回单表形态 ⇒ 挂图条目被报出来 ⇒ 本测试红。
+    #[tokio::test]
+    async fn unassigned_query_uses_three_table_zero_claim_bug304() {
+        let s = Store::open(tmp_db("bug304_unassigned")).await.unwrap();
+        // 宿主剧集 + 一集。
+        let host = s
+            .upsert_media_item("local", "/v/正片.mp4", "正片", "video", Some("/v/正片.mp4"), Some(10), None, None)
+            .await
+            .unwrap();
+        let sid = s.create_series("宿主", None, "series", None, None).await.unwrap();
+        let eid = s.add_episode(sid, host, 1, 1).await.unwrap();
+        // 挂图条目（只进 media_episode_image）与备用源条目（只进 media_episode_source）。
+        let img = s
+            .upsert_media_item("local", "/v/图.jpg", "图", "photo", Some("/v/图.jpg"), Some(10), None, None)
+            .await
+            .unwrap();
+        let alt = s
+            .upsert_media_item("local", "/v/备.mp4", "备", "video", Some("/v/备.mp4"), Some(10), None, None)
+            .await
+            .unwrap();
+        s.add_episode_image(eid, img).await.unwrap();
+        s.attach_episode_source(eid, alt).await.unwrap();
+        // 真孤儿：三张表全空。
+        let orphan = s
+            .upsert_media_item("local", "/v/孤儿.mp4", "孤儿", "video", Some("/v/孤儿.mp4"), Some(10), None, None)
+            .await
+            .unwrap();
+
+        let q = ItemQuery {
+            unassigned: true,
+            limit: 100,
+            ..Default::default()
+        };
+        let ids: Vec<i64> = s
+            .list_media_items(&q)
+            .await
+            .unwrap()
+            .iter()
+            .map(|it| it.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![orphan],
+            "unassigned 只报三表全空的条目；挂图/备用源已有归属，不是孤儿"
+        );
+        assert_eq!(
+            s.count_media_items(&q).await.unwrap(),
+            1,
+            "count 与 list 必须同一谓词"
+        );
+        // 归集之后 ⇒ 查询归零（这就是判据 1 的「total = 0」）。
+        let (found, ..) = s.reconcile_unfiled_items().await.unwrap();
+        assert_eq!(found, 1, "归集范围必须正好是查出来的那一条");
+        assert_eq!(
+            s.list_media_items(&q).await.unwrap().len(),
+            0,
+            "归集后不得再报未归档（不变量）"
+        );
     }
 }

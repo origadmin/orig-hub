@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { CloudOff, Film, Image as ImageIcon, Trash2 } from 'lucide-react'
+import { Film, Image as ImageIcon, Trash2 } from 'lucide-react'
 import type { MediaSeries, MediaTag } from '../../api/media'
 import { mediaItemUrl, seriesKindLabelKey } from '../../api/media'
 import { coverFit } from '../../lib/mediaSources'
@@ -200,19 +200,15 @@ export function SeriesCard(props: {
         <span className="absolute left-1 top-1 rounded bg-accent/90 px-1.5 py-0.5 text-[10px] font-semibold text-white">
           {kindLabel(series.kind)}
         </span>
-        {/* BUG-254：封面条目无字节（coverHasBytes === false）时给出可见标记，
-            与 BUG-250 的 no-bytes 视觉语言一致（CloudOff + amber）。老后端不下发该字段时
-            coverHasBytes 为 undefined，按「可能有字节」处理，不显示标记。 */}
-        {series.coverHasBytes === false ? (
-          <span
-            className="absolute right-1 top-1 flex items-center gap-0.5 rounded bg-black/75 px-1 py-0.5 text-[10px] font-semibold text-amber-500"
-            title={t('media.notCached')}
-            data-testid="series-nobytes"
-          >
-            <CloudOff className="h-3 w-3" />
-            {t('media.notCached')}
-          </span>
-        ) : null}
+        {/* BUG-304 / D18（修订 BUG-254 的呈现）：剧集卡**不再**出现「未缓存」标。
+            口径：文件域是「真的内容」，没有任何分集落盘的剧集**根本不进列表**
+            （过滤在 `MediaLibraryPanel.loadSeries`，判据是后端的 `hasBytes`）。
+            于是「标了未缓存却仍在列表里」这一自相矛盾的状态不可能再出现 ——
+            用户原话：「当前视频中居然存在未缓存,既然没有为什么在里面?」
+            注意判据的**主体**变了：原 `coverHasBytes` 只看封面那一条，
+            「封面是张没缓存的图、正片全在」会被误标；新过滤看的是「有没有任何内容」。
+            `coverHasBytes` 本身**仍然有效且仍在用** —— 它决定能否对 video 封面抽帧
+            （见下方封面渲染分支），只是不再驱动这个角标。 */}
         <span
           className="absolute bottom-1 right-1 rounded bg-black/75 px-1 text-[10px] text-white"
           data-testid="series-video-count"

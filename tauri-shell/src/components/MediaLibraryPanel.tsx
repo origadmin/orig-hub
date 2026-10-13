@@ -432,6 +432,9 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
         kind: tab === 'all' ? '' : tab,
         q: search.trim() || undefined,
         tagId: activeTagId ?? undefined,
+        // BUG-304 / D18：文件域是「真的内容」—— 只列已落盘条目。
+        // 过滤在服务端（见 `MediaListQuery.hasBytes` 的说明），与 `total` 同源。
+        hasBytes: true,
         sort,
         limit: PAGE,
         offset: 0,
@@ -451,9 +454,19 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts }: Props = {}
   const loadSeries = useCallback(async () => {
     try {
       const list = await cached(cacheKey.seriesList(activeTagId), () => listSeries(activeTagId))
-      setSeries(list)
+      /*
+       * BUG-304 / D18：文件域只列**有内容**的剧集。
+       * 判据是 `hasBytes`（后端：至少一个分集条目已落盘），不是 `coverHasBytes`
+       * ——后者只看封面那一条，「封面是张没缓存的图、正片全在」会被误杀。
+       *
+       * 老后端不下发 `hasBytes`（undefined）⇒ **不过滤**：字段缺失不等于「没有字节」，
+       * 因缺字段把整库清空比多显示几条危险得多（同 `coverHasBytes` 的兼容策略）。
+       */
+      const visible = list.filter((s) => s.hasBytes !== false)
+      setSeries(visible)
       // 无筛选时「显示数 == 总数」，顺手校正徽标（新增/删除剧集后不必整页刷新）。
-      if (activeTagId == null) setSeriesTotal(list.length)
+      // 徽标与列表**同源**（BUG-125 / BUG-133：不许两处各算一套）。
+      if (activeTagId == null) setSeriesTotal(visible.length)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }

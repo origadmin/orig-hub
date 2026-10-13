@@ -156,6 +156,17 @@ export interface MediaSeries {
    * 保持既有行为不变。
    */
   coverHasBytes?: boolean
+  /**
+   * 该剧集**是否至少有一个分集条目已落盘**（BUG-304 / D18）。
+   *
+   * 与 `coverHasBytes` 的**主体**不同：后者只看封面那一条 —— 「封面是张没缓存的图、
+   * 正片全在」的剧集会被判 false，与真实可播性不等价。本字段回答「这部剧里有没有东西」，
+   * 成品列表据此过滤（文件域只列有字节内容）。
+   *
+   * 老后端不下发该字段时为 `undefined`，前端按「可能有字节」处理（不过滤）——
+   * 与 `coverHasBytes` 的兼容策略一致：宁可多显示，也不要因为字段缺失把库清空。
+   */
+  hasBytes?: boolean
   tags: MediaTag[]
 }
 
@@ -303,6 +314,13 @@ export interface MediaListQuery {
   tagId?: number
   seriesId?: number
   unassigned?: boolean
+  /**
+   * 只列**已落盘**条目（BUG-304 / D18：文件域只列成品）。
+   *
+   * 过滤在**服务端**做，而不是拿 `bytesPresence` 在客户端筛 ——
+   * 客户端筛会让「本页 N 条」与 `total` 各说各话，分页随之错位。
+   */
+  hasBytes?: boolean
   sort?: 'recent' | 'oldest' | 'title' | 'duration' | 'size'
   limit?: number
   offset?: number
@@ -370,7 +388,11 @@ export function mediaListParams(q: MediaListQuery = {}): string {
   if (q.q) sp.set('q', q.q)
   if (q.tagId !== undefined) sp.set('tagId', String(q.tagId))
   if (q.seriesId !== undefined) sp.set('seriesId', String(q.seriesId))
-  if (q.unassigned) sp.set('unassigned', '1')
+  if (q.unassigned) sp.set('unassigned', 'true')
+  // `hasBytes` 在后端是 `Option<bool>`（与 `unassigned` 同一契约）：serde_urlencoded
+  // 只认 `true`/`false`，发 `'1'` 会被 400 拒掉（运行时验收实测：
+  // "provided string was not `true` or `false`"）⇒ 整页列表加载失败。
+  if (q.hasBytes) sp.set('hasBytes', 'true')
   if (q.sort) sp.set('sort', q.sort)
   sp.set('limit', String(q.limit ?? 60))
   sp.set('offset', String(q.offset ?? 0))

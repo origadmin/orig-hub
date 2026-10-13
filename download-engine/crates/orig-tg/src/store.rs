@@ -508,7 +508,28 @@ impl Store {
         }
         // 媒体资料库（内容/剧集/标签）：与 TG 流水同库、职责分离。
         crate::media::migrate(&conn).await?;
-        Ok(Self { conn, db_path })
+        let store = Self { conn, db_path };
+        // BUG-304 / D18（用户 2026-10-14 拍板：视频=剧集，永远不存在未归档）：
+        // 启动自愈 —— 把「零认领」条目补进剧集。三条入库路径里只有
+        // `IngestCtx::ensure_series` 建剧（`register_media_item_t0` 与
+        // `import_media_items` 不建，worker 走到第 k 条之前结束就留下永久孤儿，
+        // 机制层见 BUG-296）⇒ 孤儿是**结构必然**，必须在每次启动时收敛，
+        // 否则「未归档」只是被藏起来，没有被消灭。
+        //
+        // 失败**不阻断启动**：归集是自愈，不是字节搬运的前提（同 BUG-246 的
+        // 「登记失败不阻断入队」容错口径）。
+        match store.reconcile_unfiled_items().await {
+            Ok((found, created, attached, skipped)) if found > 0 || skipped > 0 => {
+                eprintln!(
+                    "[store] BUG-304: filed {attached}/{found} episodic zero-claim item(s) into {created} series ({skipped} non-episodic left to their category)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("[store] BUG-304: reconcile_unfiled_items failed (non-fatal): {e}");
+            }
+        }
+        Ok(store)
     }
 
     /// 查询首个结果行；无结果返回 `None`。
@@ -1891,7 +1912,15 @@ mod tests {
     async fn store(name: &str) -> Store {
         let dir = std::env::temp_dir().join(format!("orig_tg_store_{}_{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        Store::open(dir.join("store.db")).await.unwrap()
+        // 清掉可能被 **pid 复用**继承的旧库：本 helper 原先不删文件，Windows 回收
+        // pid 后新进程会打开上一轮留下的、仍带 `queued` 任务的库 ⇒ BUG-220 去重
+        // 测试的「首个应新建」随机红（实测 62 个残留目录全部带 active 任务）。
+        // 与 media.rs tests 的 `tmp_db`（先 remove_file）同一纪律。
+        let db = dir.join("store.db");
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(dir.join("store.db-wal"));
+        let _ = std::fs::remove_file(dir.join("store.db-shm"));
+        Store::open(db).await.unwrap()
     }
 
     #[tokio::test]

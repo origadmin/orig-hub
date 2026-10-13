@@ -3167,7 +3167,7 @@ use crate::media::{
     EpisodeMove, ItemPatch, ItemQuery, SeriesPatch, SERIES_KINDS,
 };
 
-/// `GET /api/media/items?kind=&q=&tagId=&seriesId=&unassigned=&sort=&limit=&offset=`
+/// `GET /api/media/items?kind=&q=&tagId=&seriesId=&unassigned=&hasBytes=&sort=&limit=&offset=`
 #[derive(Deserialize)]
 struct MediaItemsQuery {
     kind: Option<String>,
@@ -3177,6 +3177,9 @@ struct MediaItemsQuery {
     #[serde(rename = "seriesId")]
     series_id: Option<i64>,
     unassigned: Option<bool>,
+    /// BUG-304 / D18：只列已落盘条目（成品列表不列无字节）。缺省 false = 不过滤。
+    #[serde(rename = "hasBytes")]
+    has_bytes: Option<bool>,
     sort: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
@@ -3192,6 +3195,7 @@ async fn list_media_items(
         tag_id: q.tag_id,
         series_id: q.series_id,
         unassigned: q.unassigned.unwrap_or(false),
+        has_bytes: q.has_bytes.unwrap_or(false),
         sort: q.sort,
         limit: q.limit.unwrap_or(60),
         offset: q.offset.unwrap_or(0),
@@ -3431,6 +3435,24 @@ async fn import_media_items(
         ids.push(id);
     }
     st.push_log(&format!("/api/media/items imported {} item(s)", ids.len()));
+    // BUG-304 / D18（用户 2026-10-14 拍板）：导入即成剧 —— 一次导入就是一个
+    // 单集剧集（用户口径「视频 = 剧集」的直接翻译）。此前导入路径只
+    // `upsert_media_item`，local 条目永远拿不到剧集归属（实测 58 条全有字节、
+    // 全无剧），只能等下次进程启动时的自愈补——那期间它们又是「未归档」。
+    // 幂等键与启动自愈同一把（`item:{id}` / tg 组键），重复导入不裂剧集。
+    // 失败不阻断导入响应（与 BUG-246「登记失败不阻断入队」同口径）。
+    match st.store.file_items_into_series(&ids).await {
+        Ok((created, attached)) => {
+            st.push_log(&format!(
+                "/api/media/items: BUG-304 auto-filed {attached} item(s) into {created} new series"
+            ));
+        }
+        Err(e) => {
+            st.push_log(&format!(
+                "/api/media/items: BUG-304 auto-file failed (non-fatal): {e}"
+            ));
+        }
+    }
     Ok(Json(json!({"ids": ids, "count": ids.len()})))
 }
 
