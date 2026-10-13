@@ -1,0 +1,30 @@
+{
+  "bug": "BUG-121",
+  "capturedAt": "2026-10-10T22:16:27.953Z",
+  "appUrl": "http://127.0.0.1:5180/",
+  "tgApi": "http://127.0.0.1:19787",
+  "screenshot": "D:\\workspace\\project\\golang\\origadmin\\framework\\projects\\orig-hub\\tauri-shell\\verify\\evidence\\BUG-121\\01-tg-panel-photo-bubbles.png",
+  "screenshotCacheLabel": "D:\\workspace\\project\\golang\\origadmin\\framework\\projects\\orig-hub\\tauri-shell\\verify\\evidence\\BUG-121\\02-tg-panel-cache-label.png",
+  "wordingSeenOnScreen": {
+    "addLib": [
+      "加入媒体库"
+    ],
+    "cache": [
+      "缓存"
+    ]
+  },
+  "backendFacts": {
+    "channelId": -1001341930464,
+    "photoItems": 16,
+    "tgPhotoItems": 16,
+    "tgPhotosWithBytes": 0,
+    "nonPhotoItems": 44,
+    "nonPhotoWithBytes": 21,
+    "feedVideoMessageIds": [
+      208336,
+      208327
+    ]
+  },
+  "finding": "同一屏同时出现两种措辞（tg.addToLibrary / tg.download），但后端对图片是\"只入库不落盘\"（tgPhotoItems 全为 filePath=null）——两种措辞对应两种真实行为。",
+  "note": "合并为单一措辞前必须先决定后端是否让图片落盘：只改前端措辞会让 UI 对用户撒谎。详见 docs/bugs/BUG-121.md。"
+}

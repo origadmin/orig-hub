@@ -1,0 +1,20 @@
+{
+  "api": {
+    "audios": 0,
+    "diskBytes": 2097152,
+    "diskBytesTruncated": false,
+    "items": 1,
+    "onDiskItems": 1,
+    "photos": 0,
+    "series": 0,
+    "tags": 0,
+    "totalSize": 20971520,
+    "videos": 1
+  },
+  "ui": {
+    "diskText": "占用 2.0 MB",
+    "diskTitle": "占用空间 = 资料库在本机实际占用的磁盘字节（清缓存后会下降）",
+    "registeredText": "· 登记 20.0 MB",
+    "registeredTitle": "登记值 = 内容在源头的大小之和（未落盘/字节已清的内容仍计入），不是本地磁盘占用"
+  }
+}

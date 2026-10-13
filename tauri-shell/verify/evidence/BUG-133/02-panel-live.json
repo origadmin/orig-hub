@@ -1,0 +1,21 @@
+{
+  "ui": {
+    "diskText": "占用 1.7 MB",
+    "diskTitle": "占用空间 = 资料库在本机实际占用的磁盘字节（清缓存后会下降）",
+    "registeredText": "· 登记 28.0 MB",
+    "registeredTitle": "登记值 = 内容在源头的大小之和（未落盘/字节已清的内容仍计入），不是本地磁盘占用",
+    "headerText": "🎬 媒体库 4 项 · 占用 1.7 MB· 登记 28.0 MB 剧集 全部剧集 0 内容（全部 / 散片） 全部内容 4 视频 4 标签 —"
+  },
+  "api": {
+    "audios": 0,
+    "diskBytes": 1740800,
+    "diskBytesTruncated": false,
+    "items": 4,
+    "onDiskItems": 3,
+    "photos": 0,
+    "series": 0,
+    "tags": 0,
+    "totalSize": 29360128,
+    "videos": 4
+  }
+}

@@ -1,0 +1,44 @@
+[endpoints] daemon=http://127.0.0.1:19786 app=http://127.0.0.1:5180 tg=http://127.0.0.1:19788 (tg_port=19788 from http://127.0.0.1:19786/api/config)
+
+=== 面板挂载 + 自动选中首个监控频道（0→3.5s） ===
+window=4s  /api 请求总数=53  peak/s=37
+--- 按 HTTP 方法（OPTIONS=预检） ---
+  {"GET":52,"POST":1}
+--- 按端点族 ---
+     26x  /api/media/items/by-ref
+     13x  /api/tg/thumb/{chat}/{msg}
+      3x  /api/tg/dialogs
+      2x  /health
+      2x  /api/tg/cache/tasks
+      2x  /api/tg/session
+      1x  /api/tg/monitor/channels
+      1x  /api/tg/folders
+      1x  /api/tg/monitor/messages
+      1x  /api/tg/monitor/sync
+      1x  /api/tg/downloaded/{chat}
+--- 逐秒分布 (sec:count) ---
+  0:37  1:15  2:1
+--- 重复 URL（>1 次）共 3 个，Top 12 ---
+     2x  /health
+     2x  /api/tg/cache/tasks
+     2x  /api/tg/session
+--- initiator 归属（脚本栈 url:line:col） ---
+     26x  script :: http://127.0.0.1:5180/src/api/media.ts?t=1791578883220:3:20 request
+     14x  script :: http://127.0.0.1:5180/src/api/tg.ts?t=1791578883220:31:16 request
+     13x  other :: (other)
+[baseline] 面板挂载后（含自动进入频道）请求数=53
+[enter] clicked monitored row「每日沙雕墙」，开始 30s 采样
+[dom] {"imgCount":30,"thumbImgs":30,"albumTiles":13,"photoPreviews":14}
+
+=== 进入「每日沙雕墙」后 30s ===
+window=30s  /api 请求总数=0  peak/s=0
+--- 按 HTTP 方法（OPTIONS=预检） ---
+  {}
+--- 按端点族 ---
+--- 逐秒分布 (sec:count) ---
+  
+--- 重复 URL（>1 次）共 0 个，Top 12 ---
+--- initiator 归属（脚本栈 url:line:col） ---
+
+[VERDICT] /api 总数=0 peak/s=0 重复URL数=0
+PROBE FAILED: [endpoints] 进入「每日沙雕墙」30s: captured 0 requests to orig-tg (http://127.0.0.1:19788). A wrong port produces exactly this "0 traffic" result -- refusing to report it as success. Verify the CDP capture and that the app actually talks to http://127.0.0.1:19788.

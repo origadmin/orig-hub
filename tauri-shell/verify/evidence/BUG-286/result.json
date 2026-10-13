@@ -1,0 +1,127 @@
+{
+  "passed": 24,
+  "total": 24,
+  "all_passed": true,
+  "checks": [
+    {
+      "name": "A0a App 已挂载（#root 有子节点）",
+      "ok": true,
+      "detail": "rootMounted=true"
+    },
+    {
+      "name": "A0b 无 Tauri 上下文成立（__TAURI_INTERNALS__ 已抹除）",
+      "ok": true,
+      "detail": "hasTauri=false stripped=true"
+    },
+    {
+      "name": "A1 设置页 / 下载 tab 可达，且「打开库根文件夹」已渲染",
+      "ok": true,
+      "detail": "exists=true"
+    },
+    {
+      "name": "A4 「浏览…」按钮在网页模式下 disabled（能力边界用禁用表达）",
+      "ok": true,
+      "detail": "browse={\"exists\":true,\"disabled\":true}"
+    },
+    {
+      "name": "A2p 前置：库目录目标路径已就绪（按钮可点）",
+      "ok": true,
+      "detail": "target=\"C:\\\\Users\\\\godcong\\\\AppData\\\\Roaming\\\\com.origadmin.orighub\\\\tg\\\\library\" disabled=false"
+    },
+    {
+      "name": "A2a 点「打开库根文件夹」无 uncaught 异常（含 invoke 指纹）",
+      "ok": true,
+      "detail": "pageErrors=[]"
+    },
+    {
+      "name": "A2b 同一点击无 invoke 控制台报错",
+      "ok": true,
+      "detail": "console=[]"
+    },
+    {
+      "name": "A2c UI 未出现危险 toast（原始异常没有上屏）",
+      "ok": true,
+      "detail": "toast=null"
+    },
+    {
+      "name": "A3 出现内联降级提示且含目标路径（走的是降级，不是沉默）",
+      "ok": true,
+      "detail": "hint=\"网页调试模式不支持打开系统文件夹，路径已复制：C:\\\\Users\\\\godcong\\\\AppData\\\\Roaming\\\\com.origadmin.orighub\\\\tg\\\\library\" target=\"C:\\\\Users\\\\godcong\\\\AppData\\\\Roaming\\\\com.origadmin.orighub\\\\tg\\\\library\""
+    },
+    {
+      "name": "A5p 前置：「打开调试日志目录」可点（daemon 下发了 logs.dir）",
+      "ok": true,
+      "detail": "btn={\"exists\":true,\"disabled\":false} dir=\"C:\\\\Users\\\\godcong\\\\AppData\\\\Roaming\\\\com.origadmin.orighub\\\\logs\""
+    },
+    {
+      "name": "A5a 点「打开调试日志目录」三个通道均无 invoke 报错",
+      "ok": true,
+      "detail": "toast=null console=[] page=[]"
+    },
+    {
+      "name": "A5b 日志入口同样给出含路径的降级提示",
+      "ok": true,
+      "detail": "hint=\"网页调试模式不支持打开系统文件夹，路径已复制：C:\\\\Users\\\\godcong\\\\AppData\\\\Roaming\\\\com.origadmin.orighub\\\\logs\" dir=\"C:\\\\Users\\\\godcong\\\\AppData\\\\Roaming\\\\com.origadmin.orighub\\\\logs\""
+    },
+    {
+      "name": "C1a 注入前：浏览按钮处于网页模式禁用态",
+      "ok": true,
+      "detail": "disabled=true"
+    },
+    {
+      "name": "C1b 注入后触发可见性事件 ⇒ 浏览按钮转为可用（不冻结在首帧判定）",
+      "ok": true,
+      "detail": "hasTauri=true disabled=false"
+    },
+    {
+      "name": "B0 桌面模式上下文成立（IPC 桥已注入）",
+      "ok": true,
+      "detail": "hasTauri=true"
+    },
+    {
+      "name": "B1 桌面模式「浏览…」未被禁用（守卫没把桌面入口一起藏掉）",
+      "ok": true,
+      "detail": "browse={\"exists\":true,\"disabled\":false}"
+    },
+    {
+      "name": "B2a 桌面模式真的下发了 opener IPC 命令（路径 === 目标路径）",
+      "ok": true,
+      "detail": "cmds=[{\"cmd\":\"ensure_daemon\",\"args\":{}},{\"cmd\":\"ensure_daemon\",\"args\":{}},{\"cmd\":\"daemon_status\",\"args\":{}},{\"cmd\":\"daemon_status\",\"args\":{}}] target=\"C:\\\\Users\\\\godcong\\\\AppData\\\\Roaming\\\\com.origadmin.orighub\\\\tg\\\\library\""
+    },
+    {
+      "name": "B2b 桌面模式未出现 invoke 报错（IPC 桥正常）",
+      "ok": true,
+      "detail": "toast=null"
+    },
+    {
+      "name": "B3 桌面模式不出现网页模式专属的降级提示",
+      "ok": true,
+      "detail": "libHint=null logsHint=null"
+    },
+    {
+      "name": "D0 证伪锚点存在（SettingsPanel.tsx 含加守卫后的 openLogFolder）",
+      "ok": true,
+      "detail": "openLogFolder"
+    },
+    {
+      "name": "D1a 红态读数：裸 openPath 后 invoke 报错重新出现（toast 或 console）",
+      "ok": true,
+      "detail": "toast=\"Cannot read properties of undefined (reading 'invoke')\" console=[\"openPath failed TypeError: Cannot read properties of undefined (reading 'invoke')\\n    at invoke (http://127.0.0.1:5180/node_modules/.vite/deps/chunk-G7S6KQDI.js?v=edf623f2:109:37)\\n    at openPath (http://127.0.0.1:5180/node_modules/.vite/deps/@tauri-apps_plugin-opener.js?v=edf623f2:14:9)\\n    at openLogFolder (http://127.0.0.1:5180/src/components/SettingsPanel.tsx?t=1791832617226:351:13)\"]"
+    },
+    {
+      "name": "D1b 红态读数：降级提示消失（降级分支被摘掉）",
+      "ok": true,
+      "detail": "hint=null"
+    },
+    {
+      "name": "D2a 字节级还原：sha256 与证伪前一致",
+      "ok": true,
+      "detail": "before=244c1b118a3a after=244c1b118a3a"
+    },
+    {
+      "name": "D2b 还原后复跑：日志入口无 invoke 报错且降级提示回归",
+      "ok": true,
+      "detail": "toast=null hint=\"网页调试模式不支持打开系统文件夹，路径：C:\\\\Users\\\\godcong\\\\AppData\\\\Roaming\\\\com.origadmin.orighub\\\\logs\""
+    }
+  ]
+}

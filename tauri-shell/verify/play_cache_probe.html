@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>playback cache probe</title></head>
+<body>
+<video id="v" preload="auto" autoplay muted playsinline></video>
+<script>
+  const p = new URLSearchParams(location.search);
+  const v = document.getElementById('v');
+  const src = p.get('src');
+  v.src = src;
+  v.muted = true;
+  v.playbackRate = 4;            // stress the read path like the user's 2x/4x complaint
+  v.play().catch(e => { console.error('play rejected', e); });
+  // never stop fetching: loop the clip so the network/cache path stays hot
+  v.addEventListener('ended', () => { try { v.currentTime = 0; v.play(); } catch (_) {} });
+  // surface buffered progress for debugging via title
+  setInterval(() => {
+    try { document.title = 'buf=' + (v.buffered.length ? v.buffered.end(v.buffered.length-1).toFixed(1) : '0'); } catch (_) {}
+  }, 1000);
+</script>
+</body>
+</html>

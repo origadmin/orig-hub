@@ -1,0 +1,234 @@
+[endpoints] daemon=http://127.0.0.1:19786 app=http://127.0.0.1:5180 tg=http://127.0.0.1:19788 (tg_port=19788 from http://127.0.0.1:19786/api/config)
+
+=== [P1 first-entry (clicked=true)] all=6  TG=4 ===
+     2x  http://127.0.0.1:5180/src/styles.css
+           trigger: /@vite/client:815×2
+     1x  /api/media/stats
+           trigger: /src/api/media.ts?t=1791578883220:4×1
+     1x  /api/tg/diag
+           trigger: /src/api/tg.ts?t=1791578883220:32×1
+     1x  /api/media/tags
+           trigger: /src/api/media.ts?t=1791578883220:4×1
+     1x  /api/media/series
+           trigger: /src/api/media.ts?t=1791578883220:4×1
+  -- duplicate TG URLs: 0
+  DOM P1: {"seriesCards":38,"seriesCardsUniq":38,"seriesDupIds":[],"mediaCards":0,"mediaCardsUniq":0,"mediaDupKeys":[]}
+
+=== [P2 reload+entry (clicked=true)] all=119  TG=13 ===
+    11x  http://127.0.0.1:19786/api/config
+           trigger: /src/api/daemon.ts?t=1791578883220:12×11
+     9x  /api/tg/session
+           trigger: /src/api/tg.ts?t=1791578883220:32×9
+     2x  http://127.0.0.1:19786/api/downloads
+           trigger: /src/api/daemon.ts?t=1791578883220:12×2
+     2x  http://127.0.0.1:19786/health
+           trigger: /src/api/daemon.ts?t=1791578883220:12×2
+     2x  http://127.0.0.1:19786/api/events
+           trigger: other×2
+     1x  http://127.0.0.1:5180/
+           trigger: other×1
+     1x  http://127.0.0.1:5180/@vite/client
+           trigger: parser×1
+     1x  http://127.0.0.1:5180/src/main.tsx
+           trigger: parser×1
+     1x  http://127.0.0.1:5180/@react-refresh
+           trigger: script×1
+     1x  http://127.0.0.1:5180/node_modules/vite/dist/client/env.mjs
+           trigger: script×1
+     1x  http://127.0.0.1:5180/node_modules/.vite/deps/react_jsx-dev-runtime.js
+           trigger: script×1
+     1x  http://127.0.0.1:5180/node_modules/.vite/deps/react.js
+           trigger: script×1
+     1x  http://127.0.0.1:5180/node_modules/.vite/deps/react-dom_client.js
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/App.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/store/useStore.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/i18n/index.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/styles.css
+           trigger: parser×1
+     1x  http://127.0.0.1:5180/node_modules/.vite/deps/chunk-TAJOU4CS.js
+           trigger: script×1
+     1x  http://127.0.0.1:5180/node_modules/.vite/deps/chunk-PX6F3LHL.js
+           trigger: script×1
+     1x  http://127.0.0.1:5180/node_modules/.vite/deps/chunk-TI2F7RXM.js
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/MainLayout.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/node_modules/.vite/deps/zustand.js
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/api/daemon.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/api/tg.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/lib/tgReason.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/i18n/locales/zh-CN.json
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/i18n/locales/en-US.json
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/Sidebar.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/DownloadList.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/AddDownloadDialog.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/SettingsPanel.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/TgPanel.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/MediaLibraryPanel.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/MediaViewer.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/ui/ErrorBoundary.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/TitleBar.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/ContextBar.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/store/selectors.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/store/connState.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/hooks/useEvent.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/api/tauri.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/lib/utils.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/DownloadItem.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/ui/button.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/ui/input.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/ui/stepper.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/DirectoryPicker.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/InterfacePickerDialog.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/ui/switch.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/ui/badge.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/AccountsPanel.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/CacheManagerDialog.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/lib/tgmedia.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/lib/decodeHealth.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/api/media.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/store/tgSearch.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/lib/entryState.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/hooks/useSeriesDetail.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/lib/fetchCache.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/lib/displayTitle.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/MediaCard.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/SeriesDetail.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/SeriesCard.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/ImportDialog.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/TagManagerDialog.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/SeriesDialog.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/ExportPreviewDialog.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/ItemEditDialog.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/lib/mediaSources.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/node_modules/.vite/deps/lucide-react.js
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/VideoPlayer.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/EpisodeList.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/ContextBarActions.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/ContextBarStatus.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/TgGlobalSearch.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/TgCacheEntry.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/node_modules/.vite/deps/@tauri-apps_api_core.js
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/ui/progress.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/DownloadDetailSheet.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/node_modules/.vite/deps/chunk-G7S6KQDI.js
+           trigger: script×1
+     1x  http://127.0.0.1:5180/node_modules/.vite/deps/@tauri-apps_plugin-dialog.js
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/lib/recentDirs.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/lib/env.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/CacheBytesPanel.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/lib/poster.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/TagToken.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/lib/episodePresentation.ts
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/Deck.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/EpisodeEditPanel.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/SeriesEditPanel.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/EpisodeImagePickerDialog.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/Lightbox.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/components/media/CoverImage.tsx
+           trigger: script×1
+     1x  http://127.0.0.1:5180/src/hooks/usePlayerSettings.ts
+           trigger: script×1
+     1x  /api/media/stats
+           trigger: /src/api/media.ts?t=1791578883220:4×1
+     1x  /api/tg/diag
+           trigger: /src/api/tg.ts?t=1791578883220:32×1
+     1x  /api/media/tags
+           trigger: /src/api/media.ts?t=1791578883220:4×1
+     1x  /api/media/series
+           trigger: /src/api/media.ts?t=1791578883220:4×1
+  -- duplicate TG URLs: 1
+       9x  /api/tg/session
+  DOM P2: {"seriesCards":38,"seriesCardsUniq":38,"seriesDupIds":[],"mediaCards":0,"mediaCardsUniq":0,"mediaDupKeys":[]}
+
+=== [P3 switch-away-and-back (away=true back=true)] all=0  TG=0 ===
+  -- duplicate TG URLs: 0
+  DOM P3: {"seriesCards":38,"seriesCardsUniq":38,"seriesDupIds":[],"mediaCards":0,"mediaCardsUniq":0,"mediaDupKeys":[]}
+
+=== [P4 items-grid (clicked=true)] all=1  TG=1 ===
+     1x  /api/media/items?sort=recent&limit=120&offset=0
+           trigger: /src/api/media.ts?t=1791578883220:4×1
+  -- duplicate TG URLs: 0
+  DOM P4: {"seriesCards":0,"seriesCardsUniq":0,"seriesDupIds":[],"mediaCards":120,"mediaCardsUniq":62,"mediaDupKeys":["title:","title:","title:","title:","title:","title:","title:","title:"]}
+
+=== VERDICT SUMMARY ===
+P1 first-entry : all=6 TG=4
+P2 reload+entry: all=119 TG=13
+P3 re-entry    : all=0 TG=0
+P4 items-grid  : all=1 TG=1
+DOM seriesCards: P1=38/38unq  P2=38/38unq  P3=38/38unq
+DOM mediaCards : P4=120/62unq dupKeys=["title:","title:","title:","title:","title:","title:","title:","title:"]

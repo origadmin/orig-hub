@@ -1,0 +1,15 @@
+[app] 673 1080p30 HEVC 10.2Mbps @1x ... cs=1 elemRate=1 presented=30 decoded=30.1 drop=0.3% effRate=1 bufAhead=15s el=1440x807 src=1920x1080 gap p50/p90/p95/p99/max=33.4/33.6/50/50.2/51.6ms gt50=15 gt100=0 gt250=0 loadstart=0 loadedmetadata=0 srcChanged=false longtasks=0(max 0ms)
+[app] 673 1080p30 HEVC 10.2Mbps @2x ... cs=2 elemRate=1 presented=29.9 decoded=30 drop=0% effRate=1 bufAhead=2.4s el=1440x807 src=1920x1080 gap p50/p90/p95/p99/max=33.3/33.5/33.6/50.1/50.2ms gt50=4 gt100=0 gt250=0 loadstart=0 loadedmetadata=0 srcChanged=false longtasks=0(max 0ms)
+[app] 673 1080p30 HEVC 10.2Mbps @4x ... cs=4 elemRate=1 presented=29.9 decoded=29.9 drop=0% effRate=1 bufAhead=3.4s el=1440x807 src=1920x1080 gap p50/p90/p95/p99/max=33.3/33.7/49.6/50.2/50.2ms gt50=9 gt100=0 gt250=0 loadstart=0 loadedmetadata=0 srcChanged=false longtasks=0(max 0ms)
+[app] 472 720p60 HEVC 11.8Mbps @1x ... cs=1 elemRate=1 presented=51.2 decoded=59.8 drop=1.8% effRate=0.997 bufAhead=15.5s el=1440x807 src=1280x720 gap p50/p90/p95/p99/max=16.7/33.3/33.4/34.4/108.3ms gt50=4 gt100=2 gt250=0 loadstart=0 loadedmetadata=0 srcChanged=false longtasks=0(max 0ms)
+[app] 472 720p60 HEVC 11.8Mbps @2x ... cs=2 elemRate=1 presented=30 decoded=30 drop=0% effRate=1 bufAhead=2.4s el=1440x807 src=1280x720 gap p50/p90/p95/p99/max=33.3/33.5/33.6/49.8/50.1ms gt50=1 gt100=0 gt250=0 loadstart=0 loadedmetadata=0 srcChanged=false longtasks=0(max 0ms)
+[app] 472 720p60 HEVC 11.8Mbps @4x ... cs=4 elemRate=1 presented=15.4 decoded=15.6 drop=1.1% effRate=0.519 bufAhead=1.8s el=1440x807 src=1280x720 gap p50/p90/p95/p99/max=33.3/33.6/33.6/2667.8/3217.8ms gt50=3 gt100=2 gt250=2 loadstart=0 loadedmetadata=0 srcChanged=false longtasks=0(max 0ms)
+
+=== SUMMARY (csv) ===
+item,rate,contentSpeed,elemRate,presentedFps,decodedFps,dropPct,effRate,bufAheadSec,gapP50,gapP90,gapP95,gapP99,gapMax,gt50,gt100,gt250,loadstart,loadedmetadata,srcChanged,longtasks,longtaskMax
+673 1080p30 HEVC 10.2Mbps,1,1,1,30,30.1,0.3,1,15,33.4,33.6,50,50.2,51.6,15,0,0,0,0,false,0,0
+673 1080p30 HEVC 10.2Mbps,2,2,1,29.9,30,0,1,2.4,33.3,33.5,33.6,50.1,50.2,4,0,0,0,0,false,0,0
+673 1080p30 HEVC 10.2Mbps,4,4,1,29.9,29.9,0,1,3.4,33.3,33.7,49.6,50.2,50.2,9,0,0,0,0,false,0,0
+472 720p60 HEVC 11.8Mbps,1,1,1,51.2,59.8,1.8,0.997,15.5,16.7,33.3,33.4,34.4,108.3,4,2,0,0,0,false,0,0
+472 720p60 HEVC 11.8Mbps,2,2,1,30,30,0,1,2.4,33.3,33.5,33.6,49.8,50.1,1,0,0,0,0,false,0,0
+472 720p60 HEVC 11.8Mbps,4,4,1,15.4,15.6,1.1,0.519,1.8,33.3,33.6,33.6,2667.8,3217.8,3,2,2,0,0,false,0,0

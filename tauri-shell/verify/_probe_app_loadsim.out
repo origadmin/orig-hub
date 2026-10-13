@@ -1,0 +1,5 @@
+[loadsim] 2x idle @2x load=0ms/9999ms ... PROBE_FAILED Error: CDP: waitForFunction timed out after 25000ms
+    at Page.waitForFunction (D:\workspace\project\golang\origadmin\framework\projects\orig-hub\tauri-shell\verify\lib\cdp.cjs:472:11)
+    at async openItem (D:\workspace\project\golang\origadmin\framework\projects\orig-hub\tauri-shell\verify\_probe_app_loadsim.cjs:68:3)
+    at async runCondition (D:\workspace\project\golang\origadmin\framework\projects\orig-hub\tauri-shell\verify\_probe_app_loadsim.cjs:248:3)
+    at async main (D:\workspace\project\golang\origadmin\framework\projects\orig-hub\tauri-shell\verify\_probe_app_loadsim.cjs:294:15)

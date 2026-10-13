@@ -1,0 +1,127 @@
+{
+  "passed": 24,
+  "total": 24,
+  "all_passed": true,
+  "checks": [
+    {
+      "name": "⓪ en-US 已生效（<html lang>）",
+      "ok": true,
+      "detail": "lang=en-US"
+    },
+    {
+      "name": "①a 弹窗可见文本 CJK 汉字数 = 0（扣除夹具标题 + 标签数据后）",
+      "ok": true,
+      "detail": "residue=[]"
+    },
+    {
+      "name": "①b 标题 = \"Edit content\"（media.item.editMeta）",
+      "ok": true,
+      "detail": "\"Edit content\""
+    },
+    {
+      "name": "①c 类型行标签 = \"Type\"，选项 = \"Video\"（media.item.kind + kindLabelKey）",
+      "ok": true,
+      "detail": "label=\"Type\" option=\"Video\""
+    },
+    {
+      "name": "①d 来源行 = \"Source: Local\"（复用 media.fromSource + sourceLabelKey）",
+      "ok": true,
+      "detail": "\"Source: Local\""
+    },
+    {
+      "name": "①e 大小行以 \"Size: \" 开头（media.item.size）",
+      "ok": true,
+      "detail": "\"Size: 2.0 KB\""
+    },
+    {
+      "name": "①f 路径行以 \"Path: \" 开头（media.item.path）",
+      "ok": true,
+      "detail": "\"Path: C:\\\\Users\\\\godcong\\\\AppData\\\\Local\\\\Temp\\\\orighub-bug263-1791822140152-ZZ-BUG263-ITEM-1791822140151.mp4\""
+    },
+    {
+      "name": "①g 归属行 = \"Series: ZZ-BUG263-SER-1791822140151\"（media.item.series）",
+      "ok": true,
+      "detail": "\"Series: ZZ-BUG263-SER-1791822140151\""
+    },
+    {
+      "name": "①h 字段标签含 \"Title\" / \"Tags\"（media.item.title / media.tags）",
+      "ok": true,
+      "detail": "[\"Type Video\",\"Title\",\"Description(everything after the original message title — the same field as the series description)\",\"Tags\"]"
+    },
+    {
+      "name": "①i 介绍标签以 \"Description\" 开头且提示含 \"the same field as the series description\"",
+      "ok": true,
+      "detail": "[\"Type Video\",\"Title\",\"Description(everything after the original message title — the same field as the series description)\",\"Tags\"]"
+    },
+    {
+      "name": "①j 介绍 placeholder = \"Leave empty to clear the description\"",
+      "ok": true,
+      "detail": "\"Leave empty to clear the description\""
+    },
+    {
+      "name": "①k 底部按钮 = [\"Clear cached file\", \"Cancel\", \"Save\"]（标签属数据，排除）",
+      "ok": true,
+      "detail": "[\"Clear cached file\",\"Cancel\",\"Save\"]"
+    },
+    {
+      "name": "①l 清缓存确认文案 = \"Clear the cached file? The record is kept and can be cached again.\"",
+      "ok": true,
+      "detail": "\"Clear the cached file? The record is kept and can be cached again.\""
+    },
+    {
+      "name": "①m 确认态按钮 = [\"Confirm\", \"Keep it\", \"Cancel\", \"Save\"]（标签属数据，排除）",
+      "ok": true,
+      "detail": "[\"Confirm\",\"Keep it\",\"Cancel\",\"Save\"]"
+    },
+    {
+      "name": "②a zh-CN 已生效且标题 = \"编辑内容\"",
+      "ok": true,
+      "detail": "lang=zh-CN title=\"编辑内容\""
+    },
+    {
+      "name": "②b zh-CN 元信息四行 = 来源：本地 / 大小：… / 路径：… / 归属：ZZ-BUG263-SER-1791822140151",
+      "ok": true,
+      "detail": "[\"来源：本地\",\"大小：2.0 KB\",\"路径：C:\\\\Users\\\\godcong\\\\AppData\\\\Local\\\\Temp\\\\orighub-bug263-1791822140152-ZZ-BUG263-ITEM-1791822140151.mp4\",\"归属：ZZ-BUG263-SER-1791822140151\"]"
+    },
+    {
+      "name": "②c zh-CN 弹窗正常渲染中文（残留 > 0，证明键存在而非回退 key 名）",
+      "ok": true,
+      "detail": "residue=55"
+    },
+    {
+      "name": "②d zh-CN 清缓存确认文案 = \"确定清除已缓存文件？记录保留，可重新缓存\"",
+      "ok": true,
+      "detail": "\"确定清除已缓存文件？记录保留，可重新缓存\""
+    },
+    {
+      "name": "③P 证伪锚点存在（en-US.json 含目标行）",
+      "ok": true,
+      "detail": "media.item.editMeta"
+    },
+    {
+      "name": "③a 红态读数：CJK 残留 > 0（改回中文后判据①a 按预期失败）",
+      "ok": true,
+      "detail": "residue=[\"编\",\"辑\",\"内\",\"容\"]"
+    },
+    {
+      "name": "③b 红态读数：标题 ≠ \"Edit content\"（判据①b 按预期失败）",
+      "ok": true,
+      "detail": "title=\"编辑内容\""
+    },
+    {
+      "name": "③c 字节级还原：sha256 与改前一致",
+      "ok": true,
+      "detail": "before=cc3d1c6d0fb9 after=cc3d1c6d0fb9"
+    },
+    {
+      "name": "③d 还原后复跑：标题 = \"Edit content\" 且 CJK 残留 = 0",
+      "ok": true,
+      "detail": "title=\"Edit content\" residue=0"
+    },
+    {
+      "name": "④ 夹具已清理（无残留剧集）",
+      "ok": true,
+      "detail": "leftover=[]"
+    }
+  ]
+}

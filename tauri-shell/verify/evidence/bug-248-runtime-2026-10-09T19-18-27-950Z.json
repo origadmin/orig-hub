@@ -1,0 +1,421 @@
+{
+  "bug": "BUG-248",
+  "stamp": "2026-10-09T19-18-27-950Z",
+  "workRoot": "C:\\Users\\godcong\\AppData\\Local\\Temp\\orig-verify-248",
+  "chatId": -1004457697592,
+  "bins": {
+    "A": {
+      "src": "D:/tmp/orig-tg-ctrl-target/debug/orig-tg.exe",
+      "snapshot": "C:\\Users\\godcong\\AppData\\Local\\Temp\\orig-verify-248\\bin\\ctrl-head-eebffcf425fb.exe",
+      "md5": "eebffcf425fb",
+      "bytes": 20960256,
+      "mtime": "2026-10-09T18:37:17.996Z"
+    },
+    "B": {
+      "src": "D:/tmp/orig-tg-fix-target/debug/orig-tg.exe",
+      "snapshot": "C:\\Users\\godcong\\AppData\\Local\\Temp\\orig-verify-248\\bin\\fixed-worktree-881b89871b71.exe",
+      "md5": "881b89871b71",
+      "bytes": 20980736,
+      "mtime": "2026-10-09T19:08:10.095Z"
+    }
+  },
+  "groups": {
+    "a": {
+      "label": "control / HEAD build (BUG-246 yes, BUG-248 no)",
+      "pid": 54196,
+      "diag": {
+        "api_configured": true,
+        "available": true,
+        "file_path_collisions": [],
+        "health": "ok",
+        "link_alive": true,
+        "log_lines": 1,
+        "mock": false,
+        "mode": "ready",
+        "port": 19886,
+        "proxy": "socks5://127.0.0.1:7897",
+        "session_phase": "Authorized",
+        "unavailable_reason": null
+      },
+      "choice": {
+        "chatId": -1004457697592,
+        "probeId": 1168,
+        "probeCaption": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+        "probeSize": 158547667,
+        "probeMediaType": "video",
+        "blockerId": 1151,
+        "blockerSize": 246268278,
+        "pickedBy": "A/B shared: not in media_message, not in any cache_task, smallest with caption (probe); largest with known size >=30MB, else largest (blocker — must hold the single-flight worker)"
+      },
+      "refKey": "-1004457697592:1168",
+      "itemBefore": {
+        "count": 0,
+        "id": null,
+        "file_path": null,
+        "title": null,
+        "kind": null,
+        "rows": []
+      },
+      "blockerStatus": "running",
+      "probeEnqueue": {
+        "status": 200,
+        "body": "{\"id\":160,\"chatId\":-1004457697592,\"itemKey\":\"m:-1004457697592:1168\",\"messageIds\":[1168],\"total\":1,\"done\":0,\"status\":\"queued\",\"createdAt\":1791573281,\"updatedAt\":1791573281}",
+        "atMs": 13
+      },
+      "observed": {
+        "atMs": 4845,
+        "status": "queued",
+        "title": "<absent>",
+        "blockerStatus": "running",
+        "blockerProgressBytes": null,
+        "itemCount": 0,
+        "itemId": null,
+        "itemFilePath": null
+      },
+      "item": {
+        "count": 0,
+        "id": null,
+        "file_path": null,
+        "title": null,
+        "kind": null,
+        "rows": []
+      },
+      "metaLate": null,
+      "itemAfterMeta": {
+        "count": 0,
+        "id": null,
+        "file_path": null,
+        "title": null,
+        "kind": null,
+        "rows": []
+      },
+      "drained": null,
+      "drainItem": {
+        "count": 0,
+        "id": null,
+        "file_path": null,
+        "title": null,
+        "kind": null,
+        "rows": []
+      },
+      "samples": [
+        {
+          "atMs": 22,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 534,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 1044,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 1556,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 2264,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 2780,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 3298,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 3820,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 4330,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 4845,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        }
+      ],
+      "blocked": null
+    },
+    "b": {
+      "label": "experiment / BUG-248 fixed",
+      "pid": 48068,
+      "diag": {
+        "api_configured": true,
+        "available": true,
+        "file_path_collisions": [],
+        "health": "ok",
+        "link_alive": true,
+        "log_lines": 1,
+        "mock": false,
+        "mode": "ready",
+        "port": 19887,
+        "proxy": "socks5://127.0.0.1:7897",
+        "session_phase": "Authorized",
+        "unavailable_reason": null
+      },
+      "choice": {
+        "chatId": -1004457697592,
+        "probeId": 1168,
+        "probeCaption": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+        "probeSize": 158547667,
+        "probeMediaType": "video",
+        "blockerId": 1151,
+        "blockerSize": 246268278,
+        "pickedBy": "A/B shared: not in media_message, not in any cache_task, smallest with caption (probe); largest with known size >=30MB, else largest (blocker — must hold the single-flight worker)"
+      },
+      "refKey": "-1004457697592:1168",
+      "itemBefore": {
+        "count": 0,
+        "id": null,
+        "file_path": null,
+        "title": null,
+        "kind": null,
+        "rows": []
+      },
+      "blockerStatus": "running",
+      "probeEnqueue": {
+        "status": 200,
+        "body": "{\"id\":160,\"chatId\":-1004457697592,\"itemKey\":\"m:-1004457697592:1168\",\"messageIds\":[1168],\"total\":1,\"done\":0,\"status\":\"queued\",\"createdAt\":1791573399,\"updatedAt\":1791573399}",
+        "atMs": 16
+      },
+      "observed": {
+        "atMs": 4666,
+        "status": "queued",
+        "title": "<absent>",
+        "blockerStatus": "running",
+        "blockerProgressBytes": null,
+        "itemCount": 1,
+        "itemId": 691,
+        "itemFilePath": null
+      },
+      "item": {
+        "count": 1,
+        "id": 691,
+        "file_path": null,
+        "title": "",
+        "kind": "file",
+        "rows": [
+          {
+            "id": 691,
+            "source": "tg",
+            "ref": "-1004457697592:1168",
+            "title": "",
+            "kind": "file",
+            "file_path": null
+          }
+        ]
+      },
+      "metaLate": {
+        "atMs": 41479,
+        "status": "queued",
+        "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️",
+        "kind": "video",
+        "itemId": 691
+      },
+      "itemAfterMeta": {
+        "count": 1,
+        "id": 691,
+        "file_path": null,
+        "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️",
+        "kind": "video",
+        "rows": [
+          {
+            "id": 691,
+            "source": "tg",
+            "ref": "-1004457697592:1168",
+            "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️",
+            "kind": "video",
+            "file_path": null
+          }
+        ]
+      },
+      "drained": null,
+      "drainItem": {
+        "count": 1,
+        "id": 691,
+        "file_path": null,
+        "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️",
+        "kind": "video",
+        "rows": [
+          {
+            "id": 691,
+            "source": "tg",
+            "ref": "-1004457697592:1168",
+            "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️",
+            "kind": "video",
+            "file_path": null
+          }
+        ]
+      },
+      "samples": [
+        {
+          "atMs": 31,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 550,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 1068,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 1576,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 2083,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 2603,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 3122,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 3644,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 4160,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 4666,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        }
+      ],
+      "blocked": null
+    }
+  }
+}

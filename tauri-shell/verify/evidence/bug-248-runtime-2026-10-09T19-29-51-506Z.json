@@ -1,0 +1,421 @@
+{
+  "bug": "BUG-248",
+  "stamp": "2026-10-09T19-29-51-506Z",
+  "workRoot": "C:\\Users\\godcong\\AppData\\Local\\Temp\\orig-verify-248",
+  "chatId": -1004457697592,
+  "bins": {
+    "A": {
+      "src": "D:/tmp/orig-tg-ctrl-target/debug/orig-tg.exe",
+      "snapshot": "C:\\Users\\godcong\\AppData\\Local\\Temp\\orig-verify-248\\bin\\ctrl-head-eebffcf425fb.exe",
+      "md5": "eebffcf425fb",
+      "bytes": 20960256,
+      "mtime": "2026-10-09T18:37:17.996Z"
+    },
+    "B": {
+      "src": "D:/tmp/orig-tg-fix-target/debug/orig-tg.exe",
+      "snapshot": "C:\\Users\\godcong\\AppData\\Local\\Temp\\orig-verify-248\\bin\\fixed-worktree-17ac643738dc.exe",
+      "md5": "17ac643738dc",
+      "bytes": 21024768,
+      "mtime": "2026-10-09T19:25:42.024Z"
+    }
+  },
+  "groups": {
+    "a": {
+      "label": "control / HEAD build (BUG-246 yes, BUG-248 no)",
+      "pid": 48488,
+      "diag": {
+        "api_configured": true,
+        "available": true,
+        "file_path_collisions": [],
+        "health": "ok",
+        "link_alive": true,
+        "log_lines": 1,
+        "mock": false,
+        "mode": "ready",
+        "port": 19886,
+        "proxy": "socks5://127.0.0.1:7897",
+        "session_phase": "Authorized",
+        "unavailable_reason": null
+      },
+      "choice": {
+        "chatId": -1004457697592,
+        "probeId": 1168,
+        "probeCaption": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+        "probeSize": 158547667,
+        "probeMediaType": "video",
+        "blockerId": 1151,
+        "blockerSize": 246268278,
+        "pickedBy": "A/B shared: not in media_message, not in any cache_task, smallest with caption (probe); largest with known size >=30MB, else largest (blocker — must hold the single-flight worker)"
+      },
+      "refKey": "-1004457697592:1168",
+      "itemBefore": {
+        "count": 0,
+        "id": null,
+        "file_path": null,
+        "title": null,
+        "kind": null,
+        "rows": []
+      },
+      "blockerStatus": "running",
+      "probeEnqueue": {
+        "status": 200,
+        "body": "{\"id\":160,\"chatId\":-1004457697592,\"itemKey\":\"m:-1004457697592:1168\",\"messageIds\":[1168],\"total\":1,\"done\":0,\"status\":\"queued\",\"createdAt\":1791573991,\"updatedAt\":1791573991}",
+        "atMs": 15
+      },
+      "observed": {
+        "atMs": 4923,
+        "status": "queued",
+        "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+        "blockerStatus": "running",
+        "blockerProgressBytes": null,
+        "itemCount": 0,
+        "itemId": null,
+        "itemFilePath": null
+      },
+      "item": {
+        "count": 0,
+        "id": null,
+        "file_path": null,
+        "title": null,
+        "kind": null,
+        "rows": []
+      },
+      "metaLate": null,
+      "itemAfterMeta": {
+        "count": 0,
+        "id": null,
+        "file_path": null,
+        "title": null,
+        "kind": null,
+        "rows": []
+      },
+      "drained": null,
+      "drainItem": {
+        "count": 0,
+        "id": null,
+        "file_path": null,
+        "title": null,
+        "kind": null,
+        "rows": []
+      },
+      "samples": [
+        {
+          "atMs": 21,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 791,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 1316,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 1841,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 2356,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 2872,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 3384,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 3899,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 4407,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 4923,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 0,
+          "itemId": null,
+          "itemFilePath": null
+        }
+      ],
+      "blocked": null
+    },
+    "b": {
+      "label": "experiment / BUG-248 fixed",
+      "pid": 38036,
+      "diag": {
+        "api_configured": true,
+        "available": true,
+        "file_path_collisions": [],
+        "health": "ok",
+        "link_alive": true,
+        "log_lines": 1,
+        "mock": false,
+        "mode": "ready",
+        "port": 19887,
+        "proxy": "socks5://127.0.0.1:7897",
+        "session_phase": "Authorized",
+        "unavailable_reason": null
+      },
+      "choice": {
+        "chatId": -1004457697592,
+        "probeId": 1168,
+        "probeCaption": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+        "probeSize": 158547667,
+        "probeMediaType": "video",
+        "blockerId": 1151,
+        "blockerSize": 246268278,
+        "pickedBy": "A/B shared: not in media_message, not in any cache_task, smallest with caption (probe); largest with known size >=30MB, else largest (blocker — must hold the single-flight worker)"
+      },
+      "refKey": "-1004457697592:1168",
+      "itemBefore": {
+        "count": 0,
+        "id": null,
+        "file_path": null,
+        "title": null,
+        "kind": null,
+        "rows": []
+      },
+      "blockerStatus": "running",
+      "probeEnqueue": {
+        "status": 200,
+        "body": "{\"id\":160,\"chatId\":-1004457697592,\"itemKey\":\"m:-1004457697592:1168\",\"messageIds\":[1168],\"total\":1,\"done\":0,\"status\":\"queued\",\"createdAt\":1791574123,\"updatedAt\":1791574123}",
+        "atMs": 8
+      },
+      "observed": {
+        "atMs": 4736,
+        "status": "queued",
+        "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+        "blockerStatus": "running",
+        "blockerProgressBytes": null,
+        "itemCount": 1,
+        "itemId": 691,
+        "itemFilePath": null
+      },
+      "item": {
+        "count": 1,
+        "id": 691,
+        "file_path": null,
+        "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️",
+        "kind": "video",
+        "rows": [
+          {
+            "id": 691,
+            "source": "tg",
+            "ref": "-1004457697592:1168",
+            "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️",
+            "kind": "video",
+            "file_path": null
+          }
+        ]
+      },
+      "metaLate": {
+        "atMs": 11,
+        "status": "queued",
+        "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️",
+        "kind": "video",
+        "itemId": 691
+      },
+      "itemAfterMeta": {
+        "count": 1,
+        "id": 691,
+        "file_path": null,
+        "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️",
+        "kind": "video",
+        "rows": [
+          {
+            "id": 691,
+            "source": "tg",
+            "ref": "-1004457697592:1168",
+            "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️",
+            "kind": "video",
+            "file_path": null
+          }
+        ]
+      },
+      "drained": null,
+      "drainItem": {
+        "count": 1,
+        "id": 691,
+        "file_path": null,
+        "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️",
+        "kind": "video",
+        "rows": [
+          {
+            "id": 691,
+            "source": "tg",
+            "ref": "-1004457697592:1168",
+            "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️",
+            "kind": "video",
+            "file_path": null
+          }
+        ]
+      },
+      "samples": [
+        {
+          "atMs": 17,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 628,
+          "status": "queued",
+          "title": "<absent>",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 1147,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 1663,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 2171,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 2682,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 3194,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 3698,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 4213,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        },
+        {
+          "atMs": 4736,
+          "status": "queued",
+          "title": "⚡️【重生之我有一家性奴店】完整剧集连载中 ⚡️  #重生之我有一家性奴店  #成人短剧 #AI短剧  #黄果短剧\n📱 😀😀😀😀😀😀   《重生之我有一家性奴店》EP1-5\n重生回到25岁生日，陆沉只剩7天寿命，觉醒性奴经营系统。他把冷艳总裁苏挽晴扣在后室矮凳上，烛火下深顶到最里面。她咬唇流泪还端着总裁架子，内壁死死绞紧，最后睁着眼软在他肩窝，合同，有效。首奴收服，寿命+1，界门初开，狼嚎已至。把冷艳驯服的视觉与声音刺激拉满，从冷面总裁到第一号货，彻底沉浸在项圈下的征服与臣服里。",
+          "blockerStatus": "running",
+          "blockerProgressBytes": null,
+          "itemCount": 1,
+          "itemId": 691,
+          "itemFilePath": null
+        }
+      ],
+      "blocked": null
+    }
+  }
+}

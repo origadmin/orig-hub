@@ -1,0 +1,54 @@
+{
+  "bug": "BUG-133 / BUG-125",
+  "when": "2026-10-10T23:02:44.599Z",
+  "mode": "read-only",
+  "passed": 9,
+  "total": 9,
+  "results": [
+    {
+      "name": "API exposes BOTH bases (diskBytes + totalSize) in one response",
+      "ok": true,
+      "detail": "diskBytes=1740800 totalSize=29360128 onDiskItems=3"
+    },
+    {
+      "name": "the two bases are genuinely different numbers (not one value relabelled)",
+      "ok": true,
+      "detail": "disk=1740800 vs registered=29360128"
+    },
+    {
+      "name": "registered sum is unchanged by filesystem reality (BUG-051 baseline)",
+      "ok": true,
+      "detail": "totalSize=29360128 (stays put when bytes are cleared)"
+    },
+    {
+      "name": "panel renders an occupancy figure",
+      "ok": true,
+      "detail": "text=\"占用 1.7 MB\""
+    },
+    {
+      "name": "panel LEADS with the disk basis (equals API diskBytes within display rounding)",
+      "ok": true,
+      "detail": "panel=1782579 api.diskBytes=1740800 (2.4% = display rounding)"
+    },
+    {
+      "name": "panel does NOT lead with the registered sum",
+      "ok": true,
+      "detail": "panel=1782579 api.totalSize=29360128"
+    },
+    {
+      "name": "the occupancy figure LABELS its basis in a tooltip (real disk bytes)",
+      "ok": true,
+      "detail": "title=\"占用空间 = 资料库在本机实际占用的磁盘字节（清缓存后会下降）\""
+    },
+    {
+      "name": "the registered basis is shown SEPARATELY and labelled as not-local-usage",
+      "ok": true,
+      "detail": "registered=\"· 登记 28.0 MB\" title=\"登记值 = 内容在源头的大小之和（未落盘/字节已清的内容仍计入），不是本地磁盘占用\""
+    },
+    {
+      "name": "FALSIFICATION: with no clear, the disk figure does NOT fall",
+      "ok": true,
+      "detail": "1740800 -> 1740800"
+    }
+  ]
+}

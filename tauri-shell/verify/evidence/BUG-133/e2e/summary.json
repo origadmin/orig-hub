@@ -1,0 +1,43 @@
+{
+  "bug": "BUG-133",
+  "when": "2026-10-10T23:02:11.875Z",
+  "passed": 7,
+  "total": 7,
+  "results": [
+    {
+      "name": "panel shows the DISK basis as the leading figure",
+      "ok": true,
+      "detail": "text=\"占用 2.0 MB\""
+    },
+    {
+      "name": "registered basis shown separately and labelled",
+      "ok": true,
+      "detail": "text=\"· 登记 20.0 MB\""
+    },
+    {
+      "name": "the two bases visibly differ on screen (registered >> disk)",
+      "ok": true,
+      "detail": "disk=占用 2.0 MB registered=· 登记 20.0 MB"
+    },
+    {
+      "name": "JUDGEMENT 1 (API): diskBytes FELL after clearing bytes",
+      "ok": true,
+      "detail": "2097152 -> 0"
+    },
+    {
+      "name": "BUG-051 unchanged: totalSize did NOT move and the item is still there",
+      "ok": true,
+      "detail": "totalSize 20971520 -> 20971520; items 1 -> 1"
+    },
+    {
+      "name": "JUDGEMENT 1 (ON SCREEN): the visible occupancy figure fell",
+      "ok": true,
+      "detail": "占用 2.0 MB -> 占用 0 B"
+    },
+    {
+      "name": "ON SCREEN: the registered figure stayed put (the two are visibly independent)",
+      "ok": true,
+      "detail": "· 登记 20.0 MB -> · 登记 20.0 MB"
+    }
+  ]
+}
