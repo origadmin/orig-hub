@@ -130,7 +130,7 @@ async function forceLanguage(page, appUrl, lang) {
 /** 媒体库 → 「全部内容」→ 点夹具卡片编辑入口 → 等内容编辑弹窗。 */
 async function openItemEditDialog(page, itemId) {
   await page.evaluate(() => {
-    const el = document.querySelector('[data-testid="nav-media"]')
+    const el = document.querySelector('[data-testid="nav-child-lib-series"]')
     if (el) el.click()
   })
   await delay(1200)

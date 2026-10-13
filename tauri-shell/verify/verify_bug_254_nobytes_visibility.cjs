@@ -166,12 +166,12 @@ async function main() {
     // ── 0. 打开媒体库 → 剧集墙 ─────────────────────────────
     await page.goto(APP, { settleMs: 1500 })
     const opened = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="nav-media"]')
+      const el = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (!el) return false
       el.click()
       return true
     })
-    check(opened, 'media library nav entry exists ([data-testid="nav-media"])', `clicked=${opened}`)
+    check(opened, 'media library nav entry exists ([data-testid="nav-child-lib-series"])', `clicked=${opened}`)
     if (!opened) throw new Error('media library nav not found — cannot continue')
 
     // 必须回布尔：直接返回 DOM 元素会让 CDP returnByValue 序列化抛

@@ -69,18 +69,18 @@ async function main() {
     const page = await browser.newPage()
     await page.goto(APP_URL, { waitUntil: 'load' })
     await new Promise((r) => setTimeout(r, 2500))
-    await page.evaluate(() => document.querySelector('[data-testid="nav-media"]').click())
+    await page.evaluate(() => document.querySelector('[data-testid="nav-child-lib-series"]').click())
     await new Promise((r) => setTimeout(r, 3500))
 
-    // ── 前提 A：全部剧集 → 完整剧集列表 ──────────────────────────────────
+    // ── 前提 A：侧栏「剧集」子项 → 完整剧集列表 ───────────────────────────
+    // M0-T01 后左栏 rail 已删，「全部剧集」这一步由侧栏树子项 `nav-child-lib-series`
+    // 直接承担（同一个落地视图），故判据不变、入口换位：不再有中间那枚 rail 按钮。
     const label = await page.evaluate(() => {
-      const b = document.querySelector('[data-testid="media-rail-series-all"]')
+      const b = document.querySelector('[data-testid="nav-child-lib-series"]')
       return b ? b.innerText.replace(/\s+/g, ' ').trim() : null
     })
-    check('左栏存在「全部剧集」入口', label !== null, label || '未找到 media-rail-series-all')
+    check('侧栏存在「剧集」子项（原左栏「全部剧集」的替代入口）', label !== null, label || '未找到 nav-child-lib-series')
 
-    await page.evaluate(() => document.querySelector('[data-testid="media-rail-series-all"]').click())
-    await new Promise((r) => setTimeout(r, 2500))
     const wall = await page.evaluate(() => {
       const w = document.querySelector('[data-testid="series-wall-scroll"]')
       return { exists: !!w, cards: document.querySelectorAll('[data-testid="series-card"]').length }

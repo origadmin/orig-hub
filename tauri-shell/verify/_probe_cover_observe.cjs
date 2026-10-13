@@ -60,7 +60,7 @@ async function main() {
       records.push({ url, site: triggerSite(p) })
     })
 
-    await clickTestId(page, 'nav-media')
+    await clickTestId(page, 'nav-child-lib-series')
     await delay(2500)
     await clickTestId(page, 'media-cat-all')
     await delay(8000)

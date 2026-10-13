@@ -351,8 +351,8 @@ async function shot(page, name) {
 /** 打开媒体库 → 剧集墙。 */
 async function gotoMediaLibrary(page) {
   await page.goto(APP_URL, { waitForRoot: true, settleMs: 1500 })
-  await waitTestid(page, 'nav-media', 20000)
-  await clickTestid(page, 'nav-media')
+  await waitTestid(page, 'nav-child-lib-series', 20000)
+  await clickTestid(page, 'nav-child-lib-series')
   await page.waitForFunction(
     () => document.querySelectorAll('[data-testid="series-card"]').length > 0,
     { timeout: 20000 },

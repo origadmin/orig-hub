@@ -167,7 +167,7 @@ async function main() {
     const targetEp = eps.find((e) => e.itemId === prefer) || eps.find((e) => presentIds.has(e.itemId))
     raw('target.episode', targetEp ? { id: targetEp.id, itemId: targetEp.itemId, title: targetEp.title } : null)
 
-    await page.evaluate(() => document.querySelector('[data-testid="nav-media"]').click())
+    await page.evaluate(() => document.querySelector('[data-testid="nav-child-lib-series"]').click())
     await sleep(1000)
     await page.evaluate(() => document.querySelector('[data-testid="media-rail-series-all"]').click())
     await sleep(1600)

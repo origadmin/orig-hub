@@ -98,7 +98,7 @@ async function main() {
     const keep = setInterval(bring, 2000)
 
     // 进入媒体库 → 全部内容网格（网格保持挂载）
-    await page.evaluate(() => document.querySelector('[data-testid="nav-media"]')?.click())
+    await page.evaluate(() => document.querySelector('[data-testid="nav-child-lib-series"]')?.click())
     await delay(1800)
     await page.evaluate(() => document.querySelector('[data-testid="media-cat-all"]')?.click())
     await page.waitForFunction(() => document.querySelectorAll('[data-testid="media-card"]').length >= 60, {

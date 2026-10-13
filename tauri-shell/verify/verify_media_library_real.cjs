@@ -50,7 +50,7 @@ async function main() {
     await page.goto(APP_URL, { waitForRoot: true, settleMs: 1800 })
 
     const clicked = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="nav-media"]')
+      const el = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (!el) return false
       el.click()
       return true

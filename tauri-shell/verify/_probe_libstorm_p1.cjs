@@ -11,7 +11,7 @@ async function main() {
   await page.goto(ep.app, { waitUntil: 'load' })
   await delay(2500)
   await page.evaluate(() => {
-    const b = document.querySelector('[data-testid="nav-media"]')
+    const b = document.querySelector('[data-testid="nav-child-lib-series"]')
     if (b) b.click()
   })
   for (const t of [2000, 4000, 8000, 12000]) {

@@ -240,12 +240,12 @@ async function readHeroDesc(page) {
 async function gotoWall(page) {
   await page.goto(APP_URL, { waitForRoot: true, settleMs: 1500 })
   const navOk = await page.evaluate(() => {
-    const el = document.querySelector('[data-testid="nav-media"]')
+    const el = document.querySelector('[data-testid="nav-child-lib-series"]')
     if (!el) return false
     el.click()
     return true
   })
-  if (!navOk) throw new Error('nav-media 入口不存在')
+  if (!navOk) throw new Error('nav-child-lib-series 入口不存在')
   await page.waitForFunction(() => !!document.querySelector('[data-testid="media-panel-title"]'), {
     timeout: 25000,
     intervalMs: 300,

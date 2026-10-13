@@ -843,7 +843,7 @@ async function enterTgPanel(page) {
 async function forceTgPanelRemount(page) {
   await closeViewer(page)
   const clickedAway = await page.evaluate(() => {
-    const b = document.querySelector('[data-testid="nav-media"]')
+    const b = document.querySelector('[data-testid="nav-child-lib-series"]')
     if (!b) return false
     b.click()
     return true

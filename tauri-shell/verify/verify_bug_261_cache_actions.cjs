@@ -213,11 +213,11 @@ async function waitToastContaining(page, candidates, timeout = 4000) {
 async function openSeriesById(page, id) {
   await page.goto(APP_URL, { waitForRoot: true, settleMs: 1500 })
   const ok = await page
-    .waitForFunction(() => !!document.querySelector('[data-testid="nav-media"]'), { timeout: 20000 })
+    .waitForFunction(() => !!document.querySelector('[data-testid="nav-child-lib-series"]'), { timeout: 20000 })
     .then(() => true)
     .catch(() => false)
-  if (!ok) throw new Error('nav-media not found (app did not boot?)')
-  await clickTestid(page, 'nav-media')
+  if (!ok) throw new Error('nav-child-lib-series not found (app did not boot?)')
+  await clickTestid(page, 'nav-child-lib-series')
   await page.waitForFunction(
     () => document.querySelectorAll('[data-testid="series-card"]').length > 0,
     { timeout: 20000 },

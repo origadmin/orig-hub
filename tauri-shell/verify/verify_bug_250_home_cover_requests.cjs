@@ -112,12 +112,12 @@ async function main() {
   try {
     await page.goto(APP, { settleMs: 1500 })
     const opened = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="nav-media"]')
+      const el = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (!el) return false
       el.click()
       return true
     })
-    check(opened, 'media library nav entry exists ([data-testid="nav-media"])', `clicked=${opened}`)
+    check(opened, 'media library nav entry exists ([data-testid="nav-child-lib-series"])', `clicked=${opened}`)
 
     // 阶段一：剧集墙（观测用，不作判据 —— 依赖后端新字段，待引擎重启）
     await page.waitForFunction(

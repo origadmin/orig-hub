@@ -488,7 +488,7 @@ async function main() {
       const onLibrary = await page
         .waitForFunction(
           () => {
-            const nav = document.querySelector('[data-testid="nav-media"]')
+            const nav = document.querySelector('[data-testid="nav-child-lib-series"]')
             return Boolean(nav && /text-accent/.test(nav.className || ''))
           },
           { timeout: WAIT_TIMEOUT_MS, intervalMs: 200 },

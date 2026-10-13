@@ -1,26 +1,31 @@
 'use strict'
 
 /**
- * BUG-259 复报取证：媒体库左栏「双重滚动条」。
+ * BUG-259 · 媒体库「双重滚动条」回归判据（M0 再锚定版）。
  *
- * 主张（可证伪）：左栏出现两条同时生效且**嵌套**的滚动条 ——
- *   外层 `<nav>`（媒体库左栏，`overflow-y-auto`，实测 client=723 / scroll=1552）
- *   内层 剧集列表（`max-h-72 overflow-y-auto`）
- * 而外层之所以溢出，是因为**标签列表没有任何上限**（BUG-259 修复方向 2 未实施）。
+ * ## 本脚本的性质变更（必读）
  *
- * 判据全部读 `getComputedStyle` + `scrollHeight/clientHeight`，
- * **不读 className 判滚动**（className 只用于定位元素）。
+ * 原版是**「缺陷存在」取证脚本**：断言左栏 `<nav>` 自身溢出 + 与剧集列表
+ * （`max-h-72 overflow-y-auto`）构成同时生效且**嵌套**的滚动对，并用「限标签容器」的
+ * 三段注入证明因果关系。头部原告警：「修复落地后它会开始报 FAIL —— 那是修复成功的信号」。
  *
- * 反向证伪（本条的因果核心，默认开启）分三段，避免「注入后没归零 ⇒ 一刀切 FAIL」这种
- * 把「主导原因」误判成「唯一原因」的错误：
- *   ① 线性响应：把标签容器限到 600 / 288（均未触底），断言
- *      `Δ外层溢出 == Δ标签容器高度`（±4px）⇒ 标签容器是唯一可伸缩项；
- *   ② 充分性：限到 212px ⇒ 外层 nav 溢出必须归零（实测 212/150/60 三档均为 0）；
- *   ③ 可逆性：还原标签容器样式 ⇒ 外层溢出必须复原到原始值 ⇒ 证明注入未被 React 覆盖。
+ * M0（BUG-298 / M0-T03）让该告警**作废**：左栏 rail 整段删除，取证的三个容器
+ * （左栏 nav、剧集列表、标签容器的左栏父级）全部消失 ⇒ **双重滚动在这个形态上
+ * 已不可能重现**。原判据不是被放宽，而是随容器一起退役。
  *
- * 若 ① 的斜率 ≠ 1，或 ② 在 212px 仍溢出，则「标签无上限 ⇒ 外层溢出」**不成立**，
- * 脚本必须报 FAIL。注意：单靠 ② 的临界值是由测量反推的（循环论证风险），
- * 所以 ① 的斜率检验才是因果证据，② 只是「存在一个足够小的上限能修好」的充分性证明。
+ * ⇒ 本脚本转为**修复后判据**（回归守卫），判的是同一类缺陷在新容器上的复活：
+ *
+ *   ① 媒体库面板子树内**不得存在同时生效且嵌套的滚动对**
+ *      （外层 overflowY ∈ {auto, scroll} 且 `scrollHeight > clientHeight + 1`，
+ *       且外层 `contains(inner)`；全部读几何，不读 className）；
+ *   ② 标签容器（`media-tag-list`）**不得是**活动滚动容器（收起态）；
+ *   ③ 标签块的祖先链（到面板根为止）不得有活动滚动容器 —— 否则标签会随内容滚走。
+ *
+ * 反向证伪（三向，自动注入 + 自动还原 + 自证 sha256）：
+ *   ① 人为制造嵌套对：把剧集墙滚动容器压到 160px、再给内部网格注入
+ *      `max-height:80px + overflow-y:auto` ⇒ 判据 ① 必须 FAIL；
+ *   ② 往标签容器注入 `max-height:120px + overflow-y:auto` ⇒ 判据 ② 必须 FAIL；
+ *   ③ 还原后 `sha256(main.outerHTML)` before == after，自证不过直接 FAIL。
  *
  * 用法：
  *   node tauri-shell/verify/verify_bug259_media_double_scroll.cjs
@@ -28,10 +33,113 @@
  */
 
 const path = require('node:path')
+const crypto = require('node:crypto')
 const cdp = require(path.join(__dirname, 'lib', 'cdp.cjs'))
 
 const APP_URL = process.env.VERIFY_APP_URL || 'http://127.0.0.1:5180/'
-const TOL = 4 // px
+const TOL = 1 // px
+
+const sha = (s) => crypto.createHash('sha256').update(s).digest('hex').slice(0, 16)
+
+/* ── 页面内测量/注入 ── */
+const PAGE = `
+window.__ds = {
+  parts() {
+    const tagBox = document.querySelector('[data-testid="media-tag-list"]')
+    const wall = document.querySelector('[data-testid="series-wall-scroll"]')
+    const host = tagBox ? (tagBox.closest('main') || document.body) : null
+    // 剧集墙内的内层容器：items 视图是有 testid 的 media-grid；剧集视图是墙的第一个
+    // 子元素（无 testid 的 grid div）—— 证伪①要往**墙内**注入，故两者都要能取到。
+    const inner = wall
+      ? wall.querySelector('[data-testid="media-grid"]') || wall.firstElementChild
+      : null
+    return { tagBox, wall, host, grid: inner }
+  },
+  snapshot() {
+    const p = window.__ds.parts()
+    if (!p || !p.host) return null
+    window.__snap = [p.host, ...p.host.querySelectorAll('*')].map((el) => ({
+      el,
+      attr: el.getAttribute('style'),
+    }))
+    return p.host.outerHTML
+  },
+  restore() {
+    for (const r of window.__snap || []) {
+      if (r.attr === null) r.el.removeAttribute('style')
+      else r.el.setAttribute('style', r.attr)
+    }
+    const p = window.__ds.parts()
+    return p && p.host ? p.host.outerHTML : ''
+  },
+  measure() {
+    const p = window.__ds.parts()
+    if (!p || !p.host) return { error: '媒体库面板未找到（未进入剧集墙视图？）' }
+    const { tagBox, wall, host, grid } = p
+    const actives = []
+    for (const el of [host, ...host.querySelectorAll('*')]) {
+      const cs = getComputedStyle(el)
+      if (cs.overflowY !== 'auto' && cs.overflowY !== 'scroll') continue
+      if (el.scrollHeight > el.clientHeight + 1) actives.push(el)
+    }
+    const pairs = []
+    for (const a of actives)
+      for (const b of actives)
+        if (a !== b && a.contains(b))
+          pairs.push({
+            outer: a.getAttribute('data-testid') || a.tagName,
+            inner: b.getAttribute('data-testid') || b.tagName,
+          })
+    const chipCount = tagBox ? [...tagBox.children].filter((el) => el.offsetParent !== null).length : -1
+    return {
+      actives: actives.length,
+      activeIds: actives.map((el) => el.getAttribute('data-testid') || el.tagName),
+      pairs,
+      tagChips: chipCount,
+      tagIsActiveScroll: !!tagBox && actives.includes(tagBox),
+      tagAncestorsScrolling: (() => {
+        if (!tagBox) return null
+        for (let el = tagBox.parentElement; el && el !== host; el = el.parentElement) {
+          if (actives.includes(el)) return true
+        }
+        return false
+      })(),
+      wallActive: !!wall && actives.includes(wall),
+      wallClientH: wall ? wall.clientHeight : -1,
+      innerScrollH: grid ? grid.scrollHeight : -1,
+      hasGrid: !!grid,
+    }
+  },
+  /** 反向证伪①：人工造出「外层 wall + 内层 grid」的嵌套滚动对（原缺陷的同形态复刻）。
+   *
+   *  ★ 关键约束（实测踩过）：**内层一旦被裁，外层就不再溢出** —— 若把内层压得比外层
+   *    可视区还矮，外层 content 只剩内层的渲染高 ⇒ 外层不滚 ⇒ 造不出对。
+   *    故内层上限必须**高于**外层可视区、同时低于自己的内容高：运行时按外层当前高度
+   *    取 wallH+80px。真库 79 剧集（内容 ≈2670px vs 外层 ≈545px）下必然成立；
+   *    内容比外层还矮的库**物理上造不出双重滚动**，此时注入无效 = 证伪未执行 ⇒ 判 FAIL
+   *    （不静默通过：没跑过的证伪不能用来宣称判据有能力 FAIL）。 */
+  injectNestedPair() {
+    const p = window.__ds.parts()
+    if (!p || !p.wall || !p.grid) return { ok: false, reason: 'series-wall-scroll 或其内层容器未找到' }
+    const h = Math.round(p.wall.getBoundingClientRect().height)
+    p.grid.style.maxHeight = h + 80 + 'px'
+    p.grid.style.overflowY = 'auto'
+    void p.wall.offsetHeight
+    return { ok: true, wallH: h }
+  },
+  /** 反向证伪②：把标签容器变成滚动容器。
+   *  ★ 调用前必须是**展开态**：收起态 8 个 chip 实测只有 20px 高（主区宽容器、单行），
+   *    任何 ≥20px 的上限都压不出溢出 ⇒ 证伪假红（BUG-259 §五 教训）。 */
+  injectTagScroll() {
+    const p = window.__ds.parts()
+    if (!p || !p.tagBox) return false
+    p.tagBox.style.maxHeight = '12px'
+    p.tagBox.style.overflowY = 'auto'
+    void p.tagBox.offsetHeight
+    return true
+  },
+}
+`
 
 async function main() {
   const results = []
@@ -47,122 +155,106 @@ async function main() {
     await new Promise((r) => setTimeout(r, 2500))
 
     const entered = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="nav-media"]')
+      const el = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (!el) return false
       el.click()
       return true
     })
-    check('进入媒体库', entered === true, 'data-testid="nav-media"')
+    check('进入媒体库（侧栏 nav-child-lib-series）', entered === true)
     await new Promise((r) => setTimeout(r, 3500))
 
-    // ── 共用测量函数（注入到页面里）─────────────────────────────────────────
-    const measure = async (cap) =>
-      page.evaluate((cap) => {
-        const title = document.querySelector('[data-testid="media-panel-title"]')
-        const nav = title.closest('aside').querySelector('nav')
-        const kids = Array.from(nav.children)
-        const tagBox = kids.find(
-          (el) => (el.getAttribute('class') || '').includes('flex-wrap') && el.children.length > 5
-        )
-        if (cap !== null && tagBox) {
-          if (cap === 'reset') {
-            tagBox.style.maxHeight = ''
-            tagBox.style.overflowY = ''
-          } else {
-            tagBox.style.maxHeight = cap + 'px'
-            tagBox.style.overflowY = 'auto'
-          }
-          void tagBox.offsetHeight
-        }
-        // 同时生效且嵌套的滚动对
-        const actives = []
-        for (const el of document.querySelectorAll('*')) {
-          const cs = getComputedStyle(el)
-          if (cs.overflowY !== 'auto' && cs.overflowY !== 'scroll') continue
-          if (el.scrollHeight > el.clientHeight + 1) actives.push(el)
-        }
-        const pairs = []
-        for (const a of actives)
-          for (const b of actives)
-            if (a !== b && a.contains(b))
-              pairs.push({
-                outer: (a.getAttribute('class') || a.tagName).slice(0, 45),
-                inner: (b.getAttribute('class') || b.tagName).slice(0, 45),
-              })
-        return {
-          clientH: nav.clientHeight,
-          scrollH: nav.scrollHeight,
-          tagH: tagBox ? Math.round(tagBox.getBoundingClientRect().height) : -1,
-          tagMaxH: tagBox ? getComputedStyle(tagBox).maxHeight : 'n/a',
-          tagChips: tagBox ? tagBox.children.length : -1,
-          actives: actives.length,
-          pairs,
-          kids: kids.map((el) => ({
-            h: Math.round(el.getBoundingClientRect().height),
-            cls: (el.getAttribute('class') || '').slice(0, 45),
-            maxH: getComputedStyle(el).maxHeight,
-            oy: getComputedStyle(el).overflowY,
-          })),
-        }
-      }, cap)
+    await page.evaluate(PAGE)
 
-    // ── 正测 0：基线 ──────────────────────────────────────────────────────
-    const base = await measure(null)
-    const baseOver = base.scrollH - base.clientH
-    check('左栏 nav 自身溢出（出现外层滚动条）', baseOver > 1,
-      `client=${base.clientH} scroll=${base.scrollH} 溢出=${baseOver}`)
+    /* ─────────── 正测：不得有嵌套滚动对 ─────────── */
+    const m = await page.evaluate(() => window.__ds.measure())
+    if (m.error) {
+      check('媒体库面板可测量', false, m.error)
+      await browser.close()
+      return 2
+    }
+    console.log(
+      `  面板活动滚动容器 ${m.actives} 个：${JSON.stringify(m.activeIds)} · 嵌套对 ${m.pairs.length} · ` +
+        `标签 chip ${m.tagChips} · 标签容器是滚动容器=${m.tagIsActiveScroll} · ` +
+        `标签祖先链滚动=${m.tagAncestorsScrolling} · 剧集墙在滚=${m.wallActive}`,
+    )
 
-    const seriesBox = base.kids.find((k) => k.oy === 'auto' && k.maxH !== 'none')
-    check('左栏内层剧集列表自带滚动容器', !!seriesBox,
-      seriesBox ? `maxHeight=${seriesBox.maxH}` : '未找到')
+    check('判据① 面板内无同时生效且嵌套的滚动对（双重滚动不复活）', m.pairs.length === 0, JSON.stringify(m.pairs))
+    check('判据② 标签容器不是活动滚动容器（收起态）', m.tagIsActiveScroll === false, `isActive=${m.tagIsActiveScroll}`)
+    check(
+      '判据③ 标签块祖先链无活动滚动容器（不随内容滚走）',
+      m.tagAncestorsScrolling === false,
+      `ancestorsScrolling=${m.tagAncestorsScrolling}`,
+    )
 
-    check('标签容器无任何上限（maxHeight=none / overflowY=visible）',
-      base.tagMaxH === 'none' && base.tagChips > 5,
-      `标签容器高=${base.tagH}px chips=${base.tagChips} maxHeight=${base.tagMaxH}`)
+    /* ─────────── 展开态再判一次（原口径「无条件禁止」不含状态例外） ─────────── */
+    const toggled = await page.evaluate(() => {
+      const el = document.querySelector('[data-testid="media-tag-toggle"]')
+      if (!el) return false
+      el.click()
+      return true
+    })
+    await new Promise((r) => setTimeout(r, 600))
+    const mExp = await page.evaluate(() => window.__ds.measure())
+    check(
+      '判据②b 展开态标签容器同样不是活动滚动容器',
+      mExp.tagIsActiveScroll === false && mExp.pairs.length === 0,
+      `isActive=${mExp.tagIsActiveScroll} 嵌套对=${mExp.pairs.length}`,
+    )
+    // 收回归起态
+    if (toggled) await page.evaluate(() => document.querySelector('[data-testid="media-tag-toggle"]')?.click())
+    await new Promise((r) => setTimeout(r, 500))
 
-    check('存在「两条同时生效且嵌套」的滚动条', base.pairs.length >= 1,
-      `在滚容器=${base.actives} 嵌套对=${base.pairs.length}` +
-      (base.pairs[0] ? `（外层「${base.pairs[0].outer}」内含内层「${base.pairs[0].inner}」）` : ''))
+    /* ─────────── 反向证伪（三向） ─────────── */
+    console.log('\n══════ 反向证伪（证明本脚本会 FAIL） ══════')
+    // 展开标签：收起态容器实测只有 20px 高，注入压不出溢出 ⇒ 假红
+    await page.evaluate(() => {
+      const el = document.querySelector('[data-testid="media-tag-toggle"]')
+      if (el && el.getAttribute('aria-expanded') !== 'true') el.click()
+    })
+    await new Promise((r) => setTimeout(r, 600))
 
-    // ── 反向证伪 ①：线性响应（斜率必须 = 1）────────────────────────────────
-    const m600 = await measure(600)
-    const m288 = await measure(288)
-    const dTag600 = base.tagH - m600.tagH
-    const dOver600 = baseOver - (m600.scrollH - m600.clientH)
-    const dTag288 = base.tagH - m288.tagH
-    const dOver288 = baseOver - (m288.scrollH - m288.clientH)
-    check('① 线性响应：把标签容器压 441px ⇒ 外层溢出减少同量（斜率=1）',
-      Math.abs(dTag600 - dOver600) <= TOL,
-      `标签 -${dTag600}px / 外层溢出 -${dOver600}px`)
-    check('① 线性响应：把标签容器压 753px ⇒ 外层溢出减少同量（斜率=1）',
-      Math.abs(dTag288 - dOver288) <= TOL,
-      `标签 -${dTag288}px / 外层溢出 -${dOver288}px（注意 cap=288 即复用 max-h-72 仍剩 ${m288.scrollH - m288.clientH}px）`)
+    const before = await page.evaluate(() => window.__ds.snapshot())
+    const h0 = sha(before)
 
-    // ── 反向证伪 ②：充分性（≤212px 必须归零）───────────────────────────────
-    const m212 = await measure(212)
-    const over212 = m212.scrollH - m212.clientH
-    check('② 充分性：标签容器限到 212px ⇒ 外层 nav 溢出归零', over212 <= 1,
-      `nav client=${m212.clientH} scroll=${m212.scrollH} 溢出=${over212}`)
-    check('② 充分性：嵌套滚动对随之归零', m212.pairs.length === 0,
-      `剩余嵌套对=${m212.pairs.length}`)
+    // ① 人造嵌套对 ⇒ 判据 ① 必须 FAIL
+    const inj1 = await page.evaluate(() => window.__ds.injectNestedPair())
+    const m1 = await page.evaluate(() => window.__ds.measure())
+    check(
+      '反向证伪① 注入「内层 grid 限高 wallH+80 + 自身滚动」⇒ 嵌套滚动对必须 ≥1（判据① 有能力 FAIL）',
+      inj1.ok === true && m1.pairs.length >= 1,
+      inj1.ok
+        ? `wallH=${inj1.wallH} 内层内容高=${m1.innerScrollH} ⇒ 嵌套对=${m1.pairs.length} ${JSON.stringify(m1.pairs)}`
+        : `注入未执行：${inj1.reason}`,
+    )
+    await page.evaluate(() => window.__ds.restore())
 
-    // ── 反向证伪 ③：可逆性（还原后必须复原）───────────────────────────────
-    const mReset = await measure('reset')
-    const overReset = mReset.scrollH - mReset.clientH
-    check('③ 可逆性：还原标签容器 ⇒ 外层溢出复原（证明注入未被 React 覆盖）',
-      Math.abs(overReset - baseOver) <= TOL,
-      `还原后溢出=${overReset} 基线=${baseOver}`)
+    // ② 标签容器注入滚动 ⇒ 判据 ② 必须 FAIL
+    const inj2 = await page.evaluate(() => window.__ds.injectTagScroll())
+    const m2 = await page.evaluate(() => window.__ds.measure())
+    check(
+      '反向证伪② 注入标签容器 max-h-12px+overflow-y-auto（展开态）⇒ 判据② 必须 FAIL（有能力 FAIL）',
+      inj2 === true && m2.tagIsActiveScroll === true,
+      `注入后 isActive=${m2.tagIsActiveScroll}`,
+    )
+    await page.evaluate(() => window.__ds.restore())
+
+    // ③ 还原自证
+    const after = await page.evaluate(() => window.__ds.restore())
+    const h1 = sha(after)
+    check('反向证伪③ 自动还原自证：sha256(main.outerHTML) before == after', h0 === h1, `${h0} vs ${h1}`)
+    const back = await page.evaluate(() => window.__ds.measure())
+    check(
+      '反向证伪③ 还原后回到基线（嵌套对 0、标签容器不在滚）',
+      back.pairs.length === 0 && back.tagIsActiveScroll === false,
+      `嵌套对=${back.pairs.length} 标签在滚=${back.tagIsActiveScroll}`,
+    )
 
     const failed = results.filter((r) => !r.pass)
     console.log(`\n${results.length - failed.length}/${results.length} PASS`)
-    console.log(`基线：nav ${base.clientH}/${base.scrollH}（溢出 ${baseOver}）· ` +
-      `标签容器 ${base.tagH}px / ${base.tagChips} chips / maxHeight=${base.tagMaxH}`)
-    // 截图落 verify_shots/（gitignore，见 .gitignore:29），不写本机绝对路径（污染门禁 §7）
-    const shots = path.resolve(__dirname, '..', 'verify_shots', 'bug259')
-    require('node:fs').mkdirSync(shots, { recursive: true })
-    await page
-      .screenshot(path.join(shots, 'double_scroll.png'))
-      .catch(() => undefined)
+    if (failed.length) {
+      console.log('未通过：')
+      for (const f of failed) console.log(`  ✗ ${f.name}${f.detail ? '  — ' + f.detail : ''}`)
+    }
     return failed.length === 0 ? 0 : 2
   } finally {
     await browser.close()

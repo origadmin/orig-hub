@@ -67,7 +67,7 @@ async function main() {
   const page = await browser.newPage()
   await page.goto(ep.app, { waitUntil: 'load' })
   await delay(3000)
-  await click(page, 'nav-media')
+  await click(page, 'nav-child-lib-series')
   await delay(7000)
 
   const series = await readSeries(page)

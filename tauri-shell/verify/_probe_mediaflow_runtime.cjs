@@ -194,12 +194,12 @@ async function main() {
 
     await page.goto(APP, { waitForRoot: true, settleMs: 1800 })
     const navOk = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="nav-media"]')
+      const el = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (!el) return false
       el.click()
       return true
     })
-    if (!navOk) throw new Error('nav-media 入口未找到')
+    if (!navOk) throw new Error('nav-child-lib-series 入口未找到')
     // 媒体库默认可能停在「剧集墙」（视图被持久化）；点分类进入 items 海报墙。
     await sleep(1000)
     const toItems = await page.evaluate(() => {

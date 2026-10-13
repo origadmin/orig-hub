@@ -142,8 +142,8 @@ function scanDots() {
 
 async function gotoMediaLibrary(page) {
   await page.goto(APP_URL, { waitForRoot: true, settleMs: 1500 })
-  await waitTestid(page, 'nav-media', 15000)
-  await clickTestid(page, 'nav-media')
+  await waitTestid(page, 'nav-child-lib-series', 15000)
+  await clickTestid(page, 'nav-child-lib-series')
   await waitTestid(page, 'media-tag-list', 15000)
   await delay(900)
 }

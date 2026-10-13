@@ -155,7 +155,7 @@ async function openSeries(page, title) {
     await delay(1500)
   }
   await page.evaluate(() => {
-    const n = document.querySelector('[data-testid="nav-media"]')
+    const n = document.querySelector('[data-testid="nav-child-lib-series"]')
     if (n) n.click()
     return !!n
   })

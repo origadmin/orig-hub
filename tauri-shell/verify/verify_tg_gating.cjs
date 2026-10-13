@@ -2,24 +2,27 @@
 'use strict'
 
 /**
- * Real-render acceptance: TG 入口级门控 = **「服务可用？否 → 不显示 TG」**（BUG-177）。
+ * Real-render acceptance: TG 入口**常驻** + 面板内引导空态（BUG-094 口径改变 /
+ * 模块重整 M0-T05，规划包 2026-10-13 拍板）。
  *
- * 回退事实（2026-09-29）：orig-tg 是 daemon 托管的子进程，但入口门控只看开关
- * `tgEnabled`，于是「已开启却连不上」被当成一种合法产品状态呈现给用户
- * （面板里写着「调试模式：TG 未连接」），用户据此怀疑「数据是不是丢了」。
+ * 2026-09-29 的旧口径（BUG-177）是「服务可用？否 → 不显示 TG」。它换来一个更坏的结果：
+ * 插件未启用/未登录时用户**既看不到入口、也看不到引导**，只会以为「功能没了」。
+ * 2026-10-13 起口径改为：**入口在任何状态下都不消失**，可用性判据
+ * （`resolveTgFeatureReady`，仍只有这一份）移入 TgPanel 自己算，未就绪时渲染引导空态。
+ * 故本脚本的核心断言由「nav-tg 存在 ⇔ 服务可达」改为「nav-tg **恒存在**」。
  *
  * 本脚本**不接受**「页面能打开」或「字符串存在」当证据。真值来自两处且必须在浏览器内对齐：
  *   1. daemon `GET /api/config` 的 `tg_enabled` / `tg_running` / `tg_last_error`；
  *   2. 浏览器**自己**那个 TG base（动态 import `/src/api/tg.ts` 取 `TG_BASE`，
  *      与 App 同源，不硬编码端口）的 `/health` 可达性。
- * 断言：`nav-tg` 存在 ⇔ (开关开 ∧ 浏览器 TG base 可达)。
- *
- * 同一脚本在「后端活 / 后端死」两种状态下都要跑：两次都得 PASS，
- * 才能证明门控真的双向生效（只在一个方向绿 = 恒绿断言）。
+ * 断言（新口径）：
+ *   a. `nav-tg` 在「后端活 / 后端死」两种状态下**都存在**（入口常驻）；
+ *   b. 点进 TG 面板必须落到五态之一（引导/启动/未绑定/故障/正常两栏）—— 不能是白板；
+ *   c. 设置·Telegram 区块的启停状态文案与 daemon 服务层原值一致（诚实性，旧口径保留）。
  *
  * Usage:
  *   node verify/verify_tg_gating.cjs
- *   APP_URL=http://127.0.0.1:5180/ DAEMON_PORT=18776 node verify/verify_tg_gating.cjs
+ *   APP_URL=http://127.0.0.1:5180/ DAEMON_PORT=19786 node verify/verify_tg_gating.cjs
  *
  * Exit: 0 = all passed, 1 = assertion failed, 2 = environment problem.
  */
@@ -31,13 +34,18 @@ const path = require('node:path')
 const cdp = require('./lib/cdp.cjs')
 
 const APP_URL = process.env.APP_URL || 'http://127.0.0.1:5180/'
-const DAEMON_PORT = Number(process.env.DAEMON_PORT || 9876)
+/* daemon 端口运行时解析，**不写死**：本机 9876 属 WinNAT 保留段（绑不上 ⇒
+   `os error 10013`），旧默认值 9876 会让脚本在任何机器上都报「daemon unreachable」，
+   与「服务没起」不可区分。真源仍是 `GET <daemon>/api/config`（与侧栏徽标同源），
+   默认值取本仓 dev 栈的 19786（与 verify_tg_ownership.cjs 一致）。 */
+const DAEMON_PORT = Number(
+  process.env.DAEMON_PORT || process.env.ORIG_DAEMON_API?.replace(/^https?:\/\/[^:]+:(\d+).*$/, '$1') || 19786,
+)
 const OUT_DIR = process.env.ORIG_VERIFY_OUT || path.join(os.tmpdir(), 'orighub-verify-tggating')
 const NAV_TIMEOUT_MS = Number(process.env.ORIG_VERIFY_NAV_TIMEOUT || 45000)
 
-const SETTINGS_HEADING = '下载设置'
-/** 设置页 TG 开关所在页签（默认页签是 downloads，必须先切） */
-const GENERAL_TAB_TESTID = 'settings-tab-general'
+/** 设置页 TG 开关所在区块（M0-T07 起在「Telegram 插件」，默认区块是 general） */
+const TG_SECTION_TESTID = 'settings-tab-telegram'
 
 const results = []
 
@@ -120,12 +128,14 @@ async function main() {
       `[verify:tggating] browser TG_BASE=${tgProbe.base} reachable=${tgProbe.reachable}`,
     )
 
-    const expectedVisible = tgEnabled && tgProbe.reachable
-    console.log(`[verify:tggating] expected nav-tg visible = ${expectedVisible}`)
+    // 新口径（2026-10-13）：入口常驻 —— 两种后端状态下 nav-tg 都必须存在。
+    const expectedVisible = true
+    console.log(`[verify:tggating] daemon tg_enabled=${tgEnabled} browser TG_BASE reachable=${tgProbe.reachable}`)
+    console.log('[verify:tggating] expected nav-tg visible = true（入口常驻，与就绪态无关）')
     console.log('')
     console.log('--- assertions ---')
 
-    // 门控是异步的（TG 探测要等），有界轮询而不是采样一次。
+    // 侧栏是异步渲染的，有界轮询而不是采样一次。
     await waitForNavTg(page, expectedVisible)
 
     const nav = await page.evaluate(() => ({
@@ -137,11 +147,39 @@ async function main() {
     console.log(`[verify:tggating] nav testids = ${JSON.stringify(nav.navIds)}`)
 
     check(
-      expectedVisible
-        ? 'TG 服务可达 → 侧栏必须有 nav-tg 入口'
-        : 'TG 服务不可达 → 侧栏不得有 nav-tg 入口（核心设计）',
+      '入口常驻：无论 TG 是否就绪，侧栏都必须有 nav-tg（BUG-094 新口径）',
       () => nav.present === expectedVisible,
       `nav-tg present=${nav.present} expected=${expectedVisible}`,
+    )
+
+    // ---- 2b. 点进 TG 面板必须落到一个可读状态（M0-T05）----
+    await page.evaluate(() => document.querySelector('[data-testid="nav-tg"]')?.click())
+    await page
+      .waitForFunction(
+        () =>
+          [
+            'tg-onboard-disabled',
+            'tg-onboard-starting',
+            'tg-unbound-guide',
+            'tg-panel-broken',
+            'tg-monitor-list',
+          ].some(id => Boolean(document.querySelector(`[data-testid="${id}"]`))),
+        { timeout: 10000, intervalMs: 200 },
+      )
+      .catch(() => {})
+    const tgState = await page.evaluate(() =>
+      [
+        'tg-onboard-disabled',
+        'tg-onboard-starting',
+        'tg-unbound-guide',
+        'tg-panel-broken',
+        'tg-monitor-list',
+      ].filter(id => Boolean(document.querySelector(`[data-testid="${id}"]`))),
+    )
+    check(
+      'TG 面板落到可读状态之一（未启用/启动中/未绑定/链路故障/正常），不是白板',
+      () => tgState.length > 0,
+      `hit=${JSON.stringify(tgState)}`,
     )
 
     // ---- 3. 设置页：开关状态与失败原因必须诚实 ----
@@ -152,14 +190,16 @@ async function main() {
       return true
     })
     check('nav-settings anchor exists and is clickable', () => clicked)
+    // 等左锚点渲染出来即可（默认区块已是 general，不再依赖任何区块标题文案 ——
+    // 旧判据等「下载设置」字样，而 M0-T07 后默认区块是通用，那个字符串不会出现）。
     await page.waitForFunction(
-      needle => document.body.innerText.includes(needle),
-      { timeout: 15000, intervalMs: 200, args: [SETTINGS_HEADING] },
+      id => Boolean(document.querySelector(`[data-testid="${id}"]`)),
+      { timeout: 15000, intervalMs: 200, args: [TG_SECTION_TESTID] },
     )
     await page.evaluate(testid => {
       const el = document.querySelector(`[data-testid="${testid}"]`)
       if (el) el.click()
-    }, GENERAL_TAB_TESTID)
+    }, TG_SECTION_TESTID)
 
     // 状态文案由异步 getConfig 填充 → 有界轮询到目标文案。
     const wantStatus = tgEnabled ? (tgRunning ? '运行中' : '启动失败') : '已停止'

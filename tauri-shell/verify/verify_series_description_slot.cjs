@@ -197,8 +197,8 @@ async function setViewport(page, width, height) {
  */
 async function openSeriesDetail(page, seriesId) {
   await page.goto(APP_URL, { waitForRoot: true, settleMs: 1200 })
-  await waitTestidSoft(page, 'nav-media', 15000)
-  await clickTestid(page, 'nav-media')
+  await waitTestidSoft(page, 'nav-child-lib-series', 15000)
+  await clickTestid(page, 'nav-child-lib-series')
   await page.waitForFunction(() => document.querySelectorAll('[data-testid="series-card"]').length > 0, {
     timeout: 20000,
   })
@@ -372,7 +372,7 @@ async function main() {
 
     if (PROBE) {
       await page.goto(APP_URL, { waitForRoot: true, settleMs: 1500 })
-      await clickTestid(page, 'nav-media')
+      await clickTestid(page, 'nav-child-lib-series')
       await delay(1500)
       const ids = await page.evaluate(() =>
         Array.from(document.querySelectorAll('[data-testid]'))

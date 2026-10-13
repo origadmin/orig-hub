@@ -42,9 +42,8 @@ const OUT_DIR =
   process.env.ORIG_VERIFY_OUT || path.join(os.tmpdir(), 'orighub-verify-tgownership')
 const NAV_TIMEOUT_MS = Number(process.env.ORIG_VERIFY_NAV_TIMEOUT || 45000)
 
-const SETTINGS_HEADING = '下载设置'
-const GENERAL_TAB = 'settings-tab-general'
-const ACCOUNTS_TAB = 'settings-tab-accounts'
+/** M0-T07 起 TG 开关与账号区同驻「Telegram 插件」区块（原 general + accounts 两个页签） */
+const TG_SECTION = 'settings-tab-telegram'
 /** BUG-178 前「待办被说成故障」的那句原话 —— 现在任何页面都不许再出现 */
 const FORBIDDEN_PHRASE = 'Telegram 不可用'
 /** 手动运维入口的文案 —— 重启/kill 归 daemon，不该留给用户点 */
@@ -188,17 +187,17 @@ async function main() {
       return true
     })
     check('nav-settings 可点开', () => opened)
-    await page.waitForFunction(needle => document.body.innerText.includes(needle), {
+    await page.waitForFunction(id => Boolean(document.querySelector(`[data-testid="${id}"]`)), {
       timeout: 15000,
       intervalMs: 200,
-      args: [SETTINGS_HEADING],
+      args: [TG_SECTION],
     })
 
-    // 通用页签：TG 开关状态
+    // Telegram 插件区块：TG 开关状态
     await page.evaluate(id => {
       const el = document.querySelector(`[data-testid="${id}"]`)
       if (el) el.click()
-    }, GENERAL_TAB)
+    }, TG_SECTION)
     const wantStatus = tgEnabled ? (tgRunning ? '运行中' : '启动失败') : '已停止'
     await page
       .waitForFunction(
@@ -218,11 +217,11 @@ async function main() {
       `ui=${JSON.stringify(status)} want=${JSON.stringify(wantStatus)}`,
     )
 
-    // 账号页签：链路层表述
+    // 同一区块下滚即可看到账号区（M0-T07：账号区已并入 Telegram 插件区块）
     await page.evaluate(id => {
       const el = document.querySelector(`[data-testid="${id}"]`)
       if (el) el.click()
-    }, ACCOUNTS_TAB)
+    }, TG_SECTION)
     await page
       .waitForFunction(
         () =>

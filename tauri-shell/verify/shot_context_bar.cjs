@@ -42,11 +42,18 @@ function check(name, ok, detail) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  |  ' + detail : ''}`)
 }
 
-/** 读上下文栏的运行期事实：标题、连接态、header 几何、按钮清单。 */
+/** 读上下文栏的运行期事实：标题、副标题、连接态、header 几何、按钮清单。
+ *
+ * `sub` = 树选择副标题（`ContextBar::ViewTitle` 的 `context-bar-sub`）：
+ * 文件域取分类/资料库组标签，下载域取档位标签；无副标题时为 null。
+ * 缺失该读数会让 `EXPECT.*.sub` 断言恒 FAIL（`undefined !== '下载中'`）——
+ * 即「断言引用了一个读不到的字段」，正是最坏的一类假绿。
+ */
 async function readBar(page) {
   return page.evaluate(() => {
     const header = document.querySelector('[data-testid="context-bar-header"]')
     const title = document.querySelector('[data-testid="context-bar-title"]')
+    const sub = document.querySelector('[data-testid="context-bar-sub"]')
     const conn = document.querySelector('[data-testid="context-conn"]')
     // BUG-169 终裁：唯一连接状态点在底栏右下角（statusbar-conn）
     const footerConn = document.querySelector('[data-testid="statusbar-conn"]')
@@ -60,6 +67,7 @@ async function readBar(page) {
     return {
       hasHeader: !!header,
       title: title ? (title.textContent || '').trim() : null,
+      sub: sub ? (sub.textContent || '').trim() : null,
       connState: conn ? conn.getAttribute('data-conn-state') : null,
       connText: conn ? (conn.textContent || '').trim() : null,
       footerConnState: footerConn ? footerConn.getAttribute('data-conn-state') : null,
@@ -89,14 +97,20 @@ async function main() {
   await page.goto(URL, { waitUntil: 'domcontentloaded' })
   await page.waitForTimeout(1200)
 
-  /** 视图 → 期望标题（zh-CN 默认语言；与 `nav.*` 一致） */
+  /**
+   * 视图 → 期望标题（zh-CN 默认语言）。
+   * M0 起一级域只剩五个，下载三档降为侧栏树子项（`nav-child-dl-*`），
+   * 标题统一取域标题（下载=「下载」，档位进副标题 `context-bar-sub`）。
+   * 键 = 侧栏锚点；`sub` = 期望副标题（无则省略）。
+   */
   const EXPECT = {
-    'nav-media': '媒体库',
-    'nav-tg': 'Telegram',
-    'nav-settings': '设置',
-    'nav-downloading': '下载中',
-    'nav-paused': '已暂停',
-    'nav-completed': '已完成',
+    'nav-files': { title: '文件', sub: null },
+    'nav-child-lib-series': { title: '文件', sub: '剧集' },
+    'nav-tg': { title: 'Telegram' },
+    'nav-settings': { title: '设置' },
+    'nav-child-dl-running': { title: '下载', sub: '下载中' },
+    'nav-child-dl-paused': { title: '下载', sub: '已暂停' },
+    'nav-child-dl-done': { title: '下载', sub: '已完成' },
   }
 
   const geo = []
@@ -112,17 +126,19 @@ async function main() {
     await page.screenshot({ path: shot })
 
     check(`${testid} 上下文栏存在`, bar.hasHeader, shot)
-    check(`${testid} 标题为「${expect}」`, bar.title === expect, `实际「${bar.title}」`)
+    check(`${testid} 标题为「${expect.title}」`, bar.title === expect.title, `实际「${bar.title}」`)
+    if (expect.sub) {
+      check(`${testid} 副标题为「${expect.sub}」`, bar.sub === expect.sub, `实际「${bar.sub}」`)
+    }
     // BUG-169 终裁：顶栏右槽不得再有连接态；唯一状态点在底栏（statusbar-conn）
     check(`${testid} 右槽无连接态（唯一状态点已收到底栏）`, bar.connState === null, `headerState=${bar.connState}`)
     check(`${testid} 底栏唯一状态点存在`, bar.footerConnState !== null, `state=${bar.footerConnState} text=${bar.footerConnText}`)
-    if (testid === 'nav-media' || testid === 'nav-tg' || testid === 'nav-settings') {
-      check(`${testid} 右槽无下载按钮`, bar.buttons.length === 0, JSON.stringify(bar.buttons))
-    } else {
+    // M0 起只有下载域（三档树子项）给操作组；其余域一律全局态右槽。
+    if (testid.startsWith('nav-child-dl-')) {
       const texts = bar.buttons.map((b) => b.text)
       check(`${testid} 有下载操作按钮`, texts.length >= 3, JSON.stringify(bar.buttons))
       const hasClear = texts.some((x) => x.includes('清空'))
-      if (testid === 'nav-completed') {
+      if (testid === 'nav-child-dl-done') {
         // 只有「已完成」档给「清空」：失败·已取消档已移除，失败项靠行内「删除」单条清理
         check(`${testid} 有「清空」`, hasClear, JSON.stringify(texts))
       } else {
@@ -147,15 +163,16 @@ async function main() {
     JSON.stringify(geo.map((g) => `${g.testid}:h=${g.height}`)),
   )
 
-  // 「全部文件」下钻：标题补一级面包屑
-  const allRow = page.locator('[data-testid="all-files-row"]')
-  if ((await allRow.count()) > 0) {
-    await allRow.first().click()
-    await page.waitForTimeout(250)
-    const bar = await readBar(page)
-    check('全部文件 标题', bar.title === '全部文件', `实际「${bar.title}」`)
-    await page.screenshot({ path: path.join(OUT, 'context_all.png') })
-  }
+  /**
+   * 「文件父行」= `nav-files` 锚点（文件域父项本身，`nav-files-row` 只是包住
+   * 「父项按钮 + 展开箭头」的 div，**没有 onClick**：点 div 不导航）。
+   *
+   * 它已进上面的 EXPECT 循环（期望标题「文件」、无副标题 —— `cat-all` 不是
+   * 分类子项，`fileCategoryOf` 返回 null）。这里不再单独点一遍：
+   * 早先版本点 `nav-files-row` 拿标题，一次性 CDP 探针实测点击被 div 吞掉、
+   * 栏上仍留着上一个视图的「下载 / 已完成」——即断言引用了一个不可点的元素，
+   * 判据本身失效（假红的孪生：判据引用了一个不存在的交互）。
+   */
 
   await browser.close()
 

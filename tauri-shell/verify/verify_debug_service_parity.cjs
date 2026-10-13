@@ -175,7 +175,7 @@ async function main() {
 
       // 4b. 媒体库渲染条目
       await page.evaluate(() => {
-        const candidates = ['nav-media', 'nav-library', 'nav-downloads']
+        const candidates = ['nav-child-lib-series', 'nav-library', 'nav-downloads']
         for (const id of candidates) {
           const el = document.querySelector(`[data-testid="${id}"]`)
           if (el) {

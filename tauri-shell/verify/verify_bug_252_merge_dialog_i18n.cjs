@@ -127,7 +127,7 @@ async function forceLanguage(page, appUrl, lang) {
  */
 async function openMergeDialog(page, targetId, sourceTitle) {
   await page.evaluate(() => {
-    const el = document.querySelector('[data-testid="nav-media"]')
+    const el = document.querySelector('[data-testid="nav-child-lib-series"]')
     if (el) el.click()
   })
   await delay(1200)

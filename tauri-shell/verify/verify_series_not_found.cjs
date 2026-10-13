@@ -202,8 +202,8 @@ async function main() {
     const page = await browser.newPage()
     // 默认视图是「下载」，先进媒体库（MediaLibraryPanel 落地视图=剧集墙）。
     await page.goto(APP_URL, { timeout: NAV_TIMEOUT_MS })
-    const navOk = await clickTestId(page, 'nav-media')
-    check('进入媒体库面板', navOk, navOk ? '' : '未找到 nav-media 导航项')
+    const navOk = await clickTestId(page, 'nav-child-lib-series')
+    check('进入媒体库面板', navOk, navOk ? '' : '未找到 nav-child-lib-series 导航项')
     if (!navOk) return dumpResults()
 
     // 剧集墙已挂载（rail 标签「剧集」出现）。
@@ -215,7 +215,7 @@ async function main() {
 
     // 让墙重新拉取，把刚建的剧集显示出来：刷新 + 再进媒体库（mount 即 loadSeries）。
     await page.goto(APP_URL, { timeout: NAV_TIMEOUT_MS })
-    await clickTestId(page, 'nav-media')
+    await clickTestId(page, 'nav-child-lib-series')
     const cardShown = await page
       .waitForFunction((t) => document.body.innerText.includes(t), {
         timeout: STEP_TIMEOUT_MS,

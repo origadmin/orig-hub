@@ -75,7 +75,7 @@ async function main() {
     await page.screenshot(path.join(OUT_DIR, 'p5-settings-libdir.png'), { fullPage: true })
 
     // 2) 媒体库：打开导出预览
-    await clickTestid(page, 'nav-media')
+    await clickTestid(page, 'nav-child-lib-series')
     await delay(1000)
     await waitTestid(page, 'media-export-preview')
     await clickTestid(page, 'media-export-preview')

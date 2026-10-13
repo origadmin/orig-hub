@@ -390,12 +390,12 @@ async function main() {
 
     // ── 进入媒体库 → 全部内容 ──
     const navOk = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="nav-media"]')
+      const el = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (!el) return false
       el.click()
       return true
     })
-    if (!navOk) throw new Error('nav-media 入口不存在')
+    if (!navOk) throw new Error('nav-child-lib-series 入口不存在')
     await delay(1800)
     const catOk = await page.evaluate(() => {
       const el = document.querySelector('[data-testid="media-cat-all"]')

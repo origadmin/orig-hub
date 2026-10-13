@@ -147,13 +147,14 @@ async function main() {
     await page.waitForTimeout(2500)
     // 进设置页。两个坑都在这里（首版就在此 FATAL）：
     // 1) 定位用 `data-testid` —— `nav button[title=…]` 既依赖翻译文案，又会命中**设置页自身的
-    //    aside>nav**（它也渲染「常规/下载/…」按钮），是不同的导航层；
-    // 2) 设置页默认落在**「下载」页签**，而清理入口挂在**「常规」**下 —— 不切页签就永远等不到它。
+    //    aside>nav**（它也渲染「通用/下载与存储/…」按钮），是不同的导航层；
+    // 2) M0-T07 起清理入口挂在**「Telegram 插件」**区块（原先在「常规」）——
+    //    不切区块就永远等不到它。
     const entry = page.locator('[data-testid="clear-cache-files"]').first()
     const usage = page.locator('[data-testid="clear-cache-usage"]').first()
-    const tabGeneral = page.locator('[data-testid="settings-tab-general"]').first()
+    const tabTg = page.locator('[data-testid="settings-tab-telegram"]').first()
 
-    /** 进设置页 → 切到「常规」。`delayPreview` > 0 时把预览请求卡住，用于造「判据未就绪」态。 */
+    /** 进设置页 → 切到「Telegram 插件」。`delayPreview` > 0 时把预览请求卡住，用于造「判据未就绪」态。 */
     const openSettings = async (delayPreview = 0) => {
       if (delayPreview > 0) {
         await page.route('**/api/cache/clear/preview**', async (route) => {
@@ -162,8 +163,8 @@ async function main() {
         })
       }
       await page.locator('[data-testid="nav-settings"]').first().click()
-      await tabGeneral.waitFor({ timeout: 15000 })
-      await tabGeneral.click()
+      await tabTg.waitFor({ timeout: 15000 })
+      await tabTg.click()
     }
 
     // ─────────── ⓪b 判据**未就绪**时不得禁用（验牙：预览请求延后 3s）───────────
@@ -182,7 +183,7 @@ async function main() {
     await page.unroute('**/api/cache/clear/preview**')
     // 离开设置页再回来，强制重挂载。用「媒体库」而不是「全部文件」：后者是
     // 「一个视觉单元、两个独立动作」（chevron 管子菜单、文字管切视图），点中心可能落在 chevron 上。
-    await page.locator('[data-testid="nav-media"]').first().click()
+    await page.locator('[data-testid="nav-files"]').first().click()
     await page.waitForTimeout(600)
 
     await openSettings()

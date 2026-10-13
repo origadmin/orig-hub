@@ -95,8 +95,8 @@ async function main() {
     console.log('[verify] navigated to', APP_URL)
 
     // 媒体库 → 打开第一部剧集
-    await waitTid(page, 'nav-media', 15000)
-    await clickTid(page, 'nav-media')
+    await waitTid(page, 'nav-child-lib-series', 15000)
+    await clickTid(page, 'nav-child-lib-series')
     await page.waitForFunction(
       () => document.querySelectorAll('[data-testid="series-card"]').length > 0,
       { timeout: 15000 },

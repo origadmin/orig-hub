@@ -310,8 +310,8 @@ const CLOSE_LIGHTBOX = () => {
 async function openSeriesById(page, id, expectMinRows = 1) {
   await page.goto(APP_URL, { waitForRoot: true, settleMs: 1200 })
   await installTestidAliases(page)
-  await waitTestidSoft(page, 'nav-media', 15000)
-  await clickTestid(page, 'nav-media')
+  await waitTestidSoft(page, 'nav-child-lib-series', 15000)
+  await clickTestid(page, 'nav-child-lib-series')
   await page.waitForFunction(() => document.querySelectorAll('[data-testid="series-card"]').length > 0, { timeout: 15000 })
   await delay(800)
   const clicked = await page.evaluate((sid) => {
@@ -451,7 +451,7 @@ async function main() {
     if (process.env.PROBE === '1') {
       await page.goto(APP_URL, { waitForRoot: true, settleMs: 1500 })
       await installTestidAliases(page)
-      await clickTestid(page, 'nav-media')
+      await clickTestid(page, 'nav-child-lib-series')
       await delay(1500)
       const ids = await page.evaluate(() =>
         Array.from(document.querySelectorAll('[data-testid]')).map((e) => e.getAttribute('data-testid')).filter((v, i, a) => a.indexOf(v) === i),
@@ -990,8 +990,8 @@ async function exerciseAttachedImageScopes(page, base) {
     const measure = async (epId) => {
       await page.goto(APP_URL, { waitForRoot: true, settleMs: 1200 })
       await installTestidAliases(page)
-      await waitTestidSoft(page, 'nav-media', 12000)
-      await clickTestid(page, 'nav-media')
+      await waitTestidSoft(page, 'nav-child-lib-series', 12000)
+      await clickTestid(page, 'nav-child-lib-series')
       await page.waitForFunction(() => document.querySelectorAll('[data-testid="series-card"]').length > 0, { timeout: 12000 })
       await delay(600)
       await page.evaluate((sid) => {

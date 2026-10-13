@@ -238,12 +238,12 @@ async function main() {
     // ── 导航：侧栏媒体库 → 剧集墙（一律 data-testid）──
     phase = 'items-view'
     const navOk = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="nav-media"]')
+      const el = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (!el) return false
       el.click()
       return true
     })
-    if (!navOk) throw new Error('nav-media 入口不存在')
+    if (!navOk) throw new Error('nav-child-lib-series 入口不存在')
     await delay(3000) // items 视图渲染窗口（供 /raw 归因）
 
     const railOk = await page.evaluate(() => {

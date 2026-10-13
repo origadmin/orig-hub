@@ -105,7 +105,7 @@ function check(name, ok, detail) {
   try {
     await page.goto(APP, { waitUntil: 'domcontentloaded' })
     await sleep(3500)
-    await page.locator('[data-testid="nav-media"]').first().click()
+    await page.locator('[data-testid="nav-child-lib-series"]').first().click()
     await sleep(2500)
 
     // ─── ⓪ 进剧集详情 ───

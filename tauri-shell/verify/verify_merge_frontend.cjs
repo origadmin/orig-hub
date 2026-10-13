@@ -478,15 +478,15 @@ async function main() {
     console.log('')
     console.log('--- 前置：进入媒体库 ---')
     try {
-      await waitForTestId(page, 'nav-media', 15000)
+      await waitForTestId(page, 'nav-child-lib-series', 15000)
     } catch (_err) {
-      check('侧栏 nav-media 存在', false, '侧栏未渲染（页面白屏？）')
-      fs.writeFileSync(path.join(OUT_DIR, 'dom-no-nav-media.html'), await page.content(), 'utf8')
+      check('侧栏 nav-child-lib-series 存在', false, '侧栏未渲染（页面白屏？）')
+      fs.writeFileSync(path.join(OUT_DIR, 'dom-no-nav-child-lib-series.html'), await page.content(), 'utf8')
       dumpResults()
       console.log('[verify:merge-fe] RESULT: FAIL (app did not render sidebar)')
       return 1
     }
-    await clickTestId(page, 'nav-media')
+    await clickTestId(page, 'nav-child-lib-series')
     try {
       await waitForTestId(page, 'media-panel-title', 15000)
     } catch (_err) {

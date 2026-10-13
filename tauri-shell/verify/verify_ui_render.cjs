@@ -39,22 +39,50 @@ const OUT_DIR =
 /** Navigation budget. */
 const NAV_TIMEOUT_MS = Number(process.env.ORIG_VERIFY_NAV_TIMEOUT || 45000)
 
-/** `data-testid` anchors that must exist in the rendered sidebar/context bar. */
+/**
+ * `data-testid` anchors that must exist in the rendered sidebar/context bar.
+ *
+ * M0（BUG-298）后侧栏重建为「五项一级域 + 两棵树」：下载三档与文件分类不再是
+ * 顶级导航位，改为 `files-chevron` / `download-chevron` 树下的子项。以下锚点
+ * 与默认展开态（`collapsed=false`、两棵树 `open=true`）对应；旧锚点
+ * `nav-downloading` / `nav-completed` / `nav-paused` / `nav-media` /
+ * `all-files-row` / `category-chevron` 已随导航模型废止。
+ */
 const REQUIRED_TESTIDS = [
   'context-bar',
   'context-bar-header',
   'context-bar-title',
-  'nav-downloading',
-  'nav-completed',
-  'nav-paused',
-  'nav-media',
+  'nav-files',
+  'nav-files-row',
+  'files-chevron',
+  'nav-child-video',
+  'nav-child-lib-series',
+  'nav-download',
+  'nav-download-row',
+  'download-chevron',
+  'nav-child-dl-running',
+  'nav-tg',
+  'nav-share',
   'nav-settings',
-  'all-files-row',
-  'category-chevron',
 ]
 
 /** Subset that is always present regardless of data volume (hard gate). */
-const CRITICAL_TESTIDS = ['context-bar-header', 'nav-downloading', 'all-files-row']
+const CRITICAL_TESTIDS = ['context-bar-header', 'nav-files-row', 'nav-tg', 'nav-settings']
+
+/**
+ * TG 面板的五个可读状态锚点（M0-T05：入口常驻后，点进 TG 必须落到其中之一）。
+ *
+ * 这是「TG 面板不是白屏」的判据：五个里一个都没命中 = 面板既没内容也没说清
+ * 原因。注意它**不能**绑定单一锚点 —— 哪种态出现取决于服务/账号状态，
+ * 绑定单一锚点会在正常环境下假绿/假红。
+ */
+const TG_PANEL_STATE_TESTIDS = [
+  'tg-onboard-disabled', // 插件未启用 → 引导卡
+  'tg-onboard-starting', // 开着但还没起来 → 启动卡
+  'tg-unbound-guide', // 未绑定 → 引导卡
+  'tg-panel-broken', // 链路故障 → 故障卡
+  'tg-monitor-list', // 正常两栏（监控列表行容器）
+]
 
 /** Console errors matching these are environment noise, not app defects. */
 const BENIGN_CONSOLE = [/favicon/i, /DevTools/i, /Download the React DevTools/i]
@@ -91,6 +119,42 @@ function corsBlockedHosts(messages) {
     }
   }
   return hosts
+}
+
+/**
+ * Backend origins the page tried to reach but that refuse TCP connections.
+ *
+ * The UI acceptance gate is meant to run with the daemon up (it exercises real
+ * requests). When the daemon is down, every request logs
+ * `net::ERR_CONNECTION_REFUSED` -- an *environment* fact, not a render defect,
+ * and letting it fail the gate would make "daemon down" indistinguishable from
+ * "my change broke the app".
+ *
+ * The exemption is deliberately falsifiable rather than a blanket whitelist:
+ * each named origin is TCP-probed, and the exemption only applies while the
+ * probe FAILS. If the daemon is up, the same message stays a hard failure.
+ *
+ * @param {Array<string>} messages console error strings
+ * @returns {Promise<Set<string>>} origins (scheme://host:port) that refused TCP
+ */
+async function refusedBackendOrigins(messages) {
+  const candidates = new Map()
+  for (const msg of messages) {
+    if (!/ERR_CONNECTION_REFUSED|ERR_EMPTY_RESPONSE/.test(msg)) continue
+    const hit = /(https?:\/\/[^\s\]'")]+)/.exec(msg)
+    if (!hit) continue
+    try {
+      const u = new URL(hit[1])
+      candidates.set(`${u.protocol}//${u.host}`, [u.hostname, Number(u.port || (u.protocol === 'https:' ? 443 : 80))])
+    } catch (_err) {
+      // Unparseable url -- simply does not widen the exemption.
+    }
+  }
+  const refused = new Set()
+  for (const [origin, [host, port]] of candidates) {
+    if (!(await tcpProbe(host, port))) refused.add(origin)
+  }
+  return refused
 }
 
 /** Strings that must never appear in a healthy render. */
@@ -148,6 +212,13 @@ const results = []
  * @type {Array<string>}
  */
 const corsNoise = []
+
+/**
+ * Backend-unreachable console messages, surfaced as explicit warnings.
+ * Only populated while the named origin still refuses TCP.
+ * @type {Array<string>}
+ */
+const backendNoise = []
 
 /** Print every assertion recorded so far, as a PASS/FAIL list. */
 function dumpResults() {
@@ -313,9 +384,12 @@ async function main() {
 
     // 5. No console errors. CORS noise is separated out and only warned about:
     //    it means a wrong origin, not a broken render. Real load failures still fail.
+    //    A backend that refuses TCP (daemon down) is likewise an environment fact,
+    //    but only while the probe still fails -- see refusedBackendOrigins.
     await check(results, 'no console errors', async () => {
       const all = page.consoleErrors()
       const blockedHosts = corsBlockedHosts(all)
+      const refusedOrigins = await refusedBackendOrigins(all)
       const isCorsFallout = msg => {
         if (CORS_NOISE.test(msg)) return true
         // The load failure a CORS block causes, but only for the blocked host.
@@ -328,10 +402,26 @@ async function main() {
           return false
         }
       }
+      const isBackendDown = msg => {
+        if (!/ERR_CONNECTION_REFUSED|ERR_EMPTY_RESPONSE/.test(msg)) return false
+        const urlHit = /(https?:\/\/[^\s\]'"]+)/.exec(msg)
+        if (!urlHit) return false
+        try {
+          return refusedOrigins.has(`${new URL(urlHit[1]).protocol}//${new URL(urlHit[1]).host}`)
+        } catch (_err) {
+          return false
+        }
+      }
       for (const msg of all) {
         if (isCorsFallout(msg)) corsNoise.push(msg)
+        if (isBackendDown(msg)) backendNoise.push(msg)
       }
-      const real = all.filter(msg => !isCorsFallout(msg) && !BENIGN_CONSOLE.some(re => re.test(msg)))
+      const real = all.filter(
+        msg =>
+          !isCorsFallout(msg) &&
+          !isBackendDown(msg) &&
+          !BENIGN_CONSOLE.some(re => re.test(msg)),
+      )
       if (real.length > 0) throw new Error(`consoleErrors: ${JSON.stringify(real.slice(0, 5))}`)
       return true
     })
@@ -363,6 +453,28 @@ async function main() {
       console.log('PASS  critical data-testid subset')
     }
 
+    // 7. TG 面板落到一个可读状态（M0-T05）。入口常驻后「点进来是白板」是
+    // 这里唯一不能接受的形态，因此五个状态锚点必须命中至少一个。
+    await check(results, 'TG panel reaches a readable state', async () => {
+      const clicked = await page.evaluate(() => {
+        const btn = document.querySelector('[data-testid="nav-tg"]')
+        if (!btn) return false
+        btn.click()
+        return true
+      })
+      if (!clicked) throw new Error('nav-tg not clickable (sidebar did not render)')
+      await page.waitForFunction(
+        ids => ids.some(id => Boolean(document.querySelector(`[data-testid="${id}"]`))),
+        { timeout: 8000, intervalMs: 200, args: [TG_PANEL_STATE_TESTIDS] },
+      )
+      const hit = await page.evaluate(ids => {
+        const found = ids.filter(id => document.querySelector(`[data-testid="${id}"]`))
+        return found
+      }, TG_PANEL_STATE_TESTIDS)
+      if (hit.length === 0) throw new Error('TG panel has no readable state anchor (white panel)')
+      return true
+    })
+
     console.log('')
     const total = results.length
     const failed = results.filter(r => !r.ok)
@@ -377,6 +489,15 @@ async function main() {
       for (const msg of corsNoise.slice(0, 5)) console.log(`  ! CORS: ${msg}`)
       console.log('  ! CORS noise means the app is served from a non-canonical origin;')
       console.log('  ! the daemon whitelists origins, so verify against :5180 (see verify/README.md).')
+    }
+
+    if (backendNoise.length > 0) {
+      console.log('')
+      console.log(`--- WARNINGS (${backendNoise.length}) ---`)
+      for (const msg of backendNoise.slice(0, 5)) console.log(`  ! BACKEND DOWN: ${msg}`)
+      console.log('  ! the daemon refused TCP while this page was rendered, so these')
+      console.log('  ! resource failures are environment facts, not render defects;')
+      console.log('  ! re-run with the daemon up for the full gate.')
     }
 
     if (failed.length > 0) {

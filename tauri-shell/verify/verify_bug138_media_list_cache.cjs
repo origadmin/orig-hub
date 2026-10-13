@@ -335,8 +335,8 @@ async function main() {
     await page.evaluate(INSTALL_COUNTER)
 
     // ---- 进入媒体库面板 ----
-    const opened = await page.evaluate(CLICK, '[data-testid="nav-media"]')
-    if (!opened) throw new Error('nav-media not found')
+    const opened = await page.evaluate(CLICK, '[data-testid="nav-child-lib-series"]')
+    if (!opened) throw new Error('nav-child-lib-series not found')
     await page.waitForFunction(
       () => Boolean(document.querySelector('[data-testid="media-panel-title"]')),
       { timeout: TIMEOUT_MS, intervalMs: 200 },

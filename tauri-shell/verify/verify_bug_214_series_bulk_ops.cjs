@@ -454,12 +454,12 @@ async function main() {
 
     // ── 导航（一律 data-testid）：媒体库 → 剧集墙 ──
     const navOk = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="nav-media"]')
+      const el = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (!el) return false
       el.click()
       return true
     })
-    if (!navOk) throw new Error('nav-media 入口不存在')
+    if (!navOk) throw new Error('nav-child-lib-series 入口不存在')
     await delay(1500)
     const railOk = await page.evaluate(() => {
       const el = document.querySelector('[data-testid="media-rail-series-all"]')

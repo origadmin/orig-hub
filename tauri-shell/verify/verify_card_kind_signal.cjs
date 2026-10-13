@@ -538,19 +538,19 @@ async function main() {
 
     // 侧栏「媒体库」入口 —— 自己探索出来的锚点，不猜。
     try {
-      await waitForTestId(page, 'nav-media', 15000)
+      await waitForTestId(page, 'nav-child-lib-series', 15000)
     } catch (_err) {
-      check('sidebar [data-testid="nav-media"] 存在', false, '侧栏未渲染出媒体库入口（页面白屏？）')
+      check('sidebar [data-testid="nav-child-lib-series"] 存在', false, '侧栏未渲染出媒体库入口（页面白屏？）')
       const html = await page.content()
-      fs.writeFileSync(path.join(OUT_DIR, 'dom-no-nav-media.html'), html, 'utf8')
+      fs.writeFileSync(path.join(OUT_DIR, 'dom-no-nav-child-lib-series.html'), html, 'utf8')
       dumpResults()
       console.log('[verify:card-kind] RESULT: FAIL (app did not render sidebar)')
       return 1
     }
-    check('sidebar [data-testid="nav-media"] 存在', true)
+    check('sidebar [data-testid="nav-child-lib-series"] 存在', true)
 
-    const entered = await clickTestId(page, 'nav-media')
-    check('点击 nav-media 进入媒体库', entered)
+    const entered = await clickTestId(page, 'nav-child-lib-series')
+    check('点击 nav-child-lib-series 进入媒体库', entered)
 
     // 左栏分类按钮出现（其计数来自后端 stats，0 计数不渲染）
     let catAll = false
@@ -809,7 +809,7 @@ async function main() {
     check('切换后 <html lang> 变为 en-US', langAfter === 'en-US', `lang=${langAfter}`)
 
     // 回媒体库，重新进入图片分类（SPA 切视图会重建卡片 DOM）
-    await clickTestId(page, 'nav-media')
+    await clickTestId(page, 'nav-child-lib-series')
     try {
       await waitForTestId(page, 'media-cat-all', 15000)
     } catch (_err) {
@@ -906,7 +906,7 @@ async function main() {
     // ---- 还原 zh-CN：证明切换双向可用，且 BUG-123 的 zh-CN 渲染值一字未变 ----
     const restored = await switchLocaleViaUI(page, '简体中文', 'zh-CN')
     check('走真实 UI 切回 zh-CN', restored)
-    await clickTestId(page, 'nav-media')
+    await clickTestId(page, 'nav-child-lib-series')
     try {
       await waitForTestId(page, 'media-cat-all', 15000)
     } catch (_err) {

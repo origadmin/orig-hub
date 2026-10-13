@@ -227,12 +227,12 @@ async function makeFixture(tg) {
 
 async function navToSeriesWall(page) {
   const navOk = await page.evaluate(() => {
-    const el = document.querySelector('[data-testid="nav-media"]')
+    const el = document.querySelector('[data-testid="nav-child-lib-series"]')
     if (!el) return false
     el.click()
     return true
   })
-  if (!navOk) throw new Error('nav-media 入口不存在')
+  if (!navOk) throw new Error('nav-child-lib-series 入口不存在')
   await delay(1500)
   await page.evaluate(() => {
     const el = document.querySelector('[data-testid="media-rail-series-all"]')
@@ -673,7 +673,7 @@ async function main() {
     // ═════════ C 段：内容弹窗的类型是本地化 + 只读 ═════════
     await page.goto(APP_URL, { waitForRoot: true, settleMs: 2500 })
     await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="nav-media"]')
+      const el = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (el) el.click()
     })
     await delay(1500)

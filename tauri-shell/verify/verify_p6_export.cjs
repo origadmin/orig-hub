@@ -28,8 +28,10 @@ const APP_PORT = Number(process.env.APP_PORT || 5180)
 const APP_URL = `http://127.0.0.1:${APP_PORT}/`
 const OUT_DIR = process.env.ORIG_VERIFY_OUT || path.join(os.tmpdir(), 'orighub-p6-shots')
 
-// 真实 Windows 目标目录（native orig-tg 进程落盘处）；用正斜杠避免输入转义问题。
-const DEFAULT_TARGET = `C:/Users/godcong/AppData/Local/Temp/orighub-p6-cdp-${Date.now()}`
+// 导出目标目录：orig-tg 进程落盘处。**不写死用户绝对路径** ——
+// 门禁 `check-pollution.sh` §7 禁止脚本内出现机器绝对路径（换用户/换机器即失效），
+// 与 OUT_DIR 同一取法：系统临时目录 + 唯一后缀（可用 P6_TARGET_DIR 覆盖）。
+const DEFAULT_TARGET = path.join(os.tmpdir(), `orighub-p6-cdp-${Date.now()}`)
 const TARGET_DIR = process.env.P6_TARGET_DIR || DEFAULT_TARGET
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -73,8 +75,8 @@ async function main() {
     await page.goto(APP_URL, { waitForRoot: true, settleMs: 1500 })
 
     // 1) 媒体库 → 打开导出预览
-    await waitTestid(page, 'nav-media')
-    await clickTestid(page, 'nav-media')
+    await waitTestid(page, 'nav-child-lib-series')
+    await clickTestid(page, 'nav-child-lib-series')
     await delay(1000)
     await waitTestid(page, 'media-export-preview')
     await clickTestid(page, 'media-export-preview')

@@ -45,12 +45,12 @@ async function main() {
 
     // 进入媒体库
     const navOk = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="nav-media"]')
+      const el = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (!el) return false
       el.click()
       return true
     })
-    assert('A0 进入媒体库(nav-media)', navOk)
+    assert('A0 进入媒体库(nav-child-lib-series)', navOk)
     await page.waitForFunction(
       () => document.querySelectorAll('[data-testid="series-card"]').length > 0,
       { timeout: 20000 },

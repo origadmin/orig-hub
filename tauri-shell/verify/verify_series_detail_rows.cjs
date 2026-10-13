@@ -247,8 +247,8 @@ async function shot(page, name, testid) {
 async function gotoMediaLibrary(page) {
   await page.goto(APP_URL, { waitForRoot: true, settleMs: 1500 })
   await installTestidAliases(page) // §13.1：旧 testid 名原样返回（series-gallery* 除外）
-  await waitTestid(page, 'nav-media', 15000)
-  await clickTestid(page, 'nav-media')
+  await waitTestid(page, 'nav-child-lib-series', 15000)
+  await clickTestid(page, 'nav-child-lib-series')
   await page.waitForFunction(
     () => document.querySelectorAll('[data-testid="series-card"]').length > 0,
     { timeout: 15000 },

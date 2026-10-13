@@ -79,7 +79,7 @@ async function main() {
     const page = await browser.newPage()
     await page.goto(APP_URL, { waitUntil: 'load' })
     await new Promise((r) => setTimeout(r, 2500))
-    await page.evaluate(() => document.querySelector('[data-testid="nav-media"]').click())
+    await page.evaluate(() => document.querySelector('[data-testid="nav-child-lib-series"]').click())
     await new Promise((r) => setTimeout(r, 3500))
 
     /*

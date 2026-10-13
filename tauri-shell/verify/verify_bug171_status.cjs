@@ -199,8 +199,8 @@ async function setViewport(page, width, height) {
 /** 冷导航打开「媒体库 → series 详情」，自证落到了目标剧集（左栏标题 + 右栏聚焦集）。 */
 async function openSeriesDetail(page, seriesId) {
   await page.goto(APP_URL, { waitForRoot: true, settleMs: 1200 })
-  await waitTestidSoft(page, 'nav-media', 15000)
-  await clickTestid(page, 'nav-media')
+  await waitTestidSoft(page, 'nav-child-lib-series', 15000)
+  await clickTestid(page, 'nav-child-lib-series')
   await page.waitForFunction(() => document.querySelectorAll('[data-testid="series-card"]').length > 0, {
     timeout: 20000,
   })

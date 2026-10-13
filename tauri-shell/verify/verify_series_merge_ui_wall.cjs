@@ -306,12 +306,12 @@ async function main() {
 
     await page.goto(APP_URL, { waitForRoot: true, settleMs: 1800 })
     const navOk = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="nav-media"]')
+      const el = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (!el) return false
       el.click()
       return true
     })
-    if (!navOk) throw new Error('nav-media entry not found')
+    if (!navOk) throw new Error('nav-child-lib-series entry not found')
     await page.waitForFunction(
       () => document.querySelectorAll('[data-testid="series-card-root"]').length > 0,
       { timeout: 20000 },

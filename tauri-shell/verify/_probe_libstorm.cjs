@@ -122,7 +122,7 @@ async function clickTestId(page, testid) {
 }
 
 async function enterMedia(page) {
-  const ok = await clickTestId(page, 'nav-media')
+  const ok = await clickTestId(page, 'nav-child-lib-series')
   await delay(FIRST_SCREEN_MS)
   return ok
 }
@@ -170,7 +170,7 @@ async function main() {
 
     // ---- P3: switch away to "all files" then back to media ----
     const m2 = records.length
-    const okAway = await clickTestId(page, 'all-files-row')
+    const okAway = await clickTestId(page, 'nav-files-row')
     await delay(1500)
     const okBack = await enterMedia(page)
     const p3 = records.slice(m2)

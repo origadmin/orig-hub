@@ -1,9 +1,9 @@
 'use strict'
 /**
  * Focused P3: does switching away from the media library and back re-fire the
- * first-screen request set? (The first big run clicked `all-files-row`, which is
+ * first-screen request set? (The first big run clicked `nav-files-row`, which is
  * a non-interactive <div> at Sidebar.tsx:230 -> that run's P3 was a no-op.)
- * Here we switch away via `nav-tg` (a real button) and back via `nav-media`.
+ * Here we switch away via `nav-tg` (a real button) and back via `nav-child-lib-series`.
  */
 const cdp = require('./lib/cdp.cjs')
 const endpoints = require('./_lib_endpoints.cjs')
@@ -46,14 +46,14 @@ async function main() {
     })
 
     const a = rec.length
-    await click(page, 'nav-media'); await delay(7000)
+    await click(page, 'nav-child-lib-series'); await delay(7000)
     const p1 = rec.slice(a)
     console.log('ENTRY#1 TG-reqs:', group(p1.filter((r) => isTg(r.url))).map(([k, n]) => `${n}x ${k}`).join(' | ') || '(none)')
     ep.assertTgTraffic(p1.filter((r) => isTg(r.url)).length, 'ENTRY#1 media library')
 
     const b = rec.length
     const okAway = await click(page, 'nav-tg'); await delay(2500)
-    const okBack = await click(page, 'nav-media'); await delay(7000)
+    const okBack = await click(page, 'nav-child-lib-series'); await delay(7000)
     const p3 = rec.slice(b)
     const media3 = p3.filter((r) => isTg(r.url))
     console.log(`SWITCH-AWAY(ok=${okAway})->BACK(ok=${okBack}) TG-reqs:`, group(media3).map(([k, n]) => `${n}x ${k}`).join(' | ') || '(none)')

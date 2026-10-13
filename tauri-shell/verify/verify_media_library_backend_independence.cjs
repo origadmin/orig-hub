@@ -69,7 +69,7 @@ async function fetchJson(url, timeoutMs = 4000) {
   await sleep(2500)
 
   const clicked = await page.evaluate(() => {
-    const el = document.querySelector('[data-testid="nav-media"]')
+    const el = document.querySelector('[data-testid="nav-child-lib-series"]')
     if (!el) return false
     el.click()
     return true
@@ -105,7 +105,7 @@ async function fetchJson(url, timeoutMs = 4000) {
   await page.screenshot(png)
   await browser.close()
 
-  check('#root mounted, 媒体库入口可点击', clicked, clicked ? '' : 'nav-media 未找到')
+  check('#root mounted, 媒体库入口可点击', clicked, clicked ? '' : 'nav-child-lib-series 未找到')
   check(
     '媒体库渲染出可判读的内容计数（统计行或内容计数至少一个存在）',
     dom.headerStats !== null || dom.contentCount !== null,
