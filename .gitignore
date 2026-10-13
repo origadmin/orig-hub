@@ -2,6 +2,8 @@
 /target
 **/target
 **/target-*/
+# 按缺陷/实验单独指定的构建目标（如 CARGO_TARGET_DIR=.cargo-target-bug133）
+.cargo-target-*/
 **/*.rs.bk
 
 # ============ Node / 前端（Vite + React） ============
@@ -10,6 +12,9 @@ dist/
 dist-ssr/
 .vite/
 *.local
+# tsc 误以 emit 模式跑时会在 vite.config.ts 旁生成同名 js/d.ts —— 属产物，不入库
+tauri-shell/vite.config.js
+tauri-shell/vite.config.d.ts
 
 # ============ Tauri 构建产物 & sidecar 二进制 ============
 tauri-shell/src-tauri/target/
@@ -47,6 +52,8 @@ __pycache__/
 # 对齐 EE：AI 工具运行态/配置一律本地化，提交即规范事故（AGENTS.md §6.3）
 .claude/
 .trae/
+# 同一工具产出的「HTML 分享包」（含打包产物，非源码）
+.trae-html-share-packages/
 .agents/
 .agent/
 .cursor/
