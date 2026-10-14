@@ -34,7 +34,14 @@ use serde::{Deserialize, Serialize};
 use crate::media::Store;
 
 /// 整理请求（preview 与 apply 共用同一形状）。
+///
+/// wire 契约 = **camelCase**（与全部兄弟媒体端点一致，见 `AppendEpisodesReq` 等的
+/// `rename = "itemIds"`）：前端 `media.ts::organizePreview/Apply` 发的是
+/// `{ itemIds, template, targetDir }`。漏 rename 时 preview/apply 对**任何**请求体
+/// 都 400（`missing field item_ids`），而单元夹具直调 `plan()/apply()` 不走 wire、
+/// 路由层又没有请求体测试 ⇒ 缺陷直达用户才暴露。
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OrganizeRequest {
     /// 要整理的条目 id 集合（前端多选）。
     pub item_ids: Vec<i64>,
@@ -594,6 +601,35 @@ mod tests {
         let c = cand();
         let out = render_template("{剧名}/S{season:02}E{episode:02} - {集名}.{ext}", &c, "第三集 夜航");
         assert_eq!(out, "星际漫游/S01E03 - 第三集 夜航.mp4");
+    }
+
+    /// wire 契约夹具（M2-T09 验收发现）：`OrganizeRequest` 必须收 **camelCase**
+    /// —— 前端 `api/media.ts::organizePreview` 发的是 `JSON.stringify({
+    /// itemIds, template, targetDir })`。曾漏 `rename_all` ⇒ 路由层对任何请求体
+    /// 都 `400 missing field item_ids`（夹具直调 `plan()` 不走 wire，抓不到）。
+    /// 本测试还原述求体的**原文字节**（不是 Rust 构造），漏 rename 即 FAIL。
+    #[test]
+    fn organize_request_accepts_camel_case_wire_bug311() {
+        let body = r#"{"itemIds":[3,1,2],"template":"{集名}.{ext}","targetDir":"D:/out"}"#;
+        let req: OrganizeRequest = serde_json::from_str(body).expect("camelCase body must deserialize");
+        assert_eq!(req.item_ids, vec![3, 1, 2]);
+        assert_eq!(req.template, "{集名}.{ext}");
+        assert_eq!(req.target_dir, "D:/out");
+    }
+
+    /// 反向证伪：snake_case 请求体必须**失败** —— 证明契约是「唯一 camelCase」，
+    /// 而不是「两种都收」（都收会让上面的夹具在 rename 丢失时假绿）。
+    /// serde 的报错用 **rename 后**的字段名（`itemIds`），不是 Rust 字段名。
+    #[test]
+    fn snake_case_wire_is_rejected_bug311() {
+        let body = r#"{"item_ids":[1],"template":"{集名}.{ext}","target_dir":"D:/out"}"#;
+        let err = serde_json::from_str::<OrganizeRequest>(body)
+            .expect_err("snake_case body must not deserialize");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("itemIds"),
+            "error should name the wire-level missing field (itemIds), got: {msg}"
+        );
     }
 
     #[test]

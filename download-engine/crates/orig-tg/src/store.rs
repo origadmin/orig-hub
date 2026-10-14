@@ -537,11 +537,13 @@ impl Store {
         // 与「`media_item.content_hash` 的实际引用数」对不上。每次启动重算一次，
         // 使「删最后一个引用才回收字节」的前提在进程起点恒成立。
         // 失败**不阻断启动**（同 BUG-304 的容错口径）。
+        //
+        // 留痕**无条件打印**（含 0）：`if n > 0` 曾让「库里没有 blob 行」的新库 /
+        // 旧库静默通过——而那正是迁移后第一次启动的真实状态，于是日志无法区分
+        // 「对账跑了、0 行」与「没接上」（M2-T09 验收盲区）。0 也是证据。
         match store.recount_blobs().await {
             Ok(n) => {
-                if n > 0 {
-                    eprintln!("[store] BUG-309: recounted blob refcounts ({n} blob row(s))");
-                }
+                eprintln!("[store] BUG-309: recounted blob refcounts ({n} blob row(s))");
             }
             Err(e) => {
                 eprintln!("[store] BUG-309: recount_blobs failed (non-fatal): {e}");
