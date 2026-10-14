@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CheckSquare, HardDrive, Square } from 'lucide-react'
 import { Button } from './ui/button'
 import { cn } from '../lib/utils'
-import { fmtSize, isRawFileName } from '../lib/tgmedia'
+import { fmtDate, fmtSize, isRawFileName } from '../lib/tgmedia'
 import { useTranslation } from '../i18n'
 import { clearCacheBytes, getCacheClearPreview } from '../api/tg'
 import { getMediaItem, kindLabelKey } from '../api/media'
@@ -69,14 +69,6 @@ function rawMetaOf(title?: string | null): { kind: string; msgId: number } | nul
   const k = m[1].toLowerCase()
   const kind = k === 'photo' ? 'photo' : k === 'video' ? 'video' : k === 'audio' ? 'audio' : 'file'
   return { kind, msgId: Number(m[2]) }
-}
-
-/** 入库时间 → `YYYY-MM-DD`（行内只要对得上「哪天进的库」就够了）。 */
-function fmtDate(sec?: number | null): string {
-  if (!sec || sec <= 0) return ''
-  const d = new Date(sec * 1000)
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
 }
 
 export function CacheBytesPanel(props: {

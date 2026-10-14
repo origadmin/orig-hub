@@ -32,6 +32,14 @@ export function fmtSize(bytes?: number | null): string {
   return `${v.toFixed(v >= 100 ? 0 : 1)} ${units[i]}`
 }
 
+/** unix 秒 → `YYYY-MM-DD`（文件列表「修改/入库日期」列用；0/缺省 = 空串，不显示 1970）。 */
+export function fmtDate(sec?: number | null): string {
+  if (!sec || sec <= 0) return ''
+  const d = new Date(sec * 1000)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
 export function fmtTime(sec?: number): string {
   if (!sec) return ''
   const d = new Date(sec * 1000)

@@ -34,6 +34,7 @@ import type {
   MediaTag,
 } from '../api/media'
 import { MediaCard } from './media/MediaCard'
+import { FileListView } from './media/FileListView'
 import { SeriesDetail } from './media/SeriesDetail'
 import { SeriesCard } from './media/SeriesCard'
 import { ImportDialog } from './media/ImportDialog'
@@ -1546,6 +1547,28 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
               </div>
             )}
           </div>
+        ) : view === 'items' && tab === 'all' && items.length > 0 ? (
+          /*
+           * 「全部文件」= 文件域父行（cat-all）→ **Explorer 列表**（BUG-299 出口判据）。
+           *
+           * 2026-10-15 用户裁定：「文件管理是列表，是 Explorer 显示，但绝对不可
+           * 能是视频」。据此，文件域的默认呈现从「媒体海报墙」改为「行列表」：
+           * 名称/类型/大小/日期/来源 + 行内动作，单击选中、双击打开。
+           *
+           * 判据取 `tab === 'all'` 而不是 `view === 'items'`：分类子行（视频/图片/
+           * 音频）仍是各自类型的浏览墙（MediaCard），只有「全部」这个**域级**父行
+           * 用列表。以后文件事实端点接进来（zip/exe/pdf 等非媒体），走的也是这
+           * 一棵树。
+           */
+          <FileListView
+            items={items}
+            selected={selected}
+            total={total}
+            onSelectToggle={toggleSelect}
+            onOpen={openItem}
+            onDelete={deleteItem}
+            onError={setError}
+          />
         ) : items.length === 0 && !loading ? (
           emptyState
         ) : (

@@ -20,6 +20,7 @@ import { getLibraryStats } from '../api/media'
 import { cacheKey, cached, invalidateCache } from './fetchCache'
 import {
   coverFit,
+  fmtDate,
   fmtDuration,
   fmtSize,
   hasMediaBytes,
@@ -338,4 +339,4 @@ export function sourceMessageUrl(source?: string | null, ref?: string | null): s
 
 // 泛型展示工具：实现源自 `lib/tgmedia`，但媒体库只当通用工具用（不引入 TG 语义）。
 // 集中在这里 re-export，媒体库组件统一从本文件取，避免再 import `lib/tgmedia`。
-export { coverFit, fmtDuration, fmtSize, hasMediaBytes, isRawFileName }
+export { coverFit, fmtDate, fmtDuration, fmtSize, hasMediaBytes, isRawFileName }
