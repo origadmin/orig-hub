@@ -333,3 +333,8 @@ bash scripts/install-hooks.sh    # 安装 pre-commit 与 commit-msg（钩子不�
 | BUG-305 | 媒体库「在 TG 中查看」仅落 t.me 外链、缺应用内跳转（插件→频道→消息）：无正向焦点接收、入口仅剧集详情源块 | fixed | shell |
 | BUG-306 | 侧栏 IA 修正：删「管理」「资料库（策划）」「分类（成品内容）」冗余标签、文件树父行改名「文件管理」、下载改名「全部下载」、父子排他选中（注：D19-⑦ 视频/剧集合并已由 BUG-307 撤回） | fixed | shell |
 | BUG-307 | 撤回 BUG-306/D19-⑦ 视频+剧集合并：恢复「视频」(cat:video 扁平库) 与「剧集」(lib-series 剧集墙) 两个独立入口、重加 files.lib.series、标签筛选样式两套式样统一 | in_progress | shell |
+| BUG-308 | 入库去重窗口只覆盖活跃任务：任务结束后同一 TG 消息可重复入队（重复下载字节+重复 cache_task 入库索引）；修法=入队前查历史认领（D22-A②，M2-T07） | open | engine |
+| BUG-309 | 无内容 hash 去重：多源/跨频道相同字节视频必然重复占盘；归仓命名 chat+msg 防覆盖（BUG-100）的反面即必存多份；hash CAS 必须配引用计数防共享误删（D24，M2） | open | engine |
+| BUG-310 | 视频显示名无唯一规则：caption 缺失标题空串、item/episode/series 三层各写各的、同一视频多处名称不一致；修法=自定义集名＞剧名集号＞来源名，改名不动物理文件（D24） | open | engine+shell |
+| BUG-311 | 缺批量整理命名能力（mp3tag 式模板命名/归位）：库内改名不动物理文件后无可读命名的对外交付手段；模板预览 diff/幂等/冲突序号，产物为硬链接或副本（D24，M2） | open | engine+shell |
+| BUG-312 | 前瞻：M3 TG 任务并入下载列表后，clearCompleted 逐条 DELETE 不区分来源将误删 cache_task 入库记录；修法=来源 clearable 能力位分流（D21-A④，M3-T03） | open | shell |
