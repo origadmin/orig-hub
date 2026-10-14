@@ -95,15 +95,16 @@ const DL_KEY: Record<Exclude<DlFilter, 'all'>, string> = {
 }
 
 /**
- * 视频入口（BUG-306 / D19-⑦：剧集与视频合并为单一「视频」入口）。
+ * 文件树子项（2026-10-14 **撤回** BUG-306 / D19-⑦ 的合并）：
  *
- * 标签复用 `files.cat.video`（「视频」/"Videos"），落点仍是 `lib-series` 剧集栅格 ——
- * D18「视频=剧集」不变量下，单集视频即 S1E1 剧集，剧集栅格覆盖全部视频内容，
- * 无需第二个扁平视频分类。置于文件树子项最上方；不再渲染 `cat:video` 分类子项，
- * 也不再有独立「剧集」树项（原 `lib-tags` / `lib-unfiled` 已于 BUG-304 删除）。
+ * - 视频（普通下载）：`nav-child-cat-video`，标签 `files.cat.video`，落点 `cat:video`
+ *   → items 网格（kind=video）—— **扁平视频库**；
+ * - 剧集（TG 插件或其他来源）：`nav-child-lib-series`，标签 `files.lib.series`，落点 `lib-series`
+ *   → 剧集墙。
  *
- * testid 沿用 `nav-child-lib-series`：入口还是那个入口（同视图、同行为），
- * 改的只是标签与位置 —— BUG-304 判据②「剧集树项仍在」因此继续成立。
+ * 两者是**两种不同浏览方式**，必须分开：合并曾让「视频」入口落到剧集墙、
+ * 混入照片剧集、且吃掉独立「剧集」入口（用户报「视频混入了图片 / 视频剧集没分开」）。
+ * `cat:video` 不再被合并吸收，作为独立分类子项渲染。
  */
 
 export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props) {
@@ -228,25 +229,35 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
 
           {filesOpen && !collapsed && (
             <div className="mt-0.5 space-y-0.5">
-              {/* 视频 / 剧集合并入口（BUG-306 / D19-⑦）：标签「视频」，落点 lib-series
-                  剧集栅格（D18：视频=剧集 ⇒ 栅格覆盖全部视频内容）。置于子项最上方，
-                  取代原平级「剧集」项与原 `cat:video` 扁平分类项。
-                  testid 沿用 nav-child-lib-series —— 同一个入口，只改标签与位置。 */}
+              {/* 视频（普通下载）：扁平视频库，落点 cat:video → items 网格（kind=video）。
+                  与剧集是两种不同浏览方式，必须分开（2026-10-14 撤回 BUG-306 / D19-⑦ 合并）。
+                  之前合并成单一「视频」入口、落点 lib-series 剧集墙，导致「视频」里混入照片剧集、
+                  且剧集入口被吃掉 —— 正是用户报的「视频混入了图片 / 视频剧集没分开」。 */}
+              <button
+                type="button"
+                data-testid="nav-child-cat-video"
+                onClick={() => onNavigate('files', { fmode: 'cat:video' })}
+                title={t('files.cat.video')}
+                className={childCls(isNavChildActive(view, fmode, dlFilter, { fmode: 'cat:video' }))}
+              >
+                <span className="min-w-0 flex-1 truncate text-left">{t('files.cat.video')}</span>
+              </button>
+              {/* 剧集（TG 插件或其他来源）：剧集墙，落点 lib-series。 */}
               <button
                 type="button"
                 data-testid="nav-child-lib-series"
                 onClick={() => onNavigate('files', { fmode: 'lib-series' })}
-                title={t('files.cat.video')}
+                title={t('files.lib.series')}
                 className={childCls(isNavChildActive(view, fmode, dlFilter, { fmode: 'lib-series' }))}
               >
-                <span className="min-w-0 flex-1 truncate text-left">{t('files.cat.video')}</span>
+                <span className="min-w-0 flex-1 truncate text-left">{t('files.lib.series')}</span>
                 {/* 徽标数与剧集墙同源（BUG-125 / BUG-133：不许侧栏另算一套）。
                     0 不渲染 —— 0 = 「确认没有」，与「不知道」是两件事。 */}
                 {counts.series > 0 ? (
                   <span className="shrink-0 text-[10px] text-muted">{counts.series}</span>
                 ) : null}
               </button>
-              {/* 分类子项：`video` 已被上方合并入口吸收（BUG-306），不再单独渲染。 */}
+              {/* 其余分类子项（不含 video，已上方单独渲染）。 */}
               {FILE_CATEGORIES.filter((cat) => cat !== 'video').map((cat) => (
                 <button
                   key={cat}
@@ -326,7 +337,7 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
           onClick={() => onNavigate('tg')}
           title={t('nav.tg')}
           data-testid="nav-tg"
-          className={cn(rowCls(view === 'tg'), collapsed && 'justify-center px-0')}
+          className={cn(rowCls(view === 'tg'), 'gap-2.5', collapsed && 'justify-center px-0')}
         >
           <span className="shrink-0">{TgIcon}</span>
           {!collapsed && <span className="min-w-0 flex-1 truncate text-left">{t('nav.tg')}</span>}
@@ -337,24 +348,28 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
           onClick={() => onNavigate('share')}
           title={t('nav.share')}
           data-testid="nav-share"
-          className={cn(rowCls(view === 'share'), collapsed && 'justify-center px-0')}
+          className={cn(rowCls(view === 'share'), 'gap-2.5', collapsed && 'justify-center px-0')}
         >
           <span className="shrink-0">{ShareIcon}</span>
           {!collapsed && <span className="min-w-0 flex-1 truncate text-left">{t('nav.share')}</span>}
         </button>
 
-        <div className="my-1 border-t border-border-subtle" />
+      </nav>
 
+      {/* 设置：沉底（BUG-306 / D19-⑧）—— 常驻侧栏底部、与上方导航分区，
+          不随导航内容滚动。`mt-auto` 保证即使上方导航很短也贴底；
+          `gap-2.5` 与「文件 / 下载」父行图标—标题间距一致（修复原 TG/分享/设置缺 gap 的不一致）。 */}
+      <div className="mt-auto border-t border-border-subtle px-2 py-2">
         <button
           onClick={() => onNavigate('settings', { section: 'general' })}
           title={t('nav.settings')}
           data-testid="nav-settings"
-          className={cn(rowCls(view === 'settings'), collapsed && 'justify-center px-0')}
+          className={cn(rowCls(view === 'settings'), 'gap-2.5', collapsed && 'justify-center px-0')}
         >
           <span className="shrink-0">{SettingsIcon}</span>
           {!collapsed && <span className="min-w-0 flex-1 truncate text-left">{t('nav.settings')}</span>}
         </button>
-      </nav>
+      </div>
     </aside>
   )
 }

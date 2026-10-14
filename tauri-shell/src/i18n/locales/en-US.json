@@ -10,6 +10,7 @@
   "files.cat.doc": "Documents",
   "files.cat.archive": "Archives",
   "files.cat.other": "Others",
+  "files.lib.series": "Series",
   "download.running": "Downloading",
   "download.paused": "Paused",
   "download.done": "Completed",

@@ -29,11 +29,11 @@ export const DL_FILTERS: readonly DlFilter[] = ['all', 'running', 'paused', 'don
 /**
  * 文件树分类：六类成品。
  *
- * `video` 的侧栏入口已与剧集合并为单一「视频」入口（BUG-306 / D19-⑦，2026-10-14
- * 用户续裁「剧集可以放视频上面或者和视频合并」⇒ 已选合并）——侧栏只渲染其余五项，
- * 视频内容经 `lib-series` 剧集栅格到达（D18：视频=剧集 ⇒ 栅格覆盖全部视频）。
- * `cat:video` 这个 fmode 仍合法（MediaLibraryPanel 的 items 视图照旧支持），
- * 只是不再有侧栏入口。
+ * `video` 的侧栏入口**独立渲染**（标签 `files.cat.video`，落点 `cat:video` → items 网格，
+ * kind=video）—— 扁平视频库。**2026-10-14 撤回 BUG-306 / D19-⑦ 合并**：此前「视频」
+ * 与「剧集」被合并成单一入口、落点 `lib-series` 剧集墙，导致「视频」混入照片剧集、
+ * 且剧集入口被吃掉。现在「视频」与「剧集」是两种不同浏览方式，分开为两个入口。
+ * `cat:video` 与 `lib-series` 都是合法 fmode，分别对应 items 网格与剧集墙。
  */
 export type FileCategory = 'video' | 'music' | 'image' | 'doc' | 'archive' | 'other'
 
@@ -47,21 +47,24 @@ export const FILE_CATEGORIES: readonly FileCategory[] = [
 ]
 
 /**
- * 资料库组（BUG-306 / D19 后只剩一个入口，且组标签已删）。
+ * 资料库组（保留 `lib-series` 落点判据）。
  *
- * **只剩「剧集」**（BUG-304 / D18，2026-10-14 用户四点裁定）：
- *   - `tags` 被移除 —— 标签是**过滤维度**不是目的地。实测 `lib-tags` 与 `lib-series`
- *     落在完全相同的视图（`MediaLibraryPanel` 里两个分支都 `setView('series')`），
- *     树项是**空转入口**。标签云与筛选框留在剧集墙顶部即可。
+ * `libraryGroupOf()` 仍返回 `'series'` 当且仅当 `fmode === 'lib-series'` —— 它是
+ * MediaLibraryPanel / ContextBar 的**落点判据**，与侧栏渲染形态解耦。
+ * 侧栏如何渲染「剧集」入口是 `Sidebar.tsx` 的事（2026-10-14 起为独立 `nav-child-lib-series`
+ * 条目，标签 `files.lib.series`），本类型不限定其形态。
+ *
+ * 已移除（BUG-304 / D18，2026-10-14 用户四点裁定）：
+ *   - `tags` 被移除 —— 标签是**过滤维度**不是目的地。`lib-tags` 与 `lib-series` 落在
+ *     完全相同的视图，是**空转入口**；标签云与筛选框留在剧集墙顶部。
  *   - `unfiled` 被移除 —— **「未归档」状态本身取消**。用户口径「视频=剧集，单集必然是
- *     一个单集剧集」⇒「有条目但无剧集归属」是**缺陷症状**而非正常态，把它做成一等入口
- *     等于把缺陷固化成功能（原 D13-③ 已由 D18 修订）。
+ *     一个单集剧集」⇒「有条目但无剧集归属」是**缺陷症状**而非正常态。
  *
- * **组标签删除、入口置顶并改名「视频」**（BUG-306 / D19，2026-10-14 续裁）：
- * 「资料库（策划）」组标签与「管理」「分类（成品内容）」同批裁定冗余（各包 0~1 个
- * 有意义子项）；剧集入口与视频分类合并为单一「视频」入口置于文件树子项最上方。
- * 保留 `LibraryGroup` 类型与 `libraryGroupOf()`：`lib-series` 仍是 MediaLibraryPanel /
- * ContextBar 的落点判据，与侧栏渲染形态解耦。
+ * **关于「剧集 = 视频」合并（BUG-306 / D19-⑦）已撤回**（2026-10-14 续裁）：
+ * 该合并把「视频」入口落点改成 `lib-series` 剧集墙、吞掉独立「剧集」入口，导致
+ * 「视频」混入照片剧集、视频/剧集不分。现恢复二者为独立入口：视频→`cat:video` 扁平库，
+ * 剧集→`lib-series` 剧集墙。D18「视频=剧集」仍是**数据模型**不变量（单集视频即 S1E1
+ * 剧集），但 UI 上允许两种浏览方式并存。
  */
 export type LibraryGroup = 'series'
 
@@ -69,10 +72,10 @@ export type LibraryGroup = 'series'
  * 文件域树选择。
  *
  * - `cat-all`               父行「全部文件」= 成品媒体墙全部（`tab: 'all'`）
- * - `cat:<category>`        分类组子项（按 kind 过滤，`tab: <kind>`；`cat:video`
- *                            已无侧栏入口 —— 视频走 `lib-series`，BUG-306 / D19-⑦）
+ * - `cat:<category>`        分类组子项（按 kind 过滤，`tab: <kind>`）；`cat:video`
+ *                            现为独立入口（侧栏 `nav-child-cat-video`，扁平视频库）
  * - `lib-series`            剧集栅格（标签云与筛选框同屏，标签是过滤维度不是目的地）；
- *                            侧栏入口标签为「视频」（BUG-306 / D19-⑦ 合并）
+ *                            侧栏入口 `nav-child-lib-series`，标签 `files.lib.series`
  * - `series:<id>`           剧集下钻（drill-in；返回即回到 `lib-series`）
  *
  * **已移除**（BUG-304 / D18）：`lib-tags`（空转入口，与 `lib-series` 同视图）、

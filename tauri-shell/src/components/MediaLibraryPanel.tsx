@@ -1239,9 +1239,12 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
         {view === "series" && (
           <>
                     <div className="flex items-center gap-2 px-2 pt-3">
-                      <p className="shrink-0 text-[10px] font-medium uppercase tracking-wide text-muted">
+                      {/* 标签筛选样式（2026-10-14 修正）：「标签」标签与筛选输入框**同一套式样**
+                          —— 同字号（11px）、同字重（medium）、同前景色（text-fg-soft），
+                          不再用「极小 uppercase muted 小标签 + 撑满大输入框」两套视觉。 */}
+                      <span className="shrink-0 text-[11px] font-medium text-fg-soft">
                         {t('media.tags')}
-                      </p>
+                      </span>
                       {/* BUG-304 / D18：常态可见，不再等 `tagExpanded`；且必须在 chip 列表
                           **之前** —— 筛选框与它筛选的对象必须同屏。 */}
                       <Input
@@ -1249,7 +1252,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
                         value={tagFilter}
                         onChange={(e) => setTagFilter(e.target.value)}
                         placeholder={t('media.tag.filterPlaceholder')}
-                        className="h-6 flex-1 text-[10.5px]"
+                        className="h-7 flex-1 text-[11px]"
                       />
                     </div>
                     <div className="mt-1 flex flex-wrap gap-1 px-1" data-testid="media-tag-list">

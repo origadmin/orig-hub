@@ -71,9 +71,9 @@ export const ViewTitle = memo(function ViewTitle({ nav }: ViewTitleProps) {
     const cat = fileCategoryOf(fmode)
     const lib = libraryGroupOf(fmode)
     if (cat) sub = t(`files.cat.${cat}`)
-    // BUG-306 / D19-⑦：剧集与视频合并为单一「视频」入口 ⇒ 副标题与侧栏同源，
-    // 不许侧栏叫「视频」、顶栏叫「剧集」（一个入口两个名 = 用户视角的分裂）。
-    else if (lib) sub = t('files.cat.video')
+    // 2026-10-14 撤回 BUG-306 / D19-⑦ 合并：剧集是独立入口（标签 `files.lib.series`），
+    // 副标题与侧栏同源，不许侧栏叫「剧集」、顶栏叫「视频」。
+    else if (lib) sub = t('files.lib.series')
   } else if (view === 'download' && dlFilter !== 'all') {
     sub = t(`download.${dlFilter}`)
   }
