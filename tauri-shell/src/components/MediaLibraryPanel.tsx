@@ -1547,8 +1547,9 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
                     // 无字节且来源支持原路取回时给「重新缓存」（BUG-080）
                     onRecache={recacheItem}
                     recacheBlockedReason={recacheBlockedReason(item.source, item.ref)}
-                    // BUG-305：tg 来源且坐标可解析时才渲染「在 TG 中查看」
-                    onViewInTg={viewInTg}
+                    // 视频=通用类（BUG-307 设计锁 2026-10-14）：items 网格不烤入 TG 跳转，
+                    // TG 跳转只保留在剧集链路（SeriesDetail / 剧集墙派生），通用视频类将来
+                    // 还会有十几个同类型插件，不能把 TG 当成视频的固有能力。
                   />
                 ))}
               </div>
