@@ -69,6 +69,12 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             "/api/tg/cache/tasks/:id",
             get(cache_task_by_id).delete(cancel_cache_task_route),
         )
+        // D22-A②（BUG-296）：任务级组清单 —— 序号全集 + 每条状态（已编入/已登记未编入/无条目）
+        // + 真缺口。**派生读**，不新建业务表、不写库。
+        .route(
+            "/api/tg/cache/tasks/:id/items",
+            get(cache_task_items),
+        )
         // BUG-277：队列优先级（置顶 / 取消置顶）。单条走 `:id`，**批量走同一个动词
         // 的静态段**（body `{ids:[…]}`）——多选置顶必须一个请求完成，
         // 禁止前端循环调单条（BUG-249 先例）。实现在 `cache::`。
@@ -149,6 +155,24 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route(
             "/api/media/series/:id/recache-missing",
             axum::routing::post(recache_series_missing),
+        )
+        // D22-A②（BUG-296）：剧集级组清单 —— 序号全集 + 每条状态 + 真缺口（先减挂图）。
+        // 剧集详情的「缺集灰条」与「已登记未编入」列表都由它派生。
+        .route(
+            "/api/media/series/:id/manifest",
+            get(get_series_manifest),
+        )
+        // D22-A⑥：人工**拆剧** —— 把同一部剧里被误并进来的条目移到新剧集。
+        // 组键统一后「同频道同名幂等同一部」，误并的出口只有这一个（不做自动冲突弹窗）。
+        .route(
+            "/api/media/series/:id/split",
+            axum::routing::post(split_media_series),
+        )
+        // D22-A②（BUG-296）：**按组清单真缺口**补缓存 —— 收「连条目都没有 / 已登记未编入」
+        // 的序号（挂图除外）。与 recache-missing（只收已存在但无字节的分集）互补。
+        .route(
+            "/api/media/series/:id/recache-gap",
+            axum::routing::post(recache_series_gap),
         )
         .route(
             "/api/media/episodes/:id",
@@ -1592,9 +1616,21 @@ async fn list_all_cache_tasks(State(st): State<Arc<AppState>>) -> Result<impl In
     let titles = cache_task_titles(&st, &tasks).await;
     // 无标题 ⇒ 后台自愈补登记，下轮轮询即拿到 caption（别再退回频道名）。
     spawn_title_selfheal(&st, &tasks, &titles);
+    // D22-A②（BUG-296）：任务级组清单**摘要** —— 一条聚合 SQL 覆盖全部任务（不是逐任务
+    // 查 + 逐条 stat），因为本端点在轮询路径上（对齐 BUG-085 的「别白跑」纪律）。
+    // 摘要只报「编入了几条」，不含字节真值。
+    let summaries = st.store.task_manifest_summaries().await.unwrap_or_default();
     let tasks: Vec<serde_json::Value> = tasks
         .iter()
-        .map(|t| task_with_progress(&st, t, cache_task_title(t, &titles)))
+        .map(|t| {
+            let mut v = task_with_progress(&st, t, cache_task_title(t, &titles));
+            if let Some(s) = summaries.get(&t.id) {
+                if v.is_object() {
+                    v["manifest"] = json!(s);
+                }
+            }
+            v
+        })
         .collect();
     Ok(Json(json!({ "tasks": tasks })))
 }
@@ -1609,6 +1645,24 @@ async fn cache_task_by_id(
             let titles = cache_task_titles(&st, std::slice::from_ref(&t)).await;
             Ok(Json(task_with_progress(&st, &t, cache_task_title(&t, &titles))))
         }
+        Ok(None) => Err(ApiError::new(StatusCode::NOT_FOUND, "cache task not found")),
+        Err(e) => Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
+    }
+}
+
+/// GET /api/tg/cache/tasks/:id/items — 任务级组清单（D22-A② / BUG-296）。
+///
+/// 返回**序号全集**（取自 `cache_task.items`，即客户端扫描 TG 的真值）+ 每条状态
+/// （`slotted` 已编入 / `registered_unslotted` 已登记未编入 / `missing` 无条目）
+/// + `imageCount` + `gap`（真缺口 = 未编入数 − 挂图数）。
+///
+/// **派生读**：数据源全是既有表，不新建业务表、不写库。`404` = 任务不存在。
+async fn cache_task_items(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    match st.store.task_group_manifest(id).await {
+        Ok(Some(m)) => Ok(Json(json!(m))),
         Ok(None) => Err(ApiError::new(StatusCode::NOT_FOUND, "cache task not found")),
         Err(e) => Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
     }
@@ -5766,6 +5820,173 @@ async fn merge_media_series(
     })))
 }
 
+/// `GET /api/media/series/:id/manifest` — 剧集级组清单（D22-A② / BUG-296）。
+///
+/// 剧集详情的「缺集灰条」与「已登记未编入」列表都由它派生：序号全集 = 覆盖该剧已认领
+/// 消息的缓存任务 `items` 的并集；`gap` = 未编入数 − 挂图数（**先减图片**，图集是设计）。
+/// 剧集不存在 → 404（与 `GET /api/media/series/:id` 同一语义）。
+async fn get_series_manifest(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let ok = st
+        .store
+        .series_exists(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if !ok {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "series not found"));
+    }
+    let m = st
+        .store
+        .series_group_manifest(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(json!(m)))
+}
+
+/// `POST /api/media/series/:id/split` 的请求体（D22-A⑥ 人工拆剧）。
+#[derive(Debug, Deserialize)]
+struct SplitSeriesReq {
+    /// 要拆出的条目 id（`media_item.id`）。空 ⇒ 400。
+    #[serde(rename = "itemIds", default)]
+    item_ids: Vec<i64>,
+    /// 新剧集标题；缺省 = `原剧名 · 拆分`。
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// `POST /api/media/series/:id/split` — 人工**拆剧**（D22-A⑥）。
+///
+/// 把给定条目移入一个**新建的手工剧集**（`source_key = NULL`），源剧集保留其余分集，
+/// 并对搬走的条目在源剧集记「已摘除」墓碑（自动路径不得再编回，BUG-126）。
+/// 语义与理由见 [`crate::media::Store::split_series`]。
+async fn split_media_series(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Json(body): Json<SplitSeriesReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    if body.item_ids.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "itemIds must not be empty",
+        ));
+    }
+    // 去重（保序）：重复 id 只搬一次。
+    let mut item_ids = body.item_ids.clone();
+    {
+        let mut seen = std::collections::HashSet::new();
+        item_ids.retain(|i| seen.insert(*i));
+    }
+    let rep = st
+        .store
+        .split_series(id, &item_ids, body.title.as_deref())
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    match rep {
+        Some(rep) => {
+            st.push_log(&format!(
+                "/api/media/series/{id}/split: 拆出 {} 集到新剧集 {}",
+                rep.moved, rep.new_series_id
+            ));
+            Ok(Json(json!(rep)))
+        }
+        // 源剧集不存在 / 给定条目一个都不在源里：两者都是 no-op，语义上等价于 404。
+        None => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "series not found or none of itemIds belong to it",
+        )),
+    }
+}
+
+/// `POST /api/media/series/:id/recache-gap` — **按组清单真缺口**补缓存（D22-A② / BUG-296）。
+///
+/// 与 BUG-261 的 `recache-missing` 的分工：后者只收**已存在但无字节**的分集（从分集自身
+/// 的来源 ref 出发）；本端点收**组清单里未编入的序号**（含「连条目都没有」的 `missing`
+/// 与「已登记未编入」的 `registered_unslotted`）—— 它们的共同点是**在媒体库里没有分集**，
+/// 只有 `(chat, msg)` 坐标，故必须从组清单反推。
+///
+/// **挂图必须排除**：图片按 BUG-049 不落盘、作为集级挂图存在（组清单里落
+/// `registered_unslotted`），它们不是缺口。按 `gap` 的口径（未编入 − 挂图）入队。
+///
+/// 入队复用 `Store::enqueue_cache_task`，组键 `g:` 前缀（gap），与 `b:`（batch 补缺）、
+/// `m:`（单条）、`g:`（相册）的键空间一致 —— 同批次重复点击命中活跃任务即复用（幂等）。
+async fn recache_series_gap(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_authorized(&st).await?;
+    let ok = st
+        .store
+        .series_exists(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if !ok {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "series not found"));
+    }
+    let m = st
+        .store
+        .series_group_manifest(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    let image_msgs: std::collections::HashSet<i64> = st
+        .store
+        .series_image_msg_ids(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .into_iter()
+        .collect();
+
+    // 真缺口 = 未编入（非 slotted）且**不是挂图**的序号。
+    let mut by_chat: std::collections::BTreeMap<i64, Vec<i64>> = std::collections::BTreeMap::new();
+    for e in &m.entries {
+        if e.state == "slotted" || image_msgs.contains(&e.message_id) {
+            continue;
+        }
+        by_chat.entry(m.chat_id).or_default().push(e.message_id);
+    }
+
+    let dir = resolve_cache_dir(&st, None).await;
+    let mut enqueued = 0usize;
+    let mut groups = 0usize;
+    for (chat_id, mut message_ids) in by_chat {
+        message_ids.sort_unstable();
+        message_ids.dedup();
+        let first = message_ids[0];
+        // 组键用 `g:` 前缀（gap）：与 `b:`（batch）/ `m:`（单条）互不相交。
+        let item_key = format!("g:{}:{}", chat_id, first);
+        let Some((task, created)) = st
+            .store
+            .enqueue_cache_task(chat_id, None, &item_key, &message_ids, &dir)
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        else {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "enqueue cache task failed",
+            ));
+        };
+        enqueued += message_ids.len();
+        groups += 1;
+        st.refresh_cache_tasks().await;
+        if created {
+            {
+                let st_bg = st.clone();
+                tokio::spawn(async move {
+                    register_enqueued_items(&st_bg, chat_id, &message_ids).await;
+                });
+            }
+            spawn_cache_task(st.clone(), task.id);
+        }
+    }
+    if groups > 0 {
+        st.push_log(&format!(
+            "/api/media/series/{id}/recache-gap: 入队 {enqueued} 条（{groups} 组）"
+        ));
+    }
+    Ok(Json(json!({ "enqueued": enqueued, "groups": groups })))
+}
+
 // ---- BUG-261：剧集级「补缺」（缓存与来源绑定） ----
 
 /// 缺失集没有任何可缓存来源时的 skip 原因（固定英文短串；界面原样透出，不翻译）。
@@ -9328,6 +9549,7 @@ mod tests {
     // ---- BUG-261：剧集级「补缺」端点（POST /api/media/series/:id/recache-missing）----
 
     use super::{parse_tg_ref_coords, recache_series_missing};
+    use super::recache_series_gap;
 
     /// 纯解析：`"chat:msg"` → 坐标；脏形态一律 None（路由侧据此进 skipped）。
     #[test]
@@ -9425,6 +9647,101 @@ mod tests {
         assert_eq!(tasks[0].chat_id, 424242);
         assert_eq!(tasks[0].message_ids, vec![71, 72], "组内消息按序齐全");
         assert_eq!(tasks[0].status, "queued", "worker 未起，任务保持排队");
+    }
+
+    /// `recache_series_gap` 的调用解构（同 `recache_missing_call`）。
+    async fn recache_gap_call(
+        st: Arc<AppState>,
+        id: i64,
+    ) -> Result<(StatusCode, serde_json::Value), (StatusCode, String)> {
+        match recache_series_gap(State(st), Path(id)).await {
+            Ok(resp) => {
+                let resp = resp.into_response();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                    .await
+                    .expect("body must be readable");
+                let v: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("body must be JSON");
+                Ok((status, v))
+            }
+            Err(e) => Err((e.status, e.message().to_string())),
+        }
+    }
+
+    /// D22-A②（BUG-296）：**按组清单真缺口**补缓存 —— 收「连条目都没有 / 已登记未编入」
+    /// 的序号（`missing` + `registered_unslotted`），**排除挂图**。
+    ///
+    /// 反向证伪：把 `image_msgs` 过滤去掉 ⇒ 图（74）被当缺口，`enqueued` 从 2 变 3 ⇒ FAIL。
+    /// 这正是 BUG-296 §复报补充的红线：不先减挂图会把「1 视频 + 9 图」错报成丢 9 集。
+    #[tokio::test]
+    async fn recache_gap_enqueues_unslotted_but_not_images_bug296() {
+        let st = recache_missing_fixture_state().await;
+        assert!(st.claim_cache_worker(), "门禁初始必须空闲");
+        let chat = 424242i64;
+        let key = format!("tg:named:{chat}:某剧");
+        // 序号全集 = 71,72,73,74（由**同组键**任务的 items 给出；D22-A①）。
+        st.store
+            .conn
+            .execute(
+                "INSERT INTO cache_task (chat_id, group_id, item_key, items, total, done, status, created_at, updated_at)
+                 VALUES (?1, NULL, ?2, ?3, 4, 4, 'done', 0, 0)",
+                libsql::params![chat, key.clone(), serde_json::to_string(&[71, 72, 73, 74]).unwrap()],
+            )
+            .await
+            .unwrap();
+        let sid = st
+            .store
+            .create_series("某剧", None, "series", None, Some(&key))
+            .await
+            .unwrap();
+        // 71 已编入（有槽位）。
+        let i1 = st
+            .store
+            .upsert_media_item("tg", &format!("{chat}:71"), "ep1", "video", None, None, None, None)
+            .await
+            .unwrap();
+        st.store.add_episode(sid, i1, 1, 1).await.unwrap();
+        // 72 已登记未编入（视频）—— 应入队。
+        st.store
+            .upsert_media_item("tg", &format!("{chat}:72"), "ep2", "video", None, None, None, None)
+            .await
+            .unwrap();
+        // 73 无条目 —— 应入队。
+        // 74 是**挂图**（有 item 行 + media_episode_image 行、无槽位）—— 不得入队。
+        let img = st
+            .store
+            .upsert_media_item("tg", &format!("{chat}:74"), "p", "photo", None, None, None, None)
+            .await
+            .unwrap();
+        let ep_id = st
+            .store
+            .get_series(sid)
+            .await
+            .unwrap()
+            .unwrap()
+            .episodes[0]
+            .id;
+        st.store
+            .conn
+            .execute(
+                "INSERT INTO media_episode_image (episode_id, item_id, sort_no, created_at) \
+                 VALUES (?1, ?2, 0, 0)",
+                libsql::params![ep_id, img],
+            )
+            .await
+            .unwrap();
+
+        let (status, v) = recache_gap_call(st.clone(), sid).await.expect("route must respond");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["enqueued"], 2, "缺口 = 72（已登记未编入）+ 73（无条目），挂图 74 不算");
+        assert_eq!(v["groups"], 1, "同 chat 聚成 1 组");
+
+        let tasks = st.store.list_cache_tasks(10).await.unwrap();
+        // 预插的同键任务（status=done）也在表里，故只数**新建的 queued 任务**。
+        let queued: Vec<_> = tasks.iter().filter(|t| t.status == "queued").collect();
+        assert_eq!(queued.len(), 1, "同 chat 一次任务");
+        assert_eq!(queued[0].message_ids, vec![72, 73], "只入队真缺口，且不含挂图 74");
     }
 
     /// 判据 4 的服务端半边：route 缺失（local 主源 / 脏 ref）的缺失集**必须**进

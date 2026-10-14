@@ -10,6 +10,7 @@ import {
   ImagePlus,
   Pencil,
   Play,
+  Scissors,
   Send,
   Tag,
   Trash2,
@@ -19,9 +20,9 @@ import type {
   MouseEvent as ReactMouseEvent,
 } from 'react'
 import type { MediaEpisode, MediaSeriesDetail, MediaTag } from '../../api/media'
-import { recacheSeriesMissing } from '../../api/media'
+import { getSeriesManifest, recacheSeriesGap, recacheSeriesMissing, splitMediaSeries } from '../../api/media'
 import { getCacheTasksForItems, setCacheTaskPriority } from '../../api/tg'
-import type { TgCacheTask } from '../../types'
+import type { GroupManifest, TgCacheTask } from '../../types'
 
 /**
  * 方向判定 hook：preload 首帧源图，按实际尺寸判竖/横（v3 `isPortrait` 等价实现；
@@ -207,6 +208,29 @@ export function SeriesDetail(props: {
   }, [refreshCacheTasks])
 
   /**
+   * 组清单（D22-A② / BUG-296）：剧集详情的「缺集灰条」数据源。
+   *
+   * 与 `missingCount`（无字节分集数）**互补而非重复**：后者只数**已存在**的分集，
+   * 前者还能报出「连条目都没有 / 已登记未编入」的缺失序号 —— 那正是 BUG-296 的核心态。
+   * 低频动作（随详情变化拉一次），不进轮询路径。
+   */
+  const [manifest, setManifest] = useState<GroupManifest | null>(null)
+  useEffect(() => {
+    let alive = true
+    setManifest(null)
+    getSeriesManifest(detail.id)
+      .then((m) => {
+        if (alive) setManifest(m)
+      })
+      .catch(() => {
+        if (alive) setManifest(null)
+      })
+    return () => {
+      alive = false
+    }
+  }, [detail.id, detail.episodeCount])
+
+  /**
    * 「优先下载」= 把该集的缓存任务提到队首（当前任务跑完后下一个跑它），**不抢占**、
    * 不弃单（缓存下载无断点续传，抢占会丢弃当前条目已下字节 —— 故不做立即打断）。
    * 再次点击 = 取消优先，回到 FIFO。priority 单一真源（引擎 cache_task.priority）。
@@ -336,6 +360,63 @@ export function SeriesDetail(props: {
       })
       .catch((e: unknown) => onError(e instanceof Error ? e.message : String(e)))
       .finally(() => setCachingMissing(false))
+  }
+
+  /**
+   * 组清单**真缺口**（D22-A② / BUG-296）：`gap` = 未编入数 − 挂图数（先减图片）。
+   *
+   * 与 `missingCount` 的区别见 `manifest` 注释 —— 这里补的是**连条目都没有 /
+   * 已登记未编入**的序号（`missing` + `registered_unslotted`），挂图不算。
+   */
+  const gapCount = manifest?.gap ?? 0
+  const [cachingGap, setCachingGap] = useState(false)
+  /** 一键补缓存真缺口：一次请求（引擎原子端点），挂图已由后端排除。 */
+  const cacheGap = () => {
+    if (cachingGap || gapCount === 0) return
+    setCachingGap(true)
+    recacheSeriesGap(detail.id)
+      .then((r) => {
+        onError(t('media.series.cacheGapQueued', { enqueued: r.enqueued }))
+        // 入队后组清单可能变化（新条目登记），刷新一次。
+        return getSeriesManifest(detail.id).then(setManifest)
+      })
+      .catch((e: unknown) => onError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setCachingGap(false))
+  }
+
+  /**
+   * 人工**拆剧**（D22-A⑥ / BUG-292 误并出口）：把选中条目移入新建手工剧集。
+   *
+   * 组键统一（D22-A①）后「同频道同名幂等同一部」，误并的唯一出口就是这个动作。
+   * 不做自动冲突弹窗 —— 只在用户显式点「拆分剧集」时进入。
+   */
+  const [splitOpen, setSplitOpen] = useState(false)
+  const [splitSelected, setSplitSelected] = useState<number[]>([])
+  const [splitTitle, setSplitTitle] = useState('')
+  const [splitting, setSplitting] = useState(false)
+  const toggleSplitSelect = (itemId: number) => {
+    setSplitSelected((prev) =>
+      prev.includes(itemId) ? prev.filter((x) => x !== itemId) : [...prev, itemId],
+    )
+  }
+  const submitSplit = () => {
+    if (splitting || splitSelected.length === 0) return
+    const title = splitTitle.trim()
+    if (title.length === 0) {
+      onError(t('media.series.splitTitleRequired'))
+      return
+    }
+    setSplitting(true)
+    splitMediaSeries(detail.id, splitSelected, title)
+      .then((r) => {
+        onError(t('media.series.splitDone', { moved: r.moved }))
+        setSplitOpen(false)
+        setSplitSelected([])
+        setSplitTitle('')
+        onChanged()
+      })
+      .catch((e: unknown) => onError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setSplitting(false))
   }
 
   /** 打开集级挂图灯箱（范围 = **本集** `images`，R6） */
@@ -633,6 +714,23 @@ export function SeriesDetail(props: {
               <GitMerge className="h-3.5 w-3.5" />
               {t('media.series.merge')}
             </Button>
+            {/* D22-A⑥（BUG-292）：人工**拆剧** —— 合并的逆操作，误并的唯一出口。
+                组键统一后「同频道同名幂等同一部」，不做自动冲突弹窗，只在此显式进入。 */}
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              onClick={() => {
+                setSplitSelected([])
+                setSplitTitle('')
+                setSplitOpen(true)
+              }}
+              title={t('media.series.splitHint')}
+              data-testid="series-split"
+            >
+              <Scissors className="h-3.5 w-3.5" />
+              {t('media.series.split')}
+            </Button>
             <Button
               variant="outline"
               size="sm"
@@ -683,6 +781,38 @@ export function SeriesDetail(props: {
               {pickerCollapsed ? t('media.episode.expand') : t('media.episode.collapse')}
             </button>
           </div>
+          {/* D22-A②（BUG-296）：**缺集灰条** —— 组清单真缺口（未编入 − 挂图）。
+              它比上方 `series-recache-missing`（无字节分集数）更完整：还能报出
+              「连条目都没有 / 已登记未编入」的缺失序号。挂图已由后端排除，不误报。
+              gap=0（或剧集无 TG 全集）时整条不渲染 —— 不挂常驻噪音。 */}
+          {manifest && manifest.total > 0 && gapCount > 0 ? (
+            <div
+              className="flex items-center gap-2 rounded-md border border-border-subtle bg-surface-2/60 px-2 py-1.5 text-[11px] text-muted"
+              data-testid="series-gap-bar"
+              data-gap={gapCount}
+              data-total={manifest.total}
+            >
+              <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-500" />
+              <span className="min-w-0 flex-1 truncate">
+                {t('media.series.gapBar', {
+                  gap: gapCount,
+                  total: manifest.total,
+                  slotted: manifest.slotted,
+                })}
+              </span>
+              <button
+                type="button"
+                onClick={cacheGap}
+                disabled={cachingGap}
+                className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] text-amber-500 hover:bg-amber-500/10 disabled:cursor-not-allowed disabled:text-muted disabled:hover:bg-transparent"
+                title={t('media.series.cacheGapHint')}
+                data-testid="series-recache-gap"
+              >
+                <CloudOff className="h-3 w-3" />
+                {t('media.series.cacheGap')}
+              </button>
+            </div>
+          ) : null}
           <div className="flex min-h-0 flex-col gap-px overflow-y-auto" data-testid="episode-picker">
             {!pickerCollapsed &&
               detail.episodes.map((ep, i) => {
@@ -1356,6 +1486,84 @@ export function SeriesDetail(props: {
               <Button variant="ghost" size="sm" onClick={() => setSourcePick(null)}>
                 {t('media.cancel')}
               </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* D22-A⑥（BUG-292）：人工**拆剧**对话框 —— 勾选要拆出的条目 + 输入新剧名。
+          合并的逆操作；拆出的新剧集是**手工剧集**（后端保证 source_key = NULL），
+          源剧集保留其余、被搬走的条目记墓碑（自动路径不再编回）。 */}
+      {splitOpen ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6"
+          data-testid="series-split-dialog"
+          onClick={() => !splitting && setSplitOpen(false)}
+        >
+          <div
+            className="flex max-h-[80vh] w-full max-w-md flex-col rounded-lg border border-border bg-surface p-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <p className="mb-1 text-sm font-medium text-fg-strong">
+              {t('media.series.split')}
+            </p>
+            <p className="mb-3 text-[11px] text-muted">{t('media.series.splitHint')}</p>
+            <div className="mb-3 flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto">
+              {detail.episodes.map((ep) => {
+                const checked = splitSelected.includes(ep.itemId)
+                return (
+                  <label
+                    key={ep.id}
+                    className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] hover:bg-surface-2"
+                    data-testid="series-split-option"
+                  >
+                    <input
+                      type="checkbox"
+                      className="h-3.5 w-3.5 shrink-0 accent-accent"
+                      checked={checked}
+                      disabled={splitting}
+                      onChange={() => toggleSplitSelect(ep.itemId)}
+                    />
+                    <span className="shrink-0 font-mono text-[10.5px] text-muted">
+                      {episodeSlotLabel(ep)}
+                    </span>
+                    <span className="min-w-0 truncate text-fg-mid">{episodeRowTitle(ep, detail)}</span>
+                  </label>
+                )
+              })}
+            </div>
+            <input
+              type="text"
+              value={splitTitle}
+              onChange={(e) => setSplitTitle(e.target.value)}
+              disabled={splitting}
+              placeholder={t('media.series.splitTitlePlaceholder')}
+              className="mb-3 w-full rounded border border-border bg-surface-2 px-2 py-1.5 text-[12px] text-fg-strong"
+              data-testid="series-split-title"
+            />
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] text-muted">
+                {t('media.series.splitSelected', { n: splitSelected.length })}
+              </span>
+              <div className="flex gap-2">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={splitting}
+                  onClick={() => setSplitOpen(false)}
+                >
+                  {t('media.cancel')}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={splitting || splitSelected.length === 0}
+                  onClick={submitSplit}
+                  data-testid="series-split-confirm"
+                >
+                  {t('media.series.splitConfirm')}
+                </Button>
+              </div>
             </div>
           </div>
         </div>

@@ -1,4 +1,5 @@
 import type {
+  GroupManifest,
   TgCacheTask,
   TgChannel,
   TgDiag,
@@ -578,6 +579,19 @@ export async function listAllCacheTasks(): Promise<{
   counts: Record<string, number>
 }> {
   return request('/api/tg/cache/tasks/all')
+}
+
+/**
+ * GET /api/tg/cache/tasks/:id/items — 任务级**组清单**（D22-A② / BUG-296）。
+ *
+ * 返回该任务覆盖的**序号全集 + 每条状态**（已编入 / 已登记未编入 / 无条目）+
+ * `hasBytes` 标志 + 真缺口 `gap`。低频动作（用户展开某一行时才拉），不进轮询路径；
+ * 任务不存在 ⇒ 404。
+ */
+export async function getCacheTaskItems(taskId: number): Promise<GroupManifest> {
+  return request<GroupManifest>(
+    `/api/tg/cache/tasks/${encodeURIComponent(String(taskId))}/items`,
+  )
 }
 
 /**

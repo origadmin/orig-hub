@@ -15,6 +15,7 @@ import {
   cancelCacheTasks,
   deleteCacheTask,
   deleteCacheTasksByIds,
+  getCacheTaskItems,
   listAllCacheTasks,
   listTgDialogs,
   retryCacheTask,
@@ -22,7 +23,7 @@ import {
   setCacheTaskPriority,
   setCacheTasksPriority,
 } from '../api/tg'
-import type { TgCacheTask, TgChannel, ViewerItem } from '../types'
+import type { GroupManifest, ManifestEntry, TgCacheTask, TgChannel, ViewerItem } from '../types'
 
 /**
  * 入库流水线面板（原「缓存管理」）。
@@ -204,6 +205,97 @@ function fmtEta(sec: number, t: (key: string, vars?: Record<string, string | num
 }
 
 /**
+ * 组清单**逐条状态**（D22-A② / BUG-296 判据 3）：展开任务行时**按需**拉取。
+ *
+ * 「展开行的逐条状态在 DOM 中可数」是 BUG-296 修复的硬判据 —— 用户必须能看见
+ * 「这批 N 条里，哪几条进了剧集、哪几条只登记没编入、哪几条连条目都没有」，
+ * 而不是只看到一个 `done=4/4` 的假完成读数。
+ *
+ * 低频动作：只在展开时发一次请求，**不进 5s 轮询**（对齐 BUG-085 的「别白跑」纪律）。
+ */
+const TaskManifestPanel = memo(function TaskManifestPanel(props: { taskId: number }) {
+  const { t } = useTranslation()
+  const [data, setData] = useState<GroupManifest | null>(null)
+  const [failed, setFailed] = useState(false)
+  useEffect(() => {
+    let alive = true
+    setData(null)
+    setFailed(false)
+    getCacheTaskItems(props.taskId)
+      .then((m) => {
+        if (alive) setData(m)
+      })
+      .catch(() => {
+        if (alive) setFailed(true)
+      })
+    return () => {
+      alive = false
+    }
+  }, [props.taskId])
+
+  if (failed) {
+    return (
+      <p className="mt-1 text-[11px] text-red-500" data-testid="cache-task-manifest-error">
+        {t('tg.manifestLoadFailed')}
+      </p>
+    )
+  }
+  if (!data) {
+    return (
+      <p className="mt-1 text-[11px] text-fg-muted" data-testid="cache-task-manifest-loading">
+        {t('tg.manifestLoading')}
+      </p>
+    )
+  }
+  const STATE_LABEL: Record<ManifestEntry['state'], string> = {
+    slotted: 'tg.manifestSlotted',
+    registered_unslotted: 'tg.manifestRegistered',
+    missing: 'tg.manifestMissing',
+  }
+  return (
+    <div
+      className="mt-1.5 flex flex-col gap-0.5 rounded-md border border-border-subtle bg-surface/60 p-2"
+      data-testid="cache-task-manifest"
+    >
+      <span className="mb-0.5 text-[11px] text-fg-muted" data-testid="cache-task-manifest-gap">
+        {t('tg.manifestGap', { gap: data.gap, total: data.total })}
+      </span>
+      {data.entries.map((e) => (
+        <div
+          key={e.messageId}
+          className="flex items-center gap-2 text-[11px]"
+          data-testid="cache-task-manifest-entry"
+          data-state={e.state}
+          data-has-bytes={e.hasBytes ? '1' : '0'}
+        >
+          <span className="shrink-0 font-mono text-[10px] text-muted">{e.messageId}</span>
+          <span
+            className={cn(
+              'shrink-0 rounded px-1 py-0.5 text-[10px]',
+              e.state === 'slotted'
+                ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                : e.state === 'registered_unslotted'
+                  ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                  : 'bg-surface-2 text-muted',
+            )}
+          >
+            {t(STATE_LABEL[e.state])}
+          </span>
+          {e.state === 'slotted' && e.season != null && e.episodeNo != null ? (
+            <span className="shrink-0 font-mono text-[10px] text-muted">
+              S{e.season}E{e.episodeNo}
+            </span>
+          ) : null}
+          <span className="shrink-0 text-[10px] text-muted">
+            {e.hasBytes ? t('tg.manifestHasBytes') : t('tg.manifestNoBytes')}
+          </span>
+        </div>
+      ))}
+    </div>
+  )
+})
+
+/**
  * 流水线的一行（AGENTS.md §5：高频路径的行组件必须 `memo` 化）。
  *
  * 行内动作**按组切换**，且只有一条主按钮：已入库 → 去媒体库查看（成品的出口）；
@@ -288,6 +380,11 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
    * 心跳时间戳用服务端下发的 `progressAt` 做差（同一时钟），不受本机时钟漂移影响。
    */
   const [rate, setRate] = useState<{ bps: number; etaSec: number | null } | null>(null)
+  /**
+   * 组清单展开态（D22-A② / BUG-296 判据 3）：展开时才拉逐条状态（低频动作）。
+   * 状态留在行内 —— 轮询刷新（`task` 对象换新）不该把用户展开的清单收起来。
+   */
+  const [manifestOpen, setManifestOpen] = useState(false)
   const prevSample = useRef<{ bytes: number; at: number } | null>(null)
   useEffect(() => {
     const bytes = task.progressBytes ?? null
@@ -390,6 +487,30 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
             {title} · {single ? t('tg.cacheScopeSingle') : t('tg.cacheScopeGroup')} ·{' '}
             {t('tg.cacheCountUnit', { n: task.messageIds.length })}
           </span>
+          {/* D22-A②（BUG-296 判据 3）：展开逐条状态 —— 「10 条里入了几条」必须可数。
+              组清单摘要（`task.manifest`）随 `/tasks/all` 下发，只有存在时才给入口。 */}
+          {task.manifest ? (
+            <button
+              type="button"
+              className="flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[10.5px] text-fg-muted hover:bg-surface-2 hover:text-fg-strong"
+              title={t('tg.manifestToggleHint')}
+              onClick={() => setManifestOpen((v) => !v)}
+              data-testid="cache-task-manifest-toggle"
+              data-unslotted={
+                task.manifest.slotted < task.manifest.total ? '1' : '0'
+              }
+            >
+              {manifestOpen ? (
+                <ChevronDown className="h-3 w-3" />
+              ) : (
+                <ChevronRight className="h-3 w-3" />
+              )}
+              {t('tg.manifestSlottedCount', {
+                slotted: task.manifest.slotted,
+                total: task.manifest.total,
+              })}
+            </button>
+          ) : null}
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
           {/* 优先下载 / 取消优先（BUG-277）：只对「排队中」或「已优先下载」的记录出现。
@@ -601,6 +722,8 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
           </div>
         </div>
       ) : null}
+      {/* D22-A②（BUG-296 判据 3）：展开的**组清单逐条状态**（按需拉取，低频）。 */}
+      {manifestOpen ? <TaskManifestPanel taskId={task.id} /> : null}
     </div>
   )
 })

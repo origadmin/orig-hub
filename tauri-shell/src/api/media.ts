@@ -6,6 +6,7 @@
  */
 
 import { tgBase } from './tg'
+import type { GroupManifest } from '../types'
 
 /** 媒体资料库与 TG 服务同进程同端口（orig-tg 9877） */
 /** 媒体库基址：每次现算 —— TG 端口由 daemon 下发，可能在运行期变化（BUG-178） */
@@ -688,6 +689,57 @@ export async function mergeSeriesMulti(
  */
 export function recacheSeriesMissing(seriesId: number): Promise<RecacheMissingResult> {
   return request(`/api/media/series/${seriesId}/recache-missing`, { method: 'POST' })
+}
+
+/**
+ * 剧集级**按组清单真缺口**补缓存（D22-A② / BUG-296）：`POST /api/media/series/:id/recache-gap`。
+ *
+ * 与 `recacheSeriesMissing` 的分工：后者只收**已存在但无字节**的分集；本函数收组清单里
+ * **未编入的序号**（含「连条目都没有」的 `missing` 与「已登记未编入」的
+ * `registered_unslotted`），且**排除挂图**（图集是设计不是缺口）。
+ */
+export function recacheSeriesGap(
+  seriesId: number,
+): Promise<{ enqueued: number; groups: number }> {
+  return request(`/api/media/series/${seriesId}/recache-gap`, { method: 'POST' })
+}
+
+/**
+ * 剧集级**组清单**（D22-A② / BUG-296）：序号全集 + 每条状态 + 真缺口。
+ *
+ * 「缺集灰条」的数据源 —— 它比 `missingCount`（无字节分集数）更完整：
+ * 后者只数**已存在**的分集，前者还能报出**连条目都没有**的缺失序号
+ * （BUG-296 的核心态：`media_item` 有行但无槽位 / 完全没有行）。
+ * 剧集不存在 ⇒ 404。
+ */
+export function getSeriesManifest(seriesId: number): Promise<GroupManifest> {
+  return request(`/api/media/series/${seriesId}/manifest`)
+}
+
+/** 人工**拆剧**结果（D22-A⑥ / BUG-292 误并出口） */
+export interface SplitSeriesResult {
+  /** 拆出的新（手工）剧集 id */
+  newSeriesId: number
+  /** 实际搬移的分集数 */
+  moved: number
+}
+
+/**
+ * 人工**拆剧**（D22-A⑥）：把误并进同一部剧的若干条目移入**新建手工剧集**。
+ *
+ * 组键统一（D22-A①）后同一频道同名相册幂等同一部，误并的唯一出口就是这个动作
+ * （合并的逆操作，不做自动冲突弹窗）。拆出的新剧集 `source_key = NULL`（手工剧集），
+ * 否则自动路径会按 key 并回来；源剧集保留其余条目、被搬走的条目记墓碑（不复活）。
+ */
+export function splitMediaSeries(
+  seriesId: number,
+  itemIds: number[],
+  title: string,
+): Promise<SplitSeriesResult> {
+  return request(`/api/media/series/${seriesId}/split`, {
+    method: 'POST',
+    body: JSON.stringify({ itemIds, title }),
+  })
 }
 
 /**

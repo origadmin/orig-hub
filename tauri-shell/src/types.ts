@@ -324,6 +324,13 @@ export interface TgCacheTask {
    * 壳端不得因为字段缺失就崩，也不得据此假装「可置顶」。
    */
   priority?: number
+  /**
+   * 组清单摘要（D22-A② / BUG-296）：该任务覆盖消息的编入状态计数。
+   *
+   * 只在 `/api/tg/cache/tasks/all`（缓存管理面板）注入；`/tasks` 与 `/tasks/:id`
+   * 不带（轮询路径不做这个聚合）。缺省 = 未注入，前端不得据此假装「已全部编入」。
+   */
+  manifest?: ManifestSummary
 }
 
 /**
@@ -338,6 +345,60 @@ export interface TgQueuedTask {
   groupId?: number
   messageIds: number[]
   total: number
+}
+
+/**
+ * 组清单**摘要**（D22-A② / BUG-296）：任务列表轮询路径随每条 `TgCacheTask` 下发。
+ *
+ * 语义是「这批消息编入了几条」，**不是**「字节在不在」——字节真值由逐条明细给出。
+ * `total` = 序号全集（`cache_task.items` 的长度），`slotted` = 已编入剧集，
+ * `registeredUnslotted` = 已登记未编入（BUG-296 的核心态），`missing` = 无条目。
+ * 三态之和恒等于 `total`。
+ */
+export interface ManifestSummary {
+  total: number
+  slotted: number
+  registeredUnslotted: number
+  missing: number
+}
+
+/** 组清单的逐条状态：`slotted` 已编入 | `registered_unslotted` 已登记未编入 | `missing` 无条目 */
+export type ManifestState = 'slotted' | 'registered_unslotted' | 'missing'
+
+/**
+ * 组清单的**一条**（D22-A② / BUG-296）。
+ *
+ * `hasBytes` 是**独立标志**（可与任一态并存）：「无字节」不是独立状态。
+ * `episodeId/season/episodeNo` 仅在 `state === 'slotted'` 时有值。
+ */
+export interface ManifestEntry {
+  messageId: number
+  state: ManifestState
+  hasBytes: boolean
+  episodeId?: number
+  season?: number
+  episodeNo?: number
+}
+
+/**
+ * 组清单（D22-A② / BUG-296）：**序号全集 + 每条状态 + 缺口**。
+ *
+ * 派生读、不新建业务表。序号全集取 `cache_task.items`（TG 侧真值的一部分）。
+ * `gap` = **真缺口** = 未编入数 − 挂图数（先减 `imageCount`：图集是设计不是丢失）。
+ */
+export interface GroupManifest {
+  chatId: number
+  /** 参与合成的任务 id（剧集级可能由多批缓存合成，如 EP1-5 + EP6-10） */
+  taskIds: number[]
+  total: number
+  slotted: number
+  registeredUnslotted: number
+  missing: number
+  /** 该组在剧集内的挂图数（`media_episode_image`） */
+  imageCount: number
+  /** 真缺口 = 未编入数 − 挂图数 */
+  gap: number
+  entries: ManifestEntry[]
 }
 
 /** orig-tg 运行诊断快照（GET /api/tg/diag） */

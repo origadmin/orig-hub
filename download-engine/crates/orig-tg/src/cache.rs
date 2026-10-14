@@ -2022,7 +2022,15 @@ mod tests {
     fn priority_db(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("orig_priority_{tag}_{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        d.join("store.db")
+        // 清掉可能被 **pid 复用**继承的旧库：本 helper 原先不删文件，Windows 回收 pid
+        // 后新进程会打开上一轮留下的库 ⇒ `enqueue_cache_task` 命中旧行、`created=false`，
+        // 本档「首次入队必须新建」随机红。与 store.rs tests 的 `store()` / media.rs 的
+        // `tmp_db`（先 remove_file）同一纪律。
+        let db = d.join("store.db");
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(d.join("store.db-wal"));
+        let _ = std::fs::remove_file(d.join("store.db-shm"));
+        db
     }
 
     /// 单条置顶端点 → `(状态码, JSON)`，与 `batch_call` 同一手写解构

@@ -1466,6 +1466,119 @@ pub struct SeriesDetail {
     pub episodes: Vec<EpisodeView>,
 }
 
+/// 组清单里单条消息的状态（D22-A② / BUG-296，**只读派生**）。
+///
+/// 三值互斥，覆盖 BUG-296 的五态口径：
+/// - `slotted`（已编入剧集）—— 有 `media_episode` 行；
+/// - `registered_unslotted`（已登记未编入）—— 有 `media_item` 行但无槽位；
+/// - `missing`（无条目）—— 连 `media_item` 行都没有。
+///
+/// 「无字节」不是独立状态而是 `has_bytes` 标志（可与任一态并存）；
+/// 「从未入队」在**组清单**（序号全集取自任务 `items`）里不适用 —— 全集本身
+/// 就来自某次入队，故任务级清单不产生该态（剧集级清单同理，见
+/// [`Store::series_group_manifest`]）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestEntry {
+    #[serde(rename = "messageId")]
+    pub message_id: i64,
+    /// `slotted` | `registered_unslotted` | `missing`。
+    pub state: &'static str,
+    /// 字节是否真的在盘（`probe_cached_bytes`，与分集/条目视图同一套真值，BUG-132）。
+    #[serde(rename = "hasBytes")]
+    pub has_bytes: bool,
+    #[serde(rename = "episodeId", skip_serializing_if = "Option::is_none")]
+    pub episode_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub season: Option<i64>,
+    #[serde(rename = "episodeNo", skip_serializing_if = "Option::is_none")]
+    pub episode_no: Option<i64>,
+}
+
+/// 组清单（D22-A② / BUG-296）：**序号全集 + 每条状态 + 缺口**。
+///
+/// **派生读，不新建业务表**（决策 D22-A②）。序号全集取 `cache_task.items`
+/// —— 那是客户端扫描 TG 后发来的消息 id 数组，本身即 TG 侧真值的一部分
+/// （BUG-296 勘误：**不可**用 `media_message` 计数反推「相册有几条」）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupManifest {
+    #[serde(rename = "chatId")]
+    pub chat_id: i64,
+    /// 参与合成的任务 id（剧集级可能由多批缓存合成，如 EP1-5 + EP6-10）。
+    #[serde(rename = "taskIds")]
+    pub task_ids: Vec<i64>,
+    /// 序号全集大小。
+    pub total: usize,
+    pub slotted: usize,
+    #[serde(rename = "registeredUnslotted")]
+    pub registered_unslotted: usize,
+    pub missing: usize,
+    /// 该组在剧集内的**挂图**数（`media_episode_image`）—— 图片按 BUG-049 不落盘、
+    /// 作为集级挂图存在，故它们天然没有槽位。
+    #[serde(rename = "imageCount")]
+    pub image_count: usize,
+    /// **真缺口** = 未编入数 − 挂图数（先减图片：图集是**设计**，不是丢失）。
+    ///
+    /// BUG-296 §复报补充的红线：不先减 `media_episode_image` 会把「10 视频 + 9 图」
+    /// 这类**设计形态**错报成「丢了 9 集」——两个方向都会错。
+    pub gap: usize,
+    pub entries: Vec<ManifestEntry>,
+}
+
+/// 组清单**摘要**（无逐条明细、无字节探测）：任务列表轮询路径用。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManifestSummary {
+    pub total: usize,
+    pub slotted: usize,
+    #[serde(rename = "registeredUnslotted")]
+    pub registered_unslotted: usize,
+    pub missing: usize,
+}
+
+/// 由逐条状态合成组清单 —— 缺口判定**只在这一处**（两个调用方各算一遍必然漂移）。
+fn manifest_from(
+    chat_id: i64,
+    task_ids: Vec<i64>,
+    entries: Vec<ManifestEntry>,
+    image_count: usize,
+) -> GroupManifest {
+    let total = entries.len();
+    let slotted = entries.iter().filter(|e| e.state == "slotted").count();
+    let missing = entries.iter().filter(|e| e.state == "missing").count();
+    let registered_unslotted = total - slotted - missing;
+    let unslotted = total - slotted;
+    GroupManifest {
+        chat_id,
+        task_ids,
+        total,
+        slotted,
+        registered_unslotted,
+        missing,
+        image_count,
+        // 先减挂图：图集是设计，不是丢失（BUG-296 §复报补充 红线）。
+        gap: unslotted.saturating_sub(image_count),
+        entries,
+    }
+}
+
+/// 从剧集组键（`media_series.source_key`）里解出 `chat_id`。
+///
+/// 键由 [`crate::routes::episodic_group_key`] 生成，形如
+/// `tg:named:{chat}:{name}` / `tg:group:{chat}:{g}` / `tg:msgs:{chat}:{msg}`。
+/// 剧集级清单在「已认领条目为空」时靠它兜出 chat —— 否则逐条状态会拿 `chat=0`
+/// 去查 `media_item`，把整组错报成「无条目」。
+fn chat_from_group_key(key: &str) -> Option<i64> {
+    let mut parts = key.split(':');
+    let scheme = parts.next()?; // tg
+    if scheme != "tg" {
+        return None;
+    }
+    let _kind = parts.next()?; // named | group | msgs
+    parts.next()?.parse::<i64>().ok()
+}
+
 /// 导出完备性单类问题（byte-ownership P5）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1515,6 +1628,17 @@ pub struct MergeReport {
     /// 留作未来「多源同槽归并」扩展接口，避免再次破坏公共 API）。
     #[serde(default)]
     pub sources_attached: i64,
+}
+
+/// 人工**拆剧**（D22-A⑥）的结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitReport {
+    /// 新建的手工剧集 id。
+    #[serde(rename = "newSeriesId")]
+    pub new_series_id: i64,
+    /// 实际搬移的分集数。
+    pub moved: usize,
 }
 
 /// 列表查询条件。
@@ -2395,6 +2519,309 @@ impl Store {
         Ok(Some(SeriesDetail { series, episodes }))
     }
 
+    /// 派生**任务级**组清单（D22-A② / BUG-296）——该任务覆盖的全部消息的逐条状态 + 缺口。
+    ///
+    /// 数据源全部**已存在**：`cache_task.items`（序号全集）+ `media_item`（登记）
+    /// + `media_episode`（槽位）+ `media_episode_image`（挂图）。**只读派生、不新建表、不写库**。
+    pub async fn task_group_manifest(&self, task_id: i64) -> libsql::Result<Option<GroupManifest>> {
+        let Some(t) = self.get_cache_task(task_id).await? else {
+            return Ok(None);
+        };
+        let image_count = self.group_image_count(t.chat_id, &t.message_ids).await?;
+        let entries = self.manifest_entries(t.chat_id, &t.message_ids).await?;
+        Ok(Some(manifest_from(t.chat_id, vec![task_id], entries, image_count)))
+    }
+
+    /// 派生**剧集级**组清单（BUG-296 的「缺集灰条」数据源）。
+    ///
+    /// 剧集 → 序号全集：先把剧集已认领的 TG 条目（分集主源 ∪ 备用源 ∪ 集级挂图）折成
+    /// `(chat, msg)`，再用它们反查**覆盖了其中任一消息**的缓存任务，取这些任务 `items`
+    /// 的**并集** —— 这正是「分批缓存（EP1-5 今天、EP6-10 下周）合成一部剧」后仍能还原
+    /// 出全集 10 条的机制（配合 D22-A① 的组键统一）。
+    ///
+    /// 剧集不含任何 TG 条目（如纯 `local` 导入）时返回空清单（`total == 0`）——
+    /// 没有「TG 侧全集」这个概念，不臆造缺口。
+    pub async fn series_group_manifest(&self, series_id: i64) -> libsql::Result<GroupManifest> {
+        // 剧集的**组键**（D22-A①）：`media_series.source_key` 与 `cache_task.item_key`
+        // 是同一把键（`episodic_group_key` 的产物）。凭它找回**同一部剧的全部批次**——
+        // 这是「某批整批未编入（无任何槽位）也能还原出它的序号全集」的唯一途径。
+        let key: Option<String> = self
+            .row_opt(
+                "SELECT source_key FROM media_series WHERE id = ?1",
+                params![series_id],
+            )
+            .await?
+            .and_then(|r| r.get::<Option<String>>(0).ok())
+            .flatten();
+        let refs = self.series_tg_refs(series_id).await?;
+        let mut coords: Vec<(i64, i64)> = refs
+            .iter()
+            .filter_map(|r| crate::routes::parse_tg_ref(r))
+            .collect();
+        coords.sort_unstable();
+        coords.dedup();
+        // chat 优先取已认领条目；一条都没有时（纯未编入批次）从组键里解出。
+        let chat_id = coords
+            .first()
+            .map(|(c, _)| *c)
+            .or_else(|| key.as_deref().and_then(chat_from_group_key))
+            .unwrap_or(0);
+        let seed_msgs: Vec<i64> = coords.iter().map(|(_, m)| *m).collect();
+        let (task_ids, all_msgs) = self
+            .tasks_for_series(key.as_deref(), chat_id, &seed_msgs)
+            .await?;
+        let image_count = self.series_image_count(series_id).await?;
+        let entries = self.manifest_entries(chat_id, &all_msgs).await?;
+        Ok(manifest_from(chat_id, task_ids, entries, image_count))
+    }
+
+    /// 全部任务的组清单**摘要**（无逐条明细、不 probe 字节）——供任务列表（5s 轮询）批量使用。
+    ///
+    /// 单独一条聚合 SQL 覆盖全部任务：逐任务调 [`Self::task_group_manifest`] 会变成
+    /// N 次查询 + N×items 次 stat，在轮询路径上不可接受（对齐 BUG-085 的「别白跑」纪律）。
+    /// 字节真值不在此给出 —— 摘要是「编入了几条」，不是「字节在不在」。
+    pub async fn task_manifest_summaries(
+        &self,
+    ) -> libsql::Result<std::collections::HashMap<i64, ManifestSummary>> {
+        // `media_episode UNIQUE(item_id)`（D22-A④）保证 e 侧至多一行，join 不会扇出。
+        let sql = "SELECT t.id, COUNT(*), \
+                          SUM(CASE WHEN i.id IS NULL THEN 1 ELSE 0 END), \
+                          SUM(CASE WHEN i.id IS NOT NULL AND e.id IS NULL THEN 1 ELSE 0 END), \
+                          SUM(CASE WHEN e.id IS NOT NULL THEN 1 ELSE 0 END) \
+                     FROM cache_task t \
+                     JOIN json_each(t.items) je \
+                     LEFT JOIN media_item i \
+                            ON i.source = 'tg' AND i.ref = (t.chat_id || ':' || je.value) \
+                     LEFT JOIN media_episode e ON e.item_id = i.id \
+                    GROUP BY t.id";
+        let mut rows = self.conn.query(sql, ()).await?;
+        let mut out = std::collections::HashMap::new();
+        while let Some(r) = rows.next().await? {
+            let id: i64 = r.get(0)?;
+            out.insert(
+                id,
+                ManifestSummary {
+                    total: r.get::<i64>(1)? as usize,
+                    missing: r.get::<i64>(2)? as usize,
+                    registered_unslotted: r.get::<i64>(3)? as usize,
+                    slotted: r.get::<i64>(4)? as usize,
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    /// 某组（chat + 消息全集）在剧集内的挂图数：该组消息所落剧集（们）的 `media_episode_image` 行数。
+    async fn group_image_count(&self, chat_id: i64, msgs: &[i64]) -> libsql::Result<usize> {
+        if msgs.is_empty() {
+            return Ok(0);
+        }
+        let refs: Vec<String> = msgs.iter().map(|m| format!("{chat_id}:{m}")).collect();
+        let placeholders = refs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT COUNT(*) FROM media_episode_image m \
+               JOIN media_episode e ON e.id = m.episode_id \
+              WHERE e.series_id IN ( \
+                    SELECT e2.series_id FROM media_episode e2 \
+                      JOIN media_item i ON i.id = e2.item_id \
+                     WHERE i.source = 'tg' AND i.ref IN ({placeholders}))"
+        );
+        let p: Vec<libsql::Value> = refs.into_iter().map(Into::into).collect();
+        let row = self.row_opt(&sql, p).await?;
+        Ok(row.map(|r| r.get::<i64>(0).unwrap_or(0)).unwrap_or(0) as usize)
+    }
+
+    /// 剧集已认领的 TG 条目 ref 集合（分集主源 ∪ 备用源 ∪ 集级挂图）。
+    async fn series_tg_refs(&self, series_id: i64) -> libsql::Result<Vec<String>> {
+        let sql = "SELECT i.ref FROM media_episode e \
+                     JOIN media_item i ON i.id = e.item_id \
+                    WHERE e.series_id = ?1 AND i.source = 'tg' AND i.ref IS NOT NULL \
+                   UNION \
+                   SELECT i.ref FROM media_episode_source s \
+                     JOIN media_item i ON i.id = s.item_id \
+                     JOIN media_episode e ON e.id = s.episode_id \
+                    WHERE e.series_id = ?1 AND i.source = 'tg' AND i.ref IS NOT NULL \
+                   UNION \
+                   SELECT i.ref FROM media_episode_image m \
+                     JOIN media_item i ON i.id = m.item_id \
+                     JOIN media_episode e ON e.id = m.episode_id \
+                    WHERE e.series_id = ?1 AND i.source = 'tg' AND i.ref IS NOT NULL";
+        let mut rows = self.conn.query(sql, params![series_id]).await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(r.get::<String>(0)?);
+        }
+        Ok(out)
+    }
+
+    /// 剧集内挂图总数（`media_episode_image`，经分集归属）。
+    async fn series_image_count(&self, series_id: i64) -> libsql::Result<usize> {
+        let row = self
+            .row_opt(
+                "SELECT COUNT(*) FROM media_episode_image m \
+                   JOIN media_episode e ON e.id = m.episode_id \
+                  WHERE e.series_id = ?1",
+                params![series_id],
+            )
+            .await?;
+        Ok(row.map(|r| r.get::<i64>(0).unwrap_or(0)).unwrap_or(0) as usize)
+    }
+
+    /// 剧集内挂图对应的 TG **消息号**集合（`media_episode_image` → `media_item`）。
+    ///
+    /// 供「缺集补缓存」**排除挂图**：图片按 BUG-049 不落盘、作为集级挂图存在，天然没有
+    /// 槽位 —— 在组清单里它们落 `registered_unslotted`，但**不是缺口**。不排除就会把
+    /// 「1 视频 + 9 图」重新当 9 集去缓存（正是 BUG-296 §复报补充要防的错报）。
+    pub async fn series_image_msg_ids(&self, series_id: i64) -> libsql::Result<Vec<i64>> {
+        let sql = "SELECT i.ref FROM media_episode_image m \
+                     JOIN media_item i ON i.id = m.item_id \
+                     JOIN media_episode e ON e.id = m.episode_id \
+                    WHERE e.series_id = ?1 AND i.source = 'tg' AND i.ref IS NOT NULL";
+        let mut rows = self.conn.query(sql, params![series_id]).await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            let ref_key: String = r.get(0)?;
+            if let Some((_chat, msg)) = crate::routes::parse_tg_ref(&ref_key) {
+                out.push(msg);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// 与某剧相关的全部缓存任务 id（升序去重）+ 这些任务 `items` 的**并集**（升序去重）。
+    ///
+    /// 两条来源合并（D22-A① 组键统一的落点）：
+    /// 1. **同组键任务**（`cache_task.item_key = series.source_key`）—— 即便某一批
+    ///    **整批未编入**（该批没有任何 `media_episode` 槽位）也能凭键找回它的序号全集；
+    /// 2. **覆盖了该剧已认领消息的任务** —— 兜住旧数据里 `item_key` 尚未统一的批次
+    ///    （它们的键还停在 `g:{chat}:{group}`，仅靠键匹配会漏）。
+    ///
+    /// 两者取并集，缺一不可：只用 ② 会在「第二批全失败」时漏掉整批（BUG-296 要修的场景）；
+    /// 只用 ① 会在旧数据上漏掉历史任务。
+    async fn tasks_for_series(
+        &self,
+        key: Option<&str>,
+        chat_id: i64,
+        seed_msgs: &[i64],
+    ) -> libsql::Result<(Vec<i64>, Vec<i64>)> {
+        let mut task_ids: Vec<i64> = Vec::new();
+        let mut set: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+
+        // ① 同组键任务。
+        if let Some(k) = key {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id, items FROM cache_task WHERE item_key = ?1 ORDER BY id ASC",
+                    params![k],
+                )
+                .await?;
+            while let Some(r) = rows.next().await? {
+                task_ids.push(r.get::<i64>(0)?);
+                let items: String = r.get(1)?;
+                if let Ok(v) = serde_json::from_str::<Vec<i64>>(&items) {
+                    set.extend(v);
+                }
+            }
+        }
+
+        // ② 覆盖已认领消息的任务。
+        if !seed_msgs.is_empty() {
+            let placeholders = seed_msgs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT id, items FROM cache_task \
+                  WHERE chat_id = ?1 \
+                    AND EXISTS (SELECT 1 FROM json_each(cache_task.items) \
+                                 WHERE json_each.value IN ({placeholders})) \
+                  ORDER BY id ASC"
+            );
+            let mut p: Vec<libsql::Value> = Vec::with_capacity(seed_msgs.len() + 1);
+            p.push(chat_id.into());
+            for m in seed_msgs {
+                p.push((*m).into());
+            }
+            let mut rows = self.conn.query(&sql, p).await?;
+            while let Some(r) = rows.next().await? {
+                task_ids.push(r.get::<i64>(0)?);
+                let items: String = r.get(1)?;
+                if let Ok(v) = serde_json::from_str::<Vec<i64>>(&items) {
+                    set.extend(v);
+                }
+            }
+        }
+
+        task_ids.sort_unstable();
+        task_ids.dedup();
+        Ok((task_ids, set.into_iter().collect()))
+    }
+
+    /// 逐条派生状态（`slotted` / `registered_unslotted` / `missing`），`has_bytes` 走真实探测。
+    async fn manifest_entries(
+        &self,
+        chat_id: i64,
+        msgs: &[i64],
+    ) -> libsql::Result<Vec<ManifestEntry>> {
+        let lib_root = self.library_root().await;
+        let mut out = Vec::with_capacity(msgs.len());
+        for &m in msgs {
+            let ref_key = format!("{chat_id}:{m}");
+            let row = self
+                .row_opt(
+                    "SELECT id, file_path FROM media_item WHERE source = 'tg' AND ref = ?1",
+                    params![ref_key],
+                )
+                .await?;
+            let Some(r) = row else {
+                out.push(ManifestEntry {
+                    message_id: m,
+                    state: "missing",
+                    has_bytes: false,
+                    episode_id: None,
+                    season: None,
+                    episode_no: None,
+                });
+                continue;
+            };
+            let item_id: i64 = r.get(0)?;
+            let file_path: Option<String> = r.get(1)?;
+            // BUG-132：字节真值 = 解析后 stat，不是 `file_path IS NOT NULL` 那句「承诺」。
+            let has_bytes = match file_path.as_deref() {
+                Some(p) => {
+                    let abs = crate::cache::resolve_item_path(&lib_root, p);
+                    probe_cached_bytes(&abs.to_string_lossy()).await == BytesPresence::Present
+                }
+                None => false,
+            };
+            let ep = self
+                .row_opt(
+                    "SELECT id, season, episode_no FROM media_episode WHERE item_id = ?1 LIMIT 1",
+                    params![item_id],
+                )
+                .await?;
+            match ep {
+                Some(e) => out.push(ManifestEntry {
+                    message_id: m,
+                    state: "slotted",
+                    has_bytes,
+                    episode_id: Some(e.get(0)?),
+                    season: Some(e.get(1)?),
+                    episode_no: Some(e.get(2)?),
+                }),
+                None => out.push(ManifestEntry {
+                    message_id: m,
+                    state: "registered_unslotted",
+                    has_bytes,
+                    episode_id: None,
+                    season: None,
+                    episode_no: None,
+                }),
+            }
+        }
+        Ok(out)
+    }
+
     /// 导出完备性校验（byte-ownership P5，只读）。
     ///
     /// 逐剧集列出四类导出阻断项：缺字节（`file_path` 缺失或解析后文件不存在，走
@@ -3013,6 +3440,133 @@ impl Store {
     ) -> libsql::Result<MergeReport> {
         self.conn.execute("BEGIN IMMEDIATE", ()).await?;
         let outcome = self.merge_one_source_in_tx(target_id, source_id).await;
+        match outcome {
+            Ok(rep) => {
+                self.conn.execute("COMMIT", ()).await?;
+                Ok(rep)
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// 人工**拆剧**（D22-A⑥）：把 `source_id` 中指定的条目移入一个**新建的手工剧集**。
+    ///
+    /// 返回 `None` = 源剧集不存在或给定条目一个都不在源剧集里（no-op，不改库）。
+    ///
+    /// ## 为什么新剧集必须是「手工」剧集（`source_key = NULL`）
+    ///
+    /// 组键统一（D22-A①）后同一频道的同名相册**幂等同一部**；误并（同频道同名实为两部）
+    /// 的唯一出口就是人工拆剧。拆出去的那半若仍是**自动**剧集（带 `source_key`），
+    /// 自动成剧路径下次缓存时会按 key 把它并回来 —— 拆了等于没拆。故新剧集恒为手工剧集。
+    ///
+    /// ## 为什么还要给源剧集记墓碑
+    ///
+    /// 只搬分集不够：源剧集仍是自动剧集，`append_episodes_ranged` 下次仍会按
+    /// `source_key` 把搬走的条目**重新编回来**（BUG-126 的「删了又回来」形态）。
+    /// 故对每个搬走的条目在源剧集记一条「已摘除」墓碑（复用 [`Self::tombstone_episode`]）。
+    ///
+    /// ## 不删源剧集
+    ///
+    /// 即使源被拆空也**保留**：拆剧是用户的编排动作，静默删掉一部剧会让「拆完发现少了一部」
+    /// 变成不可解释。空剧集在列表里可见，用户可显式删（`DELETE /api/media/series/:id`）；
+    /// 搬走的条目已记墓碑，不会因源留空而被并回。
+    ///
+    /// ## 编号
+    ///
+    /// 移入的分集在新剧集里按原 `(season, episode_no, id)` 顺序重排为 `S1E1..S1EN` ——
+    /// 拆出去的是**另一部剧**，从头编号才符合直觉（保留原号会让新剧从 E6 起跳）。
+    pub async fn split_series(
+        &self,
+        source_id: i64,
+        item_ids: &[i64],
+        new_title: Option<&str>,
+    ) -> libsql::Result<Option<SplitReport>> {
+        if item_ids.is_empty() {
+            return Ok(None);
+        }
+        if !self.series_exists(source_id).await? {
+            return Ok(None);
+        }
+        let source_key = self.series_source_key(source_id).await?;
+        let meta = self
+            .row_opt(
+                "SELECT title, kind, year FROM media_series WHERE id = ?1",
+                params![source_id],
+            )
+            .await?;
+        let (src_title, src_kind, src_year) = match meta {
+            Some(r) => (
+                r.get::<String>(0)?,
+                r.get::<String>(1)?,
+                r.get::<Option<i64>>(2)?,
+            ),
+            None => return Ok(None),
+        };
+
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let outcome: libsql::Result<Option<SplitReport>> = async {
+            // 源剧集的分集按原顺序取回，再在内存里筛出要搬的（源通常很小，免拼动态 IN）。
+            let moving: Vec<(i64, i64)> = {
+                let stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT id, item_id FROM media_episode \
+                          WHERE series_id = ?1 ORDER BY season ASC, episode_no ASC, id ASC",
+                    )
+                    .await?;
+                let mut rows = stmt.query(params![source_id]).await?;
+                let want: std::collections::HashSet<i64> = item_ids.iter().copied().collect();
+                let mut v = Vec::new();
+                while let Some(r) = rows.next().await? {
+                    let ep_id: i64 = r.get(0)?;
+                    let item_id: i64 = r.get(1)?;
+                    if want.contains(&item_id) {
+                        v.push((ep_id, item_id));
+                    }
+                }
+                v
+            };
+            if moving.is_empty() {
+                return Ok(None);
+            }
+            let title = new_title
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{src_title} · 拆分"));
+            // 手工剧集：`source_key = NULL`（见上方「为什么必须是手工剧集」）。
+            let new_id = self
+                .create_series(&title, None, &src_kind, src_year, None)
+                .await?;
+            let t = now_secs();
+            for (i, (ep_id, item_id)) in moving.iter().enumerate() {
+                // 搬移 = 改归属 + 重排编号（`UNIQUE(item_id)` 下不新增行，只改 series/槽位）。
+                self.conn
+                    .execute(
+                        "UPDATE media_episode SET series_id = ?1, season = 1, episode_no = ?2 \
+                          WHERE id = ?3",
+                        params![new_id, (i as i64) + 1, *ep_id],
+                    )
+                    .await?;
+                // 源剧集记墓碑：自动路径下次不得把它编回来（BUG-126）。
+                self.tombstone_episode(source_id, *item_id, source_key.as_deref())
+                    .await?;
+            }
+            self.conn
+                .execute(
+                    "UPDATE media_series SET updated_at = ?1 WHERE id IN (?2, ?3)",
+                    params![t, source_id, new_id],
+                )
+                .await?;
+            Ok(Some(SplitReport {
+                new_series_id: new_id,
+                moved: moving.len(),
+            }))
+        }
+        .await;
         match outcome {
             Ok(rep) => {
                 self.conn.execute("COMMIT", ()).await?;
@@ -10553,5 +11107,198 @@ mod tests {
             0,
             "归集后不得再报未归档（不变量）"
         );
+    }
+
+    // ---- D22-A②/A⑥（BUG-296/292）：组清单派生 + 人工拆剧 ----
+
+    /// 插一条 cache_task，返回其 id（组清单夹具共用）。
+    ///
+    /// `key` 是 `cache_task.item_key` —— 剧集级清单靠它（与 `media_series.source_key`
+    /// 同一把）找回同部剧的全部批次，故用例必须写真键，不能一律用相册键。
+    async fn insert_task(s: &Store, chat: i64, key: &str, msgs: &[i64], status: &str) -> i64 {
+        let items = serde_json::to_string(msgs).unwrap();
+        let total = msgs.len() as i64;
+        s.conn
+            .execute(
+                "INSERT INTO cache_task (chat_id, group_id, item_key, items, total, done, status, created_at, updated_at)
+                 VALUES (?1, NULL, ?2, ?3, ?4, ?4, ?5, ?6, ?6)",
+                params![chat, key, items, total, status, now_secs()],
+            )
+            .await
+            .unwrap();
+        scalar_i64(&s.conn, "SELECT id FROM cache_task ORDER BY id DESC LIMIT 1").await
+    }
+
+    /// D22-A②（BUG-296 判据 2）：任务级组清单报三态，`done` **不再**等于「都进剧集」。
+    #[tokio::test]
+    async fn task_group_manifest_derives_three_states_bug296() {
+        let s = Store::open(tmp_db("task_manifest")).await.unwrap();
+        let chat = 900i64;
+        let msgs: Vec<i64> = vec![401, 402, 403, 404];
+        let task = insert_task(&s, chat, "g:900:77", &msgs, "done").await;
+        let sid = s
+            .create_series("某剧", None, "series", None, Some("tg:named:900:某剧"))
+            .await
+            .unwrap();
+        // 401 已编入；402 已登记未编入；403/404 无条目。
+        let a = s
+            .upsert_media_item("tg", "900:401", "A", "video", None, None, None, None)
+            .await
+            .unwrap();
+        s.add_episode(sid, a, 1, 1).await.unwrap();
+        s.upsert_media_item("tg", "900:402", "B", "video", None, None, None, None)
+            .await
+            .unwrap();
+
+        let m = s.task_group_manifest(task).await.unwrap().expect("task exists");
+        assert_eq!((m.total, m.slotted, m.registered_unslotted, m.missing), (4, 1, 1, 2));
+        assert_eq!(m.gap, 3, "无挂图 ⇒ 真缺口 = 未编入 3");
+        // 判据 2：`done=4/4` 的任务不得被报成「全部已入库」。
+        assert_ne!(m.slotted, 4, "done 是消息计数，不是编入计数");
+        assert_eq!(s.task_group_manifest(999_999).await.unwrap(), None, "任务不存在 ⇒ None");
+    }
+
+    /// D22-A②（BUG-296）：剧集级组清单 —— 序号全集取**覆盖该剧消息的任务并集**（分批缓存合成一部）。
+    #[tokio::test]
+    async fn series_group_manifest_unions_batches_and_counts_states_bug296() {
+        let s = Store::open(tmp_db("series_manifest")).await.unwrap();
+        let chat = 910i64;
+        // 两批缓存（EP1-5 / EP6-10）→ 同一部剧（D22-A① 组键统一的落点）：
+        // 两批**同键**（`tg:named:910:某剧`），故第二批即便整批未编入也能被找回。
+        insert_task(&s, chat, "tg:named:910:某剧", &(301..=305).collect::<Vec<_>>(), "done").await;
+        insert_task(&s, chat, "tg:named:910:某剧", &(306..=310).collect::<Vec<_>>(), "interrupted")
+            .await;
+        let sid = s
+            .create_series("某剧", None, "series", None, Some("tg:named:910:某剧"))
+            .await
+            .unwrap();
+        // 3 条已编入
+        for (i, m) in (301..=303).enumerate() {
+            let id = s
+                .upsert_media_item("tg", &format!("{chat}:{m}"), "v", "video", None, None, None, None)
+                .await
+                .unwrap();
+            s.add_episode(sid, id, 1, (i as i64) + 1).await.unwrap();
+        }
+        // 2 条已登记未编入
+        for m in 304..=305 {
+            s.upsert_media_item("tg", &format!("{chat}:{m}"), "v", "video", None, None, None, None)
+                .await
+                .unwrap();
+        }
+        // 其余 5 条（306..=310）无条目。
+        let m = s.series_group_manifest(sid).await.unwrap();
+        assert_eq!(m.total, 10, "两批并集 = 10（分批缓存合成一部）");
+        assert_eq!(m.task_ids.len(), 2, "两批任务都参与合成");
+        assert_eq!((m.slotted, m.registered_unslotted, m.missing), (3, 2, 5));
+        assert_eq!(m.image_count, 0);
+        assert_eq!(m.gap, 7, "无挂图 ⇒ 真缺口 = 未编入 7");
+    }
+
+    /// D22-A②（BUG-296 §复报补充 红线，**反向证伪**）：真缺口必须**先减挂图**。
+    ///
+    /// 夹具复刻「10 条消息 = 1 视频 + 9 图」的**设计形态**：图片按 BUG-049 不落盘、作为
+    /// 集级挂图存在，故它们天然没有槽位。不减挂图会把这一类错报成「丢了 9 集」。
+    /// **反向证伪**：把 `gap` 改成 `total - slotted`（不减 `image_count`）⇒ 本断言 0 变 9 ⇒ FAIL。
+    #[tokio::test]
+    async fn manifest_gap_subtracts_images_bug296() {
+        let s = Store::open(tmp_db("manifest_gap")).await.unwrap();
+        let chat = 920i64;
+        let msgs: Vec<i64> = (401..=410).collect();
+        let task = insert_task(&s, chat, "g:920:81", &msgs, "done").await;
+        let sid = s
+            .create_series("图集剧", None, "series", None, Some("tg:named:920:图集剧"))
+            .await
+            .unwrap();
+        // 1 条视频编入 S1E1
+        let vid = s
+            .upsert_media_item("tg", "920:401", "v", "video", None, None, None, None)
+            .await
+            .unwrap();
+        s.add_episode(sid, vid, 1, 1).await.unwrap();
+        let ep_id =
+            scalar_i64(&s.conn, &format!("SELECT id FROM media_episode WHERE series_id = {sid}")).await;
+        // 9 张图挂在该集下（有 media_item 行、无槽位 = 设计）
+        for m in 402..=410 {
+            let img = s
+                .upsert_media_item("tg", &format!("{chat}:{m}"), "p", "photo", None, None, None, None)
+                .await
+                .unwrap();
+            s.conn
+                .execute(
+                    "INSERT INTO media_episode_image (episode_id, item_id, sort_no, created_at) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![ep_id, img, m - 402, now_secs()],
+                )
+                .await
+                .unwrap();
+        }
+        let m = s.task_group_manifest(task).await.unwrap().unwrap();
+        assert_eq!((m.total, m.slotted, m.registered_unslotted, m.missing), (10, 1, 9, 0));
+        assert_eq!(m.image_count, 9, "9 张集级挂图");
+        assert_eq!(
+            m.gap, 0,
+            "图集是设计不是丢失：真缺口 = 未编入 9 − 挂图 9 = 0（不减挂图会错报 9）"
+        );
+    }
+
+    /// D22-A⑥（BUG-292 误并出口）：拆剧移入**新建手工剧集**，源保留其余，搬走的条目记墓碑。
+    #[tokio::test]
+    async fn split_series_moves_to_manual_series_and_tombstones_source_bug292() {
+        let s = Store::open(tmp_db("split_series")).await.unwrap();
+        let sid = s
+            .create_series("误并剧", None, "series", None, Some("tg:named:930:某剧"))
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for (i, m) in [101i64, 102, 103].iter().enumerate() {
+            let id = s
+                .upsert_media_item("tg", &format!("930:{m}"), "v", "video", None, None, None, None)
+                .await
+                .unwrap();
+            s.add_episode(sid, id, 1, (i as i64) + 1).await.unwrap();
+            ids.push(id);
+        }
+        let c = ids[2];
+
+        let rep = s
+            .split_series(sid, &[c], Some("另一部剧"))
+            .await
+            .unwrap()
+            .expect("给定条目在源剧集里 ⇒ 必须真的拆");
+        assert_eq!(rep.moved, 1);
+        // 新剧集必须是**手工**剧集（source_key = NULL），否则自动路径会按 key 并回来。
+        assert_eq!(
+            s.series_source_key(rep.new_series_id).await.unwrap(),
+            None,
+            "拆出的新剧集必须是手工剧集"
+        );
+        // 新剧集里从头编号为 S1E1。
+        let new_eps = s.get_series(rep.new_series_id).await.unwrap().unwrap().episodes;
+        assert_eq!(new_eps.len(), 1);
+        assert_eq!(
+            (new_eps[0].item_id, new_eps[0].season, new_eps[0].episode_no),
+            (c, 1, 1),
+            "拆出的分集在新剧集里重排为 S1E1"
+        );
+        // 源剧集保留其余两条。
+        assert_eq!(
+            s.get_series(sid).await.unwrap().unwrap().episodes.len(),
+            2,
+            "源剧集保留其余分集"
+        );
+        // 墓碑 + 自动路径不得编回（BUG-126）。
+        assert!(
+            s.removed_item_ids(sid).await.unwrap().contains(&c),
+            "搬走的条目必须在源剧集留墓碑"
+        );
+        assert_eq!(
+            s.append_episodes_ranged(sid, 1, &[(c, None)]).await.unwrap(),
+            0,
+            "自动路径不得把拆走的条目再编回源剧集"
+        );
+        // 空 itemIds / 不存在的条目 ⇒ no-op（None），不改库。
+        assert!(s.split_series(sid, &[], None).await.unwrap().is_none());
+        assert!(s.split_series(sid, &[999_999], None).await.unwrap().is_none());
     }
 }

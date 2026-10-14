@@ -2053,6 +2053,13 @@ mod tests {
             .join(format!("orig_tg_store_{}_", std::process::id()))
             .join("libroot_chain");
         std::fs::create_dir_all(&dir).unwrap();
+        // 清掉可能被 **pid 复用**继承的旧库与 config.json：本用例原先不删文件，Windows
+        // 回收 pid 后新进程会打开上一轮留下的库（其 `library_dir` 已被本用例写到
+        // `lib-from-setting`）与 `config.json` ⇒ 「默认档」断言随机红。与 `store()` 同一纪律。
+        let _ = std::fs::remove_file(dir.join("store.db"));
+        let _ = std::fs::remove_file(dir.join("store.db-wal"));
+        let _ = std::fs::remove_file(dir.join("store.db-shm"));
+        let _ = std::fs::remove_file(dir.join("config.json"));
         let db_path = dir.join("store.db");
         let s = Store::open(&db_path).await.unwrap();
 
