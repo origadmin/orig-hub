@@ -5321,6 +5321,24 @@ async fn list_media_series(
         .list_series_filtered(q.tag_id)
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    // BUG-307 临时修复：剧集墙只显示「真实群集」，隐藏 D18 自动「单视频=S1E1」便利序列。
+    //
+    // 标记：`source_key LIKE 'item:%'`（D18 在 `media.rs` 为每个本地 item 自动建序列时写入）。
+    // 这些是数据层便利记录，**不是**用户/插件建立的群集，混在剧集墙里让用户误以为
+    // 「非 TG 数据进了剧集」（用户 2026-10-14 截图证据：`scene_*`/`portrait_*`/
+    // `banner_*`/`sample_*`/`movie` 全是 `D:\test_videos\...` 下的本地文件，被建成了
+    // 160 个 D18 自动序列）。
+    //
+    // 为什么不在 `list_series_filtered` 的 SQL WHERE 里过滤：那个函数同时被
+    // `get_series(id)`（按 id 查单条，`media.rs:2085`）复用，SQL 过滤会顺带让 D18
+    // 自动序列的详情页打不开。Post-filter 只影响剧集**列表**端点。
+    //
+    // 正确做法是给 `media_series` 加 `is_auto_series` 布尔列 + 迁移（性能好、逻辑清晰），
+    // 但用户明确「当前先进行简单的错误修复,整体需要重新架构设计」，架构重设计时再换。
+    let list: Vec<_> = list
+        .into_iter()
+        .filter(|s| s.source_key.as_deref().map_or(true, |k| !k.starts_with("item:")))
+        .collect();
     Ok(Json(json!({"items": list})))
 }
 

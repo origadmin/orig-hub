@@ -1152,6 +1152,16 @@ pub struct SeriesView {
     ///
     /// 谓词同样是 `file_path IS NOT NULL`（缓存承诺），理由见 `ItemQuery::has_bytes`。
     pub has_bytes: bool,
+    /// 序列来源标识（BUG-307 临时修复，HTTP 端点 `list_media_series` 据此 post-filter）。
+    ///
+    /// - `Some("item:<N>")` = D18 自动「单视频=S1E1」便利序列（数据层概念，**不是**群集）
+    /// - `Some("tg:group:<chat>:<msg>")` = TG 群组归档的剧集
+    /// - `None` = 用户手动建的群集
+    ///
+    /// `#[serde(skip)]` —— 不下发到前端：内部判据字段，架构重设计（用户 2026-10-14 明确
+    /// 「整体需要重新架构设计，当前先进行简单的错误修复」）时可能改名/换字段，不进 API 契约。
+    #[serde(skip)]
+    pub source_key: Option<String>,
     pub tags: Vec<TagRef>,
 }
 
@@ -2013,7 +2023,12 @@ impl Store {
                         -- 不等价（用户报的「视频里居然存在未缓存」）。成品列表按本列过滤。
                         EXISTS(
                           SELECT 1 FROM media_episode e JOIN media_item i ON i.id = e.item_id
-                           WHERE e.series_id = s.id AND i.file_path IS NOT NULL)
+                           WHERE e.series_id = s.id AND i.file_path IS NOT NULL),
+                        -- BUG-307 临时修复：剧集墙 post-filter 用的 source_key 标识。
+                        -- `item:<N>` 是 D18 自动「单视频=S1E1」便利序列，不是群集。
+                        -- SQL 不在这里 WHERE 过滤：会顺带影响 `get_series()`（按 id 查单条），
+                        -- 让 D18 自动序列的详情页打不开。改为 HTTP 层 post-filter。
+                        s.source_key
                    FROM media_series s
                   WHERE (?1 IS NULL
                          OR s.id IN (SELECT series_id FROM media_series_tag WHERE tag_id = ?1))
@@ -2043,6 +2058,7 @@ impl Store {
                 photo_count: r.get(14)?,
                 cover_has_bytes: r.get::<i64>(15)? != 0,
                 has_bytes: r.get::<i64>(16)? != 0,
+                source_key: r.get(17)?,
                 tags: Vec::new(),
             });
         }
