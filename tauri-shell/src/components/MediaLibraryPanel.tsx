@@ -968,11 +968,20 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
     return confirmSeriesIds.map((id) => byId.get(id) ?? { id, title: `#${id}`, episodeCount: 0 })
   }, [confirmSeriesIds, series, selectedSeriesList, detail])
 
-  // 空态必须区分「库真的空」（引导导入）与「筛选无结果」（引导清筛选）——
-  // 把后者渲染成"资料库是空的 + 导入目录"会误导用户以为数据丢了。
+  // 空态必须区分「库真的空」（引导导入/缓存）与「筛选无结果」（引导清筛选）——
+  // 把后者渲染成"文件管理里还没有内容 + 导入目录"会误导用户以为数据丢了。
   // 判据用**库级统计** stats.items，不能用列表响应的 total：
   // total 是筛选后总数（标签筛空时为 0），会让"无匹配"伪装成"库空"。
   const libraryEmpty = (stats?.items ?? 0) === 0
+
+  /**
+   * 空态文案（M0-T03·tasks.md 第 2 条，BUG-298 实施记录⑩）：
+   * 规划包原文 = 「下载/缓存完成的内容会自动出现在这里」（D16 语义前置）。
+   * 落地时按「宁可没有、也不编造」收敛为当前事实：TG 缓存与导入今天确实自动出现，
+   * **HTTP 下载完成自动入库尚未接线**（BUG-299 / M2-T01，ingest 只有 TG 一条路径）
+   * ⇒ 文案明确写出这条正在完善 + 给出「打开目录」的现实出路，不替未落地的能力背书。
+   * （缺陷号只进注释与缺陷档，用户可见文案不带内部编号。）
+   */
 
   /**
    * 左栏标签区（BUG-259）：当前是否「剧集侧」—— 决定标签计数取 `itemCount` 还是
@@ -1109,8 +1118,8 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
               className="shrink-0 text-[11px] text-muted"
               data-testid="media-occupancy"
               title={`${hasDiskBasis
-                ? '占用空间 = 资料库在本机实际占用的磁盘字节（清缓存后会下降）'
-                : '占用空间 = 媒体库登记的内容大小（后端未提供磁盘占用读数；清缓存后此值不变）'}\n登记值 = 内容在源头的大小之和（未落盘/字节已清的内容仍计入），不是本地磁盘占用`}
+                ? '占用空间 = 文件管理在本机实际占用的磁盘字节（清缓存后会下降）'
+                : '占用空间 = 文件管理登记的内容大小（后端未提供磁盘占用读数；清缓存后此值不变）'}\n登记值 = 内容在源头的大小之和（未落盘/字节已清的内容仍计入），不是本地磁盘占用`}
             >
               占用 {fmtOccupancy(leadingBytes)}
               {stats.diskBytesTruncated ? '（已截断）' : ''} · 登记{' '}
