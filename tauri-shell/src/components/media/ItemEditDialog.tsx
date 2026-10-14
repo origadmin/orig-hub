@@ -53,6 +53,9 @@ export function ItemEditDialog(props: {
    */
   const canClear = hasMediaBytes(item)
 
+  /** 来源原文（只读事实，D24-A / BUG-310）：条目第一次入库时的名字。 */
+  const sourceTitle = (item.sourceTitle ?? '').trim()
+
   /**
    * 类型文案（BUG-258）：走 `media.kindVideo / kindPhoto / kindAudio / kindFile`
    * 四个既有 i18n 键，与卡片角标共用 `api/media#kindLabelKey` 一份映射。
@@ -164,6 +167,23 @@ export function ItemEditDialog(props: {
             <p className="truncate" data-testid="item-edit-source">
               {t('media.fromSource', { source: t(sourceLabelKey(item.source)) })}
             </p>
+            {/*
+             * 来源原文（D24-A / BUG-310）：**只读事实字段** —— 这条内容第一次被写下的
+             * 名字（caption 首行 / 来源原文）。用户改名只动上面的「标题」，本字段不随之
+             * 改变，是显名规则「…＞ 来源原文」那一层的真源。
+             *
+             * 只在**与当前标题不同**时渲染：相同则无信息量（用户读两遍同一个名字），
+             * 这正是 BUG-148「能力边界只在用户正因此受阻时出现」的口径。
+             */}
+            {sourceTitle && sourceTitle !== item.title.trim() ? (
+              <p
+                className="truncate"
+                title={sourceTitle}
+                data-testid="item-edit-source-title"
+              >
+                {t('media.item.sourceTitle', { title: sourceTitle })}
+              </p>
+            ) : null}
             <p className="truncate">{t('media.item.size', { size: fmtSize(item.size) })}</p>
             {/* P2：filePath 是库内规范形式（相对路径），展示用后端解析好的绝对路径 */}
             <p className="truncate" title={item.absolutePath ?? item.filePath ?? ''}>

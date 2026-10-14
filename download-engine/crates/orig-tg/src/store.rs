@@ -97,6 +97,9 @@ pub struct FilePathCollision {
 }
 
 /// libsql 本地 SQLite 存储。
+///
+/// `pub`（而非 `pub(crate)`）：`organize` 模块的 plan/apply 对外只收 `&Store`，
+/// 收 `pub(crate)` 会在该模块外泄漏一条「导不出去又用不上」的私有类型。
 pub struct Store {
     /// `pub(crate)` 供 `media` 模块复用同一连接（资料库与 TG 流水同库）。
     pub(crate) conn: Connection,
@@ -527,6 +530,21 @@ impl Store {
             Ok(_) => {}
             Err(e) => {
                 eprintln!("[store] BUG-304: reconcile_unfiled_items failed (non-fatal): {e}");
+            }
+        }
+        // D24-A / BUG-309（M2-T09 · T05 启动对账）：`media_blob.refcount` 是**可重算
+        // 派生值**（blob-store-design C5）——崩溃 / 手工改库 / 跨版本升级都可能让它
+        // 与「`media_item.content_hash` 的实际引用数」对不上。每次启动重算一次，
+        // 使「删最后一个引用才回收字节」的前提在进程起点恒成立。
+        // 失败**不阻断启动**（同 BUG-304 的容错口径）。
+        match store.recount_blobs().await {
+            Ok(n) => {
+                if n > 0 {
+                    eprintln!("[store] BUG-309: recounted blob refcounts ({n} blob row(s))");
+                }
+            }
+            Err(e) => {
+                eprintln!("[store] BUG-309: recount_blobs failed (non-fatal): {e}");
             }
         }
         Ok(store)

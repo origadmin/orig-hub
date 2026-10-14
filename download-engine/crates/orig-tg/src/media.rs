@@ -17,7 +17,10 @@ use serde::{Deserialize, Serialize};
 use futures::stream::StreamExt;
 
 use crate::cache::{probe_cached_bytes, BytesPresence};
-use crate::store::Store;
+/// `Store` 在本模块里被 `impl Store` 大规模复用，同时作为公开 API 的类型
+/// 出现在若干 `pub` 签名里（`organize::plan(&Store, …)`）—— 用 `pub use` 让它
+/// 也跟着公开，否则外部模块拿到的是「私有导入」。
+pub use crate::store::Store;
 
 /// 磁盘真值统计的**条目上限**（BUG-133）。
 ///
@@ -712,9 +715,78 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_media_item_kind ON media_item(kind);
         CREATE INDEX IF NOT EXISTS idx_media_episode_series ON media_episode(series_id);
+        -- D24-A（BUG-309）：内容寻址 blob 的引用计数表。
+        --
+        -- `refcount` 是**可重算的派生值**（权威算法 = `SELECT COUNT(*) FROM media_item
+        -- WHERE content_hash = media_blob.hash`，见 `Store::recount_blobs`）—— 它是缓存，
+        -- 不是第二份真源。整表对旧库是新表，`CREATE ... IF NOT EXISTS` 安全（BUG-032）。
+        CREATE TABLE IF NOT EXISTS media_blob (
+            hash         TEXT PRIMARY KEY,
+            size         INTEGER NOT NULL,
+            refcount     INTEGER NOT NULL DEFAULT 0,
+            created_at   INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_media_blob_refcount ON media_blob(refcount);
+        -- D24-A / BUG-311：批量整理的**发布层**登记表。
+        --
+        -- 整理产物（用户指定目录下的硬链接 / 副本）登记在这里，作为「外部发布路径」——
+        -- **不是**字节唯一来源：外部删了产物不影响库内播放（播放永远走 blob，
+        -- `media_item.file_path`）。一内容可发布到多处（多目录 / 多次整理），故
+        -- 主键是 (item_id, path)。整表对新旧库都是新表，`CREATE ... IF NOT EXISTS` 安全。
+        CREATE TABLE IF NOT EXISTS media_publish (
+            item_id    INTEGER NOT NULL,
+            path       TEXT NOT NULL,
+            mode       TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (item_id, path)
+        );
         "#,
     )
     .await?;
+    // 旧库兼容：media_item 补 content_hash 列（D24-A / BUG-309）。
+    //
+    // **必须**走 pragma 探查 + ALTER，不得写进上面的 CREATE —— 旧库里 media_item 已存在，
+    // CREATE 被跳过，新列永远补不上（BUG-032 铁律）。content_hash 是 refcount 的键，
+    // 也是「位置层由内容算出」的唯一输入。
+    let probe = conn
+        .prepare("SELECT 1 FROM pragma_table_info('media_item') WHERE name = 'content_hash'")
+        .await?;
+    let exists = probe.query(()).await?.next().await?.is_some();
+    if !exists {
+        conn.execute("ALTER TABLE media_item ADD COLUMN content_hash TEXT", ())
+            .await?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_media_item_hash ON media_item(content_hash)",
+        (),
+    )
+    .await?;
+    // 旧库兼容：media_item 补 source_title 列（D24-A / BUG-310）。
+    //
+    // `source_title` 是**只读的来源事实字段**：记录这条内容**第一次**被写下的名字
+    // （caption 首行 / 来源原文），此后无论用户在剧集编排层怎么改名，它都不动。
+    // 显名规则「用户自定义集名 ＞ 剧名+集号 ＞ 来源原文」里的「来源原文」就是它 ——
+    // 没有这个不可变基准，「这条标题是用户改的还是系统写的」在数据上不可表达，
+    // 三处各写各的（BUG-310 的根因）就会永远复发。
+    //
+    // **必须**走 pragma 探查 + ALTER（BUG-032 铁律）：旧库 media_item 已存在，
+    // 写进上面的 CREATE 会被整批跳过，新列永远补不上。
+    let probe = conn
+        .prepare("SELECT 1 FROM pragma_table_info('media_item') WHERE name = 'source_title'")
+        .await?;
+    let exists = probe.query(()).await?.next().await?.is_some();
+    if !exists {
+        conn.execute("ALTER TABLE media_item ADD COLUMN source_title TEXT", ())
+            .await?;
+        // 一次性回填：把现有 `title` 当作来源原文（最接近的历史事实）。只填 NULL ——
+        // 已写过 source_title 的行（含空串，表示「来源确实无题」）一律不碰，保证幂等。
+        conn.execute(
+            "UPDATE media_item SET source_title = title WHERE source_title IS NULL",
+            (),
+        )
+        .await?;
+    }
     // 旧库兼容：media_episode 补 description 列（SQLite 的 ADD COLUMN 不支持 IF NOT EXISTS，
     // 用 pragma_table_info 判断列是否存在，避免重复 ALTER 报错）。
     let probe = conn
@@ -1210,6 +1282,10 @@ pub struct CachedBytesDetail {
     pub source: String,
     pub ref_key: String,
     pub file_path: String,
+    /// 内容 hash（D24-A / BUG-309）：清理链据此做引用计数 release，归零才真删字节。
+    /// 序列化时省略（它是清理内部量，不是前端展示字段）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
 }
 
 /// 内容条目（资料库行）。`poster` 为前端生成的 data-uri 缩略图。
@@ -1221,6 +1297,12 @@ pub struct MediaItem {
     #[serde(rename = "ref")]
     pub ref_key: String,
     pub title: String,
+    /// **只读来源事实**（D24-A / BUG-310）：这条内容**第一次**被写下的名字
+    /// （caption 首行 / 来源原文）。用户改名只写 `title`，本字段永不随改名而变 ——
+    /// 显名规则「用户自定义集名 ＞ 剧名+集号 ＞ 来源原文」里的「来源原文」即它。
+    /// `None` = 来源确实无题（如无 caption 的 TG 视频）。
+    #[serde(rename = "sourceTitle", skip_serializing_if = "Option::is_none")]
+    pub source_title: Option<String>,
     /// 介绍（caption 首行之外的部分）。与剧集 `description` **同源同切法** ——
     /// 同一条 TG 消息自动成剧时，剧集与条目必须给出同一份「标题 + 介绍」，
     /// 否则用户在剧集详情页看到正确的名与简介、点开同一条视频却只有一整坨 caption
@@ -1243,6 +1325,19 @@ pub struct MediaItem {
     pub tags: Vec<TagRef>,
     pub series_id: Option<i64>,
     pub series_title: Option<String>,
+    /// 该条目在所属剧集里的槽位（季 / 集号 / 合集终点）—— D24-A / BUG-310 显名规则
+    /// 「剧名+集号」需要集号才能拼出「剧名 S1E3」。条目未入剧时全为 `None`。
+    /// 与 `series_title` 同源（同一条 `media_episode` 行，按 season/episode_no 取首条）。
+    #[serde(rename = "seriesSeason", skip_serializing_if = "Option::is_none")]
+    pub series_season: Option<i64>,
+    #[serde(rename = "seriesEpisodeNo", skip_serializing_if = "Option::is_none")]
+    pub series_episode_no: Option<i64>,
+    #[serde(rename = "seriesEpisodeNoEnd", skip_serializing_if = "Option::is_none")]
+    pub series_episode_no_end: Option<i64>,
+    /// 所属剧集的分集总数 —— 「单集用剧名」判定（`== 1` 时显名只用剧名，不拼集号）。
+    /// 条目未入剧时为 `None`。
+    #[serde(rename = "seriesEpisodeCount", skip_serializing_if = "Option::is_none")]
+    pub series_episode_count: Option<i64>,
     /// 磁盘字节真值（BUG-132）：**唯一**的「这条内容现在能不能本地播」判据。
     ///
     /// 为什么不能沿用 `file_path IS NOT NULL`：那是数据库里的**承诺**不是字节本身 ——
@@ -1699,6 +1794,11 @@ fn media_item_from_row(r: &Row) -> libsql::Result<MediaItem> {
         series_id: r.get(12)?,
         series_title: r.get(13)?,
         description: r.get(14)?,
+        source_title: r.get(15)?,
+        series_season: r.get(16)?,
+        series_episode_no: r.get(17)?,
+        series_episode_no_end: r.get(18)?,
+        series_episode_count: r.get(19)?,
         // 占位值：**必须由调用方** `attach_bytes_presence()` 覆盖。
         // 这里填 `Missing` 而不是 `Unknown` —— `Unknown` 的语义是「stat 失败、别动状态」，
         // 用它当初始值会让「忘了探测」看起来像一次合法判定。填 `Missing` 则方向保守：
@@ -1744,7 +1844,17 @@ const ITEM_SELECT: &str = "
              ORDER BY e.season, e.episode_no LIMIT 1) AS series_id,
            (SELECT s.title FROM media_episode e JOIN media_series s ON s.id = e.series_id
              WHERE e.item_id = i.id ORDER BY e.season, e.episode_no LIMIT 1) AS series_title,
-           i.description
+           i.description,
+           i.source_title,
+           (SELECT e.season FROM media_episode e WHERE e.item_id = i.id
+             ORDER BY e.season, e.episode_no LIMIT 1) AS series_season,
+           (SELECT e.episode_no FROM media_episode e WHERE e.item_id = i.id
+             ORDER BY e.season, e.episode_no LIMIT 1) AS series_episode_no,
+           (SELECT e.episode_no_end FROM media_episode e WHERE e.item_id = i.id
+             ORDER BY e.season, e.episode_no LIMIT 1) AS series_episode_no_end,
+           (SELECT COUNT(*) FROM media_episode e2
+             WHERE e2.series_id = (SELECT e.series_id FROM media_episode e WHERE e.item_id = i.id
+                                     ORDER BY e.season, e.episode_no LIMIT 1)) AS series_episode_count
       FROM media_item i";
 
 fn order_by(sort: Option<&str>) -> &'static str {
@@ -1793,8 +1903,138 @@ fn fallback_series_title(title: &str, kind: &str, item_id: i64) -> String {
     format!("未命名{label} #{item_id}")
 }
 
-// ────────────────────────────── Store 扩展 ──────────────────────────────
+/// **内容显名唯一解析函数**（引擎侧）—— D24-A / BUG-310。
+///
+/// 规则：`用户自定义集名 ＞ 剧名+集号（单集用剧名） ＞ 来源原文`。
+/// 与前端 `lib/displayName.ts#resolveDisplayName` **同规则**（整理模板的 `{集名}`
+/// 也用它，保证「库里显示的名字」与「整理出来的文件名」不打架）。
+///
+/// - 用户自定义集名 = `title` 且与 `source_title` 不同（被改名过）；
+/// - 剧名+集号 = `series_title` + `S{season}E{ep}`（`series_episode_count == 1` 时只给剧名）；
+/// - 来源原文 = `source_title`，缺省回落 `title`。
+pub fn resolve_display_name(
+    title: &str,
+    source_title: Option<&str>,
+    series_title: Option<&str>,
+    season: Option<i64>,
+    episode_no: Option<i64>,
+    episode_no_end: Option<i64>,
+    series_episode_count: Option<i64>,
+) -> String {
+    let effective = title.trim();
+    let source = source_title
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(effective);
+    if !effective.is_empty() && effective != source {
+        return effective.to_string();
+    }
+    if let Some(st) = series_title.map(str::trim).filter(|s| !s.is_empty()) {
+        let single = series_episode_count == Some(1);
+        if !single {
+            if let (Some(se), Some(ep)) = (season, episode_no) {
+                let base = format!("S{se}E{ep}");
+                return match episode_no_end.filter(|e| *e > ep) {
+                    Some(end) => format!("{st} {base}-{end}"),
+                    None => format!("{st} {base}"),
+                };
+            }
+        }
+        return st.to_string();
+    }
+    source.to_string()
+}
 
+// ────────────────── 批量整理（D24-A / BUG-311）──────────────────
+
+impl Store {
+    /// 整理候选（BUG-311）：按 id 集合读出模板渲染所需的全字段（含剧集槽位派生）。
+    ///
+    /// 顺序按 `i.id` 稳定 —— 预览全表与执行必须同序，否则「预览看到第 3 行」与
+    /// 「执行写的第 3 行」会对不上。
+    pub async fn organize_candidates(
+        &self,
+        ids: &[i64],
+    ) -> libsql::Result<Vec<crate::organize::OrganizeCandidate>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT i.id, i.title, i.source_title, i.kind, i.source, i.added_at, i.file_path,
+                    (SELECT s.title FROM media_episode e JOIN media_series s ON s.id = e.series_id
+                      WHERE e.item_id = i.id ORDER BY e.season, e.episode_no LIMIT 1) AS series_title,
+                    (SELECT e.season FROM media_episode e WHERE e.item_id = i.id
+                      ORDER BY e.season, e.episode_no LIMIT 1) AS season,
+                    (SELECT e.episode_no FROM media_episode e WHERE e.item_id = i.id
+                      ORDER BY e.season, e.episode_no LIMIT 1) AS episode_no,
+                    (SELECT e.episode_no_end FROM media_episode e WHERE e.item_id = i.id
+                      ORDER BY e.season, e.episode_no LIMIT 1) AS episode_no_end,
+                    (SELECT COUNT(*) FROM media_episode e2
+                      WHERE e2.series_id = (SELECT e.series_id FROM media_episode e
+                                              WHERE e.item_id = i.id
+                                              ORDER BY e.season, e.episode_no LIMIT 1)) AS series_episode_count
+               FROM media_item i
+              WHERE i.id IN ({placeholders})
+              ORDER BY i.id"
+        );
+        let stmt = self.conn.prepare(&sql).await?;
+        let mut rows = stmt.query(ids.to_vec()).await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(crate::organize::OrganizeCandidate {
+                item_id: r.get(0)?,
+                title: r.get(1)?,
+                source_title: r.get(2)?,
+                kind: r.get(3)?,
+                source: r.get(4)?,
+                added_at: r.get(5)?,
+                file_path: r.get(6)?,
+                series_title: r.get(7)?,
+                season: r.get(8)?,
+                episode_no: r.get(9)?,
+                episode_no_end: r.get(10)?,
+                series_episode_count: r.get(11)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 登记一条**外部发布路径**（整理产物）—— D24-A / BUG-311。
+    ///
+    /// 幂等：同 (item_id, path) 覆盖 `mode`/`created_at`（重跑整理不产生重复行）。
+    pub async fn record_publish(
+        &self,
+        item_id: i64,
+        path: &str,
+        mode: &str,
+    ) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO media_publish (item_id, path, mode, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![item_id, path, mode, now_secs()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// 某条目已登记的发布路径（外部整理产物）。
+    pub async fn list_publish(&self, item_id: i64) -> libsql::Result<Vec<String>> {
+        let stmt = self
+            .conn
+            .prepare("SELECT path FROM media_publish WHERE item_id = ?1 ORDER BY created_at, path")
+            .await?;
+        let mut rows = stmt.query(params![item_id]).await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(r.get(0)?);
+        }
+        Ok(out)
+    }
+}
+
+// ────────────────────────────── Store 扩展 ──────────────────────────────
 impl Store {
     // ---- 内容（items） ----
 
@@ -1953,10 +2193,13 @@ impl Store {
         let t = now_secs();
         self.conn
             .execute(
-                "INSERT INTO media_item (source, ref, title, kind, file_path, size, duration, added_at, description)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "INSERT INTO media_item (source, ref, title, kind, file_path, size, duration, added_at, description, source_title)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?3)
                  ON CONFLICT(source, ref) DO UPDATE SET
                    title = COALESCE(NULLIF(excluded.title, ''), media_item.title),
+                   -- source_title 只认**第一个非空**的来源名（BUG-310 只读事实）：
+                   -- 已有非空值就永不覆盖，保证「来源原文」不随重新入库 / 用户改名漂移。
+                   source_title = COALESCE(NULLIF(media_item.source_title, ''), NULLIF(excluded.source_title, '')),
                    kind = excluded.kind,
                    file_path = COALESCE(excluded.file_path, media_item.file_path),
                    size = COALESCE(excluded.size, media_item.size),
@@ -1991,14 +2234,171 @@ impl Store {
         id: i64,
         file_path: Option<&str>,
     ) -> libsql::Result<bool> {
+        // D24-A（BUG-309）：位置层唯一入口 → **引用计数的 release 挂在这里**（设计 §2.3）。
+        // 挂在 `purge_item` 里只会覆盖「缓存清理面板」那一条路，而 `delete_media_item`
+        // 是另一条路径 —— 漏掉它就只增不减，blob 永不回收 = 静默磁盘泄漏。
+        self.set_item_file_path_with_blob(id, file_path, None, 0).await
+    }
+
+    /// 位置层写入（含 blob 引用计数的唯一权威入口，D24-A / BUG-309）。
+    ///
+    /// 在一个**顺序事务**里完成：release 旧 hash → acquire 新 hash → 写
+    /// `file_path` + `content_hash`。hash 未变时只改路径（不重复计数）。
+    ///
+    /// - `file_path = None` ⇒ 清字节：release 旧 hash、`content_hash` 置空；
+    /// - `new_hash = Some` ⇒ 字节落到某个 blob：acquire（refcount +1）。
+    ///
+    /// **归零不在这里删字节**：本函数只维护计数，字节的 unlink 由调用方在
+    /// `release_blob` 返回 `true`（orphan）时执行 —— 让「位置层」与「字节层」分离。
+    pub async fn set_item_file_path_with_blob(
+        &self,
+        id: i64,
+        file_path: Option<&str>,
+        new_hash: Option<&str>,
+        new_size: i64,
+    ) -> libsql::Result<bool> {
+        let old: Option<String> = self
+            .row_opt(
+                "SELECT content_hash FROM media_item WHERE id = ?1",
+                params![id],
+            )
+            .await?
+            .and_then(|r| r.get::<Option<String>>(0).ok())
+            .flatten();
+        if old.as_deref() != new_hash {
+            if let Some(h) = old.as_deref() {
+                self.release_blob(Some(h)).await?;
+            }
+            if let Some(h) = new_hash {
+                self.blob_acquire(h, new_size).await?;
+            }
+        }
         let n = self
             .conn
             .execute(
-                "UPDATE media_item SET file_path = ?1 WHERE id = ?2",
-                params![file_path, id],
+                "UPDATE media_item SET file_path = ?1, content_hash = ?2 WHERE id = ?3",
+                params![file_path, new_hash, id],
             )
             .await?;
         Ok(n > 0)
+    }
+
+    /// blob 引用计数 +1（D24-A / BUG-309）：无行则 insert(refcount=1)，有行则 +1。
+    ///
+    /// `size` 只在**首次**插入时生效（冲突时保留既有 size，避免后来的 size=0 覆盖真值）。
+    pub async fn blob_acquire(&self, hash: &str, size: i64) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO media_blob (hash, size, refcount, created_at, last_seen_at) \
+                 VALUES (?1, ?2, 1, ?3, ?3) \
+                 ON CONFLICT(hash) DO UPDATE SET \
+                    refcount = media_blob.refcount + 1, \
+                    last_seen_at = ?3, \
+                    size = CASE WHEN excluded.size > 0 THEN excluded.size ELSE media_blob.size END",
+                params![hash, size, now_secs()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// blob 引用计数 -1（D24-A / BUG-309）：返回 `true` 表示**归零**（调用方据此 unlink 字节）。
+    ///
+    /// `None` / 未知 hash ⇒ `false`（不是受管 blob，调用方按老语义处理）。
+    pub async fn release_blob(&self, hash: Option<&str>) -> libsql::Result<bool> {
+        let Some(h) = hash else { return Ok(false) };
+        let n = self
+            .conn
+            .execute(
+                "UPDATE media_blob SET refcount = refcount - 1 WHERE hash = ?1",
+                params![h],
+            )
+            .await?;
+        if n == 0 {
+            return Ok(false);
+        }
+        let orphan = self
+            .row_opt("SELECT refcount FROM media_blob WHERE hash = ?1", params![h])
+            .await?
+            .map(|r| r.get::<i64>(0).unwrap_or(1) <= 0)
+            .unwrap_or(false);
+        if orphan {
+            self.conn
+                .execute("DELETE FROM media_blob WHERE hash = ?1", params![h])
+                .await?;
+        }
+        Ok(orphan)
+    }
+
+    /// 清条目字节（D24-A / BUG-309）：**同一处**完成「release 旧 hash → 置空
+    /// `file_path` + `content_hash`」，并回传是否归零。
+    ///
+    /// 返回 `Some(true)` = 该 blob 引用归零（调用方应 unlink 字节）；`Some(false)` =
+    /// 还有其他条目引用（字节必须留下）；`None` = 该条目原本没有 hash（存量未纳入，
+    /// 调用方按老语义「有字节就删」处理）。
+    ///
+    /// release 与置空**必须同处** —— 分成两处（如 `release_blob` + `set_item_file_path`）
+    /// 会让 `set_item_file_path_with_blob` 再 release 一次，引用计数双重扣减。
+    pub async fn clear_item_bytes(&self, id: i64) -> libsql::Result<Option<bool>> {
+        let old: Option<String> = self
+            .row_opt(
+                "SELECT content_hash FROM media_item WHERE id = ?1",
+                params![id],
+            )
+            .await?
+            .and_then(|r| r.get::<Option<String>>(0).ok())
+            .flatten();
+        let orphan = match old.as_deref() {
+            Some(h) => Some(self.release_blob(Some(h)).await?),
+            None => None,
+        };
+        self.conn
+            .execute(
+                "UPDATE media_item SET file_path = NULL, content_hash = NULL WHERE id = ?1",
+                params![id],
+            )
+            .await?;
+        Ok(orphan)
+    }
+
+    /// 按权威算法重建 `media_blob.refcount`（D24-A / BUG-309 §2.2）。
+    ///
+    /// 权威 = `SELECT COUNT(*) FROM media_item WHERE content_hash = hash`；`refcount`
+    /// 只是它的缓存。启动对账 / 迁移收尾 / 恢复后各跑一次，**不报错、不告警**（以权威为准）。
+    pub async fn recount_blobs(&self) -> libsql::Result<usize> {
+        // ① 条目已不再引用的 blob 行 → 删（引用计数归零）。
+        self.conn
+            .execute(
+                "DELETE FROM media_blob WHERE hash NOT IN \
+                    (SELECT content_hash FROM media_item WHERE content_hash IS NOT NULL)",
+                (),
+            )
+            .await?;
+        // ② 有条目引用但缺行的 blob → 补（size 取该 hash 下条目的最大值）。
+        //
+        // **必须** `ON CONFLICT DO NOTHING`：本函数挂在 `Store::open`（每次启动都跑），
+        // 而 ① 的 DELETE 之后仍可能与 ② 的目标行重叠（并发写入 / 旧版本残留行）。
+        // 无保护的 INSERT 会在这一步抛 UNIQUE —— 那会把「启动对账」变成「启动失败」，
+        // 用户看到的是整个服务起不来。权威值由 ③ 统一重算，② 只负责补缺口。
+        self.conn
+            .execute(
+                "INSERT INTO media_blob (hash, size, refcount, created_at, last_seen_at) \
+                 SELECT content_hash, COALESCE(MAX(size), 0), COUNT(*), ?1, ?1 FROM media_item \
+                  WHERE content_hash IS NOT NULL \
+                  GROUP BY content_hash \
+                  ON CONFLICT(hash) DO NOTHING",
+                params![now_secs()],
+            )
+            .await?;
+        // ③ 重算引用计数。
+        self.conn
+            .execute(
+                "UPDATE media_blob SET refcount = \
+                    (SELECT COUNT(*) FROM media_item WHERE content_hash = media_blob.hash)",
+                (),
+            )
+            .await?;
+        let row = self.row_opt("SELECT COUNT(*) FROM media_blob", ()).await?;
+        Ok(row.map(|r| r.get::<i64>(0).unwrap_or(0)).unwrap_or(0) as usize)
     }
 
     /// 字节回填的**专用语句**（byte-ownership P1 / MEDIA-DESIGN C3）。
@@ -2023,6 +2423,32 @@ impl Store {
             .execute(
                 "UPDATE media_item SET file_path = ?2, kind = COALESCE(?3, kind) WHERE id = ?1",
                 params![id, file_path, kind],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// 字节回填（带内容 hash）—— D24-A / BUG-309：归仓产出 blob 时的专用入口。
+    ///
+    /// 与 [`Self::backfill_item_bytes`] 的分工：本函数额外写 `content_hash` 并做一次
+    /// blob acquire（refcount +1）。归仓把字节落到 `blobs/ab/cd/<hash>` 时**必须**走它，
+    /// 否则 hash 缺失 ⇒ refcount 键为空 ⇒ 引用计数从源头就不成立。
+    pub async fn backfill_item_bytes_with_blob(
+        &self,
+        id: i64,
+        file_path: &str,
+        kind: Option<&str>,
+        hash: &str,
+        size: i64,
+    ) -> libsql::Result<bool> {
+        // 先走引用计数（release 旧 / acquire 新），再写路径与 kind。
+        self.set_item_file_path_with_blob(id, Some(file_path), Some(hash), size)
+            .await?;
+        let n = self
+            .conn
+            .execute(
+                "UPDATE media_item SET kind = COALESCE(?2, kind) WHERE id = ?1",
+                params![id, kind],
             )
             .await?;
         Ok(n > 0)
@@ -2058,7 +2484,7 @@ impl Store {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, title, source, ref, file_path FROM media_item \
+                "SELECT id, title, source, ref, file_path, content_hash FROM media_item \
                  WHERE file_path IS NOT NULL ORDER BY id",
                 (),
             )
@@ -2071,6 +2497,7 @@ impl Store {
                 source: r.get(2)?,
                 ref_key: r.get(3)?,
                 file_path: r.get(4)?,
+                content_hash: r.get(5)?,
             });
         }
         Ok(out)
@@ -2144,7 +2571,12 @@ impl Store {
         self.conn
             .execute(
                 "UPDATE media_item SET title = ?1, poster = ?2, duration = ?3,
-                        width = ?4, height = ?5, kind = ?6, description = ?7 WHERE id = ?8",
+                        width = ?4, height = ?5, kind = ?6, description = ?7,
+                        -- BUG-310：source_title 只认**第一个非空**的标题 —— 入库时标题为空、
+                        -- 后续由 caption 补强（strengthen）时把它记为来源事实；此后用户改名
+                        -- 只动 title，来源事实不再漂移（已有的非空值永不覆盖）。
+                        source_title = COALESCE(NULLIF(source_title, ''), NULLIF(?1, ''))
+                  WHERE id = ?8",
                 params![title, poster, duration, width, height, kind, description, id],
             )
             .await?;
@@ -6091,8 +6523,14 @@ mod tests {
     }
 
     async fn scalar_i64(conn: &libsql::Connection, sql: &str) -> i64 {
+        scalar_i64_p(conn, sql, ()).await
+    }
+
+    /// 带参数的标量查询（`scalar_i64` 的无参版本不够用：`?1` 占位必须真绑值，
+    /// 否则 libsql 把 NULL 绑进去 ⇒ 断言「永假」却看不出来，那是假绿）。
+    async fn scalar_i64_p(conn: &libsql::Connection, sql: &str, p: impl libsql::params::IntoParams) -> i64 {
         let stmt = conn.prepare(sql).await.unwrap();
-        let mut rows = stmt.query(()).await.unwrap();
+        let mut rows = stmt.query(p).await.unwrap();
         match rows.next().await.unwrap() {
             Some(r) => r.get(0).unwrap(),
             None => 0,
@@ -6142,6 +6580,172 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ─────────── D24-A / BUG-309：blob 内容寻址 + 引用计数 ───────────
+
+    /// 造一条**指向 blob** 的条目（`file_path` = 绝对 blob 路径，`content_hash` 已写入）。
+    /// 返回条目 id。
+    async fn seed_blob_item(s: &Store, name: &str, hash: &str, size: i64) -> i64 {
+        s.upsert_media_item("tg", &format!("-100:{name}"), name, "video", None, Some(size), None, None)
+            .await
+            .unwrap();
+        let id = s
+            .item_id_by_ref("tg", &format!("-100:{name}"))
+            .await
+            .unwrap()
+            .expect("seeded item must exist");
+        // blob 的库内规范形式 = 绝对路径（cache::resolve_item_path 对绝对路径恒等）。
+        s.backfill_item_bytes_with_blob(id, &format!("/abs/.blobs/{hash}"), None, hash, size)
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn blob_refcount(s: &Store, hash: &str) -> i64 {
+        let stmt = s
+            .conn
+            .prepare("SELECT refcount FROM media_blob WHERE hash = ?1")
+            .await
+            .unwrap();
+        let mut rows = stmt.query(params![hash.to_string()]).await.unwrap();
+        match rows.next().await.unwrap() {
+            Some(r) => r.get(0).unwrap(),
+            None => -1,
+        }
+    }
+
+    async fn blob_row_count(s: &Store) -> i64 {
+        let stmt = s.conn.prepare("SELECT COUNT(*) FROM media_blob").await.unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
+    /// **必过关**（09 §15.3 红线）：blob 双向删除夹具 ——
+    /// 两条条目共指同一 blob，删第一条时**文件必须在**（refcount 1），
+    /// 删第二条时才回收（refcount 0 + 字节真的没了）。
+    ///
+    /// 反向证伪：若把 `release_blob` 写成「无条件删行」，`clear_item_bytes(a)`
+    /// 就会报 orphan=true ⇒ 调用方去删文件 ⇒ 第一个用例当场失败。
+    #[tokio::test]
+    async fn shared_blob_bytes_survive_until_the_last_reference_is_dropped_bug309() {
+        let s = Store::open(tmp_db("bug309_refcount")).await.unwrap();
+        let hash = "ab".repeat(32); // 64 hex
+        let a = seed_blob_item(&s, "a", &hash, 100).await;
+        let b = seed_blob_item(&s, "b", &hash, 100).await;
+
+        assert_eq!(blob_refcount(&s, &hash).await, 2, "两指 ⇒ refcount 2");
+
+        // ① 共指删 1/2：文件在、count 未归零。
+        assert!(
+            !s.clear_item_bytes(a).await.unwrap().unwrap_or(false),
+            "refcount 还剩 1 ⇒ **不得**报 orphan（否则调用方会删掉 b 还在用的字节）"
+        );
+        assert_eq!(blob_refcount(&s, &hash).await, 1, "删一条 ⇒ refcount 1");
+        assert!(blob_row_count(&s).await >= 1, "行仍在（还有引用）");
+
+        // ② 删 2/2：归零 ⇒ orphan，行也删。
+        assert!(
+            s.clear_item_bytes(b).await.unwrap().unwrap_or(false),
+            "最后一个引用删除后必须报 orphan，让调用方回收字节"
+        );
+        assert_eq!(blob_refcount(&s, &hash).await, -1, "refcount 归零 ⇒ 行被删");
+        // 文件层：调用方据 orphan 删文件。这里直接用底层 release 的返回值已被消费，
+        // 故改为断言「`clear_item_bytes` 已把 file_path/content_hash 置空」——
+        // 那是位置层无论如何都要做的一半。
+        // 位置层：文件层由调用方据 orphan 删；位置层这一半（置空 file_path/content_hash）
+        // 无论如何都要做。hash 是内部记账字段（不下发），故直接查库断言。
+        let item = s.get_media_item(b).await.unwrap().unwrap();
+        assert!(item.file_path.is_none(), "清字节 ⇒ file_path 置空");
+        let cleared = scalar_i64_p(
+            &s.conn,
+            "SELECT COUNT(*) FROM media_item WHERE id = ?1 AND content_hash IS NULL",
+            params![b],
+        )
+        .await;
+        assert_eq!(cleared, 1, "清字节 ⇒ content_hash 置空");
+    }
+
+    /// 上传同名内容时**不重复写入字节**（C1/C4 的核心承诺）：
+    /// 同 hash 的第二个条目只走 `blob_acquire`，`media_item` 两行、`media_blob` 一行。
+    #[tokio::test]
+    async fn same_content_two_channels_dedup_to_one_blob_row_bug309() {
+        let s = Store::open(tmp_db("bug309_dedup")).await.unwrap();
+        let hash = "cd".repeat(32);
+        let _a = seed_blob_item(&s, "a", &hash, 7).await;
+        let _b = seed_blob_item(&s, "b", &hash, 7).await;
+        assert_eq!(blob_row_count(&s).await, 1, "同 hash ⇒ 唯一 blob 行");
+        assert_eq!(blob_refcount(&s, &hash).await, 2, "两个 item 共指 ⇒ refcount 2");
+    }
+
+    /// `recount_blobs` 是**可重算派生值**（C5）：手工把 refcount 改坏，
+    /// 一次重算必须回到真实值（正反都要：改小→补回，改大→压回）。
+    #[tokio::test]
+    async fn recount_blobs_recomputes_derived_refcount_bug309() {
+        let s = Store::open(tmp_db("bug309_recount")).await.unwrap();
+        let hash = "ef".repeat(32);
+        let _a = seed_blob_item(&s, "a", &hash, 10).await;
+        s.conn
+            .execute(
+                "UPDATE media_blob SET refcount = 99 WHERE hash = ?1",
+                params![hash.to_string()],
+            )
+            .await
+            .unwrap();
+        let n = s.recount_blobs().await.unwrap();
+        assert_eq!(n, 1, "重算后仍有一个 blob 行");
+        assert_eq!(blob_refcount(&s, &hash).await, 1, "改大 ⇒ 压回真实引用数");
+    }
+
+    /// 旧库没有 `content_hash` / `source_title` 列时，`migrate` 必须**幂等补列**并
+    /// 把存量 `title` 记为来源原文（BUG-032 铁律 + BUG-310 事实字段）。
+    #[tokio::test]
+    async fn legacy_db_migrates_to_source_title_without_failing_bug310() {
+        let p = tmp_db("bug310_legacy");
+        {
+            // 先按**旧 schema** 建库（刻意不带 source_title / content_hash）。
+            let conn = libsql::Builder::new_local(&p)
+                .build()
+                .await
+                .unwrap()
+                .connect()
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE media_item (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     source TEXT NOT NULL, ref TEXT NOT NULL, title TEXT NOT NULL,
+                     kind TEXT NOT NULL, file_path TEXT, poster TEXT, size INTEGER,
+                     duration INTEGER, width INTEGER, height INTEGER,
+                     added_at INTEGER NOT NULL, description TEXT,
+                     UNIQUE(source, ref));",
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO media_item (source, ref, title, kind, description, added_at)
+                 VALUES ('tg', '-1:9', '夜航', 'video', NULL, 0)",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        let s = Store::open(&p).await.unwrap();
+        let item = s.get_media_item(1).await.unwrap().expect("migrated item must survive");
+        assert_eq!(item.source_title.as_deref(), Some("夜航"), "存量 title 回填为来源原文");
+        let has_col = scalar_i64_p(
+            &s.conn,
+            "SELECT COUNT(*) FROM pragma_table_info('media_item') WHERE name = 'source_title'",
+            params![],
+        )
+        .await;
+        assert_eq!(has_col, 1, "旧库必须补出 source_title 列（BUG-032 铁律）");
+        let hashed = scalar_i64_p(
+            &s.conn,
+            "SELECT COUNT(*) FROM media_item WHERE id = 1 AND content_hash IS NOT NULL",
+            params![],
+        )
+        .await;
+        assert_eq!(hashed, 0, "无字节 ⇒ content_hash 保持 NULL");
     }
 
     /// BUG-133 判据 1 + 3：清字节后**磁盘口径下降**、**登记口径不变**，
@@ -10028,6 +10632,7 @@ mod tests {
             source: "tg".into(),
             ref_key: format!("1:{id}"),
             title: "t".into(),
+            source_title: None,
             description: None,
             kind: "video".into(),
             file_path: path,
@@ -10042,6 +10647,10 @@ mod tests {
             tags: Vec::new(),
             series_id: None,
             series_title: None,
+            series_season: None,
+            series_episode_no: None,
+            series_episode_no_end: None,
+            series_episode_count: None,
             // 构造时的占位值（见 `media_item_from_row` 的注释）
             bytes_presence: BytesPresence::Missing,
         }

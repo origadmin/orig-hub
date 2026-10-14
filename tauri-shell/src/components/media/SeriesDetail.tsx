@@ -73,7 +73,6 @@ import {
   partitionEpisodes,
   resolveSeriesCover,
   shouldRenderEpisodeDescription,
-  shouldRenderEpisodeTitle,
   showSeasonHeaders,
 } from '../../lib/episodePresentation'
 import { Deck, type DeckFrame } from './Deck'
@@ -87,6 +86,7 @@ import { CoverImage } from './CoverImage'
 import { Button } from '../ui/button'
 import { useTranslation } from '../../i18n'
 import { seriesLabel } from '../../lib/displayTitle'
+import { resolveDisplayName } from '../../lib/displayName'
 
 /**
  * 剧集介绍折叠阈值（像素）：超过该高度才给「展开 / 收起」（照抄 `SeriesHero.tsx` 的
@@ -254,6 +254,24 @@ export function SeriesDetail(props: {
     effectiveFocusedId != null
       ? detail.episodes.find((e) => e.id === effectiveFocusedId) ?? null
       : null
+
+  /**
+   * 当前聚焦集的显名（D24-A / BUG-310）：走**唯一**解析函数 ——
+   * 「用户自定义集名 ＞ 剧名+集号（单集用剧名）＞ 来源原文」。
+   * 右栏聚焦标题无左列，故用完整三层（含剧名+集号）。
+   */
+  const curDisplayName = cur
+    ? resolveDisplayName({
+        episode: {
+          season: cur.season,
+          episodeNo: cur.episodeNo,
+          episodeNoEnd: cur.episodeNoEnd,
+          title: cur.title,
+        },
+        series: { title: detail.title },
+        seriesEpisodeCount: detail.episodes?.length ?? null,
+      })
+    : null
 
   /**
    * BUG-285：当前集的「跳回 TG 源消息」深链。
@@ -1028,24 +1046,17 @@ export function SeriesDetail(props: {
             </p>
           ) : (
             <>
-              {/* 头：本集标题（**单行省略** §6.2；被去重门控隐藏时集号即主标识） */}
+              {/* 头：本集标题（**单行省略** §6.2；编辑态只显槽位标签，BUG-203）。
+                  显名统一走 `resolveDisplayName`（D24-A / BUG-310）。 */}
               <div className="flex min-w-0 flex-wrap items-center gap-2">
                 <h3
                   className="min-w-0 flex-1 truncate text-[16px] font-semibold text-fg-strong"
-                  title={editingEpisode
-                    ? episodeSlotLabel(cur)
-                    : shouldRenderEpisodeTitle(cur, detail)
-                      ? cur.title ?? ''
-                      : episodeSlotLabel(cur)}
+                  title={editingEpisode ? episodeSlotLabel(cur) : curDisplayName ?? ''}
                   data-testid="episode-focus-title"
                 >
                   {/* BUG-203：编辑态只显槽位标签 —— 标题正在下方表单里被编辑，
                       顶部再渲染一份就是用户看到的「重叠重复 2 行」。 */}
-                  {editingEpisode
-                    ? episodeSlotLabel(cur)
-                    : shouldRenderEpisodeTitle(cur, detail)
-                      ? cur.title
-                      : episodeSlotLabel(cur)}
+                  {editingEpisode ? episodeSlotLabel(cur) : curDisplayName}
                 </h3>
                 {/* 单一编辑入口：标题行即编辑按钮，点一下进入本集统一编辑态
                     （标题 / 介绍 / 季号 / 集号 / 结束集号一次提交；集可以没有标题）。

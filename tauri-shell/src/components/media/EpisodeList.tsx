@@ -7,6 +7,7 @@ import { coverFit, fmtDuration } from '../../lib/tgmedia'
 import { useTranslation } from '../../i18n'
 import { sortEpisodes } from '../../hooks/useSeriesDetail'
 import { seriesLabel } from '../../lib/displayTitle'
+import { resolveDisplayName } from '../../lib/displayName'
 
 /**
  * 播放/浏览中的分集列表侧栏（纯展示）。
@@ -151,10 +152,20 @@ export function EpisodeList({
             const enabled = isSelectable ? isSelectable(ep.itemId) : true
             const isPhoto = ep.kind === 'photo'
             const seq = seqNo.get(ep.itemId)
-            // 标题直接取分集字段 —— 后端已把它收敛为「所指向条目的标题」，
-            // 这里不再有 `ep.title || ep.itemTitle` 的兜底链（两个名字的来源）。
+            // 显名（D24-A / BUG-310）：行标签走**唯一**解析函数
+            // 「用户自定义集名 ＞ 剧名+集号（单集用剧名）＞ 来源原文」。
+            // 此前是裸 `ep.title` 加自造兜底链，与文件域卡片各说各话。
             const label =
-              ep.title ||
+              resolveDisplayName({
+                episode: {
+                  season: ep.season,
+                  episodeNo: ep.episodeNo,
+                  episodeNoEnd: ep.episodeNoEnd,
+                  title: ep.title,
+                },
+                series: { title },
+                seriesEpisodeCount: sorted.length,
+              }) ||
               (isPhoto ? t('player.photoEp', { n: seq?.pos ?? 1 }) : '') ||
               t('player.untitled')
             return (

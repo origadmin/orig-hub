@@ -305,17 +305,23 @@ async fn clear_item(
     }
 
     // BUG-109：删文件失败**不能**被吞掉再报 `cleared: true` —— 那是把失败说成成功。
-    std::fs::remove_file(&path).map_err(|e| {
-        st.push_log(&format!("/api/cache/items/{id}: remove_file failed: {e}"));
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("failed to delete cache file: {e}"),
-        )
-    })?;
-    st.store
-        .set_item_file_path(id, None)
+    //
+    // D24-A（BUG-309）：先 release（`clear_item_bytes` 一并置空 file_path/hash），
+    // **只有归零才 unlink** —— 共享 blob 的其余条目不能因为清了一条就变死链。
+    let orphan = st
+        .store
+        .clear_item_bytes(id)
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if orphan.unwrap_or(true) {
+        std::fs::remove_file(&path).map_err(|e| {
+            st.push_log(&format!("/api/cache/items/{id}: remove_file failed: {e}"));
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to delete cache file: {e}"),
+            )
+        })?;
+    }
     // TG 来源：字节没了要同步复位 downloaded，否则「已缓存」状态说谎。
     // 复位失败同样如实报错（否则条目会在下次 upsert 时复活 —— BUG-029）。
     if !reset_tg_flag(&st, &item.source, &item.ref_key).await {
@@ -446,22 +452,38 @@ async fn purge_item(st: &Arc<AppState>, dir: &Path, lib_root: &Path, it: &Cached
     let bytes = std::fs::metadata(&it.file_path).map(|m| m.len()).unwrap_or(0);
     // BUG-109：两步都不能静默 —— 任一步失败，这条就**没有真正清掉**，
     // 却会被计成 removed，用户于是以为清理成功（而文件还在、条目仍显示已缓存）。
-    let removed_file = std::fs::remove_file(&it.file_path);
-    let cleared = st.store.set_item_file_path(it.id, None).await;
+    //
+    // D24-A（BUG-309）：删字节升级为「**删最后一个引用才回收**」。`clear_item_bytes`
+    // 在**同一处**完成「release 旧 hash → 置空 file_path + content_hash」，并回传
+    // 是否归零（`orphan`）—— 只有归零才真 unlink，共享 blob 的其余条目不会变死链
+    // （BUG-100 的教训：共享必须计数）。release 与置空必须同处，分两处会双重计数。
+    let orphan = match st.store.clear_item_bytes(it.id).await {
+        Ok(o) => o,
+        Err(e) => {
+            st.push_log(&format!(
+                "purge_item: clear_item_bytes failed for id={} hash={:?}: {e}",
+                it.id, it.content_hash
+            ));
+            return Purged {
+                removed: 0,
+                skipped: 0,
+                failed: 1,
+                bytes: 0,
+            };
+        }
+    };
+    // 无 hash（存量未纳入）或归零 ⇒ 可回收字节；有 hash 且仍有其他引用 ⇒ 字节留给别人。
+    let removed_file = if orphan.unwrap_or(true) {
+        std::fs::remove_file(&it.file_path)
+    } else {
+        Ok(())
+    };
     let mut failed = 0u64;
     if let Err(e) = &removed_file {
         failed = 1;
         st.push_log(&format!(
             "purge_item: remove_file failed for {} (id={}): {e}",
             it.file_path, it.id
-        ));
-    }
-    if let Err(e) = &cleared {
-        failed = 1;
-        st.push_log(&format!(
-            "purge_item: set_item_file_path(None) failed for id={}: {e} \
-             （字节已删但条目仍显示已缓存）",
-            it.id
         ));
     }
     // TG 来源的 downloaded 复位失败同样算失败：字节没了但标记还在，条目会「复活」。
@@ -557,12 +579,14 @@ fn age_days(path: &str, now: u64) -> u64 {
 }
 
 /// 下载中的临时文件（`.part` / `.tmp`）**不算孤儿**：它们正被 worker 写着，
-/// 删掉等于打断下载。判据只看后缀，不看年龄。
+/// 删掉等于打断下载。判据看后缀，另加一条：落在内容寻址暂存区
+/// `<下载目录>/.blobs/_tmp/` 下的任何文件都视为「正在写」（M2-T09，blob 无固定后缀）。
 fn is_in_progress(p: &Path) -> bool {
-    matches!(
-        p.extension().and_then(|s| s.to_str()),
-        Some("part") | Some("tmp")
-    )
+    crate::blob::is_tmp_path(p)
+        || matches!(
+            p.extension().and_then(|s| s.to_str()),
+            Some("part") | Some("tmp")
+        )
 }
 
 /// 路径归一（比对用）：尽量 canonicalize，统一分隔符；Windows 下再折叠大小写
@@ -598,6 +622,12 @@ fn scan_cache_files(dir: &Path, limit: usize) -> (Vec<(PathBuf, u64)>, bool) {
                 continue;
             };
             if meta.is_dir() {
+                // 内容寻址暂存区 `<下载目录>/.blobs/_tmp/` 永不纳入孤儿扫描：
+                // 里面的文件正被 worker 写着，且 blob 无扩展名，靠 `is_in_progress`
+                // 兜不住整棵子树 —— 直接剪枝。
+                if p.file_name().and_then(|s| s.to_str()) == Some(crate::blob::TMP_DIR) {
+                    continue;
+                }
                 stack.push(p);
                 continue;
             }
@@ -1699,6 +1729,7 @@ mod tests {
             source: "tg".into(),
             ref_key: "not-a-valid-tg-ref".into(),
             file_path: missing.to_string_lossy().into_owned(),
+            content_hash: None,
         };
         let p = purge_item(&st, &dir, &lib, &it).await;
         assert_eq!(p.failed, 1, "删不掉必须计 failed");
@@ -1723,6 +1754,7 @@ mod tests {
             source: "local".into(),
             ref_key: "x".into(),
             file_path: f.to_string_lossy().into_owned(),
+            content_hash: None,
         };
         let p = purge_item(&st, &dir, &lib, &it).await;
         assert_eq!(p.removed, 1, "真删掉了必须计 removed");

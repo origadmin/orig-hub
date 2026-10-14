@@ -20,6 +20,7 @@ import { EpisodeEditPanel } from './EpisodeEditPanel'
 import { CoverImage } from './CoverImage'
 import { useTranslation } from '../../i18n'
 import { seriesLabel } from '../../lib/displayTitle'
+import { resolveDisplayName } from '../../lib/displayName'
 
 /** 展开态挂图横滚条的最大张数（超出后靠横滚，不再展开/收起） */
 const IMAGE_TILE_LIMIT = 24
@@ -79,6 +80,22 @@ export function EpisodeExpanded(props: {
   // BUG-281：与剧集介绍逐字相同 = 剧集级文案（组级 caption 共享）⇒ 标签换「剧集介绍」。
   const descIsSeriesLevel = episodeDescriptionIsSeriesLevel(ep, series)
 
+  /**
+   * 本集显名（D24-A / BUG-310）：走**唯一**解析函数 ——
+   * 「用户自定义集名 ＞ 剧名+集号（单集用剧名）＞ 来源原文」。
+   * 展开态是单集的唯一焦点（无左列），故这里用完整三层（含剧名+集号）。
+   */
+  const displayName = resolveDisplayName({
+    episode: {
+      season: ep.season,
+      episodeNo: ep.episodeNo,
+      episodeNoEnd: ep.episodeNoEnd,
+      title: ep.title,
+    },
+    series: { title: series.title },
+    seriesEpisodeCount: series.episodes?.length ?? null,
+  })
+
   return (
     <div className="flex flex-col gap-4" data-testid="episode-expanded">
       {/* ① 大封面（恒显） */}
@@ -100,10 +117,11 @@ export function EpisodeExpanded(props: {
         )}
       </div>
 
-      {/* ② 本集标题（R5 门控；被隐藏时集号即主标识） */}
-      {showTitle ? (
+      {/* ② 本集标题（R5 门控；被隐藏时集号即主标识）——
+          显名统一走 `resolveDisplayName`（D24-A / BUG-310）。 */}
+      {showTitle || displayName ? (
         <h4 className="text-[13px] font-semibold text-fg-strong [overflow-wrap:anywhere]">
-          {ep.title}
+          {displayName}
         </h4>
       ) : (
         <h4 className="text-[13px] font-semibold text-muted">{episodeSlotLabel(ep)}</h4>

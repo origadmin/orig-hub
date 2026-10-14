@@ -30,6 +30,7 @@ use grammers_client::sender::ConnectionParams;
 use grammers_client::session::storages::SqliteSession;
 use grammers_client::session::types::{PeerAuth, PeerId, PeerRef};
 use grammers_client::{Client as TgClient, SenderPool, SignInError, tl};
+use sha2::Digest;
 use tokio::sync::Mutex;
 
 use crate::config::Config;
@@ -1002,11 +1003,14 @@ impl Client for GrammersClient {
         let message = found.ok_or(ClientError::MediaNotFound)?;
 
         let media = message.media().ok_or(ClientError::MediaNotFound)?;
-        // 落盘命名（BUG-100）：三种形态都必须带 `<chat>`/`<msg>` 唯一标识——
-        // `photo-<chat>_<msg>.jpg` / `doc-<chat>_<msg>.<ext>` / `<清洗名>-<chat>-<msg>.<ext>`。
-        // 曾用裸原始名，两个频道各发一个 `video_2024.mp4` 会落到**完全相同**的 `file_path`，
-        // 两个 `media_item` 于是共享一个文件：清掉其中一条即 unlink 掉另一条的字节，
-        // 另一条状态字段不复位 → UI 仍显示「已缓存」，点开 404 且没有重新缓存入口。
+        // D24-A（BUG-309）：落盘改**内容寻址** —— `<download_dir>/.blobs/ab/cd/<sha256>`。
+        //
+        // 旧布局（`<chat>_<msg>` 唯一锚，BUG-100）解决了「同名覆盖」，代价是「同内容必存
+        // 多份」；且文档分支用裸原始名 `sanitize_filename` 时仍会**跨频道撞名覆盖**（内容
+        // 不同即物理丢失）。hash 布局让「同内容 → 同一路径」成为设计意图，配合引用计数
+        // （`media_blob`）共享字节、删最后引用才回收。
+        //
+        // `filename` 仅作**降级**用途保留（blob 区不可创建时退回旧平铺布局），不决定正常路径。
         let filename = match &media {
             Media::Photo(_) => format!("photo-{}_{}.jpg", chat_id, message_id),
             Media::Document(doc) => {
@@ -1024,18 +1028,18 @@ impl Client for GrammersClient {
         };
 
         let dir = PathBuf::from(dir);
-        tokio::fs::create_dir_all(&dir)
+        // 临时文件落在 `<dir>/.blobs/_tmp/`（与正式 blob 同卷 ⇒ rename 原子）。
+        let tmp = crate::blob::tmp_path(&dir);
+        tokio::fs::create_dir_all(crate::blob::tmp_dir(&dir))
             .await
-            .map_err(|e| ClientError::Other(format!("create dir: {e}")))?;
-        let path = dir.join(&filename);
+            .map_err(|e| ClientError::Other(format!("create blob tmp dir: {e}")))?;
 
         // 缓存走与在线播放完全相同的**并行**拉流流程（BUG-028，替代 iter_download 串行整段
         // + 自管写盘），替代 `message.download_media`（其落盘路径对 Windows 文件名/目录敏感，
         // 曾在文件名含非法字符时统一报 os error 5）。播放正常的媒体即可缓存。
         //
-        // 原子落盘（BUG-024）：先写 `<name>.part`，全部字节落完再改名为最终路径。
-        // 此前直接写最终路径，中途失败/请求被中断会留下「看着已缓存、实为半截」的文件，
-        // 而 DB 未标记 → 磁盘与状态不一致。`PartFile` 的 Drop 保证未完成即自动清理。
+        // 原子落盘（BUG-024）：先写临时文件，全部字节落完再改名。`PartFile` 的 Drop 保证
+        // 未完成即自动清理 —— 磁盘上永不出现「半截但看起来像已缓存」的文件。
         let total = match &media {
             Media::Photo(p) => p.size().map(|s| s as u64),
             Media::Document(d) => d.size().map(|s| s as u64),
@@ -1048,7 +1052,7 @@ impl Client for GrammersClient {
                 p.set_total(t);
             }
         }
-        let mut out = PartFile::create(&dir, &filename)
+        let mut out = PartFile::create_at(&tmp)
             .await
             .map_err(|e| ClientError::Other(format!("create file: {e}")))?;
         let mut bytes: u64 = 0;
@@ -1089,16 +1093,20 @@ impl Client for GrammersClient {
                 }
             }
         }
-        out.persist(&path)
+        // 收尾到内容寻址布局：算流式 hash → dedup 命中删临时文件 / 否则 rename 到 blob。
+        let (final_path, content_hash, dedup) = out
+            .finish_into_blob(&dir)
             .await
             .map_err(|e| ClientError::Other(format!("flush file: {e}")))?;
+        let _ = &filename; // 降级布局的命名（当前恒走 blob，保留以备未来开关）
         Ok(DownloadOutcome {
             message_id,
-            path: path.to_string_lossy().into_owned(),
+            path: final_path.to_string_lossy().into_owned(),
             bytes,
+            content_hash: Some(content_hash),
+            dedup,
         })
     }
-
     async fn message_meta(
         &self,
         chat_id: i64,
@@ -1667,21 +1675,35 @@ struct PartFile {
     file: Option<tokio::fs::File>,
     part: PathBuf,
     persisted: bool,
+    /// 流式 SHA-256（D24-A / BUG-309）：在 `write_all` 里顺序累计，`persist` / 落 blob 前
+    /// finalize。写路径全程无 seek、无回退、无并发写 ⇒ 零额外 IO 拿到内容指纹。
+    hasher: sha2::Sha256,
 }
 
 impl PartFile {
+    /// 旧命名式落盘（`<dir>/<filename>.part` → `<dir>/<filename>`）—— **仅测试用**。
+    /// 生产路径已改为内容寻址 blob（[`Self::finish_into_blob`]），此函数保留给
+    /// 只验证「流式哈希 + 半成品清理」语义的单测，避免它们依赖 blob 布局。
+    #[allow(dead_code)]
     async fn create(dir: &Path, filename: &str) -> io::Result<Self> {
-        let part = dir.join(format!("{filename}.part"));
-        let file = tokio::fs::File::create(&part).await?;
+        Self::create_at(&dir.join(format!("{filename}.part"))).await
+    }
+
+    /// 在**指定路径**建临时文件（blob 布局用 `_tmp/<uuid>.part`）。
+    async fn create_at(part: &Path) -> io::Result<Self> {
+        let file = tokio::fs::File::create(part).await?;
         Ok(Self {
             file: Some(file),
-            part,
+            part: part.to_path_buf(),
             persisted: false,
+            hasher: sha2::Sha256::new(),
         })
     }
 
     async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        use sha2::Digest;
         use tokio::io::AsyncWriteExt;
+        self.hasher.update(buf);
         match self.file.as_mut() {
             Some(f) => f.write_all(buf).await,
             None => Ok(()),
@@ -1689,6 +1711,9 @@ impl PartFile {
     }
 
     /// 收尾：flush → 关闭句柄 → 原子改名为最终路径（Windows 上 rename 覆盖已存在目标）。
+    ///
+    /// **仅测试用**：生产落盘走 [`Self::finish_into_blob`]（内容寻址）。
+    #[allow(dead_code)]
     async fn persist(mut self, final_path: &Path) -> io::Result<()> {
         use tokio::io::AsyncWriteExt;
         if let Some(f) = self.file.as_mut() {
@@ -1699,6 +1724,34 @@ impl PartFile {
         tokio::fs::rename(&self.part, final_path).await?;
         self.persisted = true;
         Ok(())
+    }
+
+    /// 收尾到**内容寻址**布局（D24-A / BUG-309）：flush → 关句柄 → 算 hash →
+    /// dedup 命中（同 hash 的 blob 已存在）则删临时文件，否则 `rename` 到
+    /// `<download_dir>/.blobs/ab/cd/<hash>`。
+    ///
+    /// 返回 `(blob 绝对路径, hash, dedup)`。dedup 命中时**不覆盖**既有字节
+    /// （hash 保证内容一致，覆盖是纯浪费，且避免并发任务抢同一路径）。
+    async fn finish_into_blob(mut self, download_dir: &Path) -> io::Result<(PathBuf, String, bool)> {
+        use sha2::Digest;
+        use tokio::io::AsyncWriteExt;
+        if let Some(f) = self.file.as_mut() {
+            f.flush().await?;
+        }
+        drop(self.file.take());
+        let hash = crate::blob::hex_encode(&self.hasher.clone().finalize());
+        let final_path = crate::blob::blob_path(download_dir, &hash);
+        if final_path.exists() {
+            let _ = tokio::fs::remove_file(&self.part);
+            self.persisted = true;
+            return Ok((final_path, hash, true));
+        }
+        if let Some(parent) = final_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::rename(&self.part, &final_path).await?;
+        self.persisted = true;
+        Ok((final_path, hash, false))
     }
 }
 

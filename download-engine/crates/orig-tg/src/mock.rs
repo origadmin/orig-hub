@@ -212,6 +212,9 @@ impl Client for MockClient {
             message_id,
             path: path.to_string_lossy().into_owned(),
             bytes,
+            // mock 走旧平铺布局：无内容 hash（主路径由 `finish_into_blob` 给出）。
+            content_hash: None,
+            dedup: false,
         })
     }
 

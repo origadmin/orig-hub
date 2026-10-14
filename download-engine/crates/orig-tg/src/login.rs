@@ -161,6 +161,14 @@ pub struct DownloadOutcome {
     /// 实际写盘字节数。
     #[serde(rename = "bytes")]
     pub bytes: u64,
+    /// 内容 SHA-256（64 位小写 hex，D24-A / BUG-309）：落盘时**流式**算出，
+    /// 是内容寻址与引用计数的键。`None` = 未算（mock / 旧调用点）。
+    #[serde(rename = "contentHash", skip_serializing_if = "Option::is_none", default)]
+    pub content_hash: Option<String>,
+    /// 是否命中去重：`true` 表示同 hash 的 blob 已存在，本次未重复写字节
+    /// （临时文件已删，`path` 指向**既有** blob）。
+    #[serde(default)]
+    pub dedup: bool,
 }
 
 /// HTTP `Range` 头的解析产物（`bytes` 单位，未解析到合法区间时传 `None` 表示整段）。

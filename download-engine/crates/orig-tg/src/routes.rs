@@ -124,6 +124,17 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/api/media/items/by-refs", get(media_item_by_refs))
         .route("/api/media/export/preview", get(export_preview))
         .route("/api/media/export", axum::routing::post(export_media))
+        // D24-A（BUG-311）：批量整理（mp3tag 式）—— 预览全表 diff 与执行分两端点。
+        // 「一动词一端点」：preview 只读、可随意重复调用；apply 才落盘。
+        .route(
+            "/api/media/organize/preview",
+            axum::routing::post(organize_preview),
+        )
+        .route(
+            "/api/media/organize/apply",
+            axum::routing::post(organize_apply),
+        )
+        .route("/api/media/organize/presets", get(organize_presets))
         .route(
             "/api/media/series",
             get(list_media_series).post(create_media_series),
@@ -2674,34 +2685,59 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
             Ok(outcome) => {
                 match &registered {
                     Some((item, _)) => {
-                        // byte-ownership P2（I2 归仓）：先把字节**移动**进库根
-                        //（失败自动降级：留原位、回填绝对路径，见 house_downloaded_bytes），
-                        // 再用专用语句回填 `file_path` = 库根相对路径（不走 COALESCE
-                        // upsert——MEDIA-DESIGN C3：那会粘住旧路径）；kind 顺手对齐
-                        // 到扩展名分类（T0 时无文件可判）。
-                        let housed = crate::cache::house_downloaded_bytes(
-                            st,
-                            task.chat_id,
-                            msg_id,
-                            &outcome.path,
-                            tg_caption.as_deref(),
-                        )
-                        .await;
-                        // 归仓移动后原落盘位置已空：tg 消息侧的缓存路径必须跟着
-                        // 指到真实文件，否则 `cached_path` 幂等判定会误判「未缓存」。
-                        let _ = st
-                            .store
-                            .mark_downloaded(task.chat_id, msg_id, Some(&housed.absolute_path))
-                            .await;
-                        let ext = path_ext(&housed.absolute_path);
-                        let _ = st
-                            .store
-                            .backfill_item_bytes(
-                                *item,
-                                &housed.item_path,
-                                crate::media::classify_ext(&ext),
+                        // D24-A（BUG-309）：字节已由 `download` 落到**内容寻址** blob
+                        // （`<download_dir>/.blobs/ab/cd/<hash>`）—— 归仓即完成，**不再**
+                        // 搬进 `<库根>/<频道>/`（搬走会破坏内容寻址与引用计数）。
+                        // `file_path` 记**绝对** blob 路径：`resolve_item_path` 对绝对路径
+                        // 原样返回；且它落在下载目录内 ⇒ 进得了清理工作集（按 refcount 回收）。
+                        // `kind` 保持 T0 登记值（blob 无扩展名，`classify_ext("")` 会误判成
+                        // `file` ⇒ 投递 MIME 退化，故**不**按路径重判）。
+                        if let Some(hash) = outcome.content_hash.as_deref() {
+                            let _ = st
+                                .store
+                                .mark_downloaded(task.chat_id, msg_id, Some(&outcome.path))
+                                .await;
+                            let size = std::fs::metadata(&outcome.path)
+                                .map(|m| m.len() as i64)
+                                .unwrap_or(outcome.bytes as i64);
+                            let _ = st
+                                .store
+                                .backfill_item_bytes_with_blob(
+                                    *item,
+                                    &outcome.path,
+                                    None,
+                                    hash,
+                                    size,
+                                )
+                                .await;
+                        } else {
+                            // 降级：调用点未给 hash（mock / 旧客户端）—— 退回旧平铺归仓。
+                            let housed = crate::cache::house_downloaded_bytes(
+                                st,
+                                task.chat_id,
+                                msg_id,
+                                &outcome.path,
+                                tg_caption.as_deref(),
                             )
                             .await;
+                            let _ = st
+                                .store
+                                .mark_downloaded(
+                                    task.chat_id,
+                                    msg_id,
+                                    Some(&housed.absolute_path),
+                                )
+                                .await;
+                            let ext = path_ext(&housed.absolute_path);
+                            let _ = st
+                                .store
+                                .backfill_item_bytes(
+                                    *item,
+                                    &housed.item_path,
+                                    crate::media::classify_ext(&ext),
+                                )
+                                .await;
+                        }
                     }
                     None => {
                         // T0 登记失败（DB 故障）——退回旧「下载即入库」兜底一次。
@@ -3427,12 +3463,53 @@ async fn export_media(
     }
 }
 
+/// `POST /api/media/organize/preview` — 批量整理**预览**（D24-A / BUG-311，只读）。
+///
+/// 逐条渲染模板 → 目标路径（旧路径→新路径、冲突、非法字符清洗）→ 返回全表 diff。
+/// **不碰磁盘**（除 `metadata` 探测），可随意重复调用。
+async fn organize_preview(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<crate::organize::OrganizeRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let report = crate::organize::plan(&st.store, &req)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, &e))?;
+    st.push_log(&format!(
+        "/api/media/organize/preview: {} item(s), template={:?}",
+        report.rows.len(),
+        req.template
+    ));
+    Ok(Json(json!(report)))
+}
+
+/// `POST /api/media/organize/apply` — 批量整理**执行**（D24-A / BUG-311）。
+///
+/// 按 `preview` 的同一份计划落盘：同卷硬链接 / 跨卷副本；目标已就位则跳过（幂等）；
+/// 重名加序号（不覆盖）。产物登记为「外部发布路径」。
+async fn organize_apply(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<crate::organize::OrganizeRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let report = crate::organize::apply(&st.store, &req)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, &e))?;
+    st.push_log(&format!(
+        "/api/media/organize/apply: {} written, {} failed of {}",
+        report.summary.written, report.summary.failed, report.summary.total
+    ));
+    Ok(Json(json!(report)))
+}
+
+/// `GET /api/media/organize/presets` — 整理模板预设（前端下拉用）。
+async fn organize_presets() -> impl IntoResponse {
+    Json(json!({ "presets": crate::organize::preset_templates() }))
+}
+
 /// 导入请求体：批量条目（本地路径或 TG 引用）。
 #[derive(Deserialize)]
 struct ImportReq {
     items: Vec<ImportItem>,
 }
-
 #[derive(Deserialize)]
 struct ImportItem {
     /// 绝对路径（本地导入）。
@@ -3706,6 +3783,15 @@ async fn delete_media_item(
         // P2 归仓字节在库根下（`file_path` 是库根相对路径），同样属本系统产出——
         // 删条目是唯一能带走它们的链（`cache/clear` 按 I3 对库根字节让路），漏掉
         // 这里就会留下无任何回收通道的孤儿。
+        //
+        // D24-A（BUG-309）：删条目 = **引用计数必减一次**（条目本身消失），字节则
+        // 「删最后一个引用才回收」。`clear_item_bytes` 同处完成 release + 置空并回传
+        // 是否归零；`Some(false)`（仍有其他条目共享）⇒ 字节必须留下，否则共享方变死链。
+        let orphan = st
+            .store
+            .clear_item_bytes(id)
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
         if let Some(p) = item.file_path.as_deref() {
             let dir = crate::cache::download_dir(&st).await;
             let lib_root = st.store.library_root().await;
@@ -3713,7 +3799,8 @@ async fn delete_media_item(
             let absolute_str = absolute.to_string_lossy().into_owned();
             let owned = crate::cache::inside_dir(&dir, &absolute_str)
                 || crate::cache::inside_dir(&lib_root, &absolute_str);
-            if owned {
+            // 无 hash（存量未纳入）或归零 ⇒ 可回收；仍有共享引用 ⇒ 留给别人。
+            if owned && orphan.unwrap_or(true) {
                 if let Err(e) = std::fs::remove_file(&absolute) {
                     bytes_removed = false;
                     bytes_error = Some(e.to_string());
@@ -7682,6 +7769,8 @@ mod tests {
                 message_id,
                 path: path.to_string_lossy().into_owned(),
                 bytes: 13,
+                content_hash: None,
+                dedup: false,
             })
         }
         async fn message_meta(
@@ -7834,6 +7923,8 @@ mod tests {
                     message_id,
                     path: path.to_string_lossy().into_owned(),
                     bytes: 10,
+                    content_hash: None,
+                    dedup: false,
                 });
             }
             let mut f = std::fs::File::create(&path)
@@ -7850,6 +7941,8 @@ mod tests {
                 message_id,
                 path: path.to_string_lossy().into_owned(),
                 bytes: total,
+                content_hash: None,
+                dedup: false,
             })
         }
         async fn message_meta(
@@ -9495,6 +9588,7 @@ mod tests {
             source: "tg".to_string(),
             ref_key: "424242:71".to_string(),
             title: "t".to_string(),
+            source_title: None,
             description: None,
             kind: "photo".to_string(),
             file_path: Some("photos/a.jpg".to_string()),
@@ -9508,6 +9602,10 @@ mod tests {
             tags: Vec::new(),
             series_id: None,
             series_title: None,
+            series_season: None,
+            series_episode_no: None,
+            series_episode_no_end: None,
+            series_episode_count: None,
             bytes_presence: crate::cache::BytesPresence::Present,
         };
         // 有本地字节 → 本地。

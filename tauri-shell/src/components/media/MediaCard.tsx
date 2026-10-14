@@ -14,6 +14,7 @@ import {
 import type { MediaItem } from '../../api/media'
 import { kindLabelKey, mediaItemUrl } from '../../api/media'
 import { useTranslation } from '../../i18n'
+import { resolveDisplayName } from '../../lib/displayName'
 import {
   coverFit,
   fmtDuration,
@@ -325,6 +326,15 @@ function MediaCardBase(props: {
    */
   const sourceLabel = t(sourceLabelKey(item.source))
 
+  /**
+   * 显名（D24-A / BUG-310）：卡片名走**唯一**解析函数 ——
+   * 「用户自定义集名 ＞ 剧名+集号（单集用剧名）＞ 来源原文」。
+   * `item` 已带后端下发的剧集槽位派生字段（seriesTitle/seriesSeason/seriesEpisodeNo/
+   * seriesEpisodeCount），故这里无需再拼上下文。此前直接 `item.title` 会让卡片名
+   * 与剧集详情、播放器各说各话（BUG-310 的原象）。
+   */
+  const displayName = resolveDisplayName({ item, fallback: item.title })
+
   return (
     <div
       ref={boxRef}
@@ -350,12 +360,12 @@ function MediaCardBase(props: {
               onOpen(item)
             }}
             className="relative block h-full w-full"
-            title={item.title}
+            title={displayName}
           >
             {thumbSrc ? (
               <img
                 src={thumbSrc}
-                alt={item.title}
+                alt={displayName}
                 loading="lazy"
                 /* 图片类 `object-contain`：卡片几何统一（16:9），但图片**不裁切** */
                 className={`h-full w-full ${coverFit(item.kind)}`}
@@ -462,8 +472,8 @@ function MediaCardBase(props: {
 
       {/* 文本区 */}
       <div className="flex min-w-0 flex-1 flex-col gap-0.5 px-2 py-1.5">
-        <p className="truncate text-[12px] font-medium text-fg-strong" title={item.title}>
-          {item.title}
+        <p className="truncate text-[12px] font-medium text-fg-strong" title={displayName}>
+          {displayName}
         </p>
         <p className="flex items-center gap-1 truncate text-[10px] text-muted">
           {/*

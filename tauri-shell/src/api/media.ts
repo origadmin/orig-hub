@@ -98,6 +98,15 @@ export interface MediaItem {
   source: 'local' | 'tg' | string
   ref: string
   title: string
+  /**
+   * **只读来源事实**（D24-A / BUG-310）：这条内容第一次被写下的名字（caption 首行 /
+   * 来源原文）。用户改名只写 `title`，本字段永不随改名而变。
+   *
+   * 显名规则「用户自定义集名 ＞ 剧名+集号 ＞ 来源原文」里的「来源原文」即它 ——
+   * 全部显名位置请走 `lib/displayName.ts#resolveDisplayName`，不要各自兜底。
+   * 缺省（老后端 / 来源确实无题）时回落 `title`。
+   */
+  sourceTitle?: string | null
   /** 介绍：与剧集 `description` 同源同切法（caption 首行之外的部分） */
   description?: string | null
   kind: MediaKind
@@ -124,6 +133,15 @@ export interface MediaItem {
   tags: MediaTag[]
   seriesId?: number | null
   seriesTitle?: string | null
+  /**
+   * 该条目在所属剧集里的槽位（D24-A / BUG-310）。显名规则「剧名+集号」需要集号才能
+   * 拼出「剧名 S1E3」；`seriesEpisodeCount === 1` 时显名只用剧名（单集用剧名）。
+   * 条目未入剧时全部缺席。
+   */
+  seriesSeason?: number | null
+  seriesEpisodeNo?: number | null
+  seriesEpisodeNoEnd?: number | null
+  seriesEpisodeCount?: number | null
 }
 
 /** 剧集列表项 */
@@ -568,6 +586,79 @@ export async function listSeries(tagId?: number | null): Promise<MediaSeries[]> 
   const qs = tagId == null ? '' : `?tagId=${tagId}`
   const r = await request<{ items: MediaSeries[] }>(`/api/media/series${qs}`)
   return r.items ?? []
+}
+
+// ─────────────────── 批量整理（D24-A / BUG-311）───────────────────
+
+/**
+ * 模板预设项。mp3tag 风格模板变量：
+ * `{剧名}` `{季}`/`{season}` `{集}`/`{episode}` `{集名}` `{来源}` `{日期}` `{ext}`，
+ * 格式符如 `{season:02}`（零填充到总宽 2）。
+ */
+export interface OrganizePreset {
+  id: string
+  template: string
+  label: string
+}
+
+/** 预览全表的一行（旧路径→新路径、冲突、动作）。 */
+export interface OrganizeRow {
+  itemId: number
+  displayName: string
+  sourcePath?: string | null
+  targetPath: string
+  /** link（同卷硬链接）/ copy（跨卷副本）/ skip（已就位）/ missing（无字节）/ blocked（失败） */
+  action: string
+  conflict: boolean
+  note?: string | null
+}
+
+export interface OrganizeSummary {
+  total: number
+  link: number
+  copy: number
+  skip: number
+  missing: number
+  blocked: number
+  written: number
+  failed: number
+}
+
+export interface OrganizeReport {
+  rows: OrganizeRow[]
+  summary: OrganizeSummary
+}
+
+/**
+ * 整理请求（预览与执行同一形状）。
+ * `targetDir` 是用户指定的产物根目录；整理**绝不**修改 blob 或条目路径。
+ */
+export async function organizePreview(
+  itemIds: number[],
+  template: string,
+  targetDir: string,
+): Promise<OrganizeReport> {
+  return request<OrganizeReport>('/api/media/organize/preview', {
+    method: 'POST',
+    body: JSON.stringify({ itemIds, template, targetDir }),
+  })
+}
+
+/** 执行整理（幂等；产物登记为外部发布路径）。 */
+export async function organizeApply(
+  itemIds: number[],
+  template: string,
+  targetDir: string,
+): Promise<OrganizeReport> {
+  return request<OrganizeReport>('/api/media/organize/apply', {
+    method: 'POST',
+    body: JSON.stringify({ itemIds, template, targetDir }),
+  })
+}
+
+export async function listOrganizePresets(): Promise<OrganizePreset[]> {
+  const r = await request<{ presets: OrganizePreset[] }>('/api/media/organize/presets')
+  return r.presets ?? []
 }
 
 export async function getSeries(id: number): Promise<MediaSeriesDetail> {

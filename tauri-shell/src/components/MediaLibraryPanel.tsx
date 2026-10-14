@@ -40,6 +40,7 @@ import { ImportDialog } from './media/ImportDialog'
 import { BulkTagDialog, TagManagerDialog } from './media/TagManagerDialog'
 import { AddToSeriesDialog, CreateSeriesDialog, MergeSeriesDialog, MergeSeriesMultiDialog } from './media/SeriesDialog'
 import { ExportPreviewDialog } from './media/ExportPreviewDialog'
+import { OrganizeWizard } from './media/OrganizeWizard'
 import { ItemEditDialog } from './media/ItemEditDialog'
 import {
   fmtSize,
@@ -357,6 +358,8 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   const [bulkSeriesTagOpen, setBulkSeriesTagOpen] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
   const [addToOpen, setAddToOpen] = useState(false)
+  /** 批量整理向导（D24-A / BUG-311）：mp3tag 式模板命名 / 归位，作用于 items 多选集 */
+  const [organizeOpen, setOrganizeOpen] = useState(false)
   /** 「合并到…」对话框（把另一个剧集并入当前打开的剧集） */
   const [mergeOpen, setMergeOpen] = useState(false)
   /** 剧集墙多选合并对话框（BUG-186）：把选中的多条剧集合并为一条 */
@@ -1154,6 +1157,17 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
                 >
                   {t('media.bulkTag')}
                 </Button>
+                {/* 批量整理（D24-A / BUG-311）：把选中条目按模板铺成可读名的硬链接/副本。
+                    与库内改名解耦 —— 改名只写库、整理才写发布层。 */}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  onClick={() => setOrganizeOpen(true)}
+                  data-testid="media-organize"
+                >
+                  {t('media.organize.open')}
+                </Button>
                 <Button
                   variant="outline"
                   size="sm"
@@ -1728,6 +1742,14 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             clearSelection()
             await refreshAll()
           }}
+          onError={(m) => setError(m)}
+        />
+      ) : null}
+
+      {organizeOpen ? (
+        <OrganizeWizard
+          itemIds={[...selected]}
+          onClose={() => setOrganizeOpen(false)}
           onError={(m) => setError(m)}
         />
       ) : null}
