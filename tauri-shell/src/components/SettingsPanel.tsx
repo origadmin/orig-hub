@@ -12,6 +12,7 @@ import {
   listInterfaces,
   saveClassifyConfig,
   saveDownloadConfig,
+  saveLibraryConfig,
   saveProxyConfig,
   verifyProxy,
 } from '../api/daemon'
@@ -171,6 +172,12 @@ export function SettingsPanel({
   // 作占位/回退，杜绝写死的 ~/Downloads（Unix 风格，在 Windows 上误导）。
   const [defaultDir, setDefaultDir] = useState('')
   /**
+   * 手动下载**未配置** `download_dir` 时的实际默认根（D23-A①）—— 由 daemon 计算下发
+   * （`<库根>/下载/`；库根也未配置则平台默认）。前端**不自己拼路径**，否则「库根/下载」
+   * 与「平台 Downloads」两套推算必然漂移。下载目录输入框的占位优先用它。
+   */
+  const [manualRoot, setManualRoot] = useState('')
+  /**
    * 调试日志路径（BUG-243）：daemon 是唯一真源（`GET /api/config` 的 `logs`），
    * 这里只**照抄展示**，不本地拼路径 —— 引擎换目录时关于页自动跟着走。
    */
@@ -254,28 +261,40 @@ export function SettingsPanel({
     listInterfaces()
       .then(({ primary }) => setAutoPrimary(primary?.name ?? null))
       .catch(() => {})
-    // 库根（P5）：tg 不可达时留空展示 —— 保存时才报错，不阻塞其他设置项
-    getTgConfig()
-      .then((c) => {
-        setLibDir(c.libraryDir ?? '')
-        setLibDirSaved(c.libraryDir ?? '')
-      })
-      .catch(() => {})
-    // 系统默认下载目录：daemon 按 OS 解析（Windows = C:\Users\<user>\Downloads），
-    // 用作未显式设置时的占位/回退，替代写死的 ~/Downloads。
-    getConfig()
-      .then((c) => {
+    /**
+     * 库根（P5）与下载目录（BUG-234）来自**两个不同服务**（TG / daemon），但 D23-A⑥
+     * 规定二者共用同一个受管根 ⇒ 必须一起读才能对账（见下方升级回填）。任一不可达都
+     * 降级为 `null`，不阻塞其它设置项（tg 不可达时库根留空展示，保存时才报错）。
+     */
+    Promise.all([getTgConfig().catch(() => null), getConfig().catch(() => null)]).then(
+      ([tg, c]) => {
+        const tgLib = tg?.libraryDir ?? ''
+        setLibDir(tgLib)
+        setLibDirSaved(tgLib)
+        if (!c) return
+        // 系统默认下载目录：daemon 按 OS 解析（Windows = C:\Users\<user>\Downloads），
+        // 用作未显式设置时的占位/回退，替代写死的 ~/Downloads。
         setDefaultDir(c.default_download_dir ?? '')
+        // 手动下载实际默认根（D23-A①）：`<库根>/下载/`，由 daemon 下发（唯一真源）。
+        setManualRoot(c.manual_download_root ?? '')
         // 下载目录的**唯一真源是引擎**（它决定文件实际落哪，BUG-234）：
-        // 引擎已配置则照它显示并同步本地镜像；未配置保持编辑态（空 = 走系统默认）。
+        // 引擎已配置则照它显示并同步本地镜像；未配置保持编辑态（空 = 走库根/下载）。
         if (c.download_dir) {
           setDir(c.download_dir)
           updateSettings({ downloadDirectory: c.download_dir })
         }
         // 调试日志路径（BUG-243）：同一份 config 里带下来，不额外打一次请求。
         if (c.logs) setLogPaths(c.logs)
-      })
-      .catch(() => {})
+        // 升级回填（D23-A⑥）：老用户的库根只存在 TG 侧（daemon 的 `library_dir` 为空），
+        // 不回填则手动下载默认根不会变成 `<库根>/下载/`（D23-A①）。仅在「daemon 为空且
+        // TG 有值」时写一次（幂等）；失败静默——下次进设置页自动重试，不打断展示。
+        if (!c.library_dir && tgLib) {
+          void saveLibraryConfig({ dir: tgLib })
+            .then((r) => setManualRoot(r.manual_download_root ?? ''))
+            .catch(() => {})
+        }
+      },
+    )
     // TG 拉起失败原因（BUG-177 / BUG-178）：服务不可用时侧栏没有 TG 入口，
     // 若这里也不说原因，用户只会以为「TG 功能没了」。走唯一刷新入口，不另拉一次 config。
     void refreshTgState()
@@ -404,16 +423,30 @@ export function SettingsPanel({
     }
   }
 
-  /** 保存库根目录（byte-ownership P5）：只在编辑态 ≠ 已保存值时打 PUT。
-   *  失败走全局 setError（BUG-167 约定：用户主动操作的失败可见），不静默吞掉。 */
+  /**
+   * 保存库根目录（byte-ownership P5 / D23-A⑥）：只在编辑态 ≠ 已保存值时打 PUT。
+   *
+   * D23-A⑥「受管库根同属一处、设置一处可配」：**两端都要写** ——
+   *  - TG（`PUT /api/tg/config`）：归仓字节的家，M1 把库根迁入 daemon 之前它仍是权威存储；
+   *  - daemon（`PUT /api/config/library`）：手动下载默认根 `<库根>/下载/` 的来源（D23-A①）。
+   * 两端并行发出（`allSettled`）：一端失败**不**阻止另一端落库，但任一失败都要让用户看见
+   * （BUG-167 约定：用户主动操作的失败不可静默）。回读 daemon 返回的 `manual_download_root`
+   * 刷新占位，保证「库根/下载」与 daemon 实际解析一致，前端不自己拼。
+   */
   const persistLibrary = async () => {
     const next = libDir.trim()
     if (next === libDirSaved) return
     try {
-      const r = await setTgLibraryDir(next)
-      const saved = r.libraryDir ?? next
+      const [tgRes, daemonRes] = await Promise.allSettled([
+        setTgLibraryDir(next),
+        saveLibraryConfig({ dir: next }),
+      ])
+      if (tgRes.status === 'rejected') throw tgRes.reason
+      if (daemonRes.status === 'rejected') throw daemonRes.reason
+      const saved = tgRes.value.libraryDir ?? next
       setLibDir(saved)
       setLibDirSaved(saved)
+      setManualRoot(daemonRes.value.manual_download_root ?? '')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -587,7 +620,7 @@ export function SettingsPanel({
                     <p className="text-[11px] text-muted">{t('downloads.dirHint')}</p>
                   </div>
                   <div className="mt-2" data-testid="download-dir-picker">
-                    <DirectoryPicker value={dir} onChange={setDir} placeholder={dir || defaultDir || t('downloads.dirPlaceholder')} onError={setError} />
+                    <DirectoryPicker value={dir} onChange={setDir} placeholder={dir || manualRoot || defaultDir || t('downloads.dirPlaceholder')} onError={setError} />
                   </div>
                   <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
                     {t('downloads.dirNote')}

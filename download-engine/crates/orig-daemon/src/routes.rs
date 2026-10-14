@@ -138,6 +138,35 @@ async fn list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
     axum::Json(out)
 }
 
+/// 同名文件自动重命名的候选：`name (1).ext` / `name (2).ext` … 直到磁盘上不存在。
+///
+/// 只在「原路径**已存在**」时调用（见 [`add`] 的完整度检测分支）；语义是「给冲突文件
+/// 找一个空位」，**不**判断原路径本身是否存在。无扩展名时退化为 `name (1)`。
+/// 抽成独立函数是为了可测（T08⑤ 回归夹具：同名 `(1)`），逻辑与内联版逐字一致。
+async fn next_free_path(output: &std::path::Path) -> std::path::PathBuf {
+    let parent = output.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = output
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".to_string());
+    let ext = output
+        .extension()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut idx = 1;
+    loop {
+        let candidate = if ext.is_empty() {
+            parent.join(format!("{stem} ({idx})"))
+        } else {
+            parent.join(format!("{stem} ({idx}).{ext}"))
+        };
+        if tokio::fs::metadata(&candidate).await.is_err() {
+            break candidate;
+        }
+        idx += 1;
+    }
+}
+
 async fn add(
     State(st): State<Arc<AppState>>,
     Json(req): Json<AddReq>,
@@ -267,27 +296,7 @@ async fn add(
                     }
                 } else {
                     // 自动重命名：name (1).ext / name (2).ext … 直到不冲突
-                    let parent = output.parent().unwrap_or_else(|| std::path::Path::new("."));
-                    let stem = output
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "download".to_string());
-                    let ext = output
-                        .extension()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    let mut idx = 1;
-                    let new_output = loop {
-                        let candidate = if ext.is_empty() {
-                            parent.join(format!("{stem} ({idx})"))
-                        } else {
-                            parent.join(format!("{stem} ({idx}).{ext}"))
-                        };
-                        if tokio::fs::metadata(&candidate).await.is_err() {
-                            break candidate;
-                        }
-                        idx += 1;
-                    };
+                    let new_output = next_free_path(&output).await;
                     eprintln!(
                         "[download] file exists, auto-rename {} -> {}",
                         output.display(),
@@ -488,6 +497,13 @@ async fn get_config(State(st): State<Arc<AppState>>) -> axum::Json<serde_json::V
         // 前端与桌面壳一律读它，不得各自硬编码 9876。
         "port": st.port,
         "download_dir": cfg.download_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        // 受管库根（D23-A⑥）：设置页「库根目录」保存时同步写入 daemon 与 TG，二者共用。
+        "library_dir": cfg.library_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        // D23-A①：手动下载**未配置** `download_dir` 时的实际默认根
+        // （= `<库根>/下载/`；库根也未配置则平台默认）。前端用它作占位，不自己拼路径。
+        "manual_download_root": crate::config::manual_download_root(&cfg)
+            .to_string_lossy()
+            .into_owned(),
         // 系统默认下载目录（Windows = SHGetKnownFolderPath(FOLDERID_Downloads)，
         // 如 C:\Users\<user>\Downloads）。前端在用户未显式设置时用它作占位/回退，
         // 不再写死 ~/Downloads（Unix 风格，在 Windows 上误导，BUG-回归：多次反馈「显示为 Linux 路径」）。
@@ -569,6 +585,46 @@ pub struct DownloadUpdateReq {
     /// 目标下载目录；空串/缺省 = 清除设置，回退平台默认。
     #[serde(default)]
     pub dir: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct LibraryUpdateReq {
+    /// 受管库根；空串/缺省 = 清除设置。
+    #[serde(default)]
+    pub dir: Option<String>,
+}
+
+/// PUT /api/config/library — 保存受管库根（运行时生效 + 持久化到 download-engine.toml）。
+///
+/// D23-A⑥：设置页保存「库根目录」时**同时**写 daemon 与 TG，二者共用同一个受管根
+/// （M1 把库根迁入 daemon 之前，TG 仍是其权威存储，故两边都要写）。保存后，**未显式
+/// 配置** `download_dir` 的手动下载默认根随之变为 `<库根>/下载/`（D23-A①）。
+async fn put_config_library(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<LibraryUpdateReq>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    let dir = req
+        .dir
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .map(|d| orig_core::paths::expand_tilde(&d));
+    let manual_root = {
+        let mut cfg = st.config.write().unwrap();
+        cfg.library_dir = dir;
+        cfg.save_library_dir("download-engine.toml").map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persist library config: {e}"),
+            )
+        })?;
+        crate::config::manual_download_root(&cfg)
+    };
+    let cfg = st.config.read().unwrap();
+    Ok(axum::Json(serde_json::json!({
+        "ok": true,
+        "library_dir": cfg.library_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        "manual_download_root": manual_root.to_string_lossy().into_owned(),
+    })))
 }
 
 /// PUT /api/config/classify — 保存自动分类规则（运行时生效 + 持久化到 download-engine.toml）。
@@ -945,6 +1001,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         // BUG-234：download_dir 此前只读（GET /api/config），设置页改了也不生效 ——
         // 补上与 classify/proxy/tg 同语义的「运行时生效 + 持久化」端点。
         .route("/api/config/download", axum::routing::put(put_config_download))
+        // D23-A⑥：设置页「库根目录」同步写 daemon（与 TG 共用同一受管根）。
+        .route("/api/config/library", axum::routing::put(put_config_library))
         .route("/api/proxy/verify", axum::routing::post(post_proxy_verify))
         .route("/api/config/tg", axum::routing::put(put_config_tg))
         .route("/api/tg/restart", axum::routing::post(post_tg_restart))
@@ -961,6 +1019,75 @@ pub(crate) fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_free_path;
+    use std::path::{Path, PathBuf};
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("orig-daemon-routes-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// T08⑤ 回归夹具：同名文件得到 `name (1).ext`，再冲突则 `name (2).ext`。
+    #[tokio::test]
+    async fn next_free_path_appends_numeric_suffix() {
+        let dir = tmp_dir("suffix");
+        let orig = dir.join("a.mp4");
+        std::fs::write(&orig, b"x").unwrap();
+
+        let p1 = next_free_path(&orig).await;
+        assert_eq!(p1, dir.join("a (1).mp4"));
+        // 占用 (1) 后应跳到 (2)。
+        std::fs::write(&p1, b"x").unwrap();
+        let p2 = next_free_path(&orig).await;
+        assert_eq!(p2, dir.join("a (2).mp4"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 无扩展名：后缀接在文件名后（`name (1)`），不带多余点。
+    #[tokio::test]
+    async fn next_free_path_handles_extensionless() {
+        let dir = tmp_dir("noext");
+        let orig = dir.join("plain");
+        std::fs::write(&orig, b"x").unwrap();
+
+        let p = next_free_path(&orig).await;
+        assert_eq!(p, dir.join("plain (1)"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 多点文件名只按**最后一段**当扩展名（`a.b.tar.gz` → `a.b.tar (1).gz`）。
+    #[tokio::test]
+    async fn next_free_path_splits_on_last_extension() {
+        let dir = tmp_dir("multi");
+        let orig = dir.join("a.b.tar.gz");
+        std::fs::write(&orig, b"x").unwrap();
+
+        let p = next_free_path(&orig).await;
+        assert_eq!(p, dir.join("a.b.tar (1).gz"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 候选落在原文件**同一父目录**（不得改变目录）。
+    #[tokio::test]
+    async fn next_free_path_stays_in_same_dir() {
+        let dir = tmp_dir("samedir");
+        let orig = dir.join("c.mkv");
+        std::fs::write(&orig, b"x").unwrap();
+
+        let p = next_free_path(&orig).await;
+        assert_eq!(p.parent(), Some(Path::new(dir.to_str().unwrap())));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 

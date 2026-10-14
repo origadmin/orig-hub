@@ -79,6 +79,12 @@ impl ClassifyConfig {
 pub struct Config {
     /// 默认下载目录（来自配置/环境变量）。为空时回退平台默认目录。
     pub download_dir: Option<PathBuf>,
+    /// 受管库根（D23-A：手动下载与插件入库同处一个受管根，设置一处可配）。
+    ///
+    /// 手动下载**从未配置** `download_dir` 时，默认根 = `<library_dir>/下载/`；
+    /// 库根也为空（老库 / 未初始化）才回退平台默认目录（BUG-071 的「绝不落字面
+    /// `~/Downloads`」纪律不变）。**插件（TG）归仓路径不经此处** —— 它由插件自管。
+    pub library_dir: Option<PathBuf>,
     /// 默认并发连接数（对齐 orig-hub `max_connections` 缺省 8）。
     pub max_connections: u32,
     /// Bearer token；为空表示不鉴权（对齐 orig-hub：token 空则不校验）。
@@ -105,6 +111,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             download_dir: None,
+            library_dir: None,
             max_connections: 8,
             token: None,
             // 19786（原 9876）：9876 常被 Windows 划进动态保留区（9857–9956 实证），
@@ -210,6 +217,10 @@ impl Config {
                         // an upgrade never lands in `<CWD>/~/Downloads` (BUG-071).
                         cfg.download_dir = Some(orig_core::paths::expand_tilde(v))
                     }
+                    "library_dir" if !v.is_empty() => {
+                        // 受管库根（D23-A）；同 `download_dir`，旧值里的 `~` 在读取期展开。
+                        cfg.library_dir = Some(orig_core::paths::expand_tilde(v))
+                    }
                     "max_connections" => {
                         if let Ok(n) = v.parse() { cfg.max_connections = n; }
                     }
@@ -281,6 +292,15 @@ impl Config {
         if let Ok(d) = std::env::var("SURGE_DOWNLOAD_DIR") {
             if !d.is_empty() {
                 cfg.download_dir = Some(orig_core::paths::expand_tilde(&d));
+            }
+        }
+        // 受管库根（D23-A）：设置页保存「库根目录」时同步写入；`ORIG_TG_LIBRARY_DIR`
+        // 作为兼容别名（M1 把库根迁入 daemon 之前，TG 侧用的就是这个名字）。
+        if let Ok(d) = std::env::var("ORIG_DAEMON_LIBRARY_DIR")
+            .or_else(|_| std::env::var("ORIG_TG_LIBRARY_DIR"))
+        {
+            if !d.is_empty() {
+                cfg.library_dir = Some(orig_core::paths::expand_tilde(&d));
             }
         }
         if let Ok(m) = std::env::var("SURGE_MAX_CONNECTIONS") {
@@ -426,6 +446,40 @@ impl Config {
         Ok(out)
     }
 
+    /// 保存受管库根（顶层键 `library_dir`）：运行时生效 + 持久化到 `download-engine.toml`。
+    ///
+    /// 与 [`Config::save_download_dir`] 同构（顶层键、正斜杠、空值删行）。D23-A⑥：
+    /// 「TG 库根与下载库根同属一个受管 library_root（设置一处可配）」—— 设置页保存
+    /// 「库根目录」时同步写入 daemon 与 TG，二者共用同一值。
+    pub fn save_library_dir(&self, path: &str) -> std::io::Result<String> {
+        let existing = std::fs::read_to_string(path).unwrap_or_default();
+        let value = self
+            .library_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let mut out = String::new();
+        let mut written = false;
+        for raw in existing.lines() {
+            let line = raw.trim_end();
+            let trimmed = line.trim();
+            if trimmed.starts_with("library_dir") && trimmed.contains('=') {
+                if !value.is_empty() {
+                    out.push_str(&format!("library_dir = \"{value}\"\n"));
+                    written = true;
+                }
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        if !written && !value.is_empty() {
+            out = format!("library_dir = \"{value}\"\n{out}");
+        }
+        std::fs::write(path, &out)?;
+        Ok(out)
+    }
+
     /// 将代理配置持久化到 `download-engine.toml` 的 `[proxy]` 段（保留其它段）。
     /// 返回写出的完整文本。
     pub fn save_proxy(&self, path: &str) -> std::io::Result<String> {
@@ -534,16 +588,36 @@ pub fn default_download_dir() -> PathBuf {
     orig_core::paths::default_download_dir()
 }
 
+/// 手动下载在受管库根下的子目录名（D23-A①）。
+pub const MANUAL_DOWNLOAD_SUBDIR: &str = "下载";
+
+/// 手动下载的**默认根**（D23-A①）—— 三层链里「配置 download_dir 为空」那一层。
+///
+/// 库根已配置 → `<库根>/下载/`；库根也未配置（老库 / 未初始化）→ 平台默认目录。
+///
+/// **为什么不是直接把 `download_dir` 的默认值改成库根**：那会把「用户显式配过系统
+/// Downloads」与「从未配置」两种状态混为一谈。D23-A 的迁移红线是**只改未配置者的
+/// 默认回退**，已配过的必须尊重 —— 故默认值放在解析链末端，而不是写进 `Config`。
+pub fn manual_download_root(cfg: &Config) -> PathBuf {
+    match cfg.library_dir.as_ref() {
+        Some(lib) => lib.join(MANUAL_DOWNLOAD_SUBDIR),
+        None => default_download_dir(),
+    }
+}
+
 /// Three-layer resolution: request dir → config download_dir → platform default
 /// directory. A leading `~` in either the request or the config is expanded to
 /// the real home directory, so a literal tilde never reaches the filesystem.
 /// Only when all three are empty does it fall back to the current directory.
+///
+/// D23-A①: the third layer is `<library_dir>/下载/` when a managed library root
+/// is configured; the platform default is the last resort.
 pub fn resolve_output(req_dir: Option<&str>, cfg: &Config, filename: &str) -> PathBuf {
     let base = req_dir
         .filter(|s| !s.is_empty())
         .map(orig_core::paths::expand_tilde)
         .or_else(|| cfg.download_dir.as_deref().map(orig_core::paths::expand_tilde_path))
-        .unwrap_or_else(default_download_dir);
+        .unwrap_or_else(|| manual_download_root(cfg));
     base.join(filename)
 }
 
@@ -572,7 +646,7 @@ pub fn resolve_output_classified(
         .download_dir
         .as_deref()
         .map(orig_core::paths::expand_tilde_path)
-        .unwrap_or_else(default_download_dir);
+        .unwrap_or_else(|| manual_download_root(cfg));
     let category = cfg.classify.classify(filename);
     base.join(category).join(filename)
 }
@@ -757,5 +831,114 @@ mod tests {
         let d = default_download_dir();
         assert!(!d.as_os_str().is_empty());
         assert!(!d.to_string_lossy().contains('~'), "got {}", d.display());
+    }
+
+    // ---- T08 / D23-A①：手动下载默认根回退 `<库根>/下载/` ----
+
+    fn cfg_with_dirs(download: Option<&str>, library: Option<&str>) -> Config {
+        Config {
+            download_dir: download.map(PathBuf::from),
+            library_dir: library.map(PathBuf::from),
+            ..Config::default()
+        }
+    }
+
+    /// 未配置 `download_dir` + 已配置库根 → 默认根 = `<库根>/下载/`（D23-A① 主断言）。
+    #[test]
+    fn unset_download_dir_falls_back_to_library_download_root() {
+        let cfg = cfg_with_dirs(None, Some("D:/lib"));
+        let p = resolve_output(None, &cfg, "a.bin");
+        assert_eq!(p, PathBuf::from("D:/lib").join(MANUAL_DOWNLOAD_SUBDIR).join("a.bin"));
+        // 分类开启时同样落到 `<库根>/下载/<分类>/`。
+        let p2 = resolve_output_classified(None, &cfg, "a.mp4", true);
+        assert_eq!(
+            p2,
+            PathBuf::from("D:/lib")
+                .join(MANUAL_DOWNLOAD_SUBDIR)
+                .join("Videos")
+                .join("a.mp4")
+        );
+    }
+
+    /// 显式配置过 `download_dir` 的**必须尊重** —— 库根不得覆盖它（D23-A 迁移红线）。
+    #[test]
+    fn explicit_download_dir_is_not_overridden_by_library() {
+        let cfg = cfg_with_dirs(Some("D:/mydl"), Some("D:/lib"));
+        let p = resolve_output(None, &cfg, "a.bin");
+        assert_eq!(p, PathBuf::from("D:/mydl").join("a.bin"));
+        // 分类开启时，分类子目录挂在**显式目录**下，而非库根/下载。
+        let p2 = resolve_output_classified(None, &cfg, "a.zip", true);
+        assert_eq!(p2, PathBuf::from("D:/mydl").join("Archives").join("a.zip"));
+    }
+
+    /// 库根也未配置（老库/未初始化）→ 回退平台默认目录（非字面 `~/Downloads`，BUG-071）。
+    #[test]
+    fn manual_download_root_without_library_is_platform_default() {
+        let cfg = cfg_with_dirs(None, None);
+        assert_eq!(manual_download_root(&cfg), default_download_dir());
+    }
+
+    /// 任务显式指定目录时，分类开关与库根都不介入（D16/D23：显式优先、不分类）。
+    #[test]
+    fn explicit_req_dir_ignores_library_root_and_classify() {
+        let cfg = cfg_with_dirs(None, Some("D:/lib"));
+        let p = resolve_output_classified(Some("E:/pick"), &cfg, "a.mp4", true);
+        assert_eq!(p, PathBuf::from("E:/pick").join("a.mp4"));
+    }
+
+    /// `library_dir` 持久化 roundtrip：写入后重新加载一致，且不动其它顶层键。
+    #[test]
+    fn save_library_dir_roundtrip_preserves_other_keys() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("orig-daemon-libdir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("download-engine.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"download_dir = \"D:/dl\"\nport = 9999\n").unwrap();
+        drop(f);
+
+        let mut cfg = Config::load_from(path.to_str().unwrap());
+        cfg.library_dir = Some(PathBuf::from("D:/My Library"));
+        cfg.save_library_dir(path.to_str().unwrap()).unwrap();
+
+        let txt = std::fs::read_to_string(&path).unwrap();
+        assert!(txt.contains("library_dir = \"D:/My Library\""), "value written: {txt}");
+        assert!(txt.contains("download_dir = \"D:/dl\""), "other top-level key preserved");
+        assert!(txt.contains("port = 9999"), "other top-level key preserved");
+        assert_eq!(txt.matches("library_dir").count(), 1, "no duplicate key: {txt}");
+
+        let cfg2 = Config::load_from(path.to_str().unwrap());
+        assert_eq!(cfg2.library_dir, Some(PathBuf::from("D:/My Library")));
+        // 库根 + 未配 download_dir 时，默认根随之变为 `<库根>/下载/`。
+        assert_eq!(
+            manual_download_root(&cfg2),
+            PathBuf::from("D:/My Library").join(MANUAL_DOWNLOAD_SUBDIR)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 清空库根（保存空值）→ 删除该行，回退平台默认。
+    #[test]
+    fn save_library_dir_empty_removes_key() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("orig-daemon-libdir-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("download-engine.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"library_dir = \"D:/old\"\nport = 9999\n").unwrap();
+        drop(f);
+
+        let mut cfg = Config::load_from(path.to_str().unwrap());
+        cfg.library_dir = None;
+        cfg.save_library_dir(path.to_str().unwrap()).unwrap();
+
+        let txt = std::fs::read_to_string(&path).unwrap();
+        assert!(!txt.contains("library_dir"), "key must be removed: {txt}");
+        assert!(txt.contains("port = 9999"), "other key preserved");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

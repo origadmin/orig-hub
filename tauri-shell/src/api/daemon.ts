@@ -107,6 +107,16 @@ export interface DaemonConfig {
   /** daemon 实际监听端口（可能与起始端口不同：保留区顺延，BUG-178）。真源。 */
   port?: number
   download_dir: string | null
+  /**
+   * 受管库根（D23-A⑥）：与 TG 侧 `libraryDir` 共用同一值，设置页保存「库根目录」时两端同步写。
+   * null = 未配置（老库/未初始化）。
+   */
+  library_dir: string | null
+  /**
+   * 手动下载**未配置** `download_dir` 时的实际默认根（D23-A①）= `<库根>/下载/`；
+   * 库根也未配置则平台默认。前端用它作占位，不自己拼路径。
+   */
+  manual_download_root: string
   /** 系统默认下载目录（按 OS 解析：Windows 为 C:\Users\<user>\Downloads，非 ~/Downloads）。前端未显式设置时作占位/回退。 */
   default_download_dir: string
   max_connections: number
@@ -199,6 +209,24 @@ export function saveDownloadConfig(req: { dir: string }): Promise<{
   default_download_dir: string
 }> {
   return request('/api/config/download', {
+    method: 'PUT',
+    body: JSON.stringify(req),
+  })
+}
+
+/**
+ * PUT /api/config/library — 保存受管库根（运行时生效 + 持久化）。
+ *
+ * D23-A⑥：设置页保存「库根目录」时**同时**写 daemon 与 TG（M1 把库根迁入 daemon 之前
+ * TG 仍是权威存储）。保存后，未显式配置 `download_dir` 的手动下载默认根随之变为
+ * `<库根>/下载/`（D23-A①）。`dir` 传空串 = 清除设置。
+ */
+export function saveLibraryConfig(req: { dir: string }): Promise<{
+  ok: boolean
+  library_dir: string | null
+  manual_download_root: string
+}> {
+  return request('/api/config/library', {
     method: 'PUT',
     body: JSON.stringify(req),
   })
