@@ -297,7 +297,7 @@ export function TgPanel(
   } = {},
 ) {
   const { t } = useTranslation()
-  const { setError, openViewer, tgService, tgLink, accounts, refreshTgState } = useStore()
+  const { setError, setToast, openViewer, tgService, tgLink, accounts, refreshTgState } = useStore()
   /**
    * BUG-305：媒体库 → TG 面板的跳转焦点（`pendingMediaFocus` 的正向对应）。
    *
@@ -1402,7 +1402,12 @@ export function TgPanel(
    */
   const doDownload = async (item: FeedItem) => {
     try {
-      await enqueueCacheTask({ chatId: item.chatId, messageIds: [item.messageId] })
+      const res = await enqueueCacheTask({ chatId: item.chatId, messageIds: [item.messageId] })
+      // BUG-308（D22-A②）：该条已入库（字节在盘）⇒ 后端拦下，不重下、不新建任务行。
+      if (res.alreadyIngested) {
+        setToast(t('tg.alreadyIngested'))
+        return
+      }
       await refreshCacheTasks()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -1418,11 +1423,16 @@ export function TgPanel(
   const downloadAlbum = async (items: FeedItem[]) => {
     if (items.length === 0) return
     try {
-      await enqueueCacheTask({
+      const res = await enqueueCacheTask({
         chatId: items[0].chatId,
         messageIds: items.map((it) => it.messageId),
         groupId: items[0].groupId,
       })
+      // BUG-308（D22-A②）：整组已入库 ⇒ 后端拦下（零字节重下、零新任务行）。
+      if (res.alreadyIngested) {
+        setToast(t('tg.alreadyIngested'))
+        return
+      }
       await refreshCacheTasks()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))

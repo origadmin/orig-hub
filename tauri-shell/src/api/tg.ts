@@ -417,15 +417,20 @@ export async function getCacheTasksForItems(
 
 /**
  * POST /api/tg/cache/tasks — 入队缓存任务。
- * 幂等：同 key 已有活跃任务时后端复用该任务，不重复下载。
+ *
+ * 幂等分两层（D22-A② / BUG-308）：
+ *  - 同 key 已有**活跃**任务 ⇒ 后端复用该任务，不重复下载；
+ *  - 该批消息**已入库**（`media_item` source+ref 存在且字节在盘）⇒ 后端拦下，
+ *    返回 `{ alreadyIngested: true }`（零字节重下、零新任务行）；调用方据此提示「已入库」。
+ *
  * 传 `groupId` 表示整组（相册）缓存；缺省为单条。
  */
 export async function enqueueCacheTask(opts: {
   chatId: number
   messageIds: number[]
   groupId?: number
-}): Promise<TgCacheTask> {
-  return request<TgCacheTask>('/api/tg/cache/tasks', {
+}): Promise<TgCacheTask & { alreadyIngested?: boolean }> {
+  return request<TgCacheTask & { alreadyIngested?: boolean }>('/api/tg/cache/tasks', {
     method: 'POST',
     body: JSON.stringify({
       chatId: opts.chatId,

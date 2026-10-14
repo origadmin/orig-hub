@@ -278,6 +278,8 @@ interface DownloadState {
   applyInterfaces: () => Promise<void>
   setError: (e: string | null) => void
   clearToast: () => void
+  /** 全局瞬时提示（信息/成功类）：失败走 `setError`，信息类不该被染成错误样式。 */
+  setToast: (msg: string) => void
 }
 
 export const useStore = create<DownloadState>((set, get) => ({
@@ -544,6 +546,7 @@ export const useStore = create<DownloadState>((set, get) => ({
 
   setError: (e) => set({ error: e, toast: e }),
   clearToast: () => set({ toast: null }),
+  setToast: (msg) => set({ toast: msg }),
 
   viewer: null,
   openViewer: (v) => set({ viewer: v }),

@@ -1194,6 +1194,81 @@ impl Store {
         }
     }
 
+    /// BUG-308（D22-A②）：查一批消息在**历史认领**中的状态。
+    ///
+    /// 返回 `(message_id, exists, has_bytes)`：`media_item(source='tg', ref='{chat}:{msg}')`
+    /// 是否已存在，以及它是否已有字节（`file_path IS NOT NULL`，与媒体库 `has_bytes`
+    /// 同谓词）。入队前用它把「已入库」的重复入队拦下来 —— 旧去重只看**活跃任务**
+    /// （queued/running），任务一旦终态，同一批消息可被再次入队，重复下载字节并新增
+    /// 一条 cache_task 索引（用户口径：入库 = TG 插件下载的索引）。
+    pub async fn claimed_messages(
+        &self,
+        chat_id: i64,
+        message_ids: &[i64],
+    ) -> libsql::Result<Vec<(i64, bool, bool)>> {
+        let mut out = Vec::with_capacity(message_ids.len());
+        for m in message_ids {
+            let ref_key = format!("{chat_id}:{m}");
+            let row = self
+                .row_opt(
+                    "SELECT file_path IS NOT NULL FROM media_item \
+                     WHERE source = 'tg' AND ref = ?1",
+                    params![ref_key],
+                )
+                .await?;
+            match row {
+                Some(r) => out.push((*m, true, r.get::<i64>(0)? != 0)),
+                None => out.push((*m, false, false)),
+            }
+        }
+        Ok(out)
+    }
+
+    /// BUG-308（D22-A②）：把「历史认领」的任务行复位重跑（补字节），**不新建行**。
+    ///
+    /// 只认**覆盖了给定任一消息**的最近一条任务（含终态）；复位为 `queued`、清 `done`
+    /// 与 `error`，语义与 [`Store::retry_cache_task`] 同（复用同一 id、同一入库记录）。
+    /// 找不到返回 `None`（调用方回退到常规入队）。
+    pub async fn requeue_task_covering(
+        &self,
+        chat_id: i64,
+        message_ids: &[i64],
+    ) -> libsql::Result<Option<CacheTask>> {
+        if message_ids.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = message_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT {CACHE_TASK_COLS} FROM cache_task \
+             WHERE chat_id = ? \
+               AND EXISTS (SELECT 1 FROM json_each(cache_task.items) \
+                            WHERE json_each.value IN ({placeholders})) \
+             ORDER BY id DESC LIMIT 1"
+        );
+        let mut params: Vec<libsql::Value> = Vec::with_capacity(message_ids.len() + 1);
+        params.push(chat_id.into());
+        for m in message_ids {
+            params.push((*m).into());
+        }
+        let mut rows = self.conn.query(&sql, params).await?;
+        let Some(r) = rows.next().await? else {
+            return Ok(None);
+        };
+        let id: i64 = r.get(0)?;
+        self.conn
+            .execute(
+                "UPDATE cache_task SET status='queued', done=0, error=NULL, updated_at=?1 \
+                 WHERE id=?2",
+                params![now(), id],
+            )
+            .await?;
+        self.get_cache_task(id).await
+    }
+
     /// 按条目查其缓存任务态（BUG-279）。
     ///
     /// 媒体库未缓存条目需要展示「排队 / 正在下 / 上次失败（原因）/ 被取消 /

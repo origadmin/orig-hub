@@ -1282,6 +1282,56 @@ async fn enqueue_cache_task(
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "messageIds is empty"));
     }
     let dir = resolve_cache_dir(&st, req.dir).await;
+    // BUG-308（D22-A②）：去重窗口从「活跃任务」扩到**历史认领**。
+    //
+    // 无活跃任务覆盖时先查该批消息是否已登记入库（`media_item` source+ref）：
+    //   ① 全部已登记且字节在盘 ⇒ 整批已入库 ⇒ 拦下（零字节重下、零新 `cache_task` 行）；
+    //   ② 全部已登记但部分字节已失 ⇒ **复用原入库记录**（复位重跑补字节，不新建索引行）；
+    //   ③ 部分/全部未登记 ⇒ 走常规入队（worker 对已有条目幂等跳过，只补缺的）。
+    //
+    // 旧实现只在 `enqueue_cache_task` 内部查**活跃**任务（queued/running），任务终态后
+    // 同一批消息可被再次入队 ⇒ 重复下载字节 + 第二条入库索引（用户口径：入库 = TG
+    // 插件下载的索引，见 BUG-308）。
+    let active = st
+        .store
+        .active_cache_task_covering(req.chat_id, &req.message_ids)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    if active.is_none() {
+        let claims = st
+            .store
+            .claimed_messages(req.chat_id, &req.message_ids)
+            .await
+            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        let all_claimed = !claims.is_empty() && claims.iter().all(|(_, exists, _)| *exists);
+        if all_claimed {
+            let bytes_all = claims.iter().all(|(_, _, has)| *has);
+            if bytes_all {
+                return Ok(Json(json!({
+                    "alreadyIngested": true,
+                    "chatId": req.chat_id,
+                    "messageIds": req.message_ids,
+                })));
+            }
+            // 只补**字节已失**的那几条所在的最近任务（不是「任意覆盖」），避免复位到
+            // 一个不含缺字节条目的任务上白跑。
+            let missing: Vec<i64> = claims
+                .iter()
+                .filter(|(_, _, has)| !*has)
+                .map(|(m, _, _)| *m)
+                .collect();
+            if let Some(task) = st
+                .store
+                .requeue_task_covering(req.chat_id, &missing)
+                .await
+                .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+            {
+                st.refresh_cache_tasks().await;
+                spawn_cache_task(st.clone(), task.id);
+                return Ok(Json(json!(task)));
+            }
+        }
+    }
     // 去重键：整组按 (chat, group)，单条按 (chat, message)。
     let item_key = match req.group_id {
         Some(g) => format!("g:{}:{}", req.chat_id, g),
@@ -1322,7 +1372,7 @@ async fn enqueue_cache_task(
             register_enqueued_items(&st_bg, chat_id, &msg_ids).await;
         });
     }
-    Ok(Json(task))
+    Ok(Json(json!(task)))
 }
 
 /// BUG-181：任务 JSON 注入条目内字节进度（仅 `running` 且字节归属当前任务时）。
@@ -2306,32 +2356,24 @@ impl IngestCtx {
         };
         // BUG-152：剧集名由 caption 的**规范化剧集名**（去集号）决定；无 caption
         //（或首行为空）才回退「频道名 · 日期」；剥完为空同样回退（空标题不可辨识）。
-        let title = match title {
-            Some(t) => normalized_series_name(&t),
-            None => {
-                let base = channel_title(st, self.chat_id)
-                    .await
-                    .unwrap_or_else(|| format!("TG {}", self.chat_id));
-                format!("{base} · {}", ymd_str(self.created_at as u64))
-            }
-        };
-        let title = if title.trim().is_empty() {
+        let norm = title.as_deref().map(normalized_series_name).unwrap_or_default();
+        let title = if norm.trim().is_empty() {
             let base = channel_title(st, self.chat_id)
                 .await
                 .unwrap_or_else(|| format!("TG {}", self.chat_id));
             format!("{base} · {}", ymd_str(self.created_at as u64))
         } else {
-            title
+            norm.clone()
         };
-        // 幂等键优先用 TG 相册 group_id（与入队去重键 `g:{chat}:{group}` 同源）；
-        // 退化时用首条消息号（旧实现同款）。
-        let key = match self.task_group {
-            Some(g) => format!("tg:group:{}:{}", self.chat_id, g),
-            None => {
-                let first = self.task_msgs.first().copied().unwrap_or(0);
-                format!("tg:msgs:{}:{}", self.chat_id, first)
-            }
-        };
+        // D22-A①（BUG-292）：幂等键统一为**规范化剧名**，相册 `group_id` 只作退化兜底。
+        // 旧实现按 `task.group_id` 有无二选一 —— 同一部剧分批缓存两次入库键不等，
+        // 于是裂成两部（实测生产库 3→5 对）。
+        let key = episodic_group_key(
+            self.chat_id,
+            &norm,
+            self.task_group,
+            self.task_msgs.first().copied().unwrap_or(0),
+        );
         match st.store.find_series_by_source_key(&key).await {
             Ok(Some(sid)) => {
                 // BUG-152：追加批次**不静默覆盖**已有标题；留痕便于诊断候选与现状差异。
@@ -3827,6 +3869,35 @@ pub(crate) fn normalized_series_name(title_line: &str) -> String {
             }
         }
         None => title_line.trim().to_string(),
+    }
+}
+
+/// D22-A①（BUG-292/296/297）：episodic 组的**唯一幂等键**。
+///
+/// 首选**规范化剧名**（`tg:named:{chat}:{name}`）——同一部剧分批缓存（EP1-5 今天、
+/// EP6-10 下周）只要剧名一致就落同一部，不再因「本次任务有没有带 `group_id`」而分裂。
+/// 旧实现按 `task.group_id` 有无二选一（`tg:group:` / `tg:msgs:`），两次入库键不等 ⇒
+/// 同一相册裂成两部（实测生产库 3→5 对，见 BUG-292）。
+///
+/// 剧名不可得（无 caption，或 caption 整行就是集号）时依次退化：相册 `group_id` →
+/// 首条消息号。**退化路径不是主路径**：它只保证「没有剧名的相册」仍能归组，不参与
+/// 正常追剧场景。
+///
+/// **不禁止同名**：键含 `chat_id`，跨频道同名各自成剧、同频道同名幂等同一部；
+/// 误并（同频道同名实为两部）走人工「拆剧」，不做自动冲突弹窗（D22-A⑥）。
+pub(crate) fn episodic_group_key(
+    chat_id: i64,
+    normalized_name: &str,
+    group_id: Option<i64>,
+    first_msg: i64,
+) -> String {
+    let name = normalized_name.trim();
+    if !name.is_empty() {
+        format!("tg:named:{chat_id}:{name}")
+    } else if let Some(g) = group_id {
+        format!("tg:group:{chat_id}:{g}")
+    } else {
+        format!("tg:msgs:{chat_id}:{first_msg}")
     }
 }
 
@@ -10282,6 +10353,13 @@ mod tests {
             .upsert_media_item("tg", "v:389", "新条目", "video", None, None, None, None)
             .await
             .unwrap();
+        // 第三个独立条目：D22-A④ 起 `media_episode UNIQUE(item_id)` 规定一个条目全局只属
+        // 一集，⑤ 的「另一季另一个槽」必须换一条目，否则会撞 item 唯一键而非槽位键。
+        let another = st
+            .store
+            .upsert_media_item("tg", "v:388", "第三条目", "video", None, None, None, None)
+            .await
+            .unwrap();
         st.store.add_episode(sid, original, 1, 1).await.unwrap();
         let before = st.store.episode_slot_occupant(sid, 1, 1).await.unwrap().unwrap();
         assert_eq!(before.item_id, original, "前置：S1E1 先归原条目 390");
@@ -10351,11 +10429,14 @@ mod tests {
         assert_eq!(overwritten.episode_id, before.episode_id, "覆盖落在同一行（upsert）");
 
         // ④ 空槽不受影响：BUG-129 的闸只拦「已占用」，不得把正常加入一起拦掉
+        //
+        // 用 `original`（被 ③ 顶下、此刻**无归属**）而非 `newcomer`：D22-A④ 起
+        // `media_episode UNIQUE(item_id)` 规定一个条目全局只属一集，`newcomer` 已在 S1E1。
         let fresh = add_media_episode(
             State(st.clone()),
             Path(sid),
             Json(EpisodeReq {
-                item_id: newcomer,
+                item_id: original,
                 season: None,
                 episode_no: Some(9), // 空槽
                 overwrite: None,
@@ -10365,12 +10446,13 @@ mod tests {
         .expect("BUG-129: 空槽必须照常写入 —— 闸只拦已占用槽位");
         assert_eq!(fresh.into_response().status(), StatusCode::OK);
 
-        // ⑤ 季参与键：S2E1 是另一个槽，即使 S1E1 被占也不该报冲突
+        // ⑤ 季参与键：S2E1 是另一个槽，即使 S1E1 被占也不该报冲突。
+        //    换用 `another`（独立条目）—— `original` 此刻已归 S1E9，见上条注释。
         let _ = add_media_episode(
             State(st.clone()),
             Path(sid),
             Json(EpisodeReq {
-                item_id: original,
+                item_id: another,
                 season: Some(2),
                 episode_no: Some(1),
                 overwrite: None,

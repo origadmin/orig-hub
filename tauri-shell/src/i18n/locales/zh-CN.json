@@ -210,6 +210,7 @@
   "accounts.diagFail": "无法连接诊断接口，请确认 orig-tg 已启动",
   "tg.toggle": "Telegram 插件",
   "tg.toggleHint": "启用后随 daemon 启动 orig-tg 服务并注入主配置代理；关闭即终止并隐藏 TG 模块",
+  "tg.alreadyIngested": "已入库，无需重复下载",
   "tg.running": "运行中",
   "tg.starting": "启动中",
   "tg.stopped": "已停止",

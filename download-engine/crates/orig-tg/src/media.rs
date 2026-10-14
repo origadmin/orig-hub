@@ -536,6 +536,126 @@ async fn backfill_episode_desc_inherit(conn: &Connection) -> libsql::Result<(usi
     Ok((filled, per_series.into_iter().collect()))
 }
 
+/// BUG-292/297（D22-A④）：`media_episode` 的 `UNIQUE(item_id)` 上线前，先收敛存量**双认领**。
+///
+/// 同一 `media_item` 被两条 `media_episode` 同时认领（实测生产库 3→5 对重复剧集）时，
+/// 直接加唯一索引会失败。收敛规则（确定性、不丢条目、不删用户数据）：
+///
+/// - **主认领** = `series_id` 最小、其次 `episode_no` 最小、再次 `id` 最小的那一条；
+/// - 其余认领：条目是 `video` ⇒ 降级为**备用源** `media_episode_source`（同槽多源，
+///   BUG-284 语义，`INSERT OR IGNORE` 幂等）；否则（`photo`）⇒ 直接删除该认领
+///   （图片是浏览位，走 `media_episode_image`，不需要独立槽位）；
+/// - 因收敛而**清空**的剧集（0 分集且 0 挂图、且是自动剧集 `source_key IS NOT NULL`）
+///   ⇒ 删除（双挂收敛为单挂 —— BUG-292 的「重复剧集 → 0」）；**手工剧集不动**
+///   （`source_key IS NULL` 的用户自建剧集即便暂时空着也不删）。
+///
+/// **幂等**：加索引后不可能再有重复，重复跑是空操作（`dup_ids` 为空即早退）。
+async fn converge_duplicate_episode_claims(conn: &Connection) -> libsql::Result<(usize, usize)> {
+    let dup_ids: Vec<i64> = {
+        let stmt = conn
+            .prepare("SELECT item_id FROM media_episode GROUP BY item_id HAVING COUNT(*) > 1")
+            .await?;
+        let mut rows = stmt.query(()).await?;
+        let mut v = Vec::new();
+        while let Some(r) = rows.next().await? {
+            v.push(r.get(0)?);
+        }
+        v
+    };
+    if dup_ids.is_empty() {
+        return Ok((0, 0));
+    }
+    let mut touched: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut converged = 0usize;
+    for item_id in &dup_ids {
+        let rows: Vec<(i64, i64)> = {
+            let stmt = conn
+                .prepare(
+                    "SELECT id, series_id FROM media_episode \
+                     WHERE item_id = ?1 ORDER BY series_id ASC, episode_no ASC, id ASC",
+                )
+                .await?;
+            let mut rs = stmt.query(params![*item_id]).await?;
+            let mut v = Vec::new();
+            while let Some(r) = rs.next().await? {
+                v.push((r.get::<i64>(0)?, r.get::<i64>(1)?));
+            }
+            v
+        };
+        let Some((keep_ep, _keep_series)) = rows.first().copied() else {
+            continue;
+        };
+        let kind: Option<String> = {
+            let stmt = conn
+                .prepare("SELECT kind FROM media_item WHERE id = ?1")
+                .await?;
+            let mut rs = stmt.query(params![*item_id]).await?;
+            match rs.next().await? {
+                Some(r) => r.get::<Option<String>>(0)?,
+                None => None,
+            }
+        };
+        for (ep_id, series_id) in rows.iter().skip(1) {
+            if kind.as_deref() == Some("video") {
+                // 同槽多源：主认领那一集保留该条目为**备用源**（BUG-284 语义）。
+                conn.execute(
+                    "INSERT OR IGNORE INTO media_episode_source (episode_id, item_id, created_at) \
+                     VALUES (?1, ?2, ?3)",
+                    params![keep_ep, *item_id, now_secs()],
+                )
+                .await?;
+            }
+            conn.execute("DELETE FROM media_episode WHERE id = ?1", params![*ep_id])
+                .await?;
+            touched.insert(*series_id);
+            converged += 1;
+        }
+    }
+    let mut pruned = 0usize;
+    for sid in touched {
+        let remaining: i64 = {
+            let stmt = conn
+                .prepare(
+                    "SELECT (SELECT COUNT(*) FROM media_episode WHERE series_id = ?1) \
+                          + (SELECT COUNT(*) FROM media_episode_image i \
+                              JOIN media_episode e ON e.id = i.episode_id \
+                             WHERE e.series_id = ?1)",
+                )
+                .await?;
+            let mut rs = stmt.query(params![sid]).await?;
+            match rs.next().await? {
+                Some(r) => r.get::<i64>(0)?,
+                None => 0,
+            }
+        };
+        if remaining != 0 {
+            continue;
+        }
+        let source_key: Option<String> = {
+            let stmt = conn
+                .prepare("SELECT source_key FROM media_series WHERE id = ?1")
+                .await?;
+            let mut rs = stmt.query(params![sid]).await?;
+            match rs.next().await? {
+                Some(r) => r.get::<Option<String>>(0)?,
+                None => None,
+            }
+        };
+        // 只有**自动**剧集（有 source_key）才剪枝；用户手工建的剧集不动。
+        if source_key.is_some() {
+            conn.execute(
+                "DELETE FROM media_series_tag WHERE series_id = ?1",
+                params![sid],
+            )
+            .await?;
+            conn.execute("DELETE FROM media_series WHERE id = ?1", params![sid])
+                .await?;
+            pruned += 1;
+        }
+    }
+    Ok((converged, pruned))
+}
+
 /// 建表（幂等）。与 TG 流水表同库，表名统一 `media_*` 前缀但语义独立。
 pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
     conn.execute_batch(
@@ -936,6 +1056,26 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
     conn.execute(
         "DELETE FROM media_episode_source
           WHERE episode_id NOT IN (SELECT id FROM media_episode)",
+        (),
+    )
+    .await?;
+
+    // ── BUG-292/297（D22-A④）：条目**只能被一条分集认领** ──
+    //
+    // 缺陷原形：`media_episode` 只有 `UNIQUE(series_id, season, episode_no)`，没有
+    // `UNIQUE(item_id)` ⇒ 同一个 `media_item` 可同时被两部剧的分集认领（实测生产库
+    // 3→5 对重复剧集、12 条双认领条目）。直接加唯一索引会在存量重复上失败，故
+    // **先收敛再加约束**（AGENTS §D7：schema 变更必须配「旧库→新代码」迁移）。
+    let (converged, pruned) = converge_duplicate_episode_claims(conn).await?;
+    if converged > 0 || pruned > 0 {
+        eprintln!(
+            "[media] duplicate episode claims converged (one-time): \
+             {converged} claim(s) dropped, {pruned} empty auto series pruned"
+        );
+    }
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_episode_item_unique \
+             ON media_episode(item_id)",
         (),
     )
     .await?;
@@ -3080,6 +3220,15 @@ impl Store {
                     (base, end)
                 };
 
+                // D22-A④（BUG-292）：`media_episode` 有 `UNIQUE(item_id)` —— 条目全局只属
+                // 一集。源剧集里该条目的分集行**必须先撤**，否则目标 INSERT 会与它冲突
+                // （合并语义不变：条目最终落在目标，源行本就要删，只是提前到插入之前）。
+                self.conn
+                    .execute(
+                        "DELETE FROM media_episode WHERE series_id = ?1 AND item_id = ?2",
+                        params![source_id, *item_id],
+                    )
+                    .await?;
                 // 刻意用纯 INSERT 而非 `add_episode`（后者带 ON CONFLICT DO UPDATE）：
                 // 集号若算错，宁可撞唯一约束让整个事务回滚，也**绝不能静默覆盖**目标已有分集。
                 self.conn
@@ -3354,6 +3503,28 @@ impl Store {
         self.append_episodes_ranged(series_id, season, &items).await
     }
 
+    /// 已被**任何**分集认领的条目 id 子集（D22-A④ 的全局不变量：一个条目全局只属一集）。
+    ///
+    /// 与 `season_item_ids` 的区别：后者只覆盖本剧集本季（`UNIQUE(series_id,season,episode_no)`
+    /// 的粒度），本函数覆盖**全库**。`media_episode UNIQUE(item_id)` 落地后，跨剧集 / 跨季的
+    /// 重复追加不再表现为「多一条分集」，而是唯一约束报错 —— 用本查询把它降级为**跳过**，
+    /// 与既有的季内幂等去重同一语义（自动路径不因重复缓存而报错）。
+    async fn claimed_item_ids(&self, item_ids: &[i64]) -> libsql::Result<HashSet<i64>> {
+        if item_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let placeholders = item_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql =
+            format!("SELECT DISTINCT item_id FROM media_episode WHERE item_id IN ({placeholders})");
+        let params: Vec<libsql::Value> = item_ids.iter().map(|i| (*i).into()).collect();
+        let mut rows = self.conn.query(&sql, params).await?;
+        let mut out = HashSet::new();
+        while let Some(r) = rows.next().await? {
+            out.insert(r.get::<i64>(0)?);
+        }
+        Ok(out)
+    }
+
     /// 带范围的批量追加（BUG-039）：每个条目可声明占用区间 `(item_id, Some(end))`，
     /// 未声明视为单集。槽位分配规则：
     ///   - 已声明区间的条目：区间不与任何已占/本轮已分配区间重叠 → 落在声明位；
@@ -3393,16 +3564,18 @@ impl Store {
         // 幂等（BUG-031）：同一**季**内跳过已收录条目 —— 重复缓存/重复入队不会把同一条目
         // 编成两集（此前会重复 add_episode，剧集里出现重复分集）。
         //
-        // 去重粒度刻意与 `UNIQUE(series_id, season, episode_no)` 对齐（剧集 × 季），
-        // 而不是整个剧集：条目「位置」的唯一性本来就按季定义，同一素材被用户显式放进
-        // 另一季（如 S1 正片 + S2 回顾）是合法编排，不该被全局去重吞掉。
+        // D22-A④ 起再加**全局**去重：`media_episode UNIQUE(item_id)` 规定一个条目全局只属
+        // 一集，跨剧集/跨季的重复追加不再「多一条分集」而是唯一约束报错 —— 故用
+        // `claimed_item_ids` 把它降级为跳过（与季内幂等同语义）。
         let have = self.season_item_ids(series_id, season).await?;
+        let ids: Vec<i64> = items.iter().map(|(id, _)| *id).collect();
+        let claimed = self.claimed_item_ids(&ids).await?;
         // BUG-126：用户摘除过的内容不得被**自动路径**重新编回（否则表现为「删了又回来」）。
         // 按剧集一次取回墓碑集合，避免在候选循环里逐条查库。
         let removed = self.removed_item_ids(series_id).await?;
         let mut added = 0;
         for (id, range) in items {
-            if have.contains(id) {
+            if have.contains(id) || claimed.contains(id) {
                 continue;
             }
             // 墓碑只拦**自动路径**：本函数是自动成剧 / 同组重新缓存的内核。用户显式加入走
@@ -3766,11 +3939,11 @@ impl Store {
     ///
     /// ## 幂等键必须与自动路径**同一把**
     ///
-    /// `tg` 条目从 `cache_task` 反查它属于哪个任务，用与 `ensure_series` **逐字相同**的键
-    /// （`tg:group:{chat}:{group_id}`，无 group 时退化 `tg:msgs:{chat}:{首条}`）。
-    /// 用另一把键（例如一律 `item:{id}`）会让同一条内容在自动路径重建时**裂成两个剧集**
-    /// —— 正是 BUG-292 的形态。其余来源（`local` / `http` / …）用 `item:{id}`：
-    /// 一次导入就是**一个单集剧集**（用户口径的直接翻译）。
+    /// `tg` 条目从 `cache_task` 反查它属于哪个任务，再按与 `ensure_series` **逐字相同**的
+    /// 规则算键：**规范化剧名优先**（`tg:named:{chat}:{name}`，D22-A①），剧名不可得时
+    /// 退化到相册 `group_id` / 首条消息号。用另一把键（例如一律 `item:{id}`）会让同一条
+    /// 内容在自动路径重建时**裂成两个剧集** —— 正是 BUG-292 的形态。其余来源
+    /// （`local` / `http` / …）用 `item:{id}`：一次导入就是**一个单集剧集**（用户口径的直接翻译）。
     ///
     /// ## 与 BUG-126 墓碑的关系
     ///
@@ -3782,6 +3955,11 @@ impl Store {
             return Ok((0, 0));
         }
         let index = self.cache_task_msg_index().await?;
+        // 组级剧名缓存：`(chat, group, first) -> 规范化剧名`。剧名取自**组内首条非空
+        // caption**（与 `ensure_series` 同一来源），不是各条自己的标题 —— 相册组的 caption
+        // 常只挂在一条消息上，按各条标题算键会把同组裂成多部。
+        let mut name_cache: std::collections::HashMap<(i64, Option<i64>, i64), String> =
+            std::collections::HashMap::new();
         let mut created = 0i64;
         let mut attached = 0i64;
         for &item_id in item_ids {
@@ -3799,13 +3977,37 @@ impl Store {
             let ref_key: String = row.get(1)?;
             let title: String = row.get(2)?;
             let kind: String = row.get(3)?;
+            // D22-A①（BUG-292）：与 `IngestCtx::ensure_series` **同一把**键 —— 规范化剧名
+            // 优先，`group_id` / 首条消息号只作退化兜底。两处规则若分叉，同一条内容会在
+            // 自动路径重建时裂成两个剧集（BUG-292 形态）。
             let key = if source == "tg" {
                 match crate::routes::parse_tg_ref(&ref_key) {
                     Some((chat, msg)) => match index.get(&(chat, msg)) {
-                        Some((Some(group), _)) => format!("tg:group:{chat}:{group}"),
-                        Some((None, first)) => format!("tg:msgs:{chat}:{first}"),
-                        // 不在任何任务里（客户端直传 / 老数据）：退化成「这一条自己一组」。
-                        None => format!("tg:msgs:{chat}:{msg}"),
+                        Some((group, first, msgs)) => {
+                            let ck = (chat, *group, *first);
+                            let name = match name_cache.get(&ck) {
+                                Some(n) => n.clone(),
+                                None => {
+                                    let n = self
+                                        .first_caption(chat, msgs)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                        .as_deref()
+                                        .map(crate::routes::normalized_series_name)
+                                        .unwrap_or_default();
+                                    name_cache.insert(ck, n.clone());
+                                    n
+                                }
+                            };
+                            crate::routes::episodic_group_key(chat, &name, *group, *first)
+                        }
+                        // 不在任何任务里（客户端直传 / 老数据）：用条目自己的标题当剧名，
+                        // 无标题再退化成「这一条自己一组」。
+                        None => {
+                            let name = crate::routes::normalized_series_name(&title);
+                            crate::routes::episodic_group_key(chat, &name, None, msg)
+                        }
                     },
                     None => format!("item:{item_id}"),
                 }
@@ -3892,24 +4094,27 @@ impl Store {
         Ok((found, created, attached, skipped))
     }
 
-    /// `(chat_id, message_id) -> (group_id, 该任务的首条 message_id)` 索引。
+    /// `(chat_id, message_id) -> (group_id, 该任务的首条 message_id, 该任务的全部 message_id)`。
     ///
-    /// 用来给孤儿 `tg` 条目找回「它属于哪个相册」，从而与 [`crate::routes`] 里
-    /// `ensure_series` 用**同一把幂等键**。`cache_task.items` 是客户端扫描后发来的
-    /// 消息 id 数组（JSON），在内存里解析 —— 不在 SQL 里 `LIKE` 拼子串：
-    /// `'%1789%'` 会命中 `17890`，那是**静默错配**。
+    /// 用来给孤儿 `tg` 条目找回「它属于哪个相册」以及**该组的剧名**（取自组内首条非空
+    /// caption），从而与 [`crate::routes`] 里 `ensure_series` 用**同一把幂等键**。
+    /// `cache_task.items` 是客户端扫描后发来的消息 id 数组（JSON），在内存里解析 ——
+    /// 不在 SQL 里 `LIKE` 拼子串：`'%1789%'` 会命中 `17890`，那是**静默错配**。
     ///
     /// 同一条消息被多个任务包含时（重复入队）：**优先带 group 的那个**（更具体），
     /// 同为带 group 时取先创建的。
     async fn cache_task_msg_index(
         &self,
-    ) -> libsql::Result<std::collections::HashMap<(i64, i64), (Option<i64>, i64)>> {
+    ) -> libsql::Result<
+        std::collections::HashMap<(i64, i64), (Option<i64>, i64, std::sync::Arc<Vec<i64>>)>,
+    > {
+        type Entry = (Option<i64>, i64, std::sync::Arc<Vec<i64>>);
         let stmt = self
             .conn
             .prepare("SELECT id, chat_id, group_id, items FROM cache_task ORDER BY id ASC")
             .await?;
         let mut rows = stmt.query(()).await?;
-        let mut map: std::collections::HashMap<(i64, i64), (Option<i64>, i64)> =
+        let mut map: std::collections::HashMap<(i64, i64), Entry> =
             std::collections::HashMap::new();
         while let Some(r) = rows.next().await? {
             let chat: i64 = r.get(1)?;
@@ -3922,12 +4127,14 @@ impl Store {
             let Some(first) = list.first().copied() else {
                 continue;
             };
+            // 组内消息全集（算组级剧名用）——Arc 共享，避免每条消息各克隆一份。
+            let msgs = std::sync::Arc::new(list.clone());
             for m in list {
                 match map.get(&(chat, m)) {
-                    Some((Some(_), _)) => {}
-                    Some((None, _)) if group.is_none() => {}
+                    Some((Some(_), _, _)) => {}
+                    Some((None, _, _)) if group.is_none() => {}
                     _ => {
-                        map.insert((chat, m), (group, first));
+                        map.insert((chat, m), (group, first, msgs.clone()));
                     }
                 }
             }
@@ -5518,6 +5725,96 @@ mod tests {
         assert!(s.item_ids_by_refs("tg", &[]).await.unwrap().is_empty());
     }
 
+    /// BUG-292/297（D22-A④）：`UNIQUE(item_id)` 迁移 —— 存量双认领**先收敛再加约束**。
+    ///
+    /// **反向证伪**：去掉 `converge_duplicate_episode_claims` 调用 ⇒ 唯一索引创建必在
+    /// 存量重复上失败 ⇒ `Store::open` 返回 Err ⇒ 本测试 FAIL。
+    #[tokio::test]
+    async fn duplicate_episode_claims_converge_before_unique_item_index_bug292() {
+        let path = tmp_db("bug292_converge");
+        {
+            let conn = libsql::Builder::new_local(&path)
+                .build()
+                .await
+                .unwrap()
+                .connect()
+                .unwrap();
+            // 「上一版」库：已有 source_key，但 media_episode **没有** UNIQUE(item_id)。
+            conn.execute_batch(
+                r#"
+                CREATE TABLE media_item (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, ref TEXT NOT NULL,
+                    title TEXT NOT NULL, kind TEXT NOT NULL, file_path TEXT, poster TEXT,
+                    size INTEGER, duration INTEGER, width INTEGER, height INTEGER,
+                    added_at INTEGER NOT NULL, UNIQUE(source, ref)
+                );
+                CREATE TABLE media_series (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT,
+                    kind TEXT NOT NULL DEFAULT 'series', poster TEXT, year INTEGER,
+                    source_key TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE media_episode (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, series_id INTEGER NOT NULL,
+                    item_id INTEGER NOT NULL, season INTEGER NOT NULL DEFAULT 1,
+                    episode_no INTEGER NOT NULL DEFAULT 1, title TEXT,
+                    UNIQUE(series_id, season, episode_no)
+                );
+                INSERT INTO media_item (id, source, ref, title, kind, added_at)
+                    VALUES (1, 'tg', '-100:7', '某剧 EP01', 'video', 1);
+                INSERT INTO media_series (id, title, kind, source_key, created_at, updated_at)
+                    VALUES (1, '某剧', 'series', 'tg:group:-100:1', 1, 1),
+                           (2, 'TG -100 · 2026-01-01', 'series', 'tg:msgs:-100:7', 1, 1);
+                INSERT INTO media_episode (series_id, item_id, season, episode_no)
+                    VALUES (1, 1, 1, 1), (2, 1, 1, 1);
+                "#,
+            )
+            .await
+            .unwrap();
+        }
+        let s = Store::open(&path)
+            .await
+            .expect("双认领库必须能被收敛后打开（顺序错误会让唯一索引创建失败）");
+        assert_eq!(
+            scalar_i64(&s.conn, "SELECT COUNT(*) FROM media_episode WHERE item_id = 1").await,
+            1,
+            "同一 item 只能剩一条认领"
+        );
+        assert_eq!(
+            scalar_i64(
+                &s.conn,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
+                   AND name = 'idx_media_episode_item_unique'"
+            )
+            .await,
+            1,
+            "收敛后必须建成 UNIQUE(item_id) 索引"
+        );
+        assert_eq!(
+            scalar_i64(&s.conn, "SELECT COUNT(*) FROM media_episode_source WHERE item_id = 1").await,
+            1,
+            "被收敛掉的 video 认领降级为备用源（同槽多源，BUG-284 语义）"
+        );
+        assert_eq!(
+            scalar_i64(
+                &s.conn,
+                "SELECT COUNT(*) FROM media_series WHERE id = 2"
+            )
+            .await,
+            0,
+            "收敛后清空的**自动**剧集必须剪枝（重复剧集 → 0）"
+        );
+        // 唯一索引真的生效：再插一条同 item 的认领必须被拒。
+        let dup = s
+            .conn
+            .execute(
+                "INSERT INTO media_episode (series_id, item_id, season, episode_no) \
+                 VALUES (1, 1, 1, 5)",
+                (),
+            )
+            .await;
+        assert!(dup.is_err(), "UNIQUE(item_id) 必须拒绝新的双认领");
+    }
+
     /// 回归（BUG-031）：**旧库 + 新代码** 首次启动时 `Store::open` 必须成功。
     ///
     /// 缺陷原形：`CREATE UNIQUE INDEX ... ON media_series(source_key)` 被放在建表批里，
@@ -6185,7 +6482,7 @@ mod tests {
     /// 前者防「重复缓存同一条消息 → 剧集里出现重复分集」（BUG-031 主诉）；
     /// 后者保护用户显式把同一素材编入另一季的合法编排。
     #[tokio::test]
-    async fn append_episodes_dedups_within_season_only() {
+    async fn append_episodes_dedups_globally_by_item_bug292() {
         let s = Store::open(tmp_db("append")).await.unwrap();
         let a = s
             .upsert_media_item("local", "D:/x/a.mp4", "a", "video", Some("D:/x/a.mp4"), None, None, None)
@@ -6201,18 +6498,19 @@ mod tests {
         // 同季重复追加：全部跳过，不产生重复分集。
         assert_eq!(s.append_episodes(sid, 1, &[a, b]).await.unwrap(), 0);
         assert_eq!(s.append_episodes(sid, 1, &[b, a]).await.unwrap(), 0);
-        // 跨季：同一素材可在另一季出现。
-        assert_eq!(s.append_episodes(sid, 2, &[a]).await.unwrap(), 1);
+        // D22-A④：`media_episode UNIQUE(item_id)` ⇒ 一个条目全局只属一集；
+        // 跨季重复追加被**跳过**（旧行为「同一素材可在另一季出现」已被该决策取代）。
+        assert_eq!(s.append_episodes(sid, 2, &[a]).await.unwrap(), 0);
 
         let det = s.get_series(sid).await.unwrap().unwrap();
-        assert_eq!(det.episodes.len(), 3, "S1 两集 + S2 一集");
+        assert_eq!(det.episodes.len(), 2, "S1 两集（跨季重复不再新增分集）");
         let mut nos: Vec<(i64, i64)> = det
             .episodes
             .iter()
             .map(|e| (e.season, e.episode_no))
             .collect();
         nos.sort();
-        assert_eq!(nos, vec![(1, 1), (1, 2), (2, 1)], "集号应连续无跳号");
+        assert_eq!(nos, vec![(1, 1), (1, 2)], "集号应连续无跳号");
     }
 
     /// ③b：#标签提取。判定必须是**词首 + Unicode 字母数字**，
@@ -9916,8 +10214,10 @@ mod tests {
     }
 
     /// BUG-304 任务 3（引擎半）：tg 条目归集必须用与 `IngestCtx::ensure_series`
-    /// **逐字相同**的幂等键（`tg:group:{chat}:{group}`）—— 用另一把键会让同一条
-    /// 内容在 worker 走到时裂成两个剧集（BUG-292 形态）。
+    /// **逐字相同**的幂等键 —— 用另一把键会让同一条内容在 worker 走到时裂成两个剧集
+    /// （BUG-292 形态）。D22-A① 后主键是规范化剧名；本夹具没有 `media_message` 行
+    /// （组内无 caption）⇒ 剧名不可得 ⇒ 退化为相册键 `tg:group:{chat}:{group}`，
+    /// 正是这条退化路径的回归。
     #[tokio::test]
     async fn file_items_into_series_tg_item_uses_cache_task_group_key_bug304() {
         let s = Store::open(tmp_db("bug304_tg_key")).await.unwrap();
@@ -9965,6 +10265,91 @@ mod tests {
         // 第二条目再次归集（模拟自愈重复跑）⇒ 幂等。
         let (c, a) = s.file_items_into_series(&[id2]).await.unwrap();
         assert_eq!((c, a), (0, 0));
+    }
+
+    /// D22-A①（BUG-292）验收：同一部剧**分批缓存**（EP1-5 一批、EP6-10 一批）必须落
+    /// **同一部剧** —— 旧实现按 `task.group_id` 有无二选一（`tg:group:` / `tg:msgs:`），
+    /// 两批键不等 ⇒ 裂成两部（实测生产库 3→5 对）。
+    ///
+    /// **反向证伪**：把 `episodic_group_key` 的主键改回相册键 / 首条消息号
+    /// ⇒ `created` 必为 2 ⇒ FAIL。
+    #[tokio::test]
+    async fn episodic_group_key_merges_batches_by_series_name_bug292() {
+        let s = Store::open(tmp_db("bug292_named_key")).await.unwrap();
+        let now = now_secs();
+        // 两批：组 11（消息 101..103）、组 12（消息 201..203）。caption 只挂在各批首条，
+        // 剧名相同（`某剧 EP01` / `某剧 EP06` 规范化后都是 `某剧`）。
+        for (task_key, group, msgs, cap_msg, caption) in [
+            ("g:500:11", 11i64, vec![101i64, 102, 103], 101i64, "某剧 EP01"),
+            ("g:500:12", 12i64, vec![201i64, 202, 203], 201i64, "某剧 EP06"),
+        ] {
+            s.conn
+                .execute(
+                    "INSERT INTO cache_task (chat_id, group_id, item_key, items, total, done, status, created_at, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, 3, 0, 'queued', ?5, ?5)",
+                    params![
+                        500i64,
+                        group,
+                        task_key,
+                        serde_json::to_string(&msgs).unwrap(),
+                        now
+                    ],
+                )
+                .await
+                .unwrap();
+            for m in &msgs {
+                let cap: Option<&str> = if *m == cap_msg { Some(caption) } else { None };
+                s.conn
+                    .execute(
+                        "INSERT INTO media_message (channel_id, message_id, caption, media_type, mime_type, created_at) \
+                         VALUES (?1, ?2, ?3, 'video', 'video/mp4', ?4)",
+                        params![500i64, *m, cap, now],
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        // 六个条目：标题只在与 caption 同一条消息上非空（其余为空，与真实相册一致）。
+        let mut ids = Vec::new();
+        for m in [101i64, 102, 103, 201, 202, 203] {
+            let title = if m == 101 {
+                "某剧 EP01".to_string()
+            } else if m == 201 {
+                "某剧 EP06".to_string()
+            } else {
+                String::new()
+            };
+            let id = s
+                .upsert_media_item(
+                    "tg",
+                    &format!("500:{m}"),
+                    &title,
+                    "video",
+                    None,
+                    Some(10),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        let (created, attached) = s.file_items_into_series(&ids).await.unwrap();
+        assert_eq!(created, 1, "两批同剧名必须落同一部剧（D22-A①）");
+        assert_eq!(attached, 6);
+        let sid = s
+            .find_series_by_source_key("tg:named:500:某剧")
+            .await
+            .unwrap()
+            .expect("键必须是 tg:named:{chat}:{规范化剧名}");
+        let eps: i64 = s
+            .count_one(
+                "SELECT COUNT(*) FROM media_episode WHERE series_id = ?1",
+                params![sid],
+            )
+            .await
+            .unwrap();
+        assert_eq!(eps, 6, "六个条目全部编入同一部剧");
     }
 
     /// BUG-304 判据 1（引擎半）：「零认领」的判定必须看**三张**认领表 ——

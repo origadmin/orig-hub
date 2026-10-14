@@ -215,6 +215,7 @@
   "accounts.diagFail": "Cannot reach diagnostics API; make sure orig-tg is running",
   "tg.toggle": "Telegram Plugin",
   "tg.toggleHint": "When enabled, daemon launches orig-tg with the main proxy injected; disabling stops it and hides the TG module",
+  "tg.alreadyIngested": "Already in the library, no need to download again",
   "tg.running": "Running",
   "tg.starting": "Starting",
   "tg.stopped": "Stopped",
