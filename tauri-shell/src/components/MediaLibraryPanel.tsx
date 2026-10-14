@@ -247,16 +247,15 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   const [tagFilter, setTagFilter] = useState('')
 
   /**
-   * 侧栏分类（6 类）→ 资料库 kind（4 值）的过渡映射（M0-T03）。
+   * 侧栏分类（6 类）→ 资料库 kind（4 值）的映射。
    *
-   * **这是有损映射，必须写明**：侧栏六分类来自文件/下载世界的分类法
-   * （`nav::FILE_CATEGORIES`），而 `MediaKind` 只有 `video | photo | audio | file`
-   * 四个值 —— `doc` / `archive` / `other` 三类在当前库里**没有 distinguishable 的 kind**，
-   * 一律落 `file`。⇒ M0 期这三个树子项会显示**同一份内容**。
-   *
-   * 不做假数据、不提前造 kind：真正的区分在 M2（BUG-299 / M2-T02「成品浏览器扩面」）
-   * 由文件事实层给出「文档/压缩/其他」的非媒体文件行。本映射只保证
-   * 「点了有正确子集、且不显示不存在的能力」。
+   * ⚠ **`doc`/`archive`/`other` 三落 `file` 是设计基础违反的症状，不是可接受
+   * 过渡态**（2026-10-15 用户裁定，BUG-299 critical）：侧栏六分类来自文件世界的
+   * 分类法（`nav::FILE_CATEGORIES`），而当前唯一数据源 `media_item` 的 `MediaKind`
+   * 只有 4 值 ⇒ 这三个树子项显示**同一份内容**，而共识（D1/D13 + README §FileFact
+   * 「受管字节的通用记录」）要求文件域对全部类型共通兼容。区分靠文件事实层给出
+   * 非媒体文件行（BUG-299 / M2-T02），**不是**「M0 期先这样」。
+   * 本映射只保证「点了不报错」，任何人不得把它读作既定正确态。
    */
   const CATEGORY_TO_KIND: Record<string, Tab> = {
     video: 'video',
