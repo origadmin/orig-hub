@@ -229,20 +229,9 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
 
           {filesOpen && !collapsed && (
             <div className="mt-0.5 space-y-0.5">
-              {/* 视频（普通下载）：扁平视频库，落点 cat:video → items 网格（kind=video）。
-                  与剧集是两种不同浏览方式，必须分开（2026-10-14 撤回 BUG-306 / D19-⑦ 合并）。
-                  之前合并成单一「视频」入口、落点 lib-series 剧集墙，导致「视频」里混入照片剧集、
-                  且剧集入口被吃掉 —— 正是用户报的「视频混入了图片 / 视频剧集没分开」。 */}
-              <button
-                type="button"
-                data-testid="nav-child-cat-video"
-                onClick={() => onNavigate('files', { fmode: 'cat:video' })}
-                title={t('files.cat.video')}
-                className={childCls(isNavChildActive(view, fmode, dlFilter, { fmode: 'cat:video' }))}
-              >
-                <span className="min-w-0 flex-1 truncate text-left">{t('files.cat.video')}</span>
-              </button>
-              {/* 剧集（TG 插件或其他来源）：剧集墙，落点 lib-series。 */}
+              {/* 剧集（TG 插件或其他来源）：**文件树第一子项**（2026-10-15 用户裁定
+                  「剧集作为核心」——文件域的组织形态以剧集为纲，普通下载的扁平视频库
+                  次之）。落点 lib-series → 剧集墙。 */}
               <button
                 type="button"
                 data-testid="nav-child-lib-series"
@@ -256,6 +245,20 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
                 {counts.series > 0 ? (
                   <span className="shrink-0 text-[10px] text-muted">{counts.series}</span>
                 ) : null}
+              </button>
+              {/* 视频（普通下载）：扁平视频库，落点 cat:video → items 网格（kind=video）。
+                  与剧集是两种不同浏览方式，必须分开（2026-10-14 撤回 BUG-306 / D19-⑦ 合并）：
+                  之前合并成单一「视频」入口、落点 lib-series 剧集墙，导致「视频」里混入照片剧集、
+                  且剧集入口被吃掉 —— 正是用户报的「视频混入了图片 / 视频剧集没分开」。
+                  顺序上位于剧集之后（剧集为核心，见上）。 */}
+              <button
+                type="button"
+                data-testid="nav-child-cat-video"
+                onClick={() => onNavigate('files', { fmode: 'cat:video' })}
+                title={t('files.cat.video')}
+                className={childCls(isNavChildActive(view, fmode, dlFilter, { fmode: 'cat:video' }))}
+              >
+                <span className="min-w-0 flex-1 truncate text-left">{t('files.cat.video')}</span>
               </button>
               {/* 其余分类子项（不含 video，已上方单独渲染）。 */}
               {FILE_CATEGORIES.filter((cat) => cat !== 'video').map((cat) => (
