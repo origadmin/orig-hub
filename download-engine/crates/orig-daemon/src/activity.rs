@@ -84,7 +84,7 @@ pub struct TaskView {
     /// 全局唯一标识：`dl:<uuid>` / `tg:<i64>`。**仅供视图定位**，写操作请用 `control`。
     pub id: String,
     pub kind: TaskKind,
-    /// 各侧原生名（文件名 / TG `itemKey`）。
+    /// 各侧原生名（下载 = 文件名；TG = 任务标题，缺失回退 itemKey）。
     pub name: String,
     pub unit: Unit,
     pub total: u64,
@@ -166,6 +166,10 @@ struct TgCacheTask {
     id: i64,
     #[serde(default, rename = "itemKey")]
     item_key: String,
+    /// 人类可读标题（orig-tg `/all` 载荷恒有该字段；老数据可能缺 → 空串）。
+    /// 缺省时 `cache_view` 回退 `itemKey`，绝不渲染空名。
+    #[serde(default)]
+    title: String,
     #[serde(default)]
     total: i64,
     #[serde(default)]
@@ -335,10 +339,18 @@ async fn fetch_cache_views(st: &AppState) -> Result<Vec<TaskView>, String> {
 fn cache_view(t: &TgCacheTask) -> TaskView {
     let total = t.total.max(0) as u64;
     let done = t.done.max(0).min(t.total.max(0)) as u64;
+    // 名称取人类可读标题（BUG-300 复报：下载域 TG 行原先只能显示
+    // `g:<chat>:<group>` 内部键，用户无从认出是哪批内容）；标题缺失/空白时
+    // 回退 itemKey —— 两种都不会渲染空名。
+    let name = if t.title.trim().is_empty() {
+        t.item_key.clone()
+    } else {
+        t.title.clone()
+    };
     TaskView {
         id: format!("tg:{}", t.id),
         kind: TaskKind::Cache,
-        name: t.item_key.clone(),
+        name,
         // 缓存任务按**条目数**计量（覆盖 N 条消息），不是字节。
         unit: Unit::Items,
         total,
@@ -579,5 +591,39 @@ mod tests {
     fn percent_is_safe_on_zero_total() {
         assert_eq!(percent(0, 0), 0.0);
         assert_eq!(percent(5, 10), 50.0);
+    }
+
+    #[test]
+    fn cache_view_name_is_human_title_with_item_key_fallback() {
+        // BUG-300 复报（2026-10-15）：下载域 TG 行必须显示人类可读标题，
+        // 否则用户只能看到 `g:<chat>:<group>` 内部键。
+        let titled = TgCacheTask {
+            id: 7,
+            item_key: "g:-1003969766003:14333518975001516".to_string(),
+            title: "《妈妈陪儿子高考》EP10 原档观享".to_string(),
+            total: 10,
+            done: 2,
+            status: "interrupted".to_string(),
+            error: None,
+            updated_at: 0,
+        };
+        assert_eq!(cache_view(&titled).name, "《妈妈陪儿子高考》EP10 原档观享");
+        // 反向证伪：标题缺失（老数据）必须回退 itemKey —— 空名/空白名都是缺陷。
+        let untitled = TgCacheTask {
+            title: String::new(),
+            ..titled
+        };
+        assert_eq!(
+            cache_view(&untitled).name,
+            "g:-1003969766003:14333518975001516"
+        );
+        let blank = TgCacheTask {
+            title: "   ".to_string(),
+            ..untitled
+        };
+        assert_eq!(
+            cache_view(&blank).name,
+            "g:-1003969766003:14333518975001516"
+        );
     }
 }

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Sidebar } from './Sidebar'
 import { DownloadPanel } from '../domains/download/DownloadPanel'
 import { AddDownloadDialog } from '../domains/download/AddDownloadDialog'
+import { useIngestGroups } from '../domains/download/useIngestGroups'
 import { SettingsPanel } from '../components/SettingsPanel'
 import { TgPanel } from '../components/TgPanel'
 import { FilesPanel } from '../domains/files/FilesPanel'
@@ -124,6 +125,17 @@ export function MainLayout() {
    * active 只算真正在跑的，不含 idle（否则只有 idle 任务时「全部暂停」会亮起却空转，
    * 那就是新造一个死按钮）。
    */
+  /**
+   * 入库任务的**唯一轮询点**（M3 · BUG-300）。
+   *
+   * 既供侧栏/状态栏计数，也经 props 下传给 `DownloadPanel`。让面板自己再拉一份
+   * 会得到「两次轮询 + 两个时刻的状态」——那正是「徽标数 ≠ 点进去的条数」的来源
+   * （BUG-082 三处同源纪律：徽标 / 树档 / 列表三处必须同源）。
+   */
+  const ingest = useIngestGroups()
+  /** 概览 = 「笼统的数据」：按**内容对象**计数，不是按原始任务记录数。 */
+  const overview = ingest.overview
+
   const downloadingBucket = downloads.filter(
     (d) => d.status === 'downloading' || d.status === 'queued' || d.status === 'idle',
   )
@@ -224,9 +236,10 @@ export function MainLayout() {
           onToggle={() => setCollapsed((c) => !c)}
           counts={{
             files: filesCounts.files,
-            downloading: downloadingBucket.length,
+            // 下载域三桶 = 引擎任务 + 入库对象（M3/BUG-300，口径见上方 overview 注释）
+            downloading: downloadingBucket.length + overview.active,
             paused: paused.length,
-            completed: completed.length,
+            completed: completed.length + overview.done,
             series: filesCounts.series,
             tags: filesCounts.tags,
           }}
@@ -276,7 +289,11 @@ export function MainLayout() {
               </ErrorBoundary>
             ) : view === 'download' ? (
               <ErrorBoundary>
-                <DownloadPanel dlFilter={nav.dlFilter} items={downloads} />
+                <DownloadPanel
+                  dlFilter={nav.dlFilter}
+                  items={downloads}
+                  ingest={ingest}
+                />
               </ErrorBoundary>
             ) : (
               <ErrorBoundary>
@@ -313,10 +330,11 @@ export function MainLayout() {
                 状态栏这个数会静默消失而 tsc 照样绿（典型假绿）。
               */}
               {t('main.status', {
-                active: downloadingBucket.length,
+                // M3/BUG-300：状态栏与侧栏徽标、下载域树档三处同源（含入库任务）
+                active: downloadingBucket.length + overview.active,
                 paused: paused.length,
-                completed: completed.length,
-                failed: failed.length,
+                completed: completed.length + overview.done,
+                failed: failed.length + overview.stalled,
               })}
             </span>
             {/*
