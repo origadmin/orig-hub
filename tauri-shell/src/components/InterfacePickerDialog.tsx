@@ -78,7 +78,7 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
       onClick={onClose}
     >
       <div
-        className="w-full max-w-lg animate-spring rounded-xl border border-border-subtle bg-surface p-5 shadow-2xl"
+        className="w-full max-w-lg animate-spring rounded-xl border border-border-subtle bg-surface p-4 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between">

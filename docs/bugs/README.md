@@ -338,3 +338,4 @@ bash scripts/install-hooks.sh    # 安装 pre-commit 与 commit-msg（钩子不�
 | BUG-310 | 视频显示名无唯一规则：caption 缺失标题空串、item/episode/series 三层各写各的、同一视频多处名称不一致；修法=自定义集名＞剧名集号＞来源名，改名不动物理文件（D24） | fixed | engine+shell |
 | BUG-311 | 缺批量整理命名能力（mp3tag 式模板命名/归位）：库内改名不动物理文件后无可读命名的对外交付手段；模板预览 diff/幂等/冲突序号，产物为硬链接或副本（D24，M2） | fixed | engine+shell |
 | BUG-312 | 前瞻：M3 TG 任务并入下载列表后，clearCompleted 逐条 DELETE 不区分来源将误删 cache_task 入库记录；修法=来源 clearable 能力位分流（D21-A④，M3-T03） | open | shell |
+| BUG-313 | 设置页排版规范缺失：区块卡/标题/间距/字号无单一真源（13 处区块卡 4 种间距 + 1 处无 padding、telegram/network 双 h3、字号圆角混用、弹窗 padding 三档），M0 合并（3b53227）后全页不一致；修法=SectionCard 单一真源 + 全仓收敛 + CDP 排版回归门禁 | fixed | shell |

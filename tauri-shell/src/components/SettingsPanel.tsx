@@ -4,6 +4,7 @@ import { Badge } from './ui/badge'
 import { Stepper } from './ui/stepper'
 import { Switch } from './ui/switch'
 import { Input } from './ui/input'
+import { SectionCard, SectionTitle, SectionDesc } from './ui/section-card'
 import { DirectoryPicker } from './DirectoryPicker'
 import { InterfacePickerDialog, type InterfaceSelection } from './InterfacePickerDialog'
 import { AccountsPanel } from './AccountsPanel'
@@ -609,10 +610,10 @@ export function SettingsPanel({
             <div className="mx-auto max-w-2xl space-y-6" data-sec="downloads">
               <div>
                 <h3 className="text-lg font-semibold text-fg-strong">{t('downloads.heading')}</h3>
-                <p className="mt-0.5 text-xs text-muted">{t('downloads.sub')}</p>
+                <SectionDesc>{t('downloads.sub')}</SectionDesc>
               </div>
 
-              <div className="space-y-5 rounded-xl border border-border-subtle bg-surface p-5">
+              <SectionCard>
                 {/* 默认下载目录：标题在上，路径框全宽（重新排版） */}
                 <div>
                   <div className="flex items-center justify-between">
@@ -691,7 +692,7 @@ export function SettingsPanel({
                   {/* 分类 → 后缀 分组编辑列表 */}
                   <div className="mt-3 space-y-2">
                     {categories.length === 0 && (
-                      <p className="rounded-md border border-border-subtle bg-surface-2/40 px-3 py-3 text-xs text-muted">
+                      <p className="rounded-md border border-border-subtle bg-surface-2/40 px-3 py-3 text-[11px] text-muted">
                         {t('downloads.noCategory')}
                       </p>
                     )}
@@ -769,7 +770,7 @@ export function SettingsPanel({
                           className="font-medium"
                         />
                       </div>
-                      <span className="shrink-0 text-xs text-muted">←</span>
+                      <span className="shrink-0 text-[11px] text-muted">←</span>
                       <div className="min-w-0 flex-1">
                         <Input
                           value={newExts}
@@ -799,7 +800,7 @@ export function SettingsPanel({
                     <p className="mt-1.5 text-[11px] text-danger">{t('downloads.saveError')}{classifyErr}</p>
                   )}
                 </div>
-              </div>
+              </SectionCard>
             </div>
           )}
 
@@ -807,13 +808,13 @@ export function SettingsPanel({
             <div className="mx-auto max-w-2xl space-y-6" data-sec="telegram">
               <div>
                 <h3 className="text-lg font-semibold text-fg-strong">{t('tg.sectionHeading')}</h3>
-                <p className="mt-0.5 text-xs text-muted">{t('tg.sectionSub')}</p>
+                <SectionDesc>{t('tg.sectionSub')}</SectionDesc>
               </div>
 
               {/* 启停 + 状态 + 失败原因（M0-T07：自「通用」区迁入本区块）。
                   旧注释「TG 不可用时侧栏入口被摘除」随 M0-T05 作废（入口常驻），
                   但**这里的呈现仍是必要的**：入口只负责让人进得来，原因说明仍在设置里。 */}
-              <div className="space-y-5 rounded-xl border border-border-subtle bg-surface p-5">
+              <SectionCard>
                   {/* TG 模块：启停开关 + 状态 + 清理缓存（属「通用」，不归「账号」） */}
                   <div>
                     <div className="flex items-center justify-between gap-4">
@@ -906,16 +907,15 @@ export function SettingsPanel({
                       </Button>
                     </div>
                   </div>
-              </div>
+              </SectionCard>
 
               {/*
                 账号管理区（M0-T07：原「账号」页签整体迁入）。
                 `AccountsPanel` 自带布局与横幅，此处只提供容器与分区归属。
                 M7（BUG-238）多账户化时数据契约预留 `account_id`，UI 仍单账户。
               */}
-              <div className="rounded-xl border border-border-subtle bg-surface" data-sec="telegram-accounts">
-                <AccountsPanel />
-              </div>
+              {/* Account panel section: AccountsPanel owns block-level layout (BUG-313) */}
+              <AccountsPanel />
             </div>
           )}
 
@@ -923,10 +923,10 @@ export function SettingsPanel({
             <div className="mx-auto max-w-2xl space-y-6" data-sec="network-nics">
               <div>
                 <h3 className="text-lg font-semibold text-fg-strong">{t('network.heading')}</h3>
-                <p className="mt-0.5 text-xs text-muted">{t('network.sub')}</p>
+                <SectionDesc>{t('network.sub')}</SectionDesc>
               </div>
 
-              <div className="space-y-4 rounded-xl border border-border-subtle bg-surface p-5">
+              <SectionCard>
                 <div className="flex items-center justify-between gap-4">
                   <div className="min-w-0">
                     <p className="text-[13px] font-medium text-fg-strong">{t('network.nics')}</p>
@@ -971,7 +971,7 @@ export function SettingsPanel({
                     </div>
                   ))}
                   {rows.length === 0 && (
-                    <p className="py-3 text-xs text-muted">
+                    <p className="py-3 text-[11px] text-muted">
                       {t('network.daemonOff')}
                     </p>
                   )}
@@ -987,7 +987,7 @@ export function SettingsPanel({
                 <p className="text-[11px] leading-relaxed text-muted">
                   {t('network.weightHint')}
                 </p>
-              </div>
+              </SectionCard>
             </div>
           )}
 
@@ -1000,11 +1000,9 @@ export function SettingsPanel({
           */}
           {activeTab === 'network' && (
             <div className="mx-auto max-w-2xl space-y-6" data-sec="network-proxy">
-              <div>
-                <h3 className="text-lg font-semibold text-fg-strong">{t('proxy.heading')}</h3>
-                <p className="mt-0.5 text-xs text-muted">{t('proxy.sub')}</p>
-              </div>
-              <div className="space-y-5 rounded-xl border border-border-subtle bg-surface p-5">
+              <SectionCard>
+                <SectionTitle>{t('proxy.heading')}</SectionTitle>
+                <SectionDesc>{t('proxy.sub')}</SectionDesc>
                 {/* 模式选择 */}
                 <div>
                   <p className="text-[13px] font-medium text-fg-strong">{t('proxy.mode')}</p>
@@ -1109,7 +1107,7 @@ export function SettingsPanel({
                     </p>
                   )}
                 </div>
-              </div>
+              </SectionCard>
 
               <p className="text-[11px] leading-relaxed text-muted">
                 {t('proxy.note')}
@@ -1121,9 +1119,9 @@ export function SettingsPanel({
             <div className="mx-auto max-w-2xl space-y-6" data-sec="general">
               <div>
                 <h3 className="text-lg font-semibold text-fg-strong">{t('general.heading')}</h3>
-                <p className="mt-0.5 text-xs text-muted">{t('general.sub')}</p>
+                <SectionDesc>{t('general.sub')}</SectionDesc>
               </div>
-              <div className="space-y-5 rounded-xl border border-border-subtle bg-surface p-5">
+              <SectionCard>
                 {/* 主题：卡片式选择，即时生效 */}
                 <div>
                   <p className="text-[13px] font-medium text-fg-strong">{t('general.theme')}</p>
@@ -1216,7 +1214,7 @@ export function SettingsPanel({
                     onChange={(v) => updateSettings({ notifications: v })}
                   />
                 </div>
-              </div>
+              </SectionCard>
             </div>
           )}
 
@@ -1229,12 +1227,12 @@ export function SettingsPanel({
             <div className="mx-auto max-w-2xl space-y-6" data-sec="engine">
               <div>
                 <h3 className="text-lg font-semibold text-fg-strong">{t('engine.heading')}</h3>
-                <p className="mt-0.5 text-xs text-muted">{t('engine.sub')}</p>
+                <SectionDesc>{t('engine.sub')}</SectionDesc>
               </div>
-              <div className="rounded-xl border border-border-subtle bg-surface p-5">
+              <SectionCard gap="none">
                 <p className="text-[13px] font-medium text-fg-strong">{t('engine.placeholderTitle')}</p>
                 <p className="mt-1 text-[11px] leading-relaxed text-muted">{t('engine.placeholderHint')}</p>
-              </div>
+              </SectionCard>
             </div>
           )}
 
@@ -1247,11 +1245,11 @@ export function SettingsPanel({
             <div className="mx-auto max-w-2xl space-y-6" data-sec="share">
               <div>
                 <h3 className="text-lg font-semibold text-fg-strong">{t('share.title')}</h3>
-                <p className="mt-0.5 text-xs text-muted">{t('share.comingSoon')}</p>
+                <SectionDesc>{t('share.comingSoon')}</SectionDesc>
               </div>
-              <div className="rounded-xl border border-border-subtle bg-surface p-5">
+              <SectionCard gap="none">
                 <p className="text-[11px] leading-relaxed text-muted">{t('share.scopeHint')}</p>
-              </div>
+              </SectionCard>
             </div>
           )}
 
@@ -1259,9 +1257,9 @@ export function SettingsPanel({
             <div className="mx-auto max-w-2xl space-y-6" data-sec="about">
               <div>
                 <h3 className="text-lg font-semibold text-fg-strong">{t('about.heading')}</h3>
-                <p className="mt-0.5 text-xs text-muted">{t('about.sub')}</p>
+                <SectionDesc>{t('about.sub')}</SectionDesc>
               </div>
-              <div className="space-y-5 rounded-xl border border-border-subtle bg-surface p-5">
+              <SectionCard>
                 <div className="flex items-center justify-between gap-4">
                   <div>
                     <p className="text-[13px] font-medium text-fg-strong">{t('about.engine')}</p>
@@ -1281,7 +1279,7 @@ export function SettingsPanel({
                     </span>
                   </div>
                 </div>
-              </div>
+              </SectionCard>
 
               {/*
                 Telegram 插件状态（BUG-233）：关于页此前只有下载引擎一项，
@@ -1290,10 +1288,7 @@ export function SettingsPanel({
                 「插件：运行中」与「Telegram 不可用」是两件事，不合并成一个含糊的绿点。
                 这里只读状态，开关仍在「常规」页签 —— 状态与动作不重复安放。
               */}
-              <div
-                className="space-y-3 rounded-xl border border-border-subtle bg-surface p-5"
-                data-testid="about-tg"
-              >
+              <SectionCard data-testid="about-tg">
                 <div className="flex items-center justify-between gap-4">
                   <div>
                     <p className="text-[13px] font-medium text-fg-strong">{t('about.tgPlugin')}</p>
@@ -1336,7 +1331,7 @@ export function SettingsPanel({
                     {t('tg.startFailedHint', { reason: tgError })}
                   </p>
                 ) : null}
-              </div>
+                            </SectionCard>
 
               {/*
                 调试日志（BUG-243）：把**日志路径**摆到关于页，出错时用户照路径就能查，
@@ -1345,10 +1340,7 @@ export function SettingsPanel({
                 性能约束（用户明确要求）：日志只写**启动/失败**两类事件，不逐请求落盘，
                 因此不影响下载与播放；单文件超 8 MiB 滚动一代，不做无限追加。
               */}
-              <div
-                className="space-y-3 rounded-xl border border-border-subtle bg-surface p-5"
-                data-testid="about-logs"
-              >
+              <SectionCard data-testid="about-logs">
                 <div className="flex items-start justify-between gap-4">
                   <div className="min-w-0">
                     <p className="text-[13px] font-medium text-fg-strong">{t('about.logs')}</p>
@@ -1387,7 +1379,7 @@ export function SettingsPanel({
                     {t('about.logsErrors')}
                   </li>
                 </ul>
-              </div>
+                            </SectionCard>
             </div>
           )}
         </div>

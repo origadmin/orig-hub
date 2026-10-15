@@ -130,7 +130,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
       onClick={onClose}
     >
       <div
-        className="w-full max-w-md animate-spring rounded-xl border border-border-subtle bg-surface p-6 shadow-2xl"
+        className="w-full max-w-md animate-spring rounded-xl border border-border-subtle bg-surface p-4 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="text-base font-semibold text-fg-strong">新建下载</h2>

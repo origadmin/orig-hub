@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Button } from './ui/button'
 import { Badge } from './ui/badge'
 import { Input } from './ui/input'
+import { SectionCard, SectionTitle, SectionDesc } from './ui/section-card'
 import { cn } from '../lib/utils'
 import { useStore } from '../store/useStore'
 import { useTranslation } from '../i18n'
@@ -158,16 +159,23 @@ export function AccountsPanel() {
   }
 
   return (
-    <div className="mx-auto max-w-2xl space-y-6">
+    <div className="space-y-5" data-sec="telegram-accounts">
       <div>
-        <h3 className="text-lg font-semibold text-fg-strong">{t('accounts.heading')}</h3>
-        <p className="mt-0.5 text-xs text-muted">{t('accounts.sub')}</p>
+        <SectionTitle>{t('accounts.heading')}</SectionTitle>
+        <SectionDesc>{t('accounts.sub')}</SectionDesc>
+        {/* 插件未运行时账号卡整体不渲染（入口级门控）：此处给一句紧凑说明，
+            否则设置·Telegram 页只剩一张空壳诊断卡，用户不知道为何没有登录入口（BUG-313）。 */}
+        {!tgFeatureReady && (
+          <p className="mt-1.5 text-[11px] text-muted" data-testid="tg-accounts-disabled-hint">
+            {t('accounts.disabledHint')}
+          </p>
+        )}
       </div>
 
       {/* Telegram 账号 —— 入口级门控：开关关或探测不可用时整体不渲染（用户裁定：
           功能不存在就不该显示绑定入口；面板级故障卡仅是 TgPanel 内的保底回退） */}
       {tgFeatureReady && (
-      <div className="space-y-5 rounded-xl border border-border-subtle bg-surface p-5">
+      <SectionCard data-testid="tg-account-card">
         <div className="flex items-center justify-between gap-4">
           <div className="flex min-w-0 items-center gap-3">
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-sky-500/15 text-sky-500">
@@ -319,11 +327,11 @@ export function AccountsPanel() {
             </div>
           </div>
         )}
-      </div>
+      </SectionCard>
       )}
 
       {/* 连接诊断面板 */}
-      <div className="rounded-xl border border-border-subtle bg-surface p-5">
+      <SectionCard>
         <button
           type="button"
           onClick={() => {
@@ -350,7 +358,7 @@ export function AccountsPanel() {
         </button>
 
         {showDiag && (
-          <div className="mt-4 space-y-3">
+          <div className="space-y-3">
             {diagErr && (
               <div className="rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-[11px] text-danger">
                 {t('accounts.diagFail')}（{diagErr}）
@@ -427,7 +435,7 @@ export function AccountsPanel() {
             </div>
           </div>
         )}
-      </div>
+      </SectionCard>
 
       <p className="text-[11px] leading-relaxed text-muted">{t('accounts.note')}</p>
     </div>

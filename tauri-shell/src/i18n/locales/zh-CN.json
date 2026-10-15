@@ -188,6 +188,7 @@
   "accounts.confirm": "确认",
   "accounts.cancel": "取消",
   "accounts.note": "账号数据仅保存在本机。Telegram 使用独立的 orig-tg 服务，须由 Tauri 拉起后可用。",
+  "accounts.disabledHint": "Telegram 插件未运行，启动后即可绑定账号。",
   "accounts.diag": "连接诊断",
   "accounts.diagDesc": "查看 orig-tg 服务的运行状态与日志，用于排查登录/取码失败",
   "accounts.diagHealth": "服务健康",
