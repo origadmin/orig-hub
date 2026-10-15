@@ -21,6 +21,9 @@ import {
   setItemTags,
   setSeriesTags,
 } from '../api/media'
+import { deleteFile, listFiles } from '../api/files'
+import type { FileFact } from '../api/files'
+import { subscribeEvents } from '../api/daemon'
 import { loadSeriesDetail, isSeriesNotFound } from '../hooks/useSeriesDetail'
 import { cacheKey, cached, invalidateCache } from '../lib/fetchCache'
 import { seriesLabel } from '../lib/displayTitle'
@@ -371,11 +374,23 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
    * `ids` 是**显式目标集**：卡片上的逐条删除与工具栏的批量删除走同一条确认路径，
    * 区别只在目标集从哪来 —— 避免两套删除流程各写一遍（BUG-057）。
    */
-  const [confirmDelete, setConfirmDelete] = useState<{
-    kind: 'items' | 'series'
-    id?: number
-    ids?: number[]
-  } | null>(null)
+  const [confirmDelete, setConfirmDelete] = useState<
+    | { kind: 'items'; ids?: number[] }
+    | { kind: 'series'; id?: number; ids?: number[] }
+    // BUG-299 M2-T00a：受管下载成品（file facts）删除。ids 可能混入合成 id，
+    // 执行路径按行上是否带 `fileFact` 标记分派（见 doDeleteItems）。
+    | { kind: 'files'; paths: string[] }
+    | null
+  >(null)
+  /**
+   * 受管下载根成品（BUG-299 M2-T00a）——与 `items`（已登记媒体）**并列的另一个
+   * 数据源**，不是它的替代：文件域父行（cat-all）= 两者的并集（按绝对路径去重）。
+   *
+   * 为什么不走「完成即入库」：那要跨进程写 orig-tg 的库（M2-T01b，需 BUG-172
+   * 或等价决策）；读通路没有该依赖，且用户手动放入受管根的文件同样算成品
+   * （出口判据 8）——读端点是严格更强的项。
+   */
+  const [downloadFiles, setDownloadFiles] = useState<FileFact[]>([])
 
   // ---------- 加载 ----------
   const loadMeta = useCallback(async () => {
@@ -491,6 +506,41 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
     const h = setTimeout(() => void loadItems(), 250)
     return () => clearTimeout(h)
   }, [alive, view, loadItems])
+
+  /**
+   * 受管成品读取（M2-T00a）：**只在文件域父行（cat-all）拉**。
+   *
+   * daemon 不可达（栈没起）时不清空媒体列表、也不抛到用户脸上——媒体条目照常
+   * 展示，下载成品那一侧就是空的；错误只落到 error 通道（与 `loadItems` 同立场）。
+   */
+  const loadDownloadFiles = useCallback(async () => {
+    try {
+      const r = await listFiles()
+      setDownloadFiles(r.files)
+    } catch (e) {
+      setDownloadFiles([])
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }, [setError])
+
+  useEffect(() => {
+    if (!alive || view !== 'items' || tab !== 'all') return
+    void loadDownloadFiles()
+  }, [alive, view, tab, loadDownloadFiles])
+
+  /**
+   * **下载↔文件域联动**（用户 2026-10-15 报「入库流水线和下载仍然没有联动」）：
+   * 订阅 daemon SSE，下载完成/删除即刷新受管成品枚举 —— 用户在文件管理里
+   * **看着下载完成、行自己出现**，不必手动切视图/刷新。
+   *
+   * 复用现有 `/api/events` 通道（下载域已在用），不新建轮询、不新建 SSE。
+   */
+  useEffect(() => {
+    if (!alive || view !== 'items' || tab !== 'all') return
+    return subscribeEvents(({ event }) => {
+      if (event === 'completed' || event === 'deleted') void loadDownloadFiles()
+    })
+  }, [alive, view, tab, loadDownloadFiles])
 
   // 剧集列表跟随标签筛选：`loadSeries` 依赖 `activeTagId`，故切换标签即自动重取。
   // 这让 TG 自动归档到剧集的 `#标签` 真正可用（此前标签只能筛「内容」，筛不到剧集）。
@@ -612,10 +662,32 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   /** 卡片入口：按 item 定位序号（稳定引用，卡片 `memo` 才不会白做）。 */
   const openItem = useCallback(
     (item: MediaItem) => {
+      /*
+       * 受管成品（file fact）不进应用内播放器：它没有 `media_item` 行，
+       * 播放器的一切坐标（条目 id / 媒体 URL）都不存在。双击 = 交给系统默认
+       * 程序打开（视频/图片/音频/zip 一视同仁，出口判据 7 的「可打开」）。
+       * web 调试模式无该通道，如实报错（同「打开目录」的立场）。
+       */
+      const fact = (item as MediaItem & { fileFact?: FileFact }).fileFact
+      if (fact) {
+        void (async () => {
+          if (!('__TAURI_INTERNALS__' in window)) {
+            setError(t('media.fileList.openWebUnsupported'))
+            return
+          }
+          try {
+            const { openPath } = await import('@tauri-apps/plugin-opener')
+            await openPath(fact.path)
+          } catch (e) {
+            setError(e instanceof Error ? e.message : String(e))
+          }
+        })()
+        return
+      }
       const idx = items.findIndex((x) => x.id === item.id)
       void playItems(items, Math.max(0, idx), item.title)
     },
-    [items, playItems],
+    [items, playItems, setError, t],
   )
 
   /**
@@ -638,6 +710,13 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   )
   /** 逐条删除入口（稳定引用，同上）。 */
   const deleteItem = useCallback((item: MediaItem) => {
+    // 受管成品（合成行）与媒体条目是两种删除语义：前者删**文件本体**
+    // （daemon 受管根守卫内），后者删媒体行（字节联动见 doDeleteItems）。
+    const fact = (item as MediaItem & { fileFact?: FileFact }).fileFact
+    if (fact) {
+      setConfirmDelete({ kind: 'files', paths: [fact.path] })
+      return
+    }
     setConfirmDelete({ kind: 'items', ids: [item.id] })
   }, [])
 
@@ -874,13 +953,42 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
    *
    * 单条删除曾经不存在：只能「勾选一条 → 再去工具栏点移除」，选择态成了前置仪式。
    * 现在目标集由调用方给出（卡片传 `[id]`，工具栏传所选集合），执行链完全一致。
+   *
+   * **混合目标集分派**（M2-T00a）：cat-all 的选中集可能同时含媒体条目（正 id）
+   * 与受管成品（负合成 id，行上带 `fileFact` 标记）——两者删除语义不同
+   * （删媒体行 vs 删文件本体），执行前先拆集，再各自走自己的端点。
    */
   const doDeleteItems = async (ids: number[]) => {
     if (ids.length === 0) return
+    const factPaths: string[] = []
+    const mediaIds: number[] = []
+    for (const id of ids) {
+      const row = catAllRows.find((r) => r.id === id)
+      const fact = (row as (MediaItem & { fileFact?: FileFact }) | undefined)?.fileFact
+      if (fact) factPaths.push(fact.path)
+      else mediaIds.push(id)
+    }
     try {
-      for (const id of ids) await deleteMediaItem(id)
+      for (const p of factPaths) await deleteFile(p)
+      for (const id of mediaIds) await deleteMediaItem(id)
+      if (factPaths.length > 0) await loadDownloadFiles()
       clearSelection()
       await refreshAll()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  /**
+   * 删除受管成品（文件本体）—— 单条入口（行内删除键）的执行路径。
+   * daemon 侧守卫：路径必须落在受管根内（否则 403），必须是普通文件（否则 404）。
+   */
+  const doDeleteFiles = async (paths: string[]) => {
+    if (paths.length === 0) return
+    try {
+      for (const p of paths) await deleteFile(p)
+      clearSelection()
+      await loadDownloadFiles()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -920,6 +1028,67 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   // `search` 只在 items 视图真正参与过滤 ——
   // 否则 series 视图会呈现「已过滤」的假象（显示「清除筛选」却没有过滤发生）。
   const filterActive = activeTagId !== null || (view === 'items' && search.trim() !== '')
+
+  /**
+   * 路径 → 稳定负 id（FNV-1a 取正后取负）。
+   *
+   * 受管成品没有 `media_item` 行，但选择态 / testid / 批量目标集全按数字 id 走；
+   * 负值与媒体条目的正 id **不可能相撞**，且同路径恒定（重渲染不换 id，
+   * 选中态不会莫名丢失）。
+   */
+  const factId = (path: string): number => {
+    let h = 0x811c9dc5
+    for (let i = 0; i < path.length; i++) {
+      h ^= path.charCodeAt(i)
+      h = Math.imul(h, 0x01000193)
+    }
+    return -(Math.abs(h) % 0x3fffffff) - 1
+  }
+
+  /**
+   * cat-all 显示行 = 已登记媒体 ∪ 受管成品（M2-T00a/M2-T01a）。
+   *
+   * - **去重按绝对路径**（`absolutePath ?? filePath` 规范化后比较）：手动导入过
+   *   的下载成品同时在两边的，只认媒体条目那一份（它有更完整的元数据）；
+   * - 成品行带 `fileFact` 标记 —— 打开/删除据此分派（系统程序打开 / 删文件本体），
+   *   见 `openItem` / `deleteItem` / `doDeleteItems`；
+   * - `kindLabel` 直接给分类键（`category.Archives` 等），类型列不落到
+   *   「doc/archive/other 三落 file」的有损映射（BUG-299 违反标记的兑现）。
+   */
+  const catAllRows = useMemo<(MediaItem & { fileFact?: FileFact; kindLabel?: string })[]>(() => {
+    if (tab !== 'all') return items
+    const norm = (p?: string | null) => (p ?? '').replace(/\\/g, '/').toLowerCase()
+    const taken = new Set(items.map((i) => norm(i.absolutePath ?? i.filePath)).filter(Boolean))
+    const facts = downloadFiles
+      .filter((f) => !taken.has(norm(f.path)))
+      .map((f): MediaItem & { fileFact: FileFact; kindLabel: string } => ({
+        id: factId(f.path),
+        source: 'download',
+        ref: '',
+        title: f.name,
+        kind:
+          f.kind === 'video' || f.kind === 'photo' || f.kind === 'audio' ? f.kind : 'file',
+        filePath: f.path,
+        absolutePath: f.path,
+        // 0 字节也是事实：照常列出并带「缺字节」标记（BUG-132 同款诚实口径）。
+        bytesPresence: f.size > 0 ? 'present' : 'missing',
+        size: f.size,
+        addedAt: f.modified_at,
+        tags: [],
+        kindLabel: `category.${f.category}`,
+        fileFact: f,
+      }))
+    if (facts.length === 0) return items
+    // 「最近添加」是默认排序：两源按日期真合并（下载成品 mtime vs 媒体 addedAt）；
+    // 其余排序媒体侧走服务端，成品行附后（M2-T02 六分类归一后再统一）。
+    if (sort === 'recent') {
+      return [...items, ...facts].sort((a, b) => (b.addedAt ?? 0) - (a.addedAt ?? 0))
+    }
+    if (sort === 'oldest') {
+      return [...items, ...facts].sort((a, b) => (a.addedAt ?? 0) - (b.addedAt ?? 0))
+    }
+    return [...items, ...facts]
+  }, [tab, items, downloadFiles, sort])
 
   /**
    * 删除确认的目标集：卡片逐条 = `[id]`，工具栏批量 = 当前勾选。
@@ -1547,7 +1716,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
               </div>
             )}
           </div>
-        ) : view === 'items' && tab === 'all' && items.length > 0 ? (
+        ) : view === 'items' && tab === 'all' && catAllRows.length > 0 ? (
           /*
            * 「全部文件」= 文件域父行（cat-all）→ **Explorer 列表**（BUG-299 出口判据）。
            *
@@ -1557,13 +1726,15 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
            *
            * 判据取 `tab === 'all'` 而不是 `view === 'items'`：分类子行（视频/图片/
            * 音频）仍是各自类型的浏览墙（MediaCard），只有「全部」这个**域级**父行
-           * 用列表。以后文件事实端点接进来（zip/exe/pdf 等非媒体），走的也是这
-           * 一棵树。
+           * 用列表。
+           *
+           * 行集 = `catAllRows`（已登记媒体 ∪ 受管下载成品，M2-T00a）——判据 7
+           * 的「共通性」就在这一行：zip/exe/pdf 与媒体同列表、同动作。
            */
           <FileListView
-            items={items}
+            items={catAllRows}
             selected={selected}
-            total={total}
+            total={total + Math.max(0, catAllRows.length - items.length)}
             onSelectToggle={toggleSelect}
             onOpen={openItem}
             onDelete={deleteItem}
@@ -1876,16 +2047,24 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
                 ? confirmTargetIds.length === 1
                   ? t('media.confirmRemoveOne')
                   : t('media.confirmRemoveItems')
-                : confirmSeriesIds.length >= 2
-                  ? t('media.seriesConfirmBulkTitle', { n: confirmSeriesIds.length })
-                  : t('media.confirmDeleteSeries')}
+                : confirmDelete.kind === 'files'
+                  ? confirmDelete.paths.length === 1
+                    ? t('media.confirmDeleteFile')
+                    : t('media.confirmDeleteFiles', { n: confirmDelete.paths.length })
+                  : confirmSeriesIds.length >= 2
+                    ? t('media.seriesConfirmBulkTitle', { n: confirmSeriesIds.length })
+                    : t('media.confirmDeleteSeries')}
             </h4>
             <p className="mt-1.5 text-[11.5px] leading-relaxed text-muted">
               {confirmDelete.kind === 'items'
                 ? t('media.confirmRemoveItemsHint', { n: confirmTargetIds.length })
-                : confirmSeriesIds.length >= 2
-                  ? t('media.seriesConfirmBulkHint')
-                  : t('media.confirmDeleteSeriesHint')}
+                : confirmDelete.kind === 'files'
+                  ? confirmDelete.paths.length === 1
+                    ? t('media.confirmDeleteFileHint', { path: confirmDelete.paths[0] })
+                    : t('media.confirmDeleteFilesHint', { n: confirmDelete.paths.length })
+                  : confirmSeriesIds.length >= 2
+                    ? t('media.seriesConfirmBulkHint')
+                    : t('media.confirmDeleteSeriesHint')}
             </p>
             {/* 批量删剧集必须**列出将删剧名与集数**：确认框只说「删 3 个剧集」时，
                 用户无从核对删的是哪三个（BUG-214 修复方向：两步确认 + 明示影响面）。 */}
@@ -1944,6 +2123,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
                   // 单条与批量走**同一条**执行路径（BUG-214）：
                   // 目标集只是「从哪来的」不同，执行链不该有两份。
                   if (k.kind === 'items') await doDeleteItems(k.ids ?? [...selected])
+                  else if (k.kind === 'files') await doDeleteFiles(k.paths)
                   else await doDeleteSeriesMany(k.ids ?? (k.id !== undefined ? [k.id] : []))
                 }}
                 data-testid="media-confirm-yes"

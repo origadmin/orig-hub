@@ -99,6 +99,9 @@ const FileRow = memo(function FileRow(props: {
       role="row"
       data-testid="file-list-row"
       data-item-id={item.id}
+      // 可证伪锚点：来源列的真实语义必须落在 DOM 上（验收数「下载成品行」用；
+      // 只靠文案列会让脚本退化成字符串匹配——名字里带「下载」就会误计）。
+      data-source={item.source}
       data-selected={selected ? 'true' : undefined}
       className={[
         'grid grid-cols-[20px_24px_minmax(0,1fr)_64px_88px_104px_64px_auto] items-center gap-2',

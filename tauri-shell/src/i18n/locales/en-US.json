@@ -25,6 +25,7 @@
   "nav.tg": "Telegram",
   "nav.media": "Media Library",
   "source.tg": "TG",
+  "source.download": "Download",
   "source.local": "Local",
   "source.oss": "OSS",
   "source.s3": "S3",

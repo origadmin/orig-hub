@@ -8,11 +8,15 @@
  *
  * 正向（渲染真发生了）：
  *   ① cat-all 下 `file-list` / `file-list-header` 存在，行数 > 0；
- *   ② 行数 ≤ min(API total, 分页页大小) —— 与列表端点同一口径对数（牙：API total>0
- *      而 UI 0 行 = FAIL，证明「有行」不是蒙的）；
+ *   ② 行数 == 媒体页（PAGE 上限）+ 受管下载成品（`/api/files`，按绝对路径去重，
+ *      与 `catAllRows` 同口径）—— 双源实算，不是估值（牙：任一端点有数而 UI 少行 = FAIL）；
  *   ③ 列头含「名称/类型/大小/日期/来源」五列（文案从 locale 源码读，不从页面猜）；
  *   ④ 每行复选框常驻（BUG-040：禁纯 hover 显形）；
  *   ⑤ 单击行 = 选中（Explorer 语义，与网格的全选 toolbar 并行不互斥）。
+ *
+ * 共通性（BUG-299 判据 7 的 UI 半，M2-T00a 读端点落地后新增）：
+ *   ⑧ 「下载」成品行数 == `/api/files` 去重后期望数（`data-source` DOM 锚，不靠文案匹配），
+ *      且成品中含非媒体类别（zip/exe/pdf）⇒ 全量 = 共通 + 兼容性真的成立。
  *
  * 互斥（「绝对不可能是视频」的本体判据）：
  *   ⑥ cat-all 下 `media-grid` 必须**不存在**（0）。
@@ -20,6 +24,8 @@
  * 反证（证明⑥不是「列表恒显/墙恒隐」的假绿，分派真的挂在 cat-all 上）：
  *   ⑦ 切到分类子行「视频」（cat:video → tab='video'）：`media-grid` 存在（>0）、
  *      `file-list` 不存在（0）—— 与⑥互为互斥类，一处渲染另一处必须消失。
+ *   ⑨ 文件树子项顺序：剧集行在视频行之前（2026-10-15 用户裁定「剧集作为核心」，
+ *      DOM 文档序断言；换位即 FAIL）。
  *
  * 脚本自身证伪纪律：判据①③⑤⑥的常量全部从**源码**读（组件/locale 文件），
  * 读不到直接 FAIL —— 不靠「页面上有这个东西」倒推源码没漂移。
@@ -41,6 +47,7 @@ const SRC = {
 const OUT = process.env.ORIG_SHOT_OUT || path.resolve(ROOT, 'verify_shots', 'bug299-file-list')
 const APP_URL = process.env.VERIFY_APP_URL || 'http://127.0.0.1:5180/'
 const TG = process.env.VERIFY_TG_BASE || 'http://127.0.0.1:19787'
+const DAEMON = process.env.VERIFY_DAEMON_BASE || 'http://127.0.0.1:19786'
 /** 分页页大小：与 MediaLibraryPanel 的 `PAGE` 同源（源码读，见源码常量段）。 */
 const PAGE = (() => {
   const m = SRC.panel.match(/^const PAGE = (\d+)$/m)
@@ -61,7 +68,12 @@ const T = {
   row: 'file-list-row',
   grid: 'media-grid',
 }
-const branchOk = /view === 'items' && tab === 'all' && items\.length > 0/.test(SRC.panel)
+// 分派牙齿：cat-all 分支必须由 `tab === 'all'` 守卫、渲染 FileListView、行集取
+// `catAllRows`（媒体页 ∪ 受管下载成品 —— 2026-10-15 M2-T00a 后的形状）。
+// 三类缺一即 FAIL：条件漂移 / 不渲染列表 / 行集退回纯媒体。
+const branchOk = /view === 'items' && tab === 'all' && catAllRows\.length > 0/.test(SRC.panel)
+  && /<FileListView\b/.test(SRC.panel)
+  && /items=\{catAllRows\}/.test(SRC.panel)
 const fileListMounted = new RegExp(`data-testid="${T.list}"`).test(SRC.fileList)
   && new RegExp(`data-testid="${T.row}"`).test(SRC.fileList)
 const zh = JSON.parse(SRC.zh)
@@ -87,9 +99,15 @@ async function main() {
     const PAGE_JS = `
     window.__b299 = {
       sel: ${JSON.stringify(T)},
+      page: ${PAGE},
       present(sel) { return document.querySelectorAll(sel).length },
       async api(p) {
         const r = await fetch('${TG}' + p, { headers: { accept: 'application/json' } })
+        if (!r.ok) throw new Error(p + ' -> HTTP ' + r.status)
+        return r.json()
+      },
+      async apiDaemon(p) {
+        const r = await fetch('${DAEMON}' + p, { headers: { accept: 'application/json' } })
         if (!r.ok) throw new Error(p + ' -> HTTP ' + r.status)
         return r.json()
       },
@@ -147,15 +165,42 @@ async function main() {
     check('⑤ 单击行 = 选中（Explorer 语义）',
       clicked === true && sel.sel === 1, `clicked=${clicked} selected=${sel.sel}`)
 
-    /* ── ②：行数 vs 列表端点（牙：API 有数而 UI 空 = FAIL） ── */
-    const api = await page.evaluate(async () => {
-      const r = await window.__b299.api('/api/media/items?hasBytes=true&limit=500')
-      return { total: r.total, got: (r.items || []).length }
+    /* ── ② 行数 vs 双源列表端点（牙：API 有数而 UI 空 = FAIL） ──
+     * cat-all 行集 = 媒体页（PAGE 上限）∪ 受管下载成品（`/api/files`，按绝对路径去重，
+     * 与 `catAllRows` 同一口径）。期望值在 Node 侧用两个端点实算 —— 不是估值。 */
+    const norm = (p) => (p ?? '').replace(/\\/g, '/').toLowerCase()
+    const mediaPage = await page.evaluate(async () => {
+      const r = await window.__b299.api(
+        '/api/media/items?hasBytes=true&sort=recent&limit=' + window.__b299.page + '&offset=0',
+      )
+      return r
     })
-    const expectRows = Math.min(api.total, PAGE)
-    check('② UI 行数与列表端点同口径（≤ min(total, PAGE)）',
-      all.rows > 0 && all.rows <= expectRows,
-      `ui=${all.rows} apiTotal=${api.total} PAGE=${PAGE}（牙：api 返回 ${api.got} 条）`)
+    const facts = await page.evaluate(async () => {
+      const r = await window.__b299.apiDaemon('/api/files')
+      return r.files || []
+    })
+    const taken = new Set(
+      (mediaPage.items || []).map((i) => norm(i.absolutePath ?? i.filePath)).filter(Boolean),
+    )
+    const expectFacts = facts.filter((f) => !taken.has(norm(f.path)))
+    const expectRows = (mediaPage.items || []).length + expectFacts.length
+    check('② UI 行数 == 媒体页 + 受管成品（双源同口径，含路径去重）',
+      all.rows === expectRows,
+      `ui=${all.rows} media=${(mediaPage.items || []).length} facts=${expectFacts.length}`)
+
+    /* ── ⑧ 共通性（BUG-299 判据 7 的可见半）：
+     * 「下载」成品真的与媒体同列表、同动作；且成品中含非媒体类别（zip/exe/pdf）
+     * ⇒ 「全量 = 共通 + 兼容性」在 UI 层成立，不只是后端能力。 */
+    const dlRows = await page.evaluate(() => {
+      const s = window.__b299.sel
+      return document.querySelectorAll(`[data-testid="${s.row}"][data-source="download"]`).length
+    })
+    const nonMedia = expectFacts.filter((f) => f.kind !== 'video' && f.kind !== 'photo' && f.kind !== 'audio')
+    check('⑧ 成品行 = 受管下载成品数（下载↔文件域联动生效）',
+      expectFacts.length > 0 && dlRows === expectFacts.length,
+      `ui=${dlRows} api=${expectFacts.length}（牙：非空跑）`)
+    check('⑧ 非媒体成品（zip/exe/pdf 等）与媒体同一列表（共通+兼容性）',
+      nonMedia.length > 0, `nonMediaFacts=${nonMedia.length} kinds=${[...new Set(nonMedia.map((f) => f.category))].join(',')}`)
 
     /* ── ③：列头五列（文案锚 locale 源码） ── */
     check('③ 列头含 名称/类型/大小/日期/来源 五列',
@@ -177,6 +222,21 @@ async function main() {
     check('⑦ 反证：视频分类子行渲染 media-grid（分派挂 cat-all，非恒列表）',
       vid.grid === 1 && vid.cards > 0, `grid=${vid.grid} cards=${vid.cards}`)
     check('⑦ 反证：视频分类子行不渲染 file-list', vid.list === 0, `count=${vid.list}`)
+
+    /* ── ⑨ 文件树子项顺序：剧集在视频之前 ──
+     * 2026-10-15 用户裁定「剧集作为核心」：文件域组织形态以剧集为纲，普通下载的
+     * 扁平视频库次之。判据用 DOM 文档序（compareDocumentPosition），换回去即 FAIL。 */
+    const order = await page.evaluate(() => {
+      const s = document.querySelector('[data-testid="nav-child-lib-series"]')
+      const v = document.querySelector('[data-testid="nav-child-cat-video"]')
+      if (!s || !v) return null
+      return {
+        seriesBeforeVideo: !!(s.compareDocumentPosition(v) & Node.DOCUMENT_POSITION_FOLLOWING),
+      }
+    })
+    check('⑨ 文件树子项顺序：剧集在视频之前（剧集为核心）',
+      order !== null && order.seriesBeforeVideo === true,
+      order ? `seriesBeforeVideo=${order.seriesBeforeVideo}` : 'rows=missing')
     await page.screenshot(path.join(OUT, '02_cat_video_grid.png'))
 
     const errs = page.pageErrors()

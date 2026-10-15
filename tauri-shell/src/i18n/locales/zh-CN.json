@@ -423,6 +423,7 @@
   "error.boundaryDesc": "TG 面板渲染时发生异常，可重试或检查 TG 服务。",
   "error.retry": "重试",
   "source.tg": "TG",
+  "source.download": "下载",
   "source.local": "本地",
   "source.oss": "OSS",
   "source.s3": "S3",

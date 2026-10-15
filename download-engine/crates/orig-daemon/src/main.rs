@@ -7,6 +7,7 @@
 
 mod activity;
 mod config;
+mod files;
 mod routes;
 mod state;
 mod status;

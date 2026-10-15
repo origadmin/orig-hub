@@ -10,6 +10,8 @@
 //!   DELETE /api/downloads/:id           -> {"status":"deleted","id":"..."}
 //!   GET  /api/events                    -> SSE 实时进度（REST+SSE 设计；原 Go 端由 Wails 轮询，此处补充）
 //!   GET  /api/activity                  -> 传输中聚合视图（只读，见 `activity.rs`）
+//!   GET  /api/files                     -> {roots, files:[FileFact]}（受管下载根成品，BUG-299 M2-T00a）
+//!   DELETE /api/files?path=...          -> {ok, path}（受管根边界守卫；404 不存在 / 403 根外）
 //!
 //! 下载流程：parse_url → probe(取总大小) → create_sources(一组 Source) →
 //! 用 `BlockMap` + `Task` 调度（见 `orig_core::engine`）。
@@ -36,6 +38,7 @@ use orig_core::engine::Task;
 use orig_core::protocol::{DownloadConfig, ParsedUrl, SseEvent};
 use crate::activity::{self, ActivityQuery, ActivitySnapshot};
 use crate::config::{resolve_output, resolve_output_classified};
+use crate::files;
 use crate::state::{log_dir, AppState, DownloadTask};
 use crate::status::DownloadStatus;
 
@@ -994,6 +997,9 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         )
         .route("/api/events", get(events))
         .route("/api/activity", get(activity))
+        // BUG-299 M2-T00a：受管下载根成品事实（文件域「全部文件」的 downloads 一侧）。
+        // GET 枚举 / DELETE 删除（受管根边界守卫，见 files.rs）。
+        .route("/api/files", get(files::list_files).delete(files::delete_file))
         .route("/api/interfaces", get(list_interfaces))
         .route("/api/config", get(get_config))
         .route("/api/config/classify", axum::routing::put(put_config_classify))
