@@ -21,6 +21,12 @@
  * 互斥（「绝对不可能是视频」的本体判据）：
  *   ⑥ cat-all 下 `media-grid` 必须**不存在**（0）。
  *
+ * 2026-10-16 BUG-316 段②适配：cat-all 改窗口化渲染（`file-list-scroll` 挂
+ * data-total 契约，DOM 只渲染视口 ± overscan 行）。②⑧ 的全列行数断言随之
+ * 改为「data-total == API 期望」+「滚到底累积数 == data-total」两道 ——
+ * 窗口化丢行必红，全量渲染（旧形态）亦必红（渲染行数会 == data-total 但
+ * longtask 回归，见 verify_bug316_segment2_render.cjs）。
+ *
  * 反证（证明⑥不是「列表恒显/墙恒隐」的假绿，分派真的挂在 cat-all 上）：
  *   ⑦ 切到分类子行「视频」（cat:video → tab='video'）：`media-grid` 存在（>0）、
  *      `file-list` 不存在（0）—— 与⑥互为互斥类，一处渲染另一处必须消失。
@@ -131,6 +137,50 @@ async function main() {
         await new Promise((r) => setTimeout(r, 400))
         return true
       },
+      /**
+       * 滚动全程累积所有行（BUG-316 段② 窗口化后适配）。
+       * 窗口化下 DOM 里只有视口 ± overscan 行；「行数 == 双源口径」这类**全列**
+       * 断言改为：滚到底逐步收集（按 data-item-id 去重），收集数必须 == 容器
+       * data-total（契约），容器 data-total 必须 == API 期望 —— 两道都过才证明
+       * 「既不少行（窗口化丢行 = FAIL）也不多行」。
+       */
+      async collectAll() {
+        const scroll = document.querySelector('[data-testid="file-list-scroll"]')
+        if (!scroll) return { ok: false }
+        const seen = new Map()
+        const collect = () => {
+          for (const el of document.querySelectorAll('[data-testid="' + this.sel.row + '"]')) {
+            const id = el.getAttribute('data-item-id')
+            if (id != null && !seen.has(id)) {
+              seen.set(id, el.getAttribute('data-source') || '')
+            }
+          }
+        }
+        const frame = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+        collect()
+        for (let i = 0; i < 400; i += 1) {
+          if (scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight - 4) break
+          scroll.scrollTop = Math.min(
+            scroll.scrollTop + Math.max(300, scroll.clientHeight - 120),
+            scroll.scrollHeight,
+          )
+          await frame()
+          collect()
+        }
+        collect()
+        return {
+          ok: true,
+          total: Number(scroll.getAttribute('data-total') || NaN),
+          count: seen.size,
+          download: [...seen.values()].filter((s) => s === 'download').length,
+        }
+      },
+      scrollFileListToTop() {
+        const el = document.querySelector('[data-testid="file-list-scroll"]')
+        if (!el) return false
+        el.scrollTop = 0
+        return true
+      },
     }
     `
     await page.evaluate(PAGE_JS)
@@ -167,7 +217,11 @@ async function main() {
 
     /* ── ② 行数 vs 双源列表端点（牙：API 有数而 UI 空 = FAIL） ──
      * cat-all 行集 = 媒体页（PAGE 上限）∪ 受管下载成品（`/api/files`，按绝对路径去重，
-     * 与 `catAllRows` 同一口径）。期望值在 Node 侧用两个端点实算 —— 不是估值。 */
+     * 与 `catAllRows` 同一口径）。期望值在 Node 侧用两个端点实算 —— 不是估值。
+     *
+     * BUG-316 段②窗口化适配：DOM 里只渲染窗口行（全列断言必须滚动累积）。
+     * 判据两道：① 容器 data-total（契约）== API 期望；② 滚到底累积数 == data-total
+     * （窗口化既不丢行也不多渲染）。 */
     const norm = (p) => (p ?? '').replace(/\\/g, '/').toLowerCase()
     const mediaPage = await page.evaluate(async () => {
       const r = await window.__b299.api(
@@ -184,21 +238,24 @@ async function main() {
     )
     const expectFacts = facts.filter((f) => !taken.has(norm(f.path)))
     const expectRows = (mediaPage.items || []).length + expectFacts.length
-    check('② UI 行数 == 媒体页 + 受管成品（双源同口径，含路径去重）',
-      all.rows === expectRows,
-      `ui=${all.rows} media=${(mediaPage.items || []).length} facts=${expectFacts.length}`)
+    const collected = await page.evaluate(() => window.__b299.collectAll())
+    check('② 容器 data-total == 媒体页 + 受管成品（双源同口径，含路径去重）',
+      collected.ok && collected.total === expectRows,
+      `ui=${collected.total} media=${(mediaPage.items || []).length} facts=${expectFacts.length}`)
+    check('② 滚到底累积行数 == data-total（窗口化不丢行、不多渲染）',
+      collected.ok && collected.count === collected.total,
+      `collected=${collected.count} total=${collected.total}`)
+    // 滚回顶部（截图与后续行级断言以列表首屏为语境）
+    await page.evaluate(() => window.__b299.scrollFileListToTop())
 
     /* ── ⑧ 共通性（BUG-299 判据 7 的可见半）：
      * 「下载」成品真的与媒体同列表、同动作；且成品中含非媒体类别（zip/exe/pdf）
-     * ⇒ 「全量 = 共通 + 兼容性」在 UI 层成立，不只是后端能力。 */
-    const dlRows = await page.evaluate(() => {
-      const s = window.__b299.sel
-      return document.querySelectorAll(`[data-testid="${s.row}"][data-source="download"]`).length
-    })
+     * ⇒ 「全量 = 共通 + 兼容性」在 UI 层成立，不只是后端能力。
+     * 窗口化适配：download 源行数在滚动全程累积集里数（data-source DOM 锚）。 */
     const nonMedia = expectFacts.filter((f) => f.kind !== 'video' && f.kind !== 'photo' && f.kind !== 'audio')
-    check('⑧ 成品行 = 受管下载成品数（下载↔文件域联动生效）',
-      expectFacts.length > 0 && dlRows === expectFacts.length,
-      `ui=${dlRows} api=${expectFacts.length}（牙：非空跑）`)
+    check('⑧ 成品行 = 受管下载成品数（下载↔文件域联动生效；滚动全程累积）',
+      expectFacts.length > 0 && collected.ok && collected.download === expectFacts.length,
+      `ui=${collected.download} api=${expectFacts.length}（牙：非空跑）`)
     check('⑧ 非媒体成品（zip/exe/pdf 等）与媒体同一列表（共通+兼容性）',
       nonMedia.length > 0, `nonMediaFacts=${nonMedia.length} kinds=${[...new Set(nonMedia.map((f) => f.category))].join(',')}`)
 

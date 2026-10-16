@@ -4,6 +4,7 @@ import { kindLabelKey } from '../../api/media'
 import { useTranslation } from '../../i18n'
 import { resolveDisplayName } from '../../lib/displayName'
 import { isTauri } from '../../lib/env'
+import { VirtualList } from '../ui/virtual-list'
 // 媒体库组件的格式化/来源工具一律从 mediaSources 取（该文件是唯一 import
 // `lib/tgmedia` 的地方，通用工具已在其中 re-export）——与本目录其他组件同一纪律。
 import { fmtDate, fmtSize, hasMediaBytes, sourceLabelKey } from '../../lib/mediaSources'
@@ -54,8 +55,9 @@ export interface FileListViewProps {
 }
 
 /**
- * 单行。`memo` 化（BUG-026 流畅优先）：一页最多 120 行，父面板任何 setState
- * 都会带着整表重渲染；复选框/图标都是纯展示，没必要跟着重算。
+ * 单行。`memo` 化（BUG-026 流畅优先）：窗口化后每刻只渲染视口 ± overscan 行
+ * （BUG-316 段②），但每次滚动进出窗口仍会重挂整行；复选框/图标都是纯展示，
+ * 没必要跟着父面板任何 setState 重算。
  */
 const FileRow = memo(function FileRow(props: {
   item: MediaItem
@@ -222,10 +224,21 @@ export function FileListView(props: FileListViewProps) {
         <span>{t('media.fileList.source')}</span>
         <span />
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto" data-testid="file-list-scroll">
-        {items.map((item) => (
+      {/*
+        窗口化（BUG-316 段②）：cat-all 实测 671 行全量同步渲染 ⇒ 单次 longtask
+        ~230ms。行高实测 34px 均匀（bug316_row_geometry 探针），estimate 取实测值；
+        overscan 10 行 ≈ 340px 快滚缓冲。契约：容器 data-total = items.length
+        （验收脚本据此断言「渲染行数 < 总数」——全量渲染必 FAIL）。
+      */}
+      <VirtualList
+        className="min-h-0 flex-1 overflow-y-auto"
+        testId="file-list-scroll"
+        items={items}
+        estimate={34}
+        overscan={10}
+        keyOf={(item) => item.id}
+        renderItem={(item) => (
           <FileRow
-            key={item.id}
             item={item}
             selected={selected.has(item.id)}
             onSelectToggle={onSelectToggle}
@@ -233,8 +246,8 @@ export function FileListView(props: FileListViewProps) {
             onDelete={onDelete}
             onReveal={reveal}
           />
-        ))}
-      </div>
+        )}
+      />
       <div className="flex items-center justify-between gap-2 border-t border-border-subtle/40 px-2 py-1.5 text-[10px] text-muted/80">
         <span>{t('media.fileList.dblHint')}</span>
         {total > items.length ? <span>{t('media.showing', { n: items.length, total })}</span> : null}

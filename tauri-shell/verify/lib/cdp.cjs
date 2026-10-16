@@ -434,7 +434,11 @@ class Page {
      * 这里只是让被放弃的等待安静结束，不改变任何成功路径的语义。
      */
     loadPromise.catch(() => {})
-    const result = await this.conn.send('Page.navigate', { url }, { sessionId })
+    // `timeoutMs` 必须显式传：不传就落到连接默认（30s），于是 `options.timeout`
+    // 只约束「等 load 事件」，而 `Page.navigate` 这条命令自身仍按 30s 判死 ——
+    // 一个更大的 timeout 形同虚设（实测：vite 侧文件变更后的首次整页加载可达 30s+，
+    // 正好卡在默认档上，表现为「导航超时」而不是「加载慢」）。
+    const result = await this.conn.send('Page.navigate', { url }, { sessionId, timeoutMs: timeout })
     if (result && result.errorText) {
       throw new Error(`CDP: navigation to ${url} failed: ${result.errorText}`)
     }
@@ -532,6 +536,28 @@ class Page {
     })
     fs.writeFileSync(target, Buffer.from(String(result.data || ''), 'base64'))
     return target
+  }
+
+  /**
+   * Send a real key press via CDP `Input.dispatchKeyEvent` (keyDown + keyUp).
+   *
+   * Why this exists: several verify scripts need to close overlays with Escape
+   * (MediaViewer, dialogs). The page wrapper has no Playwright-style `keyboard`
+   * surface, and a synthetic `new KeyboardEvent` from `evaluate` does not prove
+   * the browser's real key delivery path — the app's own `keydown` handler is
+   * what we want to exercise, so drive it the way the browser would.
+   * @param {string} key e.g. 'Escape'
+   * @param {object} [opts] `{ code, virtualKeyCode }` (defaults derived from key)
+   * @returns {Promise<void>}
+   */
+  async pressKey(key, opts = {}) {
+    const code = opts.code || (key.length === 1 ? `Key${key.toUpperCase()}` : key)
+    const vk = opts.virtualKeyCode !== undefined
+      ? opts.virtualKeyCode
+      : (key === 'Escape' ? 27 : key === 'Enter' ? 13 : key === 'ArrowLeft' ? 37 : key === 'ArrowRight' ? 39 : 0)
+    const base = { key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk }
+    await this.conn.send('Input.dispatchKeyEvent', { ...base, type: 'keyDown' }, { sessionId: this.sessionId })
+    await this.conn.send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' }, { sessionId: this.sessionId })
   }
 
   /**

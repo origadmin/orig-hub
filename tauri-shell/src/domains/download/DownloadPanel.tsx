@@ -6,6 +6,8 @@ import { IngestGroupRow } from './IngestGroupRow'
 import type { UseIngestGroupsResult } from './useIngestGroups'
 import { groupInBucket } from './ingestGroups'
 import { useStore } from '../../store/useStore'
+import { VirtualList } from '../../components/ui/virtual-list'
+import type { IngestGroup } from './ingestGroups'
 
 /**
  * 下载域容器（模块重整 M0 · BUG-298 / M0-T02；M3 并入 TG 入库 · BUG-300）。
@@ -155,10 +157,16 @@ export function DownloadPanel({ dlFilter, items, ingest }: Props) {
   }
 
   return (
-    <div className="space-y-3">
+    /*
+     * 布局：根弹性列 + 列表内滚动（BUG-316 段②）。入库组行实测 104 行全量同步
+     * 渲染 ⇒ 单次 longtask ~240ms；改为窗口化后列表只渲染视口 ± overscan 行，
+     * 概览/来源切片/banner 置顶（shrink-0），页面级滚动（main 的 overflow-y-auto）
+     * 因面板 h-full 自然变 no-op。
+     */
+    <div className="flex h-full min-h-0 flex-col gap-3">
       {/* 概览（笼统的数据）：先给结论级计数，再列具体对象 */}
       <div
-        className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-border-subtle bg-surface px-3 py-2 text-[11px] text-muted"
+        className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-border-subtle bg-surface px-3 py-2 text-[11px] text-muted"
         data-testid="dl-overview"
       >
         <span className="font-mono text-fg-mid" data-testid="dl-overview-total">
@@ -179,7 +187,7 @@ export function DownloadPanel({ dlFilter, items, ingest }: Props) {
       </div>
 
       {/* 来源切片 */}
-      <div className="flex flex-wrap items-center gap-2" data-testid="dl-source-filter">
+      <div className="flex shrink-0 flex-wrap items-center gap-2" data-testid="dl-source-filter">
         {(Object.keys(SOURCE_LABELS) as SourceFilter[]).map((k) => (
           <button
             key={k}
@@ -199,7 +207,7 @@ export function DownloadPanel({ dlFilter, items, ingest }: Props) {
 
       {tgUnavailable && (
         <div
-          className="rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning"
+          className="shrink-0 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning"
           data-testid="dl-tg-unavailable"
         >
           TG 服务未连接，入库任务暂时无法读取（普通下载不受影响）：{error}
@@ -208,7 +216,7 @@ export function DownloadPanel({ dlFilter, items, ingest }: Props) {
 
       {total === 0 ? (
         <div
-          className="flex flex-col items-center justify-center py-24 text-center"
+          className="flex flex-1 flex-col items-center justify-center py-24 text-center"
           data-testid="dl-empty"
         >
           <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-surface-2">
@@ -224,21 +232,41 @@ export function DownloadPanel({ dlFilter, items, ingest }: Props) {
           </p>
         </div>
       ) : (
-        <div className="space-y-2.5">
-          {showEngine && <DownloadList items={engineRows} />}
-          {showIngest &&
-            ingestRows.map((g) => (
-              <IngestGroupRow
-                key={g.key}
-                group={g}
-                onAction={(task, action) => {
-                  void run(task, action).catch(fail)
-                }}
-                onRemove={(task) => {
-                  void remove(task).catch(fail)
-                }}
-              />
-            ))}
+        <div className="flex min-h-0 flex-1 flex-col gap-2.5">
+          {showEngine && (
+            <div className="shrink-0">
+              <DownloadList items={engineRows} />
+            </div>
+          )}
+          {showIngest && (
+            /*
+             * 入库组行窗口化（BUG-316 段②）：实测 104 行 × 折叠 108px 全量渲染
+             * ⇒ 单次 longtask ~240ms。estimate 取折叠行实测高；展开行 432px 由
+             * measure-and-cache 逐帧收敛（VirtualList 内 RO）。间距沿用原
+             * space-y-2.5（10px 烘进 wrapper padding）。契约：容器
+             * data-total = ingestRows.length（验收脚本据此断言渲染行数 < 总数）。
+             */
+            <VirtualList<IngestGroup>
+              className="min-h-0 flex-1 overflow-y-auto"
+              testId="dl-group-list"
+              items={ingestRows}
+              estimate={108}
+              overscan={6}
+              keyOf={(g) => g.key}
+              rowClassName="pb-2.5"
+              renderItem={(g) => (
+                <IngestGroupRow
+                  group={g}
+                  onAction={(task, action) => {
+                    void run(task, action).catch(fail)
+                  }}
+                  onRemove={(task) => {
+                    void remove(task).catch(fail)
+                  }}
+                />
+              )}
+            />
+          )}
         </div>
       )}
     </div>
