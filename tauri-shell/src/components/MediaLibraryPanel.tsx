@@ -1618,7 +1618,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
                 )}
               </div>
             ) : (
-              <div className="grid grid-cols-[repeat(auto-fill,minmax(160px,1fr))] gap-3">
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4">
                 {series.map((s) => (
                   <SeriesCard
                     key={s.id}
@@ -1673,7 +1673,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             <div className="min-h-0 flex-1 overflow-y-auto p-3">
               <div
                 data-testid="media-grid"
-                className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-3"
+                className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4"
               >
                 {items.map((item) => (
                   <MediaCard

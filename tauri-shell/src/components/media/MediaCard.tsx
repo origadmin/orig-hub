@@ -399,7 +399,7 @@ function MediaCardBase(props: {
 
             {/* 时长徽标 */}
             {item.duration ? (
-              <span className="absolute bottom-1 right-1 rounded bg-black/75 px-1 text-[10px] font-medium text-white">
+              <span className="absolute bottom-1 right-1 rounded bg-black/75 px-1.5 py-0.5 text-[11px] font-medium text-white">
                 {fmtDuration(item.duration)}
               </span>
             ) : null}
@@ -418,7 +418,7 @@ function MediaCardBase(props: {
             }
           >
             <CloudOff className="h-5 w-5" />
-            <span className="text-[10px] leading-none">
+            <span className="text-xs leading-none">
               {recacheable ? t('media.bytesCleared') : t('media.fileMissing')}
             </span>
             {recacheable ? (
@@ -427,7 +427,7 @@ function MediaCardBase(props: {
                 disabled={Boolean(recacheBlockedReason)}
                 onClick={() => onRecache?.(item)}
                 className={[
-                  'rounded-full px-1.5 py-0.5 text-[10px] font-medium leading-none text-white transition-colors',
+                  'rounded-full px-2 py-1 text-xs font-medium leading-none text-white transition-colors',
                   recacheBlockedReason
                     ? 'cursor-not-allowed bg-muted/40'
                     : 'bg-accent/90 hover:bg-accent',
@@ -443,7 +443,7 @@ function MediaCardBase(props: {
 
         {/* 集号徽标 */}
         {episodeLabel ? (
-          <span className="absolute left-1 top-1 rounded bg-accent/90 px-1.5 py-0.5 text-[10px] font-semibold text-white">
+          <span className="absolute left-1 top-1 rounded bg-accent/90 px-1.5 py-0.5 text-[11px] font-semibold text-white">
             {episodeLabel}
           </span>
         ) : null}
@@ -456,7 +456,7 @@ function MediaCardBase(props: {
             `pointer-events-none`：它压在封面按钮上，不能吞掉那一角的点击。 */}
         {kindLabel ? (
           <span
-            className="pointer-events-none absolute bottom-1 left-1 rounded bg-black/65 px-1 py-0.5 text-[10px] font-medium leading-none text-white/90"
+            className="pointer-events-none absolute bottom-1 left-1 rounded bg-black/65 px-1.5 py-0.5 text-[11px] font-medium leading-none text-white/90"
             data-testid="item-kind"
           >
             {kindLabel}
@@ -476,7 +476,7 @@ function MediaCardBase(props: {
               onSelectToggle(item.id, e.shiftKey)
             }}
             className={[
-              'absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded border text-[11px] transition-opacity',
+              'absolute right-1 top-1 flex h-6 w-6 items-center justify-center rounded border text-xs transition-opacity',
               selected
                 ? 'border-accent bg-accent text-white opacity-100'
                 : 'border-white/70 bg-black/40 text-transparent opacity-0 group-hover:opacity-100',
@@ -488,11 +488,11 @@ function MediaCardBase(props: {
       </div>
 
       {/* 文本区 */}
-      <div className="flex min-w-0 flex-1 flex-col gap-0.5 px-2 py-1.5">
-        <p className="truncate text-[12px] font-medium text-fg-strong" title={displayName}>
+      <div className="flex min-w-0 flex-1 flex-col gap-1 px-2.5 py-2">
+        <p className="truncate text-sm font-medium text-fg-strong" title={displayName}>
           {displayName}
         </p>
-        <p className="flex items-center gap-1 truncate text-[10px] text-muted">
+        <p className="flex items-center gap-1 truncate text-xs text-muted">
           {/*
            * BUG-133：这里的 `item.size` 是**登记值**（源头元数据），不是本地磁盘占用。
            * 此前它被裸展示成一个和「占用空间」毫无区别的数字，两处读数被当成同一口径，
@@ -507,7 +507,7 @@ function MediaCardBase(props: {
           </span>
           {/* 来源徽标（S2）：一眼分清这条内容是从哪来的 */}
           <span
-            className="shrink-0 rounded bg-surface-2/70 px-1 text-[10px] leading-none text-muted"
+            className="shrink-0 rounded bg-surface-2/70 px-1.5 py-0.5 text-[11px] leading-none text-muted"
             data-testid="item-source"
             title={t('media.fromSource', { source: sourceLabel })}
           >
@@ -539,7 +539,7 @@ function MediaCardBase(props: {
             <button
               type="button"
               onClick={() => onViewInTg?.(tgCoords)}
-              className="flex items-center gap-1 rounded bg-black/65 px-1.5 py-0.5 text-[10px] text-white/90 backdrop-blur-sm transition-colors hover:bg-black/85 hover:text-white"
+              className="flex items-center gap-1 rounded bg-black/65 px-2 py-1 text-[11px] text-white/90 backdrop-blur-sm transition-colors hover:bg-black/85 hover:text-white"
               title={t('media.viewInTg')}
               aria-label={t('media.viewInTg')}
               data-testid="item-view-tg"
@@ -552,7 +552,7 @@ function MediaCardBase(props: {
             <button
               type="button"
               onClick={() => onDelete(item)}
-              className="flex items-center gap-1 rounded bg-black/65 px-1.5 py-0.5 text-[10px] text-white/90 backdrop-blur-sm transition-colors hover:bg-destructive hover:text-white"
+              className="flex items-center gap-1 rounded bg-black/65 px-2 py-1 text-[11px] text-white/90 backdrop-blur-sm transition-colors hover:bg-destructive hover:text-white"
               title="从资料库删除这条内容（只删记录，磁盘上的文件不受影响）"
               aria-label="删除"
               data-testid="item-delete"
@@ -565,7 +565,7 @@ function MediaCardBase(props: {
             <button
               type="button"
               onClick={() => onEdit(item)}
-              className="flex items-center gap-1 rounded bg-black/65 px-1.5 py-0.5 text-[10px] text-white/90 backdrop-blur-sm transition-colors hover:bg-black/85 hover:text-white"
+              className="flex items-center gap-1 rounded bg-black/65 px-2 py-1 text-[11px] text-white/90 backdrop-blur-sm transition-colors hover:bg-black/85 hover:text-white"
               title="编辑标题 / 介绍 / 标签"
               aria-label="编辑"
               data-testid="item-edit"

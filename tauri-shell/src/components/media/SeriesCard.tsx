@@ -151,7 +151,7 @@ export function SeriesCard(props: {
             onSelectToggle(series.id)
           }}
           className={[
-            'absolute right-1 top-1 z-10 flex h-6 w-6 items-center justify-center rounded-md border text-[13px] font-semibold leading-none shadow-sm transition-colors',
+            'absolute right-1 top-1 z-10 flex h-7 w-7 items-center justify-center rounded-md border text-[14px] font-semibold leading-none shadow-sm transition-colors',
             isSelected
               ? 'border-accent bg-accent text-white'
               : 'border-white/70 bg-black/55 text-transparent hover:bg-black/75',
@@ -193,11 +193,11 @@ export function SeriesCard(props: {
           </span>
         )}
         <span className="absolute inset-0 flex items-center justify-center bg-black/45 opacity-0 transition-opacity group-hover:opacity-100">
-          <span className="rounded-full bg-white/90 px-3 py-1 text-[11px] font-medium text-black">
+          <span className="rounded-full bg-white/90 px-3 py-1.5 text-[13px] font-medium text-black">
             {t('media.series.open')}
           </span>
         </span>
-        <span className="absolute left-1 top-1 rounded bg-accent/90 px-1.5 py-0.5 text-[10px] font-semibold text-white">
+        <span className="absolute left-1 top-1 rounded bg-accent/90 px-1.5 py-0.5 text-[11px] font-semibold text-white">
           {kindLabel(series.kind)}
         </span>
         {/* BUG-304 / D18（修订 BUG-254 的呈现）：剧集卡**不再**出现「未缓存」标。
@@ -210,7 +210,7 @@ export function SeriesCard(props: {
             `coverHasBytes` 本身**仍然有效且仍在用** —— 它决定能否对 video 封面抽帧
             （见下方封面渲染分支），只是不再驱动这个角标。 */}
         <span
-          className="absolute bottom-1 right-1 rounded bg-black/75 px-1 text-[10px] text-white"
+          className="absolute bottom-1 right-1 rounded bg-black/75 px-1.5 py-0.5 text-[11px] text-white"
           data-testid="series-video-count"
         >
           {/*
@@ -222,11 +222,11 @@ export function SeriesCard(props: {
           {series.videoCount != null ? t('media.series.videoCount', { n: series.videoCount }) : null}
         </span>
       </button>
-      <div className="flex min-w-0 flex-1 flex-col gap-0.5 px-2 py-1.5">
-        <p className="truncate text-[12px] font-medium text-fg-strong" title={series.title}>
+      <div className="flex min-w-0 flex-1 flex-col gap-1 px-2.5 py-2">
+        <p className="truncate text-sm font-medium text-fg-strong" title={series.title}>
           {series.title}
         </p>
-        <p className="text-[10px] text-muted">
+        <p className="text-xs text-muted">
           {t('media.series.seasonCount', { n: series.seasonCount })} ·{' '}
           {/* BUG-220：同角标——「N 集」改为视频数，集数口径含图片会误导。 */}
           {series.videoCount != null
@@ -237,7 +237,7 @@ export function SeriesCard(props: {
             0 也如实显示，用户不该为了确认「这部剧里有没有图片」而逐个点进去。
             老后端不下发这两个字段时不渲染（不编造 0）。 */}
         {series.videoCount != null || series.photoCount != null ? (
-          <p className="text-[10px] text-muted" data-testid="series-content-kinds">
+          <p className="text-xs text-muted" data-testid="series-content-kinds">
             {t('media.series.videoCount', { n: series.videoCount ?? 0 })} ·{' '}
             {t('media.series.photoCount', { n: series.photoCount ?? 0 })}
           </p>

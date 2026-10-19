@@ -22,7 +22,7 @@ export function TagToken(props: {
   return (
     <span
       className={[
-        'inline-flex max-w-full items-baseline gap-px whitespace-nowrap rounded px-1 text-[10px]',
+        'inline-flex max-w-full items-baseline gap-px whitespace-nowrap rounded px-1.5 text-[11px]',
         active ? 'bg-accent text-white' : 'text-muted',
         className,
       ].join(' ')}
