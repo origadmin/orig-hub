@@ -1,4 +1,9 @@
 /** 与 Rust daemon DownloadStatus 对齐的下载状态 */
+/**
+ * 引擎侧状态词。**必须与后端 `engine_task.status` 的取值集合一致** —— 少一个
+ * 就等于类型层不承认它存在，于是没人给它写分支，它就会被 `?? fallback` 吞成
+ * 别的状态（`interrupted` 曾被吞成「空闲」，那是在撒谎）。
+ */
 export type DownloadStatusValue =
   | 'idle'
   | 'queued'
@@ -7,6 +12,8 @@ export type DownloadStatusValue =
   | 'completed'
   | 'error'
   | 'cancelled'
+  // BUG-319：进程消失留下的行。后端会真的下发这个词。
+  | 'interrupted'
 
 export interface DownloadStatus {
   id: string
@@ -42,6 +49,17 @@ export interface DownloadStatus {
   supports_range?: boolean
   /** 自动分类名（后端按设置 classify_rules 推导；前端「全部文件」按此筛选） */
   category?: string
+  /**
+   * 该行**真实具备**的传输控制动词（后端 `actions_for` 计算，唯一真源）。
+   *
+   * 前端必须按它渲染按钮，不许按 `status` 自己推 —— 按 status 推等于把
+   * 「哪个状态有哪些能力」这条契约复制进 UI，新增来源（未来的第 N 个协议/插件）
+   * 就得改一遍前端；按 actions 渲染则新来源只改后端一处。
+   *
+   * 注意它**不含删除**：删除是资产操作（删下载 = 删用户文件），契约刻意不把它
+   * 混进传输动词，留在行内独立的删除按钮上。
+   */
+  actions?: string[]
 }
 
 /** 单连接（源）实时状态（BUG-002） */
@@ -378,6 +396,22 @@ export interface ManifestEntry {
   episodeId?: number
   season?: number
   episodeNo?: number
+  /** BUG-315 信息补齐：文件名（media_message.file_name） */
+  fileName?: string | null
+  /** BUG-315 信息补齐：消息文案（media_message.caption） */
+  caption?: string | null
+  /** BUG-315 信息补齐：字节数（media_message.size）；无字节时为 null */
+  size?: number | null
+  /** BUG-315 信息补齐：消息时间（Unix 秒，media_message.msg_date） */
+  msgDate?: number | null
+  /** BUG-315 信息补齐：媒体类型（video/photo/...） */
+  mediaType?: string | null
+  /** BUG-315 信息补齐：时长（秒） */
+  duration?: number | null
+  /** BUG-315 状态补齐：在途尝试起始时间戳（Unix 毫秒）；有值=正在传 */
+  startedAt?: number | null
+  /** BUG-315 状态补齐：已结束尝试累计墙钟（毫秒） */
+  accumMs?: number | null
 }
 
 /**

@@ -1946,6 +1946,7 @@ dependencies = [
  "async-trait",
  "axum",
  "futures",
+ "libsql",
  "orig-core",
  "orig-net",
  "orig-protocol-http",

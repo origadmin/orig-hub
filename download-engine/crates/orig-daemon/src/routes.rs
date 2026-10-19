@@ -12,6 +12,7 @@
 //!   GET  /api/activity                  -> 传输中聚合视图（只读，见 `activity.rs`）
 //!   GET  /api/files                     -> {roots, files:[FileFact]}（受管下载根成品，BUG-299 M2-T00a）
 //!   DELETE /api/files?path=...          -> {ok, path}（受管根边界守卫；404 不存在 / 403 根外）
+//!   GET  /api/fs/dirs?path=...          -> {path, parent, entries, roots}（只读目录浏览，BUG-323 缺陷③）
 //!
 //! 下载流程：parse_url → probe(取总大小) → create_sources(一组 Source) →
 //! 用 `BlockMap` + `Task` 调度（见 `orig_core::engine`）。
@@ -35,12 +36,16 @@ use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
 use orig_core::engine::Task;
-use orig_core::protocol::{DownloadConfig, ParsedUrl, SseEvent};
+use orig_core::protocol::{DownloadConfig, Metadata, ParsedUrl, Protocol, SseEvent};
 use crate::activity::{self, ActivityQuery, ActivitySnapshot};
 use crate::config::{resolve_output, resolve_output_classified};
+use crate::fsbrowse;
 use crate::files;
 use crate::state::{log_dir, AppState, DownloadTask};
 use crate::status::DownloadStatus;
+use crate::task_store::{
+    EngineTaskRecord, ST_CANCELLED, ST_COMPLETED, ST_DOWNLOADING, ST_ERROR, ST_PAUSED,
+};
 
 // ---- 请求结构 ----
 
@@ -118,25 +123,22 @@ async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({"status": "ok"}))
 }
 
+/// `GET /api/downloads` — 引擎侧全量。
+///
+/// 与 `/api/activity` 的 download 行共用 `engine_rows` 同一真源（内存 ∪ 库）。
+/// 之前本端点**只读内存**，导致栈重启后聚合面看得到行、下载页却空白 —— 同一个
+/// 事实两个答案。两个面必须同一份合并结果，否则「数据丢失」的观感永远修不完。
 async fn list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let tasks = st.tasks.lock().await;
+    let rows = crate::activity::engine_rows(&st).await;
     let now = now_secs();
-    let mut out = Vec::new();
-    for dt in tasks.values() {
-        let prog = dt.task.progress().await;
-        let status = DownloadStatus::from_progress(
-            &dt.task.id,
-            &dt.url,
-            &dt.filename,
-            Some(dt.output.to_string_lossy().into_owned()),
-            dt.added_at,
-            dt.max_concurrency,
-            &prog,
-            now,
-            dt.error.lock().await.clone(),
-            dt.category.clone(),
-        );
-        out.push(status);
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        // 只有内存活体才有实时明细可采；纯记录行只陈事实（不产分块/连接）。
+        let detail = match &r.live {
+            Some(t) => Some(t.progress().await),
+            None => None,
+        };
+        out.push(DownloadStatus::from_row(r, detail.as_ref(), now));
     }
     axum::Json(out)
 }
@@ -170,6 +172,284 @@ async fn next_free_path(output: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// 跑一个任务，并在结束时把**终态**写进持久化层（BUG-319）。
+///
+/// `POST /api/downloads/:id/retry` — 终态/中断行的重试（BUG-322）。
+///
+/// **来源无关是本端点的设计前提**：它不认识任何一个协议，只从记录里取出 `url`，
+/// 交给 `probe_url` 由 Registry 按 scheme 找到协议 —— 新增协议（未来的第 N 个
+/// 来源）注册进 Registry 即自动获得重试能力，本端点零改动。它是 download 侧
+/// 的动作，与 TG 侧的 `/api/cache/tasks/:id/retry` 同构（各侧自持命名空间）。
+///
+/// 与 `POST .../:id?action=pause|resume|cancel` 分开的理由不是命名洁癖：
+/// pause/resume/cancel 作用于**内存里的活体句柄**（句柄没了就没得做），retry
+/// 作用于**记录**（句柄没了才轮到它）。操作对象不同，404 的语义也不同（前者
+/// 「没有活体」、后者「没有记录」），混进同一个 `?action=` 会让调用方分不清
+/// 自己拿到的 404 是哪一种。
+async fn retry_one(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    // 还在内存里 ⇒ 它有句柄、能被 pause/resume，重试是重复入队，不做。
+    if st.tasks.lock().await.contains_key(&id) {
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"error": "task is live", "id": id})),
+        )
+            .into_response();
+    }
+    let rec = match &st.task_store {
+        Some(store) => store.get(&id).await,
+        None => None,
+    };
+    let rec = match rec {
+        Some(r) => r,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({"error": "no such record", "id": id})),
+            )
+                .into_response()
+        }
+    };
+    // 只接受「停在那儿了」的行。completed 不重试：落盘路径不重命名（见
+    // `requeue` 的注释），重试一个已完成的文件只会覆盖它自己，那是噪音不是能力。
+    if !matches!(
+        rec.status.as_str(),
+        crate::task_store::ST_INTERRUPTED
+            | crate::task_store::ST_ERROR
+            | crate::task_store::ST_CANCELLED
+    ) {
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"error": "not retryable", "status": rec.status})),
+        )
+            .into_response();
+    }
+    if let Err(e) = requeue(&st, &rec).await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(serde_json::json!({"error": "retry failed", "detail": e})),
+        )
+            .into_response();
+    }
+    // `requeue` 末尾会把状态回写成记录里的旧状态（那是它**当时的**处境）；
+    // 重试是要它**现在**开始跑，故显式置为 downloading。
+    st.set_task_status(&rec.id, crate::task_store::ST_DOWNLOADING)
+        .await;
+    // `resume: false` 不是冗余：引擎无真续传（每次 offset 0 起），必须让调用方
+    // 知道「重试 = 整任务重跑」，否则 UI 会把这个词渲染成「从断点继续」。
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({"status": "retrying", "id": id, "resume": false})),
+    )
+        .into_response()
+}
+
+/// `POST /api/downloads` 与启动恢复共用这一段：两条入队路径的终态处理只能是
+/// 同一份，否则「新建的任务记了、恢复的任务没记」又会变成一类分叉。
+fn spawn_task(st: &Arc<AppState>, id: String, task: Arc<Task>) {
+    let st_run = st.clone();
+    let id_run = id.clone();
+    tokio::spawn(async move {
+        let res = task.run().await;
+        if let Err(ref e) = res {
+            eprintln!("[download] task {id_run} error: {e}");
+            st_run
+                .events
+                .send(SseEvent::Error {
+                    id: id_run.clone(),
+                    message: e.to_string(),
+                })
+                .ok();
+            if let Some(dt) = st_run.tasks.lock().await.get(&id_run) {
+                *dt.error.lock().await = Some(e.to_string());
+            }
+        } else {
+            eprintln!("[download] task {id_run} completed");
+        }
+        // 终态落库：取消/失败/完成的行都必须留下 —— 它们是**结果**，
+        // 重启后凭空消失就是用户所说的「数据丢失」。
+        // 取消与错误分开：取消是用户意图，错误是故障；混成一个状态就等于
+        // 把「我取消的」渲染成「下载失败了」。
+        let (status, err) = match res {
+            Ok(()) => (ST_COMPLETED, None),
+            Err(ref e) => {
+                if task.control.cancel.is_cancelled() {
+                    (ST_CANCELLED, Some(e.to_string()))
+                } else {
+                    (ST_ERROR, Some(e.to_string()))
+                }
+            }
+        };
+        // 认**身份**不认 id：重试是复用同一个 id 建一个新任务（见 `requeue`），
+        // 于是旧任务的临终写入若按 id 落库，就会把新任务正在跑的状态改写成
+        // 「已取消」—— 用户刚点了重试，界面却又变回已取消（实测序列：
+        // downloading 被随后的 cancelled 覆盖）。
+        // 同理，用户删除后内存里已没有该 id ⇒ 也要跳过（不许删了又复活）。
+        let is_mine = {
+            let tasks = st_run.tasks.lock().await;
+            match tasks.get(&id_run) {
+                Some(dt) => Arc::ptr_eq(&dt.task, &task),
+                None => false,
+            }
+        };
+        if !is_mine {
+            return;
+        }
+        let prog = task.progress().await;
+        let terminal = {
+            let tasks = st_run.tasks.lock().await;
+            tasks
+                .get(&id_run)
+                .map(|t| AppState::record_of(t, status, prog.total, prog.downloaded, now_secs(), err.clone()))
+        };
+        if let Some(r) = terminal {
+            st_run.persist(&r).await;
+            // 终态让出内存句柄。活体句柄只在「还能控制它」时才有意义 ——
+            // 留着它 ⇒ 该行永远被判定为 live ⇒ 重试端点恒 409（「它还活着」），
+            // 而实际上它已经跑完了；同时又挡住库里那条记录的读取（内存优先）。
+            // 记录已落库，视图从库里读，两面的行为保持一致。
+            st_run.tasks.lock().await.remove(&id_run);
+        }
+    });
+}
+
+/// 由「已探测的 URL + 落盘路径」构造一个可运行的引擎 Task。
+///
+/// 抽出来是为了让**两条路径共用同一段构造**：
+/// - `POST /api/downloads`（用户新加一条）；
+/// - BUG-319 的启动恢复（用库里存下来的 url/output 重建被中断的任务）。
+///
+/// 两条路径共用构造，就不可能出现「新建的任务能跑、恢复的任务跑不起来」
+/// 这种双份实现分叉 —— 那正是「已入队但一直 0 字节」类假象的温床。
+async fn build_task(
+    st: &Arc<AppState>,
+    proto: &Arc<dyn Protocol>,
+    parsed: &ParsedUrl,
+    meta: &Metadata,
+    output: &std::path::Path,
+    id: &str,
+    cfg: &DownloadConfig,
+) -> Result<Arc<Task>, String> {
+    let sources = proto
+        .create_sources(parsed, cfg)
+        .await
+        .map_err(|e| format!("create sources: {e}"))?;
+    Ok(Task::new(
+        id.to_string(),
+        output.to_path_buf(),
+        meta.total_size,
+        cfg.block_size,
+        sources,
+        st.events.clone(),
+        proto.name().to_string(),
+        cfg.max_concurrency,
+        meta.supports_range,
+    ))
+}
+
+/// 把（解析 + 探测）的结果取出，供新建与恢复共用。
+async fn probe_url(
+    st: &Arc<AppState>,
+    url: &str,
+    proxy: Option<&orig_core::protocol::ProxyConfig>,
+) -> Result<(Arc<dyn Protocol>, ParsedUrl, Metadata), String> {
+    let scheme = url.split("://").next().unwrap_or("").to_string();
+    let proto = st
+        .registry
+        .find_by_scheme(&scheme)
+        .ok_or_else(|| format!("unsupported scheme: {scheme}"))?;
+    let parsed = proto.parse_url(url).await.map_err(|e| format!("parse url: {e}"))?;
+    let meta = proto
+        .probe(&parsed, proxy)
+        .await
+        .map_err(|e| format!("probe failed: {e}"))?;
+    Ok((proto, parsed, meta))
+}
+
+/// BUG-319 启动恢复：把上次进程留下的未完成下载**重新入队**。
+///
+/// 顺序不能变：
+/// 1. 先把库里「还在跑」的行改写成 `interrupted` —— 此刻确实没有任何 worker 在跑，
+///    不改写就等于对外宣称它在下载（与「已开启但未连接」同型的假象）；
+/// 2. 逐条用库里的 url/output 重新探测、重建 Task 并跑起来。重建走的是
+///    `probe_url` / `build_task`，与新建路径**同一段代码** ⇒ 恢复出来的任务和
+///    新建的任务物理上是同一种对象，不存在「恢复的跑不动」这种分叉；
+/// 3. 重建失败的（源站已失效 / 网络不通 / scheme 不支持）**留在库里**，
+///    状态保持 `interrupted` —— 记录不丢，也不假装还能跑。用户看得见它、可以重试。
+///
+/// 为什么不无条件重试到成功：源站失效是**外部事实**，重试一百次也不会变好，
+/// 而把失败藏起来（假装还在下载）才是真正的数据丢失。
+pub async fn recover_engine_tasks(st: &Arc<AppState>) {
+    let Some(store) = st.task_store.clone() else {
+        return;
+    };
+    let pending = store.take_over_unfinished().await;
+    if pending.is_empty() {
+        return;
+    }
+    eprintln!(
+        "[recover] {} engine task(s) left by the previous process; re-enqueuing",
+        pending.len()
+    );
+    for rec in pending {
+        match requeue(st, &rec).await {
+            Ok(()) => eprintln!("[recover] re-enqueued {} ({})", rec.id, rec.filename),
+            Err(e) => eprintln!("[recover] {} stays interrupted: {e}", rec.id),
+        }
+    }
+}
+
+/// 用一条持久化记录重建任务并入队（保留原 id，界面行标识不变）。
+async fn requeue(st: &Arc<AppState>, rec: &EngineTaskRecord) -> Result<(), String> {
+    let output = PathBuf::from(&rec.output);
+    if let Some(parent) = output.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("create dir: {e}"))?;
+    }
+    let proxy = Some(st.config.read().unwrap().proxy.clone());
+    let (proto, parsed, meta) = probe_url(st, &rec.url, proxy.as_ref()).await?;
+    // 恢复时用记录里存下来的并发数（用户设过的），其余按探测结果重建。
+    // 落盘路径**不重新分类、不重命名**：上次已经落到那儿了，再走一遍
+    // 「name (1).ext」等于把一次中断变成两份文件。
+    let cfg = DownloadConfig {
+        destination: output.parent().map(PathBuf::from),
+        block_size: 1 << 20,
+        max_concurrency: rec.max_concurrency.max(1),
+        // 镜像/网卡绑定是**请求级**的增强项，恢复时没有来源（库里不存），
+        // 按缺省处理 —— 宁可少一路镜像，也不能凭空造一个用户没要求过的源。
+        mirrors: Vec::new(),
+        interfaces: None,
+        supports_range: Some(meta.supports_range),
+        proxy,
+    };
+    let task = build_task(st, &proto, &parsed, &meta, &output, &rec.id, &cfg).await?;
+    // 用户**暂停过**的任务，重启后仍然是暂停的 —— 暂停是用户意图，
+    // 进程消失不是「用户改了主意」。替他继续下载等于代做决定，
+    // 而他最有理由暂停的时候（带宽被占、磁盘要留空间）恰恰是重启之后。
+    // 于是：重建出来的 Task 先置暂停，再进 run —— 用户点继续才真的继续。
+    if rec.status == ST_PAUSED {
+        task.control.paused.store(true, Ordering::SeqCst);
+    }
+    let dt = DownloadTask {
+        task: task.clone(),
+        url: rec.url.clone(),
+        filename: rec.filename.clone(),
+        output,
+        added_at: rec.added_at,
+        max_concurrency: rec.max_concurrency,
+        category: rec.category.clone(),
+        error: tokio::sync::Mutex::new(None),
+    };
+    spawn_task(st, rec.id.clone(), task);
+    st.tasks.lock().await.insert(rec.id.clone(), dt);
+    // 状态恢复到**用户离开时的那个**：暂停的仍是 paused，在跑的才是 downloading。
+    st.set_task_status(&rec.id, &rec.status).await;
+    Ok(())
+}
+
 async fn add(
     State(st): State<Arc<AppState>>,
     Json(req): Json<AddReq>,
@@ -181,38 +461,24 @@ async fn add(
         );
     }
 
-    let scheme = req.url.split("://").next().unwrap_or("").to_string();
-    let proto = match st.registry.find_by_scheme(&scheme) {
-        Some(p) => p,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                axum::Json(serde_json::json!({"error": "unsupported scheme", "scheme": scheme})),
-            )
-        }
-    };
-
-    let parsed: ParsedUrl = match proto.parse_url(&req.url).await {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                axum::Json(serde_json::json!({"error": "parse url", "detail": e.to_string()})),
-            )
-        }
-    };
-
     // 代理：请求级覆盖 > daemon 配置 [proxy] 段（探测与下载同路径）
     let proxy = req
         .proxy
         .clone()
         .or_else(|| Some(st.config.read().unwrap().proxy.clone()));
-    let meta = match proto.probe(&parsed, proxy.as_ref()).await {
-        Ok(m) => m,
+    // 解析 + 探测：与 BUG-319 启动恢复共用 `probe_url`，两处只可能有一份行为。
+    let (proto, parsed, meta) = match probe_url(&st, &req.url, proxy.as_ref()).await {
+        Ok(v) => v,
         Err(e) => {
+            // 不支持的 scheme 是**用户输入**的错（400）；解析/探测失败是上游问题（500）。
+            let code = if e.starts_with("unsupported scheme") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({"error": "probe failed", "detail": e.to_string()})),
+                code,
+                axum::Json(serde_json::json!({"error": e})),
             )
         }
     };
@@ -313,27 +579,15 @@ async fn add(
         }
     }
 
-    let sources = match proto.create_sources(&parsed, &cfg).await {
-        Ok(s) => s,
+    let task = match build_task(&st, &proto, &parsed, &meta, &output, &id, &cfg).await {
+        Ok(t) => t,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({"error": "create sources", "detail": e.to_string()})),
+                axum::Json(serde_json::json!({"error": "create task", "detail": e})),
             )
         }
     };
-
-    let task = Task::new(
-        id.clone(),
-        output.clone(),
-        meta.total_size,
-        cfg.block_size,
-        sources,
-        st.events.clone(),
-        proto.name().to_string(),
-        cfg.max_concurrency,
-        meta.supports_range,
-    );
 
     let added_at = now_secs();
     let dt = DownloadTask {
@@ -349,29 +603,14 @@ async fn add(
 
 
     let resp_filename = output.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| filename.clone());
-    // 后台运行；完成后依据状态写入错误。
-    let task_run = task.clone();
-    let st_run = st.clone();
-    let id_run = id.clone();
-    tokio::spawn(async move {
-        let res = task_run.run().await;
-        if let Err(e) = res {
-            eprintln!("[download] task {id_run} error: {e}");
-            st_run
-                .events
-                .send(SseEvent::Error {
-                    id: id_run.clone(),
-                    message: e.to_string(),
-                })
-                .ok();
-            if let Some(dt) = st_run.tasks.lock().await.get(&id_run) {
-                *dt.error.lock().await = Some(e.to_string());
-            }
-        } else {
-            eprintln!("[download] task {id_run} completed");
-        }
-    });
+    // BUG-319：入队即登记。**登记与传输分离** —— 用户加入队列的那一刻记录就落库
+    // （哪怕一个字节都还没下），与媒体库「先登记、字节异步补齐」同源。
+    // 只写这一次 + 终态那一次，进度本身不落盘（否则每轮询一次就写一次，IO 热点）。
+    let rec = AppState::record_of(&dt, ST_DOWNLOADING, meta.total_size, 0, added_at, None);
+    // 后台运行；终态由 `spawn_task` 落库（与启动恢复共用同一段终态处理）。
+    spawn_task(&st, id.clone(), task.clone());
     st.tasks.lock().await.insert(id.clone(), dt);
+    st.persist(&rec).await;
 
     (
         StatusCode::CREATED,
@@ -379,27 +618,23 @@ async fn add(
     )
 }
 
+/// `GET /api/downloads/:id` — 单行。内存里没有的行也要能查到（它在库里）。
 async fn get_one(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<axum::Json<DownloadStatus>, StatusCode> {
-    let tasks = st.tasks.lock().await;
-    let dt = tasks.get(&id).ok_or(StatusCode::NOT_FOUND)?;
-    let prog = dt.task.progress().await;
-    let now = now_secs();
-    let status = DownloadStatus::from_progress(
-        &dt.task.id,
-        &dt.url,
-        &dt.filename,
-        Some(dt.output.to_string_lossy().into_owned()),
-        dt.added_at,
-        dt.max_concurrency,
-        &prog,
-        now,
-        dt.error.lock().await.clone(),
-        dt.category.clone(),
-    );
-    Ok(axum::Json(status))
+) -> impl IntoResponse {
+    let rows = crate::activity::engine_rows(&st).await;
+    let hit = rows.into_iter().find(|x| x.id == id);
+    match hit {
+        None => StatusCode::NOT_FOUND.into_response(),
+        Some(r) => {
+            let detail = match &r.live {
+                Some(t) => Some(t.progress().await),
+                None => None,
+            };
+            axum::Json(DownloadStatus::from_row(&r, detail.as_ref(), now_secs())).into_response()
+        }
+    }
 }
 
 async fn action(
@@ -407,48 +642,69 @@ async fn action(
     Path(id): Path<String>,
     Query(q): Query<ActionReq>,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
-    let tasks = st.tasks.lock().await;
-    let dt = tasks.get(&id).ok_or(StatusCode::NOT_FOUND)?;
-    match q.action.as_str() {
-        "pause" => {
-            dt.task.control.paused.store(true, Ordering::SeqCst);
-            dt.task
-                .events
-                .send(SseEvent::Paused { id: id.clone() })
-                .ok();
-            Ok(axum::Json(serde_json::json!({"status": "paused", "id": id})))
+    // 副作用在锁内、落库在锁外：持着任务表的锁去 await DB 会把整张表堵在后面。
+    // 返回值是（响应里的动作标签，库里的状态）—— 两者刻意不同名：
+    // 「resumed」是给调用方的人话，「downloading」是库内状态机的字面量。
+    let (label, next_status) = {
+        let tasks = st.tasks.lock().await;
+        let dt = tasks.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+        match q.action.as_str() {
+            "pause" => {
+                dt.task.control.paused.store(true, Ordering::SeqCst);
+                dt.task
+                    .events
+                    .send(SseEvent::Paused { id: id.clone() })
+                    .ok();
+                ("paused", ST_PAUSED)
+            }
+            "resume" => {
+                dt.task.control.paused.store(false, Ordering::SeqCst);
+                dt.task.control.resume.notify_waiters();
+                dt.task
+                    .events
+                    .send(SseEvent::Resumed { id: id.clone() })
+                    .ok();
+                ("resumed", ST_DOWNLOADING)
+            }
+            "cancel" => {
+                dt.task.control.cancel.cancel();
+                dt.task
+                    .events
+                    .send(SseEvent::Deleted { id: id.clone() })
+                    .ok();
+                ("cancelled", ST_CANCELLED)
+            }
+            _ => return Err(StatusCode::BAD_REQUEST),
         }
-        "resume" => {
-            dt.task.control.paused.store(false, Ordering::SeqCst);
-            dt.task.control.resume.notify_waiters();
-            dt.task
-                .events
-                .send(SseEvent::Resumed { id: id.clone() })
-                .ok();
-            Ok(axum::Json(serde_json::json!({"status": "resumed", "id": id})))
-        }
-        "cancel" => {
-            dt.task.control.cancel.cancel();
-            dt.task
-                .events
-                .send(SseEvent::Deleted { id: id.clone() })
-                .ok();
-            Ok(axum::Json(serde_json::json!({"status": "cancelled", "id": id})))
-        }
-        _ => Err(StatusCode::BAD_REQUEST),
-    }
+    };
+    // BUG-319：状态迁移落库。取消的行**不删** —— 它是用户做过的事，
+    // 重启后还在列表里，与「失败」区分开。
+    st.set_task_status(&id, next_status).await;
+    Ok(axum::Json(serde_json::json!({"status": label, "id": id})))
 }
 
 async fn delete_one(
     State(st): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
-    let dt = st.tasks.lock().await.remove(&id).ok_or(StatusCode::NOT_FOUND)?;
-    dt.task.control.cancel.cancel();
-    dt.task
-        .events
-        .send(SseEvent::Deleted { id: id.clone() })
-        .ok();
+    // 终态行已让出内存句柄（见 `spawn_task` 收尾）⇒ 必须「内存 + 库」两处都查，
+    // 只查内存会让终态行删不掉 —— 而它恰恰是用户最想清掉的那一行。
+    let dt = st.tasks.lock().await.remove(&id);
+    if dt.is_none() && !st.record_exists(&id).await {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    // 顺序：**先删记录，再取消**。反了的话，正在跑的任务被取消后由后台收尾
+    // 落一条终态记录回来 —— 用户刚删掉的行又复活了。
+    // BUG-319：删除是**唯一**让记录消失的路径，且只由用户的显式删除触发。
+    // 取消（action=cancel）不删记录 —— 它是结果，要留在列表里。
+    st.forget(&id).await;
+    if let Some(dt) = dt {
+        dt.task.control.cancel.cancel();
+        dt.task
+            .events
+            .send(SseEvent::Deleted { id: id.clone() })
+            .ok();
+    }
     Ok(axum::Json(serde_json::json!({"status": "deleted", "id": id})))
 }
 
@@ -500,16 +756,26 @@ async fn get_config(State(st): State<Arc<AppState>>) -> axum::Json<serde_json::V
         // 前端与桌面壳一律读它，不得各自硬编码 9876。
         "port": st.port,
         "download_dir": cfg.download_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        // 受管库根（D23-A⑥）：设置页「库根目录」保存时同步写入 daemon 与 TG，二者共用。
-        "library_dir": cfg.library_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        // D23-A①：手动下载**未配置** `download_dir` 时的实际默认根
-        // （= `<库根>/下载/`；库根也未配置则平台默认）。前端用它作占位，不自己拼路径。
+        // BUG-323（用户 2026-10-16 裁定）：库根 = `<生效下载路径>/library`，**派生值**。
+        // 键名由 `library_dir` 改为 `library_root` —— 值语义变了（不再是可配项），
+        // 沿用旧键名会让调用方以为它还能被写回去。
+        "library_root": crate::config::library_root(&cfg).to_string_lossy().into_owned(),
+        // 生效下载路径（= 受管根 / 权限边界）：配置值或平台默认。前端「当前生效」
+        // 直出它，不自己拼（拼出来必然与引擎漂移）。
+        "effective_download_root": crate::config::effective_download_root(&cfg)
+            .to_string_lossy()
+            .into_owned(),
+        // BUG-323：手动下载**未配置** `download_dir` 时的实际默认根
+        // （= 名义默认过禁用盘规则后的值：`~/Downloads` 在 C: 上 ⇒ D:\OrigDown）。
+        // 前端用它作占位，不自己拼路径。
         "manual_download_root": crate::config::manual_download_root(&cfg)
             .to_string_lossy()
             .into_owned(),
-        // 系统默认下载目录（Windows = SHGetKnownFolderPath(FOLDERID_Downloads)，
-        // 如 C:\Users\<user>\Downloads）。前端在用户未显式设置时用它作占位/回退，
-        // 不再写死 ~/Downloads（Unix 风格，在 Windows 上误导，BUG-回归：多次反馈「显示为 Linux 路径」）。
+        // **名义**系统默认下载目录（Windows = SHGetKnownFolderPath(FOLDERID_Downloads)，
+        // 如 C:\Users\<user>\Downloads）—— 仅名义值：用户 2026-10-19 裁定
+        // 「~/Downloads是默认设置,但是不使用,改用加载配置的D盘设置」，实际落点看
+        // `manual_download_root` / `effective_download_root`（两者都会把 C: 改道到 D:）。
+        // 保留下发只为让前端能显示「默认是什么」，不得直接当写点。
         "default_download_dir": orig_core::paths::default_download_dir().to_string_lossy().into_owned(),
         "max_connections": cfg.max_connections,
         "classify_enabled": cfg.classify.enabled,
@@ -554,6 +820,11 @@ pub struct ClassifyUpdateReq {
 ///
 /// BUG-234：此前 `download_dir` 只有 GET（`/api/config`），设置页保存只写 localStorage，
 /// 用户改了目录下载照旧 —— 分类/代理/TG 都有「运行时生效 + 持久化」端点，唯它漏掉。
+///
+/// **BUG-323**：下载路径是全部文件的唯一容器（库根 = 其下 `library`），因此保存后
+/// **立即把生效路径下发给 orig-tg**（`PUT /api/tg/config`），不依赖「改完重启引擎」。
+/// TG 不可用时**不静默**：把原因带回响应（`tg_error`）并写日志，但本次保存不回滚
+/// （daemon 侧已落库，回滚会让用户看到「保存失败」却查不出所以然）。
 async fn put_config_download(
     State(st): State<Arc<AppState>>,
     Json(req): Json<DownloadUpdateReq>,
@@ -562,10 +833,17 @@ async fn put_config_download(
         .dir
         .map(|d| d.trim().to_string())
         .filter(|d| !d.is_empty())
-        .map(|d| orig_core::paths::expand_tilde(&d));
+        // BUG-323 复报（2026-10-19）：`~` 展开后收敛分隔符字面再入库。
+        // 活栈实测：无归一化时 `D:\\OrigDown` 一路存成 `D://OrigDown`，
+        // 界面（`D:\OrigDown`）与引擎（`D://OrigDown`）从此各说各话。
+        .map(|d| {
+            orig_core::paths::normalize_dir(
+                &orig_core::paths::expand_tilde(&d).to_string_lossy(),
+            )
+        });
     {
         let mut cfg = st.config.write().unwrap();
-        cfg.download_dir = dir;
+        cfg.download_dir = dir.map(std::path::PathBuf::from);
         // 持久化（读锁已释放）
         cfg.save_download_dir("download-engine.toml")
             .map_err(|e| {
@@ -575,12 +853,45 @@ async fn put_config_download(
                 )
             })?;
     }
+    let (eff, lib) = {
+        let cfg = st.config.read().unwrap();
+        (
+            crate::config::effective_download_root(&cfg),
+            crate::config::library_root(&cfg),
+        )
+    };
+    let (tg_synced, tg_error) = sync_tg_download_dir(&st, &eff).await;
     let cfg = st.config.read().unwrap();
     Ok(axum::Json(serde_json::json!({
         "ok": true,
         "download_dir": cfg.download_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
         "default_download_dir": orig_core::paths::default_download_dir().to_string_lossy().into_owned(),
+        // 生效路径与派生的库根：前端据此刷新「当前生效」与库根展示，不自己拼。
+        "effective_download_root": eff.to_string_lossy().into_owned(),
+        "library_root": lib.to_string_lossy().into_owned(),
+        "tg_synced": tg_synced,
+        "tg_error": tg_error,
     })))
+}
+
+/// 把生效下载路径下发给 orig-tg（`PUT /api/tg/config {downloadDir}`）。
+///
+/// 返回 `(synced, error)`。失败**不静默**（BUG-167：用户主动操作的失败必须可见）：
+/// 原因同时进响应与 daemon 日志；成功则记账，避免巡检重复推送。
+/// 下载路径未同步时 TG 的库根/落点会停在旧值（`sync_download_root_if_needed` 会在
+/// 下一轮巡检自动重试）。
+async fn sync_tg_download_dir(st: &AppState, dir: &std::path::Path) -> (bool, Option<String>) {
+    let want = dir.to_string_lossy().into_owned();
+    match st.push_tg_download_root(&want).await {
+        Ok(()) => {
+            *st.tg_synced_download_root.lock().await = Some(want);
+            (true, None)
+        }
+        Err(e) => {
+            eprintln!("[warn] {e}");
+            (false, Some(e))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -592,42 +903,31 @@ pub struct DownloadUpdateReq {
 
 #[derive(Deserialize)]
 pub struct LibraryUpdateReq {
-    /// 受管库根；空串/缺省 = 清除设置。
+    /// 已废字段：仅为把「旧调用方仍在写库根」解析出来并给出 422（而不是 400/静默无效）。
     #[serde(default)]
+    #[allow(dead_code)]
     pub dir: Option<String>,
 }
 
-/// PUT /api/config/library — 保存受管库根（运行时生效 + 持久化到 download-engine.toml）。
+/// PUT /api/config/library — **已废（BUG-323，用户 2026-10-16 裁定）**：库根不可独立配置。
 ///
-/// D23-A⑥：设置页保存「库根目录」时**同时**写 daemon 与 TG，二者共用同一个受管根
-/// （M1 把库根迁入 daemon 之前，TG 仍是其权威存储，故两边都要写）。保存后，**未显式
-/// 配置** `download_dir` 的手动下载默认根随之变为 `<库根>/下载/`（D23-A①）。
+/// 库根是 `<生效下载路径>/library` 的**派生值**（用户：「库根跟下载走，所有文件不允许
+/// 脱离下载路径，下载路径是所有权限的限制路径」）。因此本端点恒 422 并直出正确做法
+/// （改 `PUT /api/config/download`）—— 让「库根脱离下载路径」在接口层不可表达，
+/// 而不是收下后写进 toml 变成第二个根。
+///
+/// 历史：D23-A⑥ 曾让设置页「库根目录」同时写 daemon 与 TG，两边共用一个可配根；
+/// 这正是「两个根」的来源，已整条撤回。
 async fn put_config_library(
-    State(st): State<Arc<AppState>>,
-    Json(req): Json<LibraryUpdateReq>,
+    State(_st): State<Arc<AppState>>,
+    Json(_req): Json<LibraryUpdateReq>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
-    let dir = req
-        .dir
-        .map(|d| d.trim().to_string())
-        .filter(|d| !d.is_empty())
-        .map(|d| orig_core::paths::expand_tilde(&d));
-    let manual_root = {
-        let mut cfg = st.config.write().unwrap();
-        cfg.library_dir = dir;
-        cfg.save_library_dir("download-engine.toml").map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("persist library config: {e}"),
-            )
-        })?;
-        crate::config::manual_download_root(&cfg)
-    };
-    let cfg = st.config.read().unwrap();
-    Ok(axum::Json(serde_json::json!({
-        "ok": true,
-        "library_dir": cfg.library_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        "manual_download_root": manual_root.to_string_lossy().into_owned(),
-    })))
+    Err((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "library_dir is derived from the download directory (<download_dir>/library) \
+         and cannot be set independently; set the download directory instead (BUG-323)"
+            .to_string(),
+    ))
 }
 
 /// PUT /api/config/classify — 保存自动分类规则（运行时生效 + 持久化到 download-engine.toml）。
@@ -995,11 +1295,18 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             "/api/downloads/:id",
             get(get_one).post(action).delete(delete_one),
         )
+        // BUG-322：重试与 pause/resume/cancel 操作对象不同（记录 vs 活体句柄），
+        // 故独立成动词端点，不塞进 `?action=`。
+        .route("/api/downloads/:id/retry", axum::routing::post(retry_one))
         .route("/api/events", get(events))
         .route("/api/activity", get(activity))
         // BUG-299 M2-T00a：受管下载根成品事实（文件域「全部文件」的 downloads 一侧）。
         // GET 枚举 / DELETE 删除（受管根边界守卫，见 files.rs）。
         .route("/api/files", get(files::list_files).delete(files::delete_file))
+        // BUG-323 缺陷③：WEB（网页调试模式）没有系统原生目录对话框 ⇒ 设置页
+        // 「浏览…」在浏览器里是死的。补一个只读目录浏览端点，让挑目录这条通路
+        // 与桌面壳同源（详见 fsbrowse.rs 头部注释）。
+        .route("/api/fs/dirs", get(fsbrowse::list_dirs))
         .route("/api/interfaces", get(list_interfaces))
         .route("/api/config", get(get_config))
         .route("/api/config/classify", axum::routing::put(put_config_classify))

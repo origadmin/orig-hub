@@ -52,7 +52,7 @@ function check(name, ok, detail) {
 async function readBar(page) {
   return page.evaluate(() => {
     const header = document.querySelector('[data-testid="context-bar-header"]')
-    const title = document.querySelector('[data-testid="context-bar-title"]')
+    const title = document.querySelector('[data-testid="page-title"]')
     const sub = document.querySelector('[data-testid="context-bar-sub"]')
     const conn = document.querySelector('[data-testid="context-conn"]')
     // BUG-169 终裁：唯一连接状态点在底栏右下角（statusbar-conn）
@@ -162,6 +162,49 @@ async function main() {
     heights.size <= 1,
     JSON.stringify(geo.map((g) => `${g.testid}:h=${g.height}`)),
   )
+
+  /**
+   * 任务 #9（BUG-317 四件套）：files 视图右槽 = **库级按钮组**。
+   *
+   * 导入目录 = `page-primary-action`（每页唯一主操作，primary 变体），
+   * 新建剧集 / 导出 / 标签管理 = 次级。四个按钮不读任何选择集、任何文件
+   * 视图恒定可用 —— 断言在「文件父行」与「剧集」两个落点各验一次
+   * （库级 = 与视图内导航无关，正是任务 #9 的「因其不可变」判据）。
+   *
+   * 等待 `page-primary-action` 出现再读数：面板挂载→store 注册→按钮渲染
+   * 之间有一个 tick 的窗口，直接读会把这个**脚本侧时序竞态**误报成产品缺陷。
+   */
+  for (const testid of ['nav-files', 'nav-child-lib-series']) {
+    const reached = await goto(page, testid)
+    if (!reached) {
+      console.log(`SKIP  ${testid}  |  导航不可达（入口级门控未放开）`)
+      continue
+    }
+    try {
+      await page.locator('[data-testid="page-primary-action"]').waitFor({ timeout: 8000 })
+    } catch (_err) {
+      /* 由下面的断言如实报告 */
+    }
+    const bar = await readBar(page)
+    const texts = bar.buttons.map((b) => b.text)
+    check(
+      `${testid} 右槽有 page-primary-action（导入目录，主操作）`,
+      texts.some((x) => x.includes('导入目录')),
+      JSON.stringify(texts),
+    )
+    check(
+      `${testid} 右槽有三个次级库级按钮（新建剧集/导出/标签管理）`,
+      texts.some((x) => x.includes('新建剧集')) &&
+        texts.some((x) => x.includes('导出')) &&
+        texts.some((x) => x.includes('标签管理')),
+      JSON.stringify(texts),
+    )
+    check(
+      `${testid} 右槽无全选本页（选择态动作不在标题行，进浮动选择条）`,
+      !texts.some((x) => x.includes('全选本页')),
+      JSON.stringify(texts),
+    )
+  }
 
   /**
    * 「文件父行」= `nav-files` 锚点（文件域父项本身，`nav-files-row` 只是包住

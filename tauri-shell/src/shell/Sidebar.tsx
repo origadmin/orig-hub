@@ -35,6 +35,7 @@ interface Props {
     /** 下载中档（含 queued | idle） */
     downloading: number
     paused: number
+    /** 已完成档 */
     completed: number
     series: number
     tags: number
@@ -327,7 +328,11 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
                 >
                   <span className="min-w-0 flex-1 truncate text-left">{t(DL_KEY[f])}</span>
                   <span className="shrink-0 text-[10px] text-muted">
-                    {f === 'running' ? counts.downloading : f === 'paused' ? counts.paused : counts.completed}
+                    {f === 'running'
+                      ? counts.downloading
+                      : f === 'paused'
+                        ? counts.paused
+                        : counts.completed}
                   </span>
                 </button>
               ))}

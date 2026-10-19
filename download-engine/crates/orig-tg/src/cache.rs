@@ -64,16 +64,15 @@ pub fn router() -> Router<Arc<AppState>> {
 ///
 /// A leading `~` from the stored setting (user-typed) is expanded here, so the
 /// literal tilde never reaches the filesystem (BUG-071).
+/// 下载落点当前生效值（= 受管根 / 权限边界）。
+///
+/// BUG-323：**委托** [`crate::store::Store::download_root`]（env
+/// `ORIG_TG_DOWNLOAD_DIR` > app_setting `download_dir` > 平台默认下载目录）。
+/// 此前这里自成一条链（app_setting > `st.config.download_dir`），与
+/// `routes::effective_download_dir` 各算一套 —— 下载路径是全部文件的唯一容器，
+/// 只允许一处解析。
 pub async fn download_dir(st: &AppState) -> PathBuf {
-    let raw = st
-        .store
-        .get_setting("download_dir")
-        .await
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| st.config.download_dir.to_string_lossy().into_owned());
-    orig_core::paths::expand_tilde(&raw)
+    st.store.download_root().await
 }
 
 // ---- 库根（byte-ownership P2：归仓移动 + 相对路径） ----
@@ -90,6 +89,84 @@ pub fn resolve_item_path(lib_root: &Path, path: &str) -> PathBuf {
         p.to_path_buf()
     } else {
         lib_root.join(p)
+    }
+}
+
+/// 词法归一化（**不触盘**）：折叠 `.` / `..`，保留盘符与根。
+///
+/// 供权限边界判定使用 —— 目标路径可能尚不存在（新落点），`canonicalize` 会失败，
+/// 用它做边界会给「还没写盘的路径」假阴性，把正常写入判成越界。
+pub fn lexical_normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            // 根之上的 `..` 直接丢弃（`/..` == `/`，Windows 上 `C:\..` == `C:\`）
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// `child` 是否落在 `root` 之内（含 root 自身）。Windows 下大小写不敏感。
+///
+/// 用词法归一化后比较，不做符号链接解析（见 [`lexical_normalize`]）。
+pub fn path_within(root: &Path, child: &Path) -> bool {
+    let r = lexical_normalize(root);
+    let c = lexical_normalize(child);
+    if r.as_os_str().is_empty() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let rs = r.to_string_lossy().to_lowercase();
+        let cs = c.to_string_lossy().to_lowercase();
+        let rs = rs.trim_end_matches(['\\', '/']);
+        cs == rs
+            || cs.starts_with(&format!("{rs}\\"))
+            || cs.starts_with(&format!("{rs}/"))
+    }
+    #[cfg(not(windows))]
+    {
+        c.starts_with(&r)
+    }
+}
+
+/// 路径是否落在**任一**受管根之内（管理模块多根模型，BUG-323 续）。
+pub fn path_within_any(roots: &[PathBuf], path: &Path) -> bool {
+    roots.iter().any(|r| path_within(r, path))
+}
+
+/// 受管路径解析（管理模块并集闸门）：[`resolve_item_path`] 之后必须落在**任一**
+/// 受管根之内，越界返回 `None`（调用方一律 403/Forbidden）。
+///
+/// 与下载模块单根闸门 [`resolve_managed_path`] 平行：下载模块仍守 `download_root`
+/// （下载单根），本函数给管理模块用，覆盖受管根之并集。
+pub fn resolve_managed_path_union(roots: &[PathBuf], path: &str) -> Option<PathBuf> {
+    let resolved = resolve_item_path(Path::new(""), path);
+    if path_within_any(roots, &resolved) {
+        Some(resolved)
+    } else {
+        None
+    }
+}
+
+/// 受管路径解析（BUG-323 权限边界）：[`resolve_item_path`] 之后必须落在
+/// **下载路径**之内，越界返回 `None`（调用方一律 403）。
+///
+/// 为什么边界是下载路径而不是库根：用户 2026-10-16 裁定「下载路径是所有权限的
+/// 限制路径」—— 库根、代理、下载成品都同居其下；任何一条记录（含历史写入的
+/// 绝对路径，例如旧库根 `…/AppData/…/tg/library/x.mp4`）指到界外即越界。
+pub fn resolve_managed_path(download_root: &Path, lib_root: &Path, path: &str) -> Option<PathBuf> {
+    let resolved = resolve_item_path(lib_root, path);
+    if path_within(download_root, &resolved) {
+        Some(resolved)
+    } else {
+        None
     }
 }
 
@@ -1564,6 +1641,54 @@ mod tests {
         assert!(inside_dir(&inner, &inner.join("gone.mp4").to_string_lossy()));
     }
 
+    /// BUG-323 权限边界：受管路径解析必须把**下载路径之外**的路径判为越界。
+    ///
+    /// 含反向证伪：历史库根（应用内部 AppData）下的绝对路径 —— 正是存量
+    /// `media_item.file_path` 的形态 —— 必须被拒，否则「所有文件不脱离下载路径」
+    /// 只是口号。
+    #[test]
+    fn resolve_managed_path_rejects_outside_download_root_bug323() {
+        let dl = Path::new("C:/Users/u/Downloads");
+        let lib = dl.join("library");
+
+        // 库内相对路径（归仓规范形态）→ 解析到库根下 ⇒ 界内
+        assert!(resolve_managed_path(dl, &lib, "chat--1/2-a.mp4").is_some());
+        // 下载路径内的绝对路径（下载成品）⇒ 界内
+        assert!(resolve_managed_path(dl, &lib, "C:/Users/u/Downloads/a.mp4").is_some());
+        // 下载路径自身 ⇒ 界内
+        assert!(resolve_managed_path(dl, &lib, "C:/Users/u/Downloads").is_some());
+        // 历史 AppData 库根下的绝对路径 ⇒ 界外，必须拒绝
+        assert!(
+            resolve_managed_path(
+                dl,
+                &lib,
+                "C:/Users/u/AppData/Roaming/com.origadmin.orighub/tg/library/old.mp4"
+            )
+            .is_none(),
+            "历史库根下的绝对路径必须判越界"
+        );
+        // 平行目录（前缀相同但不是子路径）：`Downloads2` 不是 `Downloads` 的下级
+        assert!(resolve_managed_path(dl, &lib, "C:/Users/u/Downloads2/a.mp4").is_none());
+        // 库根内的 `..` 只要**没越过下载根**就仍在界内 —— 边界是下载根，不是库根。
+        // （`…/Downloads/library/../secret.mp4` 归一化 = `…/Downloads/secret.mp4`，
+        // 仍在受管区里；把它算越界是**过度拦截**，会让正常写入被 403。）
+        assert!(resolve_managed_path(dl, &lib, "../secret.mp4").is_some());
+        // 真正穿出下载根的两条：相对 `..` 上溯、绝对路径里的 `..`。
+        assert!(resolve_managed_path(dl, &lib, "../../secret.mp4").is_none());
+        assert!(resolve_managed_path(dl, &lib, "C:/Users/u/Downloads/../secret.mp4").is_none());
+    }
+
+    /// 归一化保留盘符/根，折叠 `.` 与 `..`（大小写不敏感由 [`path_within`] 负责）。
+    #[test]
+    fn lexical_normalize_folds_dots() {
+        assert_eq!(
+            lexical_normalize(Path::new("C:/a/./b/../c")),
+            PathBuf::from("C:/a/c")
+        );
+        // 根之上的 `..` 不再上溯
+        assert_eq!(lexical_normalize(Path::new("/../a")), PathBuf::from("/a"));
+    }
+
     /// `?ids=` 解析：去重排序、空白容忍；非法项必须**报错**而不是被跳过。
     #[test]
     fn parse_ids_rejects_garbage_and_dedups() {
@@ -1705,9 +1830,33 @@ mod tests {
     }
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("orig_cache_{tag}_{}", std::process::id()));
+        // 2026-10-19：夹具必须落在**非禁用盘**（`store::fixture_base`）—— 下载根解析到
+        // C: 会被改道到真实内容根 `D:\OrigDown`，「钉下载根」会静默指向用户真实
+        // 内容目录，清理类用例更会在真实文件上动手。
+        let d = crate::store::fixture_base(&format!("cache-{tag}"));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// BUG-323：把 `dl` 钉成下载根，库根随之派生为 `<dl>/library`。
+    ///
+    /// 夹具**只允许落在非禁用盘的测试夹具根**上：库根已跟随下载根，夹具若不钉，
+    /// 默认档会落到用户真实的 `~/Downloads`（测试往用户目录写文件本身就是事故）；
+    /// 而钉在 C: 上又会被禁用盘规则改道到真实内容根 `D:\OrigDown`。两头都堵死。
+    async fn pin_download_root(st: &AppState, dl: &std::path::Path) {
+        assert!(
+            dl.starts_with(crate::store::fixture_root()),
+            "夹具只允许把下载根钉在非禁用盘的测试夹具根上，收到 {dl:?}"
+        );
+        st.store
+            .set_setting("download_dir", dl.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            st.store.library_root().await,
+            dl.join(crate::store::Store::LIBRARY_SUBDIR),
+            "夹具前提：库根必须派生自下载根"
+        );
     }
 
     /// 删不掉时必须计 `failed`，**不得**计入 `removed` / `bytes` ——
@@ -1777,6 +1926,31 @@ mod tests {
         assert_eq!(resolve_item_path(root, "chat-1/10-title.mp4"), root.join("chat-1/10-title.mp4"));
     }
 
+    /// 并集闸门（管理多根，BUG-323 续）：路径须落在**任一**受管根内，越界 None。
+    #[test]
+    fn resolve_managed_path_union_accepts_any_root_and_rejects_outside() {
+        let roots: Vec<PathBuf> = if cfg!(windows) {
+            vec![PathBuf::from(r"C:\Downloads"), PathBuf::from(r"D:\Media")]
+        } else {
+            vec![PathBuf::from("/downloads"), PathBuf::from("/media")]
+        };
+        // 落在第一根内 → Some。
+        let inside1 = if cfg!(windows) { r"C:\Downloads\a.mp4" } else { "/downloads/a.mp4" };
+        assert_eq!(
+            resolve_managed_path_union(&roots, inside1),
+            Some(PathBuf::from(inside1))
+        );
+        // 落在第二根内 → Some（证明是并集而非只看首根）。
+        let inside2 = if cfg!(windows) { r"D:\Media\sub\b.mp4" } else { "/media/sub/b.mp4" };
+        assert_eq!(
+            resolve_managed_path_union(&roots, inside2),
+            Some(PathBuf::from(inside2))
+        );
+        // 界外 → None（调用方须 403/Forbidden）。
+        let outside = if cfg!(windows) { r"E:\Other\x.mp4" } else { "/other/x.mp4" };
+        assert_eq!(resolve_managed_path_union(&roots, outside), None);
+    }
+
     /// slugify 的文件名安全性：非法字符折叠为 `-`、连续折叠、掐头去尾、
     /// 截断到 40 字符；全非法输入必须返回 None（不能产出空文件名或全 `-`）。
     #[test]
@@ -1796,14 +1970,13 @@ mod tests {
     /// 路径（正斜杠）。命名只依赖稳定标识 → **确定性**：同参再跑得到同一目标名。
     #[tokio::test]
     async fn house_moves_bytes_into_library_root_with_deterministic_name() {
-        let dir = tmp_dir("house_ok");
+        let dl = tmp_dir("house_ok");
         let st = state().await;
-        st.store
-            .set_setting("library_dir", dir.to_string_lossy().as_ref())
-            .await
-            .unwrap();
+        // BUG-323：库根派生自下载根（`<下载根>/library`），`library_dir` 已无写入口。
+        pin_download_root(&st, &dl).await;
+        let lib = dl.join(crate::store::Store::LIBRARY_SUBDIR);
 
-        let src = dir.join("download").join("src.mp4");
+        let src = dl.join("download").join("src.mp4");
         std::fs::create_dir_all(src.parent().unwrap()).unwrap();
         std::fs::write(&src, b"video-bytes").unwrap();
 
@@ -1816,34 +1989,30 @@ mod tests {
         assert_eq!(housed.item_path, expected_rel, "回填值必须是库根相对路径");
         assert_eq!(
             Path::new(&housed.absolute_path),
-            &dir.join(&expected_rel),
+            &lib.join(&expected_rel),
             "实际落盘 = 库根 + 相对路径（命名确定性）"
         );
-        assert!(dir.join(&expected_rel).is_file(), "文件必须真的在库根下");
+        assert!(lib.join(&expected_rel).is_file(), "文件必须真的在库根下");
         assert!(!src.exists(), "归仓 = 移动，源位置不得留副本");
 
         // 确定性：另起一个源文件（同 chat/msg/标题），目标名必须与上次相同。
-        let src2 = dir.join("download").join("src2.mp4");
+        let src2 = dl.join("download").join("src2.mp4");
         std::fs::write(&src2, b"second").unwrap();
         let housed2 = house_downloaded_bytes(&st, chat_id, msg_id, &src2.to_string_lossy(), Some("My EP 01")).await;
         assert_eq!(housed2.item_path, expected_rel, "同参输入必须产出同一目标名");
     }
 
-    /// I2 降级条款：库根不可用（此处把它配置成一个**文件**，mkdir 必败）时
-    /// 文件留在原位、回填绝对路径——登记事实不回滚，也不允许静默丢字节。
+    /// I2 降级条款：库根不可用（此处把 `<下载根>/library` 造成一个**文件**，
+    /// mkdir 必败）时文件留在原位、回填绝对路径——登记事实不回滚，也不允许静默丢字节。
     #[tokio::test]
     async fn house_falls_back_to_original_location_when_library_root_unusable() {
-        let dir = tmp_dir("house_fallback");
+        let dl = tmp_dir("house_fallback");
         let st = state().await;
-        // 把「库根」设成一个真实文件：create_dir_all 会失败。
-        let not_a_dir = dir.join("not-a-dir");
-        std::fs::write(&not_a_dir, b"occupant").unwrap();
-        st.store
-            .set_setting("library_dir", not_a_dir.to_string_lossy().as_ref())
-            .await
-            .unwrap();
+        // 把派生的库根占成真实文件：create_dir_all(<下载根>/library) 会失败。
+        std::fs::write(dl.join(crate::store::Store::LIBRARY_SUBDIR), b"occupant").unwrap();
+        pin_download_root(&st, &dl).await;
 
-        let src = dir.join("keep-here.mp4");
+        let src = dl.join("keep-here.mp4");
         std::fs::write(&src, b"bytes").unwrap();
         let housed = house_downloaded_bytes(&st, 7, 8, &src.to_string_lossy(), Some("t")).await;
 

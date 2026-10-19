@@ -52,6 +52,13 @@ export interface FileListViewProps {
   onDelete: (item: MediaItem) => void
   /** 错误上报（打开目录失败等，走父级 error 通道）。 */
   onError?: (msg: string) => void
+  /**
+   * **选择模式**（任务 #9 / BUG-317 选择模式裁定）：面板里已有 ≥1 条被选中
+   * 时为 true。此时行双击与「打开」按钮**不进入播放/系统打开** —— 与
+   * MediaCard 封面同一口径（打开是覆盖层，会把隐形的选择上下文冲掉）。
+   * 行单击 / 复选框 / 打开目录 / 删除不受影响。
+   */
+  selectionMode?: boolean
 }
 
 /**
@@ -66,9 +73,10 @@ const FileRow = memo(function FileRow(props: {
   onOpen: (item: MediaItem) => void
   onDelete: (item: MediaItem) => void
   onReveal?: (item: MediaItem) => void
+  selectionMode?: boolean
 }) {
   const { t } = useTranslation()
-  const { item, selected, onSelectToggle, onOpen, onDelete, onReveal } = props
+  const { item, selected, onSelectToggle, onOpen, onDelete, onReveal, selectionMode = false } = props
   const name = resolveDisplayName({ item })
   const fullPath = item.absolutePath ?? item.filePath ?? ''
   const hasBytes = hasMediaBytes(item)
@@ -91,9 +99,10 @@ const FileRow = memo(function FileRow(props: {
   const open = useCallback(
     (e: React.MouseEvent) => {
       e.stopPropagation()
+      if (selectionMode) return
       onOpen(item)
     },
-    [item, onOpen],
+    [item, onOpen, selectionMode],
   )
 
   return (
@@ -111,7 +120,12 @@ const FileRow = memo(function FileRow(props: {
         selected ? 'bg-accent/10' : 'hover:bg-surface-2/60',
       ].join(' ')}
       onClick={(e) => onSelectToggle(item.id, e.shiftKey)}
-      onDoubleClick={() => onOpen(item)}
+      onDoubleClick={() => {
+        // 选择模式（任务 #9）：双击不进入播放/系统打开（覆盖层会冲掉隐形的
+        // 选择上下文），与 MediaCard 封面同一口径。
+        if (selectionMode) return
+        onOpen(item)
+      }}
       title={fullPath || undefined}
     >
       {/* 复选框常驻可见（BUG-040：禁纯 hover 显形） */}
@@ -143,9 +157,14 @@ const FileRow = memo(function FileRow(props: {
       <span className="flex shrink-0 items-center gap-1">
         <button
           type="button"
-          className="rounded px-1.5 py-0.5 text-[11px] text-muted hover:bg-surface-2 hover:text-fg-strong"
+          className="rounded px-1.5 py-0.5 text-[11px] text-muted hover:bg-surface-2 hover:text-fg-strong disabled:cursor-not-allowed disabled:opacity-40"
           onClick={open}
-          title={t('media.fileList.open')}
+          disabled={selectionMode}
+          title={
+            selectionMode
+              ? t('media.fileList.openInSelection')
+              : t('media.fileList.open')
+          }
           data-testid={`file-list-open-${item.id}`}
         >
           {t('media.fileList.open')}
@@ -177,7 +196,8 @@ const FileRow = memo(function FileRow(props: {
 
 export function FileListView(props: FileListViewProps) {
   const { t } = useTranslation()
-  const { items, selected, total, onSelectToggle, onOpen, onDelete, onError } = props
+  const { items, selected, total, onSelectToggle, onOpen, onDelete, onError, selectionMode = false } =
+    props
 
   /**
    * 「打开目录」（BUG-299 出口判据 7：文件域行内物理定位）。
@@ -245,6 +265,7 @@ export function FileListView(props: FileListViewProps) {
             onOpen={onOpen}
             onDelete={onDelete}
             onReveal={reveal}
+            selectionMode={selectionMode}
           />
         )}
       />

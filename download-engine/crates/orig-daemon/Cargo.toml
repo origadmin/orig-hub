@@ -25,3 +25,8 @@ axum = "0.7"
 tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+# BUG-319：引擎下载任务的本地持久化。
+# 采用与 orig-tg 相同的 libsql 本地后端（`core` feature），避免与 bundled
+# sqlite3 的 LNK2005 多重定义链接冲突。
+libsql = { version = "0.9.30", features = ["core"], default-features = false }

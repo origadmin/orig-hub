@@ -178,16 +178,24 @@ async function main() {
     return {
       total: rows.length,
       noBytes: rows.filter((r) => r.getAttribute('data-bytes') === '0').length,
-      noBytesWithBtn: rows.filter(
+      // BT 式选择（2026-10-19 用户裁定）：缺字节条目带复选框而非下载按钮
+      noBytesWithCheckbox: rows.filter(
         (r) =>
           r.getAttribute('data-bytes') === '0' &&
-          r.querySelector('[data-testid="ingest-sheet-entry-download"]'),
+          r.querySelector('[data-testid="ingest-sheet-entry-checkbox"]'),
       ).length,
-      hasBytesWithBtn: rows.filter(
+      hasBytesWithCheckbox: rows.filter(
         (r) =>
           r.getAttribute('data-bytes') === '1' &&
-          r.querySelector('[data-testid="ingest-sheet-entry-download"]'),
+          r.querySelector('[data-testid="ingest-sheet-entry-checkbox"]'),
       ).length,
+      // 逐条下载按钮必须不存在（旧模型整体移除）
+      legacyDownloadBtn: rows.filter((r) =>
+        r.querySelector('[data-testid="ingest-sheet-entry-download"]'),
+      ).length,
+      selectAll: !!window.__q('[data-testid="ingest-sheet-select-all-box"]'),
+      bulkBar: !!window.__q('[data-testid="ingest-sheet-bulk-bar"]'),
+      bulkBtn: !!window.__q('[data-testid="ingest-sheet-download-selected"]'),
       note: (() => {
         const n = window.__q('[data-testid="ingest-group-entry-note"]')
         return n ? (n.textContent || '').trim() : null
@@ -200,13 +208,23 @@ async function main() {
     JSON.stringify(entries),
   )
   check(
-    `B2 缺字节条目条条有「下载」（缺字节 ${entries.noBytes}，带按钮 ${entries.noBytesWithBtn}）`,
-    entries.noBytes > 0 && entries.noBytesWithBtn === entries.noBytes,
+    `B2 缺字节条目条条有复选框（缺字节 ${entries.noBytes}，带复选框 ${entries.noBytesWithCheckbox}）`,
+    entries.noBytes > 0 && entries.noBytesWithCheckbox === entries.noBytes,
     JSON.stringify(entries),
   )
   check(
-    `B3 有字节条目不给「下载」（有字节却带按钮的行 ${entries.hasBytesWithBtn}，应为 0）`,
-    entries.hasBytesWithBtn === 0,
+    `B3 有字节条目不给复选框（有字节却带复选框的行 ${entries.hasBytesWithCheckbox}，应为 0）`,
+    entries.hasBytesWithCheckbox === 0,
+    JSON.stringify(entries),
+  )
+  check(
+    `B3b 逐条「下载」按钮已整体移除（残留 ${entries.legacyDownloadBtn}，应为 0）`,
+    entries.legacyDownloadBtn === 0,
+    JSON.stringify(entries),
+  )
+  check(
+    `B5 选择式控件齐备：全选=${entries.selectAll}、批量条=${entries.bulkBar}、批量按钮=${entries.bulkBtn}`,
+    entries.selectAll && entries.bulkBar && entries.bulkBtn,
     JSON.stringify(entries),
   )
   check(

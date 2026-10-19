@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { open } from '@tauri-apps/plugin-dialog'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
+import { DirectoryBrowserDialog } from './DirectoryBrowserDialog'
 import { getRecentDirs, addRecentDir, removeRecentDir } from '../lib/recentDirs'
 import { isTauri } from '../lib/env'
 
@@ -12,13 +13,16 @@ interface Props {
   /** 是否展示历史下拉（设置页默认开，新建对话框也开） */
   showHistory?: boolean
   disabled?: boolean
+  /** 应用内浏览器的起始目录（网页调试模式用；通常传「当前生效目录」） */
+  initialPath?: string
   /** 选择失败时的回调（用于全局 toast 提示，避免“点击无反应”） */
   onError?: (msg: string) => void
 }
 
 /**
  * 目录选择输入框：
- * - 「浏览…」→ 系统原生目录选择对话框（tauri-plugin-dialog）
+ * - 「浏览…」→ 桌面壳走**系统原生对话框**（tauri-plugin-dialog）；
+ *   **网页调试模式**走**应用内目录浏览器**（daemon `GET /api/fs/dirs`，BUG-323 缺陷③）
  * - 聚焦/点击 → 历史目录下拉（localStorage 持久化，可单条删除）
  */
 export function DirectoryPicker({
@@ -27,11 +31,14 @@ export function DirectoryPicker({
   placeholder,
   showHistory = true,
   disabled,
+  initialPath,
   onError,
 }: Props) {
   const [recent, setRecent] = useState<string[]>([])
   const [openList, setOpenList] = useState(false)
   const [localErr, setLocalErr] = useState<string | null>(null)
+  /** 应用内目录浏览器（网页调试模式） */
+  const [browserOpen, setBrowserOpen] = useState(false)
   const wrapRef = useRef<HTMLDivElement>(null)
   // 网页调试模式（纯浏览器、无 Tauri 运行时）不支持系统原生目录对话框。
   // BUG-286：IPC 桥可能晚于首帧注入，若把这一判定冻结成首帧常量，下面「浏览…」
@@ -71,12 +78,13 @@ export function DirectoryPicker({
     // 网页调试模式（纯浏览器、无 Tauri 运行时）没有系统原生对话框：
     // @tauri-apps/plugin-dialog 底层 invoke 为 undefined，直接调会抛
     // "Cannot read properties of undefined (reading 'invoke')"。
-    // 软失败 + 提示，而不是让整个设置页炸成错误现场（BUG-072）。
-    // 手动输入与历史下拉在网页模式下仍可用，不影响调试。
+    //
+    // BUG-323 缺陷③：不再「软失败 + 提示」了事 —— 那等于网页模式下**根本没有**
+    // 挑目录的入口（同一产品两套可用性语义，BUG-179 禁止）。改为打开**应用内目录
+    // 浏览器**（数据来自 daemon 只读端点 `GET /api/fs/dirs`）。
     if (!isTauri()) {
-      const msg = '目录选择需在桌面客户端中使用（网页调试模式不支持系统原生对话框，可直接输入路径或选历史）'
-      setLocalErr(msg)
-      onError?.(msg)
+      setLocalErr(null)
+      setBrowserOpen(true)
       return
     }
     setLocalErr(null)
@@ -87,9 +95,12 @@ export function DirectoryPicker({
         setRecent(addRecentDir(dir))
       }
     } catch (e) {
+      // 原生通道失败（权限/插件未注册）也不留死路：降级到应用内浏览器。
+      // 同时上报全局提示（BUG-167：用户主动操作的失败不可静默）。
       const msg = e instanceof Error ? e.message : String(e)
-      setLocalErr(`选择目录失败：${msg}`)
-      onError?.(`选择目录失败：${msg}`)
+      setLocalErr(`系统目录对话框不可用（${msg}），已切换为应用内选择`)
+      onError?.(`系统目录对话框不可用，已切换为应用内选择：${msg}`)
+      setBrowserOpen(true)
     }
   }
 
@@ -139,14 +150,25 @@ export function DirectoryPicker({
           type="button"
           variant="secondary"
           onClick={pick}
-          disabled={disabled || !inTauri}
+          disabled={disabled}
           data-testid="dir-picker-browse"
-          title={inTauri ? undefined : '网页调试模式不支持系统原生目录对话框（可直接输入路径或选历史）'}
+          title={inTauri ? undefined : '网页调试模式：使用应用内目录浏览器（系统原生对话框仅桌面客户端可用）'}
           className="shrink-0"
         >
           浏览…
         </Button>
       </div>
+
+      <DirectoryBrowserDialog
+        open={browserOpen}
+        initialPath={initialPath || value}
+        onClose={() => setBrowserOpen(false)}
+        onPick={(dir) => {
+          onChange(dir)
+          setRecent(addRecentDir(dir))
+          setBrowserOpen(false)
+        }}
+      />
 
       {localErr && (
         <p className="mt-1 text-[11px] text-danger" title={localErr}>

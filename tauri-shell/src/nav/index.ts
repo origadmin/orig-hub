@@ -21,7 +21,14 @@
 /** 一级域（五项）。顺序即侧栏自上而下。 */
 export type ViewId = 'files' | 'download' | 'tg' | 'share' | 'settings'
 
-/** 下载树三档 + 父行「全部任务」。`running` 含 downloading | queued | idle（BUG-082 口径）。 */
+/**
+ * 下载树三档 + 父行「全部任务」。`running` 含 downloading | queued | idle（BUG-082 口径）。
+ *
+ * **档位是标准化的，不随诉求增设**（BUG-314）：2026-10-15 曾应用户「取消后记录不消失」
+ * 的诉求增设 `cancelled` 独立树档 —— 那是越权解读（用户要的是记录可见，不是新导航位），
+ * 主 NAVI 数量严格标准化被破坏，已撤档。取消/中止记录的可见性由「全部」档承担
+ * （本就在列表里、可数、可重试），概览区另有「已取消」计数（次级信息，非导航）。
+ */
 export type DlFilter = 'all' | 'running' | 'paused' | 'done'
 
 export const DL_FILTERS: readonly DlFilter[] = ['all', 'running', 'paused', 'done']

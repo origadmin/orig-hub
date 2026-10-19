@@ -13,11 +13,18 @@ import {
   listInterfaces,
   saveClassifyConfig,
   saveDownloadConfig,
-  saveLibraryConfig,
   saveProxyConfig,
   verifyProxy,
 } from '../api/daemon'
-import { getCacheClearPreview, getCacheStats, getTgConfig, setTgLibraryDir } from '../api/tg'
+import {
+  addManagedRoot,
+  getCacheClearPreview,
+  getCacheStats,
+  listManagedRoots,
+  removeManagedRoot,
+  setPrimaryManagedRoot,
+  type ManagedRoot,
+} from '../api/tg'
 import { isTauri, copyToClipboard } from '../lib/env'
 import { CacheManagerDialog } from './CacheManagerDialog'
 import { useStore } from '../store/useStore'
@@ -37,8 +44,9 @@ import type { SettingsSection } from '../nav'
  * 与 M0 前的两处硬差异：
  *  1. 通用区**不再放 TG 控件** —— TG 的启停/状态/缓存入口连同账号区一起归
  *     「Telegram 插件」区块（入口与它的数据在同一个家）；
- *  2. libDir（媒体库根目录）从下载区移入「下载与存储」，写入端点仍走
- *     `setTgLibraryDir`（M0 不换端点；M3 随库迁 daemon）。
+ *  2. 库根（媒体库根目录）**只读展示**：它是 `<下载路径>/library` 的派生值
+ *     （BUG-323，用户裁定「库根跟下载走」），没有自己的写入口 —— 想改库根就改
+ *     下载目录，二者不可能再分家。
  */
 const SECTIONS: { id: SettingsSection; labelKey: string; descKey: string }[] = [
   { id: 'general', labelKey: 'sec.general', descKey: 'sec.general.desc' },
@@ -166,18 +174,37 @@ export function SettingsPanel({
   const [cacheUsageLoaded, setCacheUsageLoaded] = useState(false)
   const [cacheManagerOpen, setCacheManagerOpen] = useState(false)
 
-  // 库根目录（byte-ownership P5）：编辑态 + 已保存值（变化才写，避免每次保存都打 PUT）
-  const [libDir, setLibDir] = useState('')
-  const [libDirSaved, setLibDirSaved] = useState('')
-  // 系统默认下载目录（按 OS 解析：Windows 为 C:\Users\<user>\Downloads）：用户未显式设置时
-  // 作占位/回退，杜绝写死的 ~/Downloads（Unix 风格，在 Windows 上误导）。
+  /**
+   * **受管库根**（BUG-323）= `<生效下载路径>/library` —— daemon 下发的**派生值**，
+   * 页面**只读展示**：想改它就改下载目录（用户裁定「库根跟下载走」）。
+   * 不再有编辑态/已保存值两份状态 —— 那正是「界面显示的库根 ≠ 引擎实际用的库根」的温床。
+   */
+  const [libRoot, setLibRoot] = useState('')
+  /**
+   * **生效下载路径**（受管根 / 权限边界）：daemon 计算下发（配置值 → 平台默认）。
+   * 「当前生效」行直出它，前端不自己拼 —— 拼出来必然与引擎漂移。
+   */
+  const [effectiveRoot, setEffectiveRoot] = useState('')
+  // 内容默认根（用户 2026-10-19 裁定「禁止往C盘写入任何数据,所有内容应该写D盘」
+  // ⇒ Windows 恒 `D:\OrigDown`）：用户未显式设置时作占位/回退，
+  // 杜绝写死的 ~/Downloads（Unix 风格，在 Windows 上误导）。
   const [defaultDir, setDefaultDir] = useState('')
   /**
-   * 手动下载**未配置** `download_dir` 时的实际默认根（D23-A①）—— 由 daemon 计算下发
-   * （`<库根>/下载/`；库根也未配置则平台默认）。前端**不自己拼路径**，否则「库根/下载」
-   * 与「平台 Downloads」两套推算必然漂移。下载目录输入框的占位优先用它。
+   * 手动下载**未配置** `download_dir` 时的实际默认根 —— 由 daemon 计算下发
+   * （**BUG-323 起 = 内容默认根，Windows 恒 `D://OrigDown`**）。前端**不自己拼路径**，
+   * 否则默认根与别处另算一套必然漂移。下载目录输入框的占位优先用它。
    */
   const [manualRoot, setManualRoot] = useState('')
+  /**
+   * **受管根集合**（BUG-323 第三裁定「下载单根 / 管理多根」，Stage 2 UI）：
+   * 下载根（locked，恒在）+ 用户增删的根。主根只是管理视图默认选中 ——
+   * 切换主不动下载落点（R3′）。orig-tg 是唯一真源（`GET /api/fs/roots`）。
+   */
+  const [managedRoots, setManagedRoots] = useState<ManagedRoot[]>([])
+  const [managedErr, setManagedErr] = useState<string | null>(null)
+  const [managedBusy, setManagedBusy] = useState(false)
+  /** 新增行的编辑态（DirectoryPicker 值）。 */
+  const [newRoot, setNewRoot] = useState('')
   /**
    * 调试日志路径（BUG-243）：daemon 是唯一真源（`GET /api/config` 的 `logs`），
    * 这里只**照抄展示**，不本地拼路径 —— 引擎换目录时关于页自动跟着走。
@@ -194,6 +221,7 @@ export function SettingsPanel({
   // 缓存占用：进设置页读一次（不轮询 —— 它只在清理前后变化，轮询是白耗）
   useEffect(() => {
     void refreshCacheUsage()
+    loadManagedRoots()
   }, [])
 
   // 代理配置编辑态
@@ -263,39 +291,38 @@ export function SettingsPanel({
       .then(({ primary }) => setAutoPrimary(primary?.name ?? null))
       .catch(() => {})
     /**
-     * 库根（P5）与下载目录（BUG-234）来自**两个不同服务**（TG / daemon），但 D23-A⑥
-     * 规定二者共用同一个受管根 ⇒ 必须一起读才能对账（见下方升级回填）。任一不可达都
-     * 降级为 `null`，不阻塞其它设置项（tg 不可达时库根留空展示，保存时才报错）。
+     * 目录与库根的**唯一真源都在 daemon**（BUG-323）：`effective_download_root` = 受管根 /
+     * 权限边界，`library_root` = 其下 `library`（派生、只读）。
+     *
+     * 此前这里同时读 TG 的 `libraryDir` 与 daemon 的值再「对账」，还把 TG 侧（内部 AppData）
+     * 的库根回填进 daemon —— 两个进程各报一个库根、还互相写，正是「库根脱离下载路径」的
+     * 来源（用户：「库根跟下载走」）。整条撤掉。
      */
-    Promise.all([getTgConfig().catch(() => null), getConfig().catch(() => null)]).then(
-      ([tg, c]) => {
-        const tgLib = tg?.libraryDir ?? ''
-        setLibDir(tgLib)
-        setLibDirSaved(tgLib)
-        if (!c) return
-        // 系统默认下载目录：daemon 按 OS 解析（Windows = C:\Users\<user>\Downloads），
+    getConfig()
+      .then((c) => {
+        // 内容默认根：daemon 按「所有内容写 D 盘」裁定解析（Windows = D:\OrigDown），
         // 用作未显式设置时的占位/回退，替代写死的 ~/Downloads。
         setDefaultDir(c.default_download_dir ?? '')
-        // 手动下载实际默认根（D23-A①）：`<库根>/下载/`，由 daemon 下发（唯一真源）。
+        // 手动下载实际默认根（BUG-323）：现**就是**名义默认过禁用盘规则后的内容根
+        // （Windows = D:\OrigDown），daemon 下发作唯一真源；前端不自己拼路径。
         setManualRoot(c.manual_download_root ?? '')
+        setEffectiveRoot(c.effective_download_root ?? '')
+        setLibRoot(c.library_root ?? '')
         // 下载目录的**唯一真源是引擎**（它决定文件实际落哪，BUG-234）：
-        // 引擎已配置则照它显示并同步本地镜像；未配置保持编辑态（空 = 走库根/下载）。
-        if (c.download_dir) {
-          setDir(c.download_dir)
-          updateSettings({ downloadDirectory: c.download_dir })
-        }
+        // 引擎值（含「空 = 未配置」）**双向**对齐本地镜像与编辑态。
+        //
+        // BUG-323 缺陷④：此前只写 `if (c.download_dir) { … }` —— 有值才同步，
+        // 引擎为空时**保留**本地 localStorage 里的旧值 ⇒ 界面显示一个引擎根本不会
+        // 使用的目录（同一屏里「当前生效」是内容默认根、输入框却写着别的路径）。
+        // 判定「能不能改目录」时这条最坑：用户改了、保存了、又别处清空了引擎值，
+        // 重开设置页依旧显示旧路径，看着就像「改不动」。
+        const engineDir = c.download_dir ?? ''
+        setDir(engineDir)
+        updateSettings({ downloadDirectory: engineDir })
         // 调试日志路径（BUG-243）：同一份 config 里带下来，不额外打一次请求。
         if (c.logs) setLogPaths(c.logs)
-        // 升级回填（D23-A⑥）：老用户的库根只存在 TG 侧（daemon 的 `library_dir` 为空），
-        // 不回填则手动下载默认根不会变成 `<库根>/下载/`（D23-A①）。仅在「daemon 为空且
-        // TG 有值」时写一次（幂等）；失败静默——下次进设置页自动重试，不打断展示。
-        if (!c.library_dir && tgLib) {
-          void saveLibraryConfig({ dir: tgLib })
-            .then((r) => setManualRoot(r.manual_download_root ?? ''))
-            .catch(() => {})
-        }
-      },
-    )
+      })
+      .catch(() => {})
     // TG 拉起失败原因（BUG-177 / BUG-178）：服务不可用时侧栏没有 TG 入口，
     // 若这里也不说原因，用户只会以为「TG 功能没了」。走唯一刷新入口，不另拉一次 config。
     void refreshTgState()
@@ -309,6 +336,19 @@ export function SettingsPanel({
     ...sel.enabledNames.map((name) => ({ name, isPrimary: false })),
   ]
   const cardCount = rows.length
+
+  /** 拉取受管根集合（低频：只在进设置页与增删改后拉，不轮询）。 */
+  const loadManagedRoots = () => {
+    listManagedRoots()
+      .then((roots) => {
+        setManagedRoots(roots)
+        setManagedErr(null)
+      })
+      .catch((e) => {
+        // orig-tg 不可达：集合拉不到 ⇒ 卡片显示原因，不假装「没有根」。
+        setManagedErr(e instanceof Error ? e.message : String(e))
+      })
+  }
 
   /** 保存分类规则到 daemon（运行时生效 + 持久化） */
   const persistClassify = async () => {
@@ -379,8 +419,38 @@ export function SettingsPanel({
       const saved = r.download_dir ?? ''
       setDir(saved)
       updateSettings({ downloadDirectory: saved })
+      // 生效路径与库根由引擎回读（库根 = `<下载路径>/library`，BUG-323）：
+      // 本页只照抄，不自己拼。
+      setEffectiveRoot(r.effective_download_root ?? '')
+      setLibRoot(r.library_root ?? '')
+      // 下载路径还要同步给 orig-tg（它管归仓落点与媒体库字节）。失败**必须被看见**
+      // （BUG-167 约定），否则「界面改了、引擎没跟上」又得用户自己去猜。
+      if (!r.tg_synced) {
+        setError(
+          r.tg_error
+            ? `下载路径已保存，但 Telegram 服务未同步：${r.tg_error}`
+            : '下载路径已保存，但 Telegram 服务未同步（orig-tg 不可达）',
+        )
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  /**
+   * 受管根变更（增 / 删 / 切主，BUG-323 Stage 2）：一律以 orig-tg 回包刷新，
+   * **不本地推算** —— 本地改列表而后端拒绝（如删下载根 422）会出现界面说有、
+   * 引擎说无的分裂。失败原地显示原因（下载根锁定等 422 文案由后端给出）。
+   */
+  const runManagedRoot = async (fn: () => Promise<ManagedRoot[]>) => {
+    setManagedBusy(true)
+    setManagedErr(null)
+    try {
+      setManagedRoots(await fn())
+    } catch (e) {
+      setManagedErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setManagedBusy(false)
     }
   }
 
@@ -425,35 +495,6 @@ export function SettingsPanel({
   }
 
   /**
-   * 保存库根目录（byte-ownership P5 / D23-A⑥）：只在编辑态 ≠ 已保存值时打 PUT。
-   *
-   * D23-A⑥「受管库根同属一处、设置一处可配」：**两端都要写** ——
-   *  - TG（`PUT /api/tg/config`）：归仓字节的家，M1 把库根迁入 daemon 之前它仍是权威存储；
-   *  - daemon（`PUT /api/config/library`）：手动下载默认根 `<库根>/下载/` 的来源（D23-A①）。
-   * 两端并行发出（`allSettled`）：一端失败**不**阻止另一端落库，但任一失败都要让用户看见
-   * （BUG-167 约定：用户主动操作的失败不可静默）。回读 daemon 返回的 `manual_download_root`
-   * 刷新占位，保证「库根/下载」与 daemon 实际解析一致，前端不自己拼。
-   */
-  const persistLibrary = async () => {
-    const next = libDir.trim()
-    if (next === libDirSaved) return
-    try {
-      const [tgRes, daemonRes] = await Promise.allSettled([
-        setTgLibraryDir(next),
-        saveLibraryConfig({ dir: next }),
-      ])
-      if (tgRes.status === 'rejected') throw tgRes.reason
-      if (daemonRes.status === 'rejected') throw daemonRes.reason
-      const saved = tgRes.value.libraryDir ?? next
-      setLibDir(saved)
-      setLibDirSaved(saved)
-      setManualRoot(daemonRes.value.manual_download_root ?? '')
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }
-
-  /**
    * 网页调试模式降级（BUG-286）：没有 Tauri opener 通道 ⇒ 复制路径 + 内联提示。
    *
    * 不碰原生、不上错误 —— raw `Cannot read properties of undefined (reading 'invoke')`
@@ -470,9 +511,13 @@ export function SettingsPanel({
     )
   }
 
-  /** 打开库根文件夹：桌面走 tauri opener 通道；网页调试模式降级为「复制路径 + 内联提示」（BUG-286）。 */
+  /**
+   * 打开库根文件夹：桌面走 tauri opener 通道；网页调试模式降级为「复制路径 + 内联提示」（BUG-286）。
+   *
+   * BUG-323：目标就是 daemon 下发的派生库根（只读），不再有「编辑态 vs 已保存值」的歧义。
+   */
   const openLibraryFolder = async () => {
-    const target = libDirSaved || libDir
+    const target = libRoot
     if (!target) return
     if (!isTauri()) {
       await degradeToCopyPath(target)
@@ -519,7 +564,6 @@ export function SettingsPanel({
     await persistClassify()
     await persistDownload()
     await persistProxy()
-    await persistLibrary()
     setSaved(true)
     setTimeout(() => setSaved(false), 1500)
   }
@@ -621,8 +665,22 @@ export function SettingsPanel({
                     <p className="text-[11px] text-muted">{t('downloads.dirHint')}</p>
                   </div>
                   <div className="mt-2" data-testid="download-dir-picker">
-                    <DirectoryPicker value={dir} onChange={setDir} placeholder={dir || manualRoot || defaultDir || t('downloads.dirPlaceholder')} onError={setError} />
+                    <DirectoryPicker
+                      value={dir}
+                      onChange={setDir}
+                      placeholder={dir || manualRoot || defaultDir || t('downloads.dirPlaceholder')}
+                      initialPath={dir || manualRoot || defaultDir}
+                      onError={setError}
+                    />
                   </div>
+                  {/* 生效值显式列出：输入框为空时它只是灰色占位（看着像「已经设好了」），
+                      用户会以为改不动 —— 把 daemon 实际会用的路径直出，语义只有一种。 */}
+                  <p className="mt-1.5 text-[11px] leading-relaxed text-muted" data-testid="download-dir-effective">
+                    {t('downloads.dirEffective')}
+                    <span className="ml-1 font-mono text-fg-mid">
+                      {effectiveRoot || dir || manualRoot || defaultDir || '—'}
+                    </span>
+                  </p>
                   <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
                     {t('downloads.dirNote')}
                   </p>
@@ -630,21 +688,27 @@ export function SettingsPanel({
 
                 <div className="h-px bg-border-subtle/60" />
 
-                {/* 库根目录（byte-ownership P5）：归仓字节的家 + 打开文件夹 */}
+                {/* 库根（BUG-323）：`<下载路径>/library` 的**派生值** —— 只读展示。
+                    刻意没有编辑入口：库根脱离下载路径在结构上就不可表达（用户裁定
+                    「库根跟下载走，所有文件不允许脱离下载路径」）。想换库根 = 换下载目录。 */}
                 <div>
                   <div className="flex items-center justify-between">
                     <p className="text-[13px] font-medium text-fg-strong">{t('downloads.libDir')}</p>
                     <p className="text-[11px] text-muted">{t('downloads.libDirHint')}</p>
                   </div>
                   <div className="mt-2 flex items-start gap-2">
-                    <div className="min-w-0 flex-1" data-testid="lib-dir-picker">
-                      <DirectoryPicker value={libDir} onChange={setLibDir} placeholder={libDir || defaultDir || t('downloads.dirPlaceholder')} onError={setError} />
+                    <div
+                      className="min-w-0 flex-1 truncate rounded-md border border-border-subtle bg-surface-2/40 px-3 py-2 font-mono text-xs text-fg-mid"
+                      data-testid="lib-root-readonly"
+                      title={libRoot}
+                    >
+                      {libRoot || '—'}
                     </div>
                     <Button
                       variant="outline"
                       size="sm"
                       className="h-8 shrink-0 px-2 text-xs"
-                      disabled={!libDir && !libDirSaved}
+                      disabled={!libRoot}
                       onClick={openLibraryFolder}
                       data-testid="settings-lib-open"
                     >
@@ -661,6 +725,113 @@ export function SettingsPanel({
                   )}
                   <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
                     {t('downloads.libDirNote')}
+                  </p>
+                </div>
+
+                <div className="h-px bg-border-subtle/60" />
+
+                {/* 受管目录（BUG-323 Stage 2，2026-10-19 补齐）：下载单根 /
+                    管理多根。下载根 locked 只读；用户根可增删、可设主。
+                    主根 = 管理视图默认选中，**不**决定下载落点、不重定向写入（R3′）。 */}
+                <div data-testid="managed-roots">
+                  <div className="flex items-center justify-between">
+                    <p className="text-[13px] font-medium text-fg-strong">
+                      {t('downloads.managedTitle')}
+                    </p>
+                    <p className="text-[11px] text-muted">{t('downloads.managedHint')}</p>
+                  </div>
+                  {managedErr && (
+                    <p
+                      className="mt-2 text-[11px] text-danger"
+                      data-testid="managed-roots-error"
+                    >
+                      {managedErr}
+                    </p>
+                  )}
+                  <ul className="mt-2 space-y-1.5">
+                    {managedRoots.map((r) => (
+                      <li
+                        key={r.path}
+                        className="flex flex-wrap items-center gap-2"
+                        data-testid="managed-root-row"
+                        data-locked={r.locked ? '1' : '0'}
+                        data-primary={r.primary ? '1' : '0'}
+                      >
+                        <span
+                          className="min-w-0 flex-1 truncate rounded-md border border-border-subtle bg-surface-2/40 px-3 py-1.5 font-mono text-xs text-fg-mid"
+                          title={r.path}
+                        >
+                          {r.path}
+                        </span>
+                        {r.primary && (
+                          <Badge variant="secondary" className="shrink-0">
+                            {t('downloads.managedPrimaryBadge')}
+                          </Badge>
+                        )}
+                        {r.locked && (
+                          <Badge variant="default" className="shrink-0">
+                            {t('downloads.managedLockedBadge')}
+                          </Badge>
+                        )}
+                        {!r.locked && !r.primary && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 shrink-0 px-2 text-xs"
+                            disabled={managedBusy}
+                            onClick={() =>
+                              void runManagedRoot(() => setPrimaryManagedRoot(r.path))
+                            }
+                            data-testid="managed-root-set-primary"
+                          >
+                            {t('downloads.managedSetPrimary')}
+                          </Button>
+                        )}
+                        {!r.locked && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 shrink-0 px-2 text-xs"
+                            disabled={managedBusy}
+                            onClick={() =>
+                              void runManagedRoot(() => removeManagedRoot(r.path))
+                            }
+                            data-testid="managed-root-remove"
+                          >
+                            {t('downloads.managedRemove')}
+                          </Button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                  {/* 新增：目录选择 + 添加。目录不存在也接受（先登记再导入）。 */}
+                  <div className="mt-2 flex items-center gap-1.5">
+                    <div className="min-w-0 flex-1" data-testid="managed-root-new-picker">
+                      <DirectoryPicker
+                        value={newRoot}
+                        onChange={setNewRoot}
+                        placeholder={t('downloads.managedAddPlaceholder')}
+                        initialPath={effectiveRoot}
+                        onError={setError}
+                      />
+                    </div>
+                    <Button
+                      variant="secondary"
+                      className="shrink-0"
+                      disabled={managedBusy || !newRoot.trim()}
+                      onClick={() => {
+                        const p = newRoot.trim()
+                        if (!p) return
+                        setNewRoot('')
+                        void runManagedRoot(() => addManagedRoot(p))
+                      }}
+                      data-testid="managed-root-add"
+                    >
+                      {t('downloads.managedAdd')}
+                    </Button>
+                  </div>
+                  <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
+                    {t('downloads.managedNote')}
                   </p>
                 </div>
 

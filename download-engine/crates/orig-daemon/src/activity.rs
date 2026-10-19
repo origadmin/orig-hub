@@ -22,12 +22,105 @@
 //! - `speed` 对 TG 侧恒为 `null`（无采样），不是 0 —— 0 会被读成「已停止」。
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
+use orig_core::engine::Task;
 use serde::{Deserialize, Serialize};
 
 use crate::routes::now_secs;
-use crate::state::{AppState, TG_PORT};
+use crate::state::AppState;
 use crate::status::status_string;
+
+/// 引擎侧的**单一真源行**：内存任务（有控制句柄） ∪ 库记录（进程死后留下的）。
+///
+/// 为什么必须存在：同一批引擎任务有两个呈现面 —— `/api/downloads`（原生面，带
+/// 分块/连接明细）与 `/api/activity`（聚合面，与 TG 同列）。若两处各自去「合并
+/// 内存与库」，必有一处漏合并，用户观感就是「这里看得到、那里看不到」。实证：
+/// 聚合面合并了库、原生面没合并 ⇒ 栈重启后下载页仍然空白，而活动页有行。
+///
+/// 合并口径：**内存优先，库补齐**。内存里有的是本进程能控制的活体，库只用来补
+/// 那些「记录还在、句柄已不在」的行（终态，或上次进程留下的）。
+// 不派生 Debug：`Task` 没有实现它，而为一个视图结构体去给引擎内核加 Debug
+// 是把呈现需求倒灌进内核。
+#[derive(Clone)]
+pub struct EngineRow {
+    pub id: String,
+    pub url: String,
+    pub filename: String,
+    /// 落盘绝对路径。
+    pub output: String,
+    pub total: u64,
+    pub done: u64,
+    pub status: String,
+    pub error: Option<String>,
+    pub added_at: i64,
+    /// 最近更新时点：内存任务没有更新时点 ⇒ 与 `added_at` 同值（诚实回退）；
+    /// 库记录有真实时点。
+    pub updated_at: i64,
+    pub category: Option<String>,
+    pub max_concurrency: u32,
+    /// 实时速度（非运行态恒 0 —— 0 是「没在动」，不是「不知道」）。
+    pub speed: f64,
+    /// 内存活体句柄。`None` = 本进程已不持有该 Task ⇒ 无实时明细可采、也无
+    /// pause/resume 可言，但**记录仍然可见**（记录是结果，不是待办）。
+    pub live: Option<Arc<Task>>,
+}
+
+/// 引擎侧合并读取（内存 ∪ 库）。两个呈现面都必须走这里，不许各自合并一遍。
+pub async fn engine_rows(st: &AppState) -> Vec<EngineRow> {
+    let mut out = Vec::new();
+    let mut live_ids: Vec<String> = Vec::new();
+    {
+        // 锁内 await 是既有实现（progress 本身异步）；块作用域确保读库之前
+        // 放掉任务表的锁 —— 持锁 await DB 会把整张表堵在后面。
+        let tasks = st.tasks.lock().await;
+        for dt in tasks.values() {
+            let prog = dt.task.progress().await;
+            out.push(EngineRow {
+                id: dt.task.id.clone(),
+                url: dt.url.clone(),
+                filename: dt.filename.clone(),
+                output: dt.output.to_string_lossy().into_owned(),
+                total: prog.total,
+                done: prog.downloaded,
+                status: status_string(prog.status),
+                error: dt.error.lock().await.clone(),
+                added_at: dt.added_at,
+                updated_at: dt.added_at,
+                category: dt.category.clone(),
+                max_concurrency: dt.max_concurrency,
+                speed: prog.speed as f64,
+                live: Some(dt.task.clone()),
+            });
+            live_ids.push(dt.task.id.clone());
+        }
+    }
+    if let Some(store) = &st.task_store {
+        for r in store.all().await {
+            // 内存里有的以内存为准，库只补内存没有的那些。
+            if live_ids.contains(&r.id) {
+                continue;
+            }
+            out.push(EngineRow {
+                id: r.id.clone(),
+                url: r.url.clone(),
+                filename: r.filename.clone(),
+                output: r.output.clone(),
+                total: r.total,
+                done: r.downloaded,
+                status: r.status.clone(),
+                error: r.error.clone(),
+                added_at: r.added_at,
+                updated_at: r.updated_at,
+                category: r.category.clone(),
+                max_concurrency: r.max_concurrency,
+                speed: 0.0,
+                live: None,
+            });
+        }
+    }
+    out
+}
 
 /// 任务来源。两侧的存储与引擎**不统一**（架构裁定），这里只统一呈现。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -86,6 +179,25 @@ pub struct TaskView {
     pub kind: TaskKind,
     /// 各侧原生名（下载 = 文件名；TG = 任务标题，缺失回退 itemKey）。
     pub name: String,
+    /// 聚合键（BUG-300 复报：入库任务**就住在 orig-tg**，`itemKey` 是内容对象天然
+    /// 的去重键；下载侧无去重语义，用任务 id 自身作为唯一键，保持每行独立）。
+    /// 前端据此把「同一内容的多次入库」合并成一行（BT 的「种子」粒度），而不是
+    /// 把每条 `cache_task` 记录平铺成一行。
+    #[serde(rename = "groupKey")]
+    pub group_key: String,
+    /// TG 侧定位坐标（BUG-300 复报：「去媒体库查看」需要 `ref = {chat}:{msg}`，
+    /// 而 `itemKey` 对相册/批量组**给不出** msg）。orig-tg 的任务载荷本就带着
+    /// `chatId`/`messageIds`，这里只做转发，不新造数据源。
+    ///
+    /// 下载侧没有「TG 频道」这一说 ⇒ `None`（不是 0：0 会被读成一个真实频道）。
+    #[serde(rename = "chatId", skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<i64>,
+    /// 任务覆盖的消息号（按缓存顺序）。下载侧无此概念 ⇒ 空数组。
+    #[serde(rename = "messageIds")]
+    pub message_ids: Vec<i64>,
+    /// 优先下载优先级（BUG-277）：越大越先跑，0 = 未置顶。下载侧无队列优先级
+    /// 概念 ⇒ 恒 0（诚实缺省，不是「排第一」）。
+    pub priority: i64,
     pub unit: Unit,
     pub total: u64,
     pub done: u64,
@@ -170,6 +282,16 @@ struct TgCacheTask {
     /// 缺省时 `cache_view` 回退 `itemKey`，绝不渲染空名。
     #[serde(default)]
     title: String,
+    /// TG 频道 id（orig-tg `chatId`）。老载荷可能缺 → 0，`cache_view` 再转成 `None`
+    /// （0 会被读成一个真实频道，不能当定位坐标用）。
+    #[serde(default, rename = "chatId")]
+    chat_id: i64,
+    /// 任务覆盖的消息号（按缓存顺序；「去媒体库查看」拼 ref 用）。
+    #[serde(default, rename = "messageIds")]
+    message_ids: Vec<i64>,
+    /// 优先下载优先级（BUG-277）；老载荷缺省 0 = 未置顶。
+    #[serde(default)]
+    priority: i64,
     #[serde(default)]
     total: i64,
     #[serde(default)]
@@ -266,42 +388,47 @@ fn merge(
     }
 }
 
-/// 普通下载侧：读本进程内存任务表（无跨进程依赖，不会失败）。
+/// 普通下载侧：内存任务表 + 持久化记录（BUG-319）。
+///
+/// 以前只读内存表 ⇒ 进程一没，列表就是空的。栈被监督者拉回来之后，
+/// 界面上的「没有数据」其实是「进程没了」，用户根本无从区分 —— 与 BUG-176
+/// 「取不到 ≠ 没有」是同型假象，只是这次丢的是下载行。
+/// 现在内存表只提供「本进程手里有控制句柄的那些」，库提供「记录还在的那些」，
+/// 两者合并后再对外：活着的能控制，留下的能看见。
 async fn download_views(st: &AppState) -> Vec<TaskView> {
-    let mut out = Vec::new();
-    let tasks = st.tasks.lock().await;
-    for dt in tasks.values() {
-        let prog = dt.task.progress().await;
-        let status = status_string(prog.status);
-        let error = dt.error.lock().await.clone();
-        let total = prog.total;
-        let done = prog.downloaded;
-        out.push(TaskView {
-            id: format!("dl:{}", dt.task.id),
-            kind: TaskKind::Download,
-            name: dt.filename.clone(),
-            unit: Unit::Bytes,
-            total,
-            done,
-            // 非运行态速度恒 0（AGENTS.md §5）；运行态取引擎采样值。
-            speed: Some(if status == "downloading" {
-                prog.speed as f64
-            } else {
-                0.0
-            }),
-            progress: percent(done, total),
-            actions: actions_for(TaskKind::Download, &status),
-            control: ControlRef {
-                side: ControlSide::Daemon,
-                native_id: dt.task.id.clone(),
-            },
-            // 内存任务没有「最后更新」时点，取入队时间作排序键。
-            updated_at: dt.added_at,
-            error,
-            status,
-        });
-    }
-    out
+    // 单一真源：与 `/api/downloads` 共用 `engine_rows`，不许各合并一遍。
+    let rows = engine_rows(st).await;
+    rows.into_iter()
+        .map(|r| {
+            let total = r.total;
+            let done = r.done;
+            TaskView {
+                id: format!("dl:{}", r.id),
+                kind: TaskKind::Download,
+                name: r.filename,
+                // 下载侧无去重语义 ⇒ 聚合键即本任务 id（唯一）。
+                group_key: r.id.clone(),
+                // 下载侧没有 TG 频道/消息号/队列优先级 ⇒ 诚实缺省（None/空/0）。
+                chat_id: None,
+                message_ids: Vec::new(),
+                priority: 0,
+                unit: Unit::Bytes,
+                total,
+                done,
+                // 非运行态速度恒 0（AGENTS.md §5）；运行态取引擎采样值。
+                speed: Some(if r.status == "downloading" { r.speed } else { 0.0 }),
+                progress: percent(done, total),
+                actions: actions_for(TaskKind::Download, &r.status),
+                control: ControlRef {
+                    side: ControlSide::Daemon,
+                    native_id: r.id,
+                },
+                updated_at: r.updated_at,
+                error: r.error,
+                status: r.status,
+            }
+        })
+        .collect()
 }
 
 /// TG 缓存侧：HTTP 读 orig-tg 的全量任务端点；任何失败都降级为 `Err(reason)`。
@@ -314,7 +441,14 @@ async fn download_views(st: &AppState) -> Vec<TaskView> {
 /// 缓解：5s 而非 1s、仅 `tg_enabled` 时才调、前端无活即停、`no_proxy` + 短超时。
 /// 正解是让 TG 补一个内存快照版全量端点，见 **BUG-085**（follow-up）。
 async fn fetch_cache_views(st: &AppState) -> Result<Vec<TaskView>, String> {
-    let url = format!("http://127.0.0.1:{TG_PORT}/api/tg/cache/tasks/all");
+    // 端口取**运行时实际值**（BUG-318）：orig-tg 绑不上起点（保留区/被占）时 daemon 会
+    // 顺延重选并落进 `st.tg_port`（`/api/config` 的 `tg_port` 读它，前端也以它校准 base）。
+    // 用编译期常量 `TG_PORT` 会在顺延后永远打到一个没有服务的端口 —— 聚合视图把健康的
+    // orig-tg 误报成 `available=false`，下载域整批入库行「消失」（用户观感即数据丢失）。
+    let url = format!(
+        "http://127.0.0.1:{}/api/tg/cache/tasks/all",
+        st.tg_port_state()
+    );
     let resp = st
         .http
         .get(&url)
@@ -351,6 +485,14 @@ fn cache_view(t: &TgCacheTask) -> TaskView {
         id: format!("tg:{}", t.id),
         kind: TaskKind::Cache,
         name,
+        // 聚合键 = orig-tg `itemKey`（同一内容多次入库共享同一个 key ⇒ 前端合并成一行）。
+        group_key: t.item_key.clone(),
+        // 定位坐标原样转发（BUG-300 复报：相册/批量组的 `itemKey` 给不出 msg，
+        // 「去媒体库查看」必须靠载荷里的 `chatId`/`messageIds`）。chat_id 为 0 的
+        // 老数据转 `None` —— 0 不是合法频道坐标。
+        chat_id: (t.chat_id != 0).then_some(t.chat_id),
+        message_ids: t.message_ids.clone(),
+        priority: t.priority,
         // 缓存任务按**条目数**计量（覆盖 N 条消息），不是字节。
         unit: Unit::Items,
         total,
@@ -374,11 +516,26 @@ fn cache_view(t: &TgCacheTask) -> TaskView {
 /// - cache：活跃（queued/running）→ 无（TG 无真续传，暂停/继续会是假能力）；
 ///   其余 → 重试（按 id 复位终态行，见 orig-tg `store::retry_cache_task`）。
 /// - **两侧都永不返回删除类动词。**
+/// 动词的线上传名（与 `#[serde(rename_all = "lowercase")]` 同源，避免前端再猜一次）。
+pub fn action_word(a: Action) -> &'static str {
+    match a {
+        Action::Pause => "pause",
+        Action::Resume => "resume",
+        Action::Cancel => "cancel",
+        Action::Retry => "retry",
+    }
+}
+
 pub fn actions_for(kind: TaskKind, status: &str) -> Vec<Action> {
     match kind {
         TaskKind::Download => match status {
             "downloading" | "queued" | "idle" => vec![Action::Pause, Action::Cancel],
             "paused" => vec![Action::Resume, Action::Cancel],
+            // BUG-322：终态与中断的**重试**入口。记录留下来了（BUG-319）却动不了
+            // 等于把结果变成遗迹，用户只能删掉重加。
+            // `completed` 不给 Retry：落盘路径不重命名（见 `requeue` 的注释），
+            // 重试一个已完成的文件只会覆盖它自己，那是噪音不是能力。
+            "interrupted" | "error" | "cancelled" => vec![Action::Retry],
             _ => vec![],
         },
         TaskKind::Cache => match status {
@@ -421,6 +578,12 @@ mod tests {
             },
             kind,
             name: status.to_string(),
+            // 与 `id: "dl:{status}"` 同口径：下载侧聚合键即本任务 id（唯一）。
+            group_key: format!("dl:{status}"),
+            // 下载侧诚实缺省：无 TG 频道/消息号/队列优先级。
+            chat_id: None,
+            message_ids: Vec::new(),
+            priority: 0,
             unit: match kind {
                 TaskKind::Download => Unit::Bytes,
                 TaskKind::Cache => Unit::Items,
@@ -570,6 +733,34 @@ mod tests {
         assert!(actions_for(TaskKind::Cache, "running").is_empty());
     }
 
+    /// BUG-322：记录留下来了却动不了 = 把结果变成遗迹。
+    /// 停在那儿的行（中断/失败/被取消）必须能重试。
+    #[test]
+    fn stalled_download_rows_expose_retry() {
+        for s in ["interrupted", "error", "cancelled"] {
+            assert_eq!(
+                actions_for(TaskKind::Download, s),
+                vec![Action::Retry],
+                "{s} 必须可重试"
+            );
+        }
+        // 已完成不重试：落盘路径不重命名，重试已完成的文件只会覆盖它自己。
+        assert!(
+            actions_for(TaskKind::Download, "completed").is_empty(),
+            "completed 不该有动作（重试它是噪音）"
+        );
+    }
+
+    /// 动词的线上传名必须是 URL 里的那个词 —— 前端按 `actions[]` 拼端点，
+    /// 这里拼错就是 404，而 404 在按钮上表现为「点了没反应」。
+    #[test]
+    fn action_word_matches_the_wire_name() {
+        assert_eq!(action_word(Action::Pause), "pause");
+        assert_eq!(action_word(Action::Resume), "resume");
+        assert_eq!(action_word(Action::Cancel), "cancel");
+        assert_eq!(action_word(Action::Retry), "retry");
+    }
+
     #[test]
     fn ordering_is_deterministic() {
         let downloads = vec![view(TaskKind::Download, "downloading")];
@@ -601,6 +792,9 @@ mod tests {
             id: 7,
             item_key: "g:-1003969766003:14333518975001516".to_string(),
             title: "《妈妈陪儿子高考》EP10 原档观享".to_string(),
+            chat_id: -1003969766003,
+            message_ids: vec![14333518975001516, 14333518975001517],
+            priority: 3,
             total: 10,
             done: 2,
             status: "interrupted".to_string(),
@@ -624,6 +818,119 @@ mod tests {
         assert_eq!(
             cache_view(&blank).name,
             "g:-1003969766003:14333518975001516"
+        );
+    }
+
+    #[test]
+    fn cache_view_group_key_equals_item_key() {
+        // BUG-300 复报（2026-10-15）：聚合键必须 == orig-tg `itemKey`，
+        // 否则前端拿 `groupKey` 合并时与按 `itemKey` 直连的结果对不上（两处口径分裂）。
+        let t = TgCacheTask {
+            id: 7,
+            item_key: "m:-1001341930464:208031".to_string(),
+            title: "EP10 原档观享".to_string(),
+            chat_id: -1001341930464,
+            message_ids: vec![208031],
+            priority: 0,
+            total: 1,
+            done: 0,
+            status: "queued".to_string(),
+            error: None,
+            updated_at: 0,
+        };
+        assert_eq!(cache_view(&t).group_key, "m:-1001341930464:208031");
+        // 下载侧 key 必须是本任务 id（唯一），不能是共享值 ⇒ 反向证伪：
+        let dl = view(TaskKind::Download, "downloading");
+        assert_eq!(dl.group_key, "dl:downloading");
+    }
+
+    #[test]
+    fn cache_view_forwards_locator_and_priority() {
+        // BUG-300 复报（2026-10-15）：「去媒体库查看」要 ref={chat}:{msg}、
+        // 优先下载要 priority —— 两者都只能来自 orig-tg 任务载荷，聚合层必须原样转发。
+        let t = TgCacheTask {
+            id: 9,
+            item_key: "g:-1003969766003:14333518975001516".to_string(),
+            title: "相册批".to_string(),
+            chat_id: -1003969766003,
+            message_ids: vec![14333518975001516, 14333518975001517],
+            priority: 5,
+            total: 2,
+            done: 0,
+            status: "queued".to_string(),
+            error: None,
+            updated_at: 0,
+        };
+        let v = cache_view(&t);
+        assert_eq!(v.chat_id, Some(-1003969766003));
+        assert_eq!(v.message_ids, vec![14333518975001516, 14333518975001517]);
+        assert_eq!(v.priority, 5);
+        // 反向证伪：老载荷 chatId 缺省成 0 时必须转 None —— 0 不是合法频道坐标，
+        // 拿它拼 ref 会查到别人的频道上去。
+        let legacy = TgCacheTask {
+            chat_id: 0,
+            ..t
+        };
+        assert_eq!(cache_view(&legacy).chat_id, None);
+        // 下载侧没有对应概念：None / 空 / 0，绝不伪装成「频道 0 的第 0 条」。
+        let dl = view(TaskKind::Download, "downloading");
+        assert_eq!(dl.chat_id, None);
+        assert!(dl.message_ids.is_empty());
+        assert_eq!(dl.priority, 0);
+    }
+
+    /// BUG-318：聚合拉取必须走 **state 里的运行时端口**，不是编译期常量 `TG_PORT`。
+    ///
+    /// 场景：orig-tg 绑不上起点（Windows 保留区/被占）⇒ daemon 顺延重选并落进
+    /// `st.tg_port`（`/api/config` 与前端都以它为真源）。旧实现用常量，顺延后聚合
+    /// 永远打到一个没有服务的端口 —— 健康的 orig-tg 被误报 `available=false`，
+    /// 下载域整批入库行消失（用户观感即「数据丢失」）。
+    ///
+    /// 判据：假 orig-tg 起在随机空闲端口（**不是** `TG_PORT`），把 `st.tg_port`
+    /// 指过去 ⇒ cache 来源必须 `available=true`。旧实现下此断言必败（常量端口上
+    /// 什么都没有）—— 即「有牙」。
+    #[tokio::test]
+    async fn cache_views_use_runtime_tg_port_not_the_const() {
+        use crate::config::Config;
+        use orig_core::registry::Registry;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 假 orig-tg：随机端口起一个最小 HTTP 服务，只回 `{"tasks":[]}`。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fake_port = listener.local_addr().unwrap().port();
+        assert_ne!(fake_port, crate::state::TG_PORT, "前置：假服务必须不在常量端口上");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"{"tasks":[]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let st = AppState::new(0, Registry::new(), tx, Config::default(), None);
+        st.config.write().unwrap().tg_enabled = true;
+        *st.tg_port.write().unwrap() = fake_port; // 顺延后的实际端口
+
+        let snap = collect(&st, Scope::All).await;
+        let cache = snap
+            .sources
+            .iter()
+            .find(|s| s.kind == TaskKind::Cache)
+            .expect("cache source must always be reported");
+        assert!(
+            cache.available,
+            "聚合必须读到 state.tg_port（顺延后的实际端口）上的 orig-tg，got error={:?}",
+            cache.error
         );
     }
 }

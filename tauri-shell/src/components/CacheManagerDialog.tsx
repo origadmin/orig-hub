@@ -7,15 +7,13 @@ import { cn, formatBytes, formatSpeed } from '../lib/utils'
 import { useTranslation } from '../i18n'
 import { describeTgFailure } from '../lib/tgReason'
 import { deriveEntryState } from '../lib/entryState'
-import { useStore } from '../store/useStore'
+import { useGoLibrary } from '../hooks/useGoLibrary'
 import { useEvent } from '../hooks/useEvent'
-import { findMediaItemIdByRef, getMediaItem, mediaItemUrl } from '../api/media'
 import {
   cancelCacheTask,
   cancelCacheTasks,
   deleteCacheTask,
   deleteCacheTasksByIds,
-  getCacheTaskItems,
   listAllCacheTasks,
   listTgDialogs,
   retryCacheTask,
@@ -23,7 +21,7 @@ import {
   setCacheTaskPriority,
   setCacheTasksPriority,
 } from '../api/tg'
-import type { GroupManifest, ManifestEntry, TgCacheTask, TgChannel, ViewerItem } from '../types'
+import type { TgCacheTask, TgChannel } from '../types'
 
 /**
  * 入库流水线面板（原「缓存管理」）。
@@ -205,101 +203,12 @@ function fmtEta(sec: number, t: (key: string, vars?: Record<string, string | num
 }
 
 /**
- * 组清单**逐条状态**（D22-A② / BUG-296 判据 3）：展开任务行时**按需**拉取。
- *
- * 「展开行的逐条状态在 DOM 中可数」是 BUG-296 修复的硬判据 —— 用户必须能看见
- * 「这批 N 条里，哪几条进了剧集、哪几条只登记没编入、哪几条连条目都没有」，
- * 而不是只看到一个 `done=4/4` 的假完成读数。
- *
- * 低频动作：只在展开时发一次请求，**不进 5s 轮询**（对齐 BUG-085 的「别白跑」纪律）。
- */
-const TaskManifestPanel = memo(function TaskManifestPanel(props: { taskId: number }) {
-  const { t } = useTranslation()
-  const [data, setData] = useState<GroupManifest | null>(null)
-  const [failed, setFailed] = useState(false)
-  useEffect(() => {
-    let alive = true
-    setData(null)
-    setFailed(false)
-    getCacheTaskItems(props.taskId)
-      .then((m) => {
-        if (alive) setData(m)
-      })
-      .catch(() => {
-        if (alive) setFailed(true)
-      })
-    return () => {
-      alive = false
-    }
-  }, [props.taskId])
-
-  if (failed) {
-    return (
-      <p className="mt-1 text-[11px] text-red-500" data-testid="cache-task-manifest-error">
-        {t('tg.manifestLoadFailed')}
-      </p>
-    )
-  }
-  if (!data) {
-    return (
-      <p className="mt-1 text-[11px] text-fg-muted" data-testid="cache-task-manifest-loading">
-        {t('tg.manifestLoading')}
-      </p>
-    )
-  }
-  const STATE_LABEL: Record<ManifestEntry['state'], string> = {
-    slotted: 'tg.manifestSlotted',
-    registered_unslotted: 'tg.manifestRegistered',
-    missing: 'tg.manifestMissing',
-  }
-  return (
-    <div
-      className="mt-1.5 flex flex-col gap-0.5 rounded-md border border-border-subtle bg-surface/60 p-2"
-      data-testid="cache-task-manifest"
-    >
-      <span className="mb-0.5 text-[11px] text-fg-muted" data-testid="cache-task-manifest-gap">
-        {t('tg.manifestGap', { gap: data.gap, total: data.total })}
-      </span>
-      {data.entries.map((e) => (
-        <div
-          key={e.messageId}
-          className="flex items-center gap-2 text-[11px]"
-          data-testid="cache-task-manifest-entry"
-          data-state={e.state}
-          data-has-bytes={e.hasBytes ? '1' : '0'}
-        >
-          <span className="shrink-0 font-mono text-[10px] text-muted">{e.messageId}</span>
-          <span
-            className={cn(
-              'shrink-0 rounded px-1 py-0.5 text-[10px]',
-              e.state === 'slotted'
-                ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                : e.state === 'registered_unslotted'
-                  ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400'
-                  : 'bg-surface-2 text-muted',
-            )}
-          >
-            {t(STATE_LABEL[e.state])}
-          </span>
-          {e.state === 'slotted' && e.season != null && e.episodeNo != null ? (
-            <span className="shrink-0 font-mono text-[10px] text-muted">
-              S{e.season}E{e.episodeNo}
-            </span>
-          ) : null}
-          <span className="shrink-0 text-[10px] text-muted">
-            {e.hasBytes ? t('tg.manifestHasBytes') : t('tg.manifestNoBytes')}
-          </span>
-        </div>
-      ))}
-    </div>
-  )
-})
-
-/**
  * 流水线的一行（AGENTS.md §5：高频路径的行组件必须 `memo` 化）。
  *
  * 行内动作**按组切换**，且只有一条主按钮：已入库 → 去媒体库查看（成品的出口）；
  * 入库失败 → 重试；入库中 → 取消。删除记录退为次级动作（记录是历史，不是资产）。
+ * 另有一个**恒在**的「去下载查看」出口：条目级明细与管理（逐条清单 / 重试 / 删除 /
+ * 取消优先）的家在下载域（2026-10-17 用户裁定「全部都在下载里面」），TG 侧不重复。
  */
 const IngestTaskRow = memo(function IngestTaskRow(props: {
   task: TgCacheTask
@@ -318,6 +227,14 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
   selected: boolean
   onToggleSelect: (task: TgCacheTask) => void
   onGoLibrary: (task: TgCacheTask) => void
+  /**
+   * 「去下载查看」的跨域出口（2026-10-17）。
+   *
+   * 条目级明细与管理的家在下载域 —— 这里只是每行给一个门。由宿主（`CacheManagerDialog`）
+   * 统一提供：它要先关掉本面板再跳，否则面板开合态留在 store 里，切回 TG 域会又弹出来。
+   * 未提供时按钮不渲染（本组件不自造跳转，与 `onGoLibrary` 同一约定）。
+   */
+  onGoDownload?: () => void
   onRetry: (task: TgCacheTask) => void
   onCancel: (task: TgCacheTask) => void
   /** 优先下载（BUG-277）：当前任务跑完后下一个跑它，不打断正在跑的任务 */
@@ -339,6 +256,7 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
     selected,
     onToggleSelect,
     onGoLibrary,
+    onGoDownload,
     onRetry,
     onCancel,
     onPreferDownload,
@@ -380,11 +298,6 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
    * 心跳时间戳用服务端下发的 `progressAt` 做差（同一时钟），不受本机时钟漂移影响。
    */
   const [rate, setRate] = useState<{ bps: number; etaSec: number | null } | null>(null)
-  /**
-   * 组清单展开态（D22-A② / BUG-296 判据 3）：展开时才拉逐条状态（低频动作）。
-   * 状态留在行内 —— 轮询刷新（`task` 对象换新）不该把用户展开的清单收起来。
-   */
-  const [manifestOpen, setManifestOpen] = useState(false)
   const prevSample = useRef<{ bytes: number; at: number } | null>(null)
   useEffect(() => {
     const bytes = task.progressBytes ?? null
@@ -487,32 +400,26 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
             {title} · {single ? t('tg.cacheScopeSingle') : t('tg.cacheScopeGroup')} ·{' '}
             {t('tg.cacheCountUnit', { n: task.messageIds.length })}
           </span>
-          {/* D22-A②（BUG-296 判据 3）：展开逐条状态 —— 「10 条里入了几条」必须可数。
-              组清单摘要（`task.manifest`）随 `/tasks/all` 下发，只有存在时才给入口。 */}
-          {task.manifest ? (
-            <button
-              type="button"
-              className="flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[10.5px] text-fg-muted hover:bg-surface-2 hover:text-fg-strong"
-              title={t('tg.manifestToggleHint')}
-              onClick={() => setManifestOpen((v) => !v)}
-              data-testid="cache-task-manifest-toggle"
-              data-unslotted={
-                task.manifest.slotted < task.manifest.total ? '1' : '0'
-              }
-            >
-              {manifestOpen ? (
-                <ChevronDown className="h-3 w-3" />
-              ) : (
-                <ChevronRight className="h-3 w-3" />
-              )}
-              {t('tg.manifestSlottedCount', {
-                slotted: task.manifest.slotted,
-                total: task.manifest.total,
-              })}
-            </button>
-          ) : null}
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
+          {/* 「去下载查看」（2026-10-17 用户裁定「入口只需要简易内容，全部都在下载
+              里面，其他都不要」）：条目级明细与管理（逐条清单 / 重试 / 删除 / 取消优先）
+              的家在**下载域**，TG 侧不再重复一份 —— 这里只留一个去那边的出口。
+              宿主没给 `onGoDownload` 时整个按钮不出现（与「去媒体库查看」同一约定：
+              出口由宿主提供，本组件不自造跳转）。 */}
+          {onGoDownload ? (
+            <Button
+              variant="secondary"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              disabled={busy}
+              onClick={onGoDownload}
+              title={t('tg.cacheGoDownloadHint')}
+              data-testid="cache-task-godownload"
+            >
+              {t('tg.cacheGoDownload')}
+            </Button>
+          ) : null}
           {/* 优先下载 / 取消优先（BUG-277）：只对「排队中」或「已优先下载」的记录出现。
               语义写在 title 里：优先下载 = 当前任务跑完后下一个跑它，**不是**立即抢占。 */}
           {canPrefer ? (
@@ -722,8 +629,6 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
           </div>
         </div>
       ) : null}
-      {/* D22-A②（BUG-296 判据 3）：展开的**组清单逐条状态**（按需拉取，低频）。 */}
-      {manifestOpen ? <TaskManifestPanel taskId={task.id} /> : null}
     </div>
   )
 })
@@ -756,10 +661,19 @@ export function CacheManagerDialog(props: {
    * 把用户送到成品所在的媒体库。宿主没给时只在本地起播（不切视图），能力不消失。
    */
   onOpenMedia?: () => void
+  /**
+   * 「去下载查看」的跨视图出口（2026-10-17 用户裁定「全部都在下载里面」）。
+   *
+   * 条目级明细与管理（逐条清单 / 重试 / 删除 / 取消优先）的家在**下载域**，TG 侧
+   * 只留每行一个门。由 MainLayout 提供（`view` 是它的局部 state）。本组件在跳转前
+   * 会先 `onClose()` 关掉自己（面板开合态在 store 里，不关的话切回 TG 域会又弹出来）。
+   * 宿主没给时按钮不渲染 —— 出口由宿主提供，本组件不自造跳转。
+   */
+  onOpenDownload?: () => void
 }) {
-  const { channels, onClose, onTasksChanged, initialView = 'tasks', onOpenMedia } = props
+  const { channels, onClose, onTasksChanged, initialView = 'tasks', onOpenMedia, onOpenDownload } =
+    props
   const { t } = useTranslation()
-  const { openViewer, setPendingMediaFocus } = useStore()
   const [view, setView] = useState<'tasks' | 'bytes'>(initialView)
   const [tasks, setTasks] = useState<TgCacheTask[]>([])
   const [counts, setCounts] = useState<Record<string, number>>({})
@@ -768,8 +682,6 @@ export function CacheManagerDialog(props: {
   /** 批量选择的记录 id（BUG-149）。只存 id，选中集与列表按 id 求交，故任务被删/列表
    *  刷新后自然收敛，不需要额外的清理 effect。 */
   const [selected, setSelected] = useState<Set<number>>(() => new Set())
-  /** 点过「去媒体库查看」但库里查不到成品的 ref：行内如实写「尚未入库」。 */
-  const [missRefs, setMissRefs] = useState<Set<string>>(new Set())
   /** 已取消分组默认折叠（不占主视图），展开才看。 */
   const [cancelledOpen, setCancelledOpen] = useState(false)
   const [loading, setLoading] = useState(true)
@@ -777,13 +689,16 @@ export function CacheManagerDialog(props: {
   const [err, setErr] = useState('')
   const aliveRef = useRef(true)
   /**
-   * 已查过的 tg ref → 媒体库条目 id（`null` = 查过但不在库里）。
-   *
-   * 与 TgPanel 的 `photoCheckedRef` 同一写法：**同一个 ref 只问一次后端**。
-   * 不做列表级 `source="tg"` 筛选（后端 `listMediaItems` 不支持），也不在每次渲染
-   * 重查 —— by-ref 是幂等读，但十几个行一起渲染就会变成十几个请求。
+   * 「去媒体库查看」走共享 hook（`hooks/useGoLibrary`）：下载域入库行（BUG-300 复报）
+   * 与这里必须是**同一份实现** —— ref 约定或 ViewerItem 形状漂移，就会变成一个宿主
+   * 能跳、另一个跳错。`missRefs` 由 hook 持有，行内「尚未入库」提示照旧读它。
    */
-  const libRefCache = useRef<Map<string, number | null>>(new Map())
+  const { goLibrary, missRefs } = useGoLibrary({
+    onOpenMedia,
+    onError: (msg) => {
+      if (aliveRef.current) setErr(msg)
+    },
+  })
   // 拖拽误关防护：只有在遮罩上按下**且**抬起时才关闭（面板内拖到遮罩松手会误关）。
   const downOnOverlay = useRef(false)
 
@@ -994,56 +909,38 @@ export function CacheManagerDialog(props: {
   })
 
   /**
-   * 「去媒体库查看」：一次入库的终点是媒体库里的成品，出口就该通向成品。
-   *
-   * 走 by-ref（`source="tg"`、`ref="{chat}:{msg}"`），不按 chat 全量筛 —— 后端
-   * `listMediaItems` 只支持 kind/q/tag/series，本次不为这个出口新增后端能力。
-   * 命中即**就地起播**（播放器是全屏覆盖层），再把焦点 ref 交给媒体库、切视图，
-   * 于是关掉播放器后用户落在成品所在的库里；未命中就如实写「尚未入库」——
-   * 「已入库」却跳不到成品，比不给出这个按钮更让人困惑。
+   * 「去媒体库查看」的实现已上移 `hooks/useGoLibrary`（与下载域入库行共用一份）。
+   * 这里只把恒定引用透给行组件 —— 写成内联箭头函数的话，行组件每次渲染都收到新的
+   * prop，`memo` 直接失效（AGENTS.md §5）。
    */
-  const goLibrary = useEvent(async (task: TgCacheTask) => {
-    const msgId = task.messageIds[0]
-    if (msgId == null) return
-    const ref = `${task.chatId}:${msgId}`
-    let id = libRefCache.current.get(ref)
-    if (id === undefined) {
-      try {
-        id = await findMediaItemIdByRef('tg', ref)
-      } catch {
-        id = null
-      }
-      libRefCache.current.set(ref, id)
-    }
-    if (!aliveRef.current) return
-    if (id == null) {
-      setMissRefs((prev) => (prev.has(ref) ? prev : new Set(prev).add(ref)))
-      return
-    }
-    try {
-      const item = await getMediaItem(id)
-      if (!aliveRef.current) return
-      const viewerItem: ViewerItem = {
-        key: `media-${item.id}`,
-        chatId: 0,
-        messageId: item.id,
-        kind: item.kind,
-        caption: item.title,
-        description: item.description ?? null,
-        src: mediaItemUrl(item.id),
-        poster: item.poster ?? null,
-        seriesId: item.seriesId ?? null,
-        // BUG-253：真源总时长随条目下发，播放器据此显示正确总数。
-        duration: item.duration,
-      }
-      setPendingMediaFocus(ref)
-      openViewer({ items: [viewerItem], index: 0, title: item.title || undefined })
-      onOpenMedia?.()
-    } catch (e) {
-      if (aliveRef.current) setErr(e instanceof Error ? e.message : String(e))
-    }
+  const onGoLibrary = useEvent((task: TgCacheTask) => void goLibrary(task))
+  /**
+   * 「去下载查看」（2026-10-17 用户裁定「全部都在下载里面」）。
+   *
+   * 两个动作**顺序不可换**：先 `onClose()` 再跳。面板开合态是 store 里的
+   * `tgCacheManagerOpen`（`TgPanel` 挂载本组件），只跳不关的话，用户下次切回 TG 域
+   * 会把面板又弹出来 —— 出口必须走得干净。
+   *
+   * 用 `useEvent` 而非内联箭头：行组件是 `memo` 的，内联函数每次渲染都是新引用，
+   * memo 直接失效（AGENTS.md §5）。
+   */
+  const goDownloadRow = useEvent(() => {
+    onClose()
+    onOpenDownload?.()
   })
-
+  /**
+   * ★ 宿主**真的接了线**才把回调透给行组件（BUG-324 复报修正）。
+   *
+   * 原先无条件传 `goDownloadRow`：宿主没给 `onOpenDownload` 时按钮**照样渲染**，
+   * 点了只关面板、不切视图 —— 一个**能点但做不成事**的死按钮。用户报
+   * 「按钮有了,但是功能全部没有实现」正是这个形态（HMR 只热更了本组件、
+   * `MainLayout` 新增的 `onOpenDownload` 尚未生效时就会复现）。
+   *
+   * 判据：**能渲染的按钮必须能做它承诺的事**。宿主没接线 ⇒ 不渲染（本组件无从
+   * 判断宿主是否接线，所以由宿主的存在与否决定），与 `onGoLibrary` 同一约定。
+   */
+  const goDownload = onOpenDownload ? goDownloadRow : undefined
+  const onAskDelete = useEvent((task: TgCacheTask) => setConfirm({ kind: 'one', id: task.id }))
   // 筛选：三档标签**只决定看什么**，同时它也是「全选」的作用范围。
   const visible = useMemo(() => {
     switch (scope) {
@@ -1170,10 +1067,7 @@ export function CacheManagerDialog(props: {
   const onCancelPrefer = useEvent((task: TgCacheTask) =>
     void act(() => setCacheTaskPriority(task.id, { priority: 0 })),
   )
-  // 「去媒体库查看」同样必须引用恒定：写成内联箭头函数的话，行组件每次渲染都收到新的
-  // prop，`memo` 直接失效 —— 轮询一刷新就整列表重渲染（AGENTS.md §5）。
-  const onGoLibrary = useEvent((task: TgCacheTask) => void goLibrary(task))
-  const onAskDelete = useEvent((task: TgCacheTask) => setConfirm({ kind: 'one', id: task.id }))
+  // `onGoLibrary` / `onAskDelete` 已在上方（`useGoLibrary` 接线处）定义。
   const onDelete = useEvent((task: TgCacheTask) => {
     setConfirm(null)
     void removeOne(task.id)
@@ -1475,6 +1369,7 @@ export function CacheManagerDialog(props: {
               selected={selected.has(task.id)}
               onToggleSelect={onToggleSelect}
               onGoLibrary={onGoLibrary}
+              onGoDownload={goDownload}
               onRetry={onRetry}
               onCancel={onCancelTask}
               onPreferDownload={onPreferDownload}
@@ -1524,6 +1419,7 @@ export function CacheManagerDialog(props: {
                     selected={false}
                     onToggleSelect={onToggleSelect}
                     onGoLibrary={onGoLibrary}
+                    onGoDownload={goDownload}
                     onRetry={onRetry}
                     onCancel={onCancelTask}
                     onPreferDownload={onPreferDownload}

@@ -6,6 +6,8 @@ import { IngestGroupRow } from './IngestGroupRow'
 import type { UseIngestGroupsResult } from './useIngestGroups'
 import { groupInBucket } from './ingestGroups'
 import { useStore } from '../../store/useStore'
+import { useGoLibrary } from '../../hooks/useGoLibrary'
+import { enqueueCacheTask } from '../../api/tg'
 import { VirtualList } from '../../components/ui/virtual-list'
 import type { IngestGroup } from './ingestGroups'
 
@@ -36,11 +38,8 @@ import type { IngestGroup } from './ingestGroups'
  *
  * ## 数据源
  *   - **普通下载** = `props.items`（MainLayout 从 store 取，SSE 单一合并源，含块进度等细节）；
- *   - **TG 入库** = `props.ingest`（orig-tg 全量任务，含 `itemKey` 聚合依据）。
- *
- * 为什么不走 daemon `/api/activity`：它**不下发 `itemKey`**，缺了聚合依据；
- * 补字段需重编并重启 daemon，而本机 `taskkill` 返回「拒绝访问」（无权重启）。
- * 直连 orig-tg 与媒体库（`api/media.ts`）是同一种既有架构形态。
+ *   - **TG 入库** = `props.ingest`（daemon `GET /api/activity`，`groupKey` = orig-tg `itemKey`
+ *     作聚合依据；BUG-300 复报后切回的单一聚合入口）。
  */
 
 interface Props {
@@ -55,6 +54,14 @@ interface Props {
    * 各自拉一份会轮询两次、落后一个间隔不等（BUG-082 三处同源纪律）。
    */
   ingest: UseIngestGroupsResult
+  /**
+   * 「去媒体库查看」的跨视图出口（切到媒体库视图）。
+   *
+   * 由 MainLayout 提供（`view` 是它的局部 state）：入库行点了「去媒体库查看」，
+   * 就地起播之后要落在成品所在的媒体库（而不是留在下载域），否则「查看」只是一次
+   * 播放器弹出，用户从没到达过成品所在的地方。宿主没给时只在本地起播，能力不消失。
+   */
+  onOpenMedia?: () => void
 }
 
 const RUNNING: DownloadStatusValue[] = ['downloading', 'queued', 'idle']
@@ -68,10 +75,19 @@ const SOURCE_LABELS: Record<SourceFilter, string> = {
   ingest: 'TG 入库',
 }
 
-export function DownloadPanel({ dlFilter, items, ingest }: Props) {
+export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
   const { setError } = useStore()
-  const { groups, overview, loading, error, refresh, run, remove } = ingest
+  const { groups, overview, loading, error, unavailable, refresh, run, remove } = ingest
   const [source, setSource] = useState<SourceFilter>('all')
+  /**
+   * 「去媒体库查看」（BUG-300 复报：入库流水线原先没有跳转查看）。与缓存管理面板
+   * 共用 `useGoLibrary` 一份实现 —— ref 约定/ViewerItem 形状漂移就会一个宿主能跳、
+   * 另一个跳错（BUG-082 同款分裂）。
+   */
+  const { goLibrary } = useGoLibrary({
+    onOpenMedia,
+    onError: (msg) => setError(msg),
+  })
 
   /**
    * 本面板挂载时立即拉一次。
@@ -95,14 +111,18 @@ export function DownloadPanel({ dlFilter, items, ingest }: Props) {
         return items.filter((d) => d.status === 'completed')
       case 'all':
       default:
-        // 全部任务 = 三档 + 失败兜底（error | cancelled 只在此可见）
+        // 全部任务 = 三档 + 取消/失败/中断兜底（cancelled 与 error 只在此可见 ——
+        // BUG-314 撤档后取消记录没有独立树档，可见性由本档承担）。
+        // `interrupted` 必须在此列：它是 BUG-319 持久化留下的新状态，漏了它
+        // 就等于「记录存下来了但哪儿都不显示」—— 又是一次数据丢失的观感。
         return items.filter(
           (d) =>
             RUNNING.includes(d.status) ||
             d.status === 'paused' ||
             d.status === 'completed' ||
+            d.status === 'cancelled' ||
             d.status === 'error' ||
-            d.status === 'cancelled',
+            d.status === 'interrupted',
         )
     }
   }, [dlFilter, items])
@@ -120,11 +140,47 @@ export function DownloadPanel({ dlFilter, items, ingest }: Props) {
   /**
    * 来源健康：orig-tg 不可达 ⇒ 拉取必然失败。
    *
-   * banner 与 `error` **严格同真同假**（双向），避免出现「banner 恒隐」式假绿。
+   * BUG-318：两条通道并检 —— `error` = 聚合端点都没通（daemon 挂）；`unavailable` =
+   * 端点通但 cache 来源 `available=false`（orig-tg 重启中/被关闭）。任一条为真都出
+   * banner，且**不清空已拉到的行**（清空即用户观感的「数据丢失」，见 useIngestGroups）。
+   *
+   * banner 与两个原因**严格同真同假**（双向），避免出现「banner 恒隐」式假绿。
    */
-  const tgUnavailable = error != null
+  const tgUnavailable = error != null || unavailable != null
+  const tgReason = unavailable ?? error
 
   const fail = (e: unknown) => setError(e instanceof Error ? e.message : String(e))
+
+  /**
+   * 批量下载**勾选的**条目（BT 式选择，2026-10-19 用户裁定「不需要按钮，
+   * 只需要选择，只有选中的才下载」）。
+   *
+   * 幂等由后端保证（BUG-308）：整条已入库 ⇒ 返回 `alreadyIngested`（零字节重下）；
+   * 有活跃任务覆盖 ⇒ 复用；只有「已登记但字节已失」才复位重跑。所以这里**不做
+   * 前端去重** —— 前端猜去重必然与后端口径分裂（同一条消息一处拦下一处放行）。
+   *
+   * 逐条入队而非合并成一个任务：勾选只是用户面的「选中即下载」表达，后端没有
+   * 「把任意消息集打成一个任务」的契约（`enqueueCacheTask` 的 messageIds 是
+   * 同组/同条语义），硬造合并请求会改变任务的取消/重试粒度。
+   *
+   * 全部入队后 refresh 一次：新任务要马上出现在列表里，否则用户点了没反应。
+   */
+  const downloadSelected = async (chatId: number, messageIds: number[]) => {
+    if (messageIds.length === 0) return
+    try {
+      let skipped = 0
+      for (const messageId of messageIds) {
+        const res = await enqueueCacheTask({ chatId, messageIds: [messageId] })
+        if (res?.alreadyIngested) skipped += 1
+      }
+      if (skipped > 0) {
+        setError(`${skipped} 项已入库，未重复下载`)
+      }
+      refresh()
+    } catch (e) {
+      fail(e)
+    }
+  }
 
   const counts: Record<SourceFilter, number> = {
     all: (source !== 'ingest' ? engineRows.length : 0) +
@@ -142,16 +198,19 @@ export function DownloadPanel({ dlFilter, items, ingest }: Props) {
     )
   }
 
-  if (total === 0 && error) {
+  // 分级（BUG-318）：`error` = 聚合端点都没通（daemon 挂）⇒ 整页数据不可信，红色错误页；
+  // 仅 `unavailable` = orig-tg 单侧取不到（重启中/被关闭）⇒ 普通下载照常，走黄色
+  // banner + 空态，不把「主动关闭 TG」渲染成整页故障。
+  if (total === 0 && error != null) {
     return (
       <div className="flex flex-col items-center justify-center py-24" data-testid="dl-error">
-      <p className="text-sm text-danger">{error}</p>
+      <p className="text-sm text-danger">{tgReason}</p>
       <button
         onClick={refresh}
         className="mt-3 text-xs text-accent hover:underline"
       >
           重试
-        </button>
+      </button>
       </div>
     )
   }
@@ -210,7 +269,8 @@ export function DownloadPanel({ dlFilter, items, ingest }: Props) {
           className="shrink-0 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning"
           data-testid="dl-tg-unavailable"
         >
-          TG 服务未连接，入库任务暂时无法读取（普通下载不受影响）：{error}
+          TG 入库任务暂时无法读取（普通下载不受影响）：{tgReason}
+          {ingestRows.length > 0 && '（下列入库行为断开前的最后快照，恢复后自动刷新）'}
         </div>
       )}
 
@@ -262,6 +322,12 @@ export function DownloadPanel({ dlFilter, items, ingest }: Props) {
                   }}
                   onRemove={(task) => {
                     void remove(task).catch(fail)
+                  }}
+                  onGoLibrary={(task) => {
+                    void goLibrary(task)
+                  }}
+                  onDownloadSelected={(chatId, messageIds) => {
+                    void downloadSelected(chatId, messageIds)
                   }}
                 />
               )}

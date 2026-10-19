@@ -106,6 +106,16 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         )
         .route("/api/tg/downloaded/:chat_id", get(downloaded_map))
         .route("/api/tg/config", get(get_config).put(put_config))
+        // ---- 受管根（管理多根，BUG-323 续 / 用户 2026-10-16）----
+        // 下载模块单根（download_dir）不变；以下端点服务于「管理」模块的受管根之并集。
+        .route(
+            "/api/fs/roots",
+            get(list_managed_roots)
+                .post(add_managed_root)
+                .delete(remove_managed_root),
+        )
+        .route("/api/fs/roots/primary", axum::routing::post(set_primary_managed_root))
+        .route("/api/fs/list", get(list_fs_dir))
         // ---- 媒体资料库（内容 / 剧集 / 标签）----
         .route("/api/media/stats", get(media_stats))
         .route(
@@ -845,8 +855,17 @@ async fn local_file(
     // 契约与媒体库条目投递完全一致（见 serve_local_file）：
     // Range / ETag / Last-Modified / MIME 判定只有一处实现，避免「已缓存播放」退化。
     // P2：存在性判定以解析后的绝对路径为准（相对 = 库根相对）。
+    // BUG-323：解析后必须落在**下载路径**之内 —— 下载路径是所有权限的限制路径，
+    // 存量里按旧库根写死的绝对路径正落在这道闸门外，一律 403（不静默服务）。
     let lib_root = st.store.library_root().await;
-    let path = crate::cache::resolve_item_path(&lib_root, &path)
+    let download_root = st.store.download_root().await;
+    let path = crate::cache::resolve_managed_path(&download_root, &lib_root, &path)
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "cached file path is outside the managed download root (BUG-323)",
+            )
+        })?
         .to_string_lossy()
         .into_owned();
     if !std::path::Path::new(&path).exists() {
@@ -855,31 +874,32 @@ async fn local_file(
     serve_local_file(&path, msg.media_type.as_deref(), msg.duration, &headers).await
 }
 
-/// 下载目录当前生效值：DB 设置 > env/默认配置。
-/// A leading `~` from either source is expanded (BUG-071).
+/// 下载目录当前生效值（= 受管根 / 权限边界，BUG-323）。
+///
+/// 与 [`crate::store::Store::download_root`] **同源**：env `ORIG_TG_DOWNLOAD_DIR`
+/// > app_setting `download_dir` > 平台默认下载目录（`~` 展开在那一侧统一做，
+/// BUG-071）。此处不再自己拼第三条链 —— 下载路径是全部文件的唯一容器，
+/// 只允许一处解析（此前它读 `st.config.download_dir`，与 store 侧各算一套）。
 async fn effective_download_dir(st: &AppState) -> String {
-    let raw = st
-        .store
-        .get_setting("download_dir")
+    st.store
+        .download_root()
         .await
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| st.config.download_dir.to_string_lossy().into_owned());
-    orig_core::paths::expand_tilde(&raw).to_string_lossy().into_owned()
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[derive(Deserialize)]
 struct ConfigUpdateReq {
     #[serde(rename = "downloadDir", default)]
     download_dir: Option<String>,
-    /// byte-ownership P2：库根（归仓字节的家）。缺省 = 沿用既有解析链
-    /// （env > app_setting > config.json > `<TG 数据目录>/library`），不覆盖。
+    /// **已废（BUG-323）**：库根不再是独立配置项，收到即 422（见 [`put_config`]）。
+    /// 保留该字段只为把「旧调用方仍在写库根」变成一条**明确错误**，
+    /// 而不是收下后静默无效（静默无效正是「改了像没改」的来源）。
     #[serde(rename = "libraryDir", default)]
     library_dir: Option<String>,
 }
 
-/// GET /api/tg/config — 运行时配置快照（缓存下载目录、库根等）。
+/// GET /api/tg/config — 运行时配置快照（下载路径、派生的库根）。
 async fn get_config(State(st): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     let download_dir = effective_download_dir(&st).await;
     let library_root = st.store.library_root().await;
@@ -891,52 +911,166 @@ async fn get_config(State(st): State<Arc<AppState>>) -> Result<impl IntoResponse
 
 /// PUT /api/tg/config — 更新运行时配置，持久化到 app_setting。
 ///
-/// 两键独立可选，至少给一个（前端只改其一的请求不会被另一键的缺省清掉）。
+/// **BUG-323（用户 2026-10-16 裁定）**：库根跟随下载路径（= `<downloadDir>/library`），
+/// 故 `libraryDir` **不可单独设置** —— 收到一律 422 并直出正确做法（改 `downloadDir`）。
+/// 让「库根脱离下载路径」在接口层不可表达，而不是接受后悄悄忽略。
 async fn put_config(
     State(st): State<Arc<AppState>>,
     Json(req): Json<ConfigUpdateReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if req.download_dir.is_none() && req.library_dir.is_none() {
+    if req.library_dir.is_some() {
         return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "nothing to update: provide downloadDir and/or libraryDir",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "libraryDir is derived from the download directory (<downloadDir>/library) \
+             and cannot be set independently; set downloadDir instead (BUG-323)",
         ));
     }
-    let mut resp = json!({});
-    if let Some(raw_dir) = &req.download_dir {
-        let dir = raw_dir.trim().to_string();
-        if dir.is_empty() {
-            return Err(ApiError::new(StatusCode::BAD_REQUEST, "downloadDir is empty"));
+    let Some(raw_dir) = &req.download_dir else {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "nothing to update: provide downloadDir",
+        ));
+    };
+    let dir = raw_dir.trim().to_string();
+    if dir.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "downloadDir is empty",
+        ));
+    }
+    // Expand a user-typed leading `~` *before* creating the directory and
+    // persisting it, otherwise Windows would materialise `<CWD>/~/...` (BUG-071).
+    // BUG-323 复报（2026-10-19）：再收敛分隔符字面（`D:\\x`/`D:/x`/`D://x` → 同一形态）
+    // —— 活栈实测 `D://OrigDown` 能一直存进配置，全靠两侧都没有归一化。
+    let dir = orig_core::paths::normalize_dir(
+        &orig_core::paths::expand_tilde(&dir).to_string_lossy(),
+    );
+    // 预创建校验：目录不可创建（权限/非法字符）时拒绝保存。
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, &format!("create dir: {e}")))?;
+    st.store
+        .set_setting("download_dir", &dir)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    // BUG-323 复报（2026-10-19）：下载根变更 ⇒ 存量迁移（旧根字节搬进新根 + DB
+    // 绝对路径改写），否则「改了路径、库里文件整片失联」= 用户口中的「选择完全无效」。
+    // 失败**不阻断保存**（daemon 侧已落库，回滚会让用户看到「保存失败」却查不出
+    // 所以然），但必须留痕：回执/原因进响应，原因进日志；下次启动自动重试。
+    let (migration, migration_error) = match st.store.migrate_root_change().await {
+        Ok(m) => (m, None),
+        Err(e) => {
+            tracing::warn!(target: "orig_tg::store", "root change migration failed: {e}");
+            (None, Some(e))
         }
-        // Expand a user-typed leading `~` *before* creating the directory and
-        // persisting it, otherwise Windows would materialise `<CWD>/~/...` (BUG-071).
-        let dir = orig_core::paths::expand_tilde(&dir).to_string_lossy().into_owned();
-        // 预创建校验：目录不可创建（权限/非法字符）时拒绝保存。
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, &format!("create dir: {e}")))?;
-        st.store
-            .set_setting("download_dir", &dir)
+    };
+    // 库根随之派生（无需另写一步，这正是「跟下载走」的意义）。
+    let library_root = st.store.library_root().await;
+    Ok(Json(json!({
+        "downloadDir": dir,
+        "libraryDir": library_root.to_string_lossy(),
+        "migration": migration,
+        "migration_error": migration_error,
+    })))
+}
+
+/// GET /api/fs/roots — 受管根集合（管理多根）。下载根恒为 `locked` + 默认 `primary`。
+async fn list_managed_roots(
+    State(st): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let roots = st.store.managed_roots().await;
+    Ok(Json(json!({ "roots": roots })))
+}
+
+#[derive(Deserialize)]
+struct ManagedRootReq {
+    path: String,
+}
+
+/// POST /api/fs/roots — 新增受管根（去重；下载根除外）。
+async fn add_managed_root(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<ManagedRootReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.store
+        .add_managed_root(std::path::Path::new(&req.path))
+        .await
+        .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, &e))?;
+    let roots = st.store.managed_roots().await;
+    Ok(Json(json!({ "roots": roots })))
+}
+
+/// DELETE /api/fs/roots — 删除受管根（locked/下载根 不可删）。
+async fn remove_managed_root(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<ManagedRootReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.store
+        .remove_managed_root(std::path::Path::new(&req.path))
+        .await
+        .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, &e))?;
+    let roots = st.store.managed_roots().await;
+    Ok(Json(json!({ "roots": roots })))
+}
+
+/// POST /api/fs/roots/primary — 切换主根（只改管理视图默认选中，不动下载落点）。
+async fn set_primary_managed_root(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<ManagedRootReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.store
+        .set_primary_root(std::path::Path::new(&req.path))
+        .await
+        .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, &e))?;
+    let roots = st.store.managed_roots().await;
+    Ok(Json(json!({ "roots": roots })))
+}
+
+#[derive(Deserialize)]
+struct FsListQuery {
+    path: String,
+}
+
+/// GET /api/fs/list?path=<absolute dir> — 在任一受管根内列目录（并集闸门）。
+async fn list_fs_dir(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<FsListQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let roots = st.store.managed_roots().await;
+    let root_paths: Vec<PathBuf> = roots.iter().map(|r| PathBuf::from(&r.path)).collect();
+    let Some(abs) = crate::cache::resolve_managed_path_union(&root_paths, &q.path) else {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "path is outside any managed root",
+        ));
+    };
+    if !abs.is_dir() {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "not a directory"));
+    }
+    let mut entries = Vec::new();
+    let mut rd = tokio::fs::read_dir(&abs)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    while let Some(e) = rd
+        .next_entry()
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+    {
+        let ft = e
+            .file_type()
             .await
             .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-        resp["downloadDir"] = json!(dir);
+        let meta = e.metadata().await.ok();
+        entries.push(json!({
+            "name": e.file_name().to_string_lossy(),
+            "isDir": ft.is_dir(),
+            "size": meta.as_ref().map(|m| m.len()).unwrap_or(0),
+            "modified": meta
+                .and_then(|m| m.modified().ok())
+                .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)),
+        }));
     }
-    if let Some(raw_dir) = &req.library_dir {
-        let dir = raw_dir.trim().to_string();
-        if dir.is_empty() {
-            return Err(ApiError::new(StatusCode::BAD_REQUEST, "libraryDir is empty"));
-        }
-        let dir = orig_core::paths::expand_tilde(&dir).to_string_lossy().into_owned();
-        tokio::fs::create_dir_all(&dir)
-            .await
-            .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, &format!("create dir: {e}")))?;
-        st.store
-            .set_setting("library_dir", &dir)
-            .await
-            .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-        resp["libraryDir"] = json!(dir);
-    }
-    Ok(Json(resp))
+    Ok(Json(json!({ "path": abs.to_string_lossy(), "entries": entries })))
 }
 
 async fn download(
@@ -945,7 +1079,7 @@ async fn download(
     Json(req): Json<DownloadReq>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_authorized(&st).await?;
-    let dir = resolve_cache_dir(&st, req.dir).await;
+    let dir = resolve_cache_dir(&st, req.dir).await?;
     // 幂等（BUG-024）：已缓存且文件仍在 → 直接回既有路径，不重新拉流。
     // 此前无脑重下，导致「继续」把已完成的条目从头下载一遍。
     if let Some(path) = cached_path(&st, chat_id, message_id).await {
@@ -967,21 +1101,31 @@ async fn download(
 
 // ---- 缓存任务：服务端持有任务态，与 HTTP 请求解耦 ----
 
-/// 解析落盘目录：请求显式 dir > DB 设置（前端可改） > env/默认配置。
-/// A leading `~` from any source is expanded (BUG-071).
-async fn resolve_cache_dir(st: &AppState, req_dir: Option<String>) -> String {
-    let db_dir = st
-        .store
-        .get_setting("download_dir")
-        .await
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty());
-    let raw = req_dir
-        .filter(|s| !s.is_empty())
-        .or(db_dir)
-        .unwrap_or_else(|| st.config.download_dir.to_string_lossy().into_owned());
-    orig_core::paths::expand_tilde(&raw).to_string_lossy().into_owned()
+/// 解析落盘目录（BUG-323：**下载路径是唯一容器与权限边界**）。
+///
+/// 基准 = [`crate::store::Store::download_root`]（env > app_setting > 平台默认）。
+/// 此前这里是**第三条链**（`req.dir` > app_setting > `Config.download_dir`）：
+/// 同一个「下载路径」有多个真源，且 `req.dir` 可指向任意位置 ⇒ 字节能落到下载路径之外。
+///
+/// 请求级 `dir` 现在只是**下载路径之内**的子目录选择（绝对按原义、相对按下载根
+/// join）；越界一律 **403** —— 界外不允许出现任何引擎写的字节。
+async fn resolve_cache_dir(st: &AppState, req_dir: Option<String>) -> Result<String, ApiError> {
+    let root = st.store.download_root().await;
+    let Some(raw) = req_dir.filter(|s| !s.trim().is_empty()) else {
+        return Ok(root.to_string_lossy().into_owned());
+    };
+    let raw = orig_core::paths::expand_tilde(raw.trim());
+    let p = if raw.is_absolute() { raw } else { root.join(raw) };
+    if !crate::cache::path_within(&root, &p) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            &format!(
+                "dir escapes the download directory ({}): pick a path inside it (BUG-323)",
+                root.display()
+            ),
+        ));
+    }
+    Ok(crate::cache::lexical_normalize(&p).to_string_lossy().into_owned())
 }
 
 /// 已缓存且落盘文件仍在时的路径（幂等跳过依据）。
@@ -1316,7 +1460,7 @@ async fn enqueue_cache_task(
     if req.message_ids.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "messageIds is empty"));
     }
-    let dir = resolve_cache_dir(&st, req.dir).await;
+    let dir = resolve_cache_dir(&st, req.dir).await?;
     // BUG-308（D22-A②）：去重窗口从「活跃任务」扩到**历史认领**。
     //
     // 无活跃任务覆盖时先查该批消息是否已登记入库（`media_item` source+ref）：
@@ -2153,12 +2297,13 @@ async fn register_enqueued_items(st: &Arc<AppState>, chat_id: i64, msg_ids: &[i6
 ///   - 非照片条目：T0 即建剧集槽位。`append_episodes_ranged` 的占用快照/去重/
 ///     墓碑每次调用都从库中重读，`next` 游标等价演进——**同序**下逐条追加与
 ///     整批追加产生相同落位，故逐条登记 ≡ 任务末批量登记。
+///     实际只有 **video** 能落位（BUG-044 触发器只放 video；file/audio 留作库内内容）。
 ///   - 混编组照片（BUG-168）：挂到「组内它之前最近的**非照片**条目」所在集，
 ///     组首照片归首个非照片条目那一集（旧实现同一规则，目标池同为 media_pairs
 ///     = 非照片条目，不限于 video）。目标由全组消息预扫确定；目标条目登记槽位
 ///     的瞬间即挂（`add_episode_image` insert-or-ignore，幂等）。
-///   - photo-only 组（组内无 video）：照片各自成「浏览位」episode（BUG-044），
-///     同样吃 caption 集号区间（旧实现非混编时 media_pairs 含全部条目）。
+///   - photo-only 组（组内无 video）：照片**不成集**（BUG-044 回归修复，2026-10-15
+///     用户裁定「图片与视频混用集是基础逻辑错误」）—— 只完成 T0 登记，留在库内内容位。
 struct IngestCtx {
     task_id: i64,
     chat_id: i64,
@@ -2261,8 +2406,8 @@ impl IngestCtx {
         .await
     }
 
-    /// T0 槽位登记：非照片条目编入剧集；混编组照片挂目标集图片位；
-    /// photo-only 组照片自成浏览位 episode。每次登记都幂等
+    /// T0 槽位登记：**只有视频编入剧集**；混编组照片挂目标集图片位；
+    /// photo-only 组照片不成集（BUG-044 回归修复）。每次登记都幂等
     /// （`append_episodes_ranged` 跳过已收录条目、墓碑照拦；挂图 insert-or-ignore）。
     async fn register_slot(&mut self, st: &Arc<AppState>, msg_id: i64, item_id: i64, kind: &str) {
         self.ingested.push((msg_id, item_id));
@@ -2270,7 +2415,14 @@ impl IngestCtx {
             self.register_photo_slot(st, msg_id, item_id).await;
             return;
         }
-        // 非照片：一槽一位（混编/纯视频/photo-only 组同规则，旧 media_pairs 同义）。
+        // BUG-044 回归修复（2026-10-15 用户裁定）：分集只能是视频。第 4 轮曾把
+        // 分集放宽到 `video | photo`（「剧集是通用归档容器」），结果是图片与视频
+        // 混用「集」—— 实测生产库 50 条真实照片分集、31 个纯图剧集。file/audio
+        // 同样不成集（触发器只放 video），它们作为库内内容条目可检索。
+        if kind != "video" {
+            return;
+        }
+        // 非照片：一槽一位（混编/纯视频组同规则，旧 media_pairs 同义）。
         let range = self.caption_range(st, msg_id).await;
         self.append_slot(st, item_id, range).await;
         // 目标就是我：挂起照片此刻落位（旧实现在任务末尾按消息序统一挂，
@@ -2296,13 +2448,12 @@ impl IngestCtx {
     /// 组内消息序中它之前最近的**非照片**条目所在集；之前没有 → 组首照片，
     /// 归首个非照片条目那一集（旧实现的 max-then-min 回退）。目标已登记就当场挂，
     /// 否则入挂起表等目标登记（处理顺序即消息顺序，逐条处理时归属都能就地判定）。
-    /// 整组无 video（photo-only）→ 自成浏览位 episode（BUG-044）。
+    ///
+    /// **photo-only 组不成集**（BUG-044 回归修复，2026-10-15）：组内无视频时照片
+    /// 只完成 T0 登记（`media_item` 行，标题/介绍/标签照常），不占集号 ——
+    /// 「图片与视频混用集」正是第 4 轮「照片各自成集」的直接后果。
     async fn register_photo_slot(&mut self, st: &Arc<AppState>, msg_id: i64, item_id: i64) {
         if !self.has_video {
-            // 旧 mixed 判定 = 组内含 video 才挂图；无 video 的组照片仍是独立集
-            //（即便组里混着 file/audio——旧 media_pairs 在非混编时含全部条目）。
-            let range = self.caption_range(st, msg_id).await;
-            self.append_slot(st, item_id, range).await;
             return;
         }
         let target = self
@@ -2313,10 +2464,8 @@ impl IngestCtx {
             .max()
             .or_else(|| self.slot_msgs.iter().copied().min());
         let Some(target_msg) = target else {
-            // 组内没有任何非照片条目：不可能走到（has_video ⇒ slot_msgs 非空），
-            // 防御性兜底为自成 episode。
-            let range = self.caption_range(st, msg_id).await;
-            self.append_slot(st, item_id, range).await;
+            // 组内没有任何非照片条目：不可能走到（has_video ⇒ slot_msgs 非空）。
+            // 防御性兜底同样**不成集**（BUG-044）：照片留在库内内容位，不占集号。
             return;
         };
         match self.registered.get(&target_msg) {
@@ -2566,7 +2715,7 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
         "cache task {task_id}: start {} item(s) chat={}",
         task.total, task.chat_id
     ));
-    let dir = resolve_cache_dir(st, None).await;
+    let dir = effective_download_dir(st).await;
     let mut done: i64 = 0;
 
     // ── byte-ownership P1（设计 I1「事实先登记」）─────────────────────────────
@@ -4188,9 +4337,17 @@ async fn media_item_raw(
 
     match resolve_raw_locator(&item) {
         // P2：file_path 是库内规范形式（相对 = 库根相对），投递前先解析。
+        // BUG-323：解析后必须落在下载路径之内（下载路径是所有权限的限制路径）。
         RawLocator::LocalPath(p) => {
             let lib_root = st.store.library_root().await;
-            let p = crate::cache::resolve_item_path(&lib_root, &p)
+            let download_root = st.store.download_root().await;
+            let p = crate::cache::resolve_managed_path(&download_root, &lib_root, &p)
+                .ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::FORBIDDEN,
+                        "media file path is outside the managed download root (BUG-323)",
+                    )
+                })?
                 .to_string_lossy()
                 .into_owned();
             serve_local_file(&p, Some(item.kind.as_str()), item.duration, &headers).await
@@ -4712,18 +4869,33 @@ async fn media_item_stream(
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "media item not found"))?;
-    // 与 /raw 相同的路径闸门（cache::resolve_item_path：绝对原样 / 相对 join 库根）。
+    // 与 /raw 相同的路径闸门（cache::resolve_managed_path：绝对原样 / 相对 join
+    // 库根，且**必须落在下载路径之内**，BUG-323）。
     let src = match item.file_path.clone() {
         Some(p) => {
             let lib_root = st.store.library_root().await;
-            crate::cache::resolve_item_path(&lib_root, &p)
+            let download_root = st.store.download_root().await;
+            crate::cache::resolve_managed_path(&download_root, &lib_root, &p).ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "media file path is outside the managed download root (BUG-323)",
+                )
+            })?
         }
         None => return Err(ApiError::new(StatusCode::NOT_FOUND, "item has no local file")),
     };
     if tokio::fs::metadata(&src).await.is_err() {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "source file missing"));
     }
-    let proxy_dir = st.store.proxy_dir();
+    // BUG-323：代理目录 = `<下载路径>/.orighub/proxies`（派生，随下载路径走），
+    // 首次使用时就地创建（旧位置曾由启动流程预建，搬迁后不再有那一步）。
+    let proxy_dir = st.store.proxy_dir().await;
+    if let Err(e) = tokio::fs::create_dir_all(&proxy_dir).await {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("create proxy dir {}: {e}", proxy_dir.display()),
+        ));
+    }
     let key = TranscodeKey { item_id: id, speed_hundredths };
     // BUG-291：变体名带编码档位指纹，档位变更 ⇒ 旧代理不再可能被命中。
     let variant = proxy_variant(id, speed_hundredths);
@@ -5697,7 +5869,8 @@ async fn add_media_episode(
     Path(id): Path<i64>,
     Json(body): Json<EpisodeReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // 剧集收 video / photo（trigger 是硬门，这里给可读的 422）。
+    // 剧集分集只能是视频（BUG-044：图片是浏览点，不参与编集；触发器是硬门，
+    // 这里给可读的 422）。图片请走「挂图」（`media_episode_image`）。
     let kinds = st
         .store
         .item_kinds(std::slice::from_ref(&body.item_id))
@@ -5705,12 +5878,12 @@ async fn add_media_episode(
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     if kinds
         .get(&body.item_id)
-        .map(|k| k != "video" && k != "photo")
+        .map(|k| k != "video")
         .unwrap_or(true)
     {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "only video or photo items can be episodes",
+            "only video items can be episodes",
         ));
     }
     let season = body.season.unwrap_or(1);
@@ -5758,7 +5931,7 @@ async fn append_media_episodes(
     Path(id): Path<i64>,
     Json(body): Json<AppendEpisodesReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // 剧集收 video / photo。混入的音频等不合法条目显式 422（附明细），不静默过滤。
+    // 剧集分集只能是视频（BUG-044）。混入的图片等不合法条目显式 422（附明细），不静默过滤。
     let kinds = st
         .store
         .item_kinds(&body.item_ids)
@@ -5770,7 +5943,7 @@ async fn append_media_episodes(
         .filter(|id| {
             kinds
                 .get(*id)
-                .map(|k| k != "video" && k != "photo")
+                .map(|k| k != "video")
                 .unwrap_or(true)
         })
         .copied()
@@ -5778,7 +5951,7 @@ async fn append_media_episodes(
     if !rejected.is_empty() {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            &format!("only video or photo items can be episodes, rejected: {rejected:?}"),
+            &format!("only video items can be episodes, rejected: {rejected:?}"),
         ));
     }
     let n = st
@@ -6033,7 +6206,7 @@ async fn recache_series_gap(
         by_chat.entry(m.chat_id).or_default().push(e.message_id);
     }
 
-    let dir = resolve_cache_dir(&st, None).await;
+    let dir = effective_download_dir(&st).await;
     let mut enqueued = 0usize;
     let mut groups = 0usize;
     for (chat_id, mut message_ids) in by_chat {
@@ -6157,7 +6330,7 @@ async fn recache_series_missing(
         }
     }
 
-    let dir = resolve_cache_dir(&st, None).await;
+    let dir = effective_download_dir(&st).await;
     let mut enqueued = 0usize;
     let mut groups = 0usize;
     // BTreeMap 遍历序确定（chat 升序）——响应与日志不随 HashMap 序漂移。
@@ -7141,25 +7314,43 @@ mod tests {
     async fn state_in_download_dir(dir: &std::path::Path) -> Arc<AppState> {
         let mut cfg = Config::default();
         cfg.download_dir = dir.to_path_buf();
-        Arc::new(AppState::new(
+        let st = Arc::new(AppState::new(
             Arc::new(crate::unavailable::UnavailableClient::new("test")),
             cfg,
             Availability::Unavailable("test".to_string()),
             false,
             Store::open(":memory:").await.expect("in-memory store must open"),
-        ))
+        ));
+        pin_download_dir(&st, dir).await;
+        st
     }
 
     /// 每次调用都给出唯一临时目录（进程内并发用例互不串扰）。
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let d = std::env::temp_dir()
-            .join(format!("orig_routes_{tag}_{}_{nanos}", std::process::id()));
+        // 2026-10-19：夹具必须在**非禁用盘**（`store::fixture_base`）：下载根解析到
+        // C: 会被改道到真实内容根 `D:\OrigDown`，「钉下载根」会静默指向用户真实
+        // 内容目录 —— 媒资清理类用例会在真实文件上动手。落点跟着工作区 target/tmp 走。
+        let d = crate::store::fixture_base(tag);
         std::fs::create_dir_all(&d).expect("scratch dir must be creatable");
         d
+    }
+
+    /// BUG-323：把 `dir` 钉成**下载根**（受管根 / 权限边界）。
+    ///
+    /// 下载路径的真源在 `Store`（`app_setting download_dir`），不再是
+    /// `Config.download_dir` —— 后者在 BUG-323 之后只剩「启动期提示」作用。
+    /// 夹具**只允许落在非禁用盘的测试夹具根**上：库根已跟随下载根，夹具若不钉，
+    /// 默认档会落到用户真实的 `~/Downloads`（媒资清理类用例一旦跑起来就会动那里
+    /// 的文件）；而钉在 C: 上又会被禁用盘规则改道到真实内容根 `D:\OrigDown`。
+    async fn pin_download_dir(st: &AppState, dir: &std::path::Path) {
+        assert!(
+            dir.starts_with(crate::store::fixture_root()),
+            "夹具只允许把下载根钉在非禁用盘的测试夹具根上，收到 {dir:?}"
+        );
+        st.store
+            .set_setting("download_dir", dir.to_string_lossy().as_ref())
+            .await
+            .expect("pin download root");
     }
 
     /// BUG-162 判据：TG 标记清除失败时，接口必须在**动手删字节之前**中止 ——
@@ -7822,6 +8013,7 @@ mod tests {
             false,
             Store::open(":memory:").await.expect("in-memory store must open"),
         ));
+        pin_download_dir(&st, dir).await;
         (st, calls)
     }
 
@@ -8019,6 +8211,7 @@ mod tests {
             false,
             Store::open(db).await.expect("store must open"),
         ));
+        pin_download_dir(&st, dir).await;
         (st, calls)
     }
 
@@ -8176,7 +8369,17 @@ mod tests {
     #[tokio::test]
     async fn wall_clock_accumulates_across_restarts_instead_of_resetting() {
         let dir = scratch_dir("bug276_wall_accum");
-        let db = dir.join("bug276.db").to_string_lossy().into_owned();
+        // 库必须是**文件库**（跨「重启」共享状态），但落在 `%TEMP%`：D: 上
+        // `Store::open` 实测 ~4s（该盘 fsync 慢），而本用例的墙钟判据是「跨重启
+        // 累计」—— 启动开销本身就会把 2.0s 阈值烧过，随后三次重启根本跑不完
+        // （2026-10-19 实测：boot1 打开库耗时 1.18s，条目在第二次重启前就已
+        // 因累计超时被判失败）。夹具 DB 不是内容（媒体字节），不适用 C 盘禁用
+        // 规则 —— 被禁的是下载根/库根这类**内容**落点，本用例的 `dir` 仍钉在
+        // 非禁用盘上（见 `scratch_dir`）。
+        let db_dir = std::env::temp_dir().join(format!("orig_routes_bug276_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&db_dir);
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db = db_dir.join("bug276.db").to_string_lossy().into_owned();
         let calls = Arc::new(std::sync::Mutex::new(HashMap::new()));
         // 墙钟 2s；慢流 240ms × 5 块 = 1200ms 跑完（**<** 墙钟 ⇒ 不被打断就一定下得完，
         // 这是反向证伪的支点）；每次尝试掐断在 400ms（≪ 1200ms ⇒ 单次够不着墙钟）。
@@ -9434,7 +9637,8 @@ mod tests {
         let media_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let thumb_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut cfg = Config::default();
-        cfg.download_dir = scratch_dir("bug117_photo_source");
+        let dir = scratch_dir("bug117_photo_source");
+        cfg.download_dir = dir.clone();
         let st = Arc::new(AppState::new(
             Arc::new(PhotoSourceClient {
                 full_size: FULL_SIZE_BYTES.to_vec(),
@@ -9447,6 +9651,7 @@ mod tests {
             false,
             Store::open(":memory:").await.expect("in-memory store must open"),
         ));
+        pin_download_dir(&st, &dir).await;
         (st, media_calls, thumb_calls)
     }
 
@@ -9548,7 +9753,9 @@ mod tests {
     #[tokio::test]
     async fn media_item_raw_prefers_local_bytes_over_network_bug117() {
         let (st, media_calls, thumb_calls) = photo_source_state(false).await;
-        let dir = scratch_dir("bug117_local_bytes");
+        // 已落盘条目必须落在**下载路径之内**（BUG-323：下载路径是所有权限的限制
+        // 路径）—— 界外路径如今一律 403，夹具若另起一个临时目录就会撞上闸门。
+        let dir = st.config.download_dir.clone();
         let f = dir.join("photo.jpg");
         std::fs::write(&f, b"LOCAL-FILE-BYTES").expect("seed local file");
         let id = st
@@ -10045,6 +10252,7 @@ mod tests {
             false,
             Store::open(":memory:").await.expect("in-memory store must open"),
         ));
+        pin_download_dir(&st, &dir).await;
         assert!(st.claim_cache_worker(), "门禁初始必须空闲");
 
         let (status, task) = enqueue_call(

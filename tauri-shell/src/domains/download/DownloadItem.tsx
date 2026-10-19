@@ -23,13 +23,33 @@ const statusMeta: Record<
   completed: { label: '已完成', variant: 'success' },
   error: { label: '错误', variant: 'danger' },
   cancelled: { label: '已取消', variant: 'secondary' },
+  // BUG-319 持久化引入的状态：进程消失留下的行。缺了它就会落进 `?? statusMeta.idle`
+  // 而被渲染成「空闲」—— 那不是空闲，是没人再跑它了。
+  interrupted: { label: '已中断', variant: 'warning' },
 }
 
 export function DownloadItem({ item }: { item: DownloadStatus }) {
-  const { pause, resume, cancel, remove, setError } = useStore()
+  const { pause, resume, cancel, retry, remove, setError } = useStore()
   const [sheetOpen, setSheetOpen] = useState(false)
   const meta = statusMeta[item.status] ?? statusMeta.idle
   const isActive = item.status === 'downloading'
+  /**
+   * 传输控制动词**只认后端下发的 `actions`**，不按 status 自己推。
+   *
+   * 为什么要这样：按 status 推等于把「哪个状态有哪些能力」这条契约复制进 UI，
+   * 每加一个来源（未来的第 N 个协议/插件）就得改一遍这里；按 actions 渲染，
+   * 新来源只在后端 `actions_for` 声明一次，本文件零改动。
+   */
+  const can = (a: string) => (item.actions ?? []).includes(a)
+  /**
+   * 停住的行（已中断 / 错误 / 已取消）：动作按钮**常驻可见**，不藏在 hover 后面。
+   *
+   * 在途行的按钮 hover 才显示是常规做法（平时不需要操作它）；但停住的行恰恰
+   * 是「用户在等它、正要找按钮」的那一行 —— 把入口藏进 hover 就等于让用户在
+   * 最需要它的时候看不见它（BUG-320 同型：入口存在但用户看不见 = 等于没有）。
+   * 判定仍从 `actions` 推：不具备暂停/继续能力 ⇒ 不在途。
+   */
+  const stalled = !can('pause') && !can('resume')
 
   /** 用默认应用打开文件本身（completed 任务可用） */
   const handleReveal = async () => {
@@ -77,6 +97,9 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
 
   return (
     <div
+      data-testid="download-item"
+      data-status={item.status}
+      data-fid={item.id}
       className="group cursor-pointer rounded-lg border border-border-subtle bg-surface p-4 transition-all duration-200 hover:border-accent/40 hover:bg-surface/80"
       onClick={() => setSheetOpen(true)}
       title="点击查看块进度详情"
@@ -95,12 +118,17 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
           </p>
         </div>
 
-        {/* 操作按钮（图标+文字，悬停显示）；stopPropagation 避免触发详情 */}
+        {/* 操作按钮（图标+文字）；stopPropagation 避免触发详情。
+            终态行（stalled：既无 pause 也无 resume 可点）必须常驻可见 ——
+            用户正要找「重试」时它却藏在 hover 后面，等于入口不存在。 */}
         <div
-          className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100"
+          className={
+            'flex shrink-0 items-center gap-1 transition-opacity ' +
+            (stalled ? 'opacity-100' : 'opacity-0 group-hover:opacity-100')
+          }
           onClick={(e) => e.stopPropagation()}
         >
-          {isActive && (
+          {can('pause') && (
             <Button size="sm" variant="ghost" onClick={() => pause(item.id)} title="暂停">
               <svg className="mr-1 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M8 5v14M16 5v14" />
@@ -108,7 +136,7 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
               暂停
             </Button>
           )}
-          {item.status === 'paused' && (
+          {can('resume') && (
             <Button size="sm" variant="ghost" onClick={() => resume(item.id)} title="恢复">
               <svg className="mr-1 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86a1 1 0 0 0-1.5.86z" />
@@ -116,7 +144,7 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
               恢复
             </Button>
           )}
-          {(isActive || item.status === 'paused' || item.status === 'queued' || item.status === 'idle') && (
+          {can('cancel') && (
             <Button size="sm" variant="ghost" onClick={() => cancel(item.id)} title="取消">
               <svg className="mr-1 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M18 6 6 18M6 6l12 12" />
@@ -124,7 +152,33 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
               取消
             </Button>
           )}
-          {(item.status === 'completed' || item.status === 'error' || item.status === 'cancelled') && (
+          {/**
+           * BUG-322：停住的行（已中断 / 错误 / 已取消）的重试入口。
+           * title 明说「整任务重跑」—— 引擎无真续传，含糊成「继续」就是假能力。
+           */}
+          {can('retry') && (
+            <Button
+              size="sm"
+              variant="ghost"
+              data-testid="download-retry"
+              onClick={() => retry(item.id)}
+              title="重试：从 0 重新下载（引擎不支持断点续传）"
+            >
+              <svg className="mr-1 h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 12a9 9 0 1 0 3-6.7M3 4v5h5" />
+              </svg>
+              重试
+            </Button>
+          )}
+          {/**
+           * 删除**不属于** `actions` 契约（契约刻意不含删除：删下载 = 删用户资产，
+           * 与传输控制不是一类事），故这里仍按状态判定 —— 但必须覆盖 `interrupted`，
+           * 否则中断的行既不能重试也删不掉，成了卡在列表里的死行。
+           */}
+          {(item.status === 'completed' ||
+            item.status === 'error' ||
+            item.status === 'cancelled' ||
+            item.status === 'interrupted') && (
             <>
               {item.status === 'completed' && isTauri() && item.dest_path && (
                 <>

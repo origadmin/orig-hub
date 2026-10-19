@@ -147,8 +147,14 @@ function toViewerItem(i: MediaItem): ViewerItem {
  */
 export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: Props = {}) {
   const { t } = useTranslation()
-  const { setError, openViewer, pendingMediaFocus, setPendingMediaFocus, setPendingTgFocus } =
-    useStore()
+  const {
+    setError,
+    openViewer,
+    pendingMediaFocus,
+    setPendingMediaFocus,
+    setPendingTgFocus,
+    setFilesActions,
+  } = useStore()
 
   // ---- 资料库后端探活（**不探 TG**：TG 只是来源之一，挂了不影响库）----
   const [alive, setAlive] = useState(false)
@@ -183,6 +189,29 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   useEffect(() => {
     void probeLibrary()
   }, [probeLibrary])
+
+  /**
+   * 库级动作上标题行（BUG-317 页面结构规范 / 任务 #9）。
+   *
+   * 「导入目录 / 新建剧集 / 导出 / 标签管理」是库级动作（不读选择集、任何视图
+   * 都可用），按四件套规范应进**标题区右槽**（`page-primary-action` + 次级），
+   * 而标题区是应用外壳的 `ContextBar`（跨子树）。对话框 state 与 `refreshAll`
+   * 都在本面板，把 state 搬去 ContextBar 会打散数据局部性 —— 故走注册表：
+   * 挂载时把四个 dialog-open handler 注册进 store，`ContextBar` 的 files
+   * 分支读取调用；卸载注销（null ⇒ 按钮整簇不渲染，不呈现死按钮）。
+   *
+   * 依赖只有 `setFilesActions`（store setter，引用恒定）：四个 handler 闭包
+   * 捕获的都是 `useState` setter（同样恒定），注册一次即终身有效。
+   */
+  useEffect(() => {
+    setFilesActions({
+      import: () => setImportOpen(true),
+      createSeries: () => setCreateOpen(true),
+      export: () => setExportOpen(true),
+      manageTags: () => setTagMgrOpen(true),
+    })
+    return () => setFilesActions(null)
+  }, [setFilesActions])
 
   /**
    * 来源后端存活态（S3）：**只**影响「重新缓存」入口，不影响库的浏览/管理。
@@ -884,8 +913,6 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
     if (view !== 'series') setSelectedSeries((prev) => (prev.size > 0 ? new Set() : prev))
   }, [view])
 
-  const visibleIds = useMemo(() => items.map((i) => i.id), [items])
-
   /**
    * 选择集的**作用域身份**（BUG-155）。
    *
@@ -1091,6 +1118,22 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   }, [tab, items, downloadFiles, sort])
 
   /**
+   * 「全选本页」的目标集 = **当前真正可见的行**（BUG-155 语义的直接延伸：
+   * 选中的必须是看得见、可被操作的行）。
+   *
+   * cat-all（Explorer 列表视图）显示的是 `catAllRows`（已登记媒体 ∪ 受管下载
+   * 成品），**不是** `items` —— 若照旧取 `items.map(id)`，全选会漏掉全部受管
+   * 成品行（合成负 id），用户在列表里看到「只选了一半」。分类子视图
+   * （视频/图片/音频…）与 catAllRows 无关，仍取 `items`。
+   *
+   * 声明必须在 `catAllRows` **之后**（TDZ）：它读的是那个 memo。
+   */
+  const visibleIds = useMemo(
+    () => (view === 'items' && tab === 'all' ? catAllRows : items).map((i) => i.id),
+    [view, tab, catAllRows, items],
+  )
+
+  /**
    * 删除确认的目标集：卡片逐条 = `[id]`，工具栏批量 = 当前勾选。
    *
    * 用**显式集合**而不是「每次都读 selected」，同一套确认状态机才能服务两种入口
@@ -1281,11 +1324,15 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             不改口径语义）：主口径 = 磁盘真值（清缓存后下降）；登记值显式标注
             「不是本地磁盘占用」。`diskBytes` 缺失时主口径回退登记值并改说明，
             不显示 0、不假装它是磁盘占用。
+
+            BUG-317 四件套③：这个读数是文件页的 **page-secondary-info**
+            （标题区下方的计数摘要，恒定口径）。库级按钮已在任务 #9 上移到
+            标题区右槽（ContextBar 的 files 分支），本工具条只余搜索/排序与本读数。
           */}
           {stats && (
             <span
               className="shrink-0 text-[11px] text-muted"
-              data-testid="media-occupancy"
+              data-testid="page-secondary-info"
               title={`${hasDiskBasis
                 ? '占用空间 = 文件管理在本机实际占用的磁盘字节（清缓存后会下降）'
                 : '占用空间 = 文件管理登记的内容大小（后端未提供磁盘占用读数；清缓存后此值不变）'}\n登记值 = 内容在源头的大小之和（未落盘/字节已清的内容仍计入），不是本地磁盘占用`}
@@ -1296,130 +1343,6 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             </span>
           )}
 
-          <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-1.5">
-            {/*
-             * BUG-155：「全选本页」只属于 items 视图 —— 它填的是 `selected`，而 `selected`
-             * 全部落点是 item 级（MediaCard 勾选、批量打标、加入剧集、批量删除），
-             * `visibleIds` 也来自 `items`。剧集墙上点它会把**当前不可见的 items id**
-             * 塞进选择集：工具栏切成「N 已选」，但没有任何东西可被看见/被操作 ——
-             * 这就是用户说的「依然是全局过滤」。
-             *
-             * 「导入目录 / 新建剧集 / 标签管理」是**库级动作**（不读 `selected`），
-             * 任何视图下都该能用，故**不给它们加视图条件**；要收窄的是同排的「全选本页」。
-             */}
-            {selected.size > 0 ? (
-              <>
-                <span className="mr-1 text-[11px] text-muted">
-                  {t('media.selected', { n: selected.size })}
-                </span>
-                {/* 剧集收 video / photo（图片入浏览位）。含 audio/未知类型时禁用（后端 422 兜底） */}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 px-2 text-[11px]"
-                  disabled={!selectedJoinable}
-                  title={
-                    selectedJoinable
-                      ? undefined
-                      : t('media.addToSeriesVideoOnly')
-                  }
-                  onClick={() => setAddToOpen(true)}
-                >
-                  {t('media.addToSeries')}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 px-2 text-[11px]"
-                  onClick={() => setBulkTagOpen(true)}
-                >
-                  {t('media.bulkTag')}
-                </Button>
-                {/* 批量整理（D24-A / BUG-311）：把选中条目按模板铺成可读名的硬链接/副本。
-                    与库内改名解耦 —— 改名只写库、整理才写发布层。 */}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 px-2 text-[11px]"
-                  onClick={() => setOrganizeOpen(true)}
-                  data-testid="media-organize"
-                >
-                  {t('media.organize.open')}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 px-2 text-[11px] text-destructive"
-                  onClick={() => setConfirmDelete({ kind: 'items' })}
-                >
-                  {t('media.remove')}
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 px-2 text-[11px]"
-                  onClick={clearSelection}
-                >
-                  {t('media.clearSel')}
-                </Button>
-              </>
-            ) : (
-              <>
-                {view === 'items' ? (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 px-2 text-[11px]"
-                    data-testid="media-select-all"
-                    onClick={() => {
-                      setSelected(new Set(visibleIds))
-                    }}
-                  >
-                    {t('media.selectAll')}
-                  </Button>
-                ) : null}
-                {/* 库级动作全视图恒渲染（工具栏 = 库级语义，与视图无关；
-                    剧集实体的合并/导出/删除在 SeriesDetail 总览卡，不进工具栏） */}
-                <>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 px-2 text-[11px]"
-                    onClick={() => setImportOpen(true)}
-                  >
-                    ⬇ {t('media.importDir')}
-                  </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-7 px-2 text-[11px]"
-                      onClick={() => setCreateOpen(true)}
-                      data-testid="media-new-series"
-                    >
-                      ＋ {t('media.newSeries')}
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-7 px-2 text-[11px]"
-                      data-testid="media-export-preview"
-                      onClick={() => setExportOpen(true)}
-                    >
-                      {t('media.export')}
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-7 px-2 text-[11px]"
-                      data-testid="media-tag-manage"
-                      onClick={() => setTagMgrOpen(true)}
-                    >
-                      🏷 {t('media.manageTags')}
-                    </Button>
-                </>
-              </>
-            )}
-          </div>
         </header>
         {/*
          * M0-T03：标签云从左栏搬迁到内容区。
@@ -1739,6 +1662,9 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             onOpen={openItem}
             onDelete={deleteItem}
             onError={setError}
+            // 选择模式（任务 #9）：已有 ≥1 条选中时，行双击与「打开」按钮
+            // 不进入播放/系统打开（覆盖层会冲掉隐形的选择上下文）。
+            selectionMode={selected.size > 0}
           />
         ) : items.length === 0 && !loading ? (
           emptyState
@@ -1756,6 +1682,9 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
                     selected={selected.has(item.id)}
                     onSelectToggle={toggleSelect}
                     onOpen={openItem}
+                    // 选择模式（任务 #9）：已有 ≥1 条选中时封面点击改切换选中，
+                    // 禁入播放详情（用户裁定「不应该能点击进入播放详情页面」）。
+                    selectionMode={selected.size > 0}
                     onEdit={setEditing}
                     // 逐条删除：目标集显式给 `[id]`，与工具栏批量走同一条确认路径
                     onDelete={deleteItem}
@@ -1849,6 +1778,107 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
               onClick={clearSeriesSelection}
             >
               {t('media.seriesSelectionClear')}
+            </Button>
+          </div>
+        ) : null}
+
+        {/*
+         * items 批量动作条（任务 #9 / BUG-317 统一化）：与剧集墙 `series-selection-bar`
+         * 同构的**浮动底部条**，选中 ≥1 条即出现。
+         *
+         * 为什么从头部工具栏搬到这里（用户 2026-10-16 裁定「其余和剧集一样，
+         * 使用弹出选择模式」）：
+         *   - 选择态是**批量整理的心智**，动作发生在「选完之后」，视线焦点在网格里
+         *     —— 顶部 sticky 常驻占一行、挤压内容高度，且选中前后头部整簇换血
+         *     （原来两个分支互斥渲染），按钮位置每次跳变；
+         *   - 全选/全不选放进选择条后，「进入选择模式」有了闭环入口：先勾任意一条
+         *     → 条出现 → 全选本页 / 全不选 / 批量动作 / 清除一应俱全；
+         *   - 形态与剧集墙完全一致（同一定位、同一样式、同一 testid 命名），
+         *     用户在两处学到的是同一套交互。
+         *
+         * 库级动作（导入目录/新建剧集/导出/标签管理）**不在这里** —— 它们已上移到
+         * 标题区右槽（BUG-317 四件套①②），任何视图恒定可用。
+         */}
+        {view === 'items' && selected.size > 0 ? (
+          <div
+            data-testid="items-selection-bar"
+            className="absolute bottom-4 left-1/2 z-30 flex -translate-x-1/2 flex-wrap items-center gap-2 rounded-full border border-accent/40 bg-surface/95 px-3 py-2 shadow-lg backdrop-blur-md"
+          >
+            <span
+              data-testid="items-selection-count"
+              className="text-[11px] font-medium text-fg-strong"
+            >
+              {t('media.selected', { n: selected.size })}
+            </span>
+            {/* 全选本页（BUG-155 语义保留）：填的是当前**可见** items 的 id。
+                testid 沿用 `media-select-all`（验收脚本的既有契约）。 */}
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              data-testid="media-select-all"
+              onClick={() => setSelected(new Set(visibleIds))}
+            >
+              {t('media.selectAll')}
+            </Button>
+            {/* 全不选（任务 #9 新增，用户点名「弹出当前缺少全选和全不选」）。 */}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              data-testid="media-select-none"
+              onClick={clearSelection}
+            >
+              {t('media.selectNone')}
+            </Button>
+            {/* 剧集收 video / photo（图片入浏览位）。含 audio/未知类型时禁用（后端 422 兜底） */}
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              data-testid="items-add-to-series"
+              disabled={!selectedJoinable}
+              title={selectedJoinable ? undefined : t('media.addToSeriesVideoOnly')}
+              onClick={() => setAddToOpen(true)}
+            >
+              {t('media.addToSeries')}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              data-testid="items-bulk-tag"
+              onClick={() => setBulkTagOpen(true)}
+            >
+              {t('media.bulkTag')}
+            </Button>
+            {/* 批量整理（D24-A / BUG-311）：把选中条目按模板铺成可读名的硬链接/副本。 */}
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              data-testid="media-organize"
+              onClick={() => setOrganizeOpen(true)}
+            >
+              {t('media.organize.open')}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[11px] text-destructive"
+              data-testid="items-bulk-remove"
+              onClick={() => setConfirmDelete({ kind: 'items' })}
+            >
+              {t('media.remove')}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              data-testid="items-selection-clear"
+              onClick={clearSelection}
+            >
+              {t('media.clearSel')}
             </Button>
           </div>
         ) : null}

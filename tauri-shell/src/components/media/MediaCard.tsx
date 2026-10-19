@@ -97,6 +97,15 @@ function MediaCardBase(props: {
   episodeLabel?: string
   onSelectToggle?: (id: number, shiftKey: boolean) => void
   onOpen: (item: MediaItem) => void
+  /**
+   * **选择模式**（任务 #9 / BUG-317 选择模式裁定）：
+   * 面板里**已有 ≥1 条被选中**时为 true。此时封面点击改走**切换选中**，
+   * 不再打开播放详情 —— 用户一旦进入「批量整理」的心智，误点封面把
+   * 播放器弹到全屏会连选择态带上下文一起丢失（选择集是隐形的：
+   * 播放器是覆盖层，回来后用户看不到任何「刚才选了哪些」的残留）。
+   * Ctrl/Cmd 点击在两种模式下都是切换选中（既有行为，不变）。
+   */
+  selectionMode?: boolean
   onEdit?: (item: MediaItem) => void
   /**
    * 逐条删除入口（BUG-057）。
@@ -141,6 +150,7 @@ function MediaCardBase(props: {
     onRecache,
     recacheBlockedReason = null,
     onViewInTg,
+    selectionMode = false,
   } = props
   const [poster, setPoster] = useState<string | null>(item.poster ?? null)
   const [genFailed, setGenFailed] = useState(false)
@@ -353,7 +363,10 @@ function MediaCardBase(props: {
           <button
             type="button"
             onClick={(e) => {
-              if (e.metaKey || e.ctrlKey) {
+              // 选择模式（任务 #9）：已有 ≥1 条选中时封面点击 = 切换选中，
+              // 禁入播放详情（裁定原文「不应该能点击进入播放详情页面」）。
+              // 显式 Ctrl/Cmd 点击在两种模式下都是切换选中（既有行为）。
+              if (selectionMode || e.metaKey || e.ctrlKey) {
                 onSelectToggle?.(item.id, e.shiftKey)
                 return
               }
@@ -361,6 +374,7 @@ function MediaCardBase(props: {
             }}
             className="relative block h-full w-full"
             title={displayName}
+            data-testid="media-card-cover"
           >
             {thumbSrc ? (
               <img
@@ -449,11 +463,14 @@ function MediaCardBase(props: {
           </span>
         ) : null}
 
-        {/* 多选勾选框（悬浮/选中时可见） */}
+        {/* 多选勾选框（悬浮/选中时可见）。
+            testid `media-card-select`：验收脚本据此进入选择模式
+            （任务 #9：勾任意一条 → 浮动选择条出现）。 */}
         {onSelectToggle ? (
           <span
             role="checkbox"
             aria-checked={Boolean(selected)}
+            data-testid="media-card-select"
             onClick={(e) => {
               e.stopPropagation()
               onSelectToggle(item.id, e.shiftKey)

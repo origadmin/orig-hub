@@ -415,6 +415,23 @@ fn first_line(s: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+/// 受管根（管理模块多根模型，BUG-323 续 / 用户 2026-10-16 裁定）。
+///
+/// 下载模块**单根**（`download_root()` 即其生产者输出目录）；管理模块**多根**：
+/// 受管根之并集。下载根恒为集合首项、`locked`（不可删）、默认 `primary`
+/// （管理视图默认选中）；用户可增删其他根、并把 `primary` 旗移到任意根
+/// （只改管理视图默认选中，**不动下载落点**）。
+///
+/// 存储：用户根集合持久化在 app_setting `managed_roots`（JSON 数组，每项
+/// `{path, primary, locked}`）。下载根由 [`Store::download_root`] 派生、
+/// 不在该数组里单独存（避免与 daemon 下发的 `download_dir` 双真源）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManagedRoot {
+    pub path: String,
+    pub primary: bool,
+    pub locked: bool,
+}
+
 impl Store {
     /// 打开（不存在则创建）数据库并建表。`path` 传 `":memory:"` 使用纯内存库。
     pub async fn open(path: impl AsRef<Path>) -> libsql::Result<Self> {
@@ -941,55 +958,625 @@ impl Store {
         Ok(())
     }
 
-    // ---- 库根（byte-ownership P2：单一库根，一处管理） ----
+    // ---- 单一受管根（byte-ownership P2；BUG-323 用户裁定 2026-10-16） ----
+    //
+    // 规则：**下载路径是所有文件的唯一容器与权限边界，库根从属于它**。
+    // 库根因此不再是独立配置项，而是 `<下载路径>/library` 的派生值 ——
+    // 「库根跑到下载路径之外」在结构上不可表达（用户：让错误状态不可表达）。
 
-    /// 库根解析链（byte-ownership I2）：
-    ///   1. env `ORIG_TG_LIBRARY_DIR`（容器/CI/sidecar 注入，最高优先）；
-    ///   2. app_setting `library_dir`（PUT /api/tg/config 持久化的运行期覆盖）；
-    ///   3. config.json `libraryDir`（Tauri 壳管理的应用配置；引擎直接读
-    ///      `<数据库文件父目录>/config.json`——生产布局里两者同在 TG 数据目录）；
-    ///   4. 默认 `<TG 数据目录>/library`（与 downloads 同级，D7：库根默认与下载目录同级）。
+    /// 库根在下载路径下的子目录名。
+    pub const LIBRARY_SUBDIR: &str = "library";
+
+    /// 引擎工作区子目录名（`<下载路径>/.orighub`，隐藏，不进库、不进成品扫描）。
+    pub const ENGINE_SUBDIR: &str = ".orighub";
+
+    /// 存量搬迁落点：旧默认下载目录（`<TG 数据目录>/downloads`）里的字节搬到这里。
     ///
-    /// 前两级与 config.json 的值都过 `expand_tilde`（用户可能手输 `~`，BUG-071 同款）。
+    /// 为什么保留一个独立子目录而不是摊在下载根上：这些是**缓存成品**，
+    /// 与归仓条目（`library/`）分属两个视图；摊平会让下载根一眼望去全是历史文件。
+    pub const LEGACY_DOWNLOADS_SUBDIR: &str = "legacy-downloads";
+
+    /// 下载路径（受管根 / 权限边界）。解析链：
+    ///   1. env `ORIG_TG_DOWNLOAD_DIR`（容器/CI/sidecar 注入，最高优先）；
+    ///   2. app_setting `download_dir`（daemon 下发 / `PUT /api/tg/config` 写入）；
+    ///   3. 平台默认下载目录（`orig_core::paths::default_download_dir()`）。
+    ///
+    /// 与 `routes::effective_download_dir` 同源同序，两处都过 `expand_tilde`
+    /// （用户可能手输 `~`，BUG-071 同款）。
+    ///
+    /// **BUG-323 复报（2026-10-19）**：返回值一律过 `normalize_dir` ——
+    /// 活栈实测存量的 `download_dir` 是 `D://OrigDown`（双斜杠，无人输入过的形态），
+    /// 而前缀比较/边界判定/DB 改写全是字符串语义 ⇒ 读取侧归一化让存量污染值
+    /// 无需手工改库即恢复单一形态（`D:/OrigDown`）。
+    ///
+    /// **C 盘禁用（用户 2026-10-19 裁定）**：「禁止往C盘写入任何数据,所有内容应该写D盘」，
+    /// 且明确「~/Downloads是默认设置,但是不使用,改用加载配置的D盘设置」。
+    /// ⇒ 第三级只是**名义默认**：解析结果一旦落在禁用盘（`C:`），改取 D 盘内容根
+    /// `orig_core::paths::content_root()` 并打日志。前两级是显式配置，若用户（或 env）
+    /// 显式把路径填成 `C:`，同样照规则改道 —— 规则是「不往 C 盘写」，不是「尊重
+    /// 一个填错的配置」。daemon 侧 `config::effective_download_root` 同一规则。
+    pub async fn download_root(&self) -> PathBuf {
+        let raw = if let Ok(v) = std::env::var("ORIG_TG_DOWNLOAD_DIR") {
+            if v.trim().is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        } else {
+            None
+        };
+        let raw = match raw {
+            Some(v) => v,
+            None => match self.get_setting("download_dir").await {
+                Ok(Some(v)) if !v.trim().is_empty() => v,
+                _ => return self.default_content_root(),
+            },
+        };
+        let norm = norm_root(&orig_core::paths::expand_tilde(raw.trim()));
+        if orig_core::paths::is_forbidden_content_drive(&norm) {
+            let redirected = self.default_content_root();
+            tracing::warn!(
+                target: "orig_tg::store",
+                "download root {} is on a forbidden content drive; using {} instead \
+                 (ruling: all content goes to the D: drive)",
+                norm.display(),
+                redirected.display()
+            );
+            return redirected;
+        }
+        norm
+    }
+
+    /// 名义默认值过禁用盘规则后的**实际内容根**（用户 2026-10-19 裁定）。
+    fn default_content_root(&self) -> PathBuf {
+        let d = norm_root(&orig_core::paths::default_download_dir());
+        if orig_core::paths::is_forbidden_content_drive(&d) {
+            orig_core::paths::content_root()
+        } else {
+            d
+        }
+    }
+
+    /// 库根 = `<下载路径>/library` —— **派生值，不可独立配置**（BUG-323）。
+    ///
+    /// 已废的历史链：env `ORIG_TG_LIBRARY_DIR` → app_setting `library_dir` →
+    /// config.json `libraryDir` → `<TG 数据目录>/library`。后三级都能把库根指到
+    /// 下载路径之外（末级更是应用内部目录，Explorer 不显示），而 `media_item`
+    /// 里已按旧根写死过绝对路径 ⇒ 归仓字节与用户可见的下载目录彻底分家。
+    /// 用户 2026-10-16 裁定「库根跟下载走、所有文件不允许脱离下载路径、下载路径是
+    /// 所有权限的限制路径」，故改为派生。
+    ///
+    /// env `ORIG_TG_LIBRARY_DIR` 保留为**运维覆盖**（容器/CI 里下载路径可能不在本机），
+    /// 不是用户面配置：设置页不暴露、`PUT /api/tg/config` 拒绝写入。
     pub async fn library_root(&self) -> PathBuf {
         if let Ok(v) = std::env::var("ORIG_TG_LIBRARY_DIR") {
             if !v.trim().is_empty() {
-                return orig_core::paths::expand_tilde(v.trim());
+                return norm_root(&orig_core::paths::expand_tilde(v.trim()));
             }
         }
+        self.download_root().await.join(Self::LIBRARY_SUBDIR)
+    }
+
+    /// 纯函数形式（供不可 async 的调用点与单测）：`<下载路径>/library`。
+    pub fn default_library_root(download_root: &Path) -> PathBuf {
+        download_root.join(Self::LIBRARY_SUBDIR)
+    }
+
+    /// 完整受管根集合：下载根（locked，primary 取存储值或默认 true）+ 用户根。
+    pub async fn managed_roots(&self) -> Vec<ManagedRoot> {
+        let download_root = self.download_root().await.to_string_lossy().into_owned();
+        let user_roots = self.user_managed_roots().await;
+        // 任一用户根标 primary ⇒ 下载根降级为非 primary。
+        let download_primary = !user_roots.iter().any(|r| r.primary);
+        let mut roots = vec![ManagedRoot {
+            path: download_root,
+            primary: download_primary,
+            locked: true,
+        }];
+        roots.extend(user_roots);
+        roots
+    }
+
+    async fn user_managed_roots(&self) -> Vec<ManagedRoot> {
+        let raw = match self.get_setting("managed_roots").await {
+            Ok(Some(v)) => v,
+            _ => return vec![],
+        };
+        serde_json::from_str::<Vec<ManagedRoot>>(&raw)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|mut r| {
+                r.locked = false; // 用户根永不可 locked
+                r.path = orig_core::paths::normalize_dir(&r.path); // BUG-323 复报：单一字面形态
+                r
+            })
+            .collect()
+    }
+
+    async fn set_user_managed_roots(&self, roots: &[ManagedRoot]) -> Result<(), String> {
+        let json = serde_json::to_string(roots).map_err(|e| e.to_string())?;
+        self.set_setting("managed_roots", &json)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// 新增受管根（去重；与下载根重复或与已登记根重复均幂等）。
+    pub async fn add_managed_root(&self, path: &Path) -> Result<(), String> {
+        let p = orig_core::paths::normalize_dir(
+            &orig_core::paths::expand_tilde(&path.to_string_lossy()).to_string_lossy(),
+        );
+        if !Path::new(&p).is_absolute() {
+            return Err("managed root must be an absolute path".into());
+        }
+        if paths_equal(Path::new(&p), &self.download_root().await) {
+            return Ok(()); // 下载根已恒在集合里
+        }
+        let mut roots = self.user_managed_roots().await;
+        if roots.iter().any(|r| paths_equal(Path::new(&r.path), Path::new(&p))) {
+            return Ok(());
+        }
+        // 允许预创建（目录尚不存在也接受，便于先登记再导入）。
+        let _ = tokio::fs::create_dir_all(&p).await;
+        roots.push(ManagedRoot {
+            path: p,
+            primary: false,
+            locked: false,
+        });
+        self.set_user_managed_roots(&roots).await
+    }
+
+    /// 删除受管根（locked/下载根 不可删；不存在则幂等）。
+    pub async fn remove_managed_root(&self, path: &Path) -> Result<(), String> {
+        let p = orig_core::paths::expand_tilde(&path.to_string_lossy())
+            .to_string_lossy()
+            .into_owned();
+        // 下载根恒为 locked，不可删（显式拒绝，而非当未登记静默成功）。
+        if paths_equal(Path::new(&p), &self.download_root().await) {
+            return Err("the download root is locked and cannot be removed".into());
+        }
+        let mut roots = self.user_managed_roots().await;
+        let before = roots.len();
+        roots.retain(|r| !paths_equal(Path::new(&r.path), Path::new(&p)));
+        if roots.len() == before {
+            return Ok(()); // 未登记 → 幂等
+        }
+        // 删掉的若是 primary，managed_roots() 会自动令下载根回退 primary。
+        self.set_user_managed_roots(&roots).await
+    }
+
+    /// 设置主根：把 `primary` 旗移到指定路径（必须是已登记受管根，含下载根）。
+    pub async fn set_primary_root(&self, path: &Path) -> Result<(), String> {
+        let p = orig_core::paths::expand_tilde(&path.to_string_lossy())
+            .to_string_lossy()
+            .into_owned();
+        let download_root = self.download_root().await;
+        let mut roots = self.user_managed_roots().await;
+        let mut found = paths_equal(Path::new(&p), &download_root);
+        for r in roots.iter_mut() {
+            if paths_equal(Path::new(&r.path), Path::new(&p)) {
+                r.primary = true;
+                found = true;
+            } else {
+                r.primary = false;
+            }
+        }
+        if !found {
+            return Err("path is not a registered managed root".into());
+        }
+        self.set_user_managed_roots(&roots).await
+    }
+
+
+    /// 历史库根（BUG-323 之前的解析链末端）—— **仅供迁移识别**，不参与任何解析。
+    ///
+    /// 链：app_setting `library_dir` → config.json `libraryDir` → `<TG 数据目录>/library`。
+    /// 三者皆空/不存在时返回 `None`。
+    pub async fn legacy_library_root(&self) -> Option<PathBuf> {
         if let Ok(Some(v)) = self.get_setting("library_dir").await {
             if !v.trim().is_empty() {
-                return orig_core::paths::expand_tilde(v.trim());
+                return Some(orig_core::paths::expand_tilde(v.trim()));
             }
         }
         if let Some(v) = Self::config_json_library_dir(&self.db_path) {
-            return v;
+            return Some(v);
         }
-        Self::default_library_root(&self.db_path)
-    }
-
-    /// 默认库根：`<TG 数据目录>/library`。`:memory:`（单测）的父目录为空串，
-    /// 退化为进程 CWD 下的 `library` —— 测试应显式 set_setting 覆盖。
-    pub fn default_library_root(db_path: &Path) -> PathBuf {
-        let base = db_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        base.join("library")
-    }
-
-    /// 转码代理目录：`<TG 数据目录>/proxies`。
-    ///
-    /// 与库根同级但**刻意不进库**（BUG-208）：代理是可再生的派生缓存（源件删了
-    /// 随时能重转），媒体库是唯一内容仓，派生物混进去会破坏「1 份存档」的计数
-    /// 与清理语义（清理链让位于 library bytes 的裁定也不应被代理字节干扰）。
-    pub fn proxy_dir(&self) -> PathBuf {
         let base = self
             .db_path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        base.join("proxies")
+        let p = base.join(Self::LIBRARY_SUBDIR);
+        p.is_dir().then_some(p)
+    }
+
+    /// 读 config.json 的 `libraryDir`（缺文件/缺键/解析失败 → None，不阻断）。
+    ///
+    /// BUG-323：该键已**不再**参与库根解析（库根是下载路径的派生值），
+    /// 保留读取只为让 [`Self::legacy_library_root`] 认出历史落点以便迁移。
+    pub fn config_json_library_dir(db_path: &Path) -> Option<PathBuf> {
+        let base = db_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let raw = std::fs::read_to_string(base.join("config.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let dir = v.get("libraryDir")?.as_str()?.trim();
+        if dir.is_empty() {
+            return None;
+        }
+        Some(orig_core::paths::expand_tilde(dir))
+    }
+
+    /// 存量受管根迁移（BUG-323）：把**引擎自己写过的旧落点**里的字节**移动**进
+    /// 下载路径，并把 DB 里仍指向旧落点的绝对路径改写过去。
+    ///
+    /// 为什么必须做：库根改为派生值后，旧根下的存量字节会整片失联 ——
+    /// 「库根相对路径」的条目在新根下解析不到（等价字节缺失），绝对路径条目则被
+    /// 权限闸门 403（`resolve_managed_path`）。规则落地不能以用户数据失联为代价。
+    ///
+    /// **不搬什么**：用户**外部导入**的引用（`POST /api/media/items` 里的本地路径）
+    /// 不在此列 —— 那是用户自己的文件，引擎既不搬别人的东西，也不替用户搬家的账。
+    ///
+    /// 纪律：
+    /// - **只移动、不留副本**（用户裁定「归仓用移动」+「无重复存储」）；
+    /// - **绝不覆盖**目标已存在的同名项（跳过并计数，冲突交给用户判断）；
+    /// - 同卷 `rename` 优先（瞬时、原子）；跨卷退化为 copy + **校验大小** + 删源；
+    /// - 幂等：旧落点不存在/为空/与新落点互含 ⇒ 跳过，不做任何事；
+    /// - 失败**不阻断启动**（返回 Err 由调用方记日志，源字节仍在原处）。
+    pub async fn migrate_legacy_managed_roots(&self) -> Result<Option<LegacyMigration>, String> {
+        let mut roots: Vec<RootMigration> = Vec::new();
+        for (name, from, to) in self.legacy_managed_roots().await {
+            if !from.is_dir() || paths_equal(&from, &to) {
+                continue;
+            }
+            // 旧新互含时移动会自我吞噬（搬进去又搬出来）—— 直接跳过，交给人工判断。
+            if crate::cache::path_within(&from, &to) || crate::cache::path_within(&to, &from) {
+                continue;
+            }
+            let mut moved = 0usize;
+            let mut skipped = 0usize;
+            move_dir_contents(&from, &to, 0, &mut moved, &mut skipped)?;
+            if moved == 0 && skipped == 0 {
+                continue;
+            }
+            let rewritten = self.rewrite_path_prefix(&from, &to).await?;
+            if skipped == 0 {
+                // 全部搬走 ⇒ 收尾：移除旧目录（`remove_dir` **只对空目录成功**，
+                // 有意外内容也不会被删）并清掉历史 setting。
+                let _ = std::fs::remove_dir(&from);
+                if name == "library" {
+                    let _ = self.set_setting("library_dir", "").await;
+                }
+            }
+            // 有跳过项时**保留**来源标记：下次启动重试（用户处理完同名冲突后自动收尾），
+            // 静默丢弃冲突项等于替用户做减法。
+            roots.push(RootMigration {
+                name: name.to_string(),
+                from: from.to_string_lossy().into_owned(),
+                to: to.to_string_lossy().into_owned(),
+                moved,
+                skipped,
+                rewritten,
+            });
+        }
+        if roots.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(LegacyMigration { roots }))
+    }
+
+    /// 上次已知下载根（app_setting `last_download_root`）—— 变更检测与断点续迁的锚。
+    async fn last_download_root(&self) -> Option<PathBuf> {
+        match self.get_setting("last_download_root").await {
+            Ok(Some(v)) if !v.trim().is_empty() => {
+                Some(norm_root(&orig_core::paths::expand_tilde(v.trim())))
+            }
+            _ => None,
+        }
+    }
+
+    async fn set_last_download_root(&self, p: &Path) {
+        let _ = self
+            .set_setting("last_download_root", &p.to_string_lossy())
+            .await;
+    }
+
+    /// 下载根**运行中变更**的存量迁移（BUG-323 复报，2026-10-19）。
+    ///
+    /// 为什么必须做：`migrate_legacy_managed_roots` 只跑在 orig-tg **启动时**且只认
+    /// 固定的历史落点。用户在设置里把下载路径从 A 改到 B 之后：
+    /// - 库根**相对路径**记录（132 条实测）解析到空的 `<B>/library` ⇒ 整片失联；
+    /// - 绝对路径记录被新边界闸门 403；
+    /// 用户观感即「路径选了完全无效」（原话）。本函数补上「变更即迁移」。
+    ///
+    /// 迁移内容（旧根 A → 新根 B）：
+    /// ① `<A>/library` → `<B>/library`（归仓字节；相对记录随之自动恢复）；
+    /// ② `<A>/legacy-downloads` → `<B>/legacy-downloads`（旧搬迁落点里的缓存成品）；
+    /// ③ A 顶层的**普通文件**（引擎下载成品）→ `<B>/legacy-downloads`；
+    /// ④ DB 绝对路径前缀 A→B 改写（`media_item` / `media_message` / `cache_task`）。
+    ///
+    /// 不搬：`.orighub`（转码代理，可再生缓存，按需重转）与未知子目录（可能是用户
+    /// 自己放的）—— 引擎不替用户搬家，也不偷用户的目录。
+    ///
+    /// 纪律与 `migrate_legacy_managed_roots` 相同：只移动、绝不覆盖、同卷 rename
+    /// 优先、幂等。**断点续迁**：有同名冲突（skipped>0）时保留旧锚点，下次启动
+    /// 或下次变更自动重试；用户处理完冲突后无需任何操作即收尾。
+    pub async fn migrate_root_change(&self) -> Result<Option<RootMigration>, String> {
+        let new_root = self.download_root().await;
+        let new_s = new_root.to_string_lossy().into_owned();
+        let Some(old_root) = self.last_download_root().await else {
+            // 无锚点 = 升级后首跑 / 全新安装：只记账不迁移。
+            // （存量由 `migrate_legacy_managed_roots` 在启动时按固定落点处理。）
+            self.set_last_download_root(&new_root).await;
+            return Ok(None);
+        };
+        if paths_equal(&old_root, &new_root) {
+            // 等价但字面不同（如存量 `D://OrigDown` vs 归一化 `D:/OrigDown`）时
+            // 同步锚点值，不触发迁移。
+            self.set_last_download_root(&new_root).await;
+            return Ok(None);
+        }
+        // 旧新互含时移动会自我吞噬 —— 跳过并记账，交给人工判断。
+        if crate::cache::path_within(&old_root, &new_root)
+            || crate::cache::path_within(&new_root, &old_root)
+        {
+            tracing::warn!(
+                target: "orig_tg::store",
+                "download root change {} -> {} skipped: roots contain each other",
+                old_root.display(),
+                new_root.display()
+            );
+            self.set_last_download_root(&new_root).await;
+            return Ok(None);
+        }
+        let mut moved = 0usize;
+        let mut skipped = 0usize;
+        let mut touched = false;
+        // ① 旧库根 → 新库根
+        let old_lib = old_root.join(Self::LIBRARY_SUBDIR);
+        let new_lib = self.library_root().await;
+        if old_lib.is_dir() && !paths_equal(&old_lib, &new_lib) {
+            move_dir_contents(&old_lib, &new_lib, 0, &mut moved, &mut skipped)?;
+            touched = true;
+        }
+        // ② 旧 legacy-downloads → 新 legacy-downloads
+        let old_ld = old_root.join(Self::LEGACY_DOWNLOADS_SUBDIR);
+        let new_ld = new_root.join(Self::LEGACY_DOWNLOADS_SUBDIR);
+        if old_ld.is_dir() && !paths_equal(&old_ld, &new_ld) {
+            move_dir_contents(&old_ld, &new_ld, 0, &mut moved, &mut skipped)?;
+            touched = true;
+        }
+        // ③ 旧根顶层的普通文件 → 新 legacy-downloads（跳过已知子目录与引擎工作区）
+        if let Ok(rd) = std::fs::read_dir(&old_root) {
+            for ent in rd.flatten() {
+                let src = ent.path();
+                let name = ent.file_name().to_string_lossy().into_owned();
+                if name == Self::LIBRARY_SUBDIR
+                    || name == Self::LEGACY_DOWNLOADS_SUBDIR
+                    || name == Self::ENGINE_SUBDIR
+                {
+                    continue;
+                }
+                if !src.is_file() {
+                    continue; // 未知子目录：不搬
+                }
+                let dst = new_ld.join(&name);
+                if dst.exists() {
+                    skipped += 1;
+                    continue;
+                }
+                move_one(&src, &dst, false)?;
+                moved += 1;
+                touched = true;
+            }
+        }
+        if !touched {
+            // 旧根没有引擎写盘内容（纯记账场景）：直接更新锚点。
+            self.set_last_download_root(&new_root).await;
+            return Ok(None);
+        }
+        let rewritten = self.rewrite_path_prefix(&old_root, &new_root).await?;
+        if skipped == 0 {
+            self.set_last_download_root(&new_root).await;
+        }
+        // skipped>0 ⇒ 锚点保留旧值，下次启动/变更重试（见方法文档）。
+        Ok(Some(RootMigration {
+            name: "root-change".to_string(),
+            from: old_root.to_string_lossy().into_owned(),
+            to: new_s,
+            moved,
+            skipped,
+            rewritten,
+        }))
+    }
+
+    /// 引擎写过的**旧落点**清单：`(名字, 旧根, 新根)`（BUG-323）。
+    ///
+    /// 只列引擎自己写过的目录：① 旧库根（应用内部目录）；② 旧默认下载目录
+    /// `<TG 数据目录>/downloads`。二者的共同点是「字节由引擎落盘」，故规则要求它们
+    /// 住在下载路径之内；用户外部导入的引用不在此列。
+    ///
+    /// **刻意不含平台默认下载目录（`~/Downloads`）下的旧落点** —— 那两处由
+    /// [`Self::migrate_platform_default_legacy_roots`] 单独处理。把它们混进来的
+    /// 后果见 BUG-325：单测会把**真实家目录里的 24 GB 媒体**搬进 %TEMP% 夹具
+    /// （`default_download_dir()` 在测试进程里同样解析到真家目录，测试无法把它
+    /// 指到别处）。「可由单测触达」与「必须只由启动路径触达」必须分开。
+    async fn legacy_managed_roots(&self) -> Vec<(&'static str, PathBuf, PathBuf)> {
+        let dl = self.download_root().await;
+        let mut out: Vec<(&'static str, PathBuf, PathBuf)> = Vec::new();
+        if let Some(from) = self.legacy_library_root().await {
+            out.push(("library", from, self.library_root().await));
+        }
+        let data_dir = self.data_dir();
+        if !data_dir.as_os_str().is_empty() {
+            let from = data_dir.join("downloads");
+            if from.is_dir() {
+                out.push((
+                    "downloads",
+                    from,
+                    dl.join(Self::LEGACY_DOWNLOADS_SUBDIR),
+                ));
+            }
+        }
+        out
+    }
+
+    /// 平台默认下载目录（`~/Downloads`）下的**引擎旧落点**（BUG-323 复报）。
+    ///
+    /// `download_dir` 未配置时期，库根与缓存成品都落在它下面 —— 活栈实测 111 条
+    /// 绝对路径指向 `~/Downloads/legacy-downloads`（33 文件 / 3.5 GB），132 条库根
+    /// 相对记录的字节也在 `<它>/library`（211 文件 / 24 GB）下。只搬 `library` 与
+    /// `legacy-downloads` 两个**引擎子目录**，不碰用户自己放在 Downloads 里的东西。
+    ///
+    /// 纯函数：默认目录由调用方注入 ⇒ **单测可传临时目录**，不触碰真实家目录
+    /// （BUG-325 的根因正是这里直接调 `default_download_dir()`）。
+    fn platform_default_legacy_roots(
+        default_dir: &Path,
+        dl: &Path,
+        library_root: &Path,
+    ) -> Vec<(&'static str, PathBuf, PathBuf)> {
+        if paths_equal(default_dir, dl) {
+            return Vec::new();
+        }
+        vec![
+            (
+                "default-library",
+                default_dir.join(Self::LIBRARY_SUBDIR),
+                library_root.to_path_buf(),
+            ),
+            (
+                "default-downloads",
+                default_dir.join(Self::LEGACY_DOWNLOADS_SUBDIR),
+                dl.join(Self::LEGACY_DOWNLOADS_SUBDIR),
+            ),
+        ]
+    }
+
+    /// 把 **OS 下载目录**（`~/Downloads`）下的引擎旧落点搬进当前下载路径
+    /// （BUG-323 复报 4，2026-10-19）。
+    ///
+    /// 只由**启动路径**（`main.rs`）调用。`os_download_dir()` 解析到真实家目录，
+    /// 任何单测调用它都会动用户的数据（BUG-325 实测搬走 27.5 GB）——所以「可由
+    /// 单测触达」的只有纯函数 [`Self::platform_default_legacy_roots`]。
+    ///
+    /// 为什么来源是 `~/Downloads` 而**不是** `default_download_dir()`：2026-10-19
+    /// 用户裁定「禁止往C盘写入任何数据,所有内容应该写D盘」，内容默认根已改为
+    /// `D:\OrigDown`；但装机存量的库根/缓存成品**物理上仍在 `~/Downloads`**
+    /// （上一轮迁移放过去的），迁移必须能指名那个目录才能把字节搬出来。
+    ///
+    /// 纪律与 [`Self::migrate_legacy_managed_roots`] 完全相同：只移动不覆盖、
+    /// 同卷 rename 优先、幂等、失败不阻断启动、有同名冲突时保留锚点下次重试。
+    pub async fn migrate_platform_default_legacy_roots(
+        &self,
+    ) -> Result<Option<LegacyMigration>, String> {
+        let dl = self.download_root().await;
+        let library_root = self.library_root().await;
+        // 指不到 OS 下载目录（非 Windows / 无家目录）⇒ 没有旧落点可认领。
+        let Some(default_dir) = orig_core::paths::os_download_dir() else {
+            return Ok(None);
+        };
+        let mut roots: Vec<RootMigration> = Vec::new();
+        for (name, from, to) in Self::platform_default_legacy_roots(&default_dir, &dl, &library_root)
+        {
+            if !from.is_dir() || paths_equal(&from, &to) {
+                continue;
+            }
+            // 旧新互含时移动会自我吞噬（搬进去又搬出来）—— 直接跳过，交给人工判断。
+            if crate::cache::path_within(&from, &to) || crate::cache::path_within(&to, &from) {
+                continue;
+            }
+            let mut moved = 0usize;
+            let mut skipped = 0usize;
+            move_dir_contents(&from, &to, 0, &mut moved, &mut skipped)?;
+            if moved == 0 && skipped == 0 {
+                continue;
+            }
+            let rewritten = self.rewrite_path_prefix(&from, &to).await?;
+            if skipped == 0 {
+                // 全部搬走 ⇒ 收尾：移除旧目录（`remove_dir` **只对空目录成功**，
+                // 有意外内容也不会被删）。
+                let _ = std::fs::remove_dir(&from);
+            }
+            // 有跳过项时**保留**来源标记：下次启动重试（用户处理完同名冲突后自动收尾），
+            // 静默丢弃冲突项等于替用户做减法。
+            roots.push(RootMigration {
+                name: name.to_string(),
+                from: from.to_string_lossy().into_owned(),
+                to: to.to_string_lossy().into_owned(),
+                moved,
+                skipped,
+                rewritten,
+            });
+        }
+        if roots.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(LegacyMigration { roots }))
+    }
+
+    /// 把 DB 里以 `from` 为前缀的绝对路径改写成 `to` 前缀。
+    ///
+    /// 逐行处理而非 `UPDATE … LIKE` + `substr`：Windows 路径大小写不敏感、
+    /// 分隔符可能混用，交给 Rust 侧判定才能精确到「分隔符边界」。
+    /// `cache_task.dir` 一并改写：它是历史任务的落点记录，留着旧值会让
+    /// 「界外路径」在库里继续存在（读路径虽不用它，但库里不该留下已搬迁的旧地址）。
+    async fn rewrite_path_prefix(&self, from: &Path, to: &Path) -> Result<usize, String> {
+        let from_s = from.to_string_lossy().into_owned();
+        let to_s = to.to_string_lossy().into_owned();
+        let mut n = 0usize;
+        for (table, col) in [
+            ("media_item", "file_path"),
+            ("media_message", "file_path"),
+            ("cache_task", "dir"),
+        ] {
+            let sql = format!("SELECT {col} FROM {table} WHERE {col} IS NOT NULL");
+            let mut rows = self
+                .conn
+                .query(&sql, libsql::params![])
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut pending: Vec<(String, String)> = Vec::new();
+            while let Some(r) = rows.next().await.map_err(|e| e.to_string())? {
+                let p: String = r.get(0).map_err(|e| e.to_string())?;
+                if let Some(rest) = strip_prefix_ci(&p, &from_s) {
+                    // 同一值可在多行重复（`cache_task.dir` 尤其常见）——
+                    // 去重后一次 UPDATE 命中全部同值行，计数按**改写过的值**算。
+                    if seen.insert(p.to_lowercase()) {
+                        pending.push((p, format!("{to_s}{rest}")));
+                    }
+                }
+            }
+            drop(rows);
+            for (old, new) in pending {
+                self.conn
+                    .execute(
+                        &format!("UPDATE {table} SET {col} = ?1 WHERE {col} = ?2"),
+                        libsql::params![new, old],
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// 转码代理目录：`<下载路径>/.orighub/proxies`。
+    ///
+    /// 与库根同级但**刻意不进库**（BUG-208）：代理是可再生的派生缓存（源件删了
+    /// 随时能重转），媒体库是唯一内容仓，派生物混进去会破坏「1 份存档」的计数
+    /// 与清理语义（清理链让位于 library bytes 的裁定也不应被代理字节干扰）。
+    ///
+    /// **BUG-323**：落点由「TG 数据目录（应用内部）」迁到**下载路径之内** ——
+    /// 用户裁定「所有文件不允许脱离下载路径」，代理同为媒体字节、不例外；
+    /// `.orighub` 前缀保证它不出现在下载列表/成品扫描里（`files.rs::walk` 跳过
+    /// `.` 开头的目录）。存量旧代理按需重转（可再生缓存）。
+    pub async fn proxy_dir(&self) -> PathBuf {
+        self.download_root()
+            .await
+            .join(Self::ENGINE_SUBDIR)
+            .join("proxies")
     }
 
     /// 真实 TG 数据目录：库根（store.db 所在目录）。
@@ -1005,21 +1592,6 @@ impl Store {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf()
-    }
-
-    /// 读 config.json 的 `libraryDir`（缺文件/缺键/解析失败 → None，不阻断）。
-    pub fn config_json_library_dir(db_path: &Path) -> Option<PathBuf> {
-        let base = db_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let raw = std::fs::read_to_string(base.join("config.json")).ok()?;
-        let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-        let dir = v.get("libraryDir")?.as_str()?.trim();
-        if dir.is_empty() {
-            return None;
-        }
-        Some(orig_core::paths::expand_tilde(dir))
     }
 
     // ---- 缓存库（跨频道聚合视图） ----
@@ -2000,6 +2572,241 @@ impl Store {
     }
 }
 
+/// 一处「引擎写过的旧落点」的搬迁结果（BUG-323）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RootMigration {
+    /// 旧落点的名字（`library` / `downloads`），只用于日志与回执。
+    pub name: String,
+    /// 旧根（迁移前）。
+    pub from: String,
+    /// 新根（下载路径之内）。
+    pub to: String,
+    /// 已移动的顶层条目数（目录按顶层计）。
+    pub moved: usize,
+    /// 因目标同名已存在而跳过的条目数（**绝不覆盖**）。
+    pub skipped: usize,
+    /// 被改写前缀的 DB 行数。
+    pub rewritten: usize,
+}
+
+/// 存量受管根搬迁的汇总（BUG-323）。
+///
+/// 为什么是「多根」而不是「库根」：库根只是旧落点之一。同一个缺陷的另一个落点是
+/// **旧默认下载目录** `<TG 数据目录>/downloads`（BUG-323 之前
+/// `Config::default().download_dir` 的值），实测仍压着 33 个文件 / 3.5 GB 真实媒资
+/// 且 26 条 `media_item` / 32 条 `media_message` / 18 条 `cache_task` 指向它。
+/// 只搬库根 = 用户下过的片子整片变成「取不到」。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LegacyMigration {
+    pub roots: Vec<RootMigration>,
+}
+
+impl LegacyMigration {
+    /// 全部搬走的顶层条目数（日志一句话用）。
+    pub fn moved(&self) -> usize {
+        self.roots.iter().map(|r| r.moved).sum()
+    }
+
+    /// 全部跳过的顶层条目数。
+    pub fn skipped(&self) -> usize {
+        self.roots.iter().map(|r| r.skipped).sum()
+    }
+
+    /// 全部被改写的 DB 行数。
+    pub fn rewritten(&self) -> usize {
+        self.roots.iter().map(|r| r.rewritten).sum()
+    }
+}
+
+/// 把解析出的根收敛成单一字面形态（BUG-323 复报 2026-10-19）。
+///
+/// 所有「根」的出口（download_root / library_root env 档 / 受管根集合）都必须过它，
+/// 否则 `D://OrigDown` 与 `D:/OrigDown` 会在系统里各算一套。
+fn norm_root(p: &Path) -> PathBuf {
+    orig_core::paths::normalize_dir_path(p)
+}
+
+/// 路径相等（Windows 大小写不敏感，忽略尾分隔符与分隔符连排）。
+///
+/// `normalize_dir` 先折叠 `D://X` / `D:/X` / `D:\X` 的字面差（BUG-323 复报）——
+/// 少了这一步，`D://OrigDown` 与 `D:/OrigDown` 会被判为两个不同的根，
+/// 迁移/去重全部静默失效。
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    fn norm(p: &Path) -> String {
+        orig_core::paths::normalize_dir(&p.to_string_lossy()).to_lowercase()
+    }
+    norm(a) == norm(b)
+}
+
+/// 大小写不敏感地剥离前缀，返回剩余部分（**含分隔符**，便于直接拼接）。
+///
+/// 边界判定到分隔符：`C:\Downloads` 绝不吃掉 `C:\Downloads2`。
+fn strip_prefix_ci(path: &str, prefix: &str) -> Option<String> {
+    let mut pre = prefix.replace('/', "\\").to_lowercase();
+    while pre.ends_with('\\') {
+        pre.pop();
+    }
+    if pre.is_empty() {
+        return None;
+    }
+    let hay = path.replace('/', "\\").to_lowercase();
+    if !hay.starts_with(&pre) {
+        return None;
+    }
+    // 用原始串取剩余部分（保留用户实际大小写与分隔符）；
+    // 先确认切点在字符边界上，避免非 ASCII 转小写改变长度时切碎字符。
+    if !path.is_char_boundary(pre.len()) {
+        return None;
+    }
+    let rest = &path[pre.len()..];
+    if rest.is_empty() || rest.starts_with(['\\', '/']) {
+        Some(rest.to_string())
+    } else {
+        None
+    }
+}
+
+/// 递归移动 `from` 下的内容到 `to`：**绝不覆盖**目标同名项，同卷 `rename` 优先。
+///
+/// 每层只做「不存在目标才搬」——冲突项留着并计数，由人判断，绝不替用户选一个删掉。
+fn move_dir_contents(
+    from: &Path,
+    to: &Path,
+    depth: usize,
+    moved: &mut usize,
+    skipped: &mut usize,
+) -> Result<(), String> {
+    const MAX_DEPTH: usize = 24;
+    if depth > MAX_DEPTH {
+        return Err(format!(
+            "move_dir_contents: depth limit exceeded at {}",
+            from.display()
+        ));
+    }
+    std::fs::create_dir_all(to).map_err(|e| format!("create {}: {e}", to.display()))?;
+    let rd = std::fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))?;
+    for ent in rd {
+        let ent = ent.map_err(|e| e.to_string())?;
+        let src = ent.path();
+        let dst = to.join(ent.file_name());
+        let is_dir = src.is_dir();
+        if dst.exists() {
+            if is_dir && dst.is_dir() {
+                move_dir_contents(&src, &dst, depth + 1, moved, skipped)?;
+            } else {
+                *skipped += 1;
+            }
+            continue;
+        }
+        move_one(&src, &dst, is_dir)?;
+        *moved += 1;
+    }
+    Ok(())
+}
+
+/// 单次移动：同卷 `rename`（瞬时、原子）；跨卷退化为 copy + 校验大小 + 删源。
+fn move_one(src: &Path, dst: &Path, is_dir: bool) -> Result<(), String> {
+    // 目标父目录可能还不存在（如迁移 ③：旧根顶层文件 → 新根的 legacy-downloads，
+    // 新根刚从零建）。rename 在 Windows 上会因目标目录不存在而失败，再退化到 copy
+    // 同样失败 ⇒ 补一次建目录，同卷跨卷两条路都稳。
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    if is_dir {
+        // 跨卷目录：逐层递归（内部仍 rename 优先），最后 `remove_dir` 只对空目录成功
+        // ⇒ 未搬走的内容会让它保持原位，不会连带删除。
+        let mut m = 0usize;
+        let mut s = 0usize;
+        move_dir_contents(src, dst, 0, &mut m, &mut s)?;
+        std::fs::remove_dir(src).map_err(|e| format!("remove {}: {e}", src.display()))?;
+        return Ok(());
+    }
+    let n = std::fs::copy(src, dst)
+        .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+    let src_len = std::fs::metadata(src).map_err(|e| e.to_string())?.len();
+    if n != src_len {
+        return Err(format!(
+            "copy size mismatch {} -> {} ({n} != {src_len})",
+            src.display(),
+            dst.display()
+        ));
+    }
+    std::fs::remove_file(src).map_err(|e| format!("remove {}: {e}", src.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_root() -> std::path::PathBuf {
+    // 测试二进制的真身在 `<target>/debug/deps/<name>.exe` ⇒ 回溯三级即 `target` 根。
+    // 这比环境变量可靠：cargo 只为 **integration test** 的编译注入
+    // `CARGO_TARGET_TMPDIR`，`src/**` 里的 unit test 编译期与运行期都取不到
+    // （2026-10-19 实测：`env!` 直接编译失败，`env::var` 运行期为空）。
+    // target 在工作区内 ⇒ 夹具跟着工作区盘走，且本就是 gitignore 的构建产物区。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(target) = exe.ancestors().nth(3) {
+            return target.join("tmp");
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// 测试夹具根：**必须落在非禁用盘**上（用户 2026-10-19 裁定「禁止往C盘写入任何数据」）。
+///
+/// 为什么不能默认用系统临时目录：下载根一旦解析到 C: 会被改道到真实内容根
+/// `D:\OrigDown`，于是「把夹具钉成下载路径」这个动作会静默指向**用户真实内容目录**。
+/// 2026-10-19 实测两类事故：① 迁移类用例把 `chat--1`、`98-d.zip` 等夹具字节搬进了
+/// `D:\OrigDown`（污染真实媒体库）；② 媒资清理类用例的删除动作会落在真实文件上
+/// —— 比 ① 更糟，属于「测试动用户数据」。
+///
+/// 夹具根本身落在禁用盘（例如工作区就在 C:）时**直接 panic** —— 宁可测试红，
+/// 也不许静默污染用户目录或假绿。
+#[cfg(test)]
+pub(crate) fn fixture_base(tag: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let base = fixture_root().join(format!(
+        "orig-tg-fixture-{tag}-{}-{nanos}",
+        std::process::id()
+    ));
+    assert!(
+        !orig_core::paths::is_forbidden_content_drive(&base),
+        "fixture base {} is on a forbidden content drive; the C: drive ban redirects \
+         every download root, so fixtures there would point at the real content root. \
+         Run the tests through cargo from a workspace that is not on the C: drive.",
+        base.display()
+    );
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("fixture dir must be creatable");
+    base
+}
+
+/// 带清理的夹具目录：离开作用域即整树删除（panic 时也删 —— unwind 会 drop）。
+#[cfg(test)]
+pub(crate) struct FixtureDir(std::path::PathBuf);
+
+#[cfg(test)]
+impl FixtureDir {
+    pub(crate) fn new(tag: &str) -> Self {
+        Self(fixture_base(tag))
+    }
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for FixtureDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2063,56 +2870,494 @@ mod tests {
         assert_eq!(m.file_path.as_deref(), Some(r#"C:\cache\video.mp4"#));
     }
 
-    /// P2 库根解析链：app_setting 覆盖 config.json，config.json 覆盖默认值；
-    /// 默认值 = `<TG 数据目录>/library`（TG 数据目录 = 数据库文件的父目录）。
-    /// env 档（`ORIG_TG_LIBRARY_DIR`）优先级最高但为进程级全局，测试无法并行
-    /// 安全地注入，故不在此覆盖（生产读的是同一行代码路径）。
+    /// BUG-323（用户 2026-10-16 裁定）：库根**派生自下载路径**，不再是独立配置项。
+    ///
+    /// 判据含**反向证伪**：把历史两级配置（app_setting `library_dir` /
+    /// config.json `libraryDir`）写到下载路径之外，库根也**不得**跟着跑出去 ——
+    /// 否则「库根脱离下载路径」仍可表达，规则等于没落地。
+    ///
+    /// env 档（`ORIG_TG_LIBRARY_DIR` / `ORIG_TG_DOWNLOAD_DIR`）优先级最高，但为
+    /// 进程级全局，测试无法并行安全地注入，故不在此覆盖（生产读的是同一行代码路径）。
     #[tokio::test]
-    async fn library_root_resolution_chain() {
-        let dir = std::env::temp_dir()
-            .join(format!("orig_tg_store_{}_", std::process::id()))
-            .join("libroot_chain");
-        std::fs::create_dir_all(&dir).unwrap();
-        // 清掉可能被 **pid 复用**继承的旧库与 config.json：本用例原先不删文件，Windows
-        // 回收 pid 后新进程会打开上一轮留下的库（其 `library_dir` 已被本用例写到
-        // `lib-from-setting`）与 `config.json` ⇒ 「默认档」断言随机红。与 `store()` 同一纪律。
+    async fn library_root_follows_download_root_bug323() {
+        let fx = FixtureDir::new("bug323_single_root");
+        let dir = fx.path().to_path_buf();
+        // 与 `store()` 同一纪律：清掉可能被 **pid 复用**继承的旧库/config.json。
         let _ = std::fs::remove_file(dir.join("store.db"));
         let _ = std::fs::remove_file(dir.join("store.db-wal"));
         let _ = std::fs::remove_file(dir.join("store.db-shm"));
         let _ = std::fs::remove_file(dir.join("config.json"));
+        // 本进程若被注入过运维 env，先清掉，否则「默认档」断言不成立。
+        unsafe {
+            std::env::remove_var("ORIG_TG_LIBRARY_DIR");
+            std::env::remove_var("ORIG_TG_DOWNLOAD_DIR");
+        }
         let db_path = dir.join("store.db");
         let s = Store::open(&db_path).await.unwrap();
 
-        // 默认档：<db 父目录>/library。
+        // 下载路径未配置 → 名义默认过禁用盘规则后的内容根；库根 = 其下 `library`。
+        // （用户 2026-10-19 裁定「~/Downloads是默认设置,但是不使用,改用加载配置的D盘设置」
+        // ⇒ 名义默认在 C: 上时改取 D 盘内容根。）
+        let expect_default = if orig_core::paths::is_forbidden_content_drive(
+            &orig_core::paths::default_download_dir(),
+        ) {
+            orig_core::paths::content_root()
+        } else {
+            orig_core::paths::default_download_dir()
+        };
         assert_eq!(
             s.library_root().await,
-            Store::default_library_root(&db_path),
-            "无 setting、无 config.json 时必须落到默认库根"
+            expect_default.join(Store::LIBRARY_SUBDIR),
+            "未配置下载路径时库根必须是 名义默认(过禁用盘规则)/library"
         );
 
-        // config.json 档：写文件即可（每次调用现读，不需要重开库）。
-        let cfg_dir = dir.join("lib-from-config");
-        std::fs::write(
-            dir.join("config.json"),
-            format!(r#"{{ "libraryDir": "{}" }}"#, cfg_dir.to_string_lossy().replace('\\', "/")),
-        )
-        .unwrap();
-        assert_eq!(
-            s.library_root().await,
-            cfg_dir,
-            "config.json 的 libraryDir 必须覆盖默认值"
-        );
-
-        // app_setting 档：最高优先级（除 env 外）。
-        let setting_dir = dir.join("lib-from-setting");
-        s.set_setting("library_dir", setting_dir.to_string_lossy().as_ref())
+        // 配置下载路径 → 库根**跟随**（不是并列、更不是各走各的）。
+        let dl = dir.join("dl");
+        s.set_setting("download_dir", dl.to_string_lossy().as_ref())
             .await
             .unwrap();
         assert_eq!(
             s.library_root().await,
-            setting_dir,
-            "app_setting 必须覆盖 config.json 与默认值"
+            dl.join(Store::LIBRARY_SUBDIR),
+            "库根必须跟随下载路径"
         );
+
+        // 反向证伪：历史两级（app_setting / config.json）均不得再把库根带出下载路径。
+        let outside = dir.join("outside-lib");
+        s.set_setting("library_dir", outside.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            format!(
+                r#"{{ "libraryDir": "{}" }}"#,
+                outside.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            s.library_root().await,
+            dl.join(Store::LIBRARY_SUBDIR),
+            "历史两级配置不得把库根带出下载路径（BUG-323）"
+        );
+        assert!(
+            !s.library_root().await.starts_with(&outside),
+            "库根绝不允许落在下载路径之外"
+        );
+
+        // 代理（媒体字节）同规则：必须在下载路径之内。
+        assert!(
+            s.proxy_dir().await.starts_with(&dl),
+            "代理目录必须落在下载路径之内（BUG-323）"
+        );
+    }
+
+    /// BUG-323：存量库根迁移 —— 移动（不留副本）、遇同名**不覆盖**、DB 前缀改写、
+    /// 重复调用不再搬字节。
+    ///
+    /// 这是规则落地的保命线：库根改为派生后，旧根下的存量字节若不跟随，
+    /// 媒体库会整片显示「无字节」（相对路径解析到新根为空、绝对路径被闸门 403）。
+    #[tokio::test]
+    async fn migrates_legacy_library_root_bug323() {
+        let fx = FixtureDir::new("bug323_migrate");
+        let base = fx.path().to_path_buf();
+        let old_root = base.join("appdata/tg/library");
+        let dl = base.join("Downloads");
+        let new_root = dl.join(Store::LIBRARY_SUBDIR);
+        std::fs::create_dir_all(old_root.join("chat--1")).unwrap();
+        std::fs::create_dir_all(new_root.join("chat--1")).unwrap();
+        // 旧根两项：`10-a.mp4` 在新根已有同名（内容不同 ⇒ 必须不覆盖）；
+        // `11-b.mp4` 需被搬走。
+        std::fs::write(old_root.join("chat--1/10-a.mp4"), b"OLD").unwrap();
+        std::fs::write(old_root.join("chat--1/11-b.mp4"), b"MOVED").unwrap();
+        std::fs::write(new_root.join("chat--1/10-a.mp4"), b"NEW").unwrap();
+
+        let db = base.join("appdata/tg/store.db");
+        let s = Store::open(&db).await.unwrap();
+        s.set_setting("download_dir", dl.to_str().unwrap())
+            .await
+            .unwrap();
+        s.set_setting("library_dir", old_root.to_str().unwrap())
+            .await
+            .unwrap();
+        // 两条记录：一条**绝对**（旧库根下 ⇒ 需改写）、一条相对（库内规范形态 ⇒ 不动）。
+        let abs_old = old_root.join("chat--1/11-b.mp4").to_string_lossy().into_owned();
+        for (ref_key, path) in [("1", abs_old.clone()), ("2", "chat--1/11-b.mp4".to_string())] {
+            s.conn
+                .execute(
+                    "INSERT INTO media_item (source, ref, title, kind, file_path, added_at) \
+                     VALUES ('tg', ?1, 't', 'video', ?2, 0)",
+                    libsql::params![ref_key, path],
+                )
+                .await
+                .unwrap();
+        }
+
+        let m = s
+            .migrate_legacy_managed_roots()
+            .await
+            .unwrap()
+            .expect("must report a migration");
+        assert_eq!(m.moved(), 1, "只搬未冲突的一项");
+        assert_eq!(m.skipped(), 1, "同名项必须跳过");
+        assert_eq!(m.rewritten(), 1, "只改写旧根下的绝对路径");
+        assert_eq!(
+            m.roots.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["library"],
+            "本夹具只有库根一处旧落点"
+        );
+        assert_eq!(
+            std::fs::read(new_root.join("chat--1/11-b.mp4")).unwrap(),
+            b"MOVED",
+            "字节必须被**移动**到新库根"
+        );
+        assert_eq!(
+            std::fs::read(new_root.join("chat--1/10-a.mp4")).unwrap(),
+            b"NEW",
+            "同名冲突项绝不能被覆盖"
+        );
+        assert!(old_root.exists(), "有冲突项时旧目录不得被删");
+        // DB：绝对路径已指到新根；相对路径原样保留
+        let p1: String = s
+            .conn
+            .query(
+                "SELECT file_path FROM media_item WHERE ref = '1'",
+                libsql::params![],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert!(
+            paths_equal(Path::new(&p1), &new_root.join("chat--1/11-b.mp4")),
+            "绝对路径必须改写到新库根，实际 = {p1}"
+        );
+
+        // 幂等：再跑一次不再搬任何字节、不再改任何路径
+        let again = s.migrate_legacy_managed_roots().await.unwrap().unwrap();
+        assert_eq!(again.moved(), 0, "重复调用不得再搬字节");
+        assert_eq!(again.rewritten(), 0, "重复调用不得再改路径");
+    }
+
+    /// BUG-323 复报（2026-10-19）：下载根**运行中变更**的迁移。
+    ///
+    /// 复报现象（活栈实证）：用户把下载路径改到 `D:\OrigDown` 后 ——
+    /// 库根相对记录解析到空的 `<新根>/library`（失联）、绝对记录被边界闸门 403。
+    /// `migrate_legacy_managed_roots` 只在启动时跑且只认固定落点，补不上这一刀。
+    #[tokio::test]
+    async fn migrates_root_change_moves_bytes_and_rewrites_db_bug323() {
+        let fx = FixtureDir::new("bug323_root_change");
+        let base = fx.path().to_path_buf();
+        let old_root = base.join("oldroot");
+        let new_root = base.join("newroot");
+        let old_lib = old_root.join(Store::LIBRARY_SUBDIR);
+        // 旧根内容：库根一项、legacy-downloads 一项、顶层成品一个、未知子目录一个、
+        // 引擎工作区一个（后两者**不得**被搬）。
+        std::fs::create_dir_all(old_lib.join("chat--1")).unwrap();
+        std::fs::write(old_lib.join("chat--1/11-b.mp4"), b"MOVED").unwrap();
+        std::fs::create_dir_all(old_root.join(Store::LEGACY_DOWNLOADS_SUBDIR)).unwrap();
+        std::fs::write(
+            old_root.join(Store::LEGACY_DOWNLOADS_SUBDIR).join("99-c.zip"),
+            b"LEGACY",
+        )
+        .unwrap();
+        std::fs::write(old_root.join("98-d.zip"), b"TOP").unwrap();
+        std::fs::create_dir_all(old_root.join("userdir")).unwrap();
+        std::fs::write(old_root.join("userdir/mine.txt"), b"MINE").unwrap();
+        std::fs::create_dir_all(old_root.join(Store::ENGINE_SUBDIR).join("proxies")).unwrap();
+        std::fs::write(
+            old_root.join(Store::ENGINE_SUBDIR).join("proxies/p.mp4"),
+            b"PROXY",
+        )
+        .unwrap();
+
+        let db = base.join("tg/store.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let s = Store::open(&db).await.unwrap();
+        s.set_setting("download_dir", old_root.to_str().unwrap())
+            .await
+            .unwrap();
+        s.set_setting("last_download_root", old_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let abs_old = old_lib.join("chat--1/11-b.mp4").to_string_lossy().into_owned();
+        s.conn
+            .execute(
+                "INSERT INTO media_item (source, ref, title, kind, file_path, added_at) \
+                 VALUES ('tg', '1', 't', 'video', ?1, 0)",
+                libsql::params![abs_old],
+            )
+            .await
+            .unwrap();
+
+        // 用户改路径（= PUT /api/tg/config 的写入动作）
+        s.set_setting("download_dir", new_root.to_str().unwrap())
+            .await
+            .unwrap();
+        let m = s
+            .migrate_root_change()
+            .await
+            .unwrap()
+            .expect("root change must report a migration");
+
+        // ① 库根字节搬到新库根；DB 绝对路径改写
+        let new_lib = new_root.join(Store::LIBRARY_SUBDIR);
+        assert_eq!(
+            std::fs::read(new_lib.join("chat--1/11-b.mp4")).unwrap(),
+            b"MOVED",
+            "库根字节必须搬进新库根"
+        );
+        let p1: String = s
+            .conn
+            .query("SELECT file_path FROM media_item WHERE ref = '1'", libsql::params![])
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert!(
+            paths_equal(Path::new(&p1), &new_lib.join("chat--1/11-b.mp4")),
+            "绝对路径必须改写到新库根，实际 = {p1}"
+        );
+        // ② legacy-downloads 与顶层成品搬进新 legacy-downloads
+        let new_ld = new_root.join(Store::LEGACY_DOWNLOADS_SUBDIR);
+        assert_eq!(std::fs::read(new_ld.join("99-c.zip")).unwrap(), b"LEGACY");
+        assert_eq!(std::fs::read(new_ld.join("98-d.zip")).unwrap(), b"TOP");
+        // ③ 未知子目录与引擎工作区**不搬**（引擎不替用户搬家）
+        assert!(
+            old_root.join("userdir/mine.txt").exists(),
+            "用户自放目录不得被搬动"
+        );
+        assert!(
+            old_root.join(Store::ENGINE_SUBDIR).join("proxies/p.mp4").exists(),
+            "转码代理是再生缓存，不随根变更搬迁"
+        );
+        // ④ 锚点更新为新的根
+        assert_eq!(
+            s.last_download_root().await,
+            Some(new_root.clone()),
+            "无冲突时锚点必须更新"
+        );
+        // ⑤ 幂等
+        assert!(
+            s.migrate_root_change().await.unwrap().is_none(),
+            "第二次调用不得再迁移"
+        );
+    }
+
+    /// BUG-323 复报（2026-10-19）：读取侧归一化 —— 存量 `download_dir` 存着
+    /// 活栈实测的 `D://OrigDown`（双斜杠）时，读取即收敛为 `D:/OrigDown`。
+    #[tokio::test]
+    async fn download_root_folds_duplicate_separators_bug323() {
+        let base = std::env::temp_dir()
+            .join(format!("orig_tg_store_{}_", std::process::id()))
+            .join("bug323_norm");
+        let _ = std::fs::remove_dir_all(&base);
+        let db = base.join("tg/store.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let s = Store::open(&db).await.unwrap();
+        s.set_setting("download_dir", "D://OrigDown").await.unwrap();
+        assert_eq!(
+            s.download_root().await,
+            PathBuf::from("D:/OrigDown"),
+            "读取侧必须折叠重复分隔符（无需手工改库即恢复单一形态）"
+        );
+        // 库根从属于它，同样单一形态
+        assert_eq!(
+            s.library_root().await,
+            PathBuf::from("D:/OrigDown").join(Store::LIBRARY_SUBDIR)
+        );
+    }
+
+    /// BUG-323 复报（2026-10-19）：`paths_equal` 必须折叠分隔符连排，
+    /// 否则 `D://X` 与 `D:/X` 会被判为两个根，去重/迁移/边界全部静默失效。
+    #[test]
+    fn paths_equal_folds_duplicate_separators_bug323() {
+        assert!(paths_equal(Path::new("D://OrigDown"), Path::new("D:/OrigDown")));
+        assert!(paths_equal(Path::new("D:\\OrigDown"), Path::new("D:/origdown")));
+        assert!(!paths_equal(Path::new("D:/OrigDown2"), Path::new("D:/OrigDown")));
+    }
+
+    /// BUG-325：平台默认落点必须**只搬引擎子目录**，且默认目录与下载路径相同时
+    /// 一项都不列。
+    ///
+    /// 这条测试是 BUG-325 的安全网：`platform_default_legacy_roots` 是**纯函数**
+    /// （默认目录由参数注入），任何单测都无法通过它碰到真实家目录。回归判据：
+    /// ① 两项且名字固定；② `~/Downloads` 顶层散落的用户文件不在列；
+    /// ③ 默认目录 == 下载路径时为空（自己搬自己 = 自我吞噬）。
+    #[test]
+    fn platform_default_legacy_roots_lists_only_engine_subdirs_bug325() {
+        let default_dir = Path::new("C:/Users/u/Downloads");
+        let dl = Path::new("D:/OrigDown");
+        let lib = dl.join(Store::LIBRARY_SUBDIR);
+        let roots = Store::platform_default_legacy_roots(default_dir, dl, &lib);
+        assert_eq!(
+            roots.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(),
+            vec!["default-library", "default-downloads"],
+            "只应有库根与缓存成品两项"
+        );
+        assert_eq!(
+            roots[0].1,
+            default_dir.join(Store::LIBRARY_SUBDIR),
+            "来源必须是默认目录下的 library，不得是整个默认目录"
+        );
+        assert_eq!(roots[0].2, lib);
+        assert_eq!(
+            roots[1].1,
+            default_dir.join(Store::LEGACY_DOWNLOADS_SUBDIR)
+        );
+        // 下载路径就是默认目录（用户没改路径）⇒ 无旧落点可搬
+        assert!(
+            Store::platform_default_legacy_roots(default_dir, default_dir, &lib).is_empty(),
+            "默认目录与下载路径相同不得列出任何迁移项"
+        );
+        // 大小写/分隔符差异也算「相同」（`paths_equal` 折叠后比较）
+        assert!(Store::platform_default_legacy_roots(
+            Path::new("c:/users/u/downloads"),
+            Path::new("C:\\Users\\u\\Downloads"),
+            &lib
+        )
+        .is_empty());
+    }
+
+    /// BUG-323 第二处旧落点：**旧默认下载目录** `<数据目录>/downloads`。
+    ///
+    /// 这是同一缺陷的另一半：BUG-323 之前 `Config::default().download_dir` 指的是
+    /// 这个应用内部目录，实测仍有 33 个文件 / 3.5 GB 真实媒资压在里面，且
+    /// `media_item` / `media_message` / `cache_task` 三张表都有行指向它。
+    /// 只搬库根 = 用户下过的片子整片变成「取不到」（绝对路径被权限闸门 403）。
+    #[tokio::test]
+    async fn migrates_legacy_downloads_root_bug323() {
+        let fx = FixtureDir::new("bug323_downloads");
+        let base = fx.path().to_path_buf();
+        let data_dir = base.join("appdata/tg");
+        let old_dl = data_dir.join("downloads");
+        let dl = base.join("Downloads");
+        let new_dl = dl.join(Store::LEGACY_DOWNLOADS_SUBDIR);
+        std::fs::create_dir_all(&old_dl).unwrap();
+        std::fs::write(old_dl.join("abc--1-2.mp4"), b"VIDEO").unwrap();
+        std::fs::write(old_dl.join("photo--1_3.jpg"), b"PHOTO").unwrap();
+
+        let db = data_dir.join("store.db");
+        let s = Store::open(&db).await.unwrap();
+        s.set_setting("download_dir", dl.to_str().unwrap())
+            .await
+            .unwrap();
+        // 三张表各留一条指向旧下载目录的记录（`cache_task.dir` 是重复值的典型）。
+        let abs = old_dl.join("abc--1-2.mp4").to_string_lossy().into_owned();
+        s.conn
+            .execute(
+                "INSERT INTO media_item (source, ref, title, kind, file_path, added_at) \
+                 VALUES ('tg', '1', 't', 'video', ?1, 0)",
+                libsql::params![abs.clone()],
+            )
+            .await
+            .unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO media_message (channel_id, message_id, file_path, downloaded, created_at) \
+                 VALUES (1, 2, ?1, 0, 0)",
+                libsql::params![abs.clone()],
+            )
+            .await
+            .unwrap();
+        for key in ["a:1", "b:2"] {
+            s.conn
+                .execute(
+                    "INSERT INTO cache_task \
+                       (chat_id, group_id, item_key, items, total, done, status, dir, created_at, updated_at) \
+                     VALUES (1, NULL, ?1, '[]', 1, 1, 'done', ?2, 0, 0)",
+                    libsql::params![key, old_dl.to_string_lossy().to_string()],
+                )
+                .await
+                .unwrap();
+        }
+
+        let m = s
+            .migrate_legacy_managed_roots()
+            .await
+            .unwrap()
+            .expect("must report a migration");
+        assert_eq!(
+            m.roots.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["downloads"],
+            "本夹具只有旧下载目录一处落点"
+        );
+        assert_eq!(m.moved(), 2, "两个文件都要搬");
+        assert_eq!(
+            m.rewritten(),
+            3,
+            "三张表各一条：media_item.file_path + media_message.file_path + cache_task.dir（后者的两行同值只算一次改写）"
+        );
+        assert_eq!(
+            std::fs::read(new_dl.join("abc--1-2.mp4")).unwrap(),
+            b"VIDEO",
+            "字节必须落到 <下载路径>/legacy-downloads"
+        );
+        assert!(!old_dl.exists(), "全部搬走后旧目录必须移除（不留空壳）");
+        // 新落点仍在下载路径之内（规则：所有文件不允许脱离下载路径）。
+        assert!(new_dl.starts_with(&dl), "搬迁落点必须在下载路径之内");
+
+        // 三张表都不再留旧地址
+        for (table, col) in [
+            ("media_item", "file_path"),
+            ("media_message", "file_path"),
+            ("cache_task", "dir"),
+        ] {
+            let n: i64 = s
+                .conn
+                .query(
+                    &format!("SELECT count(*) FROM {table} WHERE {col} LIKE ?1"),
+                    libsql::params![format!("%{}%", old_dl.to_string_lossy())],
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            assert_eq!(n, 0, "{table}.{col} 不得再指向旧下载目录");
+        }
+        // 幂等
+        assert!(
+            s.migrate_legacy_managed_roots().await.unwrap().is_none(),
+            "重复调用不得再报迁移"
+        );
+    }
+
+    /// 前缀剥离必须停在分隔符边界（`C:\Downloads` 不吃 `C:\Downloads2`）。
+    #[test]
+    fn strip_prefix_stops_at_separator() {
+        assert_eq!(
+            strip_prefix_ci(
+                r"C:\Users\u\Downloads\library\a.mp4",
+                r"C:\Users\u\Downloads\library"
+            ),
+            Some(r"\a.mp4".to_string())
+        );
+        assert_eq!(
+            strip_prefix_ci(r"C:\Users\u\Downloads2\a.mp4", r"C:\Users\u\Downloads"),
+            None,
+            "平行目录（前缀相同但不是子路径）不得被当作命中"
+        );
+        assert_eq!(
+            strip_prefix_ci(
+                r"c:\users\u\downloads\library\a.mp4",
+                r"C:\Users\u\Downloads\Library"
+            ),
+            Some(r"\a.mp4".to_string()),
+            "Windows 路径大小写不敏感"
+        );
+        assert_eq!(strip_prefix_ci("a.mp4", r"C:\x"), None);
     }
 
     #[tokio::test]
@@ -2888,15 +4133,28 @@ mod tests {
         assert_eq!(found.id, group2.id, "必须取 id 更大（最近一次尝试）");
     }
 
-    /// BUG-278：真实数据目录 = 库根（store.db 父目录），与派生的 proxy_dir 严格区分。
+    /// BUG-278：真实数据目录（store.db 父目录 = 程序数据：库文件/会话/凭据）
+    /// 与派生的 proxy_dir（媒体字节）严格区分。
+    /// BUG-323：代理落点已迁入**下载路径之内**（`<下载路径>/.orighub/proxies`）。
     #[tokio::test]
     async fn data_dir_is_library_root_not_proxy_dir_bug278() {
         let dir = std::env::temp_dir().join(format!("orig_tg_datadir_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let s = Store::open(dir.join("store.db")).await.unwrap();
         assert_eq!(s.data_dir(), dir);
-        assert_eq!(s.proxy_dir(), dir.join("proxies"));
-        assert_ne!(s.data_dir(), s.proxy_dir());
+        let proxy = s.proxy_dir().await;
+        assert_eq!(
+            proxy,
+            s.download_root()
+                .await
+                .join(Store::ENGINE_SUBDIR)
+                .join("proxies")
+        );
+        assert_ne!(s.data_dir(), proxy);
+        assert!(
+            proxy.starts_with(s.download_root().await),
+            "BUG-323：代理目录必须在下载路径之内"
+        );
     }
 
     /// BUG-220 + BUG-280：标题映射把 caption 与 file_name **分开**带回，

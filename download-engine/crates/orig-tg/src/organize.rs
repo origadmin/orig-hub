@@ -667,12 +667,10 @@ mod tests {
     fn tmp_root(tag: &str) -> std::path::PathBuf {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let d = std::env::temp_dir().join(format!(
-            "orig_organize_{}_{tag}_{seq}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        // 2026-10-19：夹具必须落在**非禁用盘**（`store::fixture_base`）—— 本组用例把
+        // 夹具根钉成下载根（库根/`.blobs` 都派生自它），而下载根解析到 C: 会被改道到
+        // 真实内容根 `D:\OrigDown`，整理动作会直接搬动用户真实文件。
+        let d = crate::store::fixture_base(&format!("organize-{tag}-{seq}"));
         d
     }
 
@@ -713,7 +711,10 @@ mod tests {
         let lib = tmp_root("apply");
         let db_path = lib.join("store.db");
         let s = crate::media::Store::open(&db_path).await.unwrap();
-        s.set_setting("library_dir", lib.to_str().unwrap()).await.unwrap();
+        // BUG-323：库根派生自下载根（`<下载根>/library`），独立的 `library_dir`
+        // 已无写入口；本组用例的 db 与 `.blobs` 都落在 `lib` 下 ⇒ 把 `lib` 钉为
+        // **下载根**，字节区整体仍在受管路径内。
+        s.set_setting("download_dir", lib.to_str().unwrap()).await.unwrap();
         let hash = "aa".repeat(32);
         let id = seed_item_with_blob(&s, &lib, "e1", &hash, 64, None, 1, 1).await;
         let target = tmp_root("apply_out");
@@ -757,7 +758,10 @@ mod tests {
     async fn organize_is_idempotent_on_rerun_bug311() {
         let lib = tmp_root("idem");
         let s = crate::media::Store::open(lib.join("store.db")).await.unwrap();
-        s.set_setting("library_dir", lib.to_str().unwrap()).await.unwrap();
+        // BUG-323：库根派生自下载根（`<下载根>/library`），独立的 `library_dir`
+        // 已无写入口；本组用例的 db 与 `.blobs` 都落在 `lib` 下 ⇒ 把 `lib` 钉为
+        // **下载根**，字节区整体仍在受管路径内。
+        s.set_setting("download_dir", lib.to_str().unwrap()).await.unwrap();
         let id = seed_item_with_blob(&s, &lib, "e1", &"bb".repeat(32), 32, None, 1, 1).await;
         let target = tmp_root("idem_out");
         let req = OrganizeRequest {
@@ -785,7 +789,10 @@ mod tests {
     async fn organize_adds_ordinal_on_same_batch_collision_bug311() {
         let lib = tmp_root("collide");
         let s = crate::media::Store::open(lib.join("store.db")).await.unwrap();
-        s.set_setting("library_dir", lib.to_str().unwrap()).await.unwrap();
+        // BUG-323：库根派生自下载根（`<下载根>/library`），独立的 `library_dir`
+        // 已无写入口；本组用例的 db 与 `.blobs` 都落在 `lib` 下 ⇒ 把 `lib` 钉为
+        // **下载根**，字节区整体仍在受管路径内。
+        s.set_setting("download_dir", lib.to_str().unwrap()).await.unwrap();
         let sid1 = s.create_series("同名剧", None, "series", None, None).await.unwrap();
         let sid2 = s.create_series("同名剧", None, "series", None, None).await.unwrap();
         let a = seed_item_with_blob(&s, &lib, "a", &"cc".repeat(32), 10, Some(sid1), 1, 1).await;
@@ -817,7 +824,10 @@ mod tests {
     async fn organize_reports_missing_for_items_without_bytes_bug311() {
         let lib = tmp_root("missing");
         let s = crate::media::Store::open(lib.join("store.db")).await.unwrap();
-        s.set_setting("library_dir", lib.to_str().unwrap()).await.unwrap();
+        // BUG-323：库根派生自下载根（`<下载根>/library`），独立的 `library_dir`
+        // 已无写入口；本组用例的 db 与 `.blobs` 都落在 `lib` 下 ⇒ 把 `lib` 钉为
+        // **下载根**，字节区整体仍在受管路径内。
+        s.set_setting("download_dir", lib.to_str().unwrap()).await.unwrap();
         s.upsert_media_item("tg", "-100:noblob", "无字节", "video", None, None, None, None)
             .await
             .unwrap();

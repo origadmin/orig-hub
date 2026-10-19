@@ -11,6 +11,10 @@
 //! - [`expand_tilde`] expands a leading `~` typed by a user into a real
 //!   absolute path, so a literal `~` never reaches the filesystem
 //!   (`PathBuf::from("~/Downloads")` would create `<CWD>/~/Downloads`).
+//! - [`normalize_dir`] folds path spelling a user can produce (`D:\\OrigDown`,
+//!   `D:/OrigDown/`, `D://OrigDown`) into one canonical form, so "the same
+//!   directory" is literally the same string everywhere (download root, DB
+//!   rows, boundary checks) — see BUG-323 re-report 2026-10-19.
 
 use std::path::{Path, PathBuf};
 
@@ -48,9 +52,11 @@ pub fn expand_tilde_path(path: &Path) -> PathBuf {
     }
 }
 
-/// Platform default download directory.
+/// **Nominal default download directory** (the OS download folder, `~/Downloads`).
 ///
-/// Resolution order, each step logged when it degrades:
+/// This is only a *nominal* default: the setting that exists so "unconfigured"
+/// has a defined value. It is **never used as a content write root** — see
+/// [`content_root`] and [`is_forbidden_content_drive`]. Resolution order:
 ///   1. [`dirs::download_dir`] — OS known-folder API (honours redirection).
 ///   2. `<home>/Downloads` — best effort when the known folder is unavailable.
 ///   3. `.` — last resort when there is no home directory at all.
@@ -70,6 +76,129 @@ pub fn default_download_dir() -> PathBuf {
         "cannot determine system download directory or home directory; falling back to current directory"
     );
     PathBuf::from(".")
+}
+
+/// The OS download folder (`~/Downloads`) — **legacy source identification only**.
+///
+/// Why this is separate from [`default_download_dir`]: before the 2026-10-19
+/// ruling ("never write content to the OS drive"), that *was* the content
+/// default, so the engine's library and cache bytes physically live under it on
+/// existing installs. Migration has to be able to *name* that folder to move the
+/// bytes out of it — while no resolution path may ever write there again.
+///
+/// **Never use this as a write target.** Resolution order:
+///   1. [`dirs::download_dir`] — OS known-folder API.
+///   2. `<home>/Downloads` — best effort when the known folder is unavailable.
+///   3. `None` — the caller skips the legacy source rather than guessing.
+pub fn os_download_dir() -> Option<PathBuf> {
+    if let Some(dir) = dirs::download_dir() {
+        return Some(dir);
+    }
+    home_dir().map(|home| home.join("Downloads"))
+}
+
+/// The **content root on the D: drive** — the value a forbidden root resolves to.
+///
+/// Ruling (verbatim, 2026-10-19): 「禁止往C盘写入任何数据,已经爆炸了. 所有内容应该写D盘」
+/// and, on how the nominal default relates to it: 「~/Downloads是默认设置,但是不使用,
+/// 改用加载配置的D盘设置,因为C盘禁用规则」.
+///
+/// So the OS download folder keeps existing as the *nominal* default, but every
+/// resolution that would land on a forbidden drive is redirected here instead.
+/// The live `download-engine.toml` / orig-tg `download_dir` settings already
+/// point at this directory; this constant is what an **unconfigured or
+/// C:-configured** install resolves to, so such an install lands on the same
+/// place rather than on the forbidden drive.
+pub const CONTENT_ROOT: &str = r"D:\OrigDown";
+
+/// [`CONTENT_ROOT`] as a [`PathBuf`].
+pub fn content_root() -> PathBuf {
+    PathBuf::from(CONTENT_ROOT)
+}
+
+/// Drives that must **never** hold content bytes (ruling 2026-10-19).
+///
+/// The OS drive is the one that "exploded"; it holds the OS, page file and the
+/// user's own files, so engine-written media/cache must never accumulate there.
+/// UNC paths are not drive-lettered and are therefore not forbidden here.
+pub fn is_forbidden_content_drive(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    let drive: String = s.chars().take(2).collect();
+    drive.len() == 2
+        && drive.as_bytes()[1] == b':'
+        && drive.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && drive.eq_ignore_ascii_case(FORBIDDEN_CONTENT_DRIVE)
+}
+
+/// The forbidden content drive letter (the OS drive, `C:` on this deployment).
+pub const FORBIDDEN_CONTENT_DRIVE: &str = "C:";
+
+/// Canonical spelling for a **directory** path string.
+///
+/// Why this exists (BUG-323 re-report, 2026-10-19): the live stack was found
+/// with `download_dir = "D://OrigDown"` — a form no user ever typed. Separator
+/// spelling that users *can* produce (`D:\\OrigDown` pasted from elsewhere,
+/// `D:/OrigDown/` from the in-app browser, `D://OrigDown` after a `\` → `/`
+/// rewrite that does not fold duplicates) must converge to **one** literal,
+/// because every boundary decision and every DB prefix rewrite is a **string**
+/// comparison. Windows tolerates duplicate separators at the API layer, which
+/// is exactly what let the bad spelling survive into config and DB.
+///
+/// Rules (after the caller has already expanded `~`):
+/// - `\` is rewritten to `/` (the TOML writer already assumes this form);
+/// - runs of separators collapse to one — **except** a leading UNC `//`;
+/// - a trailing separator is trimmed, but a drive root (`C:/`) and Unix `/`
+///   are preserved;
+/// - case is **not** touched (Windows case-insensitivity is handled by the
+///   consumers of this helper, e.g. the prefix comparisons in `orig-tg`, not
+///   here).
+pub fn normalize_dir(input: &str) -> String {
+    let s = input.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(s.len());
+    // UNC `\\server\share` / `//server/share`: keep the leading double slash,
+    // it is part of the server identity, not a separator run.
+    let body = if s.starts_with("\\\\") || s.starts_with("//") {
+        out.push_str("//");
+        &s[2..]
+    } else {
+        s
+    };
+    let mut prev_slash = false;
+    for ch in body.chars() {
+        match ch {
+            '\\' | '/' => {
+                if !prev_slash {
+                    out.push('/');
+                }
+                prev_slash = true;
+            }
+            _ => {
+                out.push(ch);
+                prev_slash = false;
+            }
+        }
+    }
+    // Trim the trailing separator, but keep a drive root (`C:/`, len 3, `:` at
+    // index 1) and a bare Unix root (`/`).
+    while out.len() > 1 && out.ends_with('/') {
+        let is_drive_root = out.len() == 3 && out.as_bytes().get(1) == Some(&b':');
+        if is_drive_root {
+            break;
+        }
+        out.pop();
+    }
+    out
+}
+
+/// [`normalize_dir`] for values that are already a [`PathBuf`].
+pub fn normalize_dir_path(path: &Path) -> PathBuf {
+    match path.to_str() {
+        Some(s) => PathBuf::from(normalize_dir(s)),
+        None => path.to_path_buf(),
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +242,76 @@ mod tests {
         // when a home directory exists the result is anchored to an absolute path
         if home_dir().is_some() {
             assert!(dir.is_absolute(), "expected absolute path, got {}", dir.display());
+        }
+    }
+
+    /// 用户裁定（2026-10-19）：「禁止往C盘写入任何数据,所有内容应该写D盘」。
+    ///
+    /// 判据是**解析结果**，不是「默认值长什么样」：名义默认 `~/Downloads` 仍在
+    /// （用户原话「~/Downloads是默认设置,但是不使用」），但任何解析到禁用盘的
+    /// 根都必须被改成 D 盘内容根，否则装机一开箱就把内容写进系统盘
+    /// （活栈实测 30.2 GB 就是这么积起来的）。
+    #[test]
+    #[cfg(windows)]
+    fn forbidden_content_drive_is_detected_and_redirected() {
+        // ① 系统盘路径必须被认出
+        assert!(is_forbidden_content_drive(Path::new(r"C:\OrigDown")));
+        assert!(is_forbidden_content_drive(Path::new(r"c:/users/u/downloads")));
+        // ② D 盘与 UNC 不得被误判（误判 = 把 D 盘内容也改道）
+        assert!(!is_forbidden_content_drive(Path::new(r"D:\OrigDown")));
+        assert!(!is_forbidden_content_drive(Path::new(r"d:\videos")));
+        assert!(!is_forbidden_content_drive(Path::new(r"\\nas\share")));
+        assert!(!is_forbidden_content_drive(Path::new("/home/u/Downloads")));
+        // ③ 名义默认在系统盘上 ⇒ 实际内容根必须在 D 盘
+        if is_forbidden_content_drive(&default_download_dir()) {
+            assert!(!is_forbidden_content_drive(&content_root()));
+        }
+    }
+
+    // ---- normalize_dir (BUG-323 re-report 2026-10-19) ----
+
+    #[test]
+    fn normalize_dir_folds_separator_spelling() {
+        // 活栈实测污染形态（BUG-323 复报）：必须收敛到同一个字面
+        assert_eq!(normalize_dir("D://OrigDown"), "D:/OrigDown");
+        assert_eq!(normalize_dir("D:\\OrigDown"), "D:/OrigDown");
+        assert_eq!(normalize_dir("D:/OrigDown"), "D:/OrigDown");
+        assert_eq!(normalize_dir("D:\\OrigDown\\"), "D:/OrigDown");
+        assert_eq!(normalize_dir("  D:/OrigDown  "), "D:/OrigDown");
+        assert_eq!(normalize_dir("D:\\Videos\\a\\b"), "D:/Videos/a/b");
+        assert_eq!(normalize_dir(""), "");
+    }
+
+    #[test]
+    fn normalize_dir_keeps_drive_and_unix_roots() {
+        assert_eq!(normalize_dir("C:/"), "C:/");
+        assert_eq!(normalize_dir("C:\\"), "C:/");
+        assert_eq!(normalize_dir("C://"), "C:/");
+        assert_eq!(normalize_dir("/"), "/");
+        // UNC：前导双斜杠是服务器身份的一部分，不是分隔符连排
+        assert_eq!(normalize_dir("\\\\server\\share\\x"), "//server/share/x");
+        assert_eq!(normalize_dir("//server/share/"), "//server/share");
+    }
+
+    #[test]
+    fn normalize_dir_preserves_case() {
+        // 大小写不敏感由消费方（前缀比较）负责，此处不擅自改
+        assert_eq!(normalize_dir("d:/origdown"), "d:/origdown");
+    }
+
+    #[test]
+    fn normalize_dir_path_matches_string_variant() {
+        assert_eq!(
+            normalize_dir_path(Path::new("D://OrigDown")),
+            PathBuf::from("D:/OrigDown")
+        );
+    }
+
+    #[test]
+    fn normalize_dir_is_idempotent() {
+        for raw in ["D://OrigDown", "D:\\OrigDown\\sub\\", "//srv/share/x"] {
+            let once = normalize_dir(raw);
+            assert_eq!(normalize_dir(&once), once, "not idempotent for {raw}");
         }
     }
 }

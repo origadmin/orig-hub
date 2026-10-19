@@ -51,11 +51,13 @@ const NAV_TIMEOUT_MS = Number(process.env.ORIG_VERIFY_NAV_TIMEOUT || 45000)
 const REQUIRED_TESTIDS = [
   'context-bar',
   'context-bar-header',
-  'context-bar-title',
+  'page-title',
   'nav-files',
   'nav-files-row',
   'files-chevron',
-  'nav-child-video',
+  // BUG-298 侧栏重构后「视频」入口的 testid：nav-child-cat-video（落点 cat:video）；
+  // 「剧集」入口独立为 nav-child-lib-series。旧 nav-child-video 随合并撤回废止。
+  'nav-child-cat-video',
   'nav-child-lib-series',
   'nav-download',
   'nav-download-row',

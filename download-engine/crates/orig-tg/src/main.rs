@@ -209,6 +209,106 @@ async fn main() {
 
     let state = Arc::new(AppState::new(client, config.clone(), availability.clone(), mock, store));
 
+    // BUG-323：存量受管根迁移（引擎写过的旧落点 → 下载路径之内）。
+    //
+    // 库根改为派生值后不迁移 = 存量字节整片失联：库根相对路径的条目在新根下
+    // 解析不到，绝对路径的条目被权限闸门 403。旧落点有两处：旧库根（应用内部目录）
+    // 与**旧默认下载目录** `<TG 数据目录>/downloads`（实测 33 个文件 / 3.5 GB）。
+    // 迁移**只移动不覆盖**，失败不阻断启动（源字节仍在原处，下次启动重试）。
+    match state.store.migrate_legacy_managed_roots().await {
+        Ok(Some(m)) => {
+            for r in &m.roots {
+                let msg = format!(
+                    "legacy root migrated ({}): {} -> {} (moved {} top-level item(s), \
+                     skipped {}, rewritten {} row(s))",
+                    r.name, r.from, r.to, r.moved, r.skipped, r.rewritten
+                );
+                println!("[tg] {msg}");
+                state.push_log(msg);
+            }
+            // 迁移回执落盘（只读线索，不删任何东西）：便于事后核对搬了什么。
+            if let Ok(json) = serde_json::to_string_pretty(&m) {
+                let _ = std::fs::write(state.store.data_dir().join("legacy-roots-migration.json"), json);
+            }
+            if m.skipped() > 0 {
+                state.push_log(format!(
+                    "[warn] {} top-level item(s) skipped while migrating legacy roots: \
+                     same name already exists at the new root (nothing was overwritten)",
+                    m.skipped()
+                ));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            let msg = format!("[warn] legacy managed-root migration failed: {e}");
+            eprintln!("{msg}");
+            state.push_log(msg);
+        }
+    }
+
+    // BUG-323 复报（2026-10-19）：平台默认下载目录（`~/Downloads`）下的引擎旧落点。
+    //
+    // 与上一段分开的两点理由：① 这两处来自**真实家目录**（`default_download_dir()`
+    // 在测试进程里同样解析到家目录），必须只由启动路径触达 —— 混进
+    // `legacy_managed_roots()` 会让单测把用户的媒体搬进 %TEMP%（BUG-325 实测
+    // 27.5 GB）；② 它体量大得多（实测 24 GB + 3.5 GB），日志单独一行便于核对。
+    match state.store.migrate_platform_default_legacy_roots().await {
+        Ok(Some(m)) => {
+            for r in &m.roots {
+                let msg = format!(
+                    "platform-default legacy root migrated ({}): {} -> {} (moved {} \
+                     top-level item(s), skipped {}, rewritten {} row(s))",
+                    r.name, r.from, r.to, r.moved, r.skipped, r.rewritten
+                );
+                println!("[tg] {msg}");
+                state.push_log(msg);
+            }
+            if m.skipped() > 0 {
+                state.push_log(format!(
+                    "[warn] {} top-level item(s) skipped while migrating platform-default \
+                     legacy roots: same name already exists at the new root (nothing was \
+                     overwritten)",
+                    m.skipped()
+                ));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            let msg = format!("[warn] platform-default legacy root migration failed: {e}");
+            eprintln!("{msg}");
+            state.push_log(msg);
+        }
+    }
+
+    // BUG-323 复报（2026-10-19）：下载根**运行中变更**后的断点续迁。
+    //
+    // `migrate_legacy_managed_roots` 只认固定历史落点；用户在设置里把下载路径
+    // 从 A 改到 B 之后，锚点 `last_download_root` 仍是 A ⇒ 这里把 A 的引擎字节
+    // 搬进 B 并改写 DB。上次迁移有同名冲突（skipped>0）时锚点保留，重启自动重试。
+    match state.store.migrate_root_change().await {
+        Ok(Some(m)) => {
+            let msg = format!(
+                "download root change migrated: {} -> {} (moved {} top-level item(s), \
+                 skipped {}, rewritten {} row(s))",
+                m.from, m.to, m.moved, m.skipped, m.rewritten
+            );
+            println!("[tg] {msg}");
+            state.push_log(msg);
+            if let Ok(json) = serde_json::to_string_pretty(&m) {
+                let _ = std::fs::write(
+                    state.store.data_dir().join("root-change-migration.json"),
+                    json,
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            let msg = format!("[warn] download root change migration failed: {e}");
+            eprintln!("{msg}");
+            state.push_log(msg);
+        }
+    }
+
     // 僵尸缓存任务降级（BUG-024）：进程被杀/崩溃时残留的 running 永远等不到 worker，
 // 必须显式标成 interrupted，否则前端会显示一个永不推进的「缓存中」假状态。
     match state.store.mark_stale_cache_tasks().await {

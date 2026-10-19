@@ -59,15 +59,13 @@ impl Default for Config {
     }
 }
 
-/// 平台默认下载目录（对齐 orig-daemon：~/Downloads）。
+/// 平台默认下载目录 —— **委托 `orig_core::paths::default_download_dir()`**（单一真源）。
+///
+/// BUG-323：此处曾自带一份 HOME/USERPROFILE 拼接实现，与 `orig-daemon` /
+/// `orig-core` 各算一套（Windows 上还得不到 `SHGetKnownFolderPath` 的真值）。
+/// 下载路径是全部文件的唯一容器，其默认值只允许一处实现。
 pub fn default_download_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join("Downloads");
-    }
-    if let Ok(prof) = std::env::var("USERPROFILE") {
-        return PathBuf::from(prof).join("Downloads");
-    }
-    PathBuf::from(".")
+    orig_core::paths::default_download_dir()
 }
 
 impl Config {

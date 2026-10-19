@@ -41,7 +41,7 @@
 
 ---
 
-## 三、设计文档（`docs/design/`，34 篇）
+## 三、设计文档（`docs/design/`，35 篇）
 
 ### 3.1 媒体库 · 剧集内页（**改这里之前必读**）
 
@@ -70,6 +70,7 @@
 | `tg-ux-tech-assessment.md` | TG UX 技术评估 | — | 未标注 |
 | `tg-ux-implementation-plan.md` | TG UX 实施计划 | — | 未标注 |
 | `telegram-cache-storage-redesign.md` | TG 缓存存储重设计 | — | 未标注 |
+| `ingest-pipeline-boundary-2026-10-17.md` | **入库流水线归位 + 插件宿主落地**（模块边界锁定；TG 面板专业划分；IPB-P1~P4 分期） | 10-17 | draft |
 
 ### 3.3 存储 · 数据
 

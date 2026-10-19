@@ -18,6 +18,7 @@ import {
   listDownloads,
   listInterfaces,
   removeDownload as apiRemoveDownload,
+  retryDownload as apiRetryDownload,
   restartTgService as apiRestartTg,
   saveTgConfig,
   setDaemonPort,
@@ -29,6 +30,20 @@ import type { AddDownloadRequest, ViewerItem } from '../types'
 
 const SETTINGS_KEY = 'orig-hub:settings'
 const ACCOUNTS_KEY = 'orig-hub:accounts'
+
+/**
+ * 文件域库级动作注册表（BUG-317 / 任务 #9）。
+ *
+ * 四个动作都是**打开面板内既有对话框**（import / createSeries / export /
+ * manageTags），不携带参数也不回传结果 —— 对话框内部的失败提示由面板自己
+ * 经 `setError` 处理，与它们原先挂在面板头部时完全同一路径。
+ */
+export interface FilesActions {
+  import: () => void
+  createSeries: () => void
+  export: () => void
+  manageTags: () => void
+}
 
 /** TG 有界退避探测：最多 5 次、每次间隔 1.5s（启动期，非轮询；BUG-097） */
 const TG_PROBE_MAX_ATTEMPTS = 5
@@ -207,6 +222,23 @@ interface DownloadState {
   setPendingTgFocus: (focus: { chatId: number; messageId: number } | null) => void
 
   /**
+   * 文件域**库级动作注册表**（BUG-317 页面结构规范 / 任务 #9 按钮统一化）。
+   *
+   * 「导入目录 / 新建剧集 / 导出 / 标签管理」是库级动作（不读任何选择集），
+   * 按 BUG-317 四件套应上标题行右槽作为 `page-primary-action` 与次级按钮 ——
+   * 而标题行是应用外壳的 `ContextBar`（跨子树），对话框 state 与 `refreshAll`
+   * 却都在 `MediaLibraryPanel` 里。搬 state 会把面板的数据局部性打散，
+   * 故走**注册表**：面板挂载时把四个 dialog-open handler 注册进 store，
+   * `ContextBar` 的 files 分支读取并调用；卸载时注销（null）。
+   *
+   * 与 `pendingMediaFocus` / `pendingTgFocus` 同一模式（store 作跨组件信号通道），
+   * 区别只在形态：那两个传「坐标」，这个传「可执行回调」。
+   * null = 文件面板未挂载（按钮整簇不渲染 —— 不可用就不展示，不呈现死按钮）。
+   */
+  filesActions: FilesActions | null
+  setFilesActions: (a: FilesActions | null) => void
+
+  /**
    * TG **服务层**状态（orig-tg 进程）：真源是 daemon `/api/config`（BUG-178）。
    *
    * 「服务在不在」只由 daemon 回答 —— 前端不再自己探测 orig-tg 端口：那是把
@@ -270,6 +302,8 @@ interface DownloadState {
   pause: (id: string) => Promise<void>
   resume: (id: string) => Promise<void>
   cancel: (id: string) => Promise<void>
+  /** 重试一条停住的行。端点独立于 pause/resume/cancel（它作用于记录，不是活体）。 */
+  retry: (id: string) => Promise<void>
   remove: (id: string) => Promise<void>
   pauseAll: () => Promise<void>
   resumeAll: () => Promise<void>
@@ -295,6 +329,10 @@ export const useStore = create<DownloadState>((set, get) => ({
   pendingMediaFocus: null,
   // BUG-305：媒体库 → TG 面板的正向跳转焦点（与上一行反向对应；null = 无待消费焦点）。
   pendingTgFocus: null,
+  // 文件域库级动作注册表（BUG-317 / 任务 #9）：null = 文件面板未挂载，
+  // 标题行右槽的库级按钮整簇不渲染（不可用就不展示）。
+  filesActions: null,
+  setFilesActions: (a) => set({ filesActions: a }),
   // 入口级门控（`resolveTgFeatureReady`）只由服务层决定：开关开着 **且** daemon 说
   // 进程在服务才显示。daemon 不可达 / 插件关闭 / 拉起失败时入口保持隐藏 ——
   // 不可用就不展示（不呈现死按钮，违反设计）。
@@ -429,6 +467,10 @@ export const useStore = create<DownloadState>((set, get) => ({
   },
   cancel: async (id) => {
     await apiDownloadAction(id, 'cancel')
+    await get().refresh()
+  },
+  retry: async (id) => {
+    await apiRetryDownload(id)
     await get().refresh()
   },
   remove: async (id) => {

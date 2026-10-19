@@ -118,10 +118,13 @@ async function main() {
     const sidebarSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'shell', 'Sidebar.tsx'), 'utf8')
     const localeZh = fs.readFileSync(path.join(__dirname, '..', 'src', 'i18n', 'locales', 'zh-CN.json'), 'utf8')
     const localeEn = fs.readFileSync(path.join(__dirname, '..', 'src', 'i18n', 'locales', 'en-US.json'), 'utf8')
-    const deadKeys = ['nav.group.manage', 'files.group.library', 'files.group.category', 'files.lib.series']
+    // `files.lib.series` 曾是死键（BUG-306 合并期剧集入口被撤、键随之废弃），
+    // 但 BUG-298（4609043）撤回合并、恢复独立剧集入口后该键重新变成活键 ——
+    // 留在死键清单会让本断言恒红。死键清单只保留三个组标签键。
+    const deadKeys = ['nav.group.manage', 'files.group.library', 'files.group.category']
     const srcHits = deadKeys.filter((k) => sidebarSrc.includes(`'${k}'`) || sidebarSrc.includes(`t('${k}')`))
     const localeHits = deadKeys.filter((k) => localeZh.includes(`"${k}"`) || localeEn.includes(`"${k}"`))
-    check('判据1 四个死键在 Sidebar.tsx 与两个 locale 中 0 命中',
+    check('判据1 三个死键在 Sidebar.tsx 与两个 locale 中 0 命中',
       srcHits.length === 0 && localeHits.length === 0,
       `src=${srcHits.join(',') || '0'} locale=${localeHits.join(',') || '0'}`)
 
@@ -129,28 +132,35 @@ async function main() {
     const labels = await page.evaluate(() => ({
       filesTitle: window.__b306.attr('[data-testid="nav-files"]', 'title'),
       dlTitle: window.__b306.attr('[data-testid="nav-download"]', 'title'),
-      ctxTitle: (document.querySelector('[data-testid="context-bar-title"]') || {}).innerText,
+      ctxTitle: (document.querySelector('[data-testid="page-title"]') || {}).innerText,
     }))
     check('判据2 文件树父行 = 「文件管理」', labels.filesTitle === '文件管理', `title=${labels.filesTitle}`)
     check('判据2（牙）顶栏域标题同源 = 「文件管理」', labels.ctxTitle === '文件管理', `ctx=${labels.ctxTitle}`)
     check('判据3 下载父行 = 「全部下载」', labels.dlTitle === '全部下载', `title=${labels.dlTitle}`)
 
-    // ── 判据 8：剧集/视频合并 ──
+    // ── 判据 8：剧集/视频合并撤回后的双入口（BUG-298 撤回 BUG-307 合并）──
+    // BUG-298（4609043）裁定：文件树下恢复「剧集」（TG 插件派生，nav-child-lib-series）
+    // 与「视频」（普通下载扁平库，nav-child-cat-video）两个独立入口，且**剧集在
+    // 视频之上**。本脚本 bbff8a6 时代的断言（「无独立剧集入口、唯一视频入口」）写
+    // 的是合并期形态，随合并撤回一并失效 —— 按当前设计裁定重写：
+    // 旧扁平 testid `nav-child-video` 必须缺席（假绿源：它早在 BUG-181 时代就没了，
+    // 旧断言因此恒真），真入口必须按新 testid 各出现一次且剧集居首。
     const merge = await page.evaluate(() => {
       const children = window.__b306.fileChildren()
       return {
         children,
-        catVideo: window.__b306.present('[data-testid="nav-child-video"]'),
-        seriesEntries: children.filter((c) => c.label === '剧集').length,
-        videoEntries: children.filter((c) => c.label === '视频').length,
-        first: children[0] || null,
+        legacyFlatVideo: window.__b306.present('[data-testid="nav-child-video"]'),
+        seriesEntries: children.filter((c) => c.testid === 'nav-child-lib-series').length,
+        videoEntries: children.filter((c) => c.testid === 'nav-child-cat-video').length,
+        seriesFirst: Boolean(children[0]) && children[0].testid === 'nav-child-lib-series',
       }
     })
-    check('判据8 无 cat:video 扁平分类子项', merge.catVideo === 0, `nav-child-video count=${merge.catVideo}`)
-    check('判据8 无独立「剧集」入口', merge.seriesEntries === 0, `标签=剧集 的子项 ${merge.seriesEntries} 个`)
-    check('判据8 唯一「视频」入口且位于子项最上方',
-      merge.videoEntries === 1 && merge.first && merge.first.label === '视频',
-      `video 入口 ${merge.videoEntries} 个；首项=${merge.first && merge.first.label}`)
+    check('判据8 无旧扁平视频 testid（nav-child-video 废止）', merge.legacyFlatVideo === 0, `count=${merge.legacyFlatVideo}`)
+    check('判据8 剧集入口唯一（nav-child-lib-series）', merge.seriesEntries === 1, `子项 ${merge.seriesEntries} 个`)
+    check('判据8 视频入口唯一（nav-child-cat-video）', merge.videoEntries === 1, `视频 子项 ${merge.videoEntries} 个`)
+    check('判据8 剧集入口位于视频之上（BUG-298 排序裁定）',
+      merge.seriesFirst,
+      `首项=${merge.children[0] && merge.children[0].label}`)
     const wall = await page.evaluate(async () => {
       const ok = window.__b306.click('[data-testid="nav-child-lib-series"]')
       await window.__b306.wait(1500)
@@ -159,7 +169,7 @@ async function main() {
       return { ok, cards, total: (all.items || []).length }
     })
     check('判据8（牙）API 确有剧集（证明墙有内容可验）', wall.total > 0, `series total=${wall.total}`)
-    check('判据8 点「视频」落入剧集栅格（lib-series）', wall.ok === true && wall.cards > 0,
+    check('判据8 点「剧集」落入剧集栅格（lib-series）', wall.ok === true && wall.cards > 0,
       `cards=${wall.cards} / total=${wall.total}`)
 
     // ── 判据 4：文件域父子排他 ──
@@ -185,8 +195,8 @@ async function main() {
         parentLit: window.__b306.lit('[data-testid="nav-files-row"]'),
       }
     })
-    check('判据4 选中「视频」入口时该子项高亮', seriesEntry.childLit === true, `childLit=${seriesEntry.childLit}`)
-    check('判据4 选中「视频」入口时文件父行熄灭（排他）', seriesEntry.parentLit === false,
+    check('判据4 选中「剧集」入口时该子项高亮', seriesEntry.childLit === true, `childLit=${seriesEntry.childLit}`)
+    check('判据4 选中「剧集」入口时文件父行熄灭（排他）', seriesEntry.parentLit === false,
       `parentLit=${seriesEntry.parentLit}`)
     const parent = await page.evaluate(async () => {
       window.__b306.click('[data-testid="nav-files"]')
@@ -265,7 +275,14 @@ async function main() {
           cjk,
           filesTitle: window.__b306.attr('[data-testid="nav-files"]', 'title'),
           dlTitle: window.__b306.attr('[data-testid="nav-download"]', 'title'),
-          videoLabel: (window.__b306.fileChildren()[0] || {}).label,
+          // BUG-298 后「视频」入口 testid = nav-child-cat-video（剧集居首，不能再
+          // 取 children[0] —— 那是剧集入口，其 en 标签是 "Series"）。
+          videoLabel: (() => {
+            const hit = window.__b306
+              .fileChildren()
+              .find((c) => c.testid === 'nav-child-cat-video')
+            return hit ? hit.label : ''
+          })(),
         }
       })
       check('判据7 en-US 侧栏无硬编码 CJK 残留', en.cjk.length === 0, `CJK: ${en.cjk.slice(0, 3).join(' / ') || '0'}`)

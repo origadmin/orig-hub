@@ -56,7 +56,7 @@ const EPISODE_TEXT_MIG: &str = "mig.episode_text_to_item_v1";
 /// **为什么必须是一次性**（BUG-258）：那条 UPDATE 的原意是纠正 BUG-044 之前
 /// 自动成剧写下的混编 `collection/album` 脏徽标，但它本该带的护栏
 /// 「且全部分集都是 video/photo」早已恒真 —— 同一份 `migrate()` 建的
-/// `trg_media_episode_media_only_*` 触发器已经保证分集只能是 `video|photo`。
+/// `trg_media_episode_video_only_*` 触发器已经保证分集只能是 `video`。
 /// 于是它的实际语义退化成「**任何有分集的剧集，每次启动都被改回 series**」，
 /// 用户的类型选择当场保存成功、重启后被静默撤销（实测真库 45/45 全是 `series`）。
 ///
@@ -277,10 +277,10 @@ async fn collapse_episode_text(conn: &Connection) -> libsql::Result<(usize, usiz
 /// ## 为什么是「一次性」而不是每次启动都跑
 ///
 /// 这条 UPDATE 自 BUG-044 起就挂在 `migrate()` 里，而 `migrate()` 由
-/// `Store::open` **无条件**调用。它的护栏「且全部分集都是 video/photo」在
-/// BUG-044 把分集放宽到 `video|photo` 之后已经**恒真** —— 同一份 `migrate()`
-/// 建的 `trg_media_episode_media_only_ins/_upd` 触发器
-/// （`media.rs` 的 `BUG-044 规则级不变量`）保证任何分集条目必属 `video|photo`。
+/// `Store::open` **无条件**调用。它的护栏「且全部分集都是 video」在
+/// BUG-044（2026-10-15 回归修复后）已经**恒真** —— 同一份 `migrate()`
+/// 建的 `trg_media_episode_video_only_ins/_upd` 触发器
+/// （`media.rs` 的 `BUG-044 规则级不变量`）保证任何分集条目必属 `video`。
 /// 于是实际语义退化为：
 ///
 /// > **任何有分集的剧集，每次启动都被强制改成 `'series'`。**
@@ -970,14 +970,17 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
     // 分集 / 备用源，数据库直接拒绝。条目不存在（kind 查不到 = NULL）同样拒绝：
     // 挂一个未知条目当分集与挂一张图片当分集是同一类错误状态。
     //
-    // 先清历史脏数据（旧版本自动成剧曾把整组 TG 相册连同图片一起编成剧集），
+    // 先清历史脏数据（旧版本自动成剧曾把整组 TG 相册连同图片一起编成剧集；
+    // 2026-10-15 回归修复：第 4 轮「照片各自成集」又产生了 50 条照片分集），
     // 失去全部分集的剧集随之删除（纯图组从来不该是「剧集」）。
+    // **字节与条目不受影响**：只摘 `media_episode` 行，`media_item`（含 file_path）
+    // 原样保留 —— 照片回到「库内内容」位，可检索、可浏览，只是不再占用集号。
     let mut affected_series: Vec<i64> = Vec::new();
     {
         let stmt = conn
             .prepare(
                 "SELECT DISTINCT series_id FROM media_episode
-                  WHERE item_id IN (SELECT id FROM media_item WHERE kind NOT IN ('video','photo'))",
+                  WHERE item_id IN (SELECT id FROM media_item WHERE kind IS NOT 'video')",
             )
             .await?;
         let mut rows = stmt.query(()).await?;
@@ -987,11 +990,11 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
     }
     conn.execute(
         "DELETE FROM media_episode
-          WHERE item_id IN (SELECT id FROM media_item WHERE kind NOT IN ('video','photo'))",
+          WHERE item_id IN (SELECT id FROM media_item WHERE kind IS NOT 'video')",
         (),
     )
     .await?;
-    // 播放源**仍然只认 video**：图片可以进剧集（浏览位），但永远不能成为某个 GIF。
+    // 播放源**只认 video**：图片永远不能成为某个分集的播放源。
     conn.execute(
         "DELETE FROM media_episode_source
           WHERE item_id IN (SELECT id FROM media_item WHERE kind IS NOT 'video')",
@@ -1028,29 +1031,33 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
     if kind_fixed > 0 {
         eprintln!("[media] series kind normalized to 'series' (one-time): {kind_fixed} row(s)");
     }
-    // 剧集是**通用归档容器**（用户在第 4 轮裁定）：所有缓存内容都进剧集 —— 单条视频、
-    // 单张图片也成剧，因为只有剧集才有「标题 + 介绍 + 标签」的完整档案位。
-    // 因此对分集放宽到 `video | photo`；图片作为**浏览位内容**入剧，
-    // 播放序列在展示层排除非视频（播放永远与图片无关）。
+    // 剧集分集**只能是视频**（BUG-044 用户裁定，最高优先级）：
+    //   「图片是浏览点，与视频完全无关。播放一个视频永远不能播到一张图片。
+    //     剧集分集与备用源只能是视频；图片不参与成剧、不参与编集、不参与集号排序。」
     //
-    // BUG-168 细化（自动入库路径）：组内**同时含视频与照片**时，照片不再各占一个
-    // 集号（那会挤占视频的集数、把「第 N 集」变成图片），改挂到它之前最近的视频
-    // 所在集的图片位（`media_episode_image`）；photo-only 组保持现状（照片各自成集，
-    // 浏览位语义不变）。
+    // ⚠️ 2026-10-15 回归修复：第 4 轮曾以「剧集是通用归档容器」为由把分集放宽到
+    // `video | photo`，用户随即裁定那是**基础逻辑错误** —— 下载的图片与视频混用
+    // 「集」。实测生产库：50 条真实照片分集、31 个纯图剧集（photo-only 组每张照片
+    // 各自成集）。故触发器回到 video-only，并新增一次性启动修复摘除历史照片分集
+    // （见 [`detach_non_video_episodes_once`]）。
     //
-    // **唯一剩下的硬门是播放源**：`media_episode_source` 仍只接受 video ——
+    // 图片的归属只有两处，都不占集号：
+    //   - 混编组（组内有视频）：挂到它之前最近的视频所在集的**图片位**
+    //     （`media_episode_image`，触发器 `*_photo_only_*` 已锁死只能挂 photo）；
+    //   - photo-only 组：只完成 T0 登记（`media_item` 行），作为库内内容可检索。
+    //
+    // **唯一剩下的硬门是播放源**：`media_episode_source` 只接受 video ——
     // 「播放视频时播放到图片」这个错误从此在结构上不可表达，而不是靠展示层自觉。
     //
     // ⚠️ 退役的旧触发器必须**显式 DROP**：`CREATE TRIGGER IF NOT EXISTS` 只防「重复创建」，
-    // 不会让**另一个名字**的旧触发器失效。第 4 轮把分集放宽到 video|photo 时新增了
-    // `*_media_only_*`，但旧的 `trg_media_episode_video_only_ins/upd` 仍留在**已升级的库**里，
-    // 它们在 `kind IS NOT 'video'` 时 ABORT —— 于是图片分集在老库上插入被拒，表现为
-    // 「剧集建成却 0 分集」。全新库（单测）没有旧触发器，故只有「旧库→新代码」这条路径
-    // 会踩坑；收敛只能靠 DROP，不能靠重建。
+    // 不会让**另一个名字**的旧触发器失效。第 4 轮新增的 `*_media_only_*`（放行 photo）
+    // 与 BUG-044 最初的 `*_video_only_*` 是两套名字，收敛只能靠 DROP，不能靠重建。
     conn.execute_batch(
         r#"
         DROP TRIGGER IF EXISTS trg_media_episode_video_only_ins;
         DROP TRIGGER IF EXISTS trg_media_episode_video_only_upd;
+        DROP TRIGGER IF EXISTS trg_media_episode_media_only_ins;
+        DROP TRIGGER IF EXISTS trg_media_episode_media_only_upd;
         "#,
     )
     .await?;
@@ -1058,21 +1065,21 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
         // 条件必须**显式判 NULL**：`kind` 为 NULL 有两种成因（条目不存在 / kind 列为空），
         // 而 `NULL NOT IN (...)` 求值为 NULL 而非真 —— 只写 NOT IN 会让「不存在的条目」
         // 堂而皇之成为分集（悬空外键）。两种成因都不合法，故 OR 并列。
-        "CREATE TRIGGER IF NOT EXISTS trg_media_episode_media_only_ins
+        "CREATE TRIGGER IF NOT EXISTS trg_media_episode_video_only_ins
              BEFORE INSERT ON media_episode
              FOR EACH ROW
              WHEN (SELECT kind FROM media_item WHERE id = NEW.item_id) IS NULL
-                  OR (SELECT kind FROM media_item WHERE id = NEW.item_id) NOT IN ('video','photo')
+                  OR (SELECT kind FROM media_item WHERE id = NEW.item_id) IS NOT 'video'
              BEGIN
-                 SELECT RAISE(ABORT, 'episode item must be an existing video or photo item');
+                 SELECT RAISE(ABORT, 'episode item must be an existing video item');
              END",
-        "CREATE TRIGGER IF NOT EXISTS trg_media_episode_media_only_upd
+        "CREATE TRIGGER IF NOT EXISTS trg_media_episode_video_only_upd
              BEFORE UPDATE OF item_id ON media_episode
              FOR EACH ROW
              WHEN (SELECT kind FROM media_item WHERE id = NEW.item_id) IS NULL
-                  OR (SELECT kind FROM media_item WHERE id = NEW.item_id) NOT IN ('video','photo')
+                  OR (SELECT kind FROM media_item WHERE id = NEW.item_id) IS NOT 'video'
              BEGIN
-                 SELECT RAISE(ABORT, 'episode item must be an existing video or photo item');
+                 SELECT RAISE(ABORT, 'episode item must be an existing video item');
              END",
         "CREATE TRIGGER IF NOT EXISTS trg_media_episode_source_video_only_ins
              BEFORE INSERT ON media_episode_source
@@ -1588,6 +1595,31 @@ pub struct ManifestEntry {
     pub season: Option<i64>,
     #[serde(rename = "episodeNo", skip_serializing_if = "Option::is_none")]
     pub episode_no: Option<i64>,
+    /// BUG-315（信息补齐）：文件名（`media_message.file_name`），无则为 `None`。
+    #[serde(rename = "fileName", skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    /// BUG-315（信息补齐）：消息文案（`media_message.caption`），无则为 `None`。
+    #[serde(rename = "caption", skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    /// BUG-315（信息补齐）：字节数（`media_message.size`），无字节时为 `None`（前端显示「—」）。
+    #[serde(rename = "size", skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+    /// BUG-315（信息补齐）：消息时间（Unix 秒，`media_message.msg_date`）。
+    #[serde(rename = "msgDate", skip_serializing_if = "Option::is_none")]
+    pub msg_date: Option<i64>,
+    /// BUG-315（信息补齐）：媒体类型（video/photo/...，`media_message.media_type`）。
+    #[serde(rename = "mediaType", skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    /// BUG-315（信息补齐）：时长（秒，视频/音频，`media_message.duration`）。
+    #[serde(rename = "duration", skip_serializing_if = "Option::is_none")]
+    pub duration: Option<i64>,
+    /// BUG-315（状态补齐）：逐条传输态——在途尝试起始时间戳（Unix 毫秒）。
+    /// `Some` = 该条目当前正在传；`None` = 当前无在途尝试。`task_id` 为 `None` 时恒 `None`。
+    #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    /// BUG-315（状态补齐）：已结束尝试累计烧掉的墙钟（毫秒，`cache_task_item_wall.accum_ms`）。
+    #[serde(rename = "accumMs", skip_serializing_if = "Option::is_none")]
+    pub accum_ms: Option<i64>,
 }
 
 /// 组清单（D22-A② / BUG-296）：**序号全集 + 每条状态 + 缺口**。
@@ -2960,7 +2992,7 @@ impl Store {
             return Ok(None);
         };
         let image_count = self.group_image_count(t.chat_id, &t.message_ids).await?;
-        let entries = self.manifest_entries(t.chat_id, &t.message_ids).await?;
+        let entries = self.manifest_entries(t.chat_id, &t.message_ids, Some(task_id)).await?;
         Ok(Some(manifest_from(t.chat_id, vec![task_id], entries, image_count)))
     }
 
@@ -3003,7 +3035,7 @@ impl Store {
             .tasks_for_series(key.as_deref(), chat_id, &seed_msgs)
             .await?;
         let image_count = self.series_image_count(series_id).await?;
-        let entries = self.manifest_entries(chat_id, &all_msgs).await?;
+        let entries = self.manifest_entries(chat_id, &all_msgs, None).await?;
         Ok(manifest_from(chat_id, task_ids, entries, image_count))
     }
 
@@ -3190,15 +3222,59 @@ impl Store {
     }
 
     /// 逐条派生状态（`slotted` / `registered_unslotted` / `missing`），`has_bytes` 走真实探测。
+    ///
+    /// BUG-315：额外透传条目级**信息**（`media_message` 的 caption/file_name/size/msg_date/
+    /// media_type/duration）与**传输态**（`cache_task_item_wall` 的 started_at/accum_ms）。
+    /// 审计三态（state/has_bytes/episode_*）语义不变、不新建表、不改状态机。
+    /// `task_id` 为 `None` 时（剧集级汇总清单）不查逐条墙钟（在途态在汇总场景无意义）。
     async fn manifest_entries(
         &self,
         chat_id: i64,
         msgs: &[i64],
+        task_id: Option<i64>,
     ) -> libsql::Result<Vec<ManifestEntry>> {
         let lib_root = self.library_root().await;
         let mut out = Vec::with_capacity(msgs.len());
         for &m in msgs {
             let ref_key = format!("{chat_id}:{m}");
+            // BUG-315：条目级信息来自 media_message（与 (channel_id, message_id) 直接对应）。
+            let msg = self
+                .row_opt(
+                    "SELECT caption, file_name, size, msg_date, media_type, duration \
+                     FROM media_message WHERE channel_id = ?1 AND message_id = ?2",
+                    params![chat_id, m],
+                )
+                .await?;
+            let (caption, file_name, size, msg_date, media_type, duration) = match &msg {
+                Some(r) => (
+                    r.get::<Option<String>>(0).ok().flatten(),
+                    r.get::<Option<String>>(1).ok().flatten(),
+                    r.get::<Option<i64>>(2).ok().flatten(),
+                    r.get::<Option<i64>>(3).ok().flatten(),
+                    r.get::<Option<String>>(4).ok().flatten(),
+                    r.get::<Option<i64>>(5).ok().flatten(),
+                ),
+                None => (None, None, None, None, None, None),
+            };
+            // BUG-315：逐条传输态来自 cache_task_item_wall（仅任务级清单有代表 task_id）。
+            let wall = match task_id {
+                Some(tid) => self
+                    .row_opt(
+                        "SELECT started_at, accum_ms FROM cache_task_item_wall \
+                         WHERE task_id = ?1 AND message_id = ?2",
+                        params![tid, m],
+                    )
+                    .await?,
+                None => None,
+            };
+            let (started_at, accum_ms) = match &wall {
+                Some(r) => (
+                    r.get::<Option<i64>>(0).ok().flatten(),
+                    r.get::<Option<i64>>(1).ok().flatten(),
+                ),
+                None => (None, None),
+            };
+
             let row = self
                 .row_opt(
                     "SELECT id, file_path FROM media_item WHERE source = 'tg' AND ref = ?1",
@@ -3213,6 +3289,14 @@ impl Store {
                     episode_id: None,
                     season: None,
                     episode_no: None,
+                    caption,
+                    file_name,
+                    size,
+                    msg_date,
+                    media_type,
+                    duration,
+                    started_at,
+                    accum_ms,
                 });
                 continue;
             };
@@ -3240,6 +3324,14 @@ impl Store {
                     episode_id: Some(e.get(0)?),
                     season: Some(e.get(1)?),
                     episode_no: Some(e.get(2)?),
+                    caption,
+                    file_name,
+                    size,
+                    msg_date,
+                    media_type,
+                    duration,
+                    started_at,
+                    accum_ms,
                 }),
                 None => out.push(ManifestEntry {
                     message_id: m,
@@ -3248,6 +3340,14 @@ impl Store {
                     episode_id: None,
                     season: None,
                     episode_no: None,
+                    caption,
+                    file_name,
+                    size,
+                    msg_date,
+                    media_type,
+                    duration,
+                    started_at,
+                    accum_ms,
                 }),
             }
         }
@@ -5031,7 +5131,7 @@ impl Store {
         Ok((created, attached))
     }
 
-    /// 找出**零认领**条目并把其中的**可分集条目**（video/photo）补进剧集。
+    /// 找出**零认领**条目并把其中的**可分集条目**（video）补进剧集。
     /// 返回 `(可分集候选数, 新建剧集数, 挂上槽位数, 跳过的非可分集条目数)`。
     ///
     /// 「零认领」= 三张认领表**全空**：`media_episode`（分集主条目）、
@@ -5040,11 +5140,15 @@ impl Store {
     /// BUG-255 同源（只看一张表就下结论）。
     ///
     /// **为什么按 kind 预切**：`media_episode` 有数据库层不变式
-    /// （`trg_media_episode_media_only`：分集条目必须是 video/photo，BUG-044 的入口
-    /// 过滤在 DDL 层的投影）。文档/音频等**永远**挂不上任何剧集 —— 它们的「家」是
-    /// 文件域的分类墙（`cat:doc` / `cat:music`…），不是剧集槽位。不预切的话，
-    /// 每次启动都要为这些条目白建一个剧集再被触发器 ABORT、再回滚（DB churn），
-    /// 且错误被 `Err(_)` 吞掉，只剩日志里一个对不上的数。
+    /// （`trg_media_episode_video_only`：分集条目只能是 video，BUG-044 的入口
+    /// 过滤在 DDL 层的投影）。图片/文档/音频等**永远**挂不上任何剧集 ——
+    /// 图片是浏览点（混编组挂视频集的图片位，photo-only 组留作库内内容），
+    /// 文档/音频的「家」是文件域的分类墙（`cat:doc` / `cat:music`…）。
+    /// 不预切的话，每次启动都要为这些条目白建一个剧集再被触发器 ABORT、再回滚
+    /// （DB churn），且错误被 `Err(_)` 吞掉，只剩日志里一个对不上的数。
+    ///
+    /// ⚠️ 2026-10-15 回归修复：这里原先把 `photo` 也算「可分集」，于是启动自愈会把
+    /// 刚摘掉的照片分集**重新编回剧集**（修复被下一次启动撤销）。现在只收 video。
     ///
     /// 调用点：`Store::open()` 之后（启动自愈）。它使「永远不存在未归档」成为**不变量**
     /// 而不是一次性清洗 —— 任何路径留下的孤儿，下次启动都会被收进来。
@@ -5065,8 +5169,8 @@ impl Store {
         while let Some(r) = rows.next().await? {
             let id = r.get::<i64>(0)?;
             let kind: String = r.get(1)?;
-            // 分集条目 = video/photo（与 trg_media_episode_media_only 逐字对齐）。
-            if kind == "video" || kind == "photo" {
+            // 分集条目只能是 video（与 trg_media_episode_video_only 逐字对齐）。
+            if kind == "video" {
                 episodic.push(id);
             } else {
                 skipped += 1;
@@ -6573,13 +6677,33 @@ mod tests {
         // 计数器保证「同一次测试进程内、任意两次调用」都不重叠。
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "orig_tg_media_{}_{name}_lib_{seq}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // 2026-10-19：夹具必须落在**非禁用盘**（`store::fixture_base`）—— 下载根
+        // 解析到 C: 会被改道到真实内容根 `D:\OrigDown`，本组用例会直接动到
+        // 用户真实媒体库（library_stats / export 都是整棵树统计）。
+        let dir = crate::store::fixture_base(&format!("media-{name}-lib-{seq}"));
         dir
+    }
+
+    /// BUG-323：把 `dl` 钉成下载根，库根随之派生为 `<dl>/library`，返回该库根。
+    ///
+    /// 夹具**只允许落在非禁用盘的测试夹具根**上：库根不再有独立写入口
+    /// （`library_dir` 已作废），夹具若不钉，默认档会落到用户真实的 `~/Downloads`
+    /// —— 测试往用户目录写文件本身就是事故；而钉在 C: 上又会被禁用盘规则改道到
+    /// 真实内容根 `D:\OrigDown`（同样是用户目录）。故两头都用断言堵死。
+    async fn pin_download_root(s: &Store, dl: &Path) -> PathBuf {
+        assert!(
+            dl.starts_with(crate::store::fixture_root()),
+            "夹具只允许把下载根钉在非禁用盘的测试夹具根上，收到 {dl:?}"
+        );
+        std::fs::create_dir_all(dl).unwrap();
+        s.set_setting("download_dir", dl.to_str().unwrap()).await.unwrap();
+        let lib = s.library_root().await;
+        assert_eq!(
+            lib,
+            dl.join(Store::LIBRARY_SUBDIR),
+            "夹具前提：库根必须派生自下载根"
+        );
+        lib
     }
 
     // ─────────── D24-A / BUG-309：blob 内容寻址 + 引用计数 ───────────
@@ -6755,9 +6879,9 @@ mod tests {
     /// `disk_bytes` 变而 `total_size` 不变 —— 若两者一起变，说明功能真的坏了。
     #[tokio::test]
     async fn library_stats_disk_bytes_drops_while_registered_total_size_holds_bug133() {
-        let lib = tmp_lib_root("bug133");
+        let dl = tmp_lib_root("bug133");
         let s = Store::open(tmp_db("bug133")).await.unwrap();
-        s.set_setting("library_dir", lib.to_str().unwrap()).await.unwrap();
+        let lib = pin_download_root(&s, &dl).await;
 
         let id = seed_housed_item(&s, &lib, "a.mp4", /*declared*/ 900, /*on disk*/ 100).await;
 
@@ -6789,9 +6913,9 @@ mod tests {
     /// 任何时候都断言下降的测试是无法证伪的。
     #[tokio::test]
     async fn library_stats_disk_bytes_holds_without_clearing_bytes_bug133() {
-        let lib = tmp_lib_root("bug133_falsify");
+        let dl = tmp_lib_root("bug133_falsify");
         let s = Store::open(tmp_db("bug133_falsify")).await.unwrap();
-        s.set_setting("library_dir", lib.to_str().unwrap()).await.unwrap();
+        let lib = pin_download_root(&s, &dl).await;
 
         seed_housed_item(&s, &lib, "keep.mp4", /*declared*/ 500, /*on disk*/ 250).await;
 
@@ -6809,9 +6933,9 @@ mod tests {
     /// `size` 来自 TG 元数据、字节还在 Telegram 上 —— 计入磁盘占用就是撒谎。
     #[tokio::test]
     async fn library_stats_excludes_items_without_bytes_from_disk_bug125() {
-        let lib = tmp_lib_root("bug125_pending");
+        let dl = tmp_lib_root("bug125_pending");
         let s = Store::open(tmp_db("bug125_pending")).await.unwrap();
-        s.set_setting("library_dir", lib.to_str().unwrap()).await.unwrap();
+        let lib = pin_download_root(&s, &dl).await;
 
         seed_housed_item(&s, &lib, "here.mp4", /*declared*/ 100, /*on disk*/ 100).await;
         // 未落盘：只有 size，没有 file_path。
@@ -6835,9 +6959,9 @@ mod tests {
     /// 必须以 stat 为准，否则又是一个「数字不反映事实」。
     #[tokio::test]
     async fn library_stats_drops_vanished_file_from_disk_total_bug133() {
-        let lib = tmp_lib_root("bug133_vanish");
+        let dl = tmp_lib_root("bug133_vanish");
         let s = Store::open(tmp_db("bug133_vanish")).await.unwrap();
-        s.set_setting("library_dir", lib.to_str().unwrap()).await.unwrap();
+        let lib = pin_download_root(&s, &dl).await;
 
         seed_housed_item(&s, &lib, "gone.mp4", /*declared*/ 300, /*on disk*/ 300).await;
         assert_eq!(s.library_stats().await.unwrap().disk_bytes, 300);
@@ -7280,16 +7404,17 @@ mod tests {
     ///
     /// 缺陷原形（BUG-112 在活库上实测）：`append_episodes_ranged` 只按**当前**
     /// `media_episode` 行去重，`remove_episode` 不留任何负向记录 —— 同一 TG 组下一次重新
-    /// 缓存（自动成剧）把用户刚摘掉的图片**原样编回**，表现为「删了又回来」。
+    /// 缓存（自动成剧）把用户刚摘掉的条目**原样编回**，表现为「删了又回来」。
+    /// （条目用 video：BUG-044 回归修复后分集只能是视频，墓碑机制与条目类型无关。）
     #[tokio::test]
     async fn automatic_append_does_not_resurrect_removed_episode_but_explicit_add_does() {
         let s = Store::open(tmp_db("tombstone")).await.unwrap();
         let a = s
-            .upsert_media_item("tg", "k:1", "a", "photo", None, None, None, None)
+            .upsert_media_item("tg", "k:1", "a", "video", None, None, None, None)
             .await
             .unwrap();
         let b = s
-            .upsert_media_item("tg", "k:2", "b", "photo", None, None, None, None)
+            .upsert_media_item("tg", "k:2", "b", "video", None, None, None, None)
             .await
             .unwrap();
         let sid = s
@@ -7404,7 +7529,7 @@ mod tests {
                     "tg",
                     &format!("sc:{i}"),
                     &format!("i{i}"),
-                    "photo",
+                    "video",
                     None,
                     None,
                     None,
@@ -7495,15 +7620,15 @@ mod tests {
 
     /// 回归（BUG-126 跨剪枝）：TG 自动成剧的剧集被**剪枝**后，按 `source_key` 重建仍被拦。
     ///
-    /// 缺陷原形（用户真实场景）：一个只有 1 张图的 TG 组，用户把图移除 → 该剧 0 分集 →
+    /// 缺陷原形（用户真实场景）：一个只有 1 个视频的 TG 组，用户把视频移除 → 该剧 0 分集 →
     /// `prune_empty_series` 删掉剧集行 → 触发器清墓碑 → 下次同组同步按 `source_key` 重建
-    /// （**新 id**）→ 旧墓碑 `(旧 id, item)` 不再匹配 → **图回来了**。
+    /// （**新 id**）→ 旧墓碑 `(旧 id, item)` 不再匹配 → **条目回来了**。
     /// 修法：墓碑快照 `source_key`，匹配时按 key 兜底；触发器只清 `source_key IS NULL` 的墓碑。
     #[tokio::test]
     async fn tombstone_survives_prune_and_blocks_source_key_rebuild() {
         let s = Store::open(tmp_db("tombstone_prune")).await.unwrap();
         let a = s
-            .upsert_media_item("tg", "pr:1", "a", "photo", None, None, None, None)
+            .upsert_media_item("tg", "pr:1", "a", "video", None, None, None, None)
             .await
             .unwrap();
         let sid = s
@@ -7558,7 +7683,7 @@ mod tests {
     async fn manual_series_prune_clears_its_tombstone() {
         let s = Store::open(tmp_db("tombstone_manual_prune")).await.unwrap();
         let a = s
-            .upsert_media_item("tg", "mp:1", "a", "photo", None, None, None, None)
+            .upsert_media_item("tg", "mp:1", "a", "video", None, None, None, None)
             .await
             .unwrap();
         // 手工建剧：source_key = None。
@@ -7590,11 +7715,11 @@ mod tests {
     async fn low_level_delete_keeps_keyed_tombstones_but_explicit_delete_clears_them() {
         let s = Store::open(tmp_db("tombstone_delete_split")).await.unwrap();
         let a = s
-            .upsert_media_item("tg", "ds:1", "a", "photo", None, None, None, None)
+            .upsert_media_item("tg", "ds:1", "a", "video", None, None, None, None)
             .await
             .unwrap();
         let b = s
-            .upsert_media_item("tg", "ds:2", "b", "photo", None, None, None, None)
+            .upsert_media_item("tg", "ds:2", "b", "video", None, None, None, None)
             .await
             .unwrap();
         let sid = s
@@ -8213,12 +8338,13 @@ mod tests {
             .await
             .unwrap();
 
-        // 第 4 轮裁定：图片**可以**成为分集（浏览位）——它是剧集归档内容的一部分。
+        // BUG-044 回归修复（2026-10-15）：图片**不得**成为分集 —— 第 4 轮曾以
+        // 「剧集是通用归档容器」放行 photo 分集，用户裁定那是基础逻辑错误
+        // （下载的图片与视频混用「集」）。音频/未知条目同样拒绝。
         assert!(
-            s.add_episode(sid, pic, 1, 1).await.is_ok(),
-            "图片应能成为分集"
+            s.add_episode(sid, pic, 1, 1).await.is_err(),
+            "图片不得成为分集"
         );
-        // 音频仍不属于剧集（剧集容器只收 video / photo）
         assert!(
             s.add_episode(sid, audio, 1, 2).await.is_err(),
             "音频不得成为分集"
@@ -8229,26 +8355,27 @@ mod tests {
             "未知条目不得成为分集"
         );
         // 正常视频可以
-        let ep = s.add_episode(sid, vid, 1, 2).await.unwrap();
+        let ep = s.add_episode(sid, vid, 1, 1).await.unwrap();
         let det = s.get_series(sid).await.unwrap().unwrap();
-        assert_eq!(det.episodes.len(), 2, "图片 1 集 + 视频 1 集");
+        assert_eq!(det.episodes.len(), 1, "只有视频那一个分集");
         // 备用源只收 video：图片与未知条目都不得成为备用（播放源不可表达图片）
         assert!(s.attach_episode_source(ep, pic).await.is_err(), "图片不得成为备用源");
         assert!(s.attach_episode_source(ep, 999_999).await.is_err());
     }
 
-    /// **旧库→新代码**迁移：升级库上新旧两套分集触发器并存时，`Store::open` 必须退役
-    /// 旧的 `trg_media_episode_video_only_ins`。
+    /// **旧库→新代码**迁移：升级库上`migrate()` 必须退役第 4 轮放的
+    /// `trg_media_episode_media_only_*`（放行 photo 的那套），换成 video-only。
     ///
-    /// 这是第 4 轮放宽分集到 video|photo 后**唯一未被覆盖**的路径：其余单测都在全新库上跑，
-    /// 那里只有新触发器，图片分集一路绿灯；而真实用户库是升级库，旧触发器仍在，图片分集
-    /// 插入被 ABORT，剧集建成却 0 分集 —— 失败被伪装成成功。故本测试专门复刻升级库状态。
+    /// BUG-044 回归修复（2026-10-15）：现在新旧两套触发器的**名字可能同时在库里**
+    /// （`media_only` 放行 photo、`video_only` 只放 video），若只 `CREATE IF NOT EXISTS`
+    /// 而不 DROP，`media_only` 会继续放行照片分集 —— 修复被旧触发器旁路。
+    /// 本测试复刻升级库状态，断言迁移后 photo 被拒、video 照常。
     #[tokio::test]
-    async fn upgrade_drops_superseded_video_only_episode_trigger() {
+    async fn upgrade_drops_superseded_media_only_episode_trigger() {
         let path = tmp_db("legacy_trigger");
-        // ① 全新库：只有 migrate() 建的新触发器
+        // ① 全新库：只有 migrate() 建的 video_only 触发器
         drop(Store::open(&path).await.unwrap());
-        // ② 复刻升级库：把旧的 video_only 触发器装回去（此时新旧并存，正是用户库现状）
+        // ② 复刻升级库：把第 4 轮放行 photo 的 media_only 触发器装回去
         {
             let conn = libsql::Builder::new_local(&path)
                 .build()
@@ -8258,12 +8385,13 @@ mod tests {
                 .unwrap();
             conn.execute_batch(
                 r#"
-                CREATE TRIGGER trg_media_episode_video_only_ins
+                CREATE TRIGGER trg_media_episode_media_only_ins
                      BEFORE INSERT ON media_episode
                      FOR EACH ROW
-                     WHEN (SELECT kind FROM media_item WHERE id = NEW.item_id) IS NOT 'video'
+                     WHEN (SELECT kind FROM media_item WHERE id = NEW.item_id) IS NULL
+                          OR (SELECT kind FROM media_item WHERE id = NEW.item_id) NOT IN ('video','photo')
                      BEGIN
-                         SELECT RAISE(ABORT, 'episode item must be a video item');
+                         SELECT RAISE(ABORT, 'episode item must be an existing video or photo item');
                      END;
                 "#,
             )
@@ -8278,16 +8406,23 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            s.add_episode(sid, pic, 1, 1).await.is_ok(),
-            "升级库上图片也必须能成为分集（旧触发器没退役 → 这里必然失败）"
+            s.add_episode(sid, pic, 1, 1).await.is_err(),
+            "回归修复后升级库上图片也不得成为分集（media_only 触发器没退役 → 这里会放行）"
         );
+        let v = s
+            .upsert_media_item("tg", "ref:up2", "clip", "video", None, None, None, None)
+            .await
+            .unwrap();
+        assert!(s.add_episode(sid, v, 1, 1).await.is_ok(), "视频照常可成为分集");
     }
 
-    /// 启动修复：只有**非法 kind**（既非 video 也非 photo）的分集会被摘除；
+    /// 启动修复：**只有视频**分集是合法内容；照片/音频等分集被摘除，
     /// 失去全部分集的剧集随之删除。
     ///
-    /// 第 4 轮裁定后**图片分集是合法内容**（浏览位），因此「纯图剧」不再被清除 ——
-    /// 这正是本测试断言变化的原因：删的是 audio 这类根本不该进剧集的东西。
+    /// BUG-044 回归修复（2026-10-15）：第 4 轮曾把图片分集当合法内容（浏览位），
+    /// 用户裁定「下载的图片与视频混用『集』是基础逻辑错误」后回归 video-only。
+    /// 于是「纯图剧」重新变成必须清除的对象 —— 照片回到库内内容位（`media_item`
+    /// 行不动），只是不再占用集号。
     ///
     /// BUG-258：本用例**不再**断言「每次启动都把 kind 重算为 series」—— 那条断言
     /// 编码的正是缺陷本身（用户选的类型被静默撤销）。归一化现在是一次性的，
@@ -8295,7 +8430,7 @@ mod tests {
     /// 这里的「残留相集」是**存量脏徽标**（BUG-044 之前的自动成剧留下的），
     /// 首次启动仍应被纠正一次 —— 故仍断言 `series`，但注释写明这是「一次性」。
     #[tokio::test]
-    async fn startup_repair_strips_illegal_episodes_only() {
+    async fn startup_repair_strips_non_video_episodes() {
         let path = tmp_db("repair");
         {
             let conn = libsql::Builder::new_local(&path).build().await.unwrap().connect().unwrap();
@@ -8324,8 +8459,8 @@ mod tests {
                     ('混编剧','series',1,1), ('纯图剧','album',1,1), ('残留相集','collection',1,1),
                     ('音频剧','series',1,1);
                 INSERT INTO media_episode (series_id, item_id, season, episode_no) VALUES
-                    (1, 1, 1, 1), (1, 2, 1, 2),  -- 混编剧：视频 + 图片（都合法）
-                    (2, 2, 1, 1),                -- 纯图剧：只有图片（合法，必须保留）
+                    (1, 1, 1, 1), (1, 2, 1, 2),  -- 混编剧：视频 + 图片（图片必须被摘）
+                    (2, 2, 1, 1),                -- 纯图剧：只有图片 ⇒ 整剧删除
                     (3, 3, 1, 1),                -- 残留相集：只剩视频
                     (4, 4, 1, 1);                -- 音频剧：audio 分集非法
                 "#,
@@ -8336,7 +8471,7 @@ mod tests {
         let s = Store::open(&path).await.unwrap();
 
         let series = s.list_series().await.unwrap();
-        assert_eq!(series.len(), 3, "音频剧因非法分集被清空而删除；纯图剧必须幸存");
+        assert_eq!(series.len(), 2, "纯图剧与音频剧失去全部分集而删除；混编与残留相集幸存");
         let det = s
             .get_series(
                 series
@@ -8348,7 +8483,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(det.episodes.len(), 2, "混编剧的视频集与图片集都在");
+        assert_eq!(det.episodes.len(), 1, "混编剧只留视频集（图片集被摘除）");
         assert_eq!(det.episodes[0].item_id, 1);
         assert_eq!(det.episodes[0].kind.as_deref(), Some("video"));
         // 残留相集：存量脏徽标（BUG-044 之前的自动成剧留下的），**首次**启动仍纠正为 series。
@@ -8361,9 +8496,7 @@ mod tests {
             repaired.kind, "series",
             "存量脏徽标应在首次启动时被一次性归一为 series"
         );
-        // 纯图剧是**合法**的 album（只有图片分集，也是合法内容）—— 一次性归一的守卫
-        // 「有分集 + 分集全 video/photo」对它是真命题，但它本来就该被纠正。
-        // 反过来：用户**此刻**把类型选成别的，第二次启动不得再动它（BUG-258 核心判据）。
+        // 用户**此刻**把类型选成别的，第二次启动不得再动它（BUG-258 核心判据）。
         drop(s);
         let s2 = Store::open(&path).await.unwrap();
         s2.conn
@@ -9368,10 +9501,13 @@ mod tests {
         );
     }
 
-    /// 剧集是通用归档容器 —— **图片也能成为分集**（浏览位），
-    /// 但**播放源**仍然只收 video（播放时出现图片在结构上不可表达）。
+    /// BUG-044 回归修复（2026-10-15）：图片**不能**成为分集，也**不能**成为播放源。
+    ///
+    /// 第 4 轮曾以「剧集是通用归档容器」为由放行 photo 分集，用户随即裁定那是
+    /// 基础逻辑错误（下载的图片与视频混用「集」）。本断言把两个方向都锁死：
+    /// 直接 INSERT 被触发器拒；播放源同样只收 video。
     #[tokio::test]
-    async fn photo_can_be_episode_but_never_a_source() {
+    async fn photo_cannot_be_episode_nor_source() {
         let s = Store::open(tmp_db("photo_episode")).await.unwrap();
         let photo = s
             .upsert_media_item("tg", "1:1", "cover", "photo", None, None, None, None)
@@ -9386,8 +9522,11 @@ mod tests {
             .await
             .unwrap();
 
-        // 图片入剧集：成功（此前触发器会 RAISE ABORT）
-        assert_eq!(s.append_episodes(sid, 1, &[photo]).await.unwrap(), 1);
+        // 图片入剧集：必须被触发器拒绝（绕过路由层的直插同样守得住）。
+        assert!(
+            s.append_episodes(sid, 1, &[photo]).await.is_err(),
+            "photo must never become an episode"
+        );
         assert_eq!(s.append_episodes(sid, 1, &[video]).await.unwrap(), 1);
 
         // 播放源只收 video：图片作为 source 必须被拒。
@@ -9408,7 +9547,7 @@ mod tests {
             .unwrap()
             .get::<i64>(0)
             .unwrap();
-        assert_eq!(n, 2, "图片与视频同为该剧分集");
+        assert_eq!(n, 1, "该剧只有视频那一个分集");
     }
 
     // ───────────── 条目文案：标题 / 介绍（「剧集正确、视频错误」的修） ─────────────
@@ -10744,12 +10883,10 @@ mod tests {
     async fn export_readiness_flags_missing_bytes_description_image_and_empty() {
         let path = tmp_db("export_readiness");
         let s = Store::open(&path).await.unwrap();
-        // 库根指向独立临时目录：完好集的 file_path 以库根相对形式落在这里。
-        let lib_root = std::env::temp_dir().join(format!("orig_export_lib_{}", std::process::id()));
-        std::fs::create_dir_all(&lib_root).unwrap();
-        s.set_setting("library_dir", &lib_root.to_string_lossy())
-            .await
-            .unwrap();
+        // 库根派生自下载根（BUG-323）：把临时下载根钉住，完好集的 file_path
+        // 以库根相对形式落在这里。
+        let dl = crate::store::fixture_base(&format!("export-dl-{}", std::process::id()));
+        let lib_root = pin_download_root(&s, &dl).await;
 
         let sid_ok = s.create_series("Ready", None, "series", None, None).await.unwrap();
         let sid_bad = s.create_series("Broken", None, "series", None, None).await.unwrap();
@@ -10855,12 +10992,8 @@ mod tests {
     async fn export_bundle_copies_video_and_writes_manifest() {
         let path = tmp_db("export_bundle");
         let s = Store::open(&path).await.unwrap();
-        let lib_root =
-            std::env::temp_dir().join(format!("orig_export_bundle_lib_{}", std::process::id()));
-        std::fs::create_dir_all(&lib_root).unwrap();
-        s.set_setting("library_dir", &lib_root.to_string_lossy())
-            .await
-            .unwrap();
+        let dl = crate::store::fixture_base(&format!("export-bundle-dl-{}", std::process::id()));
+        let lib_root = pin_download_root(&s, &dl).await;
 
         // 一部可导出剧集：真实非空视频 + 简介 + data-URI poster（poster 不复制）。
         let sid = s
@@ -10927,12 +11060,8 @@ mod tests {
     async fn export_bundle_rejects_non_empty_target_and_unready_series() {
         let path = tmp_db("export_bundle_gate");
         let s = Store::open(&path).await.unwrap();
-        let lib_root =
-            std::env::temp_dir().join(format!("orig_export_gate_lib_{}", std::process::id()));
-        std::fs::create_dir_all(&lib_root).unwrap();
-        s.set_setting("library_dir", &lib_root.to_string_lossy())
-            .await
-            .unwrap();
+        let dl = crate::store::fixture_base(&format!("export-gate-dl-{}", std::process::id()));
+        let lib_root = pin_download_root(&s, &dl).await;
 
         // 可导出剧集：真实非空视频 + 简介 + data-URI poster
         let sid_ok = s
@@ -11039,10 +11168,11 @@ mod tests {
         assert_eq!(view.photo_count, 3, "照片数必须把集级挂图算进去");
     }
 
-    /// BUG-255 回归：纯照片组（photo-only）每张照片本身就是独立集，集数仍应等于照片数，
-    /// 且不得被上面的修正误伤（不能因引入 `media_episode_image` 计数而重复或漏算）。
+    /// BUG-044 回归修复（2026-10-15）：纯照片组**不成集** —— 每张照片只完成 T0 登记，
+    /// 留在库内内容位；启动自愈（`reconcile_unfiled_items`）也不得把它们编进剧集
+    /// （原实现会，于是「摘掉照片分集」被下一次启动撤销）。
     #[tokio::test]
-    async fn bug255_photo_only_group_counts_each_photo_as_episode() {
+    async fn bug255_photo_only_group_never_becomes_episodes() {
         let path = tmp_db("bug255_photo_only");
         let s = Store::open(&path).await.unwrap();
 
@@ -11063,17 +11193,35 @@ mod tests {
             .upsert_media_item("tg", "p:3", "图3", "photo", None, None, None, None)
             .await
             .unwrap();
-        // 纯照片组：每张照片各自成集（append_slot 在 !has_video 时逐张建集）。
-        s.add_episode(sid, p1, 1, 1).await.unwrap();
-        s.add_episode(sid, p2, 1, 2).await.unwrap();
-        s.add_episode(sid, p3, 1, 3).await.unwrap();
+        // 照片**不能**被编成集（触发器是硬门，路由层 422 之前的那道）。
+        assert!(s.add_episode(sid, p1, 1, 1).await.is_err());
+        assert!(s.add_episode(sid, p2, 1, 2).await.is_err());
+        assert!(s.add_episode(sid, p3, 1, 3).await.is_err());
 
-        let list = s.list_series_filtered(None).await.unwrap();
-        assert_eq!(list.len(), 1);
-        let view = &list[0];
-        assert_eq!(view.episode_count, 3, "纯照片组集数应等于照片数");
-        assert_eq!(view.photo_count, 3, "照片数应等于照片数");
-        assert_eq!(view.video_count, 0);
+        // 启动自愈只收 video：三张照片全部计入 skipped，一条都不进剧集。
+        let (found, created, attached, skipped) = s.reconcile_unfiled_items().await.unwrap();
+        assert_eq!((found, created, attached), (0, 0, 0), "照片不是可分集候选");
+        assert_eq!(skipped, 3, "三张照片都应被跳过");
+
+        let n = s
+            .row_opt(
+                "SELECT COUNT(*) FROM media_episode WHERE series_id = ?1",
+                params![sid],
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(n, 0, "纯照片组不产生任何分集");
+        // 条目本身仍在库内（T0 登记的语义：信息先到，字节异步）。
+        for p in [p1, p2, p3] {
+            assert!(s
+                .row_opt("SELECT 1 FROM media_item WHERE id = ?1", params![p])
+                .await
+                .unwrap()
+                .is_some());
+        }
     }
 
     /// BUG-129：`episode_slot_occupant` 必须**如实**报出槽位占用者，且与 upsert
@@ -11405,28 +11553,44 @@ mod tests {
         let (created, attached) = s.file_items_into_series(&[id1, id2]).await.unwrap();
         assert_eq!(
             (created, attached),
-            (1, 2),
-            "同组两条目应进同一个剧集（相册组 = 一个剧集）"
+            (1, 1),
+            "同组只有视频进剧集（BUG-044：图片不成集，只完成 T0 登记）"
         );
         let sid = s
             .find_series_by_source_key("tg:group:777:99")
             .await
             .unwrap()
             .expect("键必须是 tg:group:{chat}:{group}（与 ensure_series 同一把）");
-        for id in [id1, id2] {
-            assert_eq!(
-                s.count_one(
-                    "SELECT COUNT(*) FROM media_episode WHERE series_id = ?1 AND item_id = ?2",
-                    params![sid, id],
-                )
+        assert_eq!(
+            s.count_one(
+                "SELECT COUNT(*) FROM media_episode WHERE series_id = ?1 AND item_id = ?2",
+                params![sid, id1],
+            )
+            .await
+            .unwrap(),
+            1,
+            "视频条目必须挂在组剧集里"
+        );
+        // 图片**不占集号**：库里没有它的分集行，但 media_item 行仍在（T0 登记语义）。
+        assert_eq!(
+            s.count_one(
+                "SELECT COUNT(*) FROM media_episode WHERE series_id = ?1 AND item_id = ?2",
+                params![sid, id2],
+            )
+            .await
+            .unwrap(),
+            0,
+            "图片不得成为分集（BUG-044 回归修复）"
+        );
+        assert_eq!(
+            s.count_one("SELECT COUNT(*) FROM media_item WHERE id = ?1", params![id2])
                 .await
                 .unwrap(),
-                1,
-                "条目 {id} 必须挂在组剧集里"
-            );
-        }
-        // 第二条目再次归集（模拟自愈重复跑）⇒ 幂等。
-        let (c, a) = s.file_items_into_series(&[id2]).await.unwrap();
+            1,
+            "图片条目本身仍登记在库内"
+        );
+        // 视频条目再次归集（模拟自愈重复跑）⇒ 幂等。
+        let (c, a) = s.file_items_into_series(&[id1]).await.unwrap();
         assert_eq!((c, a), (0, 0));
     }
 
@@ -11715,6 +11879,56 @@ mod tests {
             s.list_media_items(&q).await.unwrap().len(),
             0,
             "归集后不得再报未归档（不变量）"
+        );
+    }
+
+    /// BUG-315：条目明细层透传条目级**信息**（caption/file_name/size/msg_date/media_type/
+    /// duration）与**传输态**（started_at/accum_ms，来源 cache_task_item_wall）。审计三态
+    /// （state/has_bytes）语义不变。反向证伪：series 级清单（task_id=None）不透传 started_at。
+    #[tokio::test]
+    async fn manifest_entries_transmits_info_and_transfer_state_bug315() {
+        let s = Store::open(tmp_db("bug315_manifest_info")).await.unwrap();
+        let chat = 700i64;
+        let msg = 555i64;
+        // 信息层：media_message 带标题/文件名/大小/时间/类型/时长。
+        s.upsert_message(
+            chat,
+            msg,
+            Some("我的标题"),
+            Some("video/mp4"),
+            Some(123456),
+            Some("video"),
+            Some(1_700_000_000),
+            Some(120),
+            None,
+            Some("clip.mp4"),
+        )
+        .await
+        .unwrap();
+        // 任务级清单（task_id 有值）⇒ 透传全部新字段。
+        let task = insert_task(&s, chat, "g:700:9", &[msg], "running").await;
+        // 传输态：开一条在途尝试（必须复用真实 task id，否则 cache_task_item_wall
+        // 按 task_id 查不到该行）⇒ started_at 有值、accum_ms 默认 0。
+        s.begin_item_wall_attempt(task, msg).await.unwrap();
+        let m = s.task_group_manifest(task).await.unwrap().expect("task exists");
+        let e = m
+            .entries
+            .iter()
+            .find(|e| e.message_id == msg)
+            .expect("entry present");
+        assert_eq!(e.caption.as_deref(), Some("我的标题"), "caption 必须透传");
+        assert_eq!(e.file_name.as_deref(), Some("clip.mp4"), "file_name 必须透传");
+        assert_eq!(e.size, Some(123456), "size 必须透传");
+        assert_eq!(e.msg_date, Some(1_700_000_000), "msg_date 必须透传");
+        assert_eq!(e.media_type.as_deref(), Some("video"), "media_type 必须透传");
+        assert_eq!(e.duration, Some(120), "duration 必须透传");
+        assert!(e.started_at.is_some(), "在途尝试的 started_at 必须透传");
+        assert!(e.accum_ms.is_some(), "accum_ms 必须透传（默认 0）");
+        // 反向证伪：series 级清单 task_id=None 不查墙钟 ⇒ started_at 恒 None。
+        let entries_none = s.manifest_entries(chat, &[msg], None).await.unwrap();
+        assert!(
+            entries_none[0].started_at.is_none(),
+            "series 路径 task_id=None ⇒ started_at 恒 None"
         );
     }
 

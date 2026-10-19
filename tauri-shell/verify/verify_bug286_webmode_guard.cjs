@@ -44,7 +44,6 @@
 
 const path = require('path')
 const fs = require('fs')
-const os = require('node:os')
 const crypto = require('node:crypto')
 
 const cdp = require('./lib/cdp.cjs')
@@ -55,8 +54,8 @@ const SETTINGS_TSX = path.resolve(__dirname, '..', 'src', 'components', 'Setting
 
 /** BUG-286 的原始报错指纹（三个通道共用：toast 文案 / console.error / uncaught）。 */
 const INVOKE_FINGERPRINT = /cannot\s+read\s+properties\s+of\s+undefined\s*\(reading\s*'invoke'\)|reading 'invoke'/i
-/** 临时填进库目录输入框的路径（不点保存，刷新即散）。 */
-const TMP_LIB_DIR = path.join(os.tmpdir(), 'orighub-bug286-libdir')
+// BUG-323：库根改为**只读派生值**（`<下载路径>/library`），页面不再有「库根输入框」，
+// 因此也不需要「临时填一个路径把按钮凑成可点」的辅助常量（见 ensureLibBtnEnabled）。
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -90,6 +89,22 @@ async function installNoTauri(page) {
     { sessionId: page.sessionId },
   )
 }
+
+/**
+ * 整页导航（SPA 就绪判据的标准姿势）。
+ *
+ * 用 `DOMContentLoaded` + `#root` 挂载（cdp.goto 内置 `waitForRoot`）判就绪，
+ * 而**不**等 `load`：① `load` 要等全部子资源，其中包括打到 orig-tg 的外链请求，
+ * 慢的那个会连坐；② vite 在源文件变更后会触发自刷新，`load` 事件可能落在自刷新上
+ * 而永久悬空 —— 实测**写回同字节**同样复现（用未被本缺陷触碰的文件验证），
+ * 故与改动内容无关，是「文件变更后的首次完整加载」这一路径本身慢（可达 30s 量级）。
+ * 超时放宽到 120s：断言一字未动，只把「加载慢」与「导航超时」分开。
+ *
+ * @param {object} page cdp Page
+ * @param {string} appUrl 应用地址
+ */
+const gotoApp = (page, appUrl) =>
+  page.goto(appUrl, { waitUntil: 'domcontentloaded', settleMs: 2500, timeout: 120000 })
 
 /**
  * 桌面模式：挂载前注入一个带 **invoke 探针** 的 IPC 桥。
@@ -132,16 +147,6 @@ async function installFakeTauri(page) {
 }
 
 // ─────────────────────────────── 页面操作 ───────────────────────────────
-
-/** React 受控输入：必须用原型上的 setter 写值，再派发 input 事件，React 才认。 */
-const SET_INPUT_VALUE = (sel, value) => {
-  const el = document.querySelector(sel)
-  if (!el) return false
-  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
-  setter.call(el, value)
-  el.dispatchEvent(new Event('input', { bubbles: true }))
-  return true
-}
 
 /** 进设置页 → downloads tab → 等「打开库根文件夹」按钮出现。 */
 async function openDownloadsTab(page) {
@@ -203,11 +208,13 @@ async function readPage(page) {
       logsHint: text('[data-testid="about-logs-hint"]'),
       libBtn: btn('[data-testid="settings-lib-open"]'),
       logsBtn: btn('[data-testid="about-logs-open"]'),
-      browseBtn: btn('[data-testid="lib-dir-picker"] [data-testid="dir-picker-browse"]'),
-      libInputValue: (() => {
-        const el = q('[data-testid="lib-dir-picker"] input')
-        return el ? String(el.value || '') : null
-      })(),
+      /**
+       * BUG-323：库根改为**只读派生值**（`<下载路径>/library`），页面不再有输入框；
+       * 「浏览…」观测点随之从库根移到**下载目录**（唯一可编辑的路径项）。
+       */
+      libRootText: text('[data-testid="lib-root-readonly"]'),
+      browseBtn: btn('[data-testid="download-dir-picker"] [data-testid="dir-picker-browse"]'),
+      dirBrowserOpen: !!q('[data-testid="dir-browser"]'),
       logsDirValue: text('[data-testid="about-logs-dir"]'),
       invokes: Array.isArray(window.__BUG286_INVOKES) ? window.__BUG286_INVOKES.slice() : [],
     }
@@ -244,16 +251,20 @@ function sawInvokeFailure(collected) {
 }
 
 /**
- * 确保「打开库根文件夹」可点：库目录为空时往未保存的输入框里填一个临时路径
- * （不点保存 —— 后端配置一个字节都不动）。
+ * 确保「打开库根文件夹」可点。
+ *
+ * BUG-323 起库根由 daemon 下发（`<下载路径>/library`，只读），页面**没有**可填的
+ * 输入框 —— 按钮不可点只可能是 daemon 不可达 / 未下发库根，那就是真的失败，
+ * 不再靠「往输入框塞个临时路径」把它凑成可点。
  */
 async function ensureLibBtnEnabled(page) {
   const st = await readPage(page)
-  if (st.libBtn.exists && !st.libBtn.disabled) return st
-  const ok = await page.evaluate(SET_INPUT_VALUE, '[data-testid="lib-dir-picker"] input', TMP_LIB_DIR)
-  if (!ok) throw new Error('settings: 找不到 lib-dir-picker 输入框，无法启用「打开库根文件夹」')
-  await delay(500)
-  return readPage(page)
+  if (!st.libBtn.exists || st.libBtn.disabled) {
+    throw new Error(
+      `settings: 「打开库根文件夹」不可点（库根=${JSON.stringify(st.libRootText)}）—— daemon 不可达或库根未下发`,
+    )
+  }
+  return st
 }
 
 // ─────────────────────────────── 主流程 ───────────────────────────────
@@ -273,7 +284,7 @@ async function main() {
     // ═══════════════ A 组：网页调试模式（无 Tauri）═══════════════
     const web = await browser.newPage()
     await installNoTauri(web)
-    await web.goto(ep.app, { settleMs: 2500 })
+    await gotoApp(web, ep.app)
 
     let st = await readPage(web)
     check(
@@ -292,16 +303,16 @@ async function main() {
     st = await readPage(web)
     check('A1 设置页 / 下载 tab 可达，且「打开库根文件夹」已渲染', st.libBtn.exists, `exists=${st.libBtn.exists}`)
     check(
-      'A4 「浏览…」按钮在网页模式下 disabled（能力边界用禁用表达）',
-      st.browseBtn.exists && st.browseBtn.disabled === true,
+      'A4 「浏览…」在网页模式下可点（BUG-323：走应用内目录浏览器，不再是禁用态）',
+      st.browseBtn.exists && st.browseBtn.disabled === false,
       `browse=${JSON.stringify(st.browseBtn)}`,
     )
 
     // 使可点后再测点击
     st = await ensureLibBtnEnabled(web)
-    const libTarget = String(st.libInputValue || '').trim()
+    const libTarget = String(st.libRootText || '').trim()
     check(
-      'A2p 前置：库目录目标路径已就绪（按钮可点）',
+      'A2p 前置：库根已由 daemon 下发（只读展示有值、按钮可点）',
       !!libTarget && st.libBtn.disabled === false,
       `target=${JSON.stringify(libTarget)} disabled=${st.libBtn.disabled}`,
     )
@@ -355,13 +366,33 @@ async function main() {
     )
 
     // ═══════════════ C 组：运行期环境响应（首帧 freeze 反向判据）═══════════════
+    //
+    // BUG-323 起「浏览…」不再是禁用态（网页模式改走应用内浏览器），观测点随之改为
+    // **点击后的行为分叉**：无 Tauri 上下文 ⇒ 打开应用内浏览器（`dir-browser` 出现）；
+    // 运行期注入 IPC 桥后 ⇒ 走原生通道（不再开应用内浏览器）。
+    // 两次行为必须反映**当下**环境，而不是冻结在首帧结论上。
     await openDownloadsTab(web)
-    const beforeFlip = await readPage(web)
+    await web.evaluate(() => {
+      const el = document.querySelector(
+        '[data-testid="download-dir-picker"] [data-testid="dir-picker-browse"]',
+      )
+      if (el) el.click()
+    })
+    await delay(900)
+    const c1a = await readPage(web)
+    await web.screenshot(path.join(OUT, '04a_webmode_dir_browser.png'))
     check(
-      'C1a 注入前：浏览按钮处于网页模式禁用态',
-      beforeFlip.browseBtn.disabled === true,
-      `disabled=${beforeFlip.browseBtn.disabled}`,
+      'C1a 无 Tauri：点「浏览…」打开应用内目录浏览器',
+      c1a.dirBrowserOpen === true,
+      `dirBrowserOpen=${c1a.dirBrowserOpen}`,
     )
+
+    // 关掉应用内浏览器，注入 IPC 桥后再点同一个按钮
+    await web.evaluate(() => {
+      const el = document.querySelector('[data-testid="dir-browser-close"]')
+      if (el) el.click()
+    })
+    await delay(400)
     await web.evaluate(() => {
       // 运行期才拿到 IPC 桥（模拟壳晚注入）：组件必须自己跟上，而不是停在首帧结论。
       window.__TAURI_INTERNALS__ = { invoke: () => Promise.resolve() }
@@ -369,18 +400,25 @@ async function main() {
       document.dispatchEvent(new Event('visibilitychange'))
     })
     await delay(1000)
+    await web.evaluate(() => {
+      const el = document.querySelector(
+        '[data-testid="download-dir-picker"] [data-testid="dir-picker-browse"]',
+      )
+      if (el) el.click()
+    })
+    await delay(900)
     const afterFlip = await readPage(web)
     await web.screenshot(path.join(OUT, '04_webmode_env_flip.png'))
     check(
-      'C1b 注入后触发可见性事件 ⇒ 浏览按钮转为可用（不冻结在首帧判定）',
-      afterFlip.hasTauri === true && afterFlip.browseBtn.disabled === false,
-      `hasTauri=${afterFlip.hasTauri} disabled=${afterFlip.browseBtn.disabled}`,
+      'C1b 注入 IPC 桥后：同一按钮转为走原生通道（不再开应用内浏览器）',
+      afterFlip.hasTauri === true && afterFlip.dirBrowserOpen === false,
+      `hasTauri=${afterFlip.hasTauri} dirBrowserOpen=${afterFlip.dirBrowserOpen}`,
     )
 
     // ═══════════════ B 组：桌面模式（有 IPC 桥）═══════════════
     const desk = await browser.newPage()
     await installFakeTauri(desk)
-    await desk.goto(ep.app, { settleMs: 2500 })
+    await gotoApp(desk, ep.app)
     await openDownloadsTab(desk)
     let d = await readPage(desk)
     check('B0 桌面模式上下文成立（IPC 桥已注入）', d.hasTauri === true, `hasTauri=${d.hasTauri}`)
@@ -390,7 +428,7 @@ async function main() {
       `browse=${JSON.stringify(d.browseBtn)}`,
     )
     d = await ensureLibBtnEnabled(desk)
-    const deskTarget = String(d.libInputValue || '').trim()
+    const deskTarget = String(d.libRootText || '').trim()
     const deskClick = await clickAndCollect(desk, '[data-testid="settings-lib-open"]')
     d = await readPage(desk)
     await desk.screenshot(path.join(OUT, '05_desktop_lib_open_clicked.png'))
@@ -437,7 +475,10 @@ async function main() {
       try {
         fs.writeFileSync(SETTINGS_TSX, beforeText.replace(GUARDED_BLOCK, BARE_BLOCK))
         await delay(1500) // 等 vite watch 失效模块缓存
-        await web.goto(ep.app, { settleMs: 2500 })
+        // 变更后被改模块所在图要重建，本机实测**首次**整页加载可到 30s（与改动内容
+        // 无关：用未被本缺陷触碰的文件写回同字节同样成立）—— 默认 30s 档正好压线，
+        // 会把「加载慢」报成「导航超时」。这里放宽等待，断言本身一字未动。
+        await gotoApp(web, ep.app)
         await openAboutTab(web)
         const red = await clickAndCollect(web, '[data-testid="about-logs-open"]')
         const redLoose = !!red.toast && /invoke/i.test(red.toast)
@@ -468,7 +509,8 @@ async function main() {
       )
       await delay(1500)
       // 整页重载而不是指望 HMR：必须证明**磁盘上那份代码**跑出来的结果是绿的。
-      await web.goto(ep.app, { settleMs: 2500 })
+      // 同 D1：还原后的首次加载同样走一遍模块图重建，等待档放宽（断言不变）。
+      await gotoApp(web, ep.app)
       await openAboutTab(web)
       const green = await clickAndCollect(web, '[data-testid="about-logs-open"]')
       const greenSt = await readPage(web)

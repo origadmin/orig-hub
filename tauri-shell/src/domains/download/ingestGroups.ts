@@ -1,4 +1,5 @@
 import type { TgCacheTask } from '../../types'
+import type { DlFilter } from '../../nav'
 
 /**
  * TG 入库任务的**聚合层**（BUG-300 / M3 修正）。
@@ -24,7 +25,7 @@ export type CacheStatus = TgCacheTask['status']
 export interface IngestGroup {
   /** 聚合键（`cache_task.itemKey`）；空键回退任务 id，保证唯一。 */
   key: string
-  /** 代表任务 = 同键里**最新**的一条（先比 `updatedAt`，再比 id）。 */
+  /** 代表任务 = 同键里**最需要关注**的一条（有活跃取最新活跃，否则取最新；BUG-318）。 */
   latest: TgCacheTask
   /** 同键的其余历史批次（新→旧）。 */
   history: TgCacheTask[]
@@ -64,6 +65,12 @@ function rank(status: string): number {
  *
  * 排序键与服务端 `merge()` 的口径一致（在途优先、时间倒序、键定序），
  * 避免前端再排一套导致行序在两次请求间抖动。
+ *
+ * **代表任务（`latest`）的选取（BUG-318）**：有活跃（queued/running）的同键批次时，
+ * 取**最新的活跃**作代表；否则取最新。不能无条件按 `updatedAt` 取最新 —— 终态行
+ * 被「取消优先」等写操作 bump `updated_at`（orig-tg `store.rs::set_cache_task_priority`）
+ * 后，更早入队的活跃任务会不再是「最新」，被掩蔽进 `history`：组行显示终态、
+ * 「下载中」档看不到它、行上没有「取消」按钮 —— 用户观感即「数据/控制丢失」。
  */
 export function groupIngestTasks(tasks: TgCacheTask[]): IngestGroup[] {
   const buckets = new Map<string, TgCacheTask[]>()
@@ -80,8 +87,10 @@ export function groupIngestTasks(tasks: TgCacheTask[]): IngestGroup[] {
       if (b.updatedAt !== a.updatedAt) return b.updatedAt - a.updatedAt
       return b.id - a.id
     })
-    const [latest, ...history] = sorted
-    groups.push({ key, latest, history, runs: sorted.length })
+    const active = sorted.filter((t) => isCacheActive(t.status))
+    const rep = active.length > 0 ? active[0] : sorted[0]
+    const history = sorted.filter((t) => t !== rep)
+    groups.push({ key, latest: rep, history, runs: sorted.length })
   }
 
   groups.sort((a, b) => {
@@ -155,21 +164,34 @@ export function summarizeGroups(groups: IngestGroup[]): IngestOverview {
  * - 活跃（queued/running）→ 取消（orig-tg `DELETE /api/tg/cache/tasks/:id`）；
  * - 终态（failed/interrupted/cancelled）→ 重试（按 id 复位整行，无真续传）；
  * - **永不返回 pause/resume**（TG 无真续传，给了就是假按钮）。
+ *
+ * 优先下载（BUG-277）的两条判定与后端 `cache::prioritizable` 逐字同源：
+ *   - `prefer`：**排队中**且尚未优先下载（`priority <= 0`）—— 已跑/已终态的任务
+ *     改顺序没有任何可观察效果，给按钮就是骗人；
+ *   - `unprefer`：**已优先下载**（`priority > 0`）随时可撤销，哪怕它已不在排队
+ *     （否则点过优先下载就再也撤不回来，按钮还在、点了却 422 = 界面与端点判据分裂）。
  */
-export function ingestActionsFor(status: string): IngestAction[] {
-  if (isCacheActive(status)) return ['cancel']
-  if (isCacheStalled(status) || status === 'cancelled') return ['retry']
-  return []
+export function ingestActionsFor(status: string, priority = 0): IngestAction[] {
+  const acts: IngestAction[] = []
+  if (isCacheActive(status)) acts.push('cancel')
+  if (isCacheStalled(status) || status === 'cancelled') acts.push('retry')
+  if (priority > 0) acts.push('unprefer')
+  else if (status === 'queued') acts.push('prefer')
+  return acts
 }
 
 /** 入库对象可执行动作（见 `ingestActionsFor`）。 */
-export type IngestAction = 'retry' | 'cancel'
+export type IngestAction = 'retry' | 'cancel' | 'prefer' | 'unprefer'
 
-/** 树档过滤：入库对象归入哪个状态档（`paused` 无对应 ⇒ 恒不显示）。 */
-export function groupInBucket(
-  status: string,
-  f: 'all' | 'running' | 'paused' | 'done',
-): boolean {
+/**
+ * 树档过滤：入库对象归入哪个状态档（`paused` 无对应 ⇒ 恒不显示）。
+ *
+ * 档位集合单一真源 = `DlFilter`（`nav/index.ts`）。2026-10-15 曾按 BUG-300 复报③
+ * 增设 `cancelled` 独立档，因越权解读用户「取消后记录不消失」的诉求（用户要的是
+ * 记录可见，不是新导航位）已于 BUG-314 撤档：取消/中止记录在 `all` 档可见、可数、
+ * 可重试，概览区另有「已取消」读数 —— 不设独立树档。
+ */
+export function groupInBucket(status: string, f: DlFilter): boolean {
   switch (f) {
     case 'running':
       return isCacheActive(status)

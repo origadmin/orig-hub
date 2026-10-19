@@ -13,6 +13,11 @@
  *            so on the series wall it filled the items-only `selected` set with
  *            ids the user cannot see ("global filter"), and that selection
  *            survived a view switch.
+ *            **任务 #9 改版（2026-10-16）**：全选本页移入 items 浮动底部选择条
+ *            （选中 ≥1 条才出现，条内含全选/全不选），库级按钮上移到标题区右槽。
+ *            守卫判据随之改为「0 选中时 media-select-all 整页缺席 + 勾选后选择条
+ *            出现 + 切视图后选择条与计数一并消失」，并新增「选择模式禁入播放详情」
+ *            （选择态下点卡片封面不得打开 media-viewer）。
  *
  * 断言必须在**真实浏览器**里跑：这两个缺陷都是「渲染出来的控件有没有 / 点下去
  * 发出的请求里有没有这个键」，用 jsdom 重写一份组件逻辑再断言，测的是「我以为的
@@ -232,9 +237,10 @@ async function hasTestId(page, testid) {
  *    的假前提继续跑（`_tmp_dbg.cjs` 复现：navButtons=8、无「全部剧集」按钮）。
  *
  * 2. **不能 `document.querySelector('nav')`**：页面上有**多个** `<nav>` —— 应用左栏
- *    导航（全部文件/下载中/媒体库/设置）与媒体库面板自己的分类栏。`querySelector`
- *    返回第一个，命中的是**应用左栏**（只有 8 个按钮、没有「全部剧集」），
- *    于是永远找不到入口。必须锚定媒体库面板的 `media-rail-series-all` testid。
+ *    导航与媒体库面板自己的分类栏。`querySelector` 返回第一个，命中的是**应用左栏**，
+ *    于是找不到入口。M0（BUG-298）后媒体库左栏已删、导航收进应用侧栏双树，
+ *    「剧集」入口 = 侧栏 `nav-child-lib-series`（旧的 `media-rail-series-all` 随
+ *    左栏一并废止，这里同步改锚）。
  *
  * @param {object} page CDP page
  * @param {number} timeoutMs 超时
@@ -244,7 +250,7 @@ async function clickRailAllSeries(page, timeoutMs = STEP_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const hit = await page.evaluate(() => {
-      const btn = document.querySelector('[data-testid="media-rail-series-all"]')
+      const btn = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (!btn) return false
       btn.click()
       return true
@@ -275,12 +281,13 @@ async function clickButtonByText(page, text) {
 }
 
 /**
- * 读媒体库工具条里所有按钮的文案。
+ * 读**含库级按钮的那个 header** 里所有按钮的文案。
  *
  * **不能 `document.querySelector('header')`**：应用外壳自身也有一个 `<header>`
- * （`data-testid="context-bar-header"`，标题「媒体库 + 实时已连接」）。选择器取第一个
- * 命中的是**外壳**那个，于是「四按钮在不在场」全部读成 false。
- * 媒体库工具条是**没有 testid** 的那个 header，故按「含有导入目录按钮」来锚定它。
+ * （`data-testid="context-bar-header"`）。任务 #9 后库级按钮（导入目录/新建剧集/
+ * 导出/标签管理）已上移到标题区右槽（ContextBar files 分支），故「含有导入目录
+ * 按钮」的那个 header 现在就是**外壳标题栏** —— 锚定语义从「媒体库工具条」
+ * 改为「库级按钮所在处」，按文案包含判定，调用方足够稳。
  *
  * @param {object} page CDP page
  * @returns {Promise<Array<string>>}
@@ -488,19 +495,26 @@ async function main() {
     }
     await clickTestId(page, 'nav-child-lib-series')
     try {
-      await waitForTestId(page, 'media-panel-title', 15000)
+      // M0（BUG-298）后媒体库面板没有自带标题锚点（`media-panel-title` 随
+      // 面板头部整改废止）；「面板渲染了」的判据换成 lib-series 落点的
+      // 剧集墙滚动容器（series-wall-scroll）—— 只有面板真渲染出内容才有。
+      await waitForTestId(page, 'series-wall-scroll', 15000)
     } catch (_err) {
       /* 由下面的断言如实报告 */
     }
-    check('媒体库面板渲染（media-panel-title）', await hasTestId(page, 'media-panel-title'))
+    check('媒体库面板渲染（series-wall-scroll）', await hasTestId(page, 'series-wall-scroll'))
 
     // =========================================================================
-    // BUG-155：工具条的 view 守卫
+    // BUG-155：全选本页的作用域守卫（任务 #9 改版：选择模式弹出化）
     // =========================================================================
     console.log('')
-    console.log('--- BUG-155-A：默认落在剧集墙（series 视图）---')
+    console.log('--- BUG-155-A：series 视图不存在全选本页（0 选中时任何视图都不存在）---')
 
-    // 默认视图是 series（MediaLibraryPanel.tsx:146）。先确认「全选本页」缺席，
+    // 任务 #9（2026-10-16 用户裁定）后的形态：全选本页**不再常驻任何视图的头部**，
+    // 只在 items 视图选中 ≥1 条后出现在**浮动底部选择条**（items-selection-bar）。
+    // 库级按钮（导入目录/新建剧集/导出/标签管理）已上移到标题区右槽
+    // （ContextBar files 分支，page-primary-action + 次级）。
+    // 故 series 视图（0 选中）下 media-select-all 必须整页缺席 —— 先确认这一点，
     // 否则后面的 items 断言会因为「本来就在 items」而失去对照意义。
     let onSeriesView = false
     try {
@@ -511,10 +525,11 @@ async function main() {
     }
     check('默认视图为 series（media-select-all 缺席）', onSeriesView)
 
-    // 若不在 series（用户上次停留视图被持久化），点左栏「全部剧集」回到 series 视图
+    // 若不在 series（用户上次停留视图被持久化），点左栏「剧集」回到 series 视图
+    // （M0 导航模型：`media-rail-series-all` 已废止，侧栏入口是 nav-child-lib-series）。
     if (!onSeriesView) {
       const back = await clickRailAllSeries(page)
-      check('点击左栏「全部剧集」回到 series 视图', back)
+      check('点击左栏「剧集」回到 series 视图', back)
       try {
         await waitForTestIdGone(page, 'media-select-all', 10000)
       } catch (_err) {
@@ -522,12 +537,12 @@ async function main() {
       }
     }
 
-    // 自证伪：把守卫换成恒真（模拟修复前的「无 view 条件」）
+    // 自证伪：把「无条件存在的全选本页」注回真实 DOM（模拟修复前的无守卫形态）。
+    // 新形态下锚点是**标题区右槽**（ContextBar，含「导入目录」的那个 header）——
+    // 库级按钮在任务 #9 后从媒体面板头部落到了那里；注回的按钮等价于
+    // 「修复前它在工具栏里无条件渲染」，检测代码与正式断言逐字相同，能证到判别力。
     if (REVERT_TO_PRE_FIX) {
       const injected = await page.evaluate(() => {
-        // 修复前的 DOM 形态 = 该按钮无条件存在。这里用「把按钮克隆一份挂回工具栏」
-        // 模拟，检测代码与正式断言逐字相同，故能证到断言本身有判别力。
-        // 注意锚定的是**媒体库工具条**（含「导入目录」的那个 header），不是应用外壳的 header。
         const host = Array.from(document.querySelectorAll('header')).find(h =>
           (h.textContent || '').includes('导入目录'),
         )
@@ -548,7 +563,6 @@ async function main() {
 
     {
       const selectAllInSeries = await hasTestId(page, 'media-select-all')
-      const imported = await hasTestId(page, 'media-import-btn')
       const texts = await buttonTexts(page)
       const hasImport = texts.some(t => t.includes('导入目录'))
       const hasNewSeries = texts.some(t => t.includes('新建剧集'))
@@ -557,33 +571,38 @@ async function main() {
         `[verify:merge-fe] series 工具栏按钮: ${JSON.stringify(texts.filter(t => /全选本页|导入目录|新建剧集|标签管理/.test(t)))}`,
       )
       check(
-        '★ series 视图：不存在 media-select-all（全选本页有 view 守卫）',
+        '★ series 视图：不存在 media-select-all（0 选中时全选本页不渲染）',
         !selectAllInSeries,
         `存在=${selectAllInSeries}`,
       )
       check(
-        'series 视图：导入目录 / 新建剧集 / 标签管理 三按钮仍存在（合法的全局动作）',
+        'series 视图：导入目录 / 新建剧集 / 标签管理 仍在场（库级按钮，标题区右槽）',
         hasImport && hasNewSeries && hasManageTags,
         `importDir=${hasImport} newSeries=${hasNewSeries} manageTags=${hasManageTags}`,
       )
-      void imported
     }
 
-    console.log('')
-    console.log('--- BUG-155-B：切到 items 视图 ---')
+    // 自证伪收尾：清掉注入的克隆按钮，避免它污染后续 items 视图的断言
+    // （旧形态下它注在媒体面板头部、items 断言点的是同一个 testid，会假绿）。
+    await page.evaluate(() => {
+      for (const el of Array.from(document.querySelectorAll('[data-falsify="1"]'))) el.remove()
+    })
 
-    // 左栏内容分类入口（media-cat-all）→ items 视图。
-    // 必须**轮询到媒体库分类栏出现后再点**：进入媒体库时剧集列表仍在加载，
-    // 分类栏尚未渲染，此时点空是正常中间态（与 clickRailAllSeries 同一坑）。
-    // 点完再等「全选本页」出现，两个条件都满足才算真的进了 items 视图。
+    console.log('')
+    console.log('--- BUG-155-B：切到 items 视图（视频分类）---')
+
+    // 左栏「视频」分类入口（nav-child-cat-video）→ items 视图的 MediaCard 网格。
+    // 必须**轮询到侧栏渲染后再点**：进入媒体库时剧集列表仍在加载，
+    // 侧栏分类子项尚未渲染，此时点空是正常中间态（与 clickRailAllSeries 同一坑）。
     let toItems = false
     {
       const deadline = Date.now() + STEP_TIMEOUT_MS
       while (Date.now() < deadline && !toItems) {
-        const clicked = await clickTestId(page, 'media-cat-all')
+        const clicked = await clickTestId(page, 'nav-child-cat-video')
         if (clicked) {
           try {
-            await waitForTestId(page, 'media-select-all', 3000)
+            // 进了 items 视图的标志：MediaCard 网格渲染（media-grid）
+            await waitForTestId(page, 'media-grid', 3000)
             toItems = true
           } catch (_err) {
             toItems = false
@@ -592,66 +611,136 @@ async function main() {
         if (!toItems) await new Promise(resolve => setTimeout(resolve, 250))
       }
     }
-    check('点击左栏「全部内容」（media-cat-all）进入 items 视图', toItems)
-    let itemsReady = false
-    try {
-      await waitForTestId(page, 'media-select-all', STEP_TIMEOUT_MS)
-      itemsReady = true
-    } catch (_err) {
-      itemsReady = false
-    }
-    check('★ items 视图：media-select-all 存在', itemsReady)
+    check('点击左栏「视频」进入 items 视图', toItems)
+
+    // 任务 #9 新形态①：0 选中时头部**没有任何按钮**（含全选本页）——
+    // 库级按钮在标题行（ContextBar），选择态动作在浮动条，头部不再混放。
     {
+      const selectAllAtZero = await hasTestId(page, 'media-select-all')
       const texts = await buttonTexts(page)
-      const present = ['全选本页', '导入目录', '新建剧集', '标签管理'].map(t => ({
-        t,
-        ok: texts.some(x => x.includes(t)),
-      }))
+      const hasImport = texts.some(t => t.includes('导入目录'))
+      const hasNewSeries = texts.some(t => t.includes('新建剧集'))
+      const hasExport = texts.some(t => t.includes('导出'))
+      const hasManageTags = texts.some(t => t.includes('标签管理'))
       check(
-        'items 视图：四个按钮全部存在',
-        present.every(p => p.ok),
-        JSON.stringify(present),
+        '★ items 视图 0 选中：media-select-all 缺席（全选本页移入浮动选择条）',
+        !selectAllAtZero,
+        `存在=${selectAllAtZero}`,
+      )
+      check(
+        'items 视图：四个库级按钮仍在场（标题区右槽，任务 #9 上移）',
+        hasImport && hasNewSeries && hasExport && hasManageTags,
+        `importDir=${hasImport} newSeries=${hasNewSeries} export=${hasExport} manageTags=${hasManageTags}`,
+      )
+    }
+
+    // 任务 #9 新形态②：勾任意一条卡片 → 浮动选择条出现，条内含全选本页 + 全不选。
+    // 「功能选择单个后进入选择模式」的闭环入口就在这里。
+    let barAppeared = false
+    {
+      const deadline = Date.now() + STEP_TIMEOUT_MS
+      while (Date.now() < deadline && !barAppeared) {
+        await clickTestId(page, 'media-card-select')
+        try {
+          await waitForTestId(page, 'items-selection-bar', 3000)
+          barAppeared = true
+        } catch (_err) {
+          barAppeared = false
+        }
+        if (!barAppeared) await new Promise(resolve => setTimeout(resolve, 250))
+      }
+    }
+    check('勾选一张卡片 → items 浮动选择条出现', barAppeared)
+    {
+      const bar = await hasTestId(page, 'items-selection-bar')
+      const selectAll = await hasTestId(page, 'media-select-all')
+      const selectNone = await hasTestId(page, 'media-select-none')
+      const count = await page.evaluate(() => {
+        const el = document.querySelector('[data-testid="items-selection-count"]')
+        return el ? (el.textContent || '').trim() : null
+      })
+      check(
+        '★ 选择条内含 media-select-all（全选本页）',
+        bar && selectAll,
+        `bar=${bar} selectAll=${selectAll}`,
+      )
+      check(
+        '★ 选择条内含 media-select-none（全不选，任务 #9 新增）',
+        selectNone,
+        `selectNone=${selectNone}`,
+      )
+      check(
+        '选择条显示计数（N 已选）',
+        Boolean(count) && /已选\s*\d+\s*项|\d+\s*selected/i.test(count || ''),
+        `count=${count}`,
       )
     }
 
     console.log('')
-    console.log('--- BUG-155-C：选中不得跨视图泄漏 ---')
+    console.log('--- BUG-155-C：选择不得跨视图泄漏 + 选择模式禁入播放详情 ---')
 
-    // 必须先确认「全选本页」真的选中了东西，否则后面的「已选消失」可能因为
-    // selected 本来就是空的而假绿（BUG-155.md 明确要求这条前置）。
-    //
-    // 这里**整段重试**而不是「点一次 + 等一次」：`click()` 同步派发、React 异步渲染，
-    // 且媒体库有 250ms 防抖重取 —— 「按钮已渲染」与「onClick 挂上了」之间存在窗口，
-    // 落在窗口里的点击会被丢掉。点名一次就断言，会把这个**脚本侧的时序竞态**
-    // 误报成产品缺陷（实测踩过：itemsReady=true 但点击无效果）。
-    let selectAllGone = false
+    // 任务 #9 选择模式禁入播放详情（用户裁定「不应该能点击进入播放详情页面」）：
+    // 已有 ≥1 条选中时，点另一张卡片的**封面**必须是切换选中，而不是打开播放器。
+    // 必须在**全选之前**跑：全选后所有卡片都已勾选，找不到未勾选的对照样本。
+    {
+      const reason = await page.evaluate(() => {
+        const cards = Array.from(document.querySelectorAll('[data-testid="media-card"]'))
+        const unchecked = cards.find(c => {
+          const box = c.querySelector('[data-testid="media-card-select"]')
+          return box && box.getAttribute('aria-checked') !== 'true'
+        })
+        if (!unchecked) return 'no-unchecked-card'
+        const cover = unchecked.querySelector('[data-testid="media-card-cover"]')
+        if (!cover) return 'no-cover'
+        cover.click()
+        return null
+      })
+      check('选择模式下找到未勾选的卡片封面', reason === null, `reason=${reason}`)
+      await new Promise(resolve => setTimeout(resolve, 800))
+      const viewerOpen = await hasTestId(page, 'media-viewer')
+      check(
+        '★ 选择模式点封面不打开播放详情（media-viewer 缺席）',
+        !viewerOpen,
+        `viewer=${viewerOpen}`,
+      )
+    }
+
+    // 前置：全选本页真的把当前可见 items 全填进选择集（否则后面的
+    // 「切视图后消失」可能因为 selected 本来就是空的而假绿）。
+    // 判据是**所有可见卡片的勾选框 aria-checked 全为 true** —— 新形态下选择条
+    // 常驻（点了全选按钮也不会消失），不能用「按钮消失」当成功信号（旧形态的
+    // 写法在新形态下会恒超时假红）。
+    let selectAllWorked = false
     let selectedText = null
     let clickAttempts = 0
     {
       const deadline = Date.now() + STEP_TIMEOUT_MS
-      while (Date.now() < deadline && !selectAllGone) {
+      while (Date.now() < deadline && !selectAllWorked) {
         clickAttempts++
         await clickTestId(page, 'media-select-all')
-        try {
-          await waitForTestIdGone(page, 'media-select-all', 3000)
-          selectAllGone = true
-        } catch (_err) {
-          selectAllGone = false
-        }
-        if (!selectAllGone) await new Promise(resolve => setTimeout(resolve, 250))
+        await new Promise(resolve => setTimeout(resolve, 500))
+        const allChecked = await page.evaluate(() => {
+          const boxes = Array.from(
+            document.querySelectorAll('[data-testid="media-card-select"]'),
+          )
+          return (
+            boxes.length > 0 && boxes.every(b => b.getAttribute('aria-checked') === 'true')
+          )
+        })
+        selectAllWorked = allChecked
       }
-      selectedText = selectAllGone ? await findSelectedCountText(page) : null
+      selectedText = selectAllWorked ? await findSelectedCountText(page) : null
     }
     check('点击 media-select-all', clickAttempts > 0)
     check(
-      '★ items 视图点全选后出现「N 已选」（前置：selected 非空）',
-      selectAllGone && Boolean(selectedText),
-      `attempts=${clickAttempts} selectAllGone=${selectAllGone} text=${selectedText}`,
+      '★ items 视图点全选后全部可见卡片进入选中态（前置：selected 非空）',
+      selectAllWorked && Boolean(selectedText),
+      `attempts=${clickAttempts} allChecked=${selectAllWorked} text=${selectedText}`,
     )
 
-    // 切回 series 视图
+    // 切回 series 视图：选择条与计数必须一并消失（selected 被作用域重置清空）
     const backToSeries = await clickRailAllSeries(page)
-    check('切回 series 视图（左栏「全部剧集」）', backToSeries)
+    check('切回 series 视图（左栏「剧集」）', backToSeries)
     try {
       await waitForTestIdGone(page, 'media-select-all', 10000)
     } catch (_err) {
@@ -659,10 +748,16 @@ async function main() {
     }
     {
       const afterSwitch = await findSelectedCountText(page)
+      const barGone = !(await hasTestId(page, 'items-selection-bar'))
       check(
         '★ 切到 series 视图后「N 已选」消失（selected 被清空，不跨视图泄漏）',
         !afterSwitch,
         `text=${afterSwitch}`,
+      )
+      check(
+        '★ 切到 series 视图后浮动选择条消失（选择条只属于 items 视图）',
+        barGone,
+        `barGone=${barGone}`,
       )
     }
 
@@ -695,21 +790,26 @@ async function main() {
     }
     check(`打开剧集卡片 series-id=${rangeSeriesId}`, opened)
 
-    let slotReady = false
+    let pickerReady = false
     try {
-      await waitForTestId(page, 'episode-slot', STEP_TIMEOUT_MS)
-      slotReady = true
+      // BUG-181（feef4e8）后分集行的 testid 是 `episode-pick`（旧 `episode-slot`
+      // 已废止：行本身是 button，点击=切右栏焦点，编辑入口移到右栏标题行）。
+      await waitForTestId(page, 'episode-pick', STEP_TIMEOUT_MS)
+      pickerReady = true
     } catch (_err) {
-      slotReady = false
+      pickerReady = false
     }
-    check('剧集详情渲染出分集槽（episode-slot）', slotReady)
+    check('剧集详情渲染出分集行（episode-pick）', pickerReady)
 
     // 校验渲染：合集显示 -N，单集不显示
+    // 左列第一个 span = 槽位标签（`episodeSlotLabel`）；中列标题、右列时长/来源
+    // 不参与槽位断言（行 textContent 会把它们一起卷进来）。
     {
       const slots = await page.evaluate(() =>
-        Array.from(document.querySelectorAll('[data-testid="episode-slot"]')).map(el =>
-          (el.textContent || '').trim(),
-        ),
+        Array.from(document.querySelectorAll('[data-testid="episode-pick"]')).map(el => {
+          const label = el.querySelector('span')
+          return ((label ? label.textContent : el.textContent) || '').trim()
+        }),
       )
       const wantRange = `S${range.season}E${range.episodeNo}-${range.episodeNoEnd}`
       const singles = slots.filter(s => /S\d+E\d+$/.test(s))
@@ -729,17 +829,17 @@ async function main() {
       void ranges
     }
 
-    // 找到目标分集的编辑入口：同一行 li 里的 episode-edit
-    const openTarget = await page.evaluate(
+    // 找到目标分集并进入编辑态。
+    // BUG-181 结构变更后：编辑入口**不在行内**（行 = `episode-pick`，点击只切右栏
+    // 焦点），而在**右栏标题行**的 `episode-edit` 按钮。路径分两步：
+    // ① 点左栏目标行（左列槽位标签 startsWith S{season}E{no}）
+    // ② 右栏出现 `episode-edit` 后点它 → 编辑面板内才有 `episode-end-input`。
+    const pickedRow = await page.evaluate(
       (season, no) => {
-        for (const slot of document.querySelectorAll('[data-testid="episode-slot"]')) {
-          const text = (slot.textContent || '').trim()
-          if (!text.startsWith(`S${season}E${no}`)) continue
-          const li = slot.closest('li')
-          if (!li) continue
-          const edit = li.querySelector('[data-testid="episode-edit"]')
-          if (!edit) continue
-          edit.click()
+        for (const row of document.querySelectorAll('[data-testid="episode-pick"]')) {
+          const label = (row.querySelector('span')?.textContent || '').trim()
+          if (!label.startsWith(`S${season}E${no}`)) continue
+          row.click()
           return true
         }
         return false
@@ -748,8 +848,19 @@ async function main() {
       range.episodeNo,
     )
     check(
-      `打开 S${range.season}E${range.episodeNo} 的编辑态`,
-      openTarget,
+      `选中 S${range.season}E${range.episodeNo} 分集行（episode-pick）`,
+      pickedRow,
+    )
+    let openedEdit = false
+    try {
+      await waitForTestId(page, 'episode-edit', STEP_TIMEOUT_MS)
+      openedEdit = await clickTestId(page, 'episode-edit')
+    } catch (_err) {
+      openedEdit = false
+    }
+    check(
+      `打开 S${range.season}E${range.episodeNo} 的编辑态（右栏 episode-edit）`,
+      openedEdit,
     )
 
     let endInputReady = false
@@ -819,22 +930,37 @@ async function main() {
     }
 
     // 收尾：把终点改回原值，并顺带验证「清空 → 显式 null」
-    // 重新进入编辑态（保存成功后编辑面板已收起）
-    await page.evaluate(
-      (season, no) => {
-        for (const slot of document.querySelectorAll('[data-testid="episode-slot"]')) {
-          const text = (slot.textContent || '').trim()
-          if (!text.startsWith(`S${season}E${no}`)) continue
-          const li = slot.closest('li')
-          if (!li) continue
-          const edit = li.querySelector('[data-testid="episode-edit"]')
-          if (edit) edit.click()
-          return
-        }
-      },
-      range.season,
-      range.episodeNo,
-    )
+    // 重新进入编辑态（保存成功后编辑面板已收起）。
+    // BUG-181 后编辑入口 = 右栏 `episode-edit`（面板收起后按钮仍在，右栏焦点
+    // 未变），直接再点一次；失败则兜底重跑「点行 → 点编辑」路径。
+    let reopenedEdit = false
+    try {
+      await waitForTestId(page, 'episode-edit', STEP_TIMEOUT_MS)
+      reopenedEdit = await clickTestId(page, 'episode-edit')
+    } catch (_err) {
+      reopenedEdit = false
+    }
+    if (!reopenedEdit) {
+      await page.evaluate(
+        (season, no) => {
+          for (const row of document.querySelectorAll('[data-testid="episode-pick"]')) {
+            const label = (row.querySelector('span')?.textContent || '').trim()
+            if (!label.startsWith(`S${season}E${no}`)) continue
+            row.click()
+            return
+          }
+        },
+        range.season,
+        range.episodeNo,
+      )
+      try {
+        await waitForTestId(page, 'episode-edit', STEP_TIMEOUT_MS)
+        reopenedEdit = await clickTestId(page, 'episode-edit')
+      } catch (_err) {
+        reopenedEdit = false
+      }
+    }
+    check('保存后重新进入编辑态（右栏 episode-edit）', reopenedEdit)
     try {
       await waitForTestId(page, 'episode-end-input', 10000)
     } catch (_err) {

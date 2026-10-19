@@ -185,6 +185,12 @@ fn to_fact(path: &Path, cfg: &crate::config::Config) -> Option<FileFact> {
 /// 递归枚举一个根（深度受限）。目录读失败按「此处为空」处理（权限/占用都不是
 /// 整个端点的失败理由——与 activity 聚合的跨进程容错同一立场）。
 fn walk(root: &Path, cfg: &crate::config::Config, out: &mut Vec<FileFact>) {
+    /// 受管根**根层**下由引擎自己管理的子目录名（BUG-323）：库根（归仓媒体库）
+    /// 与引擎工作区（转码代理等）。它们同住在下载路径之内 —— 用户裁定「所有文件
+    /// 不允许脱离下载路径」—— 但**不是「下载成品」**：混进成品枚举会让下载页
+    /// 冒出媒体库文件，两个视图互相污染。
+    const ENGINE_OWNED_SUBDIRS: [&str; 2] = ["library", ".orighub"];
+
     fn rec(dir: &Path, depth: usize, cfg: &crate::config::Config, out: &mut Vec<FileFact>) {
         if depth > MAX_DEPTH || out.len() >= MAX_FILES {
             return;
@@ -200,12 +206,16 @@ fn walk(root: &Path, cfg: &crate::config::Config, out: &mut Vec<FileFact>) {
                 return;
             }
             let is_dir = p.is_dir();
-            let hidden = p
+            let name = p
                 .file_name()
-                .map(|n| n.to_string_lossy().starts_with('.'))
-                .unwrap_or(false);
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            // 隐藏项（`.` 开头）一律不进成品；根层的引擎自有目录（library / .orighub）
+            // 同样排除 —— 只认根层，用户自己在子目录里建的 `library` 不受影响。
+            let skip = name.starts_with('.')
+                || (depth == 0 && ENGINE_OWNED_SUBDIRS.contains(&name.as_str()));
             if is_dir {
-                if !hidden {
+                if !skip {
                     rec(&p, depth + 1, cfg, out);
                 }
             } else if let Some(f) = to_fact(&p, cfg) {
@@ -347,6 +357,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// BUG-323：受管根**根层**的引擎自有目录（`library` 库根 / `.orighub` 工作区）
+    /// 必须被排除出「下载成品」—— 否则下载页会冒出媒体库文件（两个视图互相污染）；
+    /// 用户自己在子目录里建的 `library` 不受影响（只认根层）。
+    #[test]
+    fn enumerate_excludes_engine_owned_root_subdirs_bug323() {
+        let root = std::env::temp_dir().join(format!("orig-files-owned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("library").join("chat--1")).unwrap();
+        std::fs::create_dir_all(root.join(".orighub").join("proxies")).unwrap();
+        std::fs::create_dir_all(root.join("Archive").join("library")).unwrap();
+        touch(&root.join("library").join("chat--1"), "housed.mp4", 30);
+        touch(&root.join(".orighub").join("proxies"), "p.mp4", 10);
+        touch(&root.join("Archive").join("library"), "user.mp4", 20);
+        touch(&root, "kept.mp4", 5);
+
+        let cfg = cfg_with_dir(&root);
+        let mut out = Vec::new();
+        walk(&root, &cfg, &mut out);
+        let names: Vec<&str> = out.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"kept.mp4"), "普通成品必须在: {names:?}");
+        assert!(!names.contains(&"housed.mp4"), "根层库根不得进成品: {names:?}");
+        assert!(!names.contains(&"p.mp4"), "根层 .orighub 不得进成品: {names:?}");
+        assert!(
+            names.contains(&"user.mp4"),
+            "子目录里的同名 library 不受影响（只排除根层）: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// 分类推导：doc/other 两类 + 未知扩展名不猜。
     #[test]
     fn kind_mapping_covers_doc_and_other() {
@@ -375,19 +414,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 扫描根去重：download_dir 与 manual_download_root 同指一个目录时只扫一遍。
+    /// 扫描根去重：受管根 = 配置的 `download_dir` + 未配置时的默认根（平台默认下载目录）。
+    ///
+    /// BUG-323：`library_dir` 已与默认根无关（默认根恒为平台默认下载目录），
+    /// 因此「同指一处」的情形由 **download_dir == 平台默认下载目录** 构造。
     #[test]
     fn scan_roots_dedups() {
         let root = std::env::temp_dir().join(format!("orig-files-roots-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+
+        // 情形一：download_dir = 默认根（**过禁用盘规则后的实际值**，用户 2026-10-19
+        // 裁定「~/Downloads是默认设置,但是不使用」）⇒ 两个来源同指一处 ⇒ 只扫一遍。
+        // 注意不能再拿裸 `default_download_dir()` 构造「同指」：它落在 C: 上时
+        // `manual_download_root` 会把它改道到 D 盘内容根，两个来源就此不同
+        // （那正是规则本身，不是去重失效）。
+        let def = crate::config::manual_download_root(&Config::default());
+        let _ = std::fs::create_dir_all(&def);
         let cfg = Config {
-            download_dir: Some(root.clone()),
-            library_dir: Some(root.clone()),
+            download_dir: Some(def.clone()),
             ..Config::default()
         };
         let roots = scan_roots(&cfg);
-        assert_eq!(roots.len(), 1, "same dir configured twice must scan once: {roots:?}");
+        assert_eq!(roots.len(), 1, "same dir from both sources must scan once: {roots:?}");
+        assert_eq!(roots[0], def);
+
+        // 情形二：配置了别的目录 ⇒ 配置目录与平台默认目录都要扫（去重不得误吞）。
+        let cfg2 = Config {
+            download_dir: Some(root.clone()),
+            ..Config::default()
+        };
+        let roots2 = scan_roots(&cfg2);
+        assert_eq!(roots2.len(), 2, "distinct roots must both be scanned: {roots2:?}");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

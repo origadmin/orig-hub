@@ -131,8 +131,17 @@ export function MainLayout() {
    * 既供侧栏/状态栏计数，也经 props 下传给 `DownloadPanel`。让面板自己再拉一份
    * 会得到「两次轮询 + 两个时刻的状态」——那正是「徽标数 ≠ 点进去的条数」的来源
    * （BUG-082 三处同源纪律：徽标 / 树档 / 列表三处必须同源）。
+   *
+   * 按视图在场门控（2026-10-16 用户裁定「不在其位不谋其政」）：不在场时
+   * hook 不拉不起轮 —— 否则任何视图都在每 3s 读 SQLite 的 `/api/activity`。
+   * 侧栏/状态栏的入库计数在场外显示最后已知快照，切回在场视图立即刷新。
+   *
+   * **TG 域也算「在位」**（2026-10-17 入口终裁）：上下文栏的「入库流水线」入口在
+   * TG 域渲染「在传 / 待处理 / 已缓存」小计数，它就是本 hook 的消费者 —— 门控若不
+   * 含 tg，用户停在 TG 域看到的会是切走前的冻结快照，计数不动。故门控 = 下载域 ∪ TG 域。
+   * 仍然是**同一处轮询**（不新增数据源，BUG-082 三处同源纪律）。
    */
-  const ingest = useIngestGroups()
+  const ingest = useIngestGroups(undefined, view === 'download' || view === 'tg')
   /** 概览 = 「笼统的数据」：按**内容对象**计数，不是按原始任务记录数。 */
   const overview = ingest.overview
 
@@ -142,9 +151,10 @@ export function MainLayout() {
   const paused = downloads.filter((d) => d.status === 'paused')
   const completed = downloads.filter((d) => d.status === 'completed')
   // error 与 cancelled 同属「未成功终态」。**只服务状态栏读数**（下方 `main.status` 的
-  // `{failed}` 占位符），**不再驱动导航** —— 失败·已取消档已移除，失败任务在「全部文件」里
-  // 以行内红色错误文字标记 + 行内「删除」处理。删掉这行 tsc 照样绿（占位符缺失只显示空
-  // 字符串），状态栏的失败数会静默消失 —— 典型假绿，勿删。
+  // `{failed}` 占位符）—— 侧栏树档已按 BUG-314 撤档（曾误设「已取消」独立档，
+  // 越权解读用户「记录不消失」诉求；记录可见性由「全部」档承担），这条只读不导航。
+  // 删掉这行 tsc 照样绿（占位符缺失只显示空字符串），状态栏的失败数会静默消失
+  // —— 典型假绿，勿删。
   const failed = downloads.filter((d) => d.status === 'error' || d.status === 'cancelled')
   // 全局聚合进度（BUG-004）：管理中任务（下载中/排队/已暂停）的累计字节占比。
   const aggregate = downloads.filter(
@@ -191,6 +201,16 @@ export function MainLayout() {
    */
   const handleOpenMedia = useEvent(() => handleNavigate('files', { fmode: 'lib-series' }))
   /**
+   * 入库流水线 → 下载域的跨视图出口（2026-10-17 用户裁定「入口只需要简易内容，
+   * 全部都在下载里面，其他都不要」）。
+   *
+   * 条目级明细与管理的家（逐条清单 / 重试 / 删除 / 取消优先）在下载域：
+   * TG 侧弹窗每行只留一个门，落到「全部下载」（`dlFilter='all'`）—— 那里按
+   * 入库口径列出全部组，点开 `IngestDetailSheet` 就是条目级明细。
+   * 与 `handleOpenMedia` 同理，视图 state 在本组件（局部），接线只能是这一个回调。
+   */
+  const handleOpenDownload = useEvent(() => handleNavigate('download', { dlFilter: 'all' }))
+  /**
    * BUG-305：媒体库 → TG 面板的跨域出口（`handleOpenMedia` 的反向对应）。
    *
    * 「在 TG 中查看」的应用内落点：入口先把来源坐标设进 store 正向焦点
@@ -236,7 +256,7 @@ export function MainLayout() {
           onToggle={() => setCollapsed((c) => !c)}
           counts={{
             files: filesCounts.files,
-            // 下载域三桶 = 引擎任务 + 入库对象（M3/BUG-300，口径见上方 overview 注释）
+            // 下载域各桶 = 引擎任务 + 入库对象（M3/BUG-300，口径见上方 overview 注释）
             downloading: downloadingBucket.length + overview.active,
             paused: paused.length,
             completed: completed.length + overview.done,
@@ -260,6 +280,8 @@ export function MainLayout() {
               onPauseAll={handlePauseAll}
               onResumeAll={handleResumeAll}
               onClearCompleted={handleClearCompleted}
+              ingestOverview={overview}
+              ingestUnavailable={ingest.unavailable}
             />
           </header>
 
@@ -281,7 +303,11 @@ export function MainLayout() {
               />
             ) : view === 'tg' ? (
               <ErrorBoundary>
-                <TgPanel onOpenAccounts={handleGoAccounts} onOpenMedia={handleOpenMedia} />
+                <TgPanel
+                  onOpenAccounts={handleGoAccounts}
+                  onOpenMedia={handleOpenMedia}
+                  onOpenDownload={handleOpenDownload}
+                />
               </ErrorBoundary>
             ) : view === 'share' ? (
               <ErrorBoundary>

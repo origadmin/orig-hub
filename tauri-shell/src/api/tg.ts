@@ -307,29 +307,17 @@ export function tgThumbUrl(chatId: number | string, messageId: number | string):
   return `${tgBase()}/api/tg/thumb/${encodeURIComponent(String(chatId))}/${encodeURIComponent(String(messageId))}`
 }
 
-/** GET /api/tg/config — 运行时配置（缓存下载目录、库根等） */
-export async function getTgConfig(): Promise<{ downloadDir: string; libraryDir?: string }> {
-  return request<{ downloadDir: string; libraryDir?: string }>('/api/tg/config')
-}
-
-/** PUT /api/tg/config — 更新缓存下载目录（持久化到 app_setting，立即生效） */
-export async function setTgDownloadDir(downloadDir: string): Promise<{ downloadDir: string }> {
-  return request<{ downloadDir: string }>('/api/tg/config', {
-    method: 'PUT',
-    body: JSON.stringify({ downloadDir }),
-  })
-}
-
 /**
- * PUT /api/tg/config — 更新库根目录（byte-ownership P2/P5）。
- * 后端做 expand_tilde + 预创建校验（不可创建时 400），成功后立即用于之后的归仓。
+ * orig-tg 的**配置读写通道已整体移除**（BUG-323）。
+ *
+ * 原因：下载路径是整个引擎的唯一根（受管根 / 权限边界），库根 = 其下 `library`，
+ * 二者由 **daemon** 统一决定 —— `PUT /api/config/download` 保存后**立即**把生效路径
+ * 推给 orig-tg（见 `api/daemon.ts::saveDownloadConfig` 的 `tg_synced`）。
+ *
+ * 前端若还留一条直写 TG 的旁路，就会出现「两个进程各持一个下载路径/库根」——
+ * 那正是 BUG-323 的成因。路径真值一律从 `GET /api/config` 读
+ * （`effective_download_root` / `library_root`），不从 TG 读、更不写 TG。
  */
-export async function setTgLibraryDir(libraryDir: string): Promise<{ libraryDir: string }> {
-  return request<{ libraryDir: string }>('/api/tg/config', {
-    method: 'PUT',
-    body: JSON.stringify({ libraryDir }),
-  })
-}
 
 /** GET /api/tg/local/{chat}/{msg} — 已缓存文件的本地流（支持 Range，不回源 TG）。
  *  供 <video> 直接引用；未缓存/文件缺失时返回 404，前端降级在线流。 */
@@ -688,4 +676,51 @@ export async function clearCacheBytes(
  */
 export async function clearCacheItem(id: number): Promise<{ ok: boolean; freed: number }> {
   return request(`/api/cache/items/${id}`, { method: 'DELETE' })
+}
+// ── 受管根（管理多根，BUG-323 第三裁定：下载单根 / 管理多根） ──────────────
+//
+// 2026-10-16 用户裁定：「管理是管理,下载是下载。下载单根,管理多根（下载根为
+// 默认主不可删除,可以设置切换主）」。Stage 1（引擎层 `/api/fs/roots*`）已落地，
+// 这里是 Stage 2 的前端通道（BUG-323 复报 2026-10-19 补齐 UI）。
+
+/** 一条受管根。下载根恒 `locked`（由 `download_dir` 派生，不可删）。 */
+export type ManagedRoot = {
+  path: string
+  /** 主根 = 管理视图默认选中；切换主**不**决定下载落点、不重定向写入（R3′）。 */
+  primary: boolean
+  /** true = 下载根：不可删除（后端显式 422，不吞成幂等）。 */
+  locked: boolean
+}
+
+/** GET /api/fs/roots — 受管根集合（下载根 + 用户根）。 */
+export async function listManagedRoots(): Promise<ManagedRoot[]> {
+  const r = await request<{ roots: ManagedRoot[] }>('/api/fs/roots')
+  return r.roots ?? []
+}
+
+/** POST /api/fs/roots {path} — 新增受管根（目录不存在也接受：先登记再导入）。 */
+export async function addManagedRoot(path: string): Promise<ManagedRoot[]> {
+  const r = await request<{ roots: ManagedRoot[] }>('/api/fs/roots', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  })
+  return r.roots ?? []
+}
+
+/** DELETE /api/fs/roots {path} — 删除受管根（下载根恒 422，显式拒绝）。 */
+export async function removeManagedRoot(path: string): Promise<ManagedRoot[]> {
+  const r = await request<{ roots: ManagedRoot[] }>('/api/fs/roots', {
+    method: 'DELETE',
+    body: JSON.stringify({ path }),
+  })
+  return r.roots ?? []
+}
+
+/** POST /api/fs/roots/primary {path} — 切换主根（只改管理视图默认选中）。 */
+export async function setPrimaryManagedRoot(path: string): Promise<ManagedRoot[]> {
+  const r = await request<{ roots: ManagedRoot[] }>('/api/fs/roots/primary', {
+    method: 'POST',
+    body: JSON.stringify({ path }),
+  })
+  return r.roots ?? []
 }

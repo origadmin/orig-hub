@@ -1,6 +1,7 @@
 //! 守护进程共享状态。
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -12,6 +13,7 @@ use tokio::process::Child;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::config::Config;
+use crate::task_store::{EngineTaskRecord, TaskStore};
 
 /// orig-tg 监听端口。**唯一真源**：拉起子进程时注入、聚合层拉取时引用，
 /// 两处必须同源，否则「启在 9877、拉 9876」这类分叉又会重新长出来。
@@ -195,7 +197,17 @@ pub struct AppState {
     pub port: u16,
     pub registry: Registry,
     /// 进行中的任务：id -> DownloadTask（Arc 共享，控制句柄在 Task 内）。
+    ///
+    /// ⚠️ 这是一个**进程内**的表：它只服务于正在跑的任务，不是记录真源。
+    /// BUG-319 之前它就是唯一数据源，于是进程一没，下载行全丢。
+    /// 现在记录真源是 [`Self::task_store`]（SQLite）；本表只装「本进程手里有
+    /// 控制句柄的那些」，两者由 `activity::download_views` 合并后再对外。
     pub tasks: Mutex<HashMap<String, DownloadTask>>,
+    /// 引擎任务持久化（BUG-319）。
+    ///
+    /// `None` = 库打不开（磁盘满 / 目录只读）—— 下载照样能跑，只是记录会丢。
+    /// 持久化是可用性增强，不是服务前提，绝不因此阻断启动。
+    pub task_store: Option<Arc<TaskStore>>,
     pub events: broadcast::Sender<SseEvent>,
     /// daemon 配置（RwLock：设置页可运行时更新自动分类规则）。
     pub config: RwLock<Config>,
@@ -218,6 +230,12 @@ pub struct AppState {
     pub tg_port: RwLock<u16>,
     /// 出向 HTTP 客户端（`/api/activity` 聚合层拉 orig-tg 用；见 `build_http_client`）。
     pub http: reqwest::Client,
+    /// **上一次已成功同步给 orig-tg 的下载路径**（BUG-323）。
+    ///
+    /// 下载路径是整个引擎的唯一根（库根 = 其下 `library`），orig-tg 必须跟随。
+    /// 记「上次成功的值」是为了：值未变一个 HTTP 都不发；发失败就不记账 ⇒
+    /// 下一轮巡检自动重试（不依赖用户点任何按钮）。
+    pub tg_synced_download_root: Mutex<Option<String>>,
 }
 
 impl AppState {
@@ -226,11 +244,13 @@ impl AppState {
         registry: Registry,
         events: broadcast::Sender<SseEvent>,
         config: Config,
+        task_store: Option<Arc<TaskStore>>,
     ) -> Self {
         Self {
             port,
             registry,
             tasks: Mutex::new(HashMap::new()),
+            task_store,
             events,
             config: RwLock::new(config),
             tg_child: Mutex::new(None),
@@ -239,12 +259,133 @@ impl AppState {
             tg_last_restart: Mutex::new(None),
             tg_port: RwLock::new(tg_port()),
             http: build_http_client(),
+            tg_synced_download_root: Mutex::new(None),
         }
     }
 
     /// 当前为 orig-tg 选定的端口（唯一真源，随 `/api/config` 下发）。
     pub fn tg_port_state(&self) -> u16 {
         *self.tg_port.read().unwrap()
+    }
+
+    /// 把下载路径推给 orig-tg（`PUT /api/tg/config {downloadDir}`），幂等。
+    ///
+    /// 下载路径是全部文件的唯一容器，orig-tg 的下载落点与库根都由它派生
+    /// （BUG-323）—— 因此这条推送是「单一根」的落地动作，不是可选优化。
+    pub async fn push_tg_download_root(&self, dir: &str) -> Result<(), String> {
+        let url = format!("http://127.0.0.1:{}/api/tg/config", self.tg_port_state());
+        let body = serde_json::json!({ "downloadDir": dir }).to_string();
+        match self
+            .http
+            .put(&url)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) => {
+                let code = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                Err(format!(
+                    "orig-tg rejected download dir update: {code} {}",
+                    text.trim()
+                ))
+            }
+            Err(e) => Err(format!("orig-tg unreachable while syncing download dir: {e}")),
+        }
+    }
+
+    /// 需要时同步下载路径（值未变则零请求）。
+    ///
+    /// 供巡检调用：TG 起来了 / 用户改了目录 / 上次推送失败 —— 三种情况都会在下一轮
+    /// 巡检里自然收敛。失败原因写日志，不静默。
+    pub async fn sync_download_root_if_needed(&self) {
+        let eff = {
+            let cfg = self.config.read().unwrap();
+            crate::config::effective_download_root(&cfg)
+        };
+        let want = eff.to_string_lossy().into_owned();
+        {
+            let last = self.tg_synced_download_root.lock().await;
+            if last.as_deref() == Some(want.as_str()) {
+                return;
+            }
+        }
+        match self.push_tg_download_root(&want).await {
+            Ok(()) => {
+                *self.tg_synced_download_root.lock().await = Some(want);
+            }
+            Err(e) => {
+                // 不记账 ⇒ 下一轮重试；同时留痕（用户可查 errors.log）。
+                let msg = format!("[warn] sync download root to orig-tg failed: {e}");
+                eprintln!("{msg}");
+                append_error_log(&msg);
+            }
+        }
+    }
+
+    /// 写一条记录进持久化层（BUG-319）。
+    ///
+    /// 没有库（打开失败）时**静默跳过**：记录丢失的后果轻于服务不可用，
+    /// 与 `open_log_file` 的「日志不能让主流程失败」同一口径。
+    pub async fn persist(&self, r: &EngineTaskRecord) {
+        if let Some(s) = &self.task_store {
+            s.upsert(r).await;
+        }
+    }
+
+    /// 只改一条记录的状态（不碰字节数，见 `TaskStore::set_status`）。
+    pub async fn set_task_status(&self, id: &str, status: &str) {
+        if let Some(s) = &self.task_store {
+            s.set_status(id, status).await;
+        }
+    }
+
+    /// 库里有没有这条记录。
+    ///
+    /// 终态行已让出内存句柄（见 `spawn_task` 收尾），只查内存会把终态行判成
+    /// 「不存在」⇒ 它删不掉 —— 而终态行恰恰是用户最想清掉的那一行。
+    pub async fn record_exists(&self, id: &str) -> bool {
+        match &self.task_store {
+            Some(s) => s.get(id).await.is_some(),
+            None => false,
+        }
+    }
+
+    /// 删掉一条记录（用户显式删除任务时）。
+    pub async fn forget(&self, id: &str) {
+        if let Some(s) = &self.task_store {
+            s.remove(id).await;
+        }
+    }
+
+    /// 由内存任务 + 调用方给定的读数构造一条持久化记录。
+    ///
+    /// 状态与字节数由调用方传入，本函数不猜：内存的 `progress()` 是瞬时快照，
+    /// 而写库只在**状态迁移**与**终态**发生 —— 混在一起就会变成每轮询写一次。
+    pub fn record_of(
+        dt: &DownloadTask,
+        status: &str,
+        total: u64,
+        downloaded: u64,
+        updated_at: i64,
+        error: Option<String>,
+    ) -> EngineTaskRecord {
+        EngineTaskRecord {
+            id: dt.task.id.clone(),
+            url: dt.url.clone(),
+            filename: dt.filename.clone(),
+            output: dt.output.to_string_lossy().into_owned(),
+            added_at: dt.added_at,
+            updated_at,
+            max_concurrency: dt.max_concurrency,
+            category: dt.category.clone(),
+            status: status.to_string(),
+            downloaded,
+            total,
+            error,
+        }
     }
 
     /// 为 orig-tg 选定端口：起点可用就沿用，不可用则顺延到第一个可绑定的（BUG-178）。
@@ -414,6 +555,7 @@ impl AppState {
         loop {
             if tg_port_has_listener(port).await {
                 self.clear_tg_last_error();
+                daemon_log(&format!("orig-tg started and listening on 127.0.0.1:{port}"));
                 return Ok(true);
             }
             // 直接探子进程退出状态（保留退出码），不再经由 `tg_managed_alive` 丢弃它。
@@ -500,8 +642,48 @@ impl AppState {
     /// 真正 spawn 受 `TG_SPAWN_COOLDOWN` 限制 —— 二进制缺失这类**永久失败**
     /// 不该变成每 15s 拉起一个立刻就死的进程。
     pub async fn tg_supervise(self: &Arc<Self>) {
+        let mut holding = false;
         loop {
             tokio::time::sleep(TG_SUPERVISE_INTERVAL).await;
+
+            // ---- 重部署握手（AI 触发；非自治）----
+            // 收到 request：停 orig-tg，写 stopped（AI 可安全构建），进入 hold（抑制自愈）。
+            if redeploy_signal_exists(REDEPLOY_REQ) {
+                remove_redeploy_signal(REDEPLOY_REQ);
+                daemon_log("redeploy request received — stopping orig-tg for build");
+                eprintln!("[daemon] redeploy request — stopping orig-tg");
+                self.tg_stop().await;
+                write_redeploy_signal(REDEPLOY_STOPPED);
+                daemon_log("orig-tg stopped; safe to build (write orighub-redeploy-built when done)");
+                eprintln!("[daemon] orig-tg stopped; safe to build now (write orighub-redeploy-built when done)");
+                holding = true;
+                continue;
+            }
+            // 收到 built：重启 orig-tg（拾取新二进制），写 done，退出 hold。
+            if holding && redeploy_signal_exists(REDEPLOY_BUILT) {
+                remove_redeploy_signal(REDEPLOY_BUILT);
+                daemon_log("redeploy built received — restarting orig-tg with new binary");
+                eprintln!("[daemon] redeploy built — restarting orig-tg");
+                match self.tg_restart().await {
+                    Ok(true) => {
+                        daemon_log("orig-tg restarted after redeploy");
+                        eprintln!("[daemon] orig-tg restarted after redeploy");
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        daemon_log(&format!("failed to restart orig-tg after redeploy: {e}"));
+                        eprintln!("[daemon] failed to restart orig-tg after redeploy: {e}");
+                    }
+                }
+                write_redeploy_signal(REDEPLOY_DONE);
+                holding = false;
+                continue;
+            }
+            // hold 期间不自愈，避免与构建抢进程（exe 被锁会 os error 5）。
+            if holding {
+                continue;
+            }
+
             let enabled = self.config.read().unwrap().tg_enabled;
             if !enabled {
                 continue;
@@ -519,7 +701,10 @@ impl AppState {
                     continue;
                 }
                 match self.tg_start().await {
-                    Ok(true) => eprintln!("[tg] supervise: orig-tg recovered"),
+                    Ok(true) => {
+                        daemon_log("orig-tg recovered (was down)");
+                        eprintln!("[tg] supervise: orig-tg recovered");
+                    }
                     Ok(false) => {}
                     Err(e) => eprintln!("[tg] supervise: failed to start orig-tg: {e}"),
                 }
@@ -532,6 +717,10 @@ impl AppState {
             // 桌面壳 `ensure_tg` 两条手动路径 —— 用户修好网络还得替系统点一下，
             // 那是把 daemon 的失职外包给用户。现在巡检自己收尾。
             if self.tg_link_healthy().await {
+                // BUG-323：TG 健康时顺手对齐下载路径。值未变 ⇒ 零请求；
+                // 上次推送失败（TG 刚回来）/ 用户刚改过目录 ⇒ 这里自然补上，
+                // 不需要用户点任何按钮。
+                self.sync_download_root_if_needed().await;
                 continue;
             }
             let can_restart = {
@@ -545,6 +734,7 @@ impl AppState {
                 continue;
             }
             eprintln!("[tg] supervise: telegram link is down, restarting orig-tg");
+            daemon_log("telegram link is down — restarting orig-tg");
             *self.tg_last_restart.lock().await = Some(tokio::time::Instant::now());
             match self.tg_restart().await {
                 Ok(true) => eprintln!("[tg] supervise: orig-tg restarted"),
@@ -598,6 +788,7 @@ impl AppState {
         *g = None;
         // 主动关闭 = 用户意图，先前的失败原因不再相关（否则关掉再开还挂着旧错）。
         self.clear_tg_last_error();
+        daemon_log("orig-tg stopped");
     }
 }
 
@@ -804,6 +995,51 @@ pub(crate) fn open_log_file(name: &str) -> Option<std::fs::File> {
         .ok()
 }
 
+/// 守护进程自身生命周期日志（追加到 `logs/orig-daemon.log`）。
+///
+/// daemon 是 `windows_subsystem`，无控制台，所有「启动 / 子进程重启 / 停止 / 重部署」
+/// 提示必须落文件才能被用户或 AI 读到 —— 对应「启动内容要有明确提示」「服务提示被杀」。
+/// 失败（磁盘满等）静默返回，**绝不影响主流程**。
+pub(crate) fn daemon_log(msg: &str) {
+    if let Some(mut f) = open_log_file("orig-daemon.log") {
+        let _ = f.write_all(format!("[orig-daemon] {msg}\n").as_bytes());
+    }
+}
+
+/// 重部署握手信号（与 `scripts/dev_services.py` 约定同一临时目录）。
+///
+/// 协议（全由 AI 经 dev_services 触发，**非自治**）：
+///   - `orighub-redeploy-request`  AI 写 → daemon 停 orig-tg、写 `…-stopped`（可安全构建）、进入 hold；
+///   - `orighub-redeploy-built`    AI 写（构建后）→ daemon 重启 orig-tg（拾取新二进制）、写 `…-done`、退出 hold；
+///   - hold 期间 daemon **抑制**对 orig-tg 的自愈，避免与 cargo build 抢进程（exe 被锁会 os error 5）。
+///
+/// daemon 自身（不是子进程）的二进制更新仍需「杀 daemon → 重建 → 用户重启」，
+/// 对应「启动服务→开发 kill→服务提示被杀→用户再启动」。
+const REDEPLOY_REQ: &str = "orighub-redeploy-request";
+const REDEPLOY_BUILT: &str = "orighub-redeploy-built";
+const REDEPLOY_STOPPED: &str = "orighub-redeploy-stopped";
+const REDEPLOY_DONE: &str = "orighub-redeploy-done";
+
+fn redeploy_signal_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(name)
+}
+fn redeploy_signal_exists(name: &str) -> bool {
+    redeploy_signal_path(name).exists()
+}
+fn write_redeploy_signal(name: &str) {
+    let _ = std::fs::write(redeploy_signal_path(name), b"");
+}
+fn remove_redeploy_signal(name: &str) {
+    let _ = std::fs::remove_file(redeploy_signal_path(name));
+}
+
+/// 启动时清理遗留的重部署握手信号，避免上次 AI 崩溃留下的 `request` 让新 daemon 一开机就停 tg。
+pub(crate) fn clear_stale_redeploy_signals() {
+    for n in [REDEPLOY_REQ, REDEPLOY_BUILT, REDEPLOY_STOPPED, REDEPLOY_DONE] {
+        remove_redeploy_signal(n);
+    }
+}
+
 /// 把 Unix 秒格式化为 `YYYY-MM-DDTHH:MM:SSZ`（UTC）。
 ///
 /// 不引日期库：本 crate 只需一个诊断时间戳，`civil_from_days`（Howard Hinnant
@@ -870,7 +1106,7 @@ mod tests {
     /// 构造一份最小 AppState（无托管子进程、默认配置）。
     fn test_state() -> AppState {
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
-        AppState::new(0, Registry::new(), tx, Config::default())
+        AppState::new(0, Registry::new(), tx, Config::default(), None)
     }
 
     /// 借内核分配一个**当前空闲**的端口号（bind 后立刻释放）。

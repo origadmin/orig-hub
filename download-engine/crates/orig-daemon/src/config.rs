@@ -81,9 +81,10 @@ pub struct Config {
     pub download_dir: Option<PathBuf>,
     /// 受管库根（D23-A：手动下载与插件入库同处一个受管根，设置一处可配）。
     ///
-    /// 手动下载**从未配置** `download_dir` 时，默认根 = `<library_dir>/下载/`；
-    /// 库根也为空（老库 / 未初始化）才回退平台默认目录（BUG-071 的「绝不落字面
-    /// `~/Downloads`」纪律不变）。**插件（TG）归仓路径不经此处** —— 它由插件自管。
+    /// **BUG-323（用户 2026-10-16 裁定）**：手动下载**从未配置** `download_dir` 时的
+    /// 默认根**不再**绑 `<library_dir>/下载/`，而是直接回退**平台默认下载目录**
+    /// （见 [`manual_download_root`]）。库根此处仅作展示/持久化，不再决定下载落点。
+    /// **插件（TG）归仓路径不经此处** —— 它由插件自管。
     pub library_dir: Option<PathBuf>,
     /// 默认并发连接数（对齐 orig-hub `max_connections` 缺省 8）。
     pub max_connections: u32,
@@ -215,7 +216,12 @@ impl Config {
                     "download_dir" if !v.is_empty() => {
                         // Legacy configs may hold `~/Downloads`; expand it here so
                         // an upgrade never lands in `<CWD>/~/Downloads` (BUG-071).
-                        cfg.download_dir = Some(orig_core::paths::expand_tilde(v))
+                        // BUG-323 复报（2026-10-19）：再收敛分隔符字面 —— 活栈
+                        // 实测存量 toml 里存着 `D://OrigDown`（双斜杠），读取侧
+                        // 归一化后无需手工改库即恢复 `D:/OrigDown`。
+                        cfg.download_dir = Some(orig_core::paths::normalize_dir_path(
+                            &orig_core::paths::expand_tilde(v),
+                        ))
                     }
                     "library_dir" if !v.is_empty() => {
                         // 受管库根（D23-A）；同 `download_dir`，旧值里的 `~` 在读取期展开。
@@ -291,7 +297,9 @@ impl Config {
         // 环境变量覆盖（在 toml 之后）：容器/远程部署用 env 始终优先于挂载的 toml。
         if let Ok(d) = std::env::var("SURGE_DOWNLOAD_DIR") {
             if !d.is_empty() {
-                cfg.download_dir = Some(orig_core::paths::expand_tilde(&d));
+                cfg.download_dir = Some(orig_core::paths::normalize_dir_path(
+                    &orig_core::paths::expand_tilde(&d),
+                ));
             }
         }
         // 受管库根（D23-A）：设置页保存「库根目录」时同步写入；`ORIG_TG_LIBRARY_DIR`
@@ -418,10 +426,13 @@ impl Config {
     /// Windows 路径若写反斜杠会被 TOML 当转义序列，读回即坏。
     pub fn save_download_dir(&self, path: &str) -> std::io::Result<String> {
         let existing = std::fs::read_to_string(path).unwrap_or_default();
+        // BUG-323 复报（2026-10-19）：先归一化再落盘。此前只 `replace('\\', "/")`
+        // 不折叠重复分隔符 ⇒ 用户输入的 `D:\\OrigDown` 会原样写成 `D://OrigDown`，
+        // 与目录浏览器/历史目录给出的形态在系统里各算一套。
         let value = self
             .download_dir
             .as_ref()
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .map(|p| orig_core::paths::normalize_dir(&p.to_string_lossy()))
             .unwrap_or_default();
         let mut out = String::new();
         let mut written = false;
@@ -446,39 +457,9 @@ impl Config {
         Ok(out)
     }
 
-    /// 保存受管库根（顶层键 `library_dir`）：运行时生效 + 持久化到 `download-engine.toml`。
-    ///
-    /// 与 [`Config::save_download_dir`] 同构（顶层键、正斜杠、空值删行）。D23-A⑥：
-    /// 「TG 库根与下载库根同属一个受管 library_root（设置一处可配）」—— 设置页保存
-    /// 「库根目录」时同步写入 daemon 与 TG，二者共用同一值。
-    pub fn save_library_dir(&self, path: &str) -> std::io::Result<String> {
-        let existing = std::fs::read_to_string(path).unwrap_or_default();
-        let value = self
-            .library_dir
-            .as_ref()
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default();
-        let mut out = String::new();
-        let mut written = false;
-        for raw in existing.lines() {
-            let line = raw.trim_end();
-            let trimmed = line.trim();
-            if trimmed.starts_with("library_dir") && trimmed.contains('=') {
-                if !value.is_empty() {
-                    out.push_str(&format!("library_dir = \"{value}\"\n"));
-                    written = true;
-                }
-                continue;
-            }
-            out.push_str(line);
-            out.push('\n');
-        }
-        if !written && !value.is_empty() {
-            out = format!("library_dir = \"{value}\"\n{out}");
-        }
-        std::fs::write(path, &out)?;
-        Ok(out)
-    }
+    /// ~~保存受管库根~~ —— **已删（BUG-323）**：库根是 `<生效下载路径>/library` 的
+    /// 派生值，没有独立写入口（`PUT /api/config/library` 恒 422）。
+    /// 保留 `library_dir` 的**读取**只是为了让旧 toml 不报错，别再无写路径。
 
     /// 将代理配置持久化到 `download-engine.toml` 的 `[proxy]` 段（保留其它段）。
     /// 返回写出的完整文本。
@@ -588,21 +569,69 @@ pub fn default_download_dir() -> PathBuf {
     orig_core::paths::default_download_dir()
 }
 
-/// 手动下载在受管库根下的子目录名（D23-A①）。
-pub const MANUAL_DOWNLOAD_SUBDIR: &str = "下载";
-
-/// 手动下载的**默认根**（D23-A①）—— 三层链里「配置 download_dir 为空」那一层。
+/// 手动下载的**默认根** —— 三层链里「配置 download_dir 为空」那一层。
 ///
-/// 库根已配置 → `<库根>/下载/`；库根也未配置（老库 / 未初始化）→ 平台默认目录。
+/// **BUG-323（用户 2026-10-16 裁定）**：默认根 = **平台默认下载目录**
+/// （Windows = `SHGetKnownFolderPath(FOLDERID_Downloads)`，如 `C:\Users\<user>\Downloads`）。
 ///
-/// **为什么不是直接把 `download_dir` 的默认值改成库根**：那会把「用户显式配过系统
-/// Downloads」与「从未配置」两种状态混为一谈。D23-A 的迁移红线是**只改未配置者的
-/// 默认回退**，已配过的必须尊重 —— 故默认值放在解析链末端，而不是写进 `Config`。
-pub fn manual_download_root(cfg: &Config) -> PathBuf {
-    match cfg.library_dir.as_ref() {
-        Some(lib) => lib.join(MANUAL_DOWNLOAD_SUBDIR),
-        None => default_download_dir(),
+/// 历史：D23-A① 曾把它定为 `<library_dir>/下载/` —— 方向正好反了。库根解析链末端是
+/// **内部 AppData 隐藏路径**（`<TG 数据目录>/library`），于是「默认下载根」变成用户
+/// 找不到的 `…AppData/…/tg/library/下载`（用户：「毫无逻辑性」）。现在是
+/// **下载路径为唯一根、库根从属于它**（见 [`library_root`]）。
+///
+/// `cfg` 参数保留仅为**不动调用方签名**（`resolve_output` / `routes`）；不再读取它 ——
+/// 用户显式配置的 `download_dir` 由上游分支优先命中，不会走到这里。
+pub fn manual_download_root(_cfg: &Config) -> PathBuf {
+    // 与 `effective_download_root` 同一条禁用盘规则（用户 2026-10-19 裁定）：
+    // 名义默认 `~/Downloads` 落在系统盘上 ⇒ 手动下载的落点改取 D 盘内容根。
+    let d = default_download_dir();
+    if orig_core::paths::is_forbidden_content_drive(&d) {
+        return orig_core::paths::content_root();
     }
+    d
+}
+
+/// **生效下载路径** = 受管根 / 权限边界（BUG-323）：配置的 `download_dir`
+/// （`~` 已在读取期展开）→ 否则平台默认下载目录。
+///
+/// 这是全部用户内容字节（下载成品、归仓媒体、转码代理）的唯一容器；前端设置页
+/// 展示的「当前生效」路径即此值，前端**不自己拼**（拼出来必然漂移）。
+///
+/// **C 盘禁用（用户 2026-10-19 裁定）**：「禁止往C盘写入任何数据,所有内容应该写D盘」；
+/// 对默认值的说明是「~/Downloads是默认设置,但是不使用,改用加载配置的D盘设置」。
+/// 所以：OS 下载目录只当**名义默认**，解析结果一旦落在禁用盘（`C:`），一律改取
+/// D 盘内容根 [`orig_core::paths::content_root`]，并打日志 —— 静默改道等于
+/// 用户以为写在 C 盘、其实没有；静默不改道等于把规则当耳边风。
+/// 活栈实测：无此规则时装机默认往 `C:\Users\…\Downloads` 积了 30.2 GB。
+pub fn effective_download_root(cfg: &Config) -> PathBuf {
+    // BUG-323 复报（2026-10-19）：边界真源自己也归一化。解析/保存/下发三段都归一化，
+    // 仍留这一处兜底 —— `cfg.download_dir` 还可能由 env（`SURGE_DOWNLOAD_DIR`）或
+    // 直接在内存里赋值的路径进来，漏一处就会出现「边界认 A、落点写 B」。
+    let raw = cfg
+        .download_dir
+        .clone()
+        .unwrap_or_else(default_download_dir);
+    let norm = orig_core::paths::normalize_dir_path(&raw);
+    if orig_core::paths::is_forbidden_content_drive(&norm) {
+        let redirected = orig_core::paths::content_root();
+        tracing::warn!(
+            "resolved download root {} is on a forbidden content drive; \
+             using {} instead (ruling: all content goes to the D: drive)",
+            norm.display(),
+            redirected.display()
+        );
+        return redirected;
+    }
+    norm
+}
+
+/// **受管库根** = `<生效下载路径>/library` —— 派生值，**不可独立配置**（BUG-323）。
+///
+/// 与 orig-tg 侧 `Store::library_root()` 是同一条规则的两端（子目录名必须一致：
+/// 引擎与桌面壳不得各算一套）。库根不设独立入口，是为了让「库根脱离下载路径」
+/// 在结构上不可表达。
+pub fn library_root(cfg: &Config) -> PathBuf {
+    effective_download_root(cfg).join("library")
 }
 
 /// Three-layer resolution: request dir → config download_dir → platform default
@@ -610,13 +639,26 @@ pub fn manual_download_root(cfg: &Config) -> PathBuf {
 /// the real home directory, so a literal tilde never reaches the filesystem.
 /// Only when all three are empty does it fall back to the current directory.
 ///
-/// D23-A①: the third layer is `<library_dir>/下载/` when a managed library root
-/// is configured; the platform default is the last resort.
+/// BUG-323: the third layer is the **platform default download directory**
+/// (`~/Downloads`), decoupled from the managed library root (see
+/// [`manual_download_root`]).
+/// 目录入链前的统一预处理（BUG-323 复报 2026-10-19）：`~` 展开 + 分隔符字面
+/// 归一化。请求目录与配置目录都必须过它，否则落点会出现「两条路径同一个目录」。
+fn norm_dir_in_chain(d: &str) -> PathBuf {
+    orig_core::paths::normalize_dir_path(&orig_core::paths::expand_tilde(d))
+}
+
 pub fn resolve_output(req_dir: Option<&str>, cfg: &Config, filename: &str) -> PathBuf {
+    // BUG-323 复报（2026-10-19）：请求目录与配置目录都先归一化再拼，
+    // 落点字面与「当前生效」行、受管根边界判定保持同一个形态。
     let base = req_dir
         .filter(|s| !s.is_empty())
-        .map(orig_core::paths::expand_tilde)
-        .or_else(|| cfg.download_dir.as_deref().map(orig_core::paths::expand_tilde_path))
+        .map(norm_dir_in_chain)
+        .or_else(|| {
+            cfg.download_dir
+                .as_deref()
+                .map(|d| norm_dir_in_chain(&d.to_string_lossy()))
+        })
         .unwrap_or_else(|| manual_download_root(cfg));
     base.join(filename)
 }
@@ -645,7 +687,7 @@ pub fn resolve_output_classified(
     let base = cfg
         .download_dir
         .as_deref()
-        .map(orig_core::paths::expand_tilde_path)
+        .map(|d| norm_dir_in_chain(&d.to_string_lossy()))
         .unwrap_or_else(|| manual_download_root(cfg));
     let category = cfg.classify.classify(filename);
     base.join(category).join(filename)
@@ -807,6 +849,69 @@ mod tests {
         assert!(!p.to_string_lossy().contains('~'));
     }
 
+    /// BUG-323 复报（2026-10-19）：读取侧归一化 —— 活栈实测存量 toml 里存着
+    /// `D://OrigDown`（双斜杠），无归一化时界面与引擎从此各算一套。
+    #[test]
+    fn load_folds_duplicate_separators_bug323() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("orig-daemon-bug323-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("download-engine.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"download_dir = \"D://OrigDown\"\n").unwrap();
+        drop(f);
+
+        let cfg = Config::load_from(path.to_str().unwrap());
+        let stored = cfg.download_dir.expect("download_dir must be parsed");
+        assert_eq!(
+            stored.to_string_lossy(),
+            "D:/OrigDown",
+            "读取侧必须折叠重复分隔符（活栈污染形态）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BUG-323 复报（2026-10-19）：保存侧归一化 —— `replace('\\', "/")` 不折叠
+    /// 重复分隔符，用户输入的 `D:\\OrigDown` 会被原样写成 `D://OrigDown`。
+    #[test]
+    fn save_download_dir_folds_duplicate_separators_bug323() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("orig-daemon-bug323s-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("download-engine.toml");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"[classify]\nenabled = false\n")
+            .unwrap();
+
+        let cfg = Config {
+            download_dir: Some(PathBuf::from("D:\\OrigDown\\")),
+            ..Config::default()
+        };
+        cfg.save_download_dir(path.to_str().unwrap()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("download_dir = \"D:/OrigDown\""),
+            "保存值必须归一化，实际 = {text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BUG-323 复报（2026-10-19）：请求目录同样归一化（新建下载的落点字面必须与
+    /// 「当前生效」行一致，否则用户看到两个路径指向同一个目录）。
+    #[test]
+    fn resolve_output_folds_request_dir_separator_spelling_bug323() {
+        let cfg = Config::default();
+        let p = resolve_output(Some("D:\\OrigDown\\"), &cfg, "a.zip");
+        assert_eq!(
+            p.to_string_lossy().replace('\\', "/"),
+            "D:/OrigDown/a.zip",
+            "请求目录必须折叠重复分隔符与尾分隔符"
+        );
+    }
+
     /// Programmatic configs (e.g. built by tests or sidecars) may still carry a
     /// tilde; the classified path must expand it as well (BUG-071).
     #[test]
@@ -833,7 +938,7 @@ mod tests {
         assert!(!d.to_string_lossy().contains('~'), "got {}", d.display());
     }
 
-    // ---- T08 / D23-A①：手动下载默认根回退 `<库根>/下载/` ----
+    // ---- BUG-323：手动下载默认根回退**平台默认**（与库根解耦）----
 
     fn cfg_with_dirs(download: Option<&str>, library: Option<&str>) -> Config {
         Config {
@@ -843,21 +948,34 @@ mod tests {
         }
     }
 
-    /// 未配置 `download_dir` + 已配置库根 → 默认根 = `<库根>/下载/`（D23-A① 主断言）。
+    /// 未配置 `download_dir` + 已配置库根 → 默认根 = **平台默认下载目录**（BUG-323 主断言）。
+    ///
+    /// C 盘禁用（用户 2026-10-19 裁定「~/Downloads是默认设置,但是不使用」）：本机平台默认
+    /// 目录就在 C: 上 ⇒ 默认值不得被采用，落点改取 D 盘内容根。所以这里只能断言
+    /// 「要么是平台默认、要么是内容根」，不能无条件断言相等 —— 断言相等等于把
+    /// 「不往 C 盘写」当缺陷。
+    ///
+    /// 反向证伪：若这条断言改回 `<库根>/下载/` 而仍 PASS，说明解耦未生效。
     #[test]
-    fn unset_download_dir_falls_back_to_library_download_root() {
+    fn unset_download_dir_falls_back_to_platform_default_bug323() {
         let cfg = cfg_with_dirs(None, Some("D:/lib"));
+        let def = default_download_dir();
+        let expect = if orig_core::paths::is_forbidden_content_drive(&def) {
+            orig_core::paths::content_root()
+        } else {
+            def.clone()
+        };
         let p = resolve_output(None, &cfg, "a.bin");
-        assert_eq!(p, PathBuf::from("D:/lib").join(MANUAL_DOWNLOAD_SUBDIR).join("a.bin"));
-        // 分类开启时同样落到 `<库根>/下载/<分类>/`。
-        let p2 = resolve_output_classified(None, &cfg, "a.mp4", true);
-        assert_eq!(
-            p2,
-            PathBuf::from("D:/lib")
-                .join(MANUAL_DOWNLOAD_SUBDIR)
-                .join("Videos")
-                .join("a.mp4")
+        assert_eq!(p, expect.join("a.bin"));
+        // 库根**不再**参与：即使它被显式配置，默认根也不得落在它下面。
+        assert!(
+            !p.starts_with("D:/lib"),
+            "库根不得再决定默认下载落点，got {}",
+            p.display()
         );
+        // 分类开启时同样落到 `<默认根>/<分类>/`。
+        let p2 = resolve_output_classified(None, &cfg, "a.mp4", true);
+        assert_eq!(p2, expect.join("Videos").join("a.mp4"));
     }
 
     /// 显式配置过 `download_dir` 的**必须尊重** —— 库根不得覆盖它（D23-A 迁移红线）。
@@ -872,10 +990,54 @@ mod tests {
     }
 
     /// 库根也未配置（老库/未初始化）→ 回退平台默认目录（非字面 `~/Downloads`，BUG-071）。
+    ///
+    /// C 盘禁用（用户 2026-10-19 裁定「~/Downloads是默认设置,但是不使用」）：当平台
+    /// 默认目录本身就在禁用盘上时，**默认值不得被采用**，落点改取 D 盘内容根。
+    /// 所以这里只能断言「要么是平台默认、要么是 D 盘内容根」，不能断言相等。
     #[test]
     fn manual_download_root_without_library_is_platform_default() {
         let cfg = cfg_with_dirs(None, None);
-        assert_eq!(manual_download_root(&cfg), default_download_dir());
+        let d = default_download_dir();
+        if orig_core::paths::is_forbidden_content_drive(&d) {
+            assert_eq!(
+                manual_download_root(&cfg),
+                orig_core::paths::content_root(),
+                "默认目录在禁用盘上时，手动下载落点必须改取 D 盘内容根"
+            );
+        } else {
+            assert_eq!(manual_download_root(&cfg), d);
+        }
+    }
+
+    /// **C 盘禁用（用户 2026-10-19 裁定）**：解析到禁用盘的下载路径一律改取 D 盘
+    /// 内容根 —— 无论它是「未配置时的名义默认」还是「用户/env 显式填了 C:」。
+    ///
+    /// 反向证伪：把 `effective_download_root` 里的改道逻辑删掉 ⇒ 前两条断言转红
+    /// （装机默认把内容写进系统盘，正是活栈积了 30.2 GB 的那条路）。
+    #[test]
+    fn forbidden_drive_root_is_redirected_to_content_root() {
+        // ① 未配置：名义默认 `~/Downloads`（本机在 C:）⇒ 改道
+        let cfg = cfg_with_dirs(None, None);
+        let d = default_download_dir();
+        if orig_core::paths::is_forbidden_content_drive(&d) {
+            assert_eq!(effective_download_root(&cfg), orig_core::paths::content_root());
+            assert_eq!(manual_download_root(&cfg), orig_core::paths::content_root());
+        }
+        // ② 显式填了 C: ⇒ 同样改道（规则是「不往 C 盘写」，不是尊重填错的配置）
+        let cfg = cfg_with_dirs(Some("C:/Users/me/Downloads"), None);
+        assert_eq!(
+            effective_download_root(&cfg),
+            orig_core::paths::content_root(),
+            "显式填 C: 也必须改道，否则「不往 C 盘写」可以被一个配置绕开"
+        );
+        // ③ D: 配置照原样生效（不得被改道改错）
+        let cfg = cfg_with_dirs(Some("D:/OrigDown"), None);
+        assert_eq!(effective_download_root(&cfg), PathBuf::from("D:/OrigDown"));
+        // ④ 库根从属于它
+        assert_eq!(
+            library_root(&cfg),
+            PathBuf::from("D:/OrigDown").join("library")
+        );
     }
 
     /// 任务显式指定目录时，分类开关与库根都不介入（D16/D23：显式优先、不分类）。
@@ -886,58 +1048,70 @@ mod tests {
         assert_eq!(p, PathBuf::from("E:/pick").join("a.mp4"));
     }
 
-    /// `library_dir` 持久化 roundtrip：写入后重新加载一致，且不动其它顶层键。
+    /// BUG-323：库根**派生自下载路径**（`<download_dir>/library`）；历史 `library_dir`
+    /// 字段彻底失效（保留解析只为旧 toml 不报错，不参与任何解析结果）。
+    ///
+    /// C 盘禁用（用户 2026-10-19 裁定）：平台默认目录在 C: 上时，「未配置下载目录」这条
+    /// 分支的默认根被改取 D 盘内容根，库根随之派生 —— 不能断言等于平台默认目录/library。
+    ///
+    /// 反向证伪：把 `library_dir` 指到别处，库根也不得跟着跑 —— 否则
+    /// 「库根跟下载走」只是口号。
     #[test]
-    fn save_library_dir_roundtrip_preserves_other_keys() {
+    fn library_root_derives_from_download_root_bug323() {
+        let mut cfg = Config {
+            download_dir: None,
+            library_dir: None,
+            ..Config::default()
+        };
+        let def = default_download_dir();
+        let default_lib = if orig_core::paths::is_forbidden_content_drive(&def) {
+            orig_core::paths::content_root().join("library")
+        } else {
+            def.join("library")
+        };
+        assert_eq!(
+            library_root(&cfg),
+            default_lib,
+            "未配置下载目录时库根 = 默认下载根/library（默认根过禁用盘规则）"
+        );
+
+        cfg.download_dir = Some(PathBuf::from("D:/Videos"));
+        assert_eq!(effective_download_root(&cfg), PathBuf::from("D:/Videos"));
+        assert_eq!(library_root(&cfg), PathBuf::from("D:/Videos").join("library"));
+
+        // 历史字段不得把库根带出下载路径
+        cfg.library_dir = Some(PathBuf::from("C:/somewhere/else"));
+        assert_eq!(
+            library_root(&cfg),
+            PathBuf::from("D:/Videos").join("library"),
+            "历史 library_dir 不得影响库根（BUG-323）"
+        );
+        // BUG-323 复报 4：手动下载落点同样过禁用盘规则（不得回到 C: 的平台默认）
+        let manual = manual_download_root(&cfg);
+        if orig_core::paths::is_forbidden_content_drive(&default_download_dir()) {
+            assert_eq!(manual, orig_core::paths::content_root());
+        } else {
+            assert_eq!(manual, default_download_dir());
+        }
+    }
+
+    /// 旧 toml 里的 `library_dir` 仍可被解析（不 panic），但**不参与**任何解析结果。
+    #[test]
+    fn legacy_library_dir_toml_is_parsed_but_inert_bug323() {
         use std::io::Write;
 
         let dir = std::env::temp_dir().join(format!("orig-daemon-libdir-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("download-engine.toml");
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(b"download_dir = \"D:/dl\"\nport = 9999\n").unwrap();
-        drop(f);
-
-        let mut cfg = Config::load_from(path.to_str().unwrap());
-        cfg.library_dir = Some(PathBuf::from("D:/My Library"));
-        cfg.save_library_dir(path.to_str().unwrap()).unwrap();
-
-        let txt = std::fs::read_to_string(&path).unwrap();
-        assert!(txt.contains("library_dir = \"D:/My Library\""), "value written: {txt}");
-        assert!(txt.contains("download_dir = \"D:/dl\""), "other top-level key preserved");
-        assert!(txt.contains("port = 9999"), "other top-level key preserved");
-        assert_eq!(txt.matches("library_dir").count(), 1, "no duplicate key: {txt}");
-
-        let cfg2 = Config::load_from(path.to_str().unwrap());
-        assert_eq!(cfg2.library_dir, Some(PathBuf::from("D:/My Library")));
-        // 库根 + 未配 download_dir 时，默认根随之变为 `<库根>/下载/`。
-        assert_eq!(
-            manual_download_root(&cfg2),
-            PathBuf::from("D:/My Library").join(MANUAL_DOWNLOAD_SUBDIR)
-        );
-
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 清空库根（保存空值）→ 删除该行，回退平台默认。
-    #[test]
-    fn save_library_dir_empty_removes_key() {
-        use std::io::Write;
-
-        let dir = std::env::temp_dir().join(format!("orig-daemon-libdir-empty-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("download-engine.toml");
         let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(b"library_dir = \"D:/old\"\nport = 9999\n").unwrap();
+        f.write_all(b"download_dir = \"D:/dl\"\nlibrary_dir = \"D:/My Library\"\n")
+            .unwrap();
         drop(f);
 
-        let mut cfg = Config::load_from(path.to_str().unwrap());
-        cfg.library_dir = None;
-        cfg.save_library_dir(path.to_str().unwrap()).unwrap();
-
-        let txt = std::fs::read_to_string(&path).unwrap();
-        assert!(!txt.contains("library_dir"), "key must be removed: {txt}");
-        assert!(txt.contains("port = 9999"), "other key preserved");
+        let cfg = Config::load_from(path.to_str().unwrap());
+        assert_eq!(cfg.library_dir, Some(PathBuf::from("D:/My Library")));
+        assert_eq!(library_root(&cfg), PathBuf::from("D:/dl").join("library"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

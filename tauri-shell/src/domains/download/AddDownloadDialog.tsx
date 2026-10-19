@@ -38,10 +38,11 @@ export function AddDownloadDialog({ open, onClose }: Props) {
   // 本次下载代理：direct=用全局配置 / custom=指定代理
   const [proxyMode, setProxyMode] = useState<'global' | 'custom'>('global')
   const [proxyUrl, setProxyUrl] = useState('')
-  // 系统默认下载目录（按 OS 解析：Windows 为 C:\Users\<user>\Downloads）：未显式指定保存目录时作占位/回退。
+  // 内容默认根（用户 2026-10-19 裁定「禁止往C盘写入任何数据,所有内容应该写D盘」
+  // ⇒ Windows 恒 `D:\OrigDown`）：未显式指定保存目录时作占位/回退。
   const [defaultDir, setDefaultDir] = useState('')
 
-  // 打开时拉一次系统默认下载目录（按 OS 解析，替代写死的 ~/Downloads）。
+  // 打开时拉一次内容默认根（daemon 下发，替代写死的 ~/Downloads）。
   useEffect(() => {
     if (!open) return
     getConfig()
