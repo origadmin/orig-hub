@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Badge } from '../../components/ui/badge'
 import { useTranslation } from '../../i18n'
 import { formatBytes } from '../../lib/utils'
@@ -101,7 +101,24 @@ export function IngestDetailSheet({
     setSelected(new Set()) // 新清单 ⇒ 旧勾选一律作废（条目集会变，陈旧勾选比没有更糟）
     getCacheTaskItems(latest.id)
       .then((m) => {
-        if (!cancelled) setManifest(m)
+        if (cancelled) return
+        setManifest(m)
+        /*
+         * 默认**全选缺字节条目**（2026-10-20 用户口径：「选中的=要下载的，
+         * 入库=要下载的，实际：全部非选中」）。
+         *
+         * 缺字节 = 还没入库 = 要下载的，所以面板一打开就该是「全部选中 + 按钮可点」，
+         * 用户只做减法（取消掉不想下的那几条）。旧实现给空集合 ⇒ 10 条全非选中、
+         * 「下载选中」还灰着，等于告诉用户「没有要下载的」——与选择语义直接矛盾。
+         *
+         * 整批在传时不预选：此时选择无法兑现（条目级停止不存在，传输最小单位是任务，
+         * 见 BUG-320 ③），预选会给出「已选 N 项」却按不动的假象。
+         */
+        if (!isCacheActive(latest.status)) {
+          setSelected(
+            new Set(m.entries.filter((e) => !e.hasBytes).map((e) => e.messageId)),
+          )
+        }
       })
       .catch((e) => {
         if (!cancelled) setErr(e instanceof Error ? e.message : String(e))
@@ -122,6 +139,49 @@ export function IngestDetailSheet({
   const progress =
     latest.total > 0 ? Math.min(100, (latest.done / latest.total) * 100) : 0
 
+  /**
+   * 可选集合 = 缺字节条目（已入库的没有下载需求，不参与选择）。
+   *
+   * 提到渲染之外算，是为了让「全选 / 半选」的状态只算一次 —— 原来两个状态算在
+   * JSX 的 IIFE 里，`<input>` 只能表达 checked，没有 indeterminate，于是
+   * **部分选中时全选框与「一条没选」长得一模一样**（用户 2026-10-20 报
+   * 「全选和选中偏离」）。半选必须看得见，否则「全选」是个说谎的开关。
+   */
+  const selectableIds = manifest
+    ? manifest.entries.filter((e) => !e.hasBytes).map((e) => e.messageId)
+    : []
+  const allChecked =
+    selectableIds.length > 0 && selectableIds.every((id) => selected.has(id))
+  const someChecked = selectableIds.some((id) => selected.has(id))
+  const selectAllRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    // `indeterminate` 只能走 DOM 属性，React 没有对应 prop。
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = someChecked && !allChecked
+    }
+  }, [someChecked, allChecked])
+
+  const toggleAll = () => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (allChecked) {
+        for (const id of selectableIds) next.delete(id)
+      } else {
+        for (const id of selectableIds) next.add(id)
+      }
+      return next
+    })
+  }
+  const toggleOne = (id: number) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-end justify-center"
@@ -139,14 +199,14 @@ export function IngestDetailSheet({
 
         {/* 表头：对象名 + 状态徽标 + 关闭 */}
         <div className="flex items-center gap-2 px-4 pb-2">
-          <Badge variant="secondary">TG 入库</Badge>
+          <Badge variant="secondary" className="text-[12px]">TG 入库</Badge>
           <p
             className="min-w-0 flex-1 truncate text-sm font-semibold text-fg-strong"
             title={latest.title || latest.itemKey}
           >
             {ingestDisplayName(latest)}
           </p>
-          <Badge variant={meta.variant}>{meta.label}</Badge>
+          <Badge variant={meta.variant} className="text-[12px]">{meta.label}</Badge>
           <button
             onClick={onClose}
             className="ml-1 rounded-md px-2 py-1 text-muted hover:bg-border-subtle"
@@ -189,47 +249,50 @@ export function IngestDetailSheet({
         <div className="min-h-0 flex-1 space-y-4 overflow-auto border-t border-border-subtle px-4 py-3">
           <div>
             <p
-              className="mb-2 text-[10px] text-muted"
+              className="mb-2.5 text-[12px] leading-relaxed text-muted"
               data-testid="ingest-group-entry-note"
             >
               {isActive
                 ? '整批入库中：条目级停止不存在（传输以整批任务为最小单位），要停请用列表行的「取消」'
-                : '勾选缺字节的条目，只有选中的才会下载（BT 式选择；已入库的条目无需下载）'}
+                : '缺字节的条目已经全部选中；取消勾选你不想下的，只有选中的才会下载'}
             </p>
-            {loading && <p className="text-[11px] text-muted">加载中…</p>}
-            {err && <p className="text-[11px] text-danger">{err}</p>}
+            {loading && <p className="text-[12px] text-muted">加载中…</p>}
+            {err && <p className="text-[12px] text-danger">{err}</p>}
             {!loading && !err && !manifest && (
-              <p className="text-[11px] text-muted">无明细</p>
+              <p className="text-[12px] text-muted">无明细</p>
             )}
             {manifest && (() => {
-              // 可下载集合 = 缺字节条目（已入库的没有下载需求，不参与选择）。
-              const selectable = manifest.entries.filter((e) => !e.hasBytes)
-              const selectableIds = selectable.map((e) => e.messageId)
-              const allChecked =
-                selectableIds.length > 0 && selectableIds.every((id) => selected.has(id))
-              const toggleAll = () => {
-                setSelected((prev) => {
-                  const next = new Set(prev)
-                  if (allChecked) {
-                    for (const id of selectableIds) next.delete(id)
-                  } else {
-                    for (const id of selectableIds) next.add(id)
-                  }
-                  return next
-                })
-              }
-              const toggleOne = (id: number) => {
-                setSelected((prev) => {
-                  const next = new Set(prev)
-                  if (next.has(id)) next.delete(id)
-                  else next.add(id)
-                  return next
-                })
-              }
               return (
               <>
-              <div className="mb-1.5 flex items-center gap-2">
-                <p className="min-w-0 flex-1 text-[11px] font-medium text-fg-mid">
+              {/*
+                全选放在**条目复选框那一列**（2026-10-20 用户报「全选和选中偏离」）：
+                原来它被 flex-1 的标题挤到最右端，实测 x=1387，而每行复选框在 x≈16 ——
+                相隔 1371px，「控制这些框的开关」和「这些框」在视觉上毫无关系。
+                现结构：[全选 复选框][全选 文字][条目明细 + 计数]。
+                字号 10px → 13px、框 12px → 16px：原来那个 36×15px 的标签几乎点不到。
+              */}
+              <div className="mb-2 flex items-center gap-3">
+                {selectableIds.length > 0 ? (
+                  <label
+                    className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[13px] text-fg-mid select-none"
+                    title={isActive ? '整批入库中：不可选择' : '全选 / 取消全选缺字节条目'}
+                    data-testid="ingest-sheet-select-all"
+                  >
+                    <input
+                      ref={selectAllRef}
+                      type="checkbox"
+                      className="h-4 w-4 shrink-0 accent-accent"
+                      checked={allChecked}
+                      disabled={isActive}
+                      onChange={toggleAll}
+                      data-testid="ingest-sheet-select-all-box"
+                    />
+                    全选
+                  </label>
+                ) : (
+                  <span className="w-4 shrink-0" aria-hidden="true" />
+                )}
+                <p className="min-w-0 flex-1 text-[13px] font-medium text-fg-strong">
                   条目明细
                   {latest.manifest && (
                     <span className="ml-2 font-normal text-muted">
@@ -238,23 +301,6 @@ export function IngestDetailSheet({
                     </span>
                   )}
                 </p>
-                {selectableIds.length > 0 && (
-                  <label
-                    className="flex shrink-0 cursor-pointer items-center gap-1 text-[10px] text-muted select-none"
-                    title={isActive ? '整批入库中：不可选择' : '全选 / 取消全选缺字节条目'}
-                    data-testid="ingest-sheet-select-all"
-                  >
-                    <input
-                      type="checkbox"
-                      className="h-3 w-3 accent-accent"
-                      checked={allChecked}
-                      disabled={isActive}
-                      onChange={toggleAll}
-                      data-testid="ingest-sheet-select-all-box"
-                    />
-                    全选
-                  </label>
-                )}
               </div>
               <ul className="space-y-1" data-testid="ingest-sheet-entries">
                 {manifest.entries.map((e) => {
@@ -294,7 +340,29 @@ export function IngestDetailSheet({
                   return (
                     <li
                       key={e.messageId}
-                      className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]"
+                      /*
+                       * 整行可点选（2026-10-20 用户报「按钮完全无法找到」）：
+                       * 原来唯一能选的只有那个 12×12px 的复选框 —— 鼠标要精确命中
+                       * 一个小方块，实际等于「没有可点的东西」。现在整行都是命中区
+                       * （≥36px 高），复选框只作状态指示。
+                       * 不可下载的行（已入库）不给指针、不响应点击 —— 点它没有任何
+                       * 可兑现的动作，做出来就是死按钮。
+                       */
+                      onClick={downloadable && !isActive ? () => toggleOne(e.messageId) : undefined}
+                      className={[
+                        'flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md px-1 py-1.5 text-[13px]',
+                        downloadable && !isActive
+                          ? 'cursor-pointer select-none hover:bg-border-subtle/50'
+                          : '',
+                        isSelected ? 'bg-accent/5' : '',
+                      ].join(' ')}
+                      title={
+                        downloadable && !isActive
+                          ? isSelected
+                            ? '点击取消这条（取消后不下载）'
+                            : '点击选中这条（选中的才会下载）'
+                          : undefined
+                      }
                       data-testid="ingest-sheet-entry"
                       data-state={e.state}
                       data-bytes={e.hasBytes ? '1' : '0'}
@@ -304,9 +372,14 @@ export function IngestDetailSheet({
                       {downloadable && (
                         <input
                           type="checkbox"
-                          className="h-3 w-3 shrink-0 accent-accent"
+                          className="h-4 w-4 shrink-0 accent-accent"
                           checked={isSelected}
                           disabled={isActive}
+                          /*
+                           * 行本身已负责切换：复选框的点击必须拦下来，否则
+                           * 「input 触发一次 + 冒泡到行再触发一次」= 双击两下等于没点。
+                           */
+                          onClick={(ev) => ev.stopPropagation()}
                           onChange={() => toggleOne(e.messageId)}
                           title={
                             isActive
@@ -318,25 +391,26 @@ export function IngestDetailSheet({
                           aria-label={`选择 ${label}`}
                         />
                       )}
-                      <span className="w-12 shrink-0 font-mono text-muted">
+                      <span className="w-14 shrink-0 font-mono text-muted">
                         {label}
                       </span>
                       <span
                         className="min-w-0 flex-1 truncate font-medium text-fg-strong"
                         title={title}
+                        data-testid="ingest-sheet-entry-title"
                       >
                         {title ?? label}
                       </span>
-                      <span className="ml-auto flex shrink-0 items-center gap-2">
+                      <span className="ml-auto flex shrink-0 items-center gap-2 text-[12px]">
                         <span className="font-mono text-fg-mid">{sizeText}</span>
                         <span className="font-mono text-muted">{dateText}</span>
                         <span className={byteBadge.tone}>{byteBadge.label}</span>
                         {inFlight ? (
-                          <Badge variant="default" className="shrink-0">
+                          <Badge variant="default" className="shrink-0 text-[12px]">
                             {t('tg.manifestInFlight')}
                           </Badge>
                         ) : accumSec > 0 ? (
-                          <Badge variant="secondary" className="shrink-0">
+                          <Badge variant="secondary" className="shrink-0 text-[12px]">
                             {t('tg.manifestAccum', { s: accumSec })}
                           </Badge>
                         ) : null}
@@ -352,14 +426,14 @@ export function IngestDetailSheet({
 
           {history.length > 0 && (
             <div>
-              <p className="mb-1.5 text-[11px] font-medium text-fg-mid">
+              <p className="mb-1.5 text-[13px] font-medium text-fg-strong">
                 历史批次（{history.length}）
               </p>
               <ul className="space-y-1" data-testid="ingest-sheet-history">
                 {history.map((h) => (
                   <li
                     key={h.id}
-                    className="flex items-center gap-3 text-[11px] text-muted"
+                    className="flex items-center gap-3 text-[12px] text-muted"
                     data-testid="ingest-sheet-history-item"
                     data-status={h.status}
                   >
@@ -378,27 +452,43 @@ export function IngestDetailSheet({
           )}
         </div>
 
-        {/* 底部批量动作（BT 式选择的落点）：只有勾选的缺字节条目会被下载。
-            宿主未接线 ⇒ 不渲染（组件不自造跳转/不自造动作，BUG-324 纪律）。 */}
+        {/*
+          底部批量动作（BT 式选择的落点）：只有勾选的缺字节条目会被下载。
+          宿主未接线 ⇒ 不渲染（组件不自造跳转/不自造动作，BUG-324 纪律）。
+
+          2026-10-20 用户报「按钮完全无法找到」：实测原按钮 68×29px、11px 白字，
+          挤在 1440 宽窗口的最右下角，未选中时还是 disabled+opacity-40 —— 看着像装饰。
+          现在：13px 字号 + px-4 py-2（实测高度 ≥36px）+ 左侧把「已选 N 项」提到
+          13px 并加粗，按钮文案永远带数量；未选中时按钮不消失（消失才是真的找不到），
+          而是保持可见 + disabled + 文案直说「先选条目」。
+        */}
         {onDownloadSelected && manifest && (
           <div
-            className="flex shrink-0 items-center gap-3 border-t border-border-subtle px-4 py-2.5"
+            className="flex shrink-0 items-center gap-3 border-t border-border-subtle px-4 py-3"
             data-testid="ingest-sheet-bulk-bar"
           >
-            <span className="min-w-0 flex-1 truncate text-[11px] text-muted">
-              {selected.size > 0
-                ? `已选 ${selected.size} 项，仅这些条目会下载`
-                : '勾选缺字节条目后，只有选中的会下载'}
+            <span className="min-w-0 flex-1 text-[13px] text-muted">
+              {selected.size > 0 ? (
+                <>
+                  已选{' '}
+                  <span className="font-mono font-semibold text-fg-strong">
+                    {selected.size}
+                  </span>{' '}
+                  项 / 可下载 {selectableIds.length} 项
+                </>
+              ) : (
+                '尚未选择条目'
+              )}
             </span>
             <button
               type="button"
-              className="shrink-0 rounded-md bg-accent px-3 py-1.5 text-[11px] font-medium text-white transition-opacity disabled:cursor-not-allowed disabled:opacity-40"
+              className="shrink-0 rounded-md bg-accent px-4 py-2 text-[13px] font-semibold text-white transition-opacity disabled:cursor-not-allowed disabled:opacity-40"
               disabled={isActive || selected.size === 0}
               title={
                 isActive
                   ? '整批正在入库：请先用列表行的「取消」停止，再勾选下载'
                   : selected.size === 0
-                    ? '先勾选要下载的条目'
+                    ? '先选条目：点行或勾选复选框'
                     : `下载选中的 ${selected.size} 项`
               }
               data-testid="ingest-sheet-download-selected"
@@ -408,7 +498,7 @@ export function IngestDetailSheet({
                 setSelected(new Set())
               }}
             >
-              下载选中{selected.size > 0 ? ` ${selected.size} 项` : ''}
+              {selected.size > 0 ? `下载选中 ${selected.size} 项` : '下载选中'}
             </button>
           </div>
         )}

@@ -405,6 +405,22 @@ class Page {
     )
   }
 
+  /**
+   * Override the emulated viewport.
+   *
+   * Needed to judge "can the user find this button" at the **shortest supported
+   * window** (`tauri.conf.json` minHeight), not only at the comfortable default:
+   * a control that sits at 852px is invisible in a 600px-tall window.
+   * @param {{width: number, height: number}} size
+   */
+  async setViewport({ width, height }) {
+    await this.conn.send(
+      'Emulation.setDeviceMetricsOverride',
+      { width, height, deviceScaleFactor: 1, mobile: false },
+      { sessionId: this.sessionId },
+    )
+  }
+
   /** Current page url as known to the driver. */
   url() {
     return this._url
