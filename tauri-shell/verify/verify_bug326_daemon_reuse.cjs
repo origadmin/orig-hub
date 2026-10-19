@@ -12,12 +12,17 @@
  *
  * 判据（任一条不满足即红）：
  *   1. 前置：19786 有健康 daemon（`/health` 200），记下其 pid；
- *   2. 启动 release `orig-hub.exe`，等 15s；
- *   3. **pid 必须不变**（没被杀、没有 kill+respawn）；
- *   4. `/health` 仍 200；
- *   5. 壳 trace（`%TEMP%/orighub-shell-trace.log`）出现 `reusing daemon`，
- *      且**不出现** `killing port owner`；
- *   6. 端点文件仍是同一端口（无端口漂移）。
+ *   1b. 前置：**没有其它 orig-hub.exe 在跑** —— 壳装了单实例插件，第二个进程
+ *      会立刻退出（只 focus 已有窗口），trace 是全局追加文件，旧实例在场时
+ *      判据归属不明（实测假红：窗口标题有了、trace 空了 90s）；
+ *   2. 启动 release `orig-hub.exe`，**有界等待**（≤90s）到壳侧写出
+ *      `[ensure_daemon]` trace —— 不用固定 sleep：trace 由前端 JS invoke 后才写，
+ *      WebView2 冷启动实测可 >15s，固定 15s 曾把正常 APP 判成假红；
+ *   3. 进程存活 + **窗口标题非空**（进程活着 ≠ 界面起来了）；
+ *   4. **pid 必须不变**（没被杀、没有 kill+respawn）；
+ *   5. `/health` 仍 200；
+ *   6. 壳 trace 出现 `reusing daemon`，且**不出现** `killing port owner`；
+ *   7. 端点文件仍是同一端口（无端口漂移）。
  *
  * 验牙（反向证伪，必须能红）：
  *   把 `port_owner_is_daemon_on` 改回 `wmic` 版本 ⇒ 第 3/5 条转红（pid 变、出现 killing）。
@@ -93,6 +98,59 @@ async function healthOk() {
   }
 }
 
+/** 当前有几个 orig-hub.exe 在跑（单实例插件会让第二个进程直接退出）。 */
+function runningHubCount() {
+  try {
+    const text = execFileSync(
+      'tasklist',
+      ['/FI', 'IMAGENAME eq orig-hub.exe', '/FO', 'CSV', '/NH'],
+      { encoding: 'utf8', windowsHide: true },
+    )
+    return (text.match(/orig-hub\.exe/gi) || []).length
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * 有界等待：轮询到 `pred()` 为真即返回，超时返回 false。
+ *
+ * 为什么不用固定 `sleep`：壳侧 trace 由**前端 JS** 调 `ensure_daemon` 后才写，
+ * 而 WebView2 首次冷启动（进程起来 → 用户数据目录初始化 → 加载 dist → React
+ * 挂载 → invoke）实测可超过 15s。固定 15s 曾把「APP 完全正常」判成
+ * 「trace 为空 ⇒ 复用分支没走」（假红）。判据要等**条件成立**，不是等一个钟点。
+ * 超时仍然如实报红（不吞失败），只在 detail 里带上真实耗时便于分辨慢机与真故障。
+ */
+async function waitFor(pred, timeoutMs, intervalMs = 400) {
+  const started = Date.now()
+  for (;;) {
+    if (pred()) return { ok: true, elapsed: Date.now() - started }
+    if (Date.now() - started >= timeoutMs) {
+      return { ok: false, elapsed: Date.now() - started }
+    }
+    await sleep(intervalMs)
+  }
+}
+
+/** release 的 GUI 子系统窗口标题（`tasklist /V` 才有这一列；`/FO CSV` 末列）。 */
+function windowTitleOf(imageName) {
+  try {
+    const text = execFileSync(
+      'tasklist',
+      ['/V', '/FI', `IMAGENAME eq ${imageName}`, '/FO', 'CSV', '/NH'],
+      { encoding: 'utf8', windowsHide: true },
+    )
+    const line = text.split(/\r?\n/).find((l) => l.includes(imageName))
+    if (!line) return null
+    // CSV: "Image","PID","Session","Session#","Mem","Status","User","CPU","Title"
+    const cols = line.match(/("([^"]|"")*"|[^,]*)(,|$)/g) || []
+    const title = (cols[8] || '').replace(/^"|",?$/g, '').replace(/""/g, '"')
+    return title || null
+  } catch {
+    return null
+  }
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 async function main() {
@@ -116,6 +174,25 @@ async function main() {
 
   check(`前置：release 产物存在（${path.relative(ROOT, EXE)}）`, fs.existsSync(EXE))
 
+  /*
+   * 前置：不能有别的实例在跑。
+   *
+   * 壳装了 `tauri-plugin-single-instance`（`lib.rs::run`）：**第二个进程会立刻退出**，
+   * 只把已有窗口 show+focus。于是「trace 里有没有本次启动的 `[ensure_daemon]`」
+   * 这个判据在旧实例存在时完全失效 —— trace 是全局追加文件，读到的可能是上一次的；
+   * 而新进程根本没跑前端。实测就吃过这个假红（窗口标题有了、trace 空了 90s）。
+   */
+  const hubCountBefore = runningHubCount()
+  check(
+    `前置：没有其它 orig-hub 实例在跑（当前 ${hubCountBefore} 个）`,
+    hubCountBefore === 0,
+    '先关掉已打开的 Orig Hub —— 单实例插件会让本次启动的进程直接退出，trace 归属不明',
+  )
+  if (hubCountBefore !== 0) {
+    console.log('\n前置不成立，无法验证（不是产品缺陷）。')
+    process.exit(1)
+  }
+
   // 清空 trace，确保下面的判据只反映本次启动
   if (fs.existsSync(TRACE)) fs.rmSync(TRACE)
 
@@ -126,20 +203,38 @@ async function main() {
     exited = true
   })
 
-  await sleep(15000)
+  // ── 等壳侧走到决策点（有界等待，不是固定 sleep）────────────────────
+  // 判据需要的是「前端确实 invoke 了 ensure_daemon」这件事发生，而不是「过了 15 秒」。
+  const traceText = () =>
+    fs.existsSync(TRACE) ? fs.readFileSync(TRACE, 'utf8') : ''
+  const waited = await waitFor(
+    () => exited || /\[ensure_daemon\]/.test(traceText()),
+    90000,
+  )
 
   // ── 判据 ────────────────────────────────────────────────────────────
   const pidAfter = listenerPid()
   const healthyAfter = await healthOk()
-  const trace = fs.existsSync(TRACE) ? fs.readFileSync(TRACE, 'utf8') : ''
+  const trace = traceText()
   const endpointAfter = fs.existsSync(ENDPOINT)
     ? fs.readFileSync(ENDPOINT, 'utf8').trim()
     : null
+  const winTitle = exited ? null : windowTitleOf('orig-hub.exe')
 
   check(
     `APP 进程存活（未启动即崩）`,
     exited === false,
     'exe 启动后立即退出',
+  )
+  check(
+    `APP 真的把窗口显示出来了（窗口标题="${winTitle}"、进程存活=${!exited}）`,
+    exited === false && !!winTitle,
+    '进程活着不等于界面起来了：窗口标题为空说明 WebView 没挂上内容',
+  )
+  check(
+    `壳侧走到 ensure_daemon 决策点（等待 ${waited.elapsed}ms，上限 90000ms）`,
+    /\[ensure_daemon\] port=/.test(trace),
+    trace.trim() || '(trace 为空 —— 前端 JS 没有 invoke ensure_daemon)',
   )
   // 反向证伪模式：--expect-kill 时把第 3 条反置，用来证明判据不是恒绿
   if (EXPECT_KILL) {
@@ -176,7 +271,8 @@ async function main() {
   fs.writeFileSync(
     path.join(OUT, 'result.json'),
     JSON.stringify(
-      { pidBefore, pidAfter, healthyBefore, healthyAfter, endpointBefore, endpointAfter },
+      { pidBefore, pidAfter, healthyBefore, healthyAfter, endpointBefore, endpointAfter,
+        waitedMs: waited.elapsed, winTitle },
       null,
       2,
     ),
