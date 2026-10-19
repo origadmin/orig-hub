@@ -190,9 +190,11 @@ export function IngestDetailSheet({
     >
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
       <div className="relative z-10 flex max-h-[86vh] w-full flex-col overflow-hidden rounded-t-2xl border border-border-subtle bg-surface shadow-2xl">
-        {/* 抓手 */}
+        {/* 抓手：**纯视觉暗示**（底部弹出面板的通用形态），不实现拖拽。
+            原先写了 `title="拖拽"` —— 面板根本不能拖，这个提示是在骗人
+            （2026-10-20 清理：不要做「说了做不到」的交互提示）。 */}
         <div className="flex items-center gap-2 px-4 pt-3">
-          <span className="select-none text-lg leading-none text-muted" title="拖拽">
+          <span className="select-none text-lg leading-none text-muted" aria-hidden="true">
             ⠿
           </span>
         </div>
@@ -209,8 +211,10 @@ export function IngestDetailSheet({
           <Badge variant={meta.variant} className="text-[12px]">{meta.label}</Badge>
           <button
             onClick={onClose}
-            className="ml-1 rounded-md px-2 py-1 text-muted hover:bg-border-subtle"
+            /* 关闭是唯一出口，命中区必须够大（原 px-2 py-1 ≈ 24×24px，13px 的 ✕ 太难点） */
+            className="ml-1 rounded-md px-2.5 py-1.5 text-base leading-none text-muted hover:bg-border-subtle hover:text-fg-strong"
             title="关闭"
+            aria-label="关闭明细"
             data-testid="ingest-detail-sheet-close"
           >
             ✕
@@ -399,7 +403,10 @@ export function IngestDetailSheet({
                         title={title}
                         data-testid="ingest-sheet-entry-title"
                       >
-                        {title ?? label}
+                        {/* 没有 caption / fileName 时退回 messageId，**不要退回 label**
+                            —— 左列已经写了「图片 / S1E1」，右列再写一遍就是「图片 图片」，
+                            实测截图里整列重复，等于白占一列宽度。 */}
+                        {title ?? `#${e.messageId}`}
                       </span>
                       <span className="ml-auto flex shrink-0 items-center gap-2 text-[12px]">
                         <span className="font-mono text-fg-mid">{sizeText}</span>
