@@ -17,9 +17,9 @@
  *     2026-10-16 用户裁定「改用底部弹出」——行内展开打穿窗口化 estimate 已废除）；
  *   - 顶部给**概览口径**（在传 / 待处理 / 已完成 / 已取消的对象数）= 「笼统的数据」。
  *
- * 断言共 42 条，分九组：源码锚点 13（含 BUG-320 展开入口真控件 / BUG-315 条目级下载接线）/
+ * 断言共 43 条，分九组：源码锚点 13（含 BUG-320 复报「明细入口按钮不存在」/ BUG-315 条目级下载接线）/
  * 接口 9（orig-tg /all + daemon /api/activity 双真源，含 chatId/messageIds/priority 转发无损）/
- * UI 挂载 1 / 聚合 5 / 概览 1 / 明细 3 /
+ * UI 挂载 1 / 聚合 5 / 概览 1 / 明细 4（含运行期「明细按钮 0 个」）/
  * 补齐能力 8（去媒体库查看 / 优先下载 / 取消记录可见 / 端到端起播 / BUG-318 可用性感知）/
  * 反证 2 / 运行期 1。
  *
@@ -36,6 +36,11 @@
  *     反向锚点 = 装饰性 `▸`/`▾` span 形态不得存在；
  *   - BUG-315：条目级「下载」接线（单条入队 + 后端幂等），且**不提供**条目级停止。
  *   这两条另有独立活栈脚本 verify_bug320_expand_toggle.cjs（11 断言，含双向验牙）。
+ *
+ * 2026-10-20 三次明确（用户：「明细按钮删除没有修复，原因是什么？明确过 3 次了」）：
+ *   前两轮（10-16 改样式/位置、10-19 只删条目级下载按钮）都**没删**这个入口按钮。
+ *   本轮删除 `ingest-group-toggle`，Sheet 唯一入口回归折叠头整块；判据随之翻转为
+ *   「按钮 0 个」（源码锚 + 运行期 DOM 计数双验），换形态长回来必须红。
  *
  * 2026-10-16 五次复报（「明细按钮位置样式有问题，随 mock 那条改用底部弹出」）适配：
  *   明细从行内展开改为底部弹出 Sheet（DLU-T01）——条目/历史/下载按钮 testid
@@ -397,23 +402,24 @@ async function main() {
     '源码（BUG-318）：读 sources 可用性（取不到不清空 + 未知态续轮）；聚合代表=最新活跃',
     sourcesOk,
   )
-  // BUG-320 锚点（展开/收缩入口不可见）+ DLU-T01 锚点（明细改底部弹出 Sheet）：
-  // 入口必须是**真控件**（button + Chevron + 「明细 N」文案 + aria-expanded），
-  // 不能退回装饰性 `▸`/`▾` span —— 用户原话「展开/收缩根本看不到」。
-  // 明细必须走**底部 Sheet**（2026-10-16 用户裁定）：条件渲染 IngestDetailSheet、
+  // BUG-320 复报（2026-10-20 用户第三次明确「明细按钮删除」）：入口按钮**不得存在**
+  // （`ingest-group-toggle`、「明细 N」文案、Chevron 都不许回来），Sheet 的唯一入口
+  // 是折叠头整块（`ingest-group-header` 的 onClick）。前两次只改样式/位置、只删
+  // 旁边的条目级按钮 ⇒ 诉求没被满足，所以这里的判据是「不存在」而不是「换了形态」。
+  // 明细仍必须走**底部 Sheet**（2026-10-16 用户裁定）：条件渲染 IngestDetailSheet、
   // onClose 回关 sheetOpen；行内展开面板（ingest-group-panel）必须不存在 ——
   // 行内展开会打穿窗口化列表的 estimate（BUG-316 段②），被拆回 inline 必须红。
   const toggleOk =
-    /<button[\s\S]{0,1500}data-testid="ingest-group-toggle"/.test(SRC.row) &&
-    /aria-expanded=\{sheetOpen\}/.test(SRC.row) &&
+    !/ingest-group-toggle/.test(SRC.row) &&
+    !/`明细 \$\{latest\.total\}`/.test(SRC.row) &&
+    /data-testid="ingest-group-header"/.test(SRC.row) &&
+    /onClick=\{\(\) => setSheetOpen\(true\)\}/.test(SRC.row) &&
     /sheetOpen && \(/.test(SRC.row) &&
     /<IngestDetailSheet[\s\S]{0,300}onClose=\{\(\) => setSheetOpen\(false\)\}/.test(SRC.row) &&
-    /`明细 \$\{latest\.total\}`/.test(SRC.row) &&
     !/'收起'/.test(SRC.row) &&
-    !/<span[^>]*data-testid="ingest-group-toggle"/.test(SRC.row) &&
     !/ingest-group-panel/.test(SRC.row)
   check(
-    '源码（BUG-320 + DLU-T01）：明细入口是真 button（aria-expanded），明细走底部 Sheet 条件渲染，无行内展开面板、无「收起」文案',
+    '源码（BUG-320 复报）：明细入口按钮不存在（折叠头整块是唯一入口），明细走底部 Sheet 条件渲染，无行内展开面板',
     toggleOk,
   )
   // BT 式选择（2026-10-19 用户裁定「下载明细不需要按钮,只需要选择,只有选中的
@@ -645,6 +651,22 @@ async function main() {
 
     // ── 明细（DLU-T01 底部 Sheet）：点开首行，条目清单条数 == 该批次 total ──
     // （BT 的「文件清单」层）。点**折叠头**：onClick 只挂在它上面。
+    // 运行期复核（2026-10-20 用户第三次明确）：明细入口按钮**必须 0 个** ——
+    // 源码锚点会被注释/条件分支绕开，真实 DOM 计数才是用户看到的东西。
+    const toggleCount = await page.evaluate(
+      (sel) => window.__count(sel),
+      '[data-testid="ingest-group-toggle"]',
+    )
+    const mingxiInteractive = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('button,a,[role="button"],[onclick]')).filter((el) =>
+        /明细/.test(el.textContent || ''),
+      ).length,
+    )
+    check(
+      `UI（BUG-320 复报）：明细入口按钮不存在（toggle=${toggleCount}、带「明细」文案的可交互控件=${mingxiInteractive}，均应为 0）`,
+      toggleCount === 0 && mingxiInteractive === 0,
+      `toggle=${toggleCount} interactive=${mingxiInteractive}`,
+    )
     const firstKey = topRows[0]?.key
     const firstTask = byKey.get(firstKey)
     const clickedRow = await page.evaluate(

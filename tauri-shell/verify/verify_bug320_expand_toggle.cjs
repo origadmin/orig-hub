@@ -1,36 +1,32 @@
 'use strict'
 /**
- * BUG-320 / BUG-315 活栈验收（Sheet 形态，DLU-T01 2026-10-16 用户裁定
- * 「随 mock 测试那条，改用底部弹出」）：入库行「明细」入口必须**看得见、是
- * 控件**，点开从底部弹 Sheet；Sheet 内条目带「下载」控制（缺字节的条目），
- * 条目级停止的缺席要直说。
+ * BUG-320 复报复核（2026-10-20 用户第三次明确「明细按钮删除」）：入库行**没有
+ * 明细入口按钮**，明细 Sheet 的唯一入口是折叠头整块点击。Sheet 内条目带
+ * BT 式选择控制（缺字节的条目），条目级停止的缺席要直说。
  *
- * 与旧行内展开版的差异映射（验牙连续性）：
- *   面板 ingest-group-panel → ingest-detail-sheet（fixed 底部层，不占列表流）
- *   条目 ingest-group-entry → ingest-sheet-entry
- *   下载 ingest-group-entry-download → ingest-sheet-entry-download
- *   A4 去 aria-controls（Sheet 不指向行内面板，无指向关系可断）
- *   A6b 去「收起」文案（Sheet 化后按钮恒「明细 N」，展开态由 aria 表达）
- *   A7 关 Sheet（点 ✕）而非再点入口
+ * 三次诉求与两次未满足（本轮才满足，判据因此锁「不存在」而不是「换形态」）：
+ *   2026-10-16「明细 N 按钮位置和样式有问题」→ 只改成底部弹出，按钮还在；
+ *   2026-10-19「下载明细不要按钮，只要选择」→ 只删了条目级逐条「下载」按钮，
+ *     「明细 N」入口按钮还在；
+ *   2026-10-20「明细按钮删除没有修复，明确过 3 次了」→ 删除 `ingest-group-toggle`。
  *
  * 判据（每条都要「有值 + 具体值」，不允许「不等于旧值」式假绿）：
- *   A1 入口存在且是 <button>（旧实现是 <span>，不可聚焦、无 aria）；
- *   A2 入口可见：rect 非 0 且**不透明**（opacity/colour 不是透明），字号 ≥ 11px；
- *   A3 入口带文案「明细 N」（不是裸三角符号；Sheet 化后恒此文案）；
- *   A4 入口带 aria-expanded 且初始为 false；
- *   A5 入口可聚焦（focus() 后 document.activeElement 就是它）；
- *   A6 点入口 ⇒ 底部 Sheet 出现（ingest-detail-sheet）且 aria-expanded=true；
- *   A7 点 Sheet ✕ ⇒ 关闭（Sheet 消失、aria 回 false、文案回「明细 N」）；
+ *   A0 **入口按钮不存在**：`ingest-group-toggle` 0 个；且全页面任何带「明细」
+ *      文案的可交互控件（button/a/onclick）0 个 —— 防换个形态长回来；
+ *   A1 折叠头（ingest-group-header）是 Sheet 入口：存在、cursor:pointer、
+ *      title 指向明细（不是死标题）；
+ *   A2 点折叠头 ⇒ 底部 Sheet 出现（ingest-detail-sheet，fixed 贴底 + 抓手）；
+ *   A3 点 Sheet ✕ ⇒ 关闭（Sheet 消失）；
  *   B1 Sheet 内条目行渲染出来（ingest-sheet-entry ≥ 1）；
- *   B2 缺字节条目（data-bytes=0）条条都有「下载」按钮；
- *   B3 有字节条目（data-bytes=1）没有「下载」按钮（已有字节不重复搬运）；
+ *   B2 缺字节条目（data-bytes=0）条条都有复选框；
+ *   B3 有字节条目（data-bytes=1）没有复选框（已有字节不重复搬运）；
  *   B4 Sheet 内的说明文案随状态给出：整批入库中直说「条目级停止不存在」+ 指路
  *      列表行取消；空闲时直说 BT 式选择语义（只有选中的才会下载）。两种都不许省略。
  *
  * 验牙（反向证伪，任一行必须转红）：
- *   入口改回 `<span>{open ? '▾' : '▸'}</span>` ⇒ A1/A3/A5 红；
- *   去掉 aria-expanded ⇒ A4 红；
- *   条目下载按钮去掉 data-testid ⇒ B2 红（noBytesWithBtn 0 ≠ noBytes）；
+ *   把入口按钮加回来（任何形态：button/span▸/文字链带「明细」）⇒ A0 红；
+ *   折叠头 onClick 去掉 ⇒ A2 红（点不开 Sheet）；
+ *   条目复选框去掉 data-testid ⇒ B2 红（noBytesWithCheckbox 0 ≠ noBytes）；
  *   说明段落去掉 data-testid ⇒ B4 红（note=null）；只留一种状态文案 ⇒ 另一种状态红。
  */
 const path = require('node:path')
@@ -86,77 +82,55 @@ async function main() {
   )
   await inject(page)
 
-  // ── A1..A5：入口本身 ────────────────────────────────────────────────
+  // ── A0/A1：入口按钮不得存在；折叠头整块即入口 ────────────────────────
   const t = await page.evaluate(() => {
-    const el = window.__q('[data-testid="ingest-group-toggle"]')
-    if (!el) return { exists: false }
-    const r = el.getBoundingClientRect()
-    const cs = getComputedStyle(el)
+    // A0：明细入口按钮（任何形态）0 个。three-strikes 判据：用户三次要求删除，
+    // 只换形态（span▸/文字链/新 testid）都算没满足 —— 按**文案**扫，不按 testid 扫。
+    const interactiveWithMingxi = Array.from(
+      document.querySelectorAll('button, a, [role="button"], [onclick]'),
+    ).filter((el) => /明细/.test(el.textContent || ''))
+    const header = document.querySelector('[data-testid="ingest-group-header"]')
+    const hs = header ? getComputedStyle(header) : null
+    const hr = header ? header.getBoundingClientRect() : null
     return {
-      exists: true,
-      tag: el.tagName,
-      text: (el.textContent || '').trim(),
-      ariaExpanded: el.getAttribute('aria-expanded'),
-      type: el.getAttribute('type'),
-      w: Math.round(r.width),
-      h: Math.round(r.height),
-      fontSize: parseFloat(cs.fontSize),
-      color: cs.color,
-      opacity: cs.opacity,
-      visibility: cs.visibility,
-      hasChevronSvg: !!el.querySelector('svg'),
+      toggleCount: document.querySelectorAll('[data-testid="ingest-group-toggle"]').length,
+      interactiveWithMingxi: interactiveWithMingxi.length,
+      headerExists: !!header,
+      headerCursor: hs ? hs.cursor : null,
+      headerTitle: header ? header.getAttribute('title') || '' : '',
+      headerW: hr ? Math.round(hr.width) : 0,
+      headerH: hr ? Math.round(hr.height) : 0,
     }
   })
 
   check(
-    `A1 入口存在且是 <button>（实到 <${t.tag || 'none'}>, type=${t.type}）`,
-    t.exists && t.tag === 'BUTTON',
+    `A0 明细入口按钮不存在（toggle=${t.toggleCount}、带「明细」文案的可交互控件=${t.interactiveWithMingxi}，均应为 0）`,
+    t.toggleCount === 0 && t.interactiveWithMingxi === 0,
     JSON.stringify(t),
   )
   check(
-    `A2 入口可见：${t.w}x${t.h}px、字号 ${t.fontSize}px、opacity ${t.opacity}、色 ${t.color}`,
-    t.exists && t.w > 0 && t.h > 0 && t.fontSize >= 11 && t.opacity === '1' && t.visibility === 'visible',
+    `A1 折叠头是 Sheet 入口：存在、cursor=${t.headerCursor}、title="${t.headerTitle}"、${t.headerW}x${t.headerH}px`,
+    t.headerExists && t.headerCursor === 'pointer' && /明细/.test(t.headerTitle) && t.headerW > 0 && t.headerH > 0,
     JSON.stringify(t),
   )
-  check(
-    `A3 入口带文案而不是裸三角（text="${t.text}"）`,
-    /明细\s+\d+/.test(t.text || ''),
-    JSON.stringify(t),
-  )
-  check(
-    `A4 入口带 aria-expanded 且初始为 false（实到 ${t.ariaExpanded}）`,
-    t.ariaExpanded === 'false',
-    JSON.stringify(t),
-  )
-  const focused = await page.evaluate(() => {
-    const el = window.__q('[data-testid="ingest-group-toggle"]')
-    if (!el || !el.focus) return false
-    el.focus()
-    return document.activeElement === el
-  })
-  check(`A5 入口可聚焦（focus() 后 activeElement === 入口：${focused}）`, focused === true)
 
-  await page.screenshot(path.join(OUT, '01-collapsed-toggle.png'))
+  await page.screenshot(path.join(OUT, '01-collapsed-row.png'))
 
-  // ── A6：点开 ⇒ 底部 Sheet ──────────────────────────────────────────
-  await page.evaluate(() => window.__click('[data-testid="ingest-group-toggle"]'))
+  // ── A2：点折叠头 ⇒ 底部 Sheet ──────────────────────────────────────
+  await page.evaluate(() => window.__click('[data-testid="ingest-group-header"]'))
   await page.waitForFunction(
     () => !!document.querySelector('[data-testid="ingest-detail-sheet"]'),
     { timeout: 8000 },
   )
   await inject(page)
   const opened = await page.evaluate(() => {
-    const el = window.__q('[data-testid="ingest-group-toggle"]')
     const sheet = window.__q('[data-testid="ingest-detail-sheet"]')
     const cs = sheet ? getComputedStyle(sheet) : null
     return {
-      aria: el ? el.getAttribute('aria-expanded') : null,
-      text: el ? (el.textContent || '').trim() : null,
       sheetPosition: cs ? cs.position : null,
       sheetBottomAnchored: (() => {
         // 底部弹出 = fixed + 内容贴底（flex items-end）：量面板下沿与视口底距
         if (!sheet) return false
-        const panel = sheet.querySelector('[data-testid="ingest-detail-sheet"] > div')
         const r = sheet.getBoundingClientRect()
         return cs.position === 'fixed' && Math.round(r.bottom) >= window.innerHeight - 1
       })(),
@@ -164,8 +138,8 @@ async function main() {
     }
   })
   check(
-    `A6 点入口弹出底部 Sheet：aria-expanded=${opened.aria}、position=${opened.sheetPosition}、贴底=${opened.sheetBottomAnchored}、抓手=${opened.hasGrip}`,
-    opened.aria === 'true' && opened.sheetBottomAnchored === true && opened.hasGrip === true,
+    `A2 点折叠头弹出底部 Sheet：position=${opened.sheetPosition}、贴底=${opened.sheetBottomAnchored}、抓手=${opened.hasGrip}`,
+    opened.sheetBottomAnchored === true && opened.hasGrip === true,
     JSON.stringify(opened),
   )
 
@@ -250,28 +224,27 @@ async function main() {
 
   await page.screenshot(path.join(OUT, '02-sheet-entries.png'))
 
-  // ── A7：关 Sheet ───────────────────────────────────────────────────
+  // ── A3：关 Sheet ───────────────────────────────────────────────────
   await page.evaluate(() => window.__click('[data-testid="ingest-detail-sheet-close"]'))
   await page.waitForFunction(
     () => !document.querySelector('[data-testid="ingest-detail-sheet"]'),
     { timeout: 8000 },
   )
   await inject(page)
-  const closed = await page.evaluate(() => {
-    const el = window.__q('[data-testid="ingest-group-toggle"]')
-    return {
-      aria: el ? el.getAttribute('aria-expanded') : null,
-      text: el ? (el.textContent || '').trim() : null,
-    }
-  })
+  const closed = await page.evaluate(() => ({
+    sheetGone: !document.querySelector('[data-testid="ingest-detail-sheet"]'),
+    // 关掉后入口按钮依然不得出现（Sheet 生命周期不会把按钮长回来）
+    toggleCount: document.querySelectorAll('[data-testid="ingest-group-toggle"]').length,
+    headerStill: !!document.querySelector('[data-testid="ingest-group-header"]'),
+  }))
   check(
-    `A7 点 Sheet ✕ 关闭：Sheet 消失、aria=${closed.aria}、文案="${closed.text}"`,
-    closed.aria === 'false' && /明细\s+\d+/.test(closed.text || ''),
+    `A3 点 Sheet ✕ 关闭：Sheet 消失=${closed.sheetGone}、按钮仍为 0=${closed.toggleCount === 0}、折叠头仍在=${closed.headerStill}`,
+    closed.sheetGone && closed.toggleCount === 0 && closed.headerStill,
     JSON.stringify(closed),
   )
 
   await browser.close()
-  console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - BUG-320 Sheet 入口与条目控制：${pass} pass / ${fail} fail`)
+  console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} - BUG-320 复报（明细按钮已删除 / 折叠头为唯一入口 / 条目选择控制）：${pass} pass / ${fail} fail`)
   if (fail > 0) process.exit(1)
 }
 

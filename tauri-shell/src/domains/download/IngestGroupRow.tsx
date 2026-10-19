@@ -1,5 +1,4 @@
 import { useState } from 'react'
-import { ChevronRight } from 'lucide-react'
 import { Badge } from '../../components/ui/badge'
 import { Button } from '../../components/ui/button'
 import { Progress } from '../../components/ui/progress'
@@ -26,6 +25,12 @@ import { IngestDetailSheet } from './IngestDetailSheet'
  * 改用底部弹出」）：条目清单 + 历史批次，形态与引擎下载行的 `DownloadDetailSheet`
  * 统一。行内展开区已废除 —— 行内展开会把窗口化列表（BUG-316 段②）的 estimate
  * 打穿（展开行 432px 与折叠行 108px 混排 ⇒ 滚动跳动），Sheet 是 fixed 层。
+ *
+ * **入口没有独立按钮**（2026-10-20 用户第三次明确「明细按钮删除」；此前两次
+ * 2026-10-16「位置样式有问题」、2026-10-19「下载明细不要按钮，只要选择」都只被
+ * 改了样式/删了旁边的条目级按钮，诉求本身没被满足）：入口即折叠头整块
+ * （`ingest-group-header` 的 onClick + title）。不要再长出任何「明细」控件 ——
+ * 按钮形态、装饰 `▸`/`▾`、文字链都不行。
  *
  * 与 `DownloadItem`（普通下载行）**并列而非合并**：两侧计量单位、状态词、可执行动作
  * 都不同，硬合成一个组件就会长出「点了没反应」的按钮。显示统一（任务组范式、
@@ -184,29 +189,13 @@ export function IngestGroupRow({
 
           <div className="flex shrink-0 items-center gap-3">
             {/*
-              明细入口（BUG-320 真按钮 + DLU-T01 底部弹出）：**按钮 + 图标 + 文案**。
-              旧实现只是一个 `▸`/`▾` 装饰字符（`<span>` + 12px muted），与动作按钮
-              同排时被完全淹没，用户原话「展开/收缩根本看不到」。文案带条目数
-              —— 「明细 N」同时回答了「这里有什么」和「点了会看到什么」。
-              2026-10-16 用户裁定「改用底部弹出」：点击从底部弹 `IngestDetailSheet`
-              （与引擎下载行 `DownloadDetailSheet` 同形态），行内展开区废除。
-              与动作按钮之间 gap-3 分区：明细是「看」，动作是「做」，两类不同。
-              stopPropagation：折叠头整块也可点，不拦就会双触发（开 Sheet 后立刻关）。
+              明细入口按钮已删除（2026-10-20 用户第三次明确；此前两次：
+              2026-10-16「位置和样式有问题」→ 只改成底部弹出；2026-10-19
+              「下载明细不要按钮，只要选择」→ 只删了条目级逐条「下载」按钮）。
+              用户要的是**没有这个按钮**：入口收回归折叠头整块（下方 div 的
+              onClick + title），Sheet 内容不变。三次诉求只改样式不改结构
+              正是 BUG-320 复报的根因 —— 不要再长一个「明细」控件回来。
             */}
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation()
-                setSheetOpen(true)
-              }}
-              aria-expanded={sheetOpen}
-              title="查看条目明细与历史批次（底部弹出）"
-              className="flex shrink-0 items-center gap-1 rounded border border-border-subtle px-2 py-1 text-[11px] text-fg-mid transition-colors hover:border-accent/40 hover:bg-surface-2 hover:text-fg-strong focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-              data-testid="ingest-group-toggle"
-            >
-              <ChevronRight className="h-3 w-3" />
-              {`明细 ${latest.total}`}
-            </button>
             {/*
               动作按钮**常驻可见**（2026-10-15 用户反馈「下载中的 TG 没有状态控制」）：
               原先整组 opacity-0 仅 hover 显形，活跃入库行——也就是最需要「取消」的那一行

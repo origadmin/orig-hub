@@ -44,6 +44,29 @@ fn read_daemon_endpoint(app: &tauri::AppHandle) -> Option<u16> {
     text.rsplit(':').next()?.trim().parse::<u16>().ok()
 }
 
+/// 桌面壳运行期 trace：**写文件**而不是只 eprintln。
+///
+/// release 构建带 `windows_subsystem = "windows"`（GUI 子系统、无控制台），
+/// stderr 写入会被丢弃 —— 于是 daemon 生命周期这类关键事件在 release 下**完全不可见**，
+/// 只能靠猜（2026-10-20 排查「APP 打开有问题」时踩到：stderr 空不代表没执行）。
+/// 文件位置：`%TEMP%/orighub-shell-trace.log`（append，失败静默 —— trace 不能影响主流程）。
+fn shell_trace(msg: &str) {
+    eprintln!("{msg}");
+    use std::io::Write;
+    let path = std::env::temp_dir().join("orighub-shell-trace.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{stamp}] {msg}");
+    }
+}
+
 /// 检查指定端口上的 daemon 是否真正可用：TCP 能连上且 GET /health 返回 200。
 /// 只做端口连通性检查会漏掉"进程活着但 handler 已坏"的情况（前端 Failed to fetch）。
 fn daemon_alive_on(port: u16) -> bool {
@@ -218,41 +241,76 @@ fn daemon_status(app: tauri::AppHandle, state: tauri::State<'_, DaemonState>) ->
 /// 先杀掉旧实例再拉起新实例，避免前端 Failed to fetch。
 #[tauri::command]
 fn ensure_daemon(app: tauri::AppHandle, state: tauri::State<'_, DaemonState>) -> Result<serde_json::Value, String> {
-    eprintln!("[ensure_daemon] called");
     // 端口以 daemon 自己写下的为准（可能顺延），不是常量。
     let port = resolve_daemon_port(&app);
     let alive = daemon_alive_on(port);
+    let busy = port_busy(port);
+    let owner = if alive { port_owner_is_daemon_on(port) } else { None };
+    shell_trace(&format!(
+        "[ensure_daemon] port={port} alive={alive} busy={busy} owner={owner:?}"
+    ));
     let mut need_kill = false;
     if alive {
-        // 仅当该端口上的监听进程确为本外壳对应的 orig-daemon 时才复用；
-        // 否则（如改名前残留的旧 surge-daemon）杀掉并重新拉起，避免“还是旧的”。
-        if port_owner_is_daemon_on(port) {
-            eprintln!("[ensure_daemon] alive=true on {port}, reusing our daemon");
-            return Ok(serde_json::json!({"started": false, "reason": "already-running", "port": port}));
+        // 仅当该端口上的监听进程**确知**不是本外壳的 orig-daemon 时才杀。
+        // `None`（判定不出）按「复用」处理：`/health` 已经 200，说明是本项目的
+        // daemon；误杀健康实例会把 dev 栈/上一次 APP 的会话一起打断（实测事故，
+        // 见 `port_owner_is_daemon_on` 文档），代价不对称。
+        // 注意用上面算好的 `owner`，不再二次探测 —— 二次探测会让「同一决策读两个时刻」。
+        match owner {
+            Some(true) | None => {
+                shell_trace(&format!("[ensure_daemon] reusing daemon on {port}"));
+                return Ok(serde_json::json!({"started": false, "reason": "already-running", "port": port}));
+            }
+            Some(false) => {
+                shell_trace(&format!(
+                    "[ensure_daemon] alive but owner is not {DAEMON_BIN}, will kill stale"
+                ));
+                need_kill = true;
+            }
         }
-        eprintln!("[ensure_daemon] alive=true but owner mismatch, will kill stale");
-        need_kill = true;
-    } else if port_busy(port) {
+    } else if busy {
         // 端口被占但 health 不可用 → 杀掉占用者（无论是否由本外壳托管）
-        eprintln!("[ensure_daemon] port {port} busy but unhealthy, will kill owner");
+        shell_trace(&format!("[ensure_daemon] port {port} busy but unhealthy, will kill owner"));
         need_kill = true;
     }
     if need_kill {
-        eprintln!("[ensure_daemon] killing port owner");
+        shell_trace(&format!("[ensure_daemon] killing port owner on {port}"));
         kill_port_owner(port);
         // 无论是否释放都继续尝试拉起；若没杀掉则 spawn 会失败报错
         wait_port_free(port);
     }
-    eprintln!("[ensure_daemon] spawning daemon");
+    shell_trace("[ensure_daemon] spawning daemon");
     let (child, actual) = spawn_daemon(&app)?;
-    eprintln!("[ensure_daemon] daemon spawned ok on {actual}");
+    shell_trace(&format!("[ensure_daemon] daemon spawned ok on {actual}"));
     *state.child.lock().unwrap() = Some(child);
     Ok(serde_json::json!({"started": true, "port": actual}))
 }
 
+/// 前端探针：把消息写进壳侧 trace（`%TEMP%/orighub-shell-trace.log`）。
+///
+/// 存在理由：release 的 GUI 子系统丢弃 stderr，webview 内的 JS 报错也不外溢，
+/// 「窗口在、进程活、界面白」这类问题在壳侧无法观测。前端在关键节点（入口脚本
+/// 第一行、React 挂载后）调用它，壳就能知道 JS 到底跑到哪一步。
+#[tauri::command]
+fn shell_probe(msg: String) {
+    shell_trace(&format!("[front] {msg}"));
+}
+
 /// 返回指定端口上的监听进程是否确为本外壳对应的 orig-daemon（按可执行文件名判断）。
-/// 用于避免复用改名前残留的旧 daemon（如 surge-daemon）。
-fn port_owner_is_daemon_on(port: u16) -> bool {
+///
+/// **三态**：`Some(true)` = 是 daemon；`Some(false)` = 查到了、但不是；
+/// `None` = **查不出**（取不到 pid，或系统工具不可用）。
+///
+/// 为什么必须三态（2026-10-20「APP 打开有问题」的根因修复）：
+/// 旧实现用 `wmic` 取进程路径 —— wmic 自 Windows 11 22H2 起被微软弃用、默认不装，
+/// 调用失败时旧实现返回 `false`，于是 `ensure_daemon` 把**健康的 daemon 判成
+/// 「owner mismatch」并直接杀掉**。实测：打开 APP ⇒ dev 栈正在用的 daemon（19786）
+/// 被 kill ⇒ 新 daemon 漂到 19787 ⇒ 端点文件被改写 ⇒ **APP 与 dev 同时不可用**
+/// （用户报的「APP 打开有问题 / dev 挂」是同一根因的两个面）。
+///
+/// 现在改 `tasklist`（系统自带、无弃用风险），并把「查不出」与「不是」分开：
+/// 查不出 ⇒ 交给调用方按「不杀」处理（`/health` 已 200，误杀代价远大于复用）。
+fn port_owner_is_daemon_on(port: u16) -> Option<bool> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -268,28 +326,32 @@ fn port_owner_is_daemon_on(port: u16) -> bool {
                     .find(|l| l.contains("LISTENING") && l.contains(&format!(":{port}")))
                     .and_then(|l| l.split_whitespace().last())
                     .and_then(|s| s.parse::<u32>().ok())
-            });
-        let pid = match pid {
-            Some(p) => p,
-            None => return false,
-        };
-        let out = Command::new("wmic")
-            .args(["process", "where", &format!("ProcessId={pid}"), "get", "ExecutablePath"])
+            })?;
+        // tasklist /FO CSV /NH：首列即映像名（"orig-daemon.exe"）。
+        // 中文 Windows 的输出含 GBK 字节 ⇒ lossy 转换，避免整段丢弃。
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
             .creation_flags(0x0800_0000)
             .output()
-            .ok();
-        if let Some(o) = out {
-            let text = String::from_utf8_lossy(&o.stdout);
-            for l in text.lines() {
-                let t = l.trim();
-                if t.to_lowercase().ends_with(".exe") {
-                    if let Some(stem) = std::path::Path::new(t).file_stem() {
-                        return stem.to_string_lossy().eq_ignore_ascii_case(DAEMON_BIN);
-                    }
-                }
-            }
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let first = text
+            .lines()
+            .next()?
+            .split(',')
+            .next()?
+            .trim()
+            .trim_matches('"')
+            .to_string();
+        // 「没有运行的任务匹配指定标准」等本地化提示行不是映像名 ⇒ 判定不了。
+        if first.is_empty() || !first.to_lowercase().ends_with(".exe") {
+            return None;
         }
-        false
+        let stem = std::path::Path::new(&first)
+            .file_stem()?
+            .to_string_lossy()
+            .to_string();
+        Some(stem.eq_ignore_ascii_case(DAEMON_BIN))
     }
     #[cfg(not(windows))]
     {
@@ -297,19 +359,15 @@ fn port_owner_is_daemon_on(port: u16) -> bool {
         let out = Command::new("lsof")
             .args(["-ti", &format!("tcp:{port}")])
             .output()
-            .ok();
-        if let Some(o) = out {
-            if let Some(pid) = String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .next()
-                .and_then(|l| l.trim().parse::<u32>().ok())
-            {
-                if let Ok(c) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-                    return c.trim().eq_ignore_ascii_case(DAEMON_BIN);
-                }
-            }
-        }
-        false
+            .ok()?;
+        let pid = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()?
+            .trim()
+            .parse::<u32>()
+            .ok()?;
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        Some(comm.trim().eq_ignore_ascii_case(DAEMON_BIN))
     }
 }
 
@@ -519,7 +577,8 @@ pub fn run() {
             daemon_status,
             ensure_daemon,
             stop_daemon,
-            tg_save_config
+            tg_save_config,
+            shell_probe
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
