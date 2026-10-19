@@ -80,6 +80,7 @@ const MEASURE = (cardSel, gridSel) => {
     minFont: minFont === Infinity ? null : minFont,
     coverH: coverRect ? Math.round(coverRect.height) : null,
     containerW: grid.clientWidth,
+    viewportW: window.innerWidth,
   }
 }
 
@@ -184,6 +185,36 @@ async function main() {
     check(`S4b 视频卡内最小可读字号 ${v.minFont}px（应 ≥11）`, v.minFont >= 11, `minFont=${v.minFont}`)
   }
 
+  /*
+   * S7 操作条不得压住文字（改前实测每张卡压住标签行 106×21px：操作条 112px 宽
+   * 绝对定位在右下角，标签行 208px ⇒ 被「删除/编辑」盖掉半行，这也是「看不清」）。
+   * 判据：删除按钮与标签行、与标题行的矩形**零交集**。
+   */
+  const overlap = await page.evaluate(() => {
+    const card = document.querySelector('[data-testid="media-card"]')
+    if (!card) return null
+    const del = card.querySelector('[data-testid="item-delete"]')
+    const tags = card.querySelector('[data-testid="item-tags"]')
+    const title = Array.from(card.querySelectorAll('p')).find((p) =>
+      p.className.includes('truncate'),
+    )
+    if (!del || !title) return null
+    const inter = (a, b) => {
+      if (!b) return 0
+      const ra = a.getBoundingClientRect()
+      const rb = b.getBoundingClientRect()
+      const ox = Math.max(0, Math.min(ra.right, rb.right) - Math.max(ra.left, rb.left))
+      const oy = Math.max(0, Math.min(ra.bottom, rb.bottom) - Math.max(ra.top, rb.top))
+      return Math.round(ox * oy)
+    }
+    return { withTags: inter(del, tags), withTitle: inter(del, title) }
+  })
+  check(
+    `S7 操作条不压文字（与标签行交集 ${overlap && overlap.withTags}px²、与标题行 ${overlap && overlap.withTitle}px²，均应为 0）`,
+    !!overlap && overlap.withTags === 0 && overlap.withTitle === 0,
+    JSON.stringify(overlap),
+  )
+
   // ── S5 最矮受支持窗口 ─────────────────────────────────────────────
   await page.setViewport({ width: 900, height: 600 })
   await new Promise((r) => setTimeout(r, 700))
@@ -191,8 +222,10 @@ async function main() {
   await page.screenshot(path.join(OUT, '03-video-grid-900x600.png'))
   if (!EXPECT_LEGACY) {
     check(
-      `S5 最矮窗口 900×600：${vMin.cols} 列、卡 ${vMin.cardW}px（应 ≥200 宽、≥2 列）`,
-      vMin.cardW >= 200 && vMin.cols >= 2,
+      `S5 最矮窗口 900×600：视口 ${vMin.viewportW}px、${vMin.cols} 列、卡 ${vMin.cardW}px（应 =900 宽、≥200 宽、≥2 列）`,
+      // 视口必须真的变成 900：否则这条判据会在 1440 下「通过」—— 那正是 2026-10-20
+      // 踩过的假绿（setViewport 被注释吞掉，5 列/230px 在 1440 下也满足阈值）。
+      vMin.viewportW === 900 && vMin.cardW >= 200 && vMin.cols >= 2,
       JSON.stringify(vMin),
     )
   }
@@ -201,8 +234,8 @@ async function main() {
   await page.screenshot(path.join(OUT, '04-series-wall-900x600.png'))
   if (!EXPECT_LEGACY) {
     check(
-      `S5b 最矮窗口下剧集卡 ${sMin.cols} 列、卡 ${sMin.cardW}px（应 ≥200 宽）`,
-      sMin.cardW >= 200,
+      `S5b 最矮窗口下剧集卡 ${sMin.cols} 列、卡 ${sMin.cardW}px（视口 ${sMin.viewportW}px）`,
+      sMin.viewportW === 900 && sMin.cardW >= 200,
       JSON.stringify(sMin),
     )
   }

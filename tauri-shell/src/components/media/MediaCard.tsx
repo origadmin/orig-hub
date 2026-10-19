@@ -530,16 +530,21 @@ function MediaCardBase(props: {
        *
        * 编辑入口曾经写成 `opacity-0 group-hover:opacity-100` —— 只有把鼠标悬停到封面正中央
        * 才显形，用户根本找不到「标题在哪儿改」，于是反馈「剧集和视频的标题不能编辑」。
-       * 功能存在但入口不可发现，等于没有。删除入口同理，且它比编辑更依赖「一眼看到」：
+       * 功能存在但入口不可发现，等于没有。删除入口同理，且它比删除更依赖「一眼看到」：
        * 找不到删除的人会去勾选，于是又把「选择」当成删除的前置仪式。
+       *
+       * 2026-10-20（BUG-328）：原先是 `absolute bottom-1 right-1`，实测**每张卡都压住
+       * 标签行 106×21px**（操作条 112px 宽，标签行 208px）—— 标签被「删除/编辑」盖掉，
+       * 这正是「内容看不清」的一部分。改成卡片内的**正常流式一行**（带分隔线、右对齐），
+       * 不再与文字抢同一块像素；卡片高度多一行，换来的是一行都读得全。
        */}
       {onEdit || onDelete || canViewInTg ? (
-        <div className="absolute bottom-1 right-1 flex items-center gap-1">
+        <div className="flex shrink-0 items-center justify-end gap-1 border-t border-border-subtle/40 px-1.5 py-1">
           {tgCoords && onViewInTg ? (
             <button
               type="button"
               onClick={() => onViewInTg?.(tgCoords)}
-              className="flex items-center gap-1 rounded bg-black/65 px-2 py-1 text-[11px] text-white/90 backdrop-blur-sm transition-colors hover:bg-black/85 hover:text-white"
+              className="flex items-center gap-1 rounded px-2 py-1 text-[11px] text-fg-mid transition-colors hover:bg-surface-2 hover:text-fg-strong"
               title={t('media.viewInTg')}
               aria-label={t('media.viewInTg')}
               data-testid="item-view-tg"
@@ -552,7 +557,7 @@ function MediaCardBase(props: {
             <button
               type="button"
               onClick={() => onDelete(item)}
-              className="flex items-center gap-1 rounded bg-black/65 px-2 py-1 text-[11px] text-white/90 backdrop-blur-sm transition-colors hover:bg-destructive hover:text-white"
+              className="flex items-center gap-1 rounded px-2 py-1 text-[11px] text-fg-mid transition-colors hover:bg-destructive hover:text-white"
               title="从资料库删除这条内容（只删记录，磁盘上的文件不受影响）"
               aria-label="删除"
               data-testid="item-delete"
@@ -565,7 +570,7 @@ function MediaCardBase(props: {
             <button
               type="button"
               onClick={() => onEdit(item)}
-              className="flex items-center gap-1 rounded bg-black/65 px-2 py-1 text-[11px] text-white/90 backdrop-blur-sm transition-colors hover:bg-black/85 hover:text-white"
+              className="flex items-center gap-1 rounded px-2 py-1 text-[11px] text-fg-mid transition-colors hover:bg-surface-2 hover:text-fg-strong"
               title="编辑标题 / 介绍 / 标签"
               aria-label="编辑"
               data-testid="item-edit"
