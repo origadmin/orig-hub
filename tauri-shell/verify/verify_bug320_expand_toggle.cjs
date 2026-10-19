@@ -24,13 +24,14 @@
  *   B1 Sheet 内条目行渲染出来（ingest-sheet-entry ≥ 1）；
  *   B2 缺字节条目（data-bytes=0）条条都有「下载」按钮；
  *   B3 有字节条目（data-bytes=1）没有「下载」按钮（已有字节不重复搬运）；
- *   B4 Sheet 内直说了「条目级停止不存在」（不解释 = 又一个黑洞）。
+ *   B4 Sheet 内的说明文案随状态给出：整批入库中直说「条目级停止不存在」+ 指路
+ *      列表行取消；空闲时直说 BT 式选择语义（只有选中的才会下载）。两种都不许省略。
  *
  * 验牙（反向证伪，任一行必须转红）：
  *   入口改回 `<span>{open ? '▾' : '▸'}</span>` ⇒ A1/A3/A5 红；
  *   去掉 aria-expanded ⇒ A4 红；
  *   条目下载按钮去掉 data-testid ⇒ B2 红（noBytesWithBtn 0 ≠ noBytes）；
- *   停止说明段落去掉 data-testid ⇒ B4 红（note=null）。
+ *   说明段落去掉 data-testid ⇒ B4 红（note=null）；只留一种状态文案 ⇒ 另一种状态红。
  */
 const path = require('node:path')
 const cdp = require(path.join(__dirname, 'lib', 'cdp.cjs'))
@@ -194,6 +195,12 @@ async function main() {
         r.querySelector('[data-testid="ingest-sheet-entry-download"]'),
       ).length,
       selectAll: !!window.__q('[data-testid="ingest-sheet-select-all-box"]'),
+      // 全选框的禁用态：整批入库中（isActive）或没有缺字节条目时为 disabled。
+      // 与 note 文案配对即可还原「当前是哪个状态」（见 B4）。
+      selectAllDisabled: (() => {
+        const el = window.__q('[data-testid="ingest-sheet-select-all-box"]')
+        return !!el && el.disabled === true
+      })(),
       bulkBar: !!window.__q('[data-testid="ingest-sheet-bulk-bar"]'),
       bulkBtn: !!window.__q('[data-testid="ingest-sheet-download-selected"]'),
       note: (() => {
@@ -227,9 +234,17 @@ async function main() {
     entries.selectAll && entries.bulkBar && entries.bulkBtn,
     JSON.stringify(entries),
   )
+  // B4：说明文案必须**随状态**给出，两种合法形态都不许省略（不解释 = 黑洞）：
+  //   - 整批入库中（有缺字节条目但全选被禁用）⇒ 直说「条目级停止不存在」+ 指路取消；
+  //   - 空闲 ⇒ 直说 BT 式选择语义（只有选中的才会下载）。
+  // 判据用「有缺字节条目 ∧ 全选禁用」还原 isActive —— 空闲时全选可用，
+  // 全部已入库时没有可选条目，那也不算 active（note 走 BT 文案）。
+  const sheetActive = entries.noBytes > 0 && entries.selectAllDisabled
   check(
-    `B4 Sheet 内直说条目级停止不存在（note="${entries.note}"）`,
-    /条目级停止不存在/.test(entries.note || ''),
+    `B4 说明文案随状态给出（active=${sheetActive}，note="${entries.note}"）`,
+    sheetActive
+      ? /条目级停止不存在/.test(entries.note || '')
+      : /只有选中的才会下载/.test(entries.note || ''),
     JSON.stringify(entries),
   )
 

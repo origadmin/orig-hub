@@ -401,6 +401,11 @@ fn tg_config_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> 
 }
 
 /// 读取配置；文件不存在返回 None（= 未配置，前端出配置表单）。
+///
+/// 桌面壳自 BUG-178 起不再自己拉起/杀死 orig-tg（进程生命周期归 daemon），
+/// setup 阶段暂时没有调用点；保留它是配置读写的另一半（写侧 `write_tg_config`），
+/// 免得下次要读时又去重拼一遍路径口径。
+#[allow(dead_code)]
 fn read_tg_config(app: &tauri::AppHandle) -> Result<Option<TgLaunchConfig>, String> {
     let path = tg_config_path(app)?;
     if !path.exists() {
@@ -460,8 +465,10 @@ fn tg_save_config(
     }
 }
 
-，好让 `setup` 阶段也能直接调用（BUG-094）。
+/// 桌面壳入口：装托盘、起 daemon、注册命令。
 ///
+/// TG 配置读写提成独立函数（`read_tg_config` / `write_tg_config` / `tg_save_config`），
+/// 好让 `setup` 阶段也能直接调用（BUG-094）。
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()

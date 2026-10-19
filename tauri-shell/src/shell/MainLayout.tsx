@@ -319,6 +319,11 @@ export function MainLayout() {
                   dlFilter={nav.dlFilter}
                   items={downloads}
                   ingest={ingest}
+                  // 「去媒体库查看」的出口（BUG-300 复报④）：入库行的 goLibrary 是
+                  // 共享 hook，但 `onOpenMedia` 是可选的 —— 宿主不给就只起播不切
+                  // 视图，按钮照样渲染（死按钮，用户原话「跳转查看」没实现）。
+                  // 视图 state 在本组件，接线只能是这一个回调（与 handleOpenTg 同理）。
+                  onOpenMedia={handleOpenMedia}
                 />
               </ErrorBoundary>
             ) : (
