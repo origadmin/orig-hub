@@ -130,6 +130,24 @@ export function SettingsPanel({
   // 不再掺链路状态 —— 掺了就会出现「插件：运行中」与「Telegram 不可用」同屏打架。
   const tgEnabled = tgService.enabled
   const tgRunning = tgService.running
+  /**
+   * BUG-351：daemon 侧链路健康 + 自愈历史（唯一真源 `/api/config` 的 `tg_link`）。
+   *
+   * 与上面的 `tgLink`（前端自探的 Telegram 会话态）是两件事：那是「Telegram 连没连上」，
+   * 这是「daemon 巡检判定的链路健康 + 它重启过 orig-tg 几次」。没有后者，界面只能
+   * 看到瞬时 `running` —— 系统每 5 分钟自杀重启一次，关于页却恒绿。
+   */
+  const tgHealth = tgService.link ?? null
+  /** epoch 秒 → 本地时钟串（「最近重启时间」用；不引额外依赖） */
+  const formatClock = (epochSec: number) => {
+    const d = new Date(epochSec * 1000)
+    const pad = (n: number) => String(n).padStart(2, '0')
+    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+  }
+  const tgDown = Boolean(tgHealth?.link_down)
+  /** 近期重启窗口：15 分钟内重启过 ⇒ 状态点转琥珀色（它是「莫名挂了」的直接来源） */
+  const tgRecentlyRestarted =
+    !!tgHealth?.last_restart_at && Date.now() / 1000 - tgHealth.last_restart_at < 900
   const [activeTab, setActiveTab] = useState<SettingsSection>(section ?? 'general')
   /**
    * 分区锚点受控同步（M0-T07）：外部（`navigate('settings',{section})`）改分区时
@@ -1466,34 +1484,64 @@ export function SettingsPanel({
                     <p className="mt-0.5 text-[11px] text-muted">
                       {!tgEnabled
                         ? t('about.tgLinkOff')
-                        : tgLink.state === 'ready'
-                          ? t('about.tgLinkReady')
-                          : t('about.tgLinkNotReady')}
+                        : // BUG-351：daemon 判定链路不可用时同样如实说「未连接」
+                          // （此前只看前端自探的会话态，daemon 重启期间两者会打架）。
+                          tgDown
+                          ? t('about.tgLinkNotReady')
+                          : tgLink.state === 'ready'
+                            ? t('about.tgLinkReady')
+                            : t('about.tgLinkNotReady')}
                     </p>
                   </div>
                   <div className="flex items-center gap-2 text-xs">
                     <span
                       className={cn(
                         'h-2 w-2 rounded-full',
-                        tgEnabled && tgRunning
-                          ? 'bg-success'
-                          : tgEnabled
-                            ? 'bg-danger'
-                            : 'bg-muted',
+                        // 判据顺序是设计的一部分：**链路 down / 近期重启过**优先于
+                        // 「进程在跑」—— 反过来写（先判 running ⇒ 绿）会把重启事实
+                        // 短路掉，界面重新回到「两个状态都是好的」（BUG-351 的现象）。
+                        !tgEnabled
+                          ? 'bg-muted'
+                          : tgDown || tgRecentlyRestarted
+                            ? 'bg-warning'
+                            : tgRunning
+                              ? 'bg-success'
+                              : 'bg-danger',
                       )}
+                      data-testid="about-tg-dot"
                     />
                     <span className="text-fg-mid" data-testid="about-tg-status">
                       {!tgEnabled
                         ? t('about.tgOff')
-                        : tgRunning
-                          ? t('about.tgRunning')
-                          : t('about.tgDead')}
+                        : !tgRunning
+                          ? t('about.tgDead')
+                          : tgDown
+                            ? t('about.tgLinkDown')
+                            : t('about.tgRunning')}
                       {tgEnabled && tgRunning && tgService.port
                         ? ` · ${t('about.port')} ${tgService.port}`
                         : ''}
                     </span>
                   </div>
                 </div>
+                {/*
+                  BUG-351：自愈历史必须可见。daemon 巡检会在链路**连续**不可用时
+                  重启 orig-tg（每次重启都会打断在传缓存任务），此前界面只有瞬时
+                  `running` 快照 ⇒ 系统每 5 分钟自杀重启一次，关于页两个绿点照常亮。
+                  这里直出「累计重启 N 次 · 最近 <时间>」，让「莫名挂了」有据可查。
+                */}
+                {tgEnabled && tgHealth?.restarts ? (
+                  <p
+                    className="rounded-md bg-warning/10 px-3 py-2 text-[11px] leading-relaxed text-warning"
+                    data-testid="about-tg-restarts"
+                  >
+                    {t('about.tgRestarts', { n: tgHealth.restarts })}
+                    {tgHealth.last_restart_at
+                      ? ` · ${t('about.tgLastRestart', { at: formatClock(tgHealth.last_restart_at) })}`
+                      : ''}
+                    {tgHealth.reason ? ` · ${tgHealth.reason}` : ''}
+                  </p>
+                ) : null}
                 {tgEnabled && !tgRunning && tgError ? (
                   <p
                     className="rounded-md bg-danger/10 px-3 py-2 text-[11px] leading-relaxed text-danger"

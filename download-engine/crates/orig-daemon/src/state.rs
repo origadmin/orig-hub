@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -68,6 +69,16 @@ const TG_SPAWN_COOLDOWN: Duration = Duration::from_secs(60);
 /// 每 15s 重启一次只会把服务打得更不可用。5 分钟给足「网络自己恢复」的窗口，
 /// 又远短于「用户手动重启应用」的平均耗时 —— 这正是要做自动化的理由。
 const TG_LINK_RESTART_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// 判定「链路真断了」需要的**连续**巡检轮数（BUG-351）。
+///
+/// 为什么必须连续：`/api/tg/session` 的 `available` 是 orig-tg 自己维护的瞬时可用
+/// 性 —— MTProto 抖动（代理重连 / bad salt / Telegram 限流）都会让它短暂 false。
+/// 一次 false 就 `tg_restart()`（杀进程 + 重 spawn）是最重的处置：会话重建、
+/// 缓存队列 re-queue（`cache queue resumed after restart`）、用户看到「TG 莫名挂了」。
+/// 实测该判据在真机上造成 477 次重启（每 5 分钟一次，冷却只限速不改判据）。
+/// 连续 3 轮 × 15s = 覆盖约 45s 的持续不可用窗口，抖动期不再重启，真断仍自愈。
+const TG_LINK_DOWN_CONFIRMS: u32 = 3;
 
 /// orig-tg 监听端口。
 ///
@@ -222,6 +233,18 @@ pub struct AppState {
     pub tg_last_spawn: Mutex<Option<tokio::time::Instant>>,
     /// 上一次因链路断而重启的时刻（巡检退避用，见 `TG_LINK_RESTART_COOLDOWN`）。
     pub tg_last_restart: Mutex<Option<tokio::time::Instant>>,
+    /// 连续判定「链路不可用」的轮数（BUG-351：达到 `TG_LINK_DOWN_CONFIRMS` 才重启）。
+    pub tg_link_down_streak: AtomicU32,
+    /// 自本进程启动以来，因链路断而重启 orig-tg 的次数（**对外可见**，BUG-351）。
+    ///
+    /// 界面此前只能看到瞬时 `tg_running`，于是「系统每 5 分钟自杀重启一次」在关于页
+    /// 完全不可见 —— 用户看到的是「TG 莫名挂了」与「两个状态都是好的」并存。
+    pub tg_link_restarts: AtomicU64,
+    /// 最近一次因链路断而重启的**墙钟**（epoch 秒，供界面显示「最近重启时间」）。
+    pub tg_last_link_restart_at: RwLock<Option<i64>>,
+    /// 最近一次判定链路不可用时的原因（orig-tg 的 `unavailable_reason`；
+    /// HTTP 探不到时记为 `session probe failed`）。
+    pub tg_last_link_down_reason: RwLock<Option<String>>,
     /// 当前为 orig-tg 选定的端口（起点 `tg_port()`，不可绑定时顺延）。
     ///
     /// 为什么要在 state 里存（BUG-178）：端口不再是一个常量 —— 本机可能把默认端口
@@ -257,6 +280,10 @@ impl AppState {
             tg_last_error: RwLock::new(None),
             tg_last_spawn: Mutex::new(None),
             tg_last_restart: Mutex::new(None),
+            tg_link_down_streak: AtomicU32::new(0),
+            tg_link_restarts: AtomicU64::new(0),
+            tg_last_link_restart_at: RwLock::new(None),
+            tg_last_link_down_reason: RwLock::new(None),
             tg_port: RwLock::new(tg_port()),
             http: build_http_client(),
             tg_synced_download_root: Mutex::new(None),
@@ -710,38 +737,78 @@ impl AppState {
                 }
                 continue;
             }
-            // 进程在，但**链路断了** → 重启（长冷却）。
+            // 进程在，但**链路断了** → 连续确认后才重启（长冷却）。
             //
             // 为什么必须由 daemon 做（BUG-178）：orig-tg 只在启动时连一次 Telegram，
             // 连不上就永远停在不可用态。以前这个动作是界面上的「重试连接」按钮 +
             // 桌面壳 `ensure_tg` 两条手动路径 —— 用户修好网络还得替系统点一下，
             // 那是把 daemon 的失职外包给用户。现在巡检自己收尾。
-            if self.tg_link_healthy().await {
-                // BUG-323：TG 健康时顺手对齐下载路径。值未变 ⇒ 零请求；
-                // 上次推送失败（TG 刚回来）/ 用户刚改过目录 ⇒ 这里自然补上，
-                // 不需要用户点任何按钮。
-                self.sync_download_root_if_needed().await;
-                continue;
-            }
-            let can_restart = {
-                let last = self.tg_last_restart.lock().await;
-                match *last {
-                    Some(t) => t.elapsed() >= TG_LINK_RESTART_COOLDOWN,
-                    None => true,
+            //
+            // 为什么必须**连续确认**（BUG-351）：一次瞬时 false 就重启是最重的处置
+            // （会话重建 + 缓存队列 re-queue + 用户可见中断）；抖动期按 5 分钟冷却
+            // 反复重启，实测 477 次。真断 = 连续 3 轮（约 45s）持续不可用。
+            match self.tg_link_probe().await {
+                Ok(()) => {
+                    self.tg_link_down_streak.store(0, Ordering::SeqCst);
+                    *self.tg_last_link_down_reason.write().unwrap() = None;
+                    // BUG-323：TG 健康时顺手对齐下载路径。值未变 ⇒ 零请求；
+                    // 上次推送失败（TG 刚回来）/ 用户刚改过目录 ⇒ 这里自然补上，
+                    // 不需要用户点任何按钮。
+                    self.sync_download_root_if_needed().await;
+                    continue;
                 }
-            };
-            if !can_restart {
-                continue;
-            }
-            eprintln!("[tg] supervise: telegram link is down, restarting orig-tg");
-            daemon_log("telegram link is down — restarting orig-tg");
-            *self.tg_last_restart.lock().await = Some(tokio::time::Instant::now());
-            match self.tg_restart().await {
-                Ok(true) => eprintln!("[tg] supervise: orig-tg restarted"),
-                Ok(false) => {}
-                Err(e) => eprintln!("[tg] supervise: failed to restart orig-tg: {e}"),
+                Err(reason) => {
+                    let streak = self.tg_link_down_streak.fetch_add(1, Ordering::SeqCst) + 1;
+                    *self.tg_last_link_down_reason.write().unwrap() = Some(reason.clone());
+                    if !link_down_confirmed(streak) {
+                        eprintln!(
+                            "[tg] supervise: link down ({streak}/{TG_LINK_DOWN_CONFIRMS}) — waiting for confirmation: {reason}"
+                        );
+                        continue;
+                    }
+                    let can_restart = {
+                        let last = self.tg_last_restart.lock().await;
+                        match *last {
+                            Some(t) => t.elapsed() >= TG_LINK_RESTART_COOLDOWN,
+                            None => true,
+                        }
+                    };
+                    if !can_restart {
+                        continue;
+                    }
+                    eprintln!("[tg] supervise: telegram link is down, restarting orig-tg");
+                    daemon_log("telegram link is down — restarting orig-tg");
+                    *self.tg_last_restart.lock().await = Some(tokio::time::Instant::now());
+                    match self.tg_restart().await {
+                        Ok(true) => eprintln!("[tg] supervise: orig-tg restarted"),
+                        Ok(false) => {}
+                        Err(e) => eprintln!("[tg] supervise: failed to restart orig-tg: {e}"),
+                    }
+                    // 重启即处置完成：计数 + 记墙钟 + 重新从 0 累积（下次仍需连续确认）。
+                    self.tg_link_down_streak.store(0, Ordering::SeqCst);
+                    self.tg_link_restarts.fetch_add(1, Ordering::SeqCst);
+                    *self.tg_last_link_restart_at.write().unwrap() =
+                        Some(chrono_like_epoch_secs());
+                }
             }
         }
+    }
+
+    /// 链路健康快照（**对外可见**，BUG-351）：`/api/config` 的 `tg_link` 字段。
+    ///
+    /// 「系统每 5 分钟重启一次 TG」此前在界面上完全不可见：`/api/config` 只有瞬时
+    /// `tg_running`（重启窗口只有几百 ms），`tg_last_error` 又只记 spawn 失败。
+    /// 没有这个字段，关于页就永远是两个绿点，与用户看到的「TG 莫名挂了」矛盾。
+    pub fn tg_link_status(&self) -> serde_json::Value {
+        let streak = self.tg_link_down_streak.load(Ordering::SeqCst);
+        serde_json::json!({
+            "link_down": streak > 0,
+            "down_streak": streak,
+            "confirms_required": TG_LINK_DOWN_CONFIRMS,
+            "restarts": self.tg_link_restarts.load(Ordering::SeqCst),
+            "last_restart_at": *self.tg_last_link_restart_at.read().unwrap(),
+            "reason": self.tg_last_link_down_reason.read().unwrap().clone(),
+        })
     }
 
     /// Telegram 链路是否健康（进程在跑时的**第二层**巡检，BUG-178）。
@@ -752,19 +819,33 @@ impl AppState {
     ///     重启只会让配置页刚填完就被顶掉）；
     ///   - 不可用且已配凭证 → 真断了，需要重启才能重连。
     /// HTTP 本身失败（进程在但已半死）同样按「要重启」处理。
-    async fn tg_link_healthy(&self) -> bool {
+    ///
+    /// 返回 `Err(reason)` = 链路不可用且**值得重启**；`Ok(())` = 健康（含「没配凭证」
+    /// 这种待办态 —— 重启一百次也修不好，还会把刚填完凭证的实例顶掉）。
+    /// 原因随结果带出（BUG-351）：界面要能回答「为什么最近重启过」。
+    async fn tg_link_probe(&self) -> Result<(), String> {
         let url = format!("http://127.0.0.1:{}/api/tg/session", self.tg_port_state());
-        let Ok(resp) = self.http.get(&url).send().await else {
-            return false;
+        let resp = match self.http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => return Err(format!("session probe failed: {e}")),
         };
         // 走 `text()` + `serde_json`：daemon 不依赖 reqwest 的 `json` feature。
         let Ok(body) = resp.text().await else {
-            return false;
+            return Err("session probe failed: unreadable body".to_string());
         };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
-            return false;
+            return Err("session probe failed: unparsable body".to_string());
         };
-        tg_link_healthy_from(&v)
+        if tg_link_healthy_from(&v) {
+            return Ok(());
+        }
+        Err(
+            v.get("reason")
+                .and_then(|x| x.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("telegram link unavailable")
+                .to_string(),
+        )
     }
 
     /// 终止 orig-tg 子进程并清空句柄（幂等）。
@@ -799,6 +880,25 @@ impl AppState {
 ///   - 不可用但**没配凭证** → 健康（待用户去配置的**待办**；重启一百次也修不好，
 ///     还会把刚填完凭证、正要走登录流程的实例顶掉）；
 ///   - 不可用且已配凭证 → 真断了，必须重启才可能重连。
+/// 连续 down 轮数是否达到「真断了」的阈值（纯函数，便于单测；BUG-351）。
+///
+/// 判据是 `streak >= TG_LINK_DOWN_CONFIRMS`：**达到**阈值即确认（第 3 轮就重启），
+/// 不是「超过」—— 冷却已经在限速，再拖一轮只会让真故障的自愈更晚。
+fn link_down_confirmed(streak: u32) -> bool {
+    streak >= TG_LINK_DOWN_CONFIRMS
+}
+
+/// 当前墙钟（epoch 秒）。
+///
+/// daemon 不引 chrono（构建面越小越好），一个 `SystemTime` 换算足够：这个值的唯一
+/// 用途是给界面显示「最近一次重启是什么时候」（BUG-351）。
+fn chrono_like_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn tg_link_healthy_from(v: &serde_json::Value) -> bool {
     if v.get("available").and_then(|x| x.as_bool()).unwrap_or(false) {
         return true;
@@ -1256,6 +1356,63 @@ mod tests {
         );
         let ok = serde_json::json!({"available": true, "api_configured": true});
         assert!(tg_link_healthy_from(&ok), "可用时不该重启");
+    }
+
+    /// BUG-351：链路 down 必须**连续确认**才重启 —— 一次瞬时 false 就杀进程是
+    /// 最重的处置（会话重建 + 缓存队列 re-queue + 用户可见中断）。
+    ///
+    /// 有牙：若判据退回「一次 down 即重启」（`streak >= 1`），第 1/2 轮的断言立刻转红，
+    /// 正是真机 477 次重启风暴的成因。
+    #[test]
+    fn link_down_requires_consecutive_confirmations() {
+        assert!(
+            !link_down_confirmed(0),
+            "健康（streak=0）不该重启"
+        );
+        assert!(
+            !link_down_confirmed(1),
+            "第 1 轮 down 只可能是抖动：不该重启（BUG-351 的根因）"
+        );
+        assert!(
+            !link_down_confirmed(TG_LINK_DOWN_CONFIRMS - 1),
+            "未达阈值前一律继续确认"
+        );
+        assert!(
+            link_down_confirmed(TG_LINK_DOWN_CONFIRMS),
+            "达到阈值（持续约 45s 不可用）= 真断了，必须自愈"
+        );
+        assert!(link_down_confirmed(TG_LINK_DOWN_CONFIRMS + 5), "超过阈值同样确认");
+    }
+
+    /// BUG-351：链路重启必须**对外可见** —— 界面此前只有瞬时 `tg_running`，
+    /// 于是「系统每 5 分钟重启一次」在关于页完全看不到。
+    #[test]
+    fn link_status_exposes_restart_history() {
+        let st = test_state();
+        let fresh = st.tg_link_status();
+        assert_eq!(fresh["restarts"], 0, "刚启动：零重启");
+        assert_eq!(fresh["link_down"], false, "刚启动：未判不可用");
+        assert_eq!(
+            fresh["confirms_required"], TG_LINK_DOWN_CONFIRMS,
+            "阈值必须随状态下发，界面才能解释「为什么还没重启」"
+        );
+
+        // 模拟巡检：连续 2 轮 down（未达阈值）→ link_down=true 但仍未重启。
+        st.tg_link_down_streak.store(2, Ordering::SeqCst);
+        *st.tg_last_link_down_reason.write().unwrap() = Some("telegram link unavailable".into());
+        let mid = st.tg_link_status();
+        assert_eq!(mid["link_down"], true, "down 必须如实下发（不是等重启了才说）");
+        assert_eq!(mid["down_streak"], 2);
+        assert_eq!(mid["restarts"], 0, "未达阈值 ⇒ 还没重启过");
+
+        // 处置完成：计一次重启 + 记墙钟 + 重新从 0 累积。
+        st.tg_link_down_streak.store(0, Ordering::SeqCst);
+        st.tg_link_restarts.fetch_add(1, Ordering::SeqCst);
+        *st.tg_last_link_restart_at.write().unwrap() = Some(chrono_like_epoch_secs());
+        let after = st.tg_link_status();
+        assert_eq!(after["restarts"], 1, "重启次数必须累计并下发");
+        assert!(after["last_restart_at"].as_i64().unwrap_or(0) > 0, "最近重启时间必须下发");
+        assert_eq!(after["link_down"], false, "重启后重新累积 ⇒ 不再报 down");
     }
 
     /// BUG-091 的实测矛盾态：9877 确实在跑（外部/遗留实例），但本进程没有子进程句柄，

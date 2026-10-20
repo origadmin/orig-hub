@@ -6,6 +6,7 @@ import type {
   DownloadStatus,
   LanguageValue,
   TgAccount,
+  TgLinkHealth,
   TgLinkInfo,
   TgServiceState,
   TgSession,
@@ -59,7 +60,12 @@ let tgProbeCancel: (() => void) | null = null
 
 /** TG 服务层 / 链路层的等值短路签名（BUG-097 + BUG-178） */
 function tgServiceKey(a: TgServiceState): string {
-  return `${a.enabled}|${a.running}|${a.port ?? ''}|${a.lastError ?? ''}`
+  // BUG-351：链路健康与自愈历史一并参与等值判定 —— 重启次数变化必须能刷新界面，
+  // 否则「刚重启过」这条事实会被短路掉（界面继续恒绿）。
+  const l = a.link
+  return `${a.enabled}|${a.running}|${a.port ?? ''}|${a.lastError ?? ''}|${
+    l ? `${l.link_down}|${l.down_streak}|${l.restarts}|${l.last_restart_at ?? ''}|${l.reason ?? ''}` : ''
+  }`
 }
 
 function tgLinkKey(a: TgLinkInfo): string {
@@ -685,6 +691,8 @@ export const useStore = create<DownloadState>((set, get) => ({
       running: cfg.tg_running,
       port: cfg.tg_port ?? null,
       lastError: cfg.tg_last_error ?? null,
+      // BUG-351：链路健康 + 自愈历史（daemon 唯一真源）。
+      link: (cfg.tg_link ?? null) as TgLinkHealth | null,
     }
     if (tgServiceKey(get().tgService) !== tgServiceKey(svc)) set({ tgService: svc })
 

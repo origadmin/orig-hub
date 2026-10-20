@@ -177,6 +177,31 @@ export interface TgServiceState {
   port: number | null
   /** 最近一次拉起/自愈失败的原因（null = 最近一次成功） */
   lastError: string | null
+  /**
+   * 链路健康 + 自愈历史（BUG-351）：daemon 巡检**连续确认**链路不可用后才重启
+   * orig-tg，并把这段历史下发。
+   *
+   * 为什么必须有它：只有瞬时 `running` 时，「系统每 5 分钟重启一次 TG」在界面上
+   * 完全不可见（重启窗口仅几百 ms）—— 用户看到的是「TG 莫名挂了」与关于页两个
+   * 绿点并存。界面据此如实呈现「最近重启过 N 次」，不再恒绿。
+   */
+  link?: TgLinkHealth | null
+}
+
+/** daemon 侧链路健康快照（`GET /api/config` 的 `tg_link`） */
+export interface TgLinkHealth {
+  /** 当前是否判为链路不可用（连续确认前的瞬时值也如实下发） */
+  link_down: boolean
+  /** 已连续判定不可用的轮数（达到 `confirms_required` 才重启） */
+  down_streak: number
+  /** 触发一次重启所需的连续确认轮数 */
+  confirms_required: number
+  /** 自 daemon 启动以来因链路断而重启 orig-tg 的次数 */
+  restarts: number
+  /** 最近一次重启的墙钟（epoch 秒；null = 从未重启） */
+  last_restart_at: number | null
+  /** 最近一次判定不可用时的原因（null = 当前健康/无记录） */
+  reason: string | null
 }
 
 /**

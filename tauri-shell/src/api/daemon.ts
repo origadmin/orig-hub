@@ -168,6 +168,19 @@ export interface DaemonConfig {
    */
   tg_last_error?: string | null
   /**
+   * 链路健康 + 自愈历史（BUG-351）：`restarts`/`last_restart_at` 让界面能如实说
+   * 「最近重启过 N 次」—— 只有瞬时 `tg_running` 时，「系统每 5 分钟重启一次
+   * orig-tg」完全不可见（重启窗口仅几百 ms），关于页因此恒绿。
+   */
+  tg_link?: {
+    link_down: boolean
+    down_streak: number
+    confirms_required: number
+    restarts: number
+    last_restart_at: number | null
+    reason: string | null
+  } | null
+  /**
    * 调试日志路径（BUG-243）：由 daemon 下发**绝对路径**，设置-关于页直接展示，
    * 用户出错时照路径就能翻到日志，不必先问「日志在哪」。前端不拼路径——
    * 拼接权在引擎（`state::log_dir()` 是唯一真源），否则两端各拼一套必然漂移。

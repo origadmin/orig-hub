@@ -796,6 +796,11 @@ async fn get_config(State(st): State<Arc<AppState>>) -> axum::Json<serde_json::V
         // 拉起/自愈失败的原因（null = 最近一次成功）。入口级门控「服务可用才显示 TG」
         // 会让 TG 不可用时侧栏没有入口，原因必须在设置页可见，否则用户只会以为功能没了。
         "tg_last_error": st.tg_last_error(),
+        // BUG-351：链路健康 + 自愈历史。只有瞬时 `tg_running` 时，「系统每 5 分钟
+        // 重启一次 orig-tg」在界面上完全不可见（重启窗口仅几百 ms），用户看到的是
+        // 「TG 莫名挂了」与关于页两个绿点并存。界面据 `restarts`/`last_restart_at`
+        // 如实呈现「最近重启过 N 次」，不再恒绿。
+        "tg_link": st.tg_link_status(),
         // 调试日志（BUG-243）：把**路径**下发给设置-关于页，用户出错时能直接去查，
         // 不必先问「日志在哪」。目录与文件同源（`state::log_dir()`），前端不拼路径。
         // orig-tg.log = 子进程完整 stdout/stderr（启动失败原因就在里面）；
