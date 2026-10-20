@@ -105,6 +105,14 @@ interface Props {
    * **条目级「停止」没有对应回调**，因为传输的最小单位是任务不是消息（见文件头 BUG-320 ③）。
    */
   onDownloadSelected?: (chatId: number, messageIds: number[]) => void
+  /**
+   * BUG-353：**选中**是下载域的控制面（2026-10-19 裁定「只有选中的才下载」同一条
+   * 原则的反向：选中的 = 被操作的）。此前在传/待处理行只有行内按钮、没有任何
+   * 选中能力 ⇒ 既不能批量干预，也没有「这些是我正在关注的内容」的表达 ——
+   * 用户原话「下载中内容，没有选中，无法过滤取消下载」。
+   */
+  selected?: boolean
+  onToggleSelect?: (key: string) => void
 }
 
 export function IngestGroupRow({
@@ -113,6 +121,8 @@ export function IngestGroupRow({
   onRemove,
   onGoLibrary,
   onDownloadSelected,
+  selected = false,
+  onToggleSelect,
 }: Props) {
   const { latest, runs } = group
   /** 明细 Sheet 开关（DLU-T01：底部弹出，替代原行内展开区）。 */
@@ -135,11 +145,15 @@ export function IngestGroupRow({
 
   return (
     <div
-      className="rounded-lg border border-border-subtle bg-surface transition-all duration-200 hover:border-accent/40"
+      className={
+        'rounded-lg border bg-surface transition-all duration-200 hover:border-accent/40 ' +
+        (selected ? 'border-accent/60 bg-accent/5' : 'border-border-subtle')
+      }
       data-testid="ingest-group-row"
       data-status={latest.status}
       data-key={group.key}
       data-runs={runs}
+      data-selected={selected ? '1' : '0'}
     >
       {/* ── 折叠头：对象名 + 状态 + 操作 ── */}
       {/*
@@ -153,6 +167,22 @@ export function IngestGroupRow({
         data-testid="ingest-group-header"
       >
         <div className="flex items-start justify-between gap-3">
+          {/* 行级选中：下载域控制面（BUG-353）。点击只切换选中态、不打开明细 Sheet
+              —— stopPropagation 拦掉折叠头整块的 onClick。 */}
+          <label
+            className="mt-0.5 flex shrink-0 cursor-pointer items-center"
+            onClick={(e) => e.stopPropagation()}
+            title="选中此入库对象（用于批量取消）"
+          >
+            <input
+              type="checkbox"
+              checked={selected}
+              onChange={() => onToggleSelect?.(group.key)}
+              className="h-4 w-4 cursor-pointer accent-accent"
+              data-testid="ingest-group-select"
+              aria-label="选中此入库对象"
+            />
+          </label>
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <Badge variant="secondary">TG 入库</Badge>

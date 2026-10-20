@@ -4,11 +4,12 @@ import type { DlFilter } from '../../nav'
 import { DownloadList } from './DownloadList'
 import { IngestGroupRow } from './IngestGroupRow'
 import type { UseIngestGroupsResult } from './useIngestGroups'
-import { groupInBucket } from './ingestGroups'
+import { groupInBucket, ingestActionsFor } from './ingestGroups'
 import { useStore } from '../../store/useStore'
 import { useGoLibrary } from '../../hooks/useGoLibrary'
 import { enqueueCacheTask } from '../../api/tg'
 import { VirtualList } from '../../components/ui/virtual-list'
+import { Button } from '../../components/ui/button'
 import type { IngestGroup } from './ingestGroups'
 
 /**
@@ -76,9 +77,21 @@ const SOURCE_LABELS: Record<SourceFilter, string> = {
 }
 
 export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
-  const { setError } = useStore()
+  const { setError, cancel } = useStore()
   const { groups, overview, loading, error, unavailable, refresh, run, remove } = ingest
   const [source, setSource] = useState<SourceFilter>('all')
+  /**
+   * BUG-353：下载域的**选中**控制面。
+   *
+   * 此前在传/待处理行只有行内「取消」按钮、没有任何选中能力 ⇒ 既不能批量干预、
+   * 也无法表达「这些是我正在关注的内容」—— 用户原话「下载中内容，没有选中，
+   * 无法过滤取消下载」（第二次强调）。现在每行一个 checkbox，选中的行进入此集合，
+   * 底部出现批量条，可一次性「取消选中」。
+   *
+   * 选中键带来源前缀以避免引擎 id 与入库 key 撞名：`e:` + 引擎任务 id，
+   * `i:` + 入库组 key。
+   */
+  const [selected, setSelected] = useState<Set<string>>(() => new Set())
   /**
    * 「去媒体库查看」（BUG-300 复报：入库流水线原先没有跳转查看）。与缓存管理面板
    * 共用 `useGoLibrary` 一份实现 —— ref 约定/ViewerItem 形状漂移就会一个宿主能跳、
@@ -182,6 +195,74 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
     }
   }
 
+  /**
+   * 行级选中切换（BUG-353）。键带 `e:`/`i:` 前缀区分引擎下载与 TG 入库。
+   */
+  const toggleSelect = (key: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+  const clearSelection = () => setSelected(new Set())
+
+  /**
+   * 批量取消选中的下载（BUG-353）：把选中集合映射到各自来源的取消动作。
+   *
+   * 只有后端判据允许取消的才进队列（引擎 `actions` 含 `cancel` / 入库
+   * `ingestActionsFor` 含 `cancel`），不可取消的选中项计入 skipped 并提示 ——
+   * 不要让「点了没反应」冒充成功。
+   */
+  const cancelSelected = async () => {
+    const ops: Array<() => Promise<unknown>> = []
+    let skipped = 0
+    for (const k of selected) {
+      if (k.startsWith('e:')) {
+        const id = k.slice(2)
+        const it = engineRows.find((d) => d.id === id)
+        if (it && (it.actions ?? []).includes('cancel')) {
+          ops.push(() => cancel(id))
+        } else {
+          skipped += 1
+        }
+      } else if (k.startsWith('i:')) {
+        const gk = k.slice(2)
+        const g = groups.find((x) => x.key === gk)
+        if (g && ingestActionsFor(g.latest.status, g.latest.priority ?? 0).includes('cancel')) {
+          ops.push(() => run(g.latest, 'cancel'))
+        } else {
+          skipped += 1
+        }
+      }
+    }
+    if (ops.length === 0) {
+      if (skipped > 0) setError('选中的内容无可取消的操作')
+      return
+    }
+    try {
+      await Promise.all(ops.map((o) => o()))
+      setSelected(new Set())
+      refresh()
+      if (skipped > 0) setError(`${skipped} 项已无取消操作，已跳过`)
+    } catch (e) {
+      fail(e)
+    }
+  }
+
+  /** 选中集合按来源拆成两个 id/key 集合，下传给两个列表（避免跨来源键名冲突）。 */
+  const engineSel = useMemo(() => {
+    const s = new Set<string>()
+    for (const k of selected) if (k.startsWith('e:')) s.add(k.slice(2))
+    return s
+  }, [selected])
+  const ingestSel = useMemo(() => {
+    const s = new Set<string>()
+    for (const k of selected) if (k.startsWith('i:')) s.add(k.slice(2))
+    return s
+  }, [selected])
+
   const counts: Record<SourceFilter, number> = {
     all: (source !== 'ingest' ? engineRows.length : 0) +
     (source !== 'download' ? ingestRows.length : 0),
@@ -264,6 +345,38 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
         ))}
       </div>
 
+      {/* BUG-353：下载域选中控制面。选中任意行后出现，批量「取消选中」。 */}
+      {selected.size > 0 && (
+        <div
+          className="flex shrink-0 items-center justify-between gap-3 rounded-lg border border-accent/40 bg-accent/5 px-3 py-2 text-sm"
+          data-testid="dl-batch-bar"
+        >
+          <span className="text-fg-mid" data-testid="dl-batch-count">
+            已选 {selected.size} 项
+          </span>
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={clearSelection}
+              data-testid="dl-batch-clear"
+              title="清空选择"
+            >
+              清空
+            </Button>
+            <Button
+              size="sm"
+              variant="default"
+              onClick={() => void cancelSelected()}
+              data-testid="dl-batch-cancel"
+              title="取消选中的下载"
+            >
+              取消选中
+            </Button>
+          </div>
+        </div>
+      )}
+
       {tgUnavailable && (
         <div
           className="shrink-0 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning"
@@ -295,7 +408,11 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
         <div className="flex min-h-0 flex-1 flex-col gap-2.5">
           {showEngine && (
             <div className="shrink-0">
-              <DownloadList items={engineRows} />
+              <DownloadList
+                items={engineRows}
+                selectedIds={engineSel}
+                onToggleSelect={(id) => toggleSelect('e:' + id)}
+              />
             </div>
           )}
           {showIngest && (
@@ -317,6 +434,8 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
               renderItem={(g) => (
                 <IngestGroupRow
                   group={g}
+                  selected={ingestSel.has(g.key)}
+                  onToggleSelect={(key) => toggleSelect('i:' + key)}
                   onAction={(task, action) => {
                     void run(task, action).catch(fail)
                   }}

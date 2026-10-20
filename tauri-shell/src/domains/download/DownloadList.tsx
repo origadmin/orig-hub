@@ -6,9 +6,12 @@ interface Props {
   loading?: boolean
   error?: string | null
   onRetry?: () => void
+  /** 行级选中（BUG-353）：已选中的引擎任务 id 集合 */
+  selectedIds?: Set<string>
+  onToggleSelect?: (id: string) => void
 }
 
-export function DownloadList({ items, loading, error, onRetry }: Props) {
+export function DownloadList({ items, loading, error, onRetry, selectedIds, onToggleSelect }: Props) {
   if (loading && items.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-24 text-muted">
@@ -51,7 +54,12 @@ export function DownloadList({ items, loading, error, onRetry }: Props) {
   return (
     <div className="space-y-2.5">
       {items.map((item) => (
-        <DownloadItem key={item.id} item={item} />
+        <DownloadItem
+          key={item.id}
+          item={item}
+          selected={selectedIds?.has(item.id) ?? false}
+          onToggleSelect={onToggleSelect}
+        />
       ))}
     </div>
   )

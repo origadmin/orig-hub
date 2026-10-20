@@ -28,7 +28,16 @@ const statusMeta: Record<
   interrupted: { label: '已中断', variant: 'warning' },
 }
 
-export function DownloadItem({ item }: { item: DownloadStatus }) {
+export function DownloadItem({
+  item,
+  selected = false,
+  onToggleSelect,
+}: {
+  item: DownloadStatus
+  /** 行级选中（BUG-353 下载域控制面） */
+  selected?: boolean
+  onToggleSelect?: (id: string) => void
+}) {
   const { pause, resume, cancel, retry, remove, setError } = useStore()
   const [sheetOpen, setSheetOpen] = useState(false)
   const meta = statusMeta[item.status] ?? statusMeta.idle
@@ -100,11 +109,30 @@ export function DownloadItem({ item }: { item: DownloadStatus }) {
       data-testid="download-item"
       data-status={item.status}
       data-fid={item.id}
-      className="group cursor-pointer rounded-lg border border-border-subtle bg-surface p-4 transition-all duration-200 hover:border-accent/40 hover:bg-surface/80"
+      data-selected={selected ? '1' : '0'}
+      className={
+        'group cursor-pointer rounded-lg border bg-surface p-4 transition-all duration-200 hover:border-accent/40 hover:bg-surface/80 ' +
+        (selected ? 'border-accent/60 bg-accent/5' : 'border-border-subtle')
+      }
       onClick={() => setSheetOpen(true)}
       title="点击查看块进度详情"
     >
       <div className="flex items-start justify-between gap-3">
+        {/* 行级选中（BUG-353）：点击只切换选中态、不打开详情 Sheet。 */}
+        <label
+          className="mt-0.5 flex shrink-0 cursor-pointer items-center"
+          onClick={(e) => e.stopPropagation()}
+          title="选中此下载（用于批量取消）"
+        >
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={() => onToggleSelect?.(item.id)}
+            className="h-4 w-4 cursor-pointer accent-accent"
+            data-testid="download-item-select"
+            aria-label="选中此下载"
+          />
+        </label>
         {/* 文件名 + URL */}
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
