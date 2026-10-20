@@ -7,6 +7,8 @@ import type {
   TgMediaItem,
   TgMessagePage,
   TgMonitoredChannel,
+  TgMonitorFilter,
+  TgMonitorFilterHit,
   TgQueuedTask,
   TgSession,
   TgStoredItem,
@@ -211,6 +213,74 @@ export function removeTgMonitoredChannel(channelId: number | string): Promise<{ 
     `/api/tg/monitor/channels/${encodeURIComponent(String(channelId))}`,
     { method: 'DELETE' },
   )
+}
+
+/**
+ * POST /api/tg/monitor/channels/:id/read — 标记该频道已读。
+ *
+ * 「点开」的语义是「用户看过了」⇒ 服务端把该频道已读游标推到最新，未读计数归零。
+ * 与「取消监控」无关：不改监控关系、不动已入库消息。
+ */
+export function markTgChannelRead(channelId: number | string): Promise<{ ok: boolean }> {
+  return request(
+    `/api/tg/monitor/channels/${encodeURIComponent(String(channelId))}/read`,
+    { method: 'POST' },
+  )
+}
+
+/** GET /api/tg/monitor/filters — 文字筛选规则（每条带自己的命中条数） */
+export async function listTgMonitorFilters(): Promise<TgMonitorFilter[]> {
+  const res = await request<{ items?: TgMonitorFilter[] }>('/api/tg/monitor/filters')
+  return res.items ?? []
+}
+
+/** POST /api/tg/monitor/filters — 新建一条筛选规则（同关键词幂等，返回其 id） */
+export function addTgMonitorFilter(input: {
+  keyword: string
+  label?: string
+}): Promise<{ ok: boolean; id: number }> {
+  return request('/api/tg/monitor/filters', {
+    method: 'POST',
+    body: JSON.stringify({ keyword: input.keyword, label: input.label }),
+  })
+}
+
+/** DELETE /api/tg/monitor/filters/:id — 删除筛选规则（不动已入库消息） */
+export function removeTgMonitorFilter(id: number | string): Promise<{ ok: boolean }> {
+  return request(`/api/tg/monitor/filters/${encodeURIComponent(String(id))}`, {
+    method: 'DELETE',
+  })
+}
+
+/** POST /api/tg/monitor/filters/:id/read — 「点开这条规则」：+N 新命中归零
+ *  （BUG-330 / TGM-06；与 `markTgChannelRead` 同构，游标只进不退）。 */
+export function markTgFilterRead(id: number | string): Promise<{ ok: boolean }> {
+  return request(
+    `/api/tg/monitor/filters/${encodeURIComponent(String(id))}/read`,
+    { method: 'POST' },
+  )
+}
+
+/** GET /api/tg/monitor/filters/:id/messages — 该规则的命中列表（新→旧，只查本地）
+ *
+ *  `before` = 上一页最后一行的复合游标 `{ date, channelId, messageId }`
+ *  （BUG-330 / TGM-05）：message_id 跨频道不唯一，缺 channelId 的游标会翻出
+ *  重复/跳过。三个字段必须齐全，否则后端按第一页处理。 */
+export async function listTgMonitorFilterMessages(
+  id: number | string,
+  limit = 200,
+  before?: { date: number; channelId: number; messageId: number },
+): Promise<TgMonitorFilterHit[]> {
+  const q = new URLSearchParams({ limit: String(limit) })
+  if (before) {
+    q.set('beforeDate', String(before.date))
+    q.set('beforeChannelId', String(before.channelId))
+    q.set('beforeMessageId', String(before.messageId))
+  }
+  const res = await request<{ items?: TgMonitorFilterHit[] }>(
+    `/api/tg/monitor/filters/${encodeURIComponent(String(id))}/messages?${q}`,
+  )
+  return res.items ?? []
 }
 
 /** GET /api/tg/monitor/messages?channelId=..&limit=..&beforeId=..

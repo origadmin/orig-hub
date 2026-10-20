@@ -25,6 +25,81 @@ pub struct MonitoredChannel {
     pub username: Option<String>,
     #[serde(rename = "addedAt")]
     pub added_at: i64,
+    /// **自上次点开以来**新增的媒体条数（`message_id > last_read_message_id`）。
+    ///
+    /// 口径由用户 2026-10-19 裁定：「显示自上次点开以来新增条数」——不是
+    /// 「库里一共有多少条」（那是累计量，对「有没有新东西」没有信息量），
+    /// 也不是「本轮同步新增」（那只是服务端一次拉取的副产品，用户点开面板
+    /// 之前它就已经被清零的下一轮覆盖）。故必须有**每频道已读游标**。
+    #[serde(rename = "newCount")]
+    pub new_count: i64,
+}
+
+/// 文字筛选规则（`monitor_filter` 行）。
+///
+/// 用户 2026-10-19 裁定：「多次作为多条，不是单一过滤。一条相当于一条监控。」
+/// ⇒ 每条规则是**并列的一个条目**，各自算自己的命中集合，**不合并**成
+/// 「同一频道内多关键词 AND/OR」的复合条件。这样它读起来就是「一条虚拟监控频道」：
+/// 有自己的名字、自己的命中数、自己的列表。
+#[derive(Debug, Clone, Serialize)]
+pub struct MonitorFilter {
+    pub id: i64,
+    pub label: String,
+    pub keyword: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: i64,
+    /// 命中条数（跨全部监控频道，匹配 caption **或** file_name）。
+    pub hits: i64,
+    /// **自上次点开该规则以来**新增的命中条数（BUG-330 / TGM-06）。
+    ///
+    /// 与 `MonitoredChannel::new_count` 同构：用户口径「筛选添加的就是我需要监听的
+    /// **更新**内容」——只有总数时，「有没有新东西」在筛选层是断的。游标是
+    /// **时间戳** `last_read_at`（unix 秒）：命中跨频道，message_id 跨频道不可比；
+    /// 时间戳跨频道可比、单调，与命中定序同源（`COALESCE(msg_date, created_at)`）。
+    /// 现算不另存计数列（存了就和真实行漂移，BUG-329 纪律）。
+    #[serde(rename = "newHits")]
+    pub new_hits: i64,
+}
+
+/// 筛选命中行：媒体消息 + 所属频道标题。
+///
+/// 与 [`MonitoredMessageHit`] 的区别：这里带出 `file_name`。用户裁定的匹配字段是
+/// 「标题/说明 + 文件名」，而大量视频消息**没有 caption、只有文件名**（BUG-220），
+/// 不把 file_name 送到前端，命中行就会显示成一排无名条目——「筛出来了」却看不出筛到了什么。
+#[derive(Debug, Clone, Serialize)]
+pub struct MonitorFilterHit {
+    #[serde(rename = "channelId")]
+    pub channel_id: i64,
+    #[serde(rename = "messageId")]
+    pub message_id: i64,
+    pub caption: Option<String>,
+    #[serde(rename = "fileName", skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date: Option<i64>,
+    pub downloaded: bool,
+    #[serde(rename = "channelTitle")]
+    pub channel_title: Option<String>,
+    /// TG 相册分组 id（同组消息构成一个相册；无则单条）。前端据此「按组入库」而非按单条
+    /// 扁平化——同一频道内的多相册必须各自成任务，保留相册结构（BUG-329 裁定①）。
+    #[serde(rename = "groupId", skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<i64>,
+    /// MIME 类型（BUG-330 / TGM-05：命中行预览的数据基础）。
+    ///
+    /// `filter_messages` 原先不取这两列 ⇒ 前端即使想展开也驱动不了
+    /// `PhotoBlock`/`VideoBlock`/`MessageBubble`（store.rs `get_message` 一直取，
+    /// 是 filter 查询漏了）。
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// 落盘路径（同上；无 = 未缓存，前端据此给「缺字节」态，BUG-080 判据）。
+    #[serde(rename = "filePath", skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
 }
 
 /// 已入库的媒体消息（`media_message` 行）。
@@ -333,8 +408,76 @@ async fn migrate_cache_task_priority(conn: &Connection) -> libsql::Result<()> {
     Ok(())
 }
 
-/// BUG-194 迁移：把 `dialog_cache` 里**存量**的空/纯空白标题行补成可辨识兜底名。
+/// 迁移：为 `monitored_channel` 补「已读游标」列 `last_read_message_id`。
 ///
+/// **为什么必须有这一列**：用户 2026-10-19 裁定的条数口径是「自上次点开以来新增」。
+/// 没有每频道已读游标时，能算的只有两种假答案——「库里共几条」（累计量，对「有没有
+/// 新东西」零信息）和「本轮同步加了几条」（服务端一次拉取的副产品，下一轮就被覆盖）。
+///
+/// **存量语义：现有库里的消息一律视为已读**（`= MAX(message_id)`）。
+/// 若让旧行停在 0，升级后第一眼就是「438 条新内容」——那不是「自上次点开以来」，
+/// 是「自开天辟地以来」，用户看到的第一屏就是假的。
+async fn migrate_monitored_channel_last_read(conn: &Connection) -> libsql::Result<bool> {
+    let mut rows = conn.query("PRAGMA table_info(monitored_channel)", ()).await?;
+    let mut have = false;
+    while let Some(r) = rows.next().await? {
+        let name: String = r.get(1)?;
+        if name == "last_read_message_id" {
+            have = true;
+        }
+    }
+    if have {
+        return Ok(false);
+    }
+    conn.execute(
+        "ALTER TABLE monitored_channel ADD COLUMN last_read_message_id INTEGER NOT NULL DEFAULT 0",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "UPDATE monitored_channel
+            SET last_read_message_id = COALESCE(
+                  (SELECT MAX(m.message_id) FROM media_message m
+                    WHERE m.channel_id = monitored_channel.channel_id), 0)",
+        (),
+    )
+    .await?;
+    Ok(true)
+}
+
+/// 迁移：为 `monitor_filter` 补「已读游标」列 `last_read_at`（BUG-330 / TGM-06）。
+///
+/// 与 `migrate_monitored_channel_last_read` 同坑同解：存量行一律初始化为
+/// **迁移时刻 now**（不是 0）。若停在 0，升级后每条既有规则的所有命中都算
+/// 「新命中」——那不是「自上次点开以来」，是「自开天辟地以来」。
+/// 新库走 schema 里的 `DEFAULT 0`，由 `add_filter` 在建规则时显式写 now
+/// （新规则从「全已读」起算，与 BUG-329 新监控频道存量视为已读同口径）。
+async fn migrate_monitor_filter_last_read(conn: &Connection) -> libsql::Result<bool> {
+    let mut rows = conn.query("PRAGMA table_info(monitor_filter)", ()).await?;
+    let mut have = false;
+    while let Some(r) = rows.next().await? {
+        let name: String = r.get(1)?;
+        if name == "last_read_at" {
+            have = true;
+        }
+    }
+    if have {
+        return Ok(false);
+    }
+    conn.execute(
+        "ALTER TABLE monitor_filter ADD COLUMN last_read_at INTEGER NOT NULL DEFAULT 0",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "UPDATE monitor_filter SET last_read_at = ?1",
+        params![now()],
+    )
+    .await?;
+    Ok(true)
+}
+
+/// BUG-194 迁移：把 `dialog_cache` 里**存量**的空/纯空白标题行补成可辨识兜底名。///
 /// 只改 `title` 为空的行 ⇒ 天然幂等（第二次执行影响 0 行），且已有 363 条
 /// 有名会话一字不动（doc 验收：频道/群组部分不受影响、不回归）。
 ///
@@ -374,6 +517,17 @@ pub struct MonitoredMessageHit {
     pub message: StoredMessage,
     #[serde(rename = "channelTitle")]
     pub channel_title: Option<String>,
+}
+
+/// 关键词 → `LIKE` 模式（`%kw%`），转义 `\` / `%` / `_`。
+///
+/// 与 `search_messages` / `search_monitored_messages` 内联的转义规则**逐字相同**，
+/// 抽出来只给筛选功能用（既有两条路径不动，避免「顺手统一」变成未审核的行为变更）。
+fn like_pattern(q: &str) -> String {
+    format!(
+        "%{}%",
+        q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    )
 }
 
 fn stored_message_from_row(r: &Row) -> libsql::Result<StoredMessage> {
@@ -443,7 +597,21 @@ impl Store {
                 channel_id INTEGER PRIMARY KEY,
                 title      TEXT NOT NULL,
                 username   TEXT,
-                added_at   INTEGER NOT NULL
+                added_at   INTEGER NOT NULL,
+                -- 「自上次点开以来新增」的已读游标（见 MonitoredChannel::new_count）。
+                -- 老库没有这列，由 migrate_monitored_channel_last_read 幂等补上。
+                last_read_message_id INTEGER NOT NULL DEFAULT 0
+            );
+            -- 文字筛选规则（每条 = 一条虚拟监控，用户 2026-10-19 裁定）。
+            CREATE TABLE IF NOT EXISTS monitor_filter (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                label      TEXT NOT NULL,
+                keyword    TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                -- 「自上次点开该规则以来新增」的已读游标（BUG-330 / TGM-06）。
+                -- 老库没有这列，由 migrate_monitor_filter_last_read 幂等补上
+                -- （存量初始化为迁移时刻 now——不初始化则升级后首屏全是假「新命中」）。
+                last_read_at INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS media_message (
                 channel_id INTEGER NOT NULL,
@@ -521,6 +689,11 @@ impl Store {
         migrate_media_message(&conn).await?;
         // 旧库的 cache_task 缺 priority：幂等补列，不删数据（BUG-277）。
         migrate_cache_task_priority(&conn).await?;
+        // 旧库的 monitored_channel 缺 last_read_message_id：幂等补列 + 存量视为已读。
+        migrate_monitored_channel_last_read(&conn).await?;
+        // 旧库的 monitor_filter 缺 last_read_at（BUG-330 / TGM-06）：幂等补列 +
+        // 存量初始化为迁移时刻 now（不初始化则升级后首屏全是假「新命中」）。
+        migrate_monitor_filter_last_read(&conn).await?;
         // BUG-194：存量 dialog_cache 里的空标题行回填为可辨识兜底名（幂等）。
         let healed = migrate_dialog_cache_blank_titles(&conn).await?;
         if healed > 0 {
@@ -582,6 +755,10 @@ impl Store {
     // ---- 监控频道 ----
 
     /// 添加/更新监控频道（同 id 幂等，更新标题/用户名）。
+    ///
+    /// 新行把已读游标初始化到**该频道当前最大 message_id**：加入监控那一刻库里的东西
+    /// 都早于「上一次点开」，不该在加入后立刻变成一片「未读」。
+    /// 冲突时**不动**游标 —— 用户读到哪就是哪，改个标题不该让他重看一遍。
     pub async fn add_channel(
         &self,
         channel_id: i64,
@@ -591,8 +768,10 @@ impl Store {
         let t = now();
         self.conn
             .execute(
-                "INSERT INTO monitored_channel (channel_id, title, username, added_at)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO monitored_channel (channel_id, title, username, added_at, last_read_message_id)
+                 VALUES (?1, ?2, ?3, ?4,
+                         COALESCE((SELECT MAX(m.message_id) FROM media_message m
+                                    WHERE m.channel_id = ?1), 0))
                  ON CONFLICT(channel_id) DO UPDATE
                    SET title = excluded.title, username = excluded.username",
                 params![channel_id, title, username, t],
@@ -601,12 +780,16 @@ impl Store {
         Ok(())
     }
 
-    /// 列出全部监控频道（按添加时间正序）。
+    /// 列出全部监控频道（按添加时间正序），并带出各频道的未读条数。
     pub async fn list_channels(&self) -> libsql::Result<Vec<MonitoredChannel>> {
         let stmt = self
             .conn
             .prepare(
-                "SELECT channel_id, title, username, added_at FROM monitored_channel ORDER BY added_at",
+                "SELECT c.channel_id, c.title, c.username, c.added_at,
+                        (SELECT COUNT(*) FROM media_message m
+                          WHERE m.channel_id = c.channel_id
+                            AND m.message_id > c.last_read_message_id)
+                 FROM monitored_channel c ORDER BY c.added_at",
             )
             .await?;
         let mut rows = stmt.query(()).await?;
@@ -617,6 +800,7 @@ impl Store {
                 title: r.get(1)?,
                 username: r.get(2)?,
                 added_at: r.get(3)?,
+                new_count: r.get(4)?,
             });
         }
         Ok(out)
@@ -626,7 +810,11 @@ impl Store {
     pub async fn get_channel(&self, channel_id: i64) -> libsql::Result<Option<MonitoredChannel>> {
         let row = self
             .row_opt(
-                "SELECT channel_id, title, username, added_at FROM monitored_channel WHERE channel_id = ?1",
+                "SELECT c.channel_id, c.title, c.username, c.added_at,
+                        (SELECT COUNT(*) FROM media_message m
+                          WHERE m.channel_id = c.channel_id
+                            AND m.message_id > c.last_read_message_id)
+                 FROM monitored_channel c WHERE c.channel_id = ?1",
                 params![channel_id],
             )
             .await?;
@@ -636,9 +824,29 @@ impl Store {
                 title: r.get(1)?,
                 username: r.get(2)?,
                 added_at: r.get(3)?,
+                new_count: r.get(4)?,
             })),
             None => Ok(None),
         }
+    }
+
+    /// 「点开」= 把已读游标推到该频道当前最大 message_id，未读计数随之归零。
+    ///
+    /// 用 `MAX(..., last_read_message_id)` 而不是直接赋值：消息被清理过（行删除）
+    /// 时 `MAX()` 会变小，直接赋值等于把游标往回倒 ⇒ 已读过的旧消息重新变成「未读」。
+    pub async fn mark_channel_read(&self, channel_id: i64) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE monitored_channel
+                    SET last_read_message_id = MAX(
+                          COALESCE((SELECT MAX(m.message_id) FROM media_message m
+                                     WHERE m.channel_id = ?1), 0),
+                          last_read_message_id)
+                  WHERE channel_id = ?1",
+                params![channel_id],
+            )
+            .await?;
+        Ok(())
     }
 
     /// 移除监控频道（保留已入库消息，用户仍可下载/播放）。
@@ -885,6 +1093,255 @@ impl Store {
             out.push(MonitoredMessageHit {
                 message: stored_message_from_row(&r)?,
                 channel_title: r.get(12)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 列出全部文字筛选规则（按创建顺序），每条带自己的命中条数。
+    ///
+    /// 命中数逐条查一次：规则数是个位数（用户手建的），而把 keyword 塞进
+    /// `LIKE '%' || keyword || '%'` 就丢了 `%`/`_` 的转义——规则里出现下划线时
+    /// 会静默变成通配符，命中集合**多出用户没要的东西**。宁可多几条 SQL。
+    pub async fn list_filters(&self) -> libsql::Result<Vec<MonitorFilter>> {
+        let stmt = self
+            .conn
+            .prepare("SELECT id, label, keyword, created_at, last_read_at FROM monitor_filter ORDER BY id")
+            .await?;
+        let mut rows = stmt.query(()).await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            let keyword: String = r.get(2)?;
+            let last_read_at: i64 = r.get(4)?;
+            let hits = self.count_filter_hits(&keyword).await?;
+            let new_hits = self.count_filter_new_hits(&keyword, last_read_at).await?;
+            out.push(MonitorFilter {
+                id: r.get(0)?,
+                label: r.get(1)?,
+                keyword,
+                created_at: r.get(3)?,
+                hits,
+                new_hits,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 单条规则的命中条数（跨全部监控频道，caption **或** file_name）。
+    async fn count_filter_hits(&self, keyword: &str) -> libsql::Result<i64> {
+        let row = self
+            .row_opt(
+                "SELECT COUNT(*)
+                   FROM media_message m
+                   JOIN monitored_channel c ON c.channel_id = m.channel_id
+                  WHERE m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\'",
+                params![like_pattern(keyword)],
+            )
+            .await?;
+        match row {
+            Some(r) => r.get(0),
+            None => Ok(0),
+        }
+    }
+
+    /// 自 `last_read_at` 以来**新增**的命中条数（BUG-330 / TGM-06）。
+    ///
+    /// 口径与 `count_filter_hits` 相同，只加时间条件
+    /// `COALESCE(msg_date, created_at) > last_read_at`——与命中定序同源，
+    /// 跨频道可比（message_id 游标做不到，见 `MonitorFilter::new_hits` 注释）。
+    ///
+    /// **秒粒度边界**（游标与 msg_date 同为 unix 秒）：与点开同一秒内到达的命中
+    /// 落在 `>` 边界上不计 +N。消息本身仍在命中列表（费的只是徽标），且监控同步
+    /// 30s 一轮、点击是离散动作，同秒碰撞罕见——取 `>` 而不是 `>=`，是为了
+    /// 「点开时列表里已有的行一律不算新」（`>=` 会把刚看过的同秒行也算新）。
+    async fn count_filter_new_hits(&self, keyword: &str, last_read_at: i64) -> libsql::Result<i64> {
+        let row = self
+            .row_opt(
+                "SELECT COUNT(*)
+                   FROM media_message m
+                   JOIN monitored_channel c ON c.channel_id = m.channel_id
+                  WHERE (m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\')
+                    AND COALESCE(m.msg_date, m.created_at) > ?2",
+                params![like_pattern(keyword), last_read_at],
+            )
+            .await?;
+        match row {
+            Some(r) => r.get(0),
+            None => Ok(0),
+        }
+    }
+
+    /// 新建（或复用）一条筛选规则，返回 id。
+    ///
+    /// 同关键词幂等：重复添加只更新显示名，不长出第二条一样的规则——否则用户看到
+    /// 两个同名条目、命中数相同，会以为是 bug。
+    pub async fn add_filter(&self, label: &str, keyword: &str) -> libsql::Result<i64> {
+        if let Some(r) = self
+            .row_opt(
+                "SELECT id FROM monitor_filter WHERE keyword = ?1",
+                params![keyword],
+            )
+            .await?
+        {
+            let id: i64 = r.get(0)?;
+            self.conn
+                .execute(
+                    "UPDATE monitor_filter SET label = ?1 WHERE id = ?2",
+                    params![label, id],
+                )
+                .await?;
+            return Ok(id);
+        }
+        // BUG-189：`INSERT ... RETURNING id` 取新 id，不用连接级的 `last_insert_rowid()`
+        //（共享连接下并发交错会拿到别人的 rowid）。
+        //
+        // `last_read_at = ?3`（= now）：新规则从「全已读」起算——创建规则不该把库里
+        // **已有的**旧命中一夜之间变成「新命中」（与 BUG-329 新监控频道存量视为
+        // 已读同口径：徽标说的是「自那以后的新东西」，不是「自开天辟地以来」）。
+        let row = self
+            .row_opt(
+                "INSERT INTO monitor_filter (label, keyword, created_at, last_read_at)
+                 VALUES (?1, ?2, ?3, ?3)
+                 RETURNING id",
+                params![label, keyword, now()],
+            )
+            .await?;
+        match row {
+            Some(r) => r.get(0),
+            None => Err(libsql::Error::Misuse("insert monitor_filter returned no id".into())),
+        }
+    }
+
+    /// 「点开某条规则」= 把已读游标推到**当前命中集合的最大日期**，`new_hits` 随之
+    /// 归零（BUG-330 / TGM-06）。
+    ///
+    /// **为什么不像 `mark_channel_read` 那样直接用墙钟 `now()`**：消息的
+    /// `msg_date` 是 **TG 服务器时钟**，与本机墙钟有秒级时差是常态；时钟超前时
+    /// （或测试里的未来日期），`now()` 置的游标**清不掉**这些行 ⇒ 徽标永远归不了零。
+    /// 与频道侧同范式：推到**库里实际存在的最大 message_id**（那里抗时差），这里推到
+    /// **当前命中集合里实际存在的最大 `COALESCE(msg_date, created_at)`**——「点开」的
+    /// 语义是「列表里现在有的我都看过了」，不是「墙钟走到哪了」。
+    ///
+    /// `MAX(last_read_at, …)` 只进不退：消息被清理（行删除）后命中集合变小，直接赋值
+    /// 等于把已读的旧命中重新变成新的；重放/坏时钟同理。
+    pub async fn mark_filter_read(&self, id: i64) -> libsql::Result<()> {
+        let Some(r) = self
+            .row_opt(
+                "SELECT keyword FROM monitor_filter WHERE id = ?1",
+                params![id],
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let keyword: String = r.get(0)?;
+        self.conn
+            .execute(
+                "UPDATE monitor_filter
+                    SET last_read_at = MAX(last_read_at, COALESCE(
+                          (SELECT MAX(COALESCE(m.msg_date, m.created_at))
+                             FROM media_message m
+                             JOIN monitored_channel c ON c.channel_id = m.channel_id
+                            WHERE m.caption LIKE ?1 ESCAPE '\\'
+                               OR m.file_name LIKE ?1 ESCAPE '\\'),
+                          last_read_at))
+                  WHERE id = ?2",
+                params![like_pattern(&keyword), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// 删除一条筛选规则（只删规则，不动已入库消息）。
+    pub async fn remove_filter(&self, id: i64) -> libsql::Result<()> {
+        self.conn
+            .execute("DELETE FROM monitor_filter WHERE id = ?1", params![id])
+            .await?;
+        Ok(())
+    }
+
+    /// 某条筛选规则的命中列表（新→旧，BUG-330 / TGM-05 补预览字段与复合游标）。
+    ///
+    /// 匹配字段由用户 2026-10-19 裁定：**标题/说明（caption）+ 文件名（file_name）**。
+    /// 只查本地已同步消息（查询语义，不做网络回补）；规则不存在返回空集而非报错。
+    ///
+    /// `before` = 复合游标 `(date, channel_id, message_id)`：
+    /// - `date` = `COALESCE(msg_date, created_at)`——与定序同源、跨频道可比；
+    /// - `channel_id` 必须在游标里：**message_id 跨频道不唯一**，只带 message_id
+    ///   会在同刻跨频道行上重复/跳过（同 BUG-329 对单频道游标的相反约束）。
+    /// 定序相应改为 `(date, channel_id, message_id)` 全降序——原定序缺 channel_id，
+    /// 同 `(date, message_id)` 跨频道两行的先后不确定，游标分页必然漏重。
+    /// `before = None` = 第一页（从最新开始）。
+    pub async fn filter_messages(
+        &self,
+        filter_id: i64,
+        limit: u32,
+        before: Option<(i64, i64, i64)>,
+    ) -> libsql::Result<Vec<MonitorFilterHit>> {
+        let Some(r) = self
+            .row_opt(
+                "SELECT keyword FROM monitor_filter WHERE id = ?1",
+                params![filter_id],
+            )
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        let keyword: String = r.get(0)?;
+        // 游标条件按「展开式」写而不用行值比较 `(a,b,c) < (?,?,?)`：判据要在旧版
+        // libsql 上也能跑，且展开式在 EXPLAIN 下与行值等价。
+        let cursor_sql = if before.is_some() {
+            " AND (
+                   COALESCE(m.msg_date, m.created_at) < ?3
+                OR (COALESCE(m.msg_date, m.created_at) = ?3 AND m.channel_id < ?4)
+                OR (COALESCE(m.msg_date, m.created_at) = ?3 AND m.channel_id = ?4 AND m.message_id < ?5)
+               )"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT m.channel_id, m.message_id, m.caption, m.file_name, m.media_type,
+                    m.size, m.duration, m.msg_date, m.downloaded, c.title, m.group_id,
+                    m.mime_type, m.file_path
+               FROM media_message m
+               JOIN monitored_channel c ON c.channel_id = m.channel_id
+              WHERE (m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\'){cursor_sql}
+              ORDER BY COALESCE(m.msg_date, m.created_at) DESC, m.channel_id DESC, m.message_id DESC
+              LIMIT ?2"
+        );
+        let stmt = self.conn.prepare(&sql).await?;
+        let mut rows = match before {
+            Some((d, c, m)) => {
+                stmt.query(params![
+                    like_pattern(&keyword),
+                    limit.clamp(1, 500) as i64,
+                    d,
+                    c,
+                    m
+                ])
+                .await?
+            }
+            None => {
+                stmt.query(params![like_pattern(&keyword), limit.clamp(1, 500) as i64])
+                    .await?
+            }
+        };
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(MonitorFilterHit {
+                channel_id: r.get(0)?,
+                message_id: r.get(1)?,
+                caption: r.get(2)?,
+                file_name: r.get(3)?,
+                media_type: r.get(4)?,
+                size: r.get(5)?,
+                duration: r.get(6)?,
+                date: r.get(7)?,
+                downloaded: r.get::<i64>(8)? != 0,
+                channel_title: r.get(9)?,
+                group_id: r.get(10)?,
+                mime_type: r.get(11)?,
+                file_path: r.get(12)?,
             });
         }
         Ok(out)
@@ -2837,6 +3294,462 @@ mod tests {
         assert_eq!(s.get_channel(1).await.unwrap().unwrap().title, "Tech News v2");
         s.remove_channel(1).await.unwrap();
         assert!(s.get_channel(1).await.unwrap().is_none());
+    }
+
+    /// 未读计数 = `message_id > last_read_message_id` 的条数，点开即归零。
+    ///
+    /// 这条判据同时证伪三种假实现：
+    /// - 「库里共几条」⇒ 点开后不会归零；
+    /// - 「本轮同步加了几条」⇒ 不点开也会被下一轮清零；
+    /// - 「读游标直接赋值 MAX」⇒ 消息被清理后游标会往回倒（见下一个测试）。
+    #[tokio::test]
+    async fn unread_count_follows_read_cursor() {
+        let s = store("unread_cursor").await;
+        s.add_channel(1, "Ch", None).await.unwrap();
+        for id in [10, 11, 12] {
+            s.upsert_message(1, id, Some("x"), None, None, None, None, None, None, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            s.get_channel(1).await.unwrap().unwrap().new_count,
+            3,
+            "新入库的消息在点开前都应计为未读"
+        );
+
+        s.mark_channel_read(1).await.unwrap();
+        assert_eq!(
+            s.get_channel(1).await.unwrap().unwrap().new_count,
+            0,
+            "点开后未读必须归零 —— 否则徽标永远清不掉，等于没有这个功能"
+        );
+
+        s.upsert_message(1, 13, Some("y"), None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_channel(1).await.unwrap().unwrap().new_count,
+            1,
+            "点开之后再到的新消息才是「自上次点开以来新增」"
+        );
+    }
+
+    /// 加入监控那一刻库里的存量**不算未读**（否则升级/新加频道第一眼就是几百条假新增）。
+    #[tokio::test]
+    async fn adding_a_channel_does_not_report_backlog_as_new() {
+        let s = store("unread_backlog").await;
+        // 消息先进库（历史残留 / 之前监控过又取消），再加监控。
+        for id in [1, 2, 3, 4] {
+            s.upsert_message(9, id, Some("old"), None, None, None, None, None, None, None)
+                .await
+                .unwrap();
+        }
+        s.add_channel(9, "Old Ch", None).await.unwrap();
+        assert_eq!(
+            s.get_channel(9).await.unwrap().unwrap().new_count,
+            0,
+            "加入监控前就在库里的内容不是「自上次点开以来新增」"
+        );
+    }
+
+    /// 已读游标只进不退：消息被清理（行删除）后，已读的旧消息不得重新变成未读。
+    #[tokio::test]
+    async fn read_cursor_never_moves_backwards() {
+        let s = store("unread_monotonic").await;
+        s.add_channel(1, "Ch", None).await.unwrap();
+        for id in [100, 200, 300] {
+            s.upsert_message(1, id, Some("x"), None, None, None, None, None, None, None)
+                .await
+                .unwrap();
+        }
+        s.mark_channel_read(1).await.unwrap();
+        // 模拟清理：删掉最新那条（MAX 会从 300 掉到 200）。
+        s.conn
+            .execute(
+                "DELETE FROM media_message WHERE channel_id = 1 AND message_id = 300",
+                (),
+            )
+            .await
+            .unwrap();
+        s.mark_channel_read(1).await.unwrap();
+        let cursor: i64 = s
+            .row_opt(
+                "SELECT last_read_message_id FROM monitored_channel WHERE channel_id = 1",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(
+            cursor, 300,
+            "游标被回倒到 200 会让已读过的 201..300 重新变成「未读」"
+        );
+    }
+
+    /// 筛选匹配字段 = **caption 或 file_name**（用户 2026-10-19 裁定）。
+    ///
+    /// 必须两条都测：大量视频消息没有 caption、只有文件名（BUG-220），
+    /// 只测 caption 的话「匹配文件名」这条口径是假的。
+    #[tokio::test]
+    async fn filter_matches_caption_and_file_name() {
+        let s = store("filter_match").await;
+        s.add_channel(1, "剧集频道", Some("drama")).await.unwrap();
+        s.add_channel(2, "另一个频道", None).await.unwrap();
+        // ① 只有 caption 命中；② 只有 file_name 命中；③ 都不命中。
+        s.upsert_message(1, 1, Some("第12集 完结"), None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        s.upsert_message(
+            2,
+            2,
+            None,
+            Some("video/mp4"),
+            None,
+            Some("video"),
+            None,
+            None,
+            None,
+            Some("短剧A_第12集.mp4"),
+        )
+        .await
+        .unwrap();
+        s.upsert_message(1, 3, Some("无关内容"), None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+
+        let id = s.add_filter("第12集", "第12集").await.unwrap();
+        let hits = s.filter_messages(id, 100, None).await.unwrap();
+        assert_eq!(hits.len(), 2, "caption 与 file_name 命中的都要算进来");
+        let titles: Vec<Option<String>> = hits.iter().map(|h| h.channel_title.clone()).collect();
+        assert!(
+            titles.iter().any(|t| t.as_deref() == Some("剧集频道"))
+                && titles.iter().any(|t| t.as_deref() == Some("另一个频道")),
+            "命中应跨频道并带出来源频道标题（实测 {titles:?}）"
+        );
+
+        let listed = s.list_filters().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].hits, 2, "规则列表的命中数必须与实际命中一致");
+    }
+
+    /// 关键词里的 `%` / `_` 按字面匹配，不得变成通配符。
+    #[tokio::test]
+    async fn filter_escapes_like_wildcards() {
+        let s = store("filter_escape").await;
+        s.add_channel(1, "Ch", None).await.unwrap();
+        s.upsert_message(1, 1, Some("a_b 命名"), None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        s.upsert_message(1, 2, Some("axb 命名"), None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let id = s.add_filter("下划线", "a_b").await.unwrap();
+        let hits = s.filter_messages(id, 100, None).await.unwrap();
+        assert_eq!(hits.len(), 1, "`_` 若当通配符会多命中 axb");
+        assert_eq!(hits[0].message_id, 1);
+    }
+
+    /// 同关键词幂等：重复添加只更新显示名，不长出第二条一样的规则。
+    #[tokio::test]
+    async fn filter_add_is_idempotent_per_keyword() {
+        let s = store("filter_idem").await;
+        let a = s.add_filter("A", "关键词").await.unwrap();
+        let b = s.add_filter("B", "关键词").await.unwrap();
+        assert_eq!(a, b, "同关键词必须复用同一条规则");
+        let listed = s.list_filters().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].label, "B", "复用时应更新显示名");
+        s.remove_filter(a).await.unwrap();
+        assert!(s.list_filters().await.unwrap().is_empty());
+    }
+
+    /// 未监控频道的消息不参与筛选（口径：筛的是「监控内容」）。
+    #[tokio::test]
+    async fn filter_ignores_unmonitored_channels() {
+        let s = store("filter_scope").await;
+        s.add_channel(1, "监控中", None).await.unwrap();
+        s.upsert_message(1, 1, Some("命中词"), None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        // 频道 2 未监控，但消息仍在库里（取消监控不删消息）。
+        s.upsert_message(2, 2, Some("命中词"), None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let id = s.add_filter("x", "命中词").await.unwrap();
+        let hits = s.filter_messages(id, 100, None).await.unwrap();
+        assert_eq!(hits.len(), 1, "只筛监控中的频道");
+        assert_eq!(hits[0].channel_id, 1);
+    }
+
+    /// BUG-330 / TGM-06：`new_hits` = 自上次点开该规则以来新增；点开归零。
+    ///
+    /// 同时证伪两种假实现：①把总数当新命中（点开后不清零）；
+    /// ②存量误判为新（建规则时把库里已有命中算成 +N——与 BUG-329 频道游标同坑）。
+    ///
+    /// **秒粒度说明**：游标是 unix 秒，与消息 `msg_date` 同粒度 ⇒ 「与点开同一秒内
+    /// 到达的命中」落在边界上不计 +N（消息本身仍在命中列表里，费的只是徽标）。
+    /// 监控同步 30s 一轮、用户点击是离散动作，同秒碰撞罕见；测试用**显式未来
+    /// msg_date** 固化语义，不依赖墙钟竞速。
+    #[tokio::test]
+    async fn filter_new_hits_follows_read_cursor() {
+        let s = store("filter_new_hits").await;
+        s.add_channel(1, "Ch", None).await.unwrap();
+        s.upsert_message(1, 1, Some("纪录片 第一集"), None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let id = s.add_filter("纪录片", "纪录片").await.unwrap();
+        let listed = s.list_filters().await.unwrap();
+        assert_eq!(listed[0].hits, 1);
+        assert_eq!(
+            listed[0].new_hits, 0,
+            "建规则时库里已有的命中不算「新」——徽标说的是「自那以后的新东西」，不是「自开天辟地以来」"
+        );
+        // 显式未来 msg_date：不依赖墙钟（同秒到达在秒粒度游标下不可分辨）。
+        let later = now() + 30;
+        s.upsert_message(1, 2, Some("纪录片 第二集"), None, None, None, Some(later), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.list_filters().await.unwrap()[0].new_hits,
+            1,
+            "建规则之后新到的命中才计为 +N"
+        );
+        s.mark_filter_read(id).await.unwrap();
+        assert_eq!(s.list_filters().await.unwrap()[0].new_hits, 0, "点开后归零");
+        let even_later = now() + 60;
+        s.upsert_message(
+            1,
+            3,
+            Some("纪录片 第三集"),
+            None,
+            None,
+            None,
+            Some(even_later),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            s.list_filters().await.unwrap()[0].new_hits,
+            1,
+            "点开之后再到的新命中才是「自上次点开以来新增」"
+        );
+    }
+
+    /// 游标只进不退：旧/怪时间戳回写（时钟回拨、重放）不得把已读命中翻回「新」。
+    #[tokio::test]
+    async fn filter_read_cursor_only_moves_forward() {
+        let s = store("filter_cursor_fwd").await;
+        s.add_channel(1, "Ch", None).await.unwrap();
+        s.upsert_message(1, 1, Some("命中词"), None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let id = s.add_filter("x", "命中词").await.unwrap();
+        // 未来时间戳（模拟坏时钟/重放）：mark 后必须保持未来值，不得被拉回。
+        let future = now() + 10_000;
+        s.conn
+            .execute(
+                "UPDATE monitor_filter SET last_read_at = ?1 WHERE id = ?2",
+                params![future, id],
+            )
+            .await
+            .unwrap();
+        s.mark_filter_read(id).await.unwrap();
+        let stored = s
+            .row_opt(
+                "SELECT last_read_at FROM monitor_filter WHERE id = ?1",
+                params![id],
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(
+            stored, future,
+            "MAX() 只进不退：未来游标不得被拉回（否则已读命中翻新）"
+        );
+        // 旧时间戳：mark 后必须推进到命中集合的最大日期（不是停在旧值）。
+        s.conn
+            .execute(
+                "UPDATE monitor_filter SET last_read_at = ?1 WHERE id = ?2",
+                params![1i64, id],
+            )
+            .await
+            .unwrap();
+        s.mark_filter_read(id).await.unwrap();
+        let after = s
+            .row_opt(
+                "SELECT last_read_at FROM monitor_filter WHERE id = ?1",
+                params![id],
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        assert!(after > 1, "点开后游标必须推进（实测 {after}）");
+        assert_eq!(
+            s.list_filters().await.unwrap()[0].new_hits,
+            0,
+            "推进后旧命中必须已读"
+        );
+    }
+
+    /// BUG-330 / TGM-05：复合游标翻页无重复无跳过（message_id 跨频道不唯一）。
+    #[tokio::test]
+    async fn filter_hits_cursor_paginates_without_dupes() {
+        let s = store("filter_page").await;
+        s.add_channel(1, "甲频道", None).await.unwrap();
+        s.add_channel(2, "乙频道", None).await.unwrap();
+        // 同刻跨频道 3 对 + 两条其他日期的：date 相同的一批必须靠
+        // (channel_id, message_id) 才能定出稳定全序。
+        for mid in 1..=3i64 {
+            s.upsert_message(1, mid, Some("命中词"), None, None, None, Some(500), None, None, None)
+                .await
+                .unwrap();
+            s.upsert_message(2, mid, Some("命中词"), None, None, None, Some(500), None, None, None)
+                .await
+                .unwrap();
+        }
+        s.upsert_message(1, 10, Some("命中词"), None, None, None, Some(900), None, None, None)
+            .await
+            .unwrap();
+        s.upsert_message(2, 10, Some("命中词"), None, None, None, Some(100), None, None, None)
+            .await
+            .unwrap();
+        let id = s.add_filter("x", "命中词").await.unwrap();
+
+        // 全量定序（date, channel_id, message_id 全降序）：
+        //   (900,1,10) → (500,2,3) (500,2,2) (500,2,1) (500,1,3) (500,1,2) (500,1,1) → (100,2,10)
+        let page1 = s.filter_messages(id, 2, None).await.unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(
+            (page1[0].date, page1[0].channel_id, page1[0].message_id),
+            (Some(900), 1, 10)
+        );
+        // 同刻跨频道：channel_id 降序 ⇒ ch2 的 m3 在 ch1 之前（原定序缺 channel_id，
+        // 这两行的先后不确定，游标翻页必漏/重）。
+        assert_eq!(
+            (page1[1].date, page1[1].channel_id, page1[1].message_id),
+            (Some(500), 2, 3)
+        );
+
+        let mut pages = page1.clone();
+        let mut cursor = (
+            page1[1].date.unwrap(),
+            page1[1].channel_id,
+            page1[1].message_id,
+        );
+        loop {
+            let p = s.filter_messages(id, 2, Some(cursor)).await.unwrap();
+            if p.is_empty() {
+                break;
+            }
+            let last = p.last().unwrap();
+            cursor = (last.date.unwrap(), last.channel_id, last.message_id);
+            pages.extend(p);
+            if pages.len() >= 8 {
+                break;
+            }
+        }
+        assert_eq!(pages.len(), 8, "8 条命中必须正好翻完（无跳过）");
+        let mut keys: Vec<(i64, i64, i64)> = pages
+            .iter()
+            .map(|h| (h.date.unwrap(), h.channel_id, h.message_id))
+            .collect();
+        let uniq = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), uniq, "同一 (date, channel, message) 不得翻出两次");
+        let mut prev: Option<(i64, i64, i64)> = None;
+        for h in &pages {
+            let k = (h.date.unwrap(), h.channel_id, h.message_id);
+            if let Some(p) = prev {
+                assert!(k < p, "定序必须严格递减，否则游标必漏/重：{p:?} → {k:?}");
+            }
+            prev = Some(k);
+        }
+    }
+
+    /// BUG-330 / TGM-05：命中行带 `mime_type`/`file_path`（展开预览的数据基础）。
+    #[tokio::test]
+    async fn filter_hits_carry_preview_fields() {
+        let s = store("filter_preview_fields").await;
+        s.add_channel(1, "Ch", None).await.unwrap();
+        s.upsert_message(
+            1,
+            1,
+            Some("命中词"),
+            Some("video/mp4"),
+            Some(123),
+            Some("video"),
+            Some(1000),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        s.mark_downloaded(1, 1, Some("D:/Verify/proxies/f.mp4"))
+            .await
+            .unwrap();
+        let id = s.add_filter("x", "命中词").await.unwrap();
+        let hits = s.filter_messages(id, 10, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].mime_type.as_deref(), Some("video/mp4"));
+        assert_eq!(hits[0].file_path.as_deref(), Some("D:/Verify/proxies/f.mp4"));
+    }
+
+    /// BUG-330 / TGM-06：老库升级后存量规则全为已读（不得一屏假「新命中」）。
+    #[tokio::test]
+    async fn filter_migration_backfills_existing_rows_as_read() {
+        // 先造一个「老 schema」库：monitor_filter 没有 last_read_at。
+        let dir = std::env::temp_dir().join(format!(
+            "orig_tg_store_{}_filter_mig",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("store.db");
+        let _ = std::fs::remove_file(&db);
+        {
+            let conn = libsql::Builder::new_local(&db)
+                .build()
+                .await
+                .unwrap()
+                .connect()
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE monitor_filter (
+                     id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                     label      TEXT NOT NULL,
+                     keyword    TEXT NOT NULL,
+                     created_at INTEGER NOT NULL
+                 );
+                 INSERT INTO monitor_filter (label, keyword, created_at)
+                     VALUES ('老规则', '老词', 1);",
+            )
+            .await
+            .unwrap();
+        }
+        // 正式开库：迁移补列 + 存量初始化为迁移时刻 now。
+        let s = Store::open(&db).await.unwrap();
+        s.add_channel(1, "Ch", None).await.unwrap();
+        // 旧命中：msg_date=1（远古），必然早于迁移时刻。
+        s.upsert_message(1, 1, Some("老词 命中"), None, None, None, Some(1), None, None, None)
+            .await
+            .unwrap();
+        let listed = s.list_filters().await.unwrap();
+        assert_eq!(listed.len(), 1, "存量规则必须在升级后仍在");
+        assert_eq!(listed[0].hits, 1);
+        assert_eq!(
+            listed[0].new_hits, 0,
+            "存量规则升级后不得把已有命中算成「新命中」（否则首屏全是假 +N）"
+        );
     }
 
     #[tokio::test]

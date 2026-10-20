@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { ChevronDown, ChevronRight } from 'lucide-react'
+import { ChevronDown, ChevronRight, ChevronUp, Plus } from 'lucide-react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { Switch } from './ui/switch'
@@ -15,6 +15,11 @@ import {
   listTgMonitoredChannels,
   addTgMonitoredChannel,
   removeTgMonitoredChannel,
+  markTgChannelRead,
+  listTgMonitorFilters,
+  addTgMonitorFilter,
+  removeTgMonitorFilter,
+  markTgFilterRead,
   listTgMonitorMessages,
   searchTgMonitorMessages,
   listTgMessages,
@@ -35,14 +40,17 @@ import type {
   TgFolder,
   TgMediaItem,
   TgMonitoredChannel,
+  TgMonitorFilter,
   TgQueuedTask,
   TgStoredMessage,
 } from '../types'
 import { tgSaveConfig } from '../api/tauri'
 import { isTauri, copyToClipboard } from '../lib/env'
 import { CacheManagerDialog } from './CacheManagerDialog'
+import { TgFilterPanel } from './TgFilterPanel'
 import { TgOnboarding } from '../domains/tg/TgOnboarding'
 import { useStore } from '../store/useStore'
+import type { TgMode } from '../nav'
 import { resolveTgFeatureReady } from '../store/selectors'
 import { useTgSearch } from '../store/tgSearch'
 import { classifyTgReason, describeTgFailure, logTgReason } from '../lib/tgReason'
@@ -132,6 +140,8 @@ interface MiddleChannel {
   title: string
   username?: string
   folder?: string
+  /** 仅监控行有值：自上次点开以来新增条数（未读徽标） */
+  newCount?: number
 }
 
 /**
@@ -285,10 +295,19 @@ function groupAlbums(feed: FeedItem[]): FeedItem[][] {
  */
 export function TgPanel(
   {
+    tgMode,
+    onTgModeChange,
     onOpenAccounts,
     onOpenMedia,
     onOpenDownload,
   }: {
+    /**
+     * TG 域内选择（BUG-330 / TGM-01/03；二级菜单 → 主列的唯一分流判据）。
+     * 与 FilesPanel 的 `nav.fmode` 同构：单一真源在 MainLayout 的 nav state，
+     * 面板只读 + 经 `onTgModeChange` 写回（禁止组件里再存一份 view）。
+     */
+    tgMode: TgMode
+    onTgModeChange: (mode: TgMode) => void
     onOpenAccounts?: () => void
     /**
      * 入库流水线的「去媒体库查看」出口：切到媒体库视图。
@@ -304,7 +323,7 @@ export function TgPanel(
      * 宿主没给时面板里那个按钮不渲染。
      */
     onOpenDownload?: () => void
-  } = {},
+  },
 ) {
   const { t } = useTranslation()
   const { setError, setToast, openViewer, tgService, tgLink, accounts, refreshTgState } = useStore()
@@ -370,18 +389,90 @@ export function TgPanel(
    */
   const [alive, setAlive] = useState(false)
   const [channels, setChannels] = useState<TgChannel[]>([])
+  /**
+   * 订阅列表是否已首次取到（BUG-330 TGM-02 + BUG-318 纪律）：
+   * 监听链状态条的频道数在取到前渲染 `—` 而不是 `0` —— 把「取不到」渲染成 0
+   * 会让用户以为真的没有频道。只有首次 fetchDialogs 真正 resolve 后才置 true。
+   */
+  const [channelsResolved, setChannelsResolved] = useState(false)
   /** 用户自定义分组（含 channelIds = Telegram pin 顺序，用于组内 pin 置顶排序） */
   const [folders, setFolders] = useState<TgFolder[]>([])
   const [scanning, setScanning] = useState(false)
   const [monitoredList, setMonitoredList] = useState<TgMonitoredChannel[]>([])
-  /** 第二列当前显示的分组（分组模式键；null = 内容模式：显示选中监控频道的内容） */
-  const [groupMode, setGroupMode] = useState<string | null>(null)
+  /** 监控列表是否已首次取到（BUG-330 TGM-02 + BUG-318：取不到渲染 `—` 不渲染 0） */
+  const [monitoredResolved, setMonitoredResolved] = useState(false)
+  /** 筛选规则是否已首次取到（同上） */
+  const [filtersResolved, setFiltersResolved] = useState(false)
   /** 监控列表折叠状态（默认展开） */
   const [monitorOpen, setMonitorOpen] = useState(true)
-  /** 第二列是否处于内容详情模式（true=内容；false=分组列表/空态） */
-  const [detail, setDetail] = useState(false)
+  /**
+   * 频道节折叠状态（BUG-330 TGM-02，设计 §2.6 优先级三机制）：
+   * 频道 = 消费序最底、偶尔动作 ⇒ **默认折叠**。折叠是优先级表达，不是功能隐藏——
+   * 节头计数与入口常驻可点（BUG-320）。
+   */
+  const [channelOpen, setChannelOpen] = useState(false)
+  /**
+   * 文字筛选规则（BUG-329）：每条 = 一条虚拟监控（用户 2026-10-19 裁定
+   * 「多次作为多条，不是单一过滤。一条相当于一条监控」）⇒ 与监控频道**并列**
+   * 渲染成多个条目，不是单频道内的复合条件。
+   */
+  const [filters, setFilters] = useState<TgMonitorFilter[]>([])
+  const [filterOpen, setFilterOpen] = useState(true)
+  /** 新建筛选的输入（弹窗内；旧版是节内常驻一行 Input+按钮，用户「严重破坏整体设计」） */
+  const [filterDraft, setFilterDraft] = useState('')
+  /** 弹窗内的显示名（可选；不填则后端 label 缺省同 keyword ⇒ 前端按此去重渲染） */
+  const [filterLabelDraft, setFilterLabelDraft] = useState('')
+  /** 「+ 新建」弹窗开关 */
+  const [filterDlgOpen, setFilterDlgOpen] = useState(false)
+  /** 节内规则检索（常驻；BUG-320：入口可见性不搞「多了才出现」） */
+  const [filterQuery, setFilterQuery] = useState('')
+  /** 规则超 K 折叠：false = 只渲染前 K 条 */
+  const [filterExpanded, setFilterExpanded] = useState(false)
+  const [filterAdding, setFilterAdding] = useState(false)
   const [search, setSearch] = useState('')
-  const [selectedId, setSelectedId] = useState<number | null>(null)
+  /**
+   * TGM-03：主列分流判据从四个独立状态（`activeFilter` / `groupMode` / `detail` /
+   * `selectedId`）+ `activeFilter ? … : …` 优先级链，收敛为**单一 `tgMode` 五值**
+   * （与文件域 `fmode` 同构，nav/index.ts）。下面全部是从 tgMode 的**只读派生**：
+   * 「筛选激活 + 分组已选」这类错误态在类型上不可表达。
+   */
+  const tgFilterId = tgMode.startsWith('filter:') ? Number(tgMode.slice(7)) : null
+  const activeFilter = useMemo(
+    () => (tgFilterId === null ? null : filters.find((f) => f.id === tgFilterId) ?? null),
+    [filters, tgFilterId],
+  )
+  /** 分组 key ↔ tgMode：ALL_KEY/UNGROUPED 是面板内部分组键，不进 nav 契约 */
+  const groupMode = useMemo<string | null>(() => {
+    if (tgMode === 'channels') return ALL_KEY
+    if (tgMode.startsWith('group:')) {
+      const g = tgMode.slice(6)
+      return g === '__ungrouped__' ? UNGROUPED : `f:${g}`
+    }
+    return null
+  }, [tgMode])
+  const tgModeOfGroupKey = (key: string): TgMode =>
+    key === ALL_KEY ? 'channels' : key === UNGROUPED ? 'group:__ungrouped__' : `group:${key.slice(2)}`
+  /** 内容视图 ⇔ `channel:<id>`；selectedId 只读派生，不再有第二处写入方 */
+  const selectedId = tgMode.startsWith('channel:') ? Number(tgMode.slice(8)) : null
+  /*
+   * 瞬态模式（全局搜索 'search' / 筛选 'filter:<id>'）的前模式：
+   * 关闭/清除时回到进来之前的那一屏（频道内容或分组列表），不是永远回全部。
+   */
+  const preTransientModeRef = useRef<TgMode | null>(null)
+  const enterTransient = (m: TgMode) => {
+    if (preTransientModeRef.current === null) {
+      preTransientModeRef.current =
+        tgMode === 'search' || tgMode.startsWith('filter:') ? 'channels' : tgMode
+    }
+    onTgModeChange(m)
+  }
+  const exitTransient = () => {
+    const back = preTransientModeRef.current ?? 'channels'
+    preTransientModeRef.current = null
+    onTgModeChange(back)
+  }
+  /** 从分组列表进内容页的来源 tgMode（「← 返回」回到那个分组；直接落频道时为 null，不显示返回） */
+  const cameFromListRef = useRef<TgMode | null>(null)
   /**
    * BUG-305：待定位的源消息（频道已选，但目标消息可能还没随 feed 到达）。
    * 用 state 而非 ref：定位循环的启停由它驱动（见下方定位 effect）。
@@ -449,7 +540,7 @@ export function TgPanel(
     new Map<string, AlbumProgress>(),
   )
   /**
-   * 图片入库状态（BUG-049 规则：图片不缓存，最多加入媒体库）：
+   * 图片入库状态（BUG-049 规则：图片不缓存，最多加入图片库）：
    * 已入库图片的 ref 集合（`<chatId>:<messageId>`）。feed 变化时对未见过的图片
    * 逐个 by-ref 查询；查过的记入 photoCheckedRef 不再重复请求。
    */
@@ -580,6 +671,7 @@ export function TgPanel(
     void (async () => {
       try {
         const cached = await fetchDialogs(false)
+        setChannelsResolved(true)
         // 冷启动：缓存为空 → 自动补一次后台扫描（后端 total==0 时同样会自扫，双保险）
         if (cached === 0) await fetchDialogs(true)
       } catch {
@@ -588,7 +680,10 @@ export function TgPanel(
       }
     })()
     listTgMonitoredChannels()
-      .then(setMonitoredList)
+      .then((m) => {
+        setMonitoredList(m)
+        setMonitoredResolved(true)
+      })
       .catch(() => {
         // BUG-167：同上，后台监控列表加载失败静默，不打脸连接灯。
       })
@@ -633,6 +728,7 @@ export function TgPanel(
         id: m.channelId,
         title: m.title,
         username: m.username,
+        newCount: m.newCount,
       })),
     [monitoredList],
   )
@@ -682,10 +778,69 @@ export function TgPanel(
     [groupMode, groupSections],
   )
 
-  // 默认选中：仅初始无选中时落到第一个监控频道；用户从分组点进的未监控频道不被重置。
+  /*
+   * 监听链状态条三数（BUG-330 TGM-02，设计 §2.0/§2.1）：
+   * 分别取 channels（订阅扫描）/ monitored（监控列表）/ filters（命中合计）三个 list
+   * 端点真值 —— 侧栏每一个数必须与 API 真值是同一个数，不许自己再算一套（BUG-125/133）。
+   */
+  const chainChannelCount = channels.length
+  const chainMonitoredCount = monitoredList.length
+  const chainHitTotal = useMemo(() => filters.reduce((s, f) => s + f.hits, 0), [filters])
+  const chainNewTotal = useMemo(
+    () =>
+      monitoredRows.reduce((s, r) => s + (r.newCount ?? 0), 0) +
+      filters.reduce((s, f) => s + (f.newHits ?? 0), 0),
+    [monitoredRows, filters],
+  )
+  /** 监控行的行内溯源（L2→L1 出处，设计 §2.3）：频道可属多个分组，取订阅列表里记录的分组 */
+  const folderOfChannel = (id: number) => channels.find((c) => c.id === id)?.folder
+
+  /*
+   * 数据驱动首落点（TGM-03；nav/index.ts::DEFAULT_TG_MODE 注释同源）：
+   * 默认 tgMode='channels' 且本会话还没为用户选过屏时，落到第一个监控频道
+   * （老行为：默认选中第一个监控频道显示其内容流）。一旦用户亲自选过
+   * （任何非默认点击）就置位不再干预 —— 用户显式停在 'channels' 时不被拽走。
+   */
+  const autoLandedRef = useRef(false)
   useEffect(() => {
-    if (selectedId === null) setSelectedId(monitoredRows[0]?.id ?? null)
-  }, [monitoredRows, selectedId])
+    if (autoLandedRef.current) return
+    if (tgMode !== 'channels') {
+      autoLandedRef.current = true
+      return
+    }
+    if (monitoredRows.length === 0) return
+    autoLandedRef.current = true
+    onTgModeChange(`channel:${monitoredRows[0].id}`)
+  }, [tgMode, monitoredRows, onTgModeChange])
+
+  /*
+   * TGM-03：上下文栏全局搜索（BUG-100）↔ `tgMode='search'` 的**单一闭环** effect。
+   * 搜索框在顶部上下文栏（TgGlobalSearch 写 store 的 `committed`），主列按 tgMode
+   * 分流 ⇒ 提交即进 'search' 瞬态模式，清词即退回进入前的那一屏。不用优先级链
+   * （`activeFilter ? … : globalSearch ? …`）—— 那正是本轮删掉的东西。
+   *
+   * **为什么进场/撤场必须同一个 effect 且记 prevTgMode**（实测教训，曾在这里
+   * 形成互撤环）：点左栏行离开搜索的那一拍，store 的 committed 还是旧值（清词
+   * 的 setState 尚未落地），若只按「committed 非空 ⇒ 进 search」判，会立刻把
+   * 用户拽回搜索模式，下一拍 exit 又弹回进搜索前的频道 ⇒ 用户点分组行永远
+   * 出不去（M6 探针抓到的就是这个环）。按「上一拍确实是 search」区分
+   * 「主动进搜索」与「被点行带出搜索」，环才断。
+   */
+  const prevTgModeRef = useRef<TgMode>(tgMode)
+  useEffect(() => {
+    const prev = prevTgModeRef.current
+    prevTgModeRef.current = tgMode
+    if (prev === 'search' && tgMode !== 'search') {
+      // 被其它入口带出搜索（点左栏行/规则）⇒ 清掉搜索词，断掉回拉
+      if (globalSearch) clearGlobalSearch()
+      return
+    }
+    if (globalSearch) {
+      if (tgMode !== 'search' && tgFilterId === null) enterTransient('search')
+    } else if (tgMode === 'search') {
+      exitTransient()
+    }
+  }, [globalSearch, tgMode, tgFilterId, onTgModeChange, clearGlobalSearch])
 
   const selectedMonitored = selectedId !== null && monitoredSet.has(selectedId)
   const selectedChannel = useMemo(
@@ -1061,7 +1216,23 @@ export function TgPanel(
     const run = async () => {
       try {
         const r = await syncTgMonitor()
-        if (!cancelled && r.added > 0) setPendingNew((n) => n + r.added)
+        if (!cancelled && r.added > 0) {
+          setPendingNew((n) => n + r.added)
+          // 新内容可能命中筛选规则、也会抬高未读徽标 ⇒ 两个数字都要跟着走，
+          // 否则用户看到的是「同步完了但数字没动」。
+          // 直接调 API 而不复用 refreshMonitored/refreshFilters：那两个 useCallback
+          // 声明在本 effect **之后**，写进依赖数组会在渲染期踩 TDZ。
+          void listTgMonitorFilters()
+            .then((f) => {
+              if (!cancelled) setFilters(f)
+            })
+            .catch(() => {})
+          void listTgMonitoredChannels()
+            .then((m) => {
+              if (!cancelled) setMonitoredList(m)
+            })
+            .catch(() => {})
+        }
       } catch {
         // 同步失败不打扰内容浏览（服务不可达时面板顶部已有整体提示）
       }
@@ -1090,7 +1261,7 @@ export function TgPanel(
   }, [feed, feedLoading])
 
   // BUG-049：feed 里每张未见过的图片查一次「是否已入库」，驱动图片气泡的
-  // 「加入媒体库 / 已入库」状态（图片不缓存，这是图片唯一的落库路径标记）。
+  // 「加入图片库 / 已入库」状态（图片不缓存，这是图片唯一的落库路径标记）。
   // BUG-241 Priority 2：**批量**一次请求覆盖所有未见过的图片（此前逐条 by-ref
   // N+1，实测首屏 54 次）；查过的记入 photoCheckedRef 不再重复请求。
   useEffect(() => {
@@ -1278,6 +1449,94 @@ export function TgPanel(
   }
 
   /**
+   * 点开监控频道 = 已读（BUG-329）。
+   *
+   * 本地先把徽标归零（乐观），再让服务端推进该频道的已读游标。失败**不弹错**：
+   * 这是一次后台尽力而为的记账，下一次拉监控列表会回到服务端的真值——
+   * 不会出现「本地假归零、服务端永远记着」的分叉。
+   */
+  const openMonitored = useCallback(
+    (id: number) => {
+      // TGM-03：点监控行 = 互斥切入 `channel:<id>`（不再有第二份 selectedId/detail）
+      cameFromListRef.current = null
+      onTgModeChange(`channel:${id}`)
+      setMonitoredList((prev) =>
+        prev.map((c) => (c.channelId === id && c.newCount !== 0 ? { ...c, newCount: 0 } : c)),
+      )
+      void markTgChannelRead(id).catch(() => {
+        // BUG-167 纪律：后台记账失败静默，不打脸连接灯。
+      })
+    },
+    [onTgModeChange, setMonitoredList],
+  )
+
+  // ---- 文字筛选（BUG-329） ----
+  const refreshFilters = useCallback(async () => {
+    try {
+      setFilters(await listTgMonitorFilters())
+      setFiltersResolved(true)
+    } catch {
+      // BUG-167：后台加载失败静默（顶部可用性横幅是唯一真相源）。
+    }
+  }, [])
+
+  const addFilter = async () => {
+    const keyword = filterDraft.trim()
+    if (!keyword || filterAdding) return
+    setFilterAdding(true)
+    try {
+      const label = filterLabelDraft.trim()
+      await addTgMonitorFilter({ keyword, label: label || undefined })
+      setFilterDraft('')
+      setFilterLabelDraft('')
+      setFilterDlgOpen(false)
+      await refreshFilters()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setFilterAdding(false)
+    }
+  }
+
+  /*
+   * 筛选节渲染派生（TGM-04）：
+   * - `shownRules`：检索框过滤后的规则（纯客户端，量级 ≤ 几百）
+   * - K 折叠：> K 条时默认只渲染前 K，其余收进「+N 条规则 ▾」（真控件）；
+   *   节头计数恒显全量（BUG-125/133：折叠不改计数口径）
+   * K 按最矮受支持窗口 900×600 下的首屏预算取（实现弧量几何后定，先 8）。
+   */
+  const FILTER_FOLD_K = 8
+  const shownRules = useMemo(() => {
+    const q = filterQuery.trim().toLowerCase()
+    if (q === '') return filters
+    return filters.filter(
+      (f) =>
+        f.label.toLowerCase().includes(q) || f.keyword.toLowerCase().includes(q),
+    )
+  }, [filters, filterQuery])
+  const rulesFolded = !filterExpanded && shownRules.length > FILTER_FOLD_K
+  const visibleRules = rulesFolded ? shownRules.slice(0, FILTER_FOLD_K) : shownRules
+
+  const removeFilter = async (id: number) => {
+    try {
+      await removeTgMonitorFilter(id)
+      // 删掉的正是当前打开的那条 ⇒ 第二列必须退回进入筛选之前的那一屏，
+      // 否则会停在一个已经不存在的筛选结果上（点什么都对不上）。
+      if (tgFilterId === id) exitTransient()
+      await refreshFilters()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  // 挂载即拉一次筛选规则（命中数由服务端算，前端不重算一遍口径）。
+  // 同步到新内容后也会重拉（见下方增量同步 effect），否则命中数会停在旧值。
+  useEffect(() => {
+    if (!alive) return
+    void refreshFilters()
+  }, [alive, refreshFilters])
+
+  /**
    * BUG-305：消费「媒体库 → TG 面板」的跳转焦点。
    *
    * 与 `MediaLibraryPanel` 消费 `pendingMediaFocus`（流水线 → 媒体库）同构，
@@ -1320,8 +1579,9 @@ export function TgPanel(
         }
       }
       if (cancelled) return
-      setDetail(true)
-      setSelectedId(chatId)
+      // TGM-03：定位焦点 = 互斥切入 `channel:<chatId>`（单一写面）
+      cameFromListRef.current = null
+      onTgModeChange(`channel:${chatId}`)
       setHighlightKey(null)
       setLocateReq({ chatId, messageId })
       setPendingTgFocus(null)
@@ -1482,7 +1742,7 @@ export function TgPanel(
   }
 
   /**
-   * 图片加入媒体库（BUG-049 规则：图片不缓存，最多入库为浏览条目）。
+   * 图片加入图片库（BUG-049 规则：图片不缓存，最多入库为浏览条目）。
    * 按 (source=tg, ref) 幂等；条目无本地文件，浏览字节由服务端现场代理缩略图。
    */
   const importPhoto = async (item: FeedItem) => {
@@ -1504,13 +1764,13 @@ export function TgPanel(
   }
 
   /**
-   * 相册整组加入媒体库（BUG-188）。
+   * 相册整组加入图片库（BUG-188）。
    *
    * 纯图组（`cacheTargets === 0`）**没有任何需要落盘的字节** —— TG 图片由 raw 端点
-   * 现场代理，`entryState.ts` 对 `tg`+`photo` 恒返回 `cached`。所以「加入媒体库」是一次
+   * 现场代理，`entryState.ts` 对 `tg`+`photo` 恒返回 `cached`。所以「加入图片库」是一次
    * **编目**动作，必须走批量入库，而不是 `enqueueCacheTask` 的**字节传输队列**：
    * 后者会把编目排到视频字节传输之后，让纯图组长时间停在「排队中」，而排队态是操作行
-   * 三个渲染分支里的**第一支**，会同时遮住「加入媒体库」按钮与完成态（BUG-188）。
+   * 三个渲染分支里的**第一支**，会同时遮住「加入图片库」按钮与完成态（BUG-188）。
    *
    * 与单图 `importPhoto` 同源：**一次**原子 POST（`importMediaItems`；产品约束禁止前端
    * 循环单条端点），按 (source=tg, ref) 幂等；成功后同步 `photoLibRefs`，该组立即渲染
@@ -1654,150 +1914,500 @@ export function TgPanel(
       ) : (
         <>
       <aside className="flex w-72 shrink-0 flex-col border-r border-border-subtle bg-surface/30">
-        {/* 上段：监控列表（本地真列表，点击 → 第二列显示内容；标题行可折叠/展开） */}
-        <div className="flex items-center gap-1.5 border-b border-border-subtle/60 px-3 py-2">
+        {/*
+         * 监听链状态条（BUG-330 TGM-02，设计 §2.0「两序分离」）：
+         * 构建序（频道 → 监控 → 筛选）由这条常驻可点的状态条承载；三节版面按**消费序**排
+         * （③ 筛选 → ② 监控 → ① 频道）。三数分别取 channels / monitored / filters 三个
+         * list 端点真值 —— 侧栏每一个数必须与 API 真值是同一个数（BUG-125/133）。
+         * 不是新导航位（BUG-314）：点阶段 = 展开并滚至对应节。
+         */}
+        <div
+          data-testid="tg-chain-bar"
+          aria-label={t('tg.chainAria')}
+          className="flex shrink-0 items-center gap-1 border-b border-border-subtle/60 px-2.5 py-1.5 text-[12px] text-muted"
+        >
           <button
             type="button"
-            aria-label={monitorOpen ? t('tg.monitorCollapse') : t('tg.monitorExpand')}
-            aria-expanded={monitorOpen}
-            aria-controls="tg-monitor-list"
-            data-testid="monitor-collapse-toggle"
-            onClick={() => setMonitorOpen((v) => !v)}
-            className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted transition-colors hover:bg-surface-2 hover:text-fg-strong"
+            title={t('tg.chainGoChannels')}
+            onClick={() => {
+              setChannelOpen(true)
+              document.getElementById('tg-section-channels')?.scrollIntoView({ block: 'start' })
+            }}
+            className="rounded px-1 py-0.5 tabular-nums transition-colors hover:bg-surface-2 hover:text-fg-strong"
           >
-            {/* BUG-101：折叠指示器此前是 10px 纯文本字符 `▾`/`▸`（读起来像装饰），
-                且与标题共用同一个 <button> → 点标题就折叠。现改为独立的 lucide
-                chevron 按钮（热区 24×24），标题不再是折叠入口。 */}
-            {monitorOpen ? (
-              <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
-            ) : (
-              <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
-            )}
+            {/* BUG-318：取不到渲染 `—`，不得渲染 0（「没有频道」与「还没问到」是两件事） */}
+            {channelsResolved ? t('tg.chainChannels', { n: chainChannelCount }) : '—'}
           </button>
-          <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold text-fg-strong">
-            ⭐ {t('tg.navMonitor')} ({monitoredList.length})
-          </h3>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 px-2 text-[11px]"
-            onClick={doSync}
-            disabled={syncing || monitoredList.length === 0}
+          <span aria-hidden="true">→</span>
+          <button
+            type="button"
+            title={t('tg.chainGoMonitor')}
+            onClick={() => {
+              setMonitorOpen(true)
+              document.getElementById('tg-section-monitor')?.scrollIntoView({ block: 'start' })
+            }}
+            className="rounded px-1 py-0.5 tabular-nums transition-colors hover:bg-surface-2 hover:text-fg-strong"
           >
-            {syncing ? t('tg.syncing') : t('tg.sync')}
-          </Button>
-        </div>
-
-        {/* 监控行（离线也可读：本地存储的监控列表；随标题行折叠/展开） */}
-        {monitorOpen && (
-          <div
-            id="tg-monitor-list"
-            data-testid="tg-monitor-list"
-            className="max-h-56 shrink-0 overflow-y-auto border-b border-border-subtle/60 p-1.5"
+            {monitoredResolved ? t('tg.chainMonitored', { n: chainMonitoredCount }) : '—'}
+          </button>
+          <span aria-hidden="true">→</span>
+          <button
+            type="button"
+            title={t('tg.chainGoFilter')}
+            onClick={() => {
+              setFilterOpen(true)
+              document.getElementById('tg-section-filter')?.scrollIntoView({ block: 'start' })
+            }}
+            className="rounded px-1 py-0.5 tabular-nums transition-colors hover:bg-surface-2 hover:text-fg-strong"
           >
-            {monitoredRows.length === 0 ? (
-              <p className="px-2 py-4 text-center text-xs text-muted">{t('tg.monitorEmpty')}</p>
-            ) : (
-              monitoredRows.map((ch) => {
-                const active = selectedId === ch.id
-                return (
-                  <div
-                    key={ch.id}
-                    className={cn(
-                      'group flex items-center gap-1 rounded-md pr-1 transition-colors',
-                      active ? 'bg-accent/10' : 'hover:bg-surface-2/70',
-                    )}
-                  >
-                    <button
-                      onClick={() => {
-                        setDetail(true)
-                        setSelectedId(ch.id)
-                      }}
-                      className="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left"
-                    >
-                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-surface-2 text-xs font-semibold text-fg-mid">
-                        {(ch.title || '?').charAt(0).toUpperCase()}
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <p className="truncate text-[13px] font-medium text-fg-strong">
-                          {ch.title}
-                        </p>
-                        {ch.username && (
-                          <p className="truncate text-[10px] text-muted">@{ch.username}</p>
-                        )}
-                      </div>
-                    </button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-7 shrink-0 px-1.5 text-[10px] text-muted hover:text-danger"
-                      onClick={() => void removeMonitor(ch.id)}
-                      title={t('tg.unmonitor')}
-                    >
-                      ✕
-                    </Button>
-                  </div>
-                )
-              })
-            )}
-          </div>
-        )}
-
-        {/* 下段：分组列表（点击 → 第二列切换为组内频道列表，进行添加/取消监控） */}
-        <div className="flex items-center justify-between px-3 pb-1 pt-2">
-          <h3 className="text-[12px] font-semibold text-fg-strong">{t('tg.addMonitor')}</h3>
-          {scanning ? (
-            <span className="flex items-center gap-1.5 px-1 text-[10px] text-muted">
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
-              {t('tg.scanning')}
-            </span>
-          ) : (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-7 px-2 text-[11px]"
-              onClick={() =>
-                // BUG-167：用户主动重扫失败仍给全局反馈（这是用户在等的动作结果，
-                // 与后台静默加载不同）；后台加载路径见挂载/轮询 effect 的静默分支。
-                void fetchDialogs(true).catch((e) =>
-                  setError(e instanceof Error ? e.message : String(e)),
-                )
-              }
-              disabled={!alive}
+            {filtersResolved ? t('tg.chainHits', { n: chainHitTotal }) : '—'}
+          </button>
+          {chainNewTotal > 0 ? (
+            <span
+              data-testid="tg-chain-new"
+              title={t('tg.monitorNewHint', { n: chainNewTotal })}
+              className="ml-auto shrink-0 rounded-md border border-accent/40 bg-accent/10 px-1.5 py-0.5 font-semibold tabular-nums text-accent"
             >
-              {t('tg.refresh')}
-            </Button>
-          )}
-        </div>
-        <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
-          {groupSections.map((sec) => {
-            const active = groupMode === sec.key
-            return (
-              <button
-                key={sec.key}
-                onClick={() => {
-                  setGroupMode(sec.key)
-                  setDetail(false)
-                }}
-                className={cn(
-                  'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12.5px] transition-colors',
-                  active
-                    ? 'bg-accent/10 font-medium text-fg-strong'
-                    : 'text-fg-mid hover:bg-surface-2/70',
-                )}
-              >
-                <span className="min-w-0 flex-1 truncate">{sec.title}</span>
-                <span className="shrink-0 text-[10px] text-muted">{sec.count}</span>
-              </button>
-            )
-          })}
+              {t('tg.chainNew', { n: chainNewTotal })}
+            </span>
+          ) : null}
         </div>
 
+        {/*
+         * 单一滚动容器（设计 §2.1）：撤掉监控节的 max-h-56 与分组节的 flex-1 各自限高
+         * ——「规则多了挤垮分组」在结构上不可能发生（诉求②的结构性修法）。
+         * 消费序：③ 筛选（每日第一眼）→ ② 监控 → ① 频道（默认折叠 = 优先级表达）。
+         */}
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {/* ===== ③ 筛选 · 我需要监听的内容（消费序①，默认展开） ===== */}
+          <section id="tg-section-filter" className="border-b border-border-subtle/60">
+            <div className="flex items-center gap-1.5 px-3 py-1.5">
+              {/*
+               * BUG-101：折叠指示器此前是 10px 纯文本字符（读起来像装饰）且与标题共用
+               * 同一个 <button>（点标题就折叠）。现为独立 lucide chevron 真控件
+               *（热区 24×24），标题文字本身不可点（BUG-320）。
+               */}
+              <button
+                type="button"
+                aria-label={filterOpen ? t('tg.filterCollapse') : t('tg.filterExpand')}
+                aria-expanded={filterOpen}
+                aria-controls="tg-filter-list-body"
+                data-testid="filter-collapse-toggle"
+                onClick={() => setFilterOpen((v) => !v)}
+                className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted transition-colors hover:bg-surface-2 hover:text-fg-strong"
+              >
+                {filterOpen ? (
+                  <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+              </button>
+              {/* 漏斗深度编号（设计 §2.5）：③ 最窄在顶 = 产出端 */}
+              <span aria-hidden="true" className="shrink-0 text-[12px] text-muted">③</span>
+              <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold text-fg-strong">
+                {t('tg.filterHeading')} ({filtersResolved ? filters.length : '—'})
+              </h3>
+              {/*
+               * v3 新建入口（用户 2026-10-20 裁定）：节标题**右上角「+ 新建」按钮 → 弹窗**。
+               * 撤掉规则列表下方常驻的「一行 Input + 添加按钮」——用户原话「当前下方一行
+               * 的方式严重破坏了整体设计」。添加是偶发动作，不占常驻版面；节首屏只剩规则
+               * 本体。弹窗内控件沿用 BUG-329 既有 testid（验收 selector 不变）。
+               */}
+              <div className="relative shrink-0">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 w-7 shrink-0 p-0"
+                  aria-label={t('tg.filterNewDlgTitle')}
+                  aria-expanded={filterDlgOpen}
+                  aria-haspopup="dialog"
+                  data-testid="tg-filter-new"
+                  onClick={() => setFilterDlgOpen((v) => !v)}
+                >
+                  <Plus className="h-4 w-4" aria-hidden="true" />
+                </Button>
+                {filterDlgOpen && (
+                  <div
+                    role="dialog"
+                    aria-label={t('tg.filterNewDlgTitle')}
+                    data-testid="tg-filter-dialog"
+                    className="absolute right-0 top-full z-20 mt-1 w-60 rounded-md border border-border-subtle bg-surface p-2 shadow-lg"
+                  >
+                    <p className="px-1 pb-1.5 text-[12px] font-semibold text-fg-strong">
+                      {t('tg.filterNewDlgTitle')}
+                    </p>
+                    <Input
+                      autoFocus
+                      value={filterDraft}
+                      onChange={(e) => setFilterDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') void addFilter()
+                        if (e.key === 'Escape') setFilterDlgOpen(false)
+                      }}
+                      placeholder={t('tg.filterKeywordPlaceholder')}
+                      aria-label={t('tg.filterKeyword')}
+                      data-testid="tg-filter-input"
+                      className="h-8 text-[13px]"
+                    />
+                    <Input
+                      value={filterLabelDraft}
+                      onChange={(e) => setFilterLabelDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') void addFilter()
+                        if (e.key === 'Escape') setFilterDlgOpen(false)
+                      }}
+                      placeholder={t('tg.filterLabelDlgPlaceholder')}
+                      aria-label={t('tg.filterLabelPlaceholder')}
+                      data-testid="tg-filter-label-input"
+                      className="mt-1 h-8 text-[13px]"
+                    />
+                    <div className="mt-1.5 flex items-center justify-end gap-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-8 px-2 text-[12px]"
+                        onClick={() => setFilterDlgOpen(false)}
+                      >
+                        {t('tg.cancel')}
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        className="h-8 px-2 text-[12px]"
+                        onClick={() => void addFilter()}
+                        disabled={!filterDraft.trim() || filterAdding}
+                        data-testid="tg-filter-add"
+                      >
+                        {filterAdding ? t('tg.filterAdding') : t('tg.filterAdd')}
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+            {filterOpen && (
+              <div id="tg-filter-list-body" className="px-1.5 pb-1.5">
+                <p className="px-2 pb-1 text-[12px] text-muted">{t('tg.filterSub')}</p>
+                {/* 节内检索框（常驻）：规则量级 ≤ 几百，纯客户端过滤。
+                    BUG-320 纪律：入口可见性不搞「规则多了才出现」。 */}
+                <div className="px-1 pb-1">
+                  <Input
+                    value={filterQuery}
+                    onChange={(e) => setFilterQuery(e.target.value)}
+                    placeholder={t('tg.filterSearchPlaceholder')}
+                    aria-label={t('tg.filterSearchPlaceholder')}
+                    data-testid="tg-filter-search"
+                    className="h-7 text-[12px]"
+                  />
+                </div>
+                {/* 文字筛选（BUG-329）：每条规则是**并列的一个条目**（用户裁定
+                    「一条相当于一条监控」），不是单频道内叠加条件的复合过滤器。 */}
+                <div className="space-y-1" data-testid="tg-filter-list">
+                  {filters.length === 0 ? (
+                    <p className="px-2 py-2 text-[12px] leading-relaxed text-muted">
+                      {t('tg.filterEmpty')}
+                    </p>
+                  ) : shownRules.length === 0 ? (
+                    <p className="px-2 py-2 text-[12px] leading-relaxed text-muted">
+                      {t('tg.filterNoRulesMatch')}
+                    </p>
+                  ) : (
+                    visibleRules.map((f) => {
+                      const active = activeFilter?.id === f.id
+                      /* label≡keyword 去重（v3）：routes.rs label 缺省 = keyword、前端旧版
+                         不传 label ⇒ UI 所建规则 100% 同词，标题行 + 副行渲染出"同一文字
+                         2 串"（用户投诉）。判据：两者相同 ⇒ 只留标题行；用户自起显示名
+                         （两者不同）时才两行都显。 */
+                      const sameAsKeyword = f.label === f.keyword
+                      return (
+                        <div
+                          key={f.id}
+                          data-testid="tg-filter-row"
+                          className={cn(
+                            'flex items-center gap-1 rounded-md pr-1 transition-colors',
+                            active ? 'bg-accent/10' : 'hover:bg-surface-2/70',
+                          )}
+                        >
+                          <button
+                            onClick={() => {
+                              enterTransient(`filter:${f.id}`)
+                              /* 点开这条规则 = 已读（TGM-04，同频道 mark read 范式）：
+                                 本地先乐观归零，再让服务端推进游标；失败静默回真值。 */
+                              setFilters((prev) =>
+                                prev.map((x) =>
+                                  x.id === f.id && (x.newHits ?? 0) > 0
+                                    ? { ...x, newHits: 0 }
+                                    : x,
+                                ),
+                              )
+                              void markTgFilterRead(f.id).catch(() => {})
+                            }}
+                            className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left"
+                          >
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-[13px] font-medium text-fg-strong">
+                                {f.label}
+                              </p>
+                              {!sameAsKeyword && (
+                                <p className="truncate text-[12px] text-muted">“{f.keyword}”</p>
+                              )}
+                              {/* 行内溯源（设计 §2.4，L3→L2 依赖）：N = monitored 端点真值 */}
+                              {monitoredResolved && (
+                                <p className="truncate text-[12px] text-muted">
+                                  {t('tg.filterScopeMonitored', { n: chainMonitoredCount })}
+                                </p>
+                              )}
+                            </div>
+                            {/* +N 新命中徽标（TGM-04 新增；0 不渲染——同 BUG-329 徽标纪律） */}
+                            {f.newHits && f.newHits > 0 ? (
+                              <span
+                                data-testid="tg-filter-new-badge"
+                                data-count={f.newHits}
+                                title={t('tg.filterNewBadge', { n: f.newHits })}
+                                className="shrink-0 rounded-md border border-accent/40 bg-accent/10 px-1.5 py-0.5 text-[12px] font-semibold tabular-nums text-accent"
+                              >
+                                +{f.newHits}
+                              </span>
+                            ) : null}
+                            <span
+                              data-testid="tg-filter-hits-count"
+                              className="shrink-0 rounded-md border border-border-subtle px-1.5 py-0.5 text-[12px] tabular-nums text-fg-mid"
+                            >
+                              {t('tg.filterHits', { n: f.hits })}
+                            </span>
+                          </button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 w-8 shrink-0 p-0 text-[12px] text-muted hover:text-danger"
+                            onClick={() => void removeFilter(f.id)}
+                            title={t('tg.filterRemove')}
+                            aria-label={t('tg.filterRemove')}
+                          >
+                            ✕
+                          </Button>
+                        </div>
+                      )
+                    })
+                  )}
+                </div>
+                {/* 规则超 K 折叠（v3，用户「多个显示超出规则后的折叠和展示」）：
+                    真 button + aria-expanded/aria-controls（BUG-320）；节头计数恒显全量
+                    （折叠不改计数口径，BUG-125/133）。 */}
+                {shownRules.length > FILTER_FOLD_K && (
+                  <button
+                    type="button"
+                    aria-expanded={filterExpanded}
+                    aria-controls="tg-filter-list"
+                    data-testid="tg-filter-fold-toggle"
+                    onClick={() => setFilterExpanded((v) => !v)}
+                    className="mt-1 flex w-full items-center gap-1 rounded-md px-2 py-1.5 text-left text-[12px] text-muted transition-colors hover:bg-surface-2/70"
+                  >
+                    {filterExpanded ? (
+                      <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" />
+                    ) : (
+                      <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+                    )}
+                    {filterExpanded
+                      ? t('tg.filterCollapseRules')
+                      : t('tg.filterMoreRules', { n: shownRules.length - FILTER_FOLD_K })}
+                  </button>
+                )}
+              </div>
+            )}
+          </section>
+          {/* ===== ② 监控 · 只检查这些频道的更新（消费序②，只读投影 §2.7） ===== */}
+          <section id="tg-section-monitor" className="border-b border-border-subtle/60">
+            <div className="flex items-center gap-1.5 px-3 py-1.5">
+              <button
+                type="button"
+                aria-label={monitorOpen ? t('tg.monitorCollapse') : t('tg.monitorExpand')}
+                aria-expanded={monitorOpen}
+                aria-controls="tg-monitor-list"
+                data-testid="monitor-collapse-toggle"
+                onClick={() => setMonitorOpen((v) => !v)}
+                className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted transition-colors hover:bg-surface-2 hover:text-fg-strong"
+              >
+                {monitorOpen ? (
+                  <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+              </button>
+              <span aria-hidden="true" className="shrink-0 text-[12px] text-muted">②</span>
+              {/* 设计 §2.1 图标纪律：节头禁 emoji —— 原此处 `⭐`（全仓唯一节头 emoji）已清除 */}
+              <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold text-fg-strong">
+                {t('tg.navMonitor')} ({monitoredResolved ? monitoredList.length : '—'})
+              </h3>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 px-2 text-[11px]"
+                onClick={doSync}
+                disabled={syncing || monitoredList.length === 0}
+              >
+                {syncing ? t('tg.syncing') : t('tg.sync')}
+              </Button>
+            </div>
+            {monitorOpen && (
+              <div
+                id="tg-monitor-list"
+                data-testid="tg-monitor-list"
+                className="p-1.5"
+              >
+                <p className="px-2 pb-1 text-[12px] text-muted">{t('tg.monitorSecSub')}</p>
+                {monitoredRows.length === 0 ? (
+                  <p className="px-2 py-4 text-center text-xs text-muted">{t('tg.monitorEmpty')}</p>
+                ) : (
+                  monitoredRows.map((ch) => {
+                    const active = selectedId === ch.id && !activeFilter
+                    const folder = folderOfChannel(ch.id)
+                    const fromGroup = t('tg.monitorFromGroup', {
+                      group: folder ?? t('tg.ungrouped'),
+                    })
+                    return (
+                      <div
+                        key={ch.id}
+                        className={cn(
+                          'group flex items-center gap-1 rounded-md pr-1 transition-colors',
+                          active ? 'bg-accent/10' : 'hover:bg-surface-2/70',
+                        )}
+                      >
+                        <button
+                          onClick={() => openMonitored(ch.id)}
+                          data-testid="tg-monitor-row"
+                          className="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left"
+                        >
+                          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-surface-2 text-xs font-semibold text-fg-mid">
+                            {(ch.title || '?').charAt(0).toUpperCase()}
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <p className="truncate text-[13px] font-medium text-fg-strong">
+                              {ch.title}
+                            </p>
+                            {ch.username || folder !== undefined ? (
+                              /* 行内溯源（设计 §2.3，L2→L1 出处）：频道可属多个分组，
+                                 取订阅列表记录的分组；无 username 时溯源独占副行。 */
+                              <p className="truncate text-[12px] text-muted">
+                                {ch.username ? `@${ch.username}` : fromGroup}
+                                {ch.username ? ` · ${fromGroup}` : ''}
+                              </p>
+                            ) : null}
+                          </div>
+                          {/* 未读徽标（BUG-329）：口径 =「自上次点开以来新增」。
+                              0 条时不渲染 —— 一排「+0」既占位又暗示有新内容。 */}
+                          {ch.newCount && ch.newCount > 0 ? (
+                            <span
+                              data-testid="tg-monitor-new-badge"
+                              data-count={ch.newCount}
+                              title={t('tg.monitorNewHint', { n: ch.newCount })}
+                              className="shrink-0 rounded-md border border-accent/40 bg-accent/10 px-1.5 py-0.5 text-[12px] font-semibold tabular-nums text-accent"
+                            >
+                              +{ch.newCount}
+                            </span>
+                          ) : null}
+                        </button>
+                        {/* §2.7 单一写面：行尾 ✕ 已撤 —— 取消监控的唯一入口上移到
+                            主列频道实体行（与分组管理列表的 Switch 同写面）。 */}
+                      </div>
+                    )
+                  })
+                )}
+              </div>
+            )}
+          </section>
+
+          {/* ===== ① 频道 · 来源（消费序③，默认折叠） ===== */}
+          <section id="tg-section-channels">
+            <div className="flex items-center gap-1.5 px-3 py-1.5">
+              <button
+                type="button"
+                aria-label={channelOpen ? t('tg.channelCollapse') : t('tg.channelExpand')}
+                aria-expanded={channelOpen}
+                aria-controls="tg-channel-list"
+                data-testid="channel-collapse-toggle"
+                onClick={() => setChannelOpen((v) => !v)}
+                className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted transition-colors hover:bg-surface-2 hover:text-fg-strong"
+              >
+                {channelOpen ? (
+                  <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+              </button>
+              <span aria-hidden="true" className="shrink-0 text-[12px] text-muted">①</span>
+              <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold text-fg-strong">
+                {t('tg.navChannels')} ({channelsResolved ? channels.length : '—'})
+              </h3>
+              <span className="shrink-0 text-[12px] tabular-nums text-muted">
+                {monitoredResolved ? t('tg.monitoredCount', { n: chainMonitoredCount }) : '—'}
+              </span>
+              {scanning ? (
+                <span className="flex items-center gap-1.5 px-1 text-[10px] text-muted">
+                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
+                  {t('tg.scanning')}
+                </span>
+              ) : (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 px-2 text-[11px]"
+                  onClick={() =>
+                    // BUG-167：用户主动重扫失败仍给全局反馈（这是用户在等的动作结果，
+                    // 与后台静默加载不同）；后台加载路径见挂载/轮询 effect 的静默分支。
+                    void fetchDialogs(true).catch((e) =>
+                      setError(e instanceof Error ? e.message : String(e)),
+                    )
+                  }
+                  disabled={!alive}
+                >
+                  {t('tg.refresh')}
+                </Button>
+              )}
+            </div>
+            {channelOpen && (
+              <div id="tg-channel-list" className="p-1.5">
+                <p className="px-2 pb-1 text-[12px] text-muted">{t('tg.channelSecSub')}</p>
+                {groupSections.map((sec) => {
+                  const active = groupMode === sec.key
+                  return (
+                    <button
+                      key={sec.key}
+                      data-testid="tg-group-row"
+                        onClick={() => {
+                          onTgModeChange(tgModeOfGroupKey(sec.key))
+                        }}
+                      className={cn(
+                        'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12.5px] transition-colors',
+                        active
+                          ? 'bg-accent/10 font-medium text-fg-strong'
+                          : 'text-fg-mid hover:bg-surface-2/70',
+                      )}
+                    >
+                      <span className="min-w-0 flex-1 truncate">{sec.title}</span>
+                      <span className="shrink-0 text-[10px] text-muted">{sec.count}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
+          </section>
+        </div>
       </aside>
 
-      {/* ===== 第二列：分组模式=组内频道列表 / 内容模式=聊天式媒体流（最新在底部） ===== */}
+      {/* ===== 第二列：单一 tgMode 五分支（TGM-03：删四态与优先级链） ===== */}
       <section className="relative flex min-w-0 flex-1 flex-col bg-surface/20">
-        {globalSearch ? (
+        {tgFilterId !== null && activeFilter ? (
+          /* `filter:<id>`：这条规则的命中工作台。互斥切换 —— 它在场时其它模式
+             不可表达（老优先级链 `activeFilter ? … : …` 删掉的原因）。 */
+          <TgFilterPanel
+            filter={activeFilter}
+            onClose={() => exitTransient()}
+            onIngested={() => {
+              void refreshFilters()
+            }}
+          />
+        ) : tgMode === 'search' ? (
           <>
             {/* 全局监控内容查找结果：跨全部监控频道，按频道分组（新→旧混排后归组）。
                 搜索框已上移到上下文栏（BUG-100），这里只留范围说明 / 命中数 / 清除，
@@ -1813,7 +2423,12 @@ export function TgPanel(
                 variant="ghost"
                 size="sm"
                 className="h-7 shrink-0 px-2 text-[11px]"
-                onClick={clearGlobalSearch}
+                onClick={() => {
+                  clearGlobalSearch()
+                  // TGM-03：清除 = 退出瞬态 'search' 模式，回到进来之前的那一屏
+                  // （不清 mode 的话，分支判据仍是 'search'，清除后停在一张空搜索台上）
+                  if (tgMode === 'search') exitTransient()
+                }}
               >
                 {t('tg.globalSearchClear')}
               </Button>
@@ -1910,7 +2525,8 @@ export function TgPanel(
               )}
             </div>
           </>
-        ) : !detail && groupMode !== null && activeGroup ? (
+        ) : groupMode !== null && activeGroup ? (
+          /* `channels` | `group:<x>`：分组管理列表（仅添加/取消监控，不浏览内容） */
           <>
             {/* 分组模式：组内频道列表（仅添加/取消监控，不浏览内容） */}
             <header className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 px-3 py-2.5">
@@ -1962,8 +2578,9 @@ export function TgPanel(
                       <button
                         type="button"
                         onClick={() => {
-                          setSelectedId(ch.id)
-                          setDetail(true)
+                          // 从分组列表进内容页：记住来源，「← 返回」回到这个分组
+                          cameFromListRef.current = tgMode
+                          onTgModeChange(`channel:${ch.id}`)
                         }}
                         className="flex min-w-0 flex-1 items-center gap-2 text-left"
                       >
@@ -1999,12 +2616,17 @@ export function TgPanel(
               data-testid="tg-channel-header"
               data-channel-id={selectedChannel.id}
             >
-              {groupMode !== null && (
+              {cameFromListRef.current !== null && (
                 <Button
                   variant="ghost"
                   size="sm"
                   className="h-7 shrink-0 px-2 text-[11px]"
-                  onClick={() => setDetail(false)}
+                  onClick={() => {
+                    // 回到进来之前的分组列表（TGM-03：瞬态前模式同款语义）
+                    const back = cameFromListRef.current ?? 'channels'
+                    cameFromListRef.current = null
+                    onTgModeChange(back)
+                  }}
                 >
                   ← {t('tg.backToFeed')}
                 </Button>
@@ -2023,7 +2645,26 @@ export function TgPanel(
                 )}
               </div>
               {selectedMonitored ? (
-                <Chip tone="success">{t('tg.monitoring')}</Chip>
+                <>
+                  <Chip tone="success">{t('tg.monitoring')}</Chip>
+                  {/*
+                   * §2.7 单一写面（BUG-330 TGM-02）：左栏 ② 监控节改为只读投影后，
+                   * 「取消监控」的唯一入口随频道实体行落在这里（此前只有一个只读 Chip，
+                   * 没有任何取消动作，取消只能去左栏行尾 ✕ / 分组管理列表 Switch）。
+                   */}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 shrink-0 px-2 text-[11px] text-muted hover:text-danger"
+                    onClick={() => {
+                      if (selectedId !== null) void removeMonitor(selectedId)
+                    }}
+                    title={t('tg.unmonitor')}
+                    aria-label={t('tg.unmonitor')}
+                  >
+                    {t('tg.unmonitor')}
+                  </Button>
+                </>
               ) : (
                 <Button
                   variant="secondary"
@@ -2280,8 +2921,9 @@ const MessageBubble = memo(function MessageBubble(props: {
           {/* 缓存/播放按钮：视频与图片同构（BUG-046）——此前视频只靠海报上的 ⬇ 图标，
               图片却有显式「缓存」按钮，逻辑倒置。海报点击行为不变（已缓存=播放，
               缓存中=在线播放，未缓存=开始缓存），按钮是明确的兜底入口。 */}
-          {/* 操作按钮（BUG-049 区分视频/图片）：视频=缓存/播放；图片=加入媒体库/已入库
-              （图片不缓存；历史已落盘的图片保留「播放」）；其余类型照旧缓存。 */}
+          {/* 操作按钮（BUG-049 区分视频/图片）：视频=缓存/播放；图片=加入图片库/已入库
+              （图片不缓存、绝不进「剧集」，最多进图片库；历史已落盘的图片保留「播放」）；
+              其余类型照旧缓存。 */}
           {downloadedPath || m.downloaded ? (
             <Button variant="secondary" size="sm" className="h-6 px-2 text-[10px]" onClick={() => onOpenDownloaded(m)}>
               {t('tg.play')}
@@ -2385,7 +3027,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
   cachedTargets: number
   /** 整组缓存进行中的进度（BUG-181：含排队态与条目内字节） */
   progress?: AlbumProgress
-  /** BUG-049：组内是否有视频 —— 决定按钮语义（缓存 vs 加入媒体库） */
+  /** BUG-049：组内是否有视频 —— 决定按钮语义（缓存 vs 加入图片库） */
   groupHasVideo: boolean
   /** BUG-049：组内图片是否全部已入库（纯图组全入库后按钮收起） */
   groupInLibrary: boolean
@@ -2396,7 +3038,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
    */
   highlighted?: boolean
   onDownload: (items: FeedItem[]) => void
-  /** BUG-188：整组加入媒体库 —— 纯图组走编目（批量入库），不进字节传输队列 */
+  /** BUG-188：整组加入图片库 —— 纯图组走编目（批量入库），不进字节传输队列 */
   onImportAlbum: (items: FeedItem[]) => void
   /** 取消整组缓存（进行中时操作行显示「取消」） */
   onCancel?: (items: FeedItem[]) => void
@@ -2421,7 +3063,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
        否则图片会把它撑成恒真（BUG-184）；
      · 纯图组（`cacheTargets === 0`）：没有可缓存的东西，完成 = 图片全部入库
        （`groupInLibrary`）。此前用 `downloadedCount >= items.length` 恒真 ⇒
-       操作行整行落 null，「加入媒体库」按钮**从来不可达**。 */
+       操作行整行落 null，「加入图片库」按钮**从来不可达**。 */
   const allDone = cacheTargets === 0 ? groupInLibrary : cachedTargets >= cacheTargets
   const caption = items.find((it) => it.caption?.trim())?.caption
   const totalSize = items.reduce((s, it) => s + (it.size ?? 0), 0)
@@ -2567,10 +3209,10 @@ const AlbumBubble = memo(function AlbumBubble(props: {
               )}
             </>
           ) : !allDone ? (
-            /* BUG-049：按钮语义按组构成区分 —— 含视频=「缓存」（图片由 worker 顺带入库，
-               不落盘）；纯图组=「加入媒体库」。
+            /* BUG-049：按钮语义按组构成区分 —— 含视频=「缓存」（图片由 worker 顺带入编目，
+               不进「剧集」）；纯图组=「加入图片库」。
                BUG-188：出口同样按组构成分流 —— 纯图组（`cacheTargets === 0`）**没有需要
-               落盘的字节**，点「加入媒体库」走批量编目（`onImportAlbum`），不再排进字节
+                   落盘的字节**，点「加入图片库」走批量编目（`onImportAlbum`），不再排进字节
                传输队列（后者会让纯图组停在「排队中」并遮住按钮与完成态）。含视频组仍走
                `onDownload`（worker）。
                注：「已入库」不再单独成支 —— 纯图组已入库即 `allDone`（见上），

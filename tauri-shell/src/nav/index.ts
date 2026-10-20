@@ -111,7 +111,38 @@ export interface NavState {
    * （M0-T05 的「启用 Telegram 采集」正是这条路径）。
    */
   section: SettingsSection
+  /**
+   * TG 域内的选择（BUG-330 / TGM-01；二级菜单 → 主列的唯一分流判据）。
+   *
+   * 与 `fmode` 同构：字符串模板，进 React state、可直接当 key/比较值。
+   * 它取代 `TgPanel` 原有的四个独立状态（`activeFilter` / `globalSearch` /
+   * `groupMode`+`detail` / `selectedId`）与 `activeFilter ? … : …` 优先级链，
+   * 使「筛选激活 + 分组已选」这种错误态**不可表达**（互斥切换）。
+   */
+  tgMode: TgMode
 }
+
+/**
+ * TG 域内选择（BUG-330 / TGM-01）。
+ *
+ * - `'search'`            跨监控频道全局搜索（上下文栏驱动，瞬态；无左栏高亮行）
+ * - `` `channel:${number}` `` 某频道内容流（监控中/未监控均可浏览，header 给监控开关）
+ * - `` `filter:${number}` ``  某筛选规则的命中列表（可预览入库工作台）
+ * - `'channels'`          频道层·全部（分组管理列表）
+ * - `` `group:${string}` ``   频道层·某分组（分组管理列表）
+ *
+ * 设计出处：`docs/design/tg-secondary-menu-2026-10-20.md` §3。
+ */
+export type TgMode =
+  | 'search'
+  | `channel:${number}`
+  | `filter:${number}`
+  | 'channels'
+  | `group:${string}`
+
+/** TG 域默认落地：频道层·全部（中性页，与文件域默认 `cat-all` 同性质）。
+ *  数据驱动的首落点（如首个监控频道）由 TGM-02/03 在挂载时计算覆盖。 */
+export const DEFAULT_TG_MODE: TgMode = 'channels'
 
 /**
  * 侧栏树徽标的**事实计数**（M0-T01）。
@@ -134,6 +165,7 @@ export const DEFAULT_NAV: NavState = {
   dlFilter: 'all',
   fmode: 'cat-all',
   section: 'general',
+  tgMode: DEFAULT_TG_MODE,
 }
 
 /** 设置域的分区锚点（M0-T07 七区块；`data-sec` 与 prototype 一致）。 */
@@ -163,6 +195,8 @@ export interface NavigateOptions {
   fmode?: FileMode
   /** 设置分区锚点（仅 view= 'settings' 有意义） */
   section?: SettingsSection
+  /** TG 域内选择（仅 view= 'tg' 有意义） */
+  tgMode?: TgMode
 }
 
 /**
@@ -180,6 +214,8 @@ export function navigate(prev: NavState, view: ViewId, opts: NavigateOptions = {
     fmode: opts.fmode ?? (view === 'files' ? prev.fmode : 'cat-all'),
     // 与上两行同构：离开设置域就回默认区，回来时保留上次所在的分区。
     section: opts.section ?? (view === 'settings' ? prev.section : DEFAULT_NAV.section),
+    // 与上三行同构：离开 TG 域回默认档，回来时保留上次所在的 tgMode（BUG-330）。
+    tgMode: opts.tgMode ?? (view === 'tg' ? prev.tgMode : DEFAULT_TG_MODE),
   }
 }
 

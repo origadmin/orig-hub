@@ -96,6 +96,28 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             "/api/tg/monitor/channels/:id",
             axum::routing::delete(remove_monitor_channel),
         )
+        // 「点开频道」= 已读游标推到最新（未读计数归零）。
+        .route(
+            "/api/tg/monitor/channels/:id/read",
+            axum::routing::post(mark_monitor_channel_read),
+        )
+        // 文字筛选规则（每条 = 一条虚拟监控，用户 2026-10-19 裁定）。
+        .route(
+            "/api/tg/monitor/filters",
+            get(list_monitor_filters).post(add_monitor_filter),
+        )
+        .route(
+            "/api/tg/monitor/filters/:id",
+            axum::routing::delete(remove_monitor_filter),
+        )
+        .route(
+            "/api/tg/monitor/filters/:id/read",
+            axum::routing::post(mark_monitor_filter_read),
+        )
+        .route(
+            "/api/tg/monitor/filters/:id/messages",
+            get(monitor_filter_messages),
+        )
         .route("/api/tg/monitor/messages", get(monitor_messages))
         .route("/api/tg/monitor/search", get(monitor_search))
         .route("/api/tg/monitor/sync", axum::routing::post(monitor_sync))
@@ -3112,6 +3134,134 @@ async fn monitor_search(
             .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
     };
     Ok(Json(json!({ "items": items })))
+}
+
+/// POST /api/tg/monitor/channels/:id/read — 标记该频道已读（未读计数归零）。
+///
+/// 「点开」在语义上是**用户看过了这个频道**，所以游标推到当前最大 message_id。
+/// 与「移除监控」分开：已读不改监控关系，也不动已入库消息。
+async fn mark_monitor_channel_read(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.store
+        .mark_channel_read(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct AddMonitorFilterReq {
+    /// 显示名（= 这条虚拟监控的名字）；缺省用关键词本身。
+    #[serde(default)]
+    label: Option<String>,
+    /// 匹配关键词（子串，大小写不敏感；匹配 caption 或 file_name）。
+    keyword: String,
+}
+
+/// GET /api/tg/monitor/filters — 文字筛选规则列表（含各规则命中条数）。
+async fn list_monitor_filters(
+    State(st): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let items = st
+        .store
+        .list_filters()
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(json!({ "items": items })))
+}
+
+/// POST /api/tg/monitor/filters — 新建一条筛选规则（同关键词幂等）。
+async fn add_monitor_filter(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<AddMonitorFilterReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    let keyword = req.keyword.trim();
+    if keyword.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "keyword is empty"));
+    }
+    let label = req
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(keyword);
+    let id = st
+        .store
+        .add_filter(label, keyword)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    st.push_log(format!("/monitor filter add {id} {keyword:?}"));
+    Ok(Json(json!({"ok": true, "id": id})))
+}
+
+/// DELETE /api/tg/monitor/filters/:id — 删除筛选规则（不动已入库消息）。
+async fn remove_monitor_filter(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.store
+        .remove_filter(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    st.push_log(format!("/monitor filter remove {id}"));
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct FilterMsgQuery {
+    #[serde(default = "default_limit")]
+    limit: u32,
+    /// 复合游标（BUG-330 / TGM-05）：上一页最后一行的
+    /// `(COALESCE(msg_date, created_at), channel_id, message_id)`。
+    /// 三个都必须传才算一个完整游标——缺任何一个按无游标（第一页）处理，
+    /// 宁可回到第一页也不半截游标翻出重复页。
+    /// 查询参数名是 camelCase（前端 `tg.ts` 的 URLSearchParams 与兄弟结构体
+    /// `MonitorMsgQuery` 同一约定）——必须显式 `rename`，serde 默认只认下划线
+    /// 字段名；漏 rename 的后果是游标被静默丢弃、每页都拉回第一页。
+    #[serde(rename = "beforeDate", default)]
+    before_date: Option<i64>,
+    #[serde(rename = "beforeChannelId", default)]
+    before_channel_id: Option<i64>,
+    #[serde(rename = "beforeMessageId", default)]
+    before_message_id: Option<i64>,
+}
+
+/// GET /api/tg/monitor/filters/:id/messages — 某条筛选规则的命中列表（新→旧）。
+///
+/// 只查本地已同步消息（查询语义，不做网络回补）。命中项带 `channelTitle` 供前端
+/// 显示来源；入库时前端按 `channelId` 分组调 `POST /api/tg/cache/tasks`（该端点
+/// 一次只接受一个 chatId，跨频道批量必须拆开——这不是本端点要解决的问题）。
+async fn monitor_filter_messages(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(q): Query<FilterMsgQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let cursor = match (q.before_date, q.before_channel_id, q.before_message_id) {
+        (Some(d), Some(c), Some(m)) => Some((d, c, m)),
+        _ => None,
+    };
+    let items = st
+        .store
+        .filter_messages(id, q.limit, cursor)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(json!({ "items": items })))
+}
+
+/// POST /api/tg/monitor/filters/:id/read — 「点开某条规则」：已读游标推到当前时刻，
+/// 「+N 新命中」归零（BUG-330 / TGM-06）。与频道侧 `POST /monitor/channels/:id/read` 同构。
+async fn mark_monitor_filter_read(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    st.store
+        .mark_filter_read(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    st.push_log(format!("/monitor filter read {id}"));
+    Ok(Json(json!({"ok": true})))
 }
 
 /// GET /api/tg/monitor/messages?channelId=..&limit=..&beforeId=.. — 监控频道媒体（新→旧）。

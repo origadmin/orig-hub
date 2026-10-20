@@ -304,6 +304,8 @@ export function MainLayout() {
             ) : view === 'tg' ? (
               <ErrorBoundary>
                 <TgPanel
+                  tgMode={nav.tgMode}
+                  onTgModeChange={(m) => setNav((prev) => navigate(prev, 'tg', { tgMode: m }))}
                   onOpenAccounts={handleGoAccounts}
                   onOpenMedia={handleOpenMedia}
                   onOpenDownload={handleOpenDownload}

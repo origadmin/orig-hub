@@ -248,7 +248,51 @@ export interface TgMonitoredChannel {
   title: string
   username?: string
   addedAt: number
+  /**
+   * **自上次点开以来**新增的媒体条数（服务端每频道已读游标派生）。
+   * 不是「库里共几条」，也不是「本轮同步加了几条」——口径见 docs/bugs/BUG-329.md。
+   */
+  newCount: number
 }
+
+/** 文字筛选规则（GET/POST /api/tg/monitor/filters）。
+ *
+ *  一条规则 = 一条虚拟监控（用户 2026-10-19 裁定「多次作为多条」）：各自算命中、
+ *  各自成条目，不合并成单频道内的 AND/OR 复合条件。 */
+export interface TgMonitorFilter {
+  id: number
+  /** 显示名（缺省等于 keyword） */
+  label: string
+  /** 匹配关键词（子串；匹配 caption 或 file_name） */
+  keyword: string
+  createdAt: number
+  /** 命中条数（跨全部监控频道） */
+  hits: number
+  /** 自上次点开该规则以来新增的命中条数（BUG-330 / TGM-06；0 不渲染徽标） */
+  newHits: number
+}
+
+/** 筛选命中行（GET /api/tg/monitor/filters/:id/messages） */
+export interface TgMonitorFilterHit {
+  channelId: number
+  messageId: number
+  caption?: string
+  /** TG 原始文件名：大量视频没有 caption，标题要靠它兜底（BUG-220） */
+  fileName?: string
+  type?: 'photo' | 'video' | 'audio' | 'file'
+  size?: number
+  duration?: number
+  date?: number
+  downloaded: boolean
+  channelTitle?: string
+  /** TG 相册分组 id（同组消息构成一个相册；无则单条）。前端据此「按组入库」而非按单条扁平化。 */
+  groupId?: number
+  /** MIME 类型（BUG-330 / TGM-05：命中行展开预览的数据基础） */
+  mimeType?: string
+  /** 落盘路径（无 = 未缓存；「缺字节」判据，BUG-080） */
+  filePath?: string
+}
+
 
 /** 已入库媒体消息（GET /api/tg/monitor/messages） */
 export interface TgStoredMessage {
