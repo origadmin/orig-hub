@@ -5063,6 +5063,16 @@ impl Store {
             let ref_key: String = row.get(1)?;
             let title: String = row.get(2)?;
             let kind: String = row.get(3)?;
+            // 分集条目只能是 video（媒体库硬规则）：在**应用层先拦截**，而不是先
+            // `create_series` + `append` 再靠触发器 ABORT + 回滚删空壳——那等于把
+            // 正确性押在「触发器必须存在」上（BUG-044 历史记录过旧触发器名字残留
+            // 导致规则失效）。口径与 `migrate` 的触发器、`reconcile_unfiled_items`
+            // 的 kind 预切**完全一致**：图片/音频/文档永远不占集号。图片是浏览点
+            // （混编组挂视频所在集的**图片位** `media_episode_image`；photo-only 组
+            // 只留 `media_item` 作库内内容），在这里直接跳过，绝不为它建剧集。
+            if kind != "video" {
+                continue;
+            }
             // D22-A①（BUG-292）：与 `IngestCtx::ensure_series` **同一把**键 —— 规范化剧名
             // 优先，`group_id` / 首条消息号只作退化兜底。两处规则若分叉，同一条内容会在
             // 自动路径重建时裂成两个剧集（BUG-292 形态）。
@@ -11468,6 +11478,96 @@ mod tests {
                 .unwrap(),
             1,
             "幂等归集不得留下第二个剧集"
+        );
+    }
+
+    /// 媒体库硬规则：图片**永远**不进剧集（用户裁定「图片就算入也是入图片库，永远不
+    /// 应该也不允许进入剧集」）。`file_items_into_series` 对 photo 必须在建剧/挂槽
+    /// **之前**按 kind 跳过 —— 与 `reconcile_unfiled_items` 的 kind 预切同一口径，
+    /// 让应用层不再依赖 `trg_media_episode_video_only` 触发器「ABORT + 回滚删空壳」
+    /// （BUG-044 记录过旧触发器名字残留导致规则失效，押注触发器是脆的）。
+    ///
+    /// 说清反向证伪的边界：这里断言的是**不变量本身**（照片不进任何剧集、混编批也不把
+    /// 照片混进视频的剧集）。今天即使去掉这行应用层守卫，数据库触发器也会让 append
+    /// 失败、空壳被回滚，最终态同为 0 —— 所以本测试**锁不变量**（将来两层里任一层
+    /// 失效且另一层也兜不住时立刻变红），而非区分「守卫 vs 触发器」这两条同向防御。
+    /// 真正互斥的用户级判据（某张图片点「去媒体库查看」不得带出剧集侧栏）由运行时
+    /// 验证脚本覆盖。
+    #[tokio::test]
+    async fn file_items_into_series_skips_photo_invariants() {
+        let s = Store::open(tmp_db("image_rule_never_series")).await.unwrap();
+        // photo-only：照片只完成 T0 登记，绝不建剧集、绝不占集号。
+        let photo = s
+            .upsert_media_item(
+                "local",
+                "/img/封面.jpg",
+                "封面",
+                "photo",
+                Some("/img/封面.jpg"),
+                Some(10),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let (c, a) = s.file_items_into_series(&[photo]).await.unwrap();
+        assert_eq!((c, a), (0, 0), "photo-only 不得归集出剧集");
+        assert_eq!(
+            s.count_one("SELECT COUNT(*) FROM media_series", ())
+                .await
+                .unwrap(),
+            0,
+            "photo-only 不得留下任何剧集"
+        );
+        assert_eq!(
+            s.count_one(
+                "SELECT COUNT(*) FROM media_episode WHERE item_id = ?1",
+                params![photo],
+            )
+            .await
+            .unwrap(),
+            0,
+            "照片不得占用集号（media_episode 无行）"
+        );
+
+        // 混编：同批里视频成剧集，照片**不得混进**该剧集。
+        let video = s
+            .upsert_media_item(
+                "local",
+                "/v/第01集.mp4",
+                "第01集",
+                "video",
+                Some("/v/第01集.mp4"),
+                Some(10),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let (c2, a2) = s.file_items_into_series(&[photo, video]).await.unwrap();
+        assert!(
+            c2 >= 1 && a2 >= 1,
+            "视频应被归集成剧集：得到 created={c2} attached={a2}"
+        );
+        assert_eq!(
+            s.count_one(
+                "SELECT COUNT(*) FROM media_episode WHERE item_id = ?1",
+                params![photo],
+            )
+            .await
+            .unwrap(),
+            0,
+            "混编组里照片也不得成为任何剧集的分集"
+        );
+        assert_eq!(
+            s.count_one(
+                "SELECT COUNT(*) FROM media_episode WHERE item_id = ?1",
+                params![video],
+            )
+            .await
+            .unwrap(),
+            1,
+            "视频应恰有一个分集槽"
         );
     }
 

@@ -84,7 +84,13 @@ export function useGoLibrary(opts: {
           description: item.description ?? null,
           src: mediaItemUrl(item.id),
           poster: item.poster ?? null,
-          seriesId: item.seriesId ?? null,
+          // 非 video 一律不挂剧集：媒体库硬规则，图片/音频/文档**永远**不进剧集。
+          // `series_id` 是 `media_episode` 存在即推导出的历史值——触发器生效前写入、
+          // 尚未被启动修复（`migrate`）摘除的照片分集，仍会在这里读回非空 seriesId，
+          // 把「某张图片」以「剧集 + 分集列表」形态打开（用户报：错误入库的数据仍能跳
+          // 媒体库）。入口处按 kind 压成 null，从根上不让图片带剧集侧栏。
+          // （与 `MediaLibraryPanel.toViewerItem` 同一口径，勿只改一处。）
+          seriesId: item.kind === 'video' ? (item.seriesId ?? null) : null,
           // BUG-253：真源总时长随条目下发，播放器据此显示正确总数。
           duration: item.duration,
         }

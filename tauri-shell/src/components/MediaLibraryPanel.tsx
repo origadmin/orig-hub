@@ -125,7 +125,10 @@ function toViewerItem(i: MediaItem): ViewerItem {
     description: i.description ?? null,
     src: mediaItemUrl(i.id),
     poster: i.poster ?? null,
-    seriesId: i.seriesId ?? null,
+    // 非 video 一律不挂剧集（与 `useGoLibrary` 同一口径）：图片/音频/文档永远不进
+    // 剧集。`series_id` 是历史推导值，须按 kind 压成 null，防止旧照片分集数据把
+    // 图片以「剧集 + 分集列表」形态打开。
+    seriesId: i.kind === 'video' ? (i.seriesId ?? null) : null,
     // BUG-253：真源总时长随条目下发，播放器据此显示正确总数（不取 live 转码流的瞬时 duration）。
     duration: i.duration,
     // BUG-254：透传字节态与来源，使播放器能区分「无内容」与「解码失败」并给出重缓存入口。
