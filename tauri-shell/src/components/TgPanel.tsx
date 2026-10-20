@@ -32,8 +32,6 @@ import {
   enqueueCacheTask,
   cancelCacheTask,
 } from '../api/tg'
-import { findMediaItemIdsByRefs, importMediaItems } from '../api/media'
-import type { ImportEntry } from '../api/media'
 import type {
   TgCacheTask,
   TgChannel,
@@ -525,12 +523,10 @@ export function TgPanel(
     new Map<string, AlbumProgress>(),
   )
   /**
-   * 图片入库状态（BUG-049 规则：图片不缓存，最多加入图片库）：
-   * 已入库图片的 ref 集合（`<chatId>:<messageId>`）。feed 变化时对未见过的图片
-   * 逐个 by-ref 查询；查过的记入 photoCheckedRef 不再重复请求。
+   * BUG-352：原「图片入库状态」集合（`photoLibRefs`）已删除 —— 图片与视频同样落盘
+   * （BUG-049 的「图片不缓存、最多加入图片库」已废），图片的入库与否由
+   * **字节真值 + 任务态**单一派生（`entryStateFor`），不再有第二套「编目」账本。
    */
-  const [photoLibRefs, setPhotoLibRefs] = useState<Set<string>>(new Set())
-  const photoCheckedRef = useRef<Set<string>>(new Set())
   /**
    * 缓存任务（服务端任务态）：缓存由 orig-tg 的后台 worker 执行并落库，前端只读状态。
    *
@@ -1227,36 +1223,9 @@ export function TgPanel(
     }
   }, [feed, feedLoading])
 
-  // BUG-049：feed 里每张未见过的图片查一次「是否已入库」，驱动图片气泡的
-  // 「加入图片库 / 已入库」状态（图片不缓存，这是图片唯一的落库路径标记）。
-  // BUG-241 Priority 2：**批量**一次请求覆盖所有未见过的图片（此前逐条 by-ref
-  // N+1，实测首屏 54 次）；查过的记入 photoCheckedRef 不再重复请求。
-  useEffect(() => {
-    const todos = feed
-      .filter((f) => f.type === 'photo')
-      .map((f) => `${f.chatId}:${f.messageId}`)
-      .filter((r) => !photoCheckedRef.current.has(r))
-    if (todos.length === 0) return
-    let alive = true
-    for (const r of todos) photoCheckedRef.current.add(r)
-    void (async () => {
-      try {
-        const ids = await findMediaItemIdsByRefs('tg', todos)
-        if (!alive) return
-        if (Object.keys(ids).length === 0) return
-        setPhotoLibRefs((prev) => {
-          const next = new Set(prev)
-          for (const r of Object.keys(ids)) next.add(r)
-          return next
-        })
-      } catch {
-        /* 服务不可用：静默，按钮保持可点击 */
-      }
-    })()
-    return () => {
-      alive = false
-    }
-  }, [feed])
+  // BUG-352：原「feed 图片逐个 by-ref 查是否已入库」的 effect 已删除 —— 图片的入库
+  // 状态由字节真值与任务态派生，不需要第二套查询账本（也顺带去掉首屏 N+1 → 批量
+  // 请求那一整条链）。
 
   /** 滚到顶部：按当前最旧消息 id 加载更早一页并 prepend */
   const loadOlder = useCallback(async () => {
@@ -1708,76 +1677,14 @@ export function TgPanel(
   }
 
   /**
-   * 图片加入图片库（BUG-049 规则：图片不缓存，最多入库为浏览条目）。
-   * 按 (source=tg, ref) 幂等；条目无本地文件，浏览字节由服务端现场代理缩略图。
-   */
-  const importPhoto = async (item: FeedItem) => {
-    const ref = `${item.chatId}:${item.messageId}`
-    try {
-      await importMediaItems([
-        {
-          source: 'tg',
-          ref,
-          kind: 'photo',
-          title: item.caption?.trim() || undefined,
-          size: item.size ?? undefined,
-        },
-      ])
-      setPhotoLibRefs((prev) => new Set(prev).add(ref))
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }
-
-  /**
-   * 相册整组加入图片库（BUG-188）。
-   *
-   * 纯图组（`cacheTargets === 0`）**没有任何需要落盘的字节** —— TG 图片由 raw 端点
-   * 现场代理，`entryState.ts` 对 `tg`+`photo` 恒返回 `cached`。所以「加入图片库」是一次
-   * **编目**动作，必须走批量入库，而不是 `enqueueCacheTask` 的**字节传输队列**：
-   * 后者会把编目排到视频字节传输之后，让纯图组长时间停在「排队中」，而排队态是操作行
-   * 三个渲染分支里的**第一支**，会同时遮住「加入图片库」按钮与完成态（BUG-188）。
-   *
-   * 与单图 `importPhoto` 同源：**一次**原子 POST（`importMediaItems`；产品约束禁止前端
-   * 循环单条端点），按 (source=tg, ref) 幂等；成功后同步 `photoLibRefs`，该组立即渲染
-   * 完成态，无需等重新拉取。含视频的组不经过这里，仍走 worker（见 `downloadAlbum`）。
-   */
-  const importAlbum = async (items: FeedItem[]) => {
-    if (items.length === 0) return
-    try {
-      await importMediaItems(
-        items.map(
-          (it): ImportEntry => ({
-            source: 'tg',
-            ref: `${it.chatId}:${it.messageId}`,
-            kind: 'photo',
-            title: it.caption?.trim() || undefined,
-            size: it.size ?? undefined,
-          }),
-        ),
-      )
-      setPhotoLibRefs((prev) => {
-        const next = new Set(prev)
-        for (const it of items) next.add(`${it.chatId}:${it.messageId}`)
-        return next
-      })
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }
-
-  /**
    * 稳定回调（useEvent）：子气泡全部 memo 化后，回调引用必须恒定。
    * 子组件回传自己的数据（item / items / index），这里点击时再取最新闭包，
    * 既保住 memo 的浅比较，又不产生陈旧闭包。
    */
   const onBubbleDownload = useEvent((item: FeedItem) => void doDownload(item))
-  const onBubbleImportPhoto = useEvent((item: FeedItem) => void importPhoto(item))
   const onBubbleOpen = useEvent((item: FeedItem) => void openDownloaded(item))
   const onBubblePreview = useEvent((item: FeedItem) => openPlayable(item, [item], 0))
   const onAlbumDownload = useEvent((items: FeedItem[]) => void downloadAlbum(items))
-  /* BUG-188：纯图组的出口 —— 编目走批量入库，不进字节传输队列 */
-  const onAlbumImport = useEvent((items: FeedItem[]) => void importAlbum(items))
   const onAlbumCancel = useEvent((items: FeedItem[]) =>
     void cancelAlbum(`a-${items[0].chatId}-${items[0].groupId}`),
   )
@@ -2387,9 +2294,7 @@ export function TgPanel(
                                 item={item}
                                 state={entryStateFor(item)}
                                 downloadedPath={downloadedPaths.get(item.key)}
-                                photoInLibrary={photoLibRefs.has(`${item.chatId}:${item.messageId}`)}
                                 onDownload={onBubbleDownload}
-                                onImportPhoto={onBubbleImportPhoto}
                                 onOpenDownloaded={onBubbleOpen}
                                 onPreview={onBubblePreview}
                               />
@@ -2601,11 +2506,9 @@ export function TgPanel(
                         item={unit[0]}
                         state={entryStateFor(unit[0])}
                         downloadedPath={downloadedPaths.get(unit[0].key)}
-                        photoInLibrary={photoLibRefs.has(`${unit[0].chatId}:${unit[0].messageId}`)}
                         progress={singleProgress.get(unit[0].messageId)}
                         highlighted={highlightKey === unit[0].key}
                         onDownload={onBubbleDownload}
-                        onImportPhoto={onBubbleImportPhoto}
                         onOpenDownloaded={onBubbleOpen}
                         onPreview={onBubblePreview}
                       />
@@ -2615,17 +2518,15 @@ export function TgPanel(
                         items={unit}
                         highlighted={unit.some((u) => u.key === highlightKey)}
                         cacheTargets={
-                          /* BUG-184：分母 = 组内**需要落盘**的条目数。TG 图片不落盘
-                             （BUG-049：raw 端点现场代理字节），把它计入会让混合相册
-                             在**没有任何缓存任务**时显示「继续 1/6」，也会让纯图组的
-                             allDone 恒真（操作行整行消失，见 BUG-185）。 */
-                          unit.filter((x) => x.type !== 'photo').length
+                          /* BUG-352：分母 = 组内**全部**条目（图片与视频都要落盘）。
+                             此前把 photo 排除在外（BUG-049「图片不缓存」），代价是
+                             纯图组的分母恒为 0 ⇒ 完成/进度两条判据同时失真。 */
+                          unit.length
                         }
                         cachedTargets={
-                          /* BUG-184：分子与分母**同源**（都只看需要落盘的条目），
-                             否则分数本身没有意义。走 BUG-170 的单源派生。 */
-                          unit.filter((x) => x.type !== 'photo' && entryStateFor(x) === 'cached')
-                            .length
+                          /* BUG-352：分子与分母同源 —— 同一把字节真值尺子
+                             （`entryStateFor`，BUG-170 单源派生），图片不特殊。 */
+                          unit.filter((x) => entryStateFor(x) === 'cached').length
                         }
                         progress={(() => {
                           // BUG-170：进度行持有——终态后快照到达前继续显示最后的
@@ -2638,15 +2539,7 @@ export function TgPanel(
                           if (!live && !stillCaching) albumProgressHoldRef.current.delete(k)
                           return live ?? (stillCaching ? held : undefined)
                         })()}
-                        groupHasVideo={unit.some((x) => x.type === 'video')}
-                        groupInLibrary={unit.every(
-                          (x) =>
-                            x.type !== 'photo' ||
-                            x.downloaded ||
-                            photoLibRefs.has(`${x.chatId}:${x.messageId}`),
-                        )}
                         onDownload={onAlbumDownload}
-                        onImportAlbum={onAlbumImport}
                         onCancel={onAlbumCancel}
                         onPreview={onAlbumPreview}
                       />
@@ -2723,7 +2616,6 @@ const MessageBubble = memo(function MessageBubble(props: {
   /** 字节快照路径（播放按钮的事实依据；与 state 互补——photo 恒 cached 但未必有本地文件） */
   downloadedPath?: string
   /** BUG-049：图片已入库（图片不缓存，入库即终态） */
-  photoInLibrary: boolean
   /** 条目内字节进度（BUG-181）：单条任务下载中时展示 `已传/总量`，避免长下载全程冻结 */
   progress?: { itemBytes?: number; itemBytesTotal?: number }
   /**
@@ -2733,7 +2625,6 @@ const MessageBubble = memo(function MessageBubble(props: {
    */
   highlighted?: boolean
   onDownload: (item: FeedItem) => void
-  onImportPhoto: (item: FeedItem) => void
   onOpenDownloaded: (item: FeedItem) => void
   onPreview: (item: FeedItem) => void
 }) {
@@ -2741,11 +2632,9 @@ const MessageBubble = memo(function MessageBubble(props: {
     item: m,
     state,
     downloadedPath,
-    photoInLibrary,
     progress,
     highlighted = false,
     onDownload,
-    onImportPhoto,
     onOpenDownloaded,
     onPreview,
   } = props
@@ -2810,21 +2699,13 @@ const MessageBubble = memo(function MessageBubble(props: {
           {/* 缓存/播放按钮：视频与图片同构（BUG-046）——此前视频只靠海报上的 ⬇ 图标，
               图片却有显式「缓存」按钮，逻辑倒置。海报点击行为不变（已缓存=播放，
               缓存中=在线播放，未缓存=开始缓存），按钮是明确的兜底入口。 */}
-          {/* 操作按钮（BUG-049 区分视频/图片）：视频=缓存/播放；图片=加入图片库/已入库
-              （图片不缓存、绝不进「剧集」，最多进图片库；历史已落盘的图片保留「播放」）；
-              其余类型照旧缓存。 */}
+          {/* 操作按钮（BUG-352：图片与视频同一把尺子）——已落盘=播放；否则=缓存/排队中/
+              重试缓存。BUG-049 的「图片=加入图片库/已入库」分支已删除：图片同样是内容，
+              同样落盘（不成「剧集」这一点不变，那是 BUG-044 的规则）。 */}
           {downloadedPath || m.downloaded ? (
             <Button variant="secondary" size="sm" className="h-6 px-2 text-[10px]" onClick={() => onOpenDownloaded(m)}>
               {t('tg.play')}
             </Button>
-          ) : m.type === 'photo' ? (
-            photoInLibrary ? (
-              <Chip tone="success">{t('tg.inLibrary')}</Chip>
-            ) : (
-              <Button variant="secondary" size="sm" className="h-6 px-2 text-[10px]" onClick={() => onImportPhoto(m)}>
-                {t('tg.addToLibrary')}
-              </Button>
-            )
           ) : (
             <Button
               variant="secondary"
@@ -2910,16 +2791,12 @@ function PlaybackSpeed(props: { rate: number; onRate: (r: number) => void }) {
  */
 const AlbumBubble = memo(function AlbumBubble(props: {
   items: FeedItem[]
-  /** BUG-184：组内**需要落盘**的条目数（photo 不计 —— 它走 raw 代理，不落盘） */
+  /** BUG-352：组内**需要落盘**的条目数（= 组内全部条目，图片计入） */
   cacheTargets: number
-  /** BUG-184：其中已缓存（字节真值 / DB 承诺）的条数。与 `cacheTargets` **同源** */
+  /** BUG-352：其中已落盘的条数（字节真值派生）。与 `cacheTargets` **同源** */
   cachedTargets: number
   /** 整组缓存进行中的进度（BUG-181：含排队态与条目内字节） */
   progress?: AlbumProgress
-  /** BUG-049：组内是否有视频 —— 决定按钮语义（缓存 vs 加入图片库） */
-  groupHasVideo: boolean
-  /** BUG-049：组内图片是否全部已入库（纯图组全入库后按钮收起） */
-  groupInLibrary: boolean
   /**
    * BUG-305：组内是否含「媒体库 → TG 面板」跳转的定位目标消息。
    * 相册是多个消息的聚合气泡：命中组内任一条即高亮整组（用户要的是
@@ -2927,8 +2804,6 @@ const AlbumBubble = memo(function AlbumBubble(props: {
    */
   highlighted?: boolean
   onDownload: (items: FeedItem[]) => void
-  /** BUG-188：整组加入图片库 —— 纯图组走编目（批量入库），不进字节传输队列 */
-  onImportAlbum: (items: FeedItem[]) => void
   /** 取消整组缓存（进行中时操作行显示「取消」） */
   onCancel?: (items: FeedItem[]) => void
   onPreview: (index: number, items: FeedItem[]) => void
@@ -2938,22 +2813,17 @@ const AlbumBubble = memo(function AlbumBubble(props: {
     cacheTargets,
     cachedTargets,
     progress,
-    groupHasVideo,
-    groupInLibrary,
     highlighted = false,
     onDownload,
-    onImportAlbum,
     onCancel,
     onPreview,
   } = props
   const { t } = useTranslation()
-  /* BUG-185：完成判据必须**按组构成分叉** ——
-     · 含需落盘条目：全部落盘即完成。分母用 `cacheTargets` 而非 `items.length`，
-       否则图片会把它撑成恒真（BUG-184）；
-     · 纯图组（`cacheTargets === 0`）：没有可缓存的东西，完成 = 图片全部入库
-       （`groupInLibrary`）。此前用 `downloadedCount >= items.length` 恒真 ⇒
-       操作行整行落 null，「加入图片库」按钮**从来不可达**。 */
-  const allDone = cacheTargets === 0 ? groupInLibrary : cachedTargets >= cacheTargets
+  /* BUG-352：完成判据只有一条 —— **全部条目都有字节**。此前按组构成分叉
+     （纯图组改判「图片是否已入库」），那是因为图片当时不落盘；现在图片与视频同样
+     落盘，分叉就成了两套互斥的「完成」定义（同一组可以按一个口径算完成、按另一个
+     算未完成）。分母恒为 `cacheTargets`（= 组内条目数，图片计入）。 */
+  const allDone = cacheTargets > 0 && cachedTargets >= cacheTargets
   const caption = items.find((it) => it.caption?.trim())?.caption
   const totalSize = items.reduce((s, it) => s + (it.size ?? 0), 0)
   return (
@@ -2969,10 +2839,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
         <div className="mb-1.5 flex items-center gap-2 text-[10px]">
           <span className="font-medium text-accent">{t('tg.albumN', { n: items.length })}</span>
           {allDone ? (
-            /* BUG-185：完成态文案按组构成取词 —— 纯图组的「完成」是入库，不是落盘 */
-            <span className="text-success">
-              {t(cacheTargets === 0 ? 'tg.inLibrary' : 'tg.downloaded')}
-            </span>
+            <span className="text-success">{t('tg.downloaded')}</span>
           ) : cachedTargets > 0 ? (
             <span className="text-muted">
               {/* BUG-184：分子分母同源（都只算需要落盘的条目） */}
@@ -3098,27 +2965,18 @@ const AlbumBubble = memo(function AlbumBubble(props: {
               )}
             </>
           ) : !allDone ? (
-            /* BUG-049：按钮语义按组构成区分 —— 含视频=「缓存」（图片由 worker 顺带入编目，
-               不进「剧集」）；纯图组=「加入图片库」。
-               BUG-188：出口同样按组构成分流 —— 纯图组（`cacheTargets === 0`）**没有需要
-                   落盘的字节**，点「加入图片库」走批量编目（`onImportAlbum`），不再排进字节
-               传输队列（后者会让纯图组停在「排队中」并遮住按钮与完成态）。含视频组仍走
-               `onDownload`（worker）。
-               注：「已入库」不再单独成支 —— 纯图组已入库即 `allDone`（见上），
-               统一由完成态分支呈现，**能力未减**（BUG-149）。 */
+            /* BUG-352：按钮语义不再按组构成分叉 —— 整组一个出口 `onDownload`
+               （worker 落盘，图片与视频同等）。部分已下时给「继续 n/N」，
+               分子分母同源（都按字节真值派生），没有任务时不会出现「继续 1/6」。 */
             <Button
               variant="outline"
               size="sm"
               className="ml-auto h-6 px-2 text-[10px]"
-              onClick={() => (cacheTargets === 0 ? onImportAlbum(items) : onDownload(items))}
+              onClick={() => onDownload(items)}
             >
-              {!groupHasVideo
-                ? t('tg.addToLibrary')
-                : cachedTargets > 0
-                  ? /* BUG-184：分子分母同源 —— 不再把图片算进「已缓存」，
-                       混合相册在没有任务时不再显示「继续 1/6」 */
-                    `${t('tg.continue')} ${cachedTargets}/${cacheTargets}`
-                  : t('tg.download')}
+              {cachedTargets > 0
+                ? `${t('tg.continue')} ${cachedTargets}/${cacheTargets}`
+                : t('tg.download')}
             </Button>
           ) : (
             /* BUG-185：完成态**不得落 null** —— 此前整行消失，用户无法区分
@@ -3126,7 +2984,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
                与单条完成后的「播放」按钮对称。 */
             <div className="ml-auto flex items-center gap-2">
               <span className="text-[10px] text-success" data-testid="album-done">
-                {t(cacheTargets === 0 ? 'tg.inLibrary' : 'tg.downloaded')}
+                {t('tg.downloaded')}
               </span>
               <Button
                 variant="outline"
@@ -3135,7 +2993,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
                 onClick={() => onPreview(0, items)}
                 data-testid="album-open"
               >
-                {t(cacheTargets === 0 ? 'tg.open' : 'tg.play')}
+                {t('tg.play')}
               </Button>
             </div>
           )}
@@ -3152,8 +3010,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
   a.progress?.queued === b.progress?.queued &&
   a.progress?.itemBytes === b.progress?.itemBytes &&
   a.progress?.itemBytesTotal === b.progress?.itemBytesTotal &&
-  a.groupHasVideo === b.groupHasVideo &&
-  a.groupInLibrary === b.groupInLibrary,
+  true,
 )
 
 /** 图片块：列表用轻量缩略图（自然比例不裁切），点击弹遮罩看原图 */

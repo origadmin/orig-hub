@@ -2900,20 +2900,18 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
             st.refresh_cache_tasks().await;
             continue;
         }
-        // BUG-049 规则：图片不缓存——不落盘，T0 登记为浏览条目（字节由 raw 端点
-        // 现场代理 TG 缩略图）。已落盘的历史图片走上面的 cached_path 分支保留本地文件。
+        // BUG-352：**图片与视频同等下载**。此前这里有一条「BUG-049 图片不缓存」的
+        // 短路：photo 只做 T0 登记、跳到 `continue`，字节永不落盘（日志
+        // `registered to library (no cache by rule)`）。那条规则在入口上无任何可选
+        // 表达——筛选面板勾选的是**整组**（组内图片与视频同样被勾上、同样计入
+        // messageIds），界面承诺「选中的 = 要下载的」（BUG-327），引擎却静默跳过其中
+        // 一类，且用户没有任何入口能说「我要/不要图片」。
+        // 图片是内容不是浏览点（媒体库唯一内容仓、本地文件夹可读）：字节照下，
+        // T0 登记照做，`photo_rule` 只保留它原本的另一半职责——无标题时的
+        // 「TG 图片 #<msg>」兜底标题。图片仍**不成剧集**（BUG-044，未动）。
         let registered = ing.register_item(st, msg_id, photo_rule).await;
         if let Some((item, kind)) = &registered {
             ing.register_slot(st, msg_id, *item, kind).await;
-        }
-        if photo_rule {
-            st.push_log(&format!(
-                "cache task {task_id}: photo {msg_id} registered to library (no cache by rule)"
-            ));
-            done += 1;
-            let _ = st.store.update_cache_task_progress(task_id, done, None).await;
-            st.refresh_cache_tasks().await;
-            continue;
         }
         // BUG-257：取消**可达在途条目**。此前这里只有一个 `.await`，取消只在下一条目
         // 之前生效 ⇒ 用户按了取消，正在下这一条仍要等满 90s 空闲看门狗才停

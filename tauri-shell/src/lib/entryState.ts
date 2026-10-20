@@ -63,9 +63,12 @@ export interface EntryStateInput {
   taskStatus?: TaskStatus | null
   /** DB `downloaded` 承诺标志（不是字节真值；仅作静默时的旧口径兜底） */
   downloadedFlag?: boolean | null
-  /** 媒体类型（tg-photo 代理判定用） */
+  /**
+   * 媒体类型（保留在输入契约里：消费点按条目字段整体传参，删字段会牵动全部调用点）。
+   * BUG-352 起**不再参与判定** —— 图片与视频同一把尺子（字节真值）。
+   */
   kind?: string | null
-  /** 来源（tg-photo 代理判定用） */
+  /** 来源（同上，保留契约、不参与判定） */
   source?: string | null
   /** 上一渲染的派生态：`factPending` 过渡窗内持有 */
   prev?: EntryState | null
@@ -91,10 +94,11 @@ function isFailedTask(s?: TaskStatus | null): boolean {
  * 任务行）一律改走这里，禁止再写 `Boolean(downloaded || path)` 一类的本地拼接。
  */
 export function deriveEntryState(input: EntryStateInput): EntryState {
-  const { bytesPresence, taskStatus, downloadedFlag, kind, source, prev, factPending } = input
-  // 1) tg 图片：raw 端点现场代理字节（BUG-049）→ 即时点亮，无缺字节态。
-  if (source === 'tg' && kind === 'photo') return 'cached'
-  // 2) 磁盘字节真值：唯一「能播」判据（BUG-132）。
+  const { bytesPresence, taskStatus, downloadedFlag, prev, factPending } = input
+  // 1) 磁盘字节真值：唯一「能播」判据（BUG-132）。
+  //    BUG-352：此处的「tg 图片恒 cached」旧规则已删除 —— 图片与视频同样落盘
+  //    （BUG-049 的「图片不缓存」已废），把图片无条件点亮会让「从未下载」的图片
+  //    永远显示已缓存、永远进不了缺字节集合、永远不会被勾选入库。
   if (bytesPresence === 'present') return 'cached'
   // 3) 任务活跃：新事实压过一切旧态（重跑已缓存条目时不倒退）。
   //    queued 与 running 分开呈现（BUG-181）：排队条目显示「排队中」，
