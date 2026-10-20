@@ -73,9 +73,10 @@ pub fn default_download_dir() -> PathBuf {
         return fallback;
     }
     tracing::warn!(
-        "cannot determine system download directory or home directory; falling back to current directory"
+        "cannot determine system download directory or home directory; \
+         falling back to the D: content root (ruling: all content goes to the D: drive)"
     );
-    PathBuf::from(".")
+    content_root()
 }
 
 /// The OS download folder (`~/Downloads`) — **legacy source identification only**.
@@ -128,6 +129,33 @@ pub fn is_forbidden_content_drive(path: &Path) -> bool {
         && drive.as_bytes()[1] == b':'
         && drive.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
         && drive.eq_ignore_ascii_case(FORBIDDEN_CONTENT_DRIVE)
+}
+
+/// A path is a **valid content root** only if it names a real, non-root,
+/// non-forbidden directory (e.g. `D:/OrigDown`). Degenerate values — the bare
+/// unix root `/`, a bare drive root like `C:/` or `D:/`, the current dir `.` —
+/// must never become the content write root, or every download lands in the
+/// filesystem root and the UI shows `/` as the effective path.
+///
+/// Subsumes [`is_forbidden_content_drive`]: a forbidden (C:) drive is, by
+/// definition, not a valid content root.
+pub fn is_valid_content_root(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    // empty, current dir, or bare unix root are never valid content roots.
+    if s.is_empty() || s == "." || s == "/" {
+        return false;
+    }
+    // bare drive root: `C:` (len 2) or `C:/` (len 3, separator after the colon).
+    if s.len() <= 3 && s.ends_with(':') {
+        return false;
+    }
+    if s.len() == 3
+        && s.as_bytes().get(1) == Some(&b':')
+        && (s.ends_with('/') || s.ends_with('\\'))
+    {
+        return false;
+    }
+    !is_forbidden_content_drive(path)
 }
 
 /// The forbidden content drive letter (the OS drive, `C:` on this deployment).
@@ -313,5 +341,21 @@ mod tests {
             let once = normalize_dir(raw);
             assert_eq!(normalize_dir(&once), once, "not idempotent for {raw}");
         }
+    }
+
+    #[test]
+    fn is_valid_content_root_rejects_degenerate_paths() {
+        // 合法内容根
+        assert!(is_valid_content_root(Path::new("D:/OrigDown")));
+        assert!(is_valid_content_root(Path::new("D:/a/b")));
+        // 退化值一律拒绝
+        assert!(!is_valid_content_root(Path::new("/")), "裸 unix 根不可作内容根");
+        assert!(!is_valid_content_root(Path::new(".")), "当前目录不可作内容根");
+        assert!(!is_valid_content_root(Path::new("")), "空路径不可作内容根");
+        assert!(!is_valid_content_root(Path::new("D:/")), "盘符根不可作内容根");
+        assert!(!is_valid_content_root(Path::new("C:/")), "C: 盘符根不可作内容根");
+        assert!(!is_valid_content_root(Path::new("C:/Users/me/Downloads")), "C: 禁用盘不可作内容根");
+        // UNC 共享视为合法
+        assert!(is_valid_content_root(Path::new("//server/share")));
     }
 }

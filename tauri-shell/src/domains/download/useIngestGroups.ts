@@ -130,6 +130,12 @@ export interface UseIngestGroupsResult {
    * 已拉到的行 —— 清空即用户观感的「数据丢失」。
    */
   unavailable: string | null
+  /**
+   * 下载源（引擎）不可用：来自 `/api/activity` 的 `sources` 中 `download` 项。
+   * 与 `unavailable`（cache/orig-tg 侧）并列 —— 两源都不可用时横幅须如实报
+   * 「TG 入库与普通下载均不可用」，而非写死「普通下载不受影响」（BUG-355）。
+   */
+  downloadUnavailable: string | null
   refresh: () => void
   run: (task: TgCacheTask, action: IngestAction) => Promise<void>
   remove: (task: TgCacheTask) => Promise<void>
@@ -143,6 +149,7 @@ export function useIngestGroups(
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [unavailable, setUnavailable] = useState<string | null>(null)
+  const [downloadUnavailable, setDownloadUnavailable] = useState<string | null>(null)
   const [tick, setTick] = useState(0)
 
   const inFlight = useRef(false)
@@ -198,6 +205,11 @@ export function useIngestGroups(
         const srcUnavailable = cacheSrc != null && cacheSrc.available === false
         if (cancelled) return
         sourceUnknown.current = srcUnavailable
+        // BUG-355：下载源可用性也纳入横幅判据（不再只盯 cache）。全 outage 时两侧都
+        // 不可用，横幅须如实报「TG 与普通下载均不可用」，而非写死「普通下载不受影响」。
+        const dlSrc = (data?.sources ?? []).find((s) => s.kind === 'download')
+        const dlDown = dlSrc != null && dlSrc.available === false
+        setDownloadUnavailable(dlDown ? (dlSrc?.error ?? '普通下载不可用') : null)
         if (srcUnavailable) {
           // 取到不取到都不知道 ⇒ 绝不清空已拉到的行（清空即用户观感的数据丢失），
           // 只把原因交给 banner；行继续显示为「断开前的最后快照」。
@@ -326,5 +338,5 @@ export function useIngestGroups(
     [refresh],
   )
 
-  return { groups, tasks, overview, loading, error, unavailable, refresh, run, remove }
+  return { groups, tasks, overview, loading, error, unavailable, downloadUnavailable, refresh, run, remove }
 }

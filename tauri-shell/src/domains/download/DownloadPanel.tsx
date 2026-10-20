@@ -78,7 +78,7 @@ const SOURCE_LABELS: Record<SourceFilter, string> = {
 
 export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
   const { setError, cancel } = useStore()
-  const { groups, overview, loading, error, unavailable, refresh, run, remove } = ingest
+  const { groups, overview, loading, error, unavailable, downloadUnavailable, refresh, run, remove } = ingest
   const [source, setSource] = useState<SourceFilter>('all')
   /**
    * BUG-353：下载域的**选中**控制面。
@@ -159,8 +159,21 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
    *
    * banner 与两个原因**严格同真同假**（双向），避免出现「banner 恒隐」式假绿。
    */
-  const tgUnavailable = error != null || unavailable != null
-  const tgReason = unavailable ?? error
+  // BUG-355：横幅范围由 `sources` 两源联合推导，不再写死「普通下载不受影响」。
+  // daemon 都没通 ⇒ 两侧都不可用；仅 cache 侧取不到 ⇒ 只报 TG；下载源也不可用 ⇒ 如实报「均不可用」。
+  const daemonDown = error != null
+  const dlDown = daemonDown || downloadUnavailable != null
+  const tgUnavailable = daemonDown || unavailable != null || downloadUnavailable != null
+  const tgReason = unavailable ?? downloadUnavailable ?? error
+  const tgScopeText = daemonDown
+    ? '服务未连接，TG 入库与普通下载均不可用'
+    : unavailable != null && dlDown
+      ? 'TG 入库与普通下载均不可用'
+      : unavailable != null
+        ? 'TG 入库任务暂时无法读取'
+        : dlDown
+          ? '普通下载不可用'
+          : ''
 
   const fail = (e: unknown) => setError(e instanceof Error ? e.message : String(e))
 
@@ -279,9 +292,10 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
     )
   }
 
-  // 分级（BUG-318）：`error` = 聚合端点都没通（daemon 挂）⇒ 整页数据不可信，红色错误页；
-  // 仅 `unavailable` = orig-tg 单侧取不到（重启中/被关闭）⇒ 普通下载照常，走黄色
-  // banner + 空态，不把「主动关闭 TG」渲染成整页故障。
+  // 分级（BUG-318 / BUG-355）：`error` = 聚合端点都没通（daemon 挂）⇒ 两侧都不可用；
+  // `unavailable` = orig-tg 单侧取不到（重启中/被关闭）⇒ 走黄色 banner + 空态；
+  // `downloadUnavailable` = 下载源（引擎）不可用 ⇒ 横幅如实报「均不可用」，不再写死
+  // 「普通下载不受影响」。三者都**不清空**已拉到的行（清空即用户观感的「数据丢失」）。
   if (total === 0 && error != null) {
     return (
       <div className="flex flex-col items-center justify-center py-24" data-testid="dl-error">
@@ -382,8 +396,10 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
           className="shrink-0 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning"
           data-testid="dl-tg-unavailable"
         >
-          TG 入库任务暂时无法读取（普通下载不受影响）：{tgReason}
-          {ingestRows.length > 0 && '（下列入库行为断开前的最后快照，恢复后自动刷新）'}
+          {tgScopeText}：{tgReason}
+          {/* 仅当「只有 TG 取不到」且仍有快照行时，才提示「断开前的最后快照」；
+              两侧都挂时不适用（BUG-355） */}
+          {unavailable != null && !dlDown && ingestRows.length > 0 && '（下列入库行为断开前的最后快照，恢复后自动刷新）'}
         </div>
       )}
 
@@ -400,7 +416,9 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
           <h3 className="mt-4 text-sm font-medium text-fg-mid">暂无传输任务</h3>
           <p className="mt-1 text-xs text-muted">
             {tgUnavailable
-              ? '连上 TG 后，入库任务会出现在这里'
+              ? (dlDown
+                  ? '恢复服务后，任务会出现在这里'
+                  : '连上 TG 后，入库任务会出现在这里')
               : '点击右上角「新建下载」添加任务，或在 TG 面板入库'}
           </p>
         </div>

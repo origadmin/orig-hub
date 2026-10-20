@@ -583,12 +583,13 @@ pub fn default_download_dir() -> PathBuf {
 /// 用户显式配置的 `download_dir` 由上游分支优先命中，不会走到这里。
 pub fn manual_download_root(_cfg: &Config) -> PathBuf {
     // 与 `effective_download_root` 同一条禁用盘规则（用户 2026-10-19 裁定）：
-    // 名义默认 `~/Downloads` 落在系统盘上 ⇒ 手动下载的落点改取 D 盘内容根。
+    // 名义默认 `~/Downloads` 落在系统盘 / 裸根上 ⇒ 手动下载的落点改取 D 盘内容根。
     let d = default_download_dir();
-    if orig_core::paths::is_forbidden_content_drive(&d) {
-        return orig_core::paths::content_root();
+    if orig_core::paths::is_valid_content_root(&d) {
+        d
+    } else {
+        orig_core::paths::content_root()
     }
-    d
 }
 
 /// **生效下载路径** = 受管根 / 权限边界（BUG-323）：配置的 `download_dir`
@@ -612,10 +613,12 @@ pub fn effective_download_root(cfg: &Config) -> PathBuf {
         .clone()
         .unwrap_or_else(default_download_dir);
     let norm = orig_core::paths::normalize_dir_path(&raw);
-    if orig_core::paths::is_forbidden_content_drive(&norm) {
+    // BUG-355：裸根 `/`、盘符根 `D:/` 与禁用盘同样不可作内容根 —— 一律改取 D 盘内容根，
+    // 否则下载落点变成根目录（"/"），所有下载失败且 UI 把 "/" 当生效路径显示（用户复报）。
+    if !orig_core::paths::is_valid_content_root(&norm) {
         let redirected = orig_core::paths::content_root();
         tracing::warn!(
-            "resolved download root {} is on a forbidden content drive; \
+            "resolved download root {} is not a valid content root; \
              using {} instead (ruling: all content goes to the D: drive)",
             norm.display(),
             redirected.display()
@@ -1038,6 +1041,33 @@ mod tests {
             library_root(&cfg),
             PathBuf::from("D:/OrigDown").join("library")
         );
+    }
+
+    /// BUG-355：裸根 `/` 与盘符根 `D:/` 不得作为下载根（用户复报：默认下载目录显示 `/`）。
+    /// 解析到这类退化值必须改取 D 盘内容根，否则下载落点变成根目录、所有下载失败。
+    #[test]
+    fn bare_root_download_dir_is_redirected_to_content_root_bug355() {
+        // ① 裸 unix 根 "/"
+        let cfg = cfg_with_dirs(Some("/"), None);
+        assert_eq!(
+            effective_download_root(&cfg),
+            orig_core::paths::content_root(),
+            "裸根 / 必须改道到 D 盘内容根"
+        );
+        assert_eq!(
+            manual_download_root(&cfg),
+            orig_core::paths::content_root()
+        );
+        // ② 盘符根 "D:/"
+        let cfg = cfg_with_dirs(Some("D:/"), None);
+        assert_eq!(
+            effective_download_root(&cfg),
+            orig_core::paths::content_root(),
+            "盘符根 D:/ 必须改道到 D 盘内容根"
+        );
+        // ③ 有效路径不受影响
+        let cfg = cfg_with_dirs(Some("D:/OrigDown"), None);
+        assert_eq!(effective_download_root(&cfg), PathBuf::from("D:/OrigDown"));
     }
 
     /// 任务显式指定目录时，分类开关与库根都不介入（D16/D23：显式优先、不分类）。

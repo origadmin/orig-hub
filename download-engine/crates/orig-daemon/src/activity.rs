@@ -320,7 +320,22 @@ pub async fn collect(st: &AppState, scope: Scope) -> ActivitySnapshot {
         Err("tg plugin disabled".to_string())
     };
 
-    merge(downloads, cache, scope)
+    let mut snap = merge(downloads, cache, scope);
+
+    // BUG-355：下载源可用性反映**真实下载根健康度**，不再写死 `true` —— 否则
+    // 「下载根非法 / 服务全挂」时界面仍谎称「普通下载不受影响」（用户实测全 outage
+    // 下所有任务失败，但横幅写死下载正常）。下载根非法（如 `/`）即标记下载源不可用。
+    if let Ok(cfg) = st.config.read() {
+        let dl_root = crate::config::effective_download_root(&cfg);
+        let dl_ok = orig_core::paths::is_valid_content_root(&dl_root);
+        snap.sources[0].available = dl_ok;
+        if !dl_ok {
+            snap.sources[0].error =
+                Some("下载根目录无效或不可写（检查设置中的下载目录）".to_string());
+        }
+    }
+
+    snap
 }
 
 /// 纯合并逻辑（与网络/状态解耦，便于单测覆盖降级路径）。
