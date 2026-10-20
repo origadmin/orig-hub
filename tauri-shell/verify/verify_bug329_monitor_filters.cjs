@@ -185,8 +185,10 @@ const ROW_SNAP = () => {
 const PANEL_SNAP = () => {
   const root = document.querySelector('[data-testid="tg-filter-panel"]')
   if (!root) return null
-  const boxes = Array.from(root.querySelectorAll('[data-testid="tg-filter-hit"] input[type=checkbox]'))
-  const rows = Array.from(root.querySelectorAll('[data-testid="tg-filter-hit"]'))
+  // BUG-341 单元级：一行 = 一个相册组（tg-filter-group）或一条单消息（tg-filter-hit）
+  const ROWS_SEL = '[data-testid="tg-filter-hit"],[data-testid="tg-filter-group"]'
+  const rows = Array.from(root.querySelectorAll(ROWS_SEL))
+  const boxes = rows.map((r) => r.querySelector('input[type=checkbox]')).filter(Boolean)
   const all = root.querySelector('[data-testid="tg-filter-select-all"]')
   const btn = root.querySelector('[data-testid="tg-filter-ingest"]')
   const countEl = root.querySelector('[data-testid="tg-filter-selected-count"]')
@@ -274,8 +276,10 @@ async function main() {
       /filters\.filter\(/.test(panelSrc),
   )
   check(
-    '源码：结果面板默认全选「缺字节」条目 + 半选走 indeterminate',
-    /selectable\.map\(keyOf\)/.test(filterSrc) && /\.indeterminate\s*=/.test(filterSrc),
+    '源码：结果面板默认全选「缺字节」单元 + 半选走 indeterminate',
+    // BUG-341 单元级：默认全选的是可勾**单元**（相册/单条），不再是消息条目
+    /selectableUnits\.map\(\(u\) => u\.key\)/.test(filterSrc) &&
+      /selectAllRef\.current\.indeterminate\s*=/.test(filterSrc),
   )
   const storeSrc = fs.readFileSync(STORE_SRC, 'utf8')
   check(
@@ -283,16 +287,17 @@ async function main() {
     /m\.group_id/.test(storeSrc) && /group_id:\s*r\.get\(10\)/.test(storeSrc),
   )
   check(
-    '源码：结果面板入库按 group_id 分组（groups Map 以 h.groupId 为键），旧 byChat 扁平化已移除',
-    /const groups = new Map/.test(filterSrc) &&
-      /h\.groupId \?\? -1/.test(filterSrc) &&
+    '源码：结果面板按单元（相册/单条）分组，旧 byChat 扁平化已移除',
+    // BUG-341：分组收敛进 groupHits（键 = `g:<chatId>:<groupId>` / `m:<chatId>:<messageId>`）
+    filterSrc.includes('function groupHits(') &&
+      filterSrc.includes('g:${h.channelId}:${h.groupId}') &&
       !/const byChat = new Map<number, number\[\]>\(\)/.test(filterSrc),
   )
   check(
-    '源码：图片不再被排除出入库（selectable/ingest 无 type!=="photo"；图片能否成剧集由后端 file_items_into_series 的 kind 预切保证）',
+    '源码：图片不再被排除出入库（可勾判定只看缺字节；能否成剧集由后端 kind 预切保证）',
     !/type\s*!==\s*'photo'/.test(filterSrc) &&
-      /filter\(\(h\) => !h\.downloaded\)/.test(filterSrc) &&
-      /filter\(\(h\) => selected\.has\(keyOf\(h\)\)\)/.test(filterSrc),
+      /members\.some\(\(m\) => !m\.downloaded\)/.test(filterSrc) &&
+      /selected\.has\(u\.key\)/.test(filterSrc),
   )
 
   // ---- 解析 orig-tg 端口（真源：daemon /api/config 的 tg_port）----
@@ -526,14 +531,27 @@ async function main() {
     { timeout: 10000 },
   )
   await page.waitForFunction(
-    () => document.querySelectorAll('[data-testid="tg-filter-hit"]').length > 0,
+    () =>
+      document.querySelectorAll('[data-testid="tg-filter-hit"],[data-testid="tg-filter-group"]')
+        .length > 0,
     { timeout: 15000 },
   )
   const p0 = await page.evaluate(PANEL_SNAP)
+  // API 返回的是**消息**，DOM 渲染的是**单元**（相册合并）——必须同口径比，
+  // 否则「187 条消息 vs 50 个单元」永远不等（BUG-341 口径迁移）。
+  const apiUnits = new Set(
+    apiHits.map((h) =>
+      h.groupId != null ? `g:${h.channelId}:${h.groupId}` : `m:${h.channelId}:${h.messageId}`,
+    ),
+  ).size
+  // 首屏只渲染一页单元（PAGE_SIZE 从源码读，不在探针里硬编码冒充契约）
+  const pageSizeM = /const PAGE_SIZE = (\d+)/.exec(filterSrc)
+  const PAGE_SIZE = pageSizeM ? Number(pageSizeM[1]) : NaN
+  const expectRows = Math.min(apiUnits, PAGE_SIZE)
   check(
-    `B4a 点规则后第二列切到命中列表（${p0.rows} 行，API ${apiHits.length} 条）`,
-    p0.rows > 0 && p0.rows === apiHits.length,
-    JSON.stringify({ dom: p0.rows, api: apiHits.length }),
+    `B4a 点规则后第二列切到命中列表（${p0.rows} 单元；API ${apiHits.length} 条消息 / ${apiUnits} 单元，首屏应 ${expectRows}）`,
+    Number.isFinite(PAGE_SIZE) && p0.rows > 0 && p0.rows === expectRows,
+    JSON.stringify({ dom: p0.rows, apiMessages: apiHits.length, apiUnits, PAGE_SIZE, expectRows }),
   )
   check(
     'B4b 面板标题/关键词区可见（tg-filter-panel + 关键词说明）',

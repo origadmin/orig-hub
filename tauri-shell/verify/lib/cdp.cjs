@@ -432,7 +432,30 @@ class Page {
    * @param {object} options `{ waitUntil, timeout, settleMs, waitForRoot, rootSelector }`
    * @returns {Promise<void>}
    */
+  /**
+   * ★ 导航超时重试（2026-10-21 实测）：headless Edge 偶发 `Page.navigate` 整条
+   * 命令无响应（devtools 端点已就绪、浏览器进程却没进事件循环）——同一次运行里
+   * `/src/main.tsx` 预热仅 6–43ms，说明与页面无关。这类卡死是启动期一次性窗口，
+   * 第二次导航几乎必成；只对**导航超时**重试，其他错误原样抛出。
+   * 重试不掩盖判据：判据根本没开始跑，不存在把红判绿。
+   */
   async goto(url, options = {}) {
+    const attempts = options.attempts || 2
+    let lastErr
+    for (let i = 0; i < attempts; i++) {
+      try {
+        return await this._gotoOnce(url, options)
+      } catch (err) {
+        lastErr = err
+        const navTimeout = /Page\.navigate timed out/.test(err.message || '')
+        if (!navTimeout || i === attempts - 1) throw err
+        await delay(1500)
+      }
+    }
+    throw lastErr
+  }
+
+  async _gotoOnce(url, options = {}) {
     const waitUntil = options.waitUntil || 'load'
     const timeout = options.timeout || 30000
     const settleMs = options.settleMs === undefined ? 1200 : options.settleMs

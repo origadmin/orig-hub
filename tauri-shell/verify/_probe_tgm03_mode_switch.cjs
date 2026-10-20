@@ -29,6 +29,7 @@ const cdp = require(path.join(__dirname, 'lib', 'cdp.cjs'))
 
 const OUT = path.resolve(__dirname, '..', '..', 'verify_shots', 'tgm03-mode-switch')
 const APP = process.env.VERIFY_APP_URL || 'http://127.0.0.1:5180/'
+const TG = process.env.VERIFY_TG_URL || 'http://127.0.0.1:19787'
 const EXPECT_LEGACY = process.argv.includes('--expect-legacy')
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -37,18 +38,30 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
  *  先 scrollIntoView 再取矩形 —— 左栏是单一滚动容器（TGM-02），① 频道节在底部，
  *  700px 视口下分组行本就在折叠线以下，不滚动就直接点会落到别的行上（实测教训）。 */
 async function realClick(page, selector) {
-  const pt = await page.evaluate((sel) => {
-    const el = document.querySelector(sel)
-    if (!el) return null
-    el.scrollIntoView({ block: 'nearest' })
-    const r = el.getBoundingClientRect()
-    if (r.width === 0 && r.height === 0) return null
-    const x = Math.round(r.left + r.width / 2)
-    const y = Math.round(r.top + r.height / 2)
-    const hit = document.elementFromPoint(x, y)
-    return { x, y, hitOk: !!hit && (el === hit || el.contains(hit)) }
-  }, selector)
-  if (!pt) throw new Error(`realClick: 找不到或不可见 ${selector}`)
+  /*
+   * ★ 有界等待「目标真的可点」（2026-10-21 实测假红）：`openTgPanel` 等到规则行
+   * 出现之后，filters 还可能再刷新一轮（后台轮询/点开即归零的乐观更新），DOM 在
+   * 等待与点击之间短暂空掉 ⇒ 直接 evaluate 拿到 null，报「找不到」——那不是产品
+   * 问题，是探针没等稳。这里改成轮询到可点（上限 15s），超时仍如实报错。
+   */
+  let pt = null
+  const deadline = Date.now() + 15000
+  while (Date.now() < deadline) {
+    pt = await page.evaluate((sel) => {
+      const el = document.querySelector(sel)
+      if (!el) return null
+      el.scrollIntoView({ block: 'nearest' })
+      const r = el.getBoundingClientRect()
+      if (r.width === 0 && r.height === 0) return null
+      const x = Math.round(r.left + r.width / 2)
+      const y = Math.round(r.top + r.height / 2)
+      const hit = document.elementFromPoint(x, y)
+      return { x, y, hitOk: !!hit && (el === hit || el.contains(hit)) }
+    }, selector)
+    if (pt && pt.hitOk) break
+    await sleep(200)
+  }
+  if (!pt) throw new Error(`realClick: 找不到或不可见 ${selector}（等待 15s 后仍不可点）`)
   if (!pt.hitOk) throw new Error(`realClick: ${selector} 的点击点被其它元素占据（命中测试失败）`)
   const conn = page.conn || page._conn
   const sessionId = page.sessionId
@@ -144,6 +157,26 @@ async function main() {
     await page.waitForFunction(
       () => document.querySelectorAll('[data-testid="tg-group-row"]').length > 0,
       { timeout: 10000 },
+    )
+    /*
+     * ★ 有界等待「订阅列表真的落地」（MEMORY 教训：只等容器出现会读到 0 条）。
+     * 「全部订阅 / 未分组」两个分组行是**恒定渲染**的（不依赖 channels），所以
+     * 上面那条 waitForFunction 会立刻满足——但 channels 还在翻页拉取（525 条 /
+     * 3 页），此时点进分组列表会看到「全部订阅 (0)」、组内 0 个频道，M3a 假红。
+     * 判据 = 左栏「全部订阅」行尾计数 === API dialogs total（同一真值口径）。
+     */
+    const dialogsTotal = await (await fetch(`${TG}/api/tg/dialogs?limit=1`)).json().then((r) => r.total)
+    await page.waitForFunction(
+      (total) => {
+        const sec = document.getElementById('tg-section-channels')
+        if (!sec) return false
+        const rows = Array.from(sec.querySelectorAll('[data-testid="tg-group-row"]'))
+        const all = rows[0]
+        if (!all) return false
+        const m = /(\d+)/.exec(all.textContent || '')
+        return !!m && Number(m[1]) === total
+      },
+      { timeout: 40000, args: [dialogsTotal] },
     )
     await realClick(page, '[data-testid="tg-group-row"]')
     await sleep(400)

@@ -104,9 +104,11 @@ const LEFT_SNAP = () => {
   }
   // BUG-340：`—` 兜底整个撤除（「数据没有获取时就应该不显示」）
   const dashInAside = asideText.includes('—')
-  // 节头截断（复报「①频道(… 显示不全」判据）：标题一律不得溢出
+  // 节头截断（复报「①频道(… 显示不全」判据）：标题一律不得溢出。
+  // ★ 前提断言：被压到 clientWidth=0 的标题 scrollWidth 也是 0（overflow:hidden），
+  //   只比 scrollWidth 会假绿——所以每个 h3 必须同时「有宽度」才允许判过。
   const truncated = Array.from(document.querySelectorAll('section h3'))
-    .filter((el) => el.scrollWidth > el.clientWidth + 1)
+    .filter((el) => el.scrollWidth > el.clientWidth + 1 || el.clientWidth < 24)
     .map((el) => ({ text: el.textContent.trim().slice(0, 30), sw: el.scrollWidth, cw: el.clientWidth }))
   // 三节是否同属一个 overflow-y-auto 滚动容器
   const scrollParent = (() => {
