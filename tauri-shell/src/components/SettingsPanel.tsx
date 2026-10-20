@@ -335,8 +335,12 @@ export function SettingsPanel({
         // 判定「能不能改目录」时这条最坑：用户改了、保存了、又别处清空了引擎值，
         // 重开设置页依旧显示旧路径，看着就像「改不动」。
         const engineDir = c.download_dir ?? ''
-        setDir(engineDir)
-        updateSettings({ downloadDirectory: engineDir })
+        // BUG-356：退化路径（"/" / "." / 空）绝不在输入框回显为下载目录 —— 一律回退到
+        // daemon 算出的生效根（D:\OrigDown），否则用户会在输入框看到裸根 "/"。
+        const degenerate = engineDir === '/' || engineDir === '.' || engineDir === ''
+        const displayDir = degenerate ? (c.effective_download_root ?? engineDir) : engineDir
+        setDir(displayDir)
+        updateSettings({ downloadDirectory: displayDir })
         // 调试日志路径（BUG-243）：同一份 config 里带下来，不额外打一次请求。
         if (c.logs) setLogPaths(c.logs)
       })
