@@ -635,11 +635,15 @@ export async function setCacheTasksPriority(
   })
 }
 
-/** GET /api/tg/cache/tasks/all — 全量任务 + 各状态计数（缓存管理面板用，低频拉取）。 */
-export async function listAllCacheTasks(): Promise<{
-  tasks: TgCacheTask[]
-  counts: Record<string, number>
-}> {
+/**
+ * GET /api/tg/cache/tasks/all — 全量任务（缓存管理面板用）。
+ *
+ * BUG-347：此前这里还声明 `counts: Record<string, number>`，但 BUG-085 已把该字段
+ * 从响应里砍掉 —— **类型层面谎称它存在**，于是 `res.counts ?? {}` 永远取到空对象，
+ * 面板读数恒 0 且编译器一声不吭。计数改由消费端从 `tasks` 本地派生（单一真源），
+ * 类型如实反映线上形状。
+ */
+export async function listAllCacheTasks(): Promise<{ tasks: TgCacheTask[] }> {
   return request('/api/tg/cache/tasks/all')
 }
 

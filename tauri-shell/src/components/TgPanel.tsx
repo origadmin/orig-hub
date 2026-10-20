@@ -304,7 +304,6 @@ export function TgPanel(
     onTgModeChange,
     onOpenAccounts,
     onOpenMedia,
-    onOpenDownload,
   }: {
     /**
      * TG 域内选择（BUG-330 / TGM-01/03；二级菜单 → 主列的唯一分流判据）。
@@ -319,15 +318,6 @@ export function TgPanel(
      * `view` 是 MainLayout 的局部 state，面板自己切不了，只能由宿主给。
      */
     onOpenMedia?: () => void
-    /**
-     * 入库流水线的「去下载查看」出口：切到下载域（条目级明细与管理的家）。
-     *
-     * 2026-10-17 用户裁定「入口只需要简易内容，全部都在下载里面，其他都不要」：
-     * 逐条清单 / 重试 / 删除 / 取消优先这些条目级动作归下载域，TG 侧只留每行一个门。
-     * 与 `onOpenMedia` 同理，`view` 是 MainLayout 的局部 state，只能由宿主给；
-     * 宿主没给时面板里那个按钮不渲染。
-     */
-    onOpenDownload?: () => void
   },
 ) {
   const { t } = useTranslation()
@@ -2702,7 +2692,6 @@ export function TgPanel(
           channels={channels}
           onClose={() => setCacheManagerOpen(false)}
           onOpenMedia={onOpenMedia}
-          onOpenDownload={onOpenDownload}
         />
       ) : null}
     </div>

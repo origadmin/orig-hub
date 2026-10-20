@@ -140,8 +140,19 @@ export function MainLayout() {
    * TG 域渲染「在传 / 待处理 / 已缓存」小计数，它就是本 hook 的消费者 —— 门控若不
    * 含 tg，用户停在 TG 域看到的会是切走前的冻结快照，计数不动。故门控 = 下载域 ∪ TG 域。
    * 仍然是**同一处轮询**（不新增数据源，BUG-082 三处同源纪律）。
+   *
+   * BUG-349：入库流水线面板打开时，**这条链让位**。
+   * 面板自己就拉全量任务明细（`GET /api/tg/cache/tasks/all`），而本 hook 走
+   * `/api/activity`，服务端每次命中还要回源同一份约 55KB 的任务全量 —— 两条链
+   * 并存就是同一份数据每 3-5s 被拉两遍（实测 TG 域稳态 2.87 请求/秒）。
+   * 面板在场时它是**专业面**：由它独家拉；入口只读最后已知快照（BUG-343 的
+   * last-known 口径）。面板关掉后本链自动接管，轮次回到入口自己手上。
    */
-  const ingest = useIngestGroups(undefined, view === 'download' || view === 'tg')
+  const cacheManagerOpen = useStore((s) => s.tgCacheManagerOpen)
+  const ingest = useIngestGroups(
+    undefined,
+    view === 'download' || (view === 'tg' && !cacheManagerOpen),
+  )
   /** 概览 = 「笼统的数据」：按**内容对象**计数，不是按原始任务记录数。 */
   const overview = ingest.overview
 
@@ -200,16 +211,6 @@ export function MainLayout() {
    * 视图 state 在本组件（局部），接线只能是这一个回调 —— 组件间不另开通道。
    */
   const handleOpenMedia = useEvent(() => handleNavigate('files', { fmode: 'lib-series' }))
-  /**
-   * 入库流水线 → 下载域的跨视图出口（2026-10-17 用户裁定「入口只需要简易内容，
-   * 全部都在下载里面，其他都不要」）。
-   *
-   * 条目级明细与管理的家（逐条清单 / 重试 / 删除 / 取消优先）在下载域：
-   * TG 侧弹窗每行只留一个门，落到「全部下载」（`dlFilter='all'`）—— 那里按
-   * 入库口径列出全部组，点开 `IngestDetailSheet` 就是条目级明细。
-   * 与 `handleOpenMedia` 同理，视图 state 在本组件（局部），接线只能是这一个回调。
-   */
-  const handleOpenDownload = useEvent(() => handleNavigate('download', { dlFilter: 'all' }))
   /**
    * BUG-305：媒体库 → TG 面板的跨域出口（`handleOpenMedia` 的反向对应）。
    *
@@ -308,7 +309,6 @@ export function MainLayout() {
                   onTgModeChange={(m) => setNav((prev) => navigate(prev, 'tg', { tgMode: m }))}
                   onOpenAccounts={handleGoAccounts}
                   onOpenMedia={handleOpenMedia}
-                  onOpenDownload={handleOpenDownload}
                 />
               </ErrorBoundary>
             ) : view === 'share' ? (

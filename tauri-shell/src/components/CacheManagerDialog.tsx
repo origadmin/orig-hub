@@ -1,9 +1,8 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronDown, ChevronRight, X } from 'lucide-react'
 import { Button } from './ui/button'
-import { Progress } from './ui/progress'
 import { CacheBytesPanel } from './CacheBytesPanel'
-import { cn, formatBytes, formatSpeed } from '../lib/utils'
+import { cn } from '../lib/utils'
 import { useTranslation } from '../i18n'
 import { describeTgFailure } from '../lib/tgReason'
 import { deriveEntryState } from '../lib/entryState'
@@ -163,23 +162,6 @@ function fmtWhen(sec: number): string {
 }
 
 /**
- * 停滞阈值（BUG-221）：字节超过 15s 没再推进而任务仍 `running` ⇒ 行内报
- * 「已 N 秒无进展」。
- *
- * 为什么是 15s：轮询 5s，取 3 拍 —— 既不会把「5s 轮询的正常间隙」误报成卡死，
- * 也不会让用户等上半分钟才知道停了。
- */
-const STALL_MS = 15_000
-
-/**
- * 速度读数的保鲜窗口：最后一次字节推进距今超过 10s 就**不再显示速度**。
- *
- * 速度是「相邻两次采样的字节差」派生出来的，它天然带着采样时刻；一旦字节停了，
- * 这个差值就变成历史值 —— 继续显示等于拿旧速率冒充当前速率（宁缺勿假）。
- */
-const RATE_FRESH_MS = 10_000
-
-/**
  * 条目级失败汇总的识别标记（BUG-257 方向 3，与引擎 `summarize_item_failures` 约定）。
  *
  * 引擎把「哪几条失败了」写进任务 `error`：`N/M item(s) failed: chat:msg 原因; …`。
@@ -193,14 +175,6 @@ function isItemFailureSummary(error: string): boolean {
   return /^\d+\/\d+ item\(s\) failed:/.test(error.trim())
 }
 
-/** 剩余时间文案（`≈3 分 20 秒` 这一档由 i18n 决定语序）。 */
-function fmtEta(sec: number, t: (key: string, vars?: Record<string, string | number>) => string): string {
-  const s = Math.max(0, Math.round(sec))
-  const h = Math.floor(s / 3600)
-  const m = Math.floor((s % 3600) / 60)
-  const rest = s % 60
-  return h > 0 ? t('tg.ingestEtaHour', { h, m }) : t('tg.ingestEtaMinSec', { m, s: rest })
-}
 
 /**
  * 流水线的一行（AGENTS.md §5：高频路径的行组件必须 `memo` 化）。
@@ -214,8 +188,6 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
   task: TgCacheTask
   /** 频道标题（宿主没给频道表时退回 `#<chatId>`） */
   title: string
-  /** 宿主时钟（ms）：停滞秒数与速度保鲜都按它算，随轮询刷新（不新开定时器） */
-  now: number
   busy: boolean
   /** 该行是否正在确认「删除记录」 */
   confirming: boolean
@@ -227,14 +199,11 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
   selected: boolean
   onToggleSelect: (task: TgCacheTask) => void
   onGoLibrary: (task: TgCacheTask) => void
-  /**
-   * 「去下载查看」的跨域出口（2026-10-17）。
-   *
-   * 条目级明细与管理的家在下载域 —— 这里只是每行给一个门。由宿主（`CacheManagerDialog`）
-   * 统一提供：它要先关掉本面板再跳，否则面板开合态留在 store 里，切回 TG 域会又弹出来。
-   * 未提供时按钮不渲染（本组件不自造跳转，与 `onGoLibrary` 同一约定）。
+  /*
+   * BUG-348：`onGoDownload`（「去下载查看」）已从行里移除。
+   * 流水线按用户裁定「只管自己」—— 跨界出口不属于入库的自我表达，
+   * 条目级明细与管理的家本来就在下载域。
    */
-  onGoDownload?: () => void
   onRetry: (task: TgCacheTask) => void
   onCancel: (task: TgCacheTask) => void
   /** 优先下载（BUG-277）：当前任务跑完后下一个跑它，不打断正在跑的任务 */
@@ -248,7 +217,6 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
   const {
     task,
     title,
-    now,
     busy,
     confirming,
     missing,
@@ -256,7 +224,6 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
     selected,
     onToggleSelect,
     onGoLibrary,
-    onGoDownload,
     onRetry,
     onCancel,
     onPreferDownload,
@@ -267,70 +234,14 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
   } = props
   const { t } = useTranslation()
   /**
-   * 进度**以字节为准**（BUG-221）。
+   * BUG-348：**入库不问进度**。
    *
-   * 旧式 `done/total` 的分母是**消息数**：一条几百 MB 的视频 `total = 1`，完成前
-   * 恒 0% —— 最耗时的恰恰最不可见。现在 running 且总量已知时优先用
-   * `progressBytes/progressBytesTotal`；总量未知就退回消息级读数；
-   * 两者都不可用时显示「准备中」，**不假造百分比**。
+   * 进度条 / 百分比 / 字节 / 速度 / ETA / 停滞秒数已全部撤出流水线的行 —— 它们是
+   * 「下载」的词汇（传到哪了、多快、还要多久），而入库回答的是另一个问题：
+   * 「这份内容进没进来」（二元），没进来的只说清为什么。
+   * 用户裁定（2026-10-21）：「只管自己，只管完成、非完成等简易内容，不管进度」。
+   * 那些读数在下载域继续保留，它们在那里是答案；搬到入库行里只是噪声。
    */
-  const pb = task.progressBytes ?? null
-  const pbTotalNum = task.progressBytesTotal ?? 0
-  const running = task.status === 'running'
-  const bytePct =
-    running && pb !== null && pb > 0 && pbTotalNum > 0
-      ? Math.min(100, (pb / pbTotalNum) * 100)
-      : null
-  const msgPct = task.total > 0 ? (task.done / task.total) * 100 : null
-  const pct = bytePct ?? msgPct
-  /** 还没起步（running 但既无字节进度也无已完成条目）：如实说「准备中」，不报 0%。 */
-  const preparing = running && bytePct === null && task.done === 0
-
-  /** 字节心跳距今多久（ms）；`null` = 服务端没给心跳（老库/未起步）。 */
-  const sinceMs = task.progressAt != null ? now - task.progressAt : null
-  const stalled = running && sinceMs !== null && sinceMs > STALL_MS
-  const stalledSec = stalled && sinceMs !== null ? Math.floor(sinceMs / 1000) : null
-
-  /**
-   * 速度 / 剩余时间：相邻两次采样的字节差派生（复用现有 5s 轮询，不新增轮询源）。
-   *
-   * 只有**一次**采样（或字节没涨、心跳没走）时保持 `null` —— 不给数字好过给假数字。
-   * 心跳时间戳用服务端下发的 `progressAt` 做差（同一时钟），不受本机时钟漂移影响。
-   */
-  const [rate, setRate] = useState<{ bps: number; etaSec: number | null } | null>(null)
-  const prevSample = useRef<{ bytes: number; at: number } | null>(null)
-  useEffect(() => {
-    const bytes = task.progressBytes ?? null
-    const at = task.progressAt ?? null
-    const clear = () => setRate((prev) => (prev === null ? prev : null))
-    if (!running || bytes === null || at === null) {
-      prevSample.current = null
-      clear()
-      return
-    }
-    const prev = prevSample.current
-    prevSample.current = { bytes, at }
-    if (prev === null || at <= prev.at || bytes <= prev.bytes) {
-      clear()
-      return
-    }
-    const bps = ((bytes - prev.bytes) * 1000) / (at - prev.at)
-    const remainSec = pbTotalNum > bytes ? Math.round((pbTotalNum - bytes) / bps) : null
-    setRate((p) =>
-      p !== null && Math.abs(p.bps - bps) < 0.5 && p.etaSec === remainSec
-        ? p
-        : { bps, etaSec: remainSec },
-    )
-  }, [running, task.progressBytes, task.progressAt, pbTotalNum])
-
-  /** 速度只在「采样还新鲜」时显示：字节一停，旧速率就不再是当前速率。 */
-  const rateFresh = rate !== null && sinceMs !== null && sinceMs <= RATE_FRESH_MS
-  const bytesLabel =
-    pb !== null && pb > 0
-      ? pbTotalNum > 0
-        ? `${formatBytes(pb)} / ${formatBytes(pbTotalNum)}`
-        : t('tg.ingestDownloaded', { size: formatBytes(pb) })
-      : null
   const active = ACTIVE_STATUS.has(task.status)
   const ingested = task.status === 'done'
   const retryable = RETRYABLE.has(task.status)
@@ -357,17 +268,26 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
   }
   return (
     <div
-      className="rounded-md border border-border-subtle bg-surface-2/40 p-2.5"
+      className={cn(
+        'rounded-md border p-2.5 transition-colors',
+        // BUG-346：选中态必须是**行**的属性——此前 `selected` 只流到复选框自己的
+        // checked，整行肉眼无变化，用户勾完看到的是「灰色的、没选上」。
+        selected
+          ? 'border-accent/60 bg-accent/[0.07]'
+          : 'border-border-subtle bg-surface-2/40',
+      )}
       data-testid="cache-task-row"
       data-status={task.status}
       data-task-id={task.id}
       data-priority={task.priority ?? 0}
+      data-selected={selected ? '1' : '0'}
+      aria-selected={selected}
     >
       <div className="flex items-center gap-2">
         {selectable ? (
           <input
             type="checkbox"
-            className="h-3.5 w-3.5 shrink-0 accent-accent"
+            className="h-4 w-4 shrink-0 accent-accent"
             checked={selected}
             disabled={busy}
             onChange={() => onToggleSelect(task)}
@@ -376,83 +296,75 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
             data-testid="cache-select-row"
           />
         ) : null}
-        <div className="flex min-w-0 flex-1 items-center gap-2">
+        <span
+          className={cn(
+            'shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium',
+            STATUS_STYLE[task.status],
+          )}
+        >
+          {t(ENTRY_LABEL_KEY[entry])}
+        </span>
+        {/* 优先下载徽标（BUG-277）：「已优先下载」是这一行的**排序状态**，必须看得见 ——
+            否则用户点了优先下载，除了列表顺序以外没有任何反馈可核对。 */}
+        {prioritized ? (
           <span
-            className={cn(
-              'shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium',
-              STATUS_STYLE[task.status],
-            )}
+            className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[11px] font-medium text-accent"
+            title={t('tg.cachePreferDownloadHint')}
+            data-testid="cache-task-prioritized"
           >
-            {t(ENTRY_LABEL_KEY[entry])}
+            {t('tg.cachePreferred')}
           </span>
-          {/* 优先下载徽标（BUG-277）：「已优先下载」是这一行的**排序状态**，必须看得见 ——
-              否则用户点了优先下载，除了列表顺序以外没有任何反馈可核对。 */}
-          {prioritized ? (
-            <span
-              className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[11px] font-medium text-accent"
-              title={t('tg.cachePreferDownloadHint')}
-              data-testid="cache-task-prioritized"
-            >
-              {t('tg.cachePreferred')}
-            </span>
-          ) : null}
-          <span className="truncate text-xs text-fg-strong">
-            {title} · {single ? t('tg.cacheScopeSingle') : t('tg.cacheScopeGroup')} ·{' '}
-            {t('tg.cacheCountUnit', { n: task.messageIds.length })}
-          </span>
-        </div>
+        ) : null}
+        <span className="min-w-0 flex-1 truncate text-xs text-fg-strong">
+          {title} · {single ? t('tg.cacheScopeSingle') : t('tg.cacheScopeGroup')} ·{' '}
+          {t('tg.cacheCountUnit', { n: task.messageIds.length })}
+        </span>
+        {/*
+          BUG-348：**单一右侧动作槽** —— 同一行、不换行。
+          此前一行同时塞 6 颗带字按钮 + 若干读数，排版只能靠 flex-wrap 自由落体，
+          用户看到的就是「按钮位置错乱」。现在：时间是时间、次要动作是图标钮、
+          一行只出**一颗**主操作（三态互斥：已入库→去媒体库 / 可重试→重试 /
+          进行中→取消）。
+          跨界出口「去下载查看」撤掉 —— 用户裁定「入库流水线只管自己」，条目级
+          明细与管理的家本来就在下载域。
+        */}
         <div className="flex shrink-0 items-center gap-1.5">
-          {/* 「去下载查看」（2026-10-17 用户裁定「入口只需要简易内容，全部都在下载
-              里面，其他都不要」）：条目级明细与管理（逐条清单 / 重试 / 删除 / 取消优先）
-              的家在**下载域**，TG 侧不再重复一份 —— 这里只留一个去那边的出口。
-              宿主没给 `onGoDownload` 时整个按钮不出现（与「去媒体库查看」同一约定：
-              出口由宿主提供，本组件不自造跳转）。 */}
-          {onGoDownload ? (
-            <Button
-              variant="secondary"
-              size="sm"
-              className="h-7 px-2 text-[11px]"
-              disabled={busy}
-              onClick={onGoDownload}
-              title={t('tg.cacheGoDownloadHint')}
-              data-testid="cache-task-godownload"
-            >
-              {t('tg.cacheGoDownload')}
-            </Button>
-          ) : null}
-          {/* 优先下载 / 取消优先（BUG-277）：只对「排队中」或「已优先下载」的记录出现。
-              语义写在 title 里：优先下载 = 当前任务跑完后下一个跑它，**不是**立即抢占。 */}
+          <span className="shrink-0 text-[11px] tabular-nums text-fg-muted">
+            {fmtWhen(task.updatedAt)}
+          </span>
+          {/* 优先下载 / 取消优先（BUG-277）：只对「排队中」或「已优先下载」的记录
+              出现。语义写在 title 里：优先下载 = 当前任务跑完后下一个跑它，
+              **不是**立即抢占。图标钮，不占主操作的位置。 */}
           {canPrefer ? (
             <Button
               variant="secondary"
-              size="sm"
-              className="h-7 px-2 text-[11px]"
+              size="icon-sm"
               disabled={busy}
-              title={t('tg.cachePreferDownloadHint')}
               onClick={() => onPreferDownload(task)}
+              title={t('tg.cachePreferDownloadHint')}
+              aria-label={t('tg.cachePreferDownload')}
               data-testid="cache-task-prefer-download"
             >
-              {t('tg.cachePreferDownload')}
+              ★
             </Button>
           ) : null}
           {canCancelPrefer ? (
             <Button
               variant="ghost"
-              size="sm"
-              className="h-7 px-2 text-[11px]"
+              size="icon-sm"
               disabled={busy}
-              title={t('tg.cacheCancelPreferHint')}
               onClick={() => onCancelPrefer(task)}
+              title={t('tg.cacheCancelPreferHint')}
+              aria-label={t('tg.cacheCancelPrefer')}
               data-testid="cache-task-cancel-prefer"
             >
-              {t('tg.cacheCancelPrefer')}
+              ☆
             </Button>
           ) : null}
           {ingested ? (
             <Button
               variant="secondary"
-              size="sm"
-              className="h-7 px-2 text-[11px]"
+              size="xs"
               disabled={busy}
               onClick={() => onGoLibrary(task)}
               data-testid="cache-task-golibrary"
@@ -463,8 +375,7 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
           {retryable ? (
             <Button
               variant="secondary"
-              size="sm"
-              className="h-7 px-2 text-[11px]"
+              size="xs"
               disabled={busy}
               onClick={() => onRetry(task)}
               data-testid="cache-task-retry"
@@ -475,8 +386,7 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
           {active ? (
             <Button
               variant="ghost"
-              size="sm"
-              className="h-7 px-2 text-[11px]"
+              size="xs"
               disabled={busy}
               onClick={() => onCancel(task)}
               data-testid="cache-task-cancel"
@@ -486,74 +396,17 @@ const IngestTaskRow = memo(function IngestTaskRow(props: {
           ) : null}
           <Button
             variant="ghost"
-            size="sm"
-            className="h-7 px-2 text-[11px]"
+            size="icon-sm"
             disabled={busy}
             onClick={() => onAskDelete(task)}
+            title={t('tg.cacheDelete')}
+            aria-label={t('tg.cacheDelete')}
             data-testid="cache-task-delete"
           >
-            {t('tg.cacheDelete')}
+            ✕
           </Button>
         </div>
       </div>
-      <div className="mt-1.5 flex items-center gap-2">
-        <Progress
-          value={pct ?? 0}
-          animated={running && !stalled}
-          smoothMs={4800}
-          className="flex-1"
-        />
-        {preparing ? (
-          <span className="shrink-0 text-[11px] text-fg-muted" data-testid="cache-task-preparing">
-            {t('tg.ingestPreparing')}
-          </span>
-        ) : pct !== null ? (
-          <span
-            className="shrink-0 text-[11px] tabular-nums text-fg-muted"
-            data-testid="cache-task-bytes-pct"
-          >
-            {pct.toFixed(1)}%
-          </span>
-        ) : null}
-        <span className="shrink-0 text-[11px] tabular-nums text-fg-muted">
-          {task.done}/{task.total}
-        </span>
-        <span className="shrink-0 text-[11px] text-fg-muted">{fmtWhen(task.updatedAt)}</span>
-      </div>
-      {/* 字节读数 / 速度 / 剩余时间 / 停滞（BUG-221）：把「在下载 / 卡死 / 已恢复」
-          变成可观测的读数，而不是让用户盯着分钟级时间戳猜。 */}
-      {bytesLabel !== null || rateFresh || stalledSec !== null ? (
-        <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-fg-muted">
-          {bytesLabel !== null ? (
-            <span className="tabular-nums" data-testid="cache-task-bytes">
-              {bytesLabel}
-            </span>
-          ) : null}
-          {rateFresh && rate !== null ? (
-            <span className="tabular-nums" data-testid="cache-task-speed">
-              {formatSpeed(rate.bps)}
-            </span>
-          ) : null}
-          {rateFresh && rate !== null && rate.etaSec !== null ? (
-            <span className="tabular-nums" data-testid="cache-task-eta">
-              {fmtEta(rate.etaSec, t)}
-            </span>
-          ) : null}
-          {stalledSec !== null ? (
-            <span
-              className="font-medium text-amber-600 dark:text-amber-400"
-              data-testid="cache-task-stalled"
-            >
-              {t('tg.ingestStalled', { n: stalledSec })}
-            </span>
-          ) : null}
-        </div>
-      ) : null}
-      {active && task.currentId != null ? (
-        <p className="mt-1 text-[11px] text-fg-muted">
-          {t('tg.cacheCurrentMsg', { id: task.currentId })}
-        </p>
-      ) : null}
       {/* BUG-257 判据 5：`interrupted` 也**必须**显示成因。此前条件只有
           `status === 'failed'`，于是「因重启中断」的行只显示「已中断」——用户既
           不知道是自己重启造成的，也不知道它可重试（它确实在 RETRYABLE 里）。
@@ -661,22 +514,11 @@ export function CacheManagerDialog(props: {
    * 把用户送到成品所在的媒体库。宿主没给时只在本地起播（不切视图），能力不消失。
    */
   onOpenMedia?: () => void
-  /**
-   * 「去下载查看」的跨视图出口（2026-10-17 用户裁定「全部都在下载里面」）。
-   *
-   * 条目级明细与管理（逐条清单 / 重试 / 删除 / 取消优先）的家在**下载域**，TG 侧
-   * 只留每行一个门。由 MainLayout 提供（`view` 是它的局部 state）。本组件在跳转前
-   * 会先 `onClose()` 关掉自己（面板开合态在 store 里，不关的话切回 TG 域会又弹出来）。
-   * 宿主没给时按钮不渲染 —— 出口由宿主提供，本组件不自造跳转。
-   */
-  onOpenDownload?: () => void
 }) {
-  const { channels, onClose, onTasksChanged, initialView = 'tasks', onOpenMedia, onOpenDownload } =
-    props
+  const { channels, onClose, onTasksChanged, initialView = 'tasks', onOpenMedia } = props
   const { t } = useTranslation()
   const [view, setView] = useState<'tasks' | 'bytes'>(initialView)
   const [tasks, setTasks] = useState<TgCacheTask[]>([])
-  const [counts, setCounts] = useState<Record<string, number>>({})
   const [scope, setScope] = useState<Scope>('all')
   const [confirm, setConfirm] = useState<Confirm>(null)
   /** 批量选择的记录 id（BUG-149）。只存 id，选中集与列表按 id 求交，故任务被删/列表
@@ -768,25 +610,20 @@ export function CacheManagerDialog(props: {
       const res = await listAllCacheTasks()
       if (!aliveRef.current) return
       const list = res.tasks ?? []
-      const nextCounts = res.counts ?? {}
-      // BUG-221：字节进度与心跳必须进等值判据 —— 否则「只有字节在涨」的刷新会被
-      // 短路掉，行内读数又变回「分钟级不动」，正是本 BUG 的现象。
-      const sig =
-        list
-          .map(
-            (x) =>
-              `${x.id}:${x.status}:${x.done}:${x.total}:${x.currentId ?? ''}:${x.error ?? ''}` +
-              `:${x.progressBytes ?? ''}:${x.progressAt ?? ''}` +
-              // BUG-277：只看进度会漏掉「只有优先下载变了」的刷新（顺序与徽标都不更新）。
-              `:${x.priority ?? 0}`,
-          )
-          .join('|') +
-        '#' +
-        JSON.stringify(nextCounts)
+      // 判据只含**会被呈现出来的**字段：状态、成因、顺序（priority）。
+      // BUG-348 撤掉字节/速度/ETA 读数后，`progressBytes`/`progressAt` 不再进判据 ——
+      // 否则每轮字节上涨都要整表 setState，而界面上没有任何东西因此改变。
+      const sig = list
+        .map(
+          (x) =>
+            `${x.id}:${x.status}:${x.done}:${x.total}:${x.currentId ?? ''}:${x.error ?? ''}` +
+            // BUG-277：漏掉 priority 就看不到「只有优先下载变了」的刷新（顺序与徽标不更新）。
+            `:${x.priority ?? 0}`,
+        )
+        .join('|')
       if (sig !== sigRef.current) {
         sigRef.current = sig
         setTasks(list)
-        setCounts(nextCounts)
       }
       setErr('')
     } catch (e) {
@@ -804,21 +641,18 @@ export function CacheManagerDialog(props: {
     }
   }, [load])
 
-  /**
-   * 宿主时钟（ms）：停滞秒数与速度保鲜都按它算。
-   *
-   * 为什么要它：字节一停，`progressAt` 就不变，等值短路会拦掉 setState —— 没有
-   * 独立时钟的话「已 N 秒无进展」会冻在第一次读到的 N 上，等于报了个过期数。
-   * 复用既有 5s 轮询的节拍（同一拍里更新），**不新开第二个定时器**。
+  /*
+   * BUG-348：宿主时钟 `nowMs` 连同它的每次刷新一并撤了 —— 它只为「停滞秒数 /
+   * 速度保鲜」而存在（字节一停，`progressAt` 不变，等值短路会拦掉 setState，
+   * 于是读数冻在旧值上）。行里不再有这些读数，时钟就没有消费者，
+   * 每 5s 白送一次整面板重渲染（正是 BUG-349 的「卡」的一半来源）。
    */
-  const [nowMs, setNowMs] = useState(() => Date.now())
 
   // 轮询三律：有活才轮（5s）；全部终态即停。
   const hasActive = tasks.some((x) => ACTIVE_STATUS.has(x.status))
   useEffect(() => {
     if (!hasActive) return
     const iv = setInterval(() => {
-      setNowMs(Date.now())
       void load()
     }, 5000)
     return () => clearInterval(iv)
@@ -914,32 +748,6 @@ export function CacheManagerDialog(props: {
    * prop，`memo` 直接失效（AGENTS.md §5）。
    */
   const onGoLibrary = useEvent((task: TgCacheTask) => void goLibrary(task))
-  /**
-   * 「去下载查看」（2026-10-17 用户裁定「全部都在下载里面」）。
-   *
-   * 两个动作**顺序不可换**：先 `onClose()` 再跳。面板开合态是 store 里的
-   * `tgCacheManagerOpen`（`TgPanel` 挂载本组件），只跳不关的话，用户下次切回 TG 域
-   * 会把面板又弹出来 —— 出口必须走得干净。
-   *
-   * 用 `useEvent` 而非内联箭头：行组件是 `memo` 的，内联函数每次渲染都是新引用，
-   * memo 直接失效（AGENTS.md §5）。
-   */
-  const goDownloadRow = useEvent(() => {
-    onClose()
-    onOpenDownload?.()
-  })
-  /**
-   * ★ 宿主**真的接了线**才把回调透给行组件（BUG-324 复报修正）。
-   *
-   * 原先无条件传 `goDownloadRow`：宿主没给 `onOpenDownload` 时按钮**照样渲染**，
-   * 点了只关面板、不切视图 —— 一个**能点但做不成事**的死按钮。用户报
-   * 「按钮有了,但是功能全部没有实现」正是这个形态（HMR 只热更了本组件、
-   * `MainLayout` 新增的 `onOpenDownload` 尚未生效时就会复现）。
-   *
-   * 判据：**能渲染的按钮必须能做它承诺的事**。宿主没接线 ⇒ 不渲染（本组件无从
-   * 判断宿主是否接线，所以由宿主的存在与否决定），与 `onGoLibrary` 同一约定。
-   */
-  const goDownload = onOpenDownload ? goDownloadRow : undefined
   const onAskDelete = useEvent((task: TgCacheTask) => setConfirm({ kind: 'one', id: task.id }))
   // 筛选：三档标签**只决定看什么**，同时它也是「全选」的作用范围。
   const visible = useMemo(() => {
@@ -956,7 +764,21 @@ export function CacheManagerDialog(props: {
   /** 已取消单独成组：不占主视图（统计条与分组标签都不算它），只留在「更多」里。 */
   const cancelled = useMemo(() => tasks.filter((x) => GROUP_OF[x.status] === 'cancelled'), [tasks])
 
-  /** 统计条的三段读数（呈现口径，服务端 counts 按状态给，这里按入库分组归并）。 */
+  /**
+   * BUG-347：**计数本地派生**，单一真源 = 已加载的全量 `tasks`。
+   *
+   * BUG-085 砍掉服务端 `counts` 字段后，消费端仍按「它存在」的方式读取
+   * （`res.counts ?? {}`）⇒ 恒空对象 ⇒ 统计条与三个分组页签读数全是 0，与入口同一
+   * 事实给出互相否定的读数（入口 1/21/73 vs 面板 0/0/0）。
+   *
+   * 列表本体已经是全量，按状态数一遍即可 —— 服务端给不给计数，读数都不受影响
+   * （也让「撒了一个字段却没人报错」这种假可用形态不再可能）。
+   */
+  const counts = useMemo(() => {
+    const out: Record<string, number> = {}
+    for (const x of tasks) out[x.status] = (out[x.status] ?? 0) + 1
+    return out
+  }, [tasks])
   const groups = useMemo(() => groupCounts(counts), [counts])
 
   /**
@@ -1202,7 +1024,8 @@ export function CacheManagerDialog(props: {
                 <label className="flex shrink-0 items-center gap-1.5">
                   <input
                     type="checkbox"
-                    className="h-3.5 w-3.5 accent-accent"
+                    // BUG-346：全选框与行内勾选同一尺寸刻度（16px），14px 是点不准的。
+                    className="h-4 w-4 accent-accent"
                     checked={allVisibleSelected}
                     disabled={busy}
                     onChange={() => onToggleAll()}
@@ -1358,7 +1181,6 @@ export function CacheManagerDialog(props: {
               key={task.id}
               task={task}
               title={ingestTitleOf(task)}
-              now={nowMs}
               busy={busy}
               confirming={confirm?.kind === 'one' && confirm.id === task.id}
               missing={
@@ -1369,7 +1191,6 @@ export function CacheManagerDialog(props: {
               selected={selected.has(task.id)}
               onToggleSelect={onToggleSelect}
               onGoLibrary={onGoLibrary}
-              onGoDownload={goDownload}
               onRetry={onRetry}
               onCancel={onCancelTask}
               onPreferDownload={onPreferDownload}
@@ -1411,7 +1232,6 @@ export function CacheManagerDialog(props: {
                     key={task.id}
                     task={task}
                     title={ingestTitleOf(task)}
-                    now={nowMs}
                     busy={busy}
                     confirming={confirm?.kind === 'one' && confirm.id === task.id}
                     missing={false}
@@ -1419,7 +1239,6 @@ export function CacheManagerDialog(props: {
                     selected={false}
                     onToggleSelect={onToggleSelect}
                     onGoLibrary={onGoLibrary}
-                    onGoDownload={goDownload}
                     onRetry={onRetry}
                     onCancel={onCancelTask}
                     onPreferDownload={onPreferDownload}

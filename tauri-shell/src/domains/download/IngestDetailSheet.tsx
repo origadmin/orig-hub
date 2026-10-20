@@ -358,7 +358,10 @@ export function IngestDetailSheet({
                         downloadable && !isActive
                           ? 'cursor-pointer select-none hover:bg-border-subtle/50'
                           : '',
-                        isSelected ? 'bg-accent/5' : '',
+                        // BUG-346：原先只给 `bg-accent/5` —— 在暗底行背景下与未选中
+                        // 行的差异肉眼不可辨，用户勾完看到的仍是「灰色的、没选上」。
+                        // 选中态必须有**边界**（描边）而不仅是底色深浅。
+                        isSelected ? 'bg-accent/10 ring-1 ring-accent/50' : '',
                       ].join(' ')}
                       title={
                         downloadable && !isActive
