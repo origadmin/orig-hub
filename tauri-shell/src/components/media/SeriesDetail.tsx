@@ -1046,9 +1046,11 @@ export function SeriesDetail(props: {
             </p>
           ) : (
             <>
-              {/* 头：本集标题（**单行省略** §6.2；编辑态只显槽位标签，BUG-203）。
-                  显名统一走 `resolveDisplayName`（D24-A / BUG-310）。 */}
-              <div className="flex min-w-0 flex-wrap items-center gap-2">
+              {/* 头：本集标题（**单行省略** §6.2）。
+                  显名统一走 `resolveDisplayName`（D24-A / BUG-310）。
+                  BUG-350：头部只留「是什么」（标题 + 槽位标签 + 元信息），
+                  编辑入口下移到主区动作条 —— 头部不再混入操作控件。 */}
+              <div data-zone="header" className="flex min-w-0 flex-wrap items-center gap-2">
                 <h3
                   className="min-w-0 flex-1 truncate text-[16px] font-semibold text-fg-strong"
                   title={editingEpisode ? episodeSlotLabel(cur) : curDisplayName ?? ''}
@@ -1058,20 +1060,6 @@ export function SeriesDetail(props: {
                       顶部再渲染一份就是用户看到的「重叠重复 2 行」。 */}
                   {editingEpisode ? episodeSlotLabel(cur) : curDisplayName}
                 </h3>
-                {/* 单一编辑入口：标题行即编辑按钮，点一下进入本集统一编辑态
-                    （标题 / 介绍 / 季号 / 集号 / 结束集号一次提交；集可以没有标题）。
-                    此前入口埋在右栏底部、与标题分处两端，用户找不到改标题的入口，
-                    于是「标题不能修改」像真的一样（关联 BUG-202：编辑被「拆开」）。 */}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-6 self-start px-1.5 text-[11px]"
-                  onClick={editingEpisode ? closeEdit : openEdit}
-                  data-testid="episode-edit"
-                >
-                  <Pencil className="h-3 w-3" />
-                  {t('media.episode.editMeta')}
-                </Button>
                 <span className="shrink-0 rounded-full bg-accent/10 px-2 py-0.5 font-mono text-[10.5px] text-accent">
                   {episodeSlotLabel(cur)}
                 </span>
@@ -1081,7 +1069,144 @@ export function SeriesDetail(props: {
                   {cur.source ? `${t(sourceLabelKey(cur.source))} · ` : ''}#{cur.itemId}
                 </span>
               </div>
-              {/* 统一编辑面板：紧贴标题行渲染，编辑态下直接覆盖本集全部可改内容 */}
+              {/*
+                BUG-350 主区（data-zone="primary"）：单集的**动作面**。
+                播放 = 右栏唯一实心主按钮（设计 `episode-internal-ia-v2` §4.2），
+                现在是右栏**第一个内容**（紧跟头部）—— 此前它被夹在「本集图组」与
+                「本集介绍」两个展示区之间，视觉上像展示流的一部分（用户 2026-10-21：
+                「核心播放位置放到了次(展示)」）。其下一条动作条收拢全部管理动作
+                （编辑 / 挂图 / 前往条目 / 重缓存 / 上移 / 下移 / 移除）——
+                此前这些动作散布右栏三处（标题行 / 移除组 / 操作组）。
+                编辑入口仍是同一开关（BUG-197/202 语义不变，testid 不变）。
+              */}
+              <div data-zone="primary" data-testid="episode-primary-zone" className="flex flex-col gap-2">
+                <Button
+                  className="h-9 w-full gap-1.5 text-[13px]"
+                  disabled={!hasMediaBytes(cur)}
+                  onClick={() => playEpisode(cur)}
+                  title={hasMediaBytes(cur) ? t('media.episode.play') : t('media.fileMissingHint')}
+                  data-testid="episode-play"
+                >
+                  <Play className="h-3 w-3" />
+                  {t('media.episode.play')}
+                </Button>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {/* 单一编辑入口（原标题行按钮下移，BUG-197/202 同一开关） */}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2.5 text-[11px]"
+                    onClick={editingEpisode ? closeEdit : openEdit}
+                    data-testid="episode-edit"
+                  >
+                    <Pencil className="h-3 w-3" />
+                    {t('media.episode.editMeta')}
+                  </Button>
+                  {/* BUG-204：图片编辑收进统一面板（episode-images-manage），
+                      编辑态不再渲染第二个图片入口。 */}
+                  {!editingEpisode ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 px-2.5 text-[11px]"
+                      onClick={() => setAttachingEpisodeId(cur.id)}
+                      data-testid="episode-attach-images"
+                    >
+                      <ImagePlus className="h-3 w-3" />
+                      {t('media.attachImages')}
+                    </Button>
+                  ) : null}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2.5 text-[11px]"
+                    onClick={() => gotoItem(cur)}
+                    data-testid="episode-goto-item"
+                  >
+                    {t('media.episode.gotoItem')}
+                  </Button>
+                  {!hasMediaBytes(cur)
+                    ? (() => {
+                        // BUG-261：判据 = 这一集是否有任一可用来源（候选含备用源 ref），
+                        // 不再绑「当前主源」——主源 local、备用源 tg 时同样可用。
+                        const cand = episodeRecacheCandidates(cur)[0]
+                        return (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 px-2.5 text-[11px]"
+                            disabled={!cand}
+                            onClick={() => recacheEpisode(cur)}
+                            title={
+                              cand
+                                ? t('media.recache')
+                                : t('media.episode.recacheNoRoute', {
+                                    source: t(sourceLabelKey(cur.source)),
+                                  })
+                            }
+                            data-testid="episode-recache"
+                          >
+                            <CloudOff className="h-3 w-3" />
+                            {t('media.recache')}
+                          </Button>
+                        )
+                      })()
+                    : null}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2 text-[11px]"
+                    onClick={() => {
+                      void (async () => {
+                        try {
+                          const r = await moveEpisode(cur.id, 'up')
+                          if (!r.moved) onError(t('media.episode.firstInSeason'))
+                          else onChanged()
+                        } catch (e) {
+                          onError(e instanceof Error ? e.message : String(e))
+                        }
+                      })()
+                    }}
+                    title={t('media.episode.moveUp')}
+                    data-testid="episode-move-up"
+                  >
+                    <ChevronUp className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2 text-[11px]"
+                    onClick={() => {
+                      void (async () => {
+                        try {
+                          const r = await moveEpisode(cur.id, 'down')
+                          if (!r.moved) onError(t('media.episode.lastInSeason'))
+                          else onChanged()
+                        } catch (e) {
+                          onError(e instanceof Error ? e.message : String(e))
+                        }
+                      })()
+                    }}
+                    title={t('media.episode.moveDown')}
+                    data-testid="episode-move-down"
+                  >
+                    <ChevronDown className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2.5 text-[11px] text-destructive"
+                    onClick={() => props.onRemoveEpisode(cur)}
+                    title={t('media.episode.removeFromSeries')}
+                    data-testid="episode-remove"
+                  >
+                    <Trash2 className="h-3 w-3" />
+                    {t('media.episode.removeFromSeries')}
+                  </Button>
+                </div>
+              </div>
+
+              {/* 统一编辑面板：主区之后渲染，编辑态下直接覆盖本集全部可改内容 */}
               {editingEpisode ? (
                 <div ref={editBlockRef} className="rounded-lg border border-border-subtle/60 bg-surface-2/30 p-2.5">
                   <EpisodeEditPanel
@@ -1097,46 +1222,35 @@ export function SeriesDetail(props: {
                 </div>
               ) : null}
 
+              {/*
+                BUG-350 次区（data-zone="secondary"）：单集的**展示面**（纯浏览流）。
+                本集图组 / 本集介绍 / 来源 / 合并溯源全部收进这里，容器只有一条
+                分隔线 —— 此前四个展示块各自带 border-t 与动作块交错平铺 8 段
+                （用户 2026-10-21：「排版逻辑非常混乱」）。
+              */}
+              <div data-zone="secondary" data-testid="episode-secondary-zone" className="flex flex-col gap-3 border-t border-border-subtle/60 pt-2.5">
               {/* 本集图组 = **stacked deck 折叠跑马灯**（规范核心；只留右栏 §6.1）。
                   点左半=上一张 / 右半=下一张；⤢ 打开灯箱（能力 R6 保留）。
-                  BUG-203/204：编辑态隐藏 —— 图片的增删替在编辑面板内进行
-                  （面板图片条 + 挂图选择器），同时再渲染一份跑马灯就成了与
-                  面板缩略图重复的第二处「本集图组」。 */}
-              {!editingEpisode ? (
-                <div className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5">
+                  BUG-203/204：编辑态隐藏 —— 图片的增删替在编辑面板内进行。
+                  BUG-350：无帧（无集图无挂图）时整块不渲染 —— 空区块标题是噪音
+                  （BUG-340 同口径：没有获取就应该不显示）。 */}
+              {!editingEpisode && focusFrames.length > 0 ? (
+                <div className="flex flex-col gap-1.5">
                   <h4 className="text-[12px] font-semibold text-fg-strong">
                     {t('media.episode.sectionImages')}
                   </h4>
-                  {focusFrames.length > 0 ? (
-                    <div className="py-1">
-                      <Deck
-                        frames={focusFrames}
-                        w={focusPortrait ? 170 : 300}
-                        h={focusPortrait ? 302 : 169}
-                        maxW={420}
-                        peek={26}
-                        onOpenFrame={(i) => openFocusLightbox(cur, i)}
-                      />
-                    </div>
-                  ) : null}
+                  <div className="py-1">
+                    <Deck
+                      frames={focusFrames}
+                      w={focusPortrait ? 170 : 300}
+                      h={focusPortrait ? 302 : 169}
+                      maxW={420}
+                      peek={26}
+                      onOpenFrame={(i) => openFocusLightbox(cur, i)}
+                    />
+                  </div>
                 </div>
               ) : null}
-
-              {/* ▶ 播放本集 = 右栏**唯一实心主按钮**（设计 `episode-internal-ia-v2` §4.2：
-                  「▶ 播放本集 ← 唯一实心主按钮，独占一行，位置随集不变」）。
-                  播放是高频主任务，前置于浏览主战场：紧跟本集图组 Deck 之后、本集介绍
-                  之前 —— 位置由结构固定，不随介绍长度 / 挂图数量漂移。此前它被埋在右栏
-                  底部「操作」区、与三个描边按钮同尺寸，主任务被降格为并列操作（BUG-210）。 */}
-              <Button
-                className="h-9 w-full gap-1.5 text-[13px]"
-                disabled={!hasMediaBytes(cur)}
-                onClick={() => playEpisode(cur)}
-                title={hasMediaBytes(cur) ? t('media.episode.play') : t('media.fileMissingHint')}
-                data-testid="episode-play"
-              >
-                <Play className="h-3 w-3" />
-                {t('media.episode.play')}
-              </Button>
 
               {/* 本集介绍（BUG-281 产品裁定：**按来源贴标签，不再按文本隐藏**）。
                   非空即渲染：与剧集介绍逐字相同 ⇒ 贴「剧集介绍」标签（TG 相册组
@@ -1146,7 +1260,7 @@ export function SeriesDetail(props: {
                   BUG-203：编辑态隐藏 —— 介绍正在编辑面板的 textarea 里，正文再渲染一份
                   就是第二处重复（与标题的 2 行重叠同根因）。 */}
               {!editingEpisode ? (
-                <div className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5">
+                <div className="flex flex-col gap-1.5">
                   <span
                     className="text-[11px] font-medium text-fg-strong"
                     data-testid="episode-focus-desc-label"
@@ -1180,7 +1294,7 @@ export function SeriesDetail(props: {
                   **控件** —— 无备用源时 `<ul>` 不进 DOM（非 hidden/opacity-0），
                   既有 2 个 testid（episode-source-switch / episode-source-detach）原样保留。 */}
               <div
-                className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5"
+                className="flex flex-col gap-1.5"
                 data-testid="episode-source-info"
               >
                 <span className="text-[11px] font-medium text-fg-strong">{t('media.episode.sourcesTitle')}</span>
@@ -1198,15 +1312,17 @@ export function SeriesDetail(props: {
                       坐标是入库时记下的 `ref`（TG 即 `<chat>:<msg>`），数据一直在、
                       只是没有出口；无标内容（占位标题）靠它才能被人工辨认。
                       本地来源解析不出 TG 消息 ⇒ 无入口（点了也没有可跳的坐标）。
-                      BUG-305：应用内跳转升级为**主入口**（不离开 OrigHub，
-                      切到 TG 插件面板并定位到该频道该消息）；t.me 外链保留为
-                      **次要出口**（`episode-source-view-tg` 原样不改名 ——
-                      BUG-285 判据①a 依赖该 testid 与 href 形状）。 */}
+                      BUG-305：应用内跳转（不离开 OrigHub，切到 TG 插件面板并定位到
+                      该频道该消息）+ t.me 外链（`episode-source-view-tg` 原样不改名 ——
+                      BUG-285 判据①a 依赖该 testid 与 href 形状）。
+                      BUG-350：应用内跳转按钮**视觉降级为次要样式**（与外链同款灰边）
+                      —— 「去 TG 看」是次内容：左栏选集器每行已有该入口，右栏来源行
+                      再放高亮主位按钮就是主次颠倒（用户 2026-10-21）。 */}
                   {curTgAt && props.onViewInTg ? (
                     <button
                       type="button"
                       onClick={() => props.onViewInTg?.(curTgAt)}
-                      className="shrink-0 rounded border border-accent/60 bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent hover:bg-accent/20"
+                      className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-muted hover:bg-surface-2 hover:text-fg-mid"
                       title={t('media.viewInTg')}
                       data-testid="episode-source-jump-tg"
                     >
@@ -1262,7 +1378,7 @@ export function SeriesDetail(props: {
                             <button
                               type="button"
                               onClick={() => props.onViewInTg?.(sTgAt)}
-                              className="shrink-0 rounded border border-accent/60 bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent hover:bg-accent/20"
+                              className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-muted hover:bg-surface-2 hover:text-fg-mid"
                               title={t('media.viewInTg')}
                               data-testid="episode-source-jump-tg"
                             >
@@ -1288,116 +1404,9 @@ export function SeriesDetail(props: {
                 ) : null}
               </div>
 
-              {/* 单集结构性操作：上移 / 下移 / 移除（编辑入口已上移到标题行，见右栏头） */}
-              <div className="flex flex-wrap items-center gap-2 border-t border-border-subtle/60 pt-2.5">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 px-2 text-[11px]"
-                    onClick={() => {
-                      void (async () => {
-                        try {
-                          const r = await moveEpisode(cur.id, 'up')
-                          if (!r.moved) onError(t('media.episode.firstInSeason'))
-                          else onChanged()
-                        } catch (e) {
-                          onError(e instanceof Error ? e.message : String(e))
-                        }
-                      })()
-                    }}
-                    title={t('media.episode.moveUp')}
-                    data-testid="episode-move-up"
-                  >
-                    <ChevronUp className="h-3.5 w-3.5" />
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 px-2 text-[11px]"
-                    onClick={() => {
-                      void (async () => {
-                        try {
-                          const r = await moveEpisode(cur.id, 'down')
-                          if (!r.moved) onError(t('media.episode.lastInSeason'))
-                          else onChanged()
-                        } catch (e) {
-                          onError(e instanceof Error ? e.message : String(e))
-                        }
-                      })()
-                    }}
-                    title={t('media.episode.moveDown')}
-                    data-testid="episode-move-down"
-                  >
-                    <ChevronDown className="h-3.5 w-3.5" />
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 px-2.5 text-[11px] text-destructive"
-                    onClick={() => props.onRemoveEpisode(cur)}
-                    title={t('media.episode.removeFromSeries')}
-                    data-testid="episode-remove"
-                  >
-                    <Trash2 className="h-3 w-3" />
-                    {t('media.episode.removeFromSeries')}
-                  </Button>
-                </div>
-
-              {/* 操作（规范 rightPane：挂图(+) / 在媒体库中查看 / 重缓存）。
-                  ▶ 播放本集已上移为右栏唯一实心主按钮（见图组之后），此处不再重复。 */}
-              <div className="flex flex-wrap items-center gap-2 border-t border-border-subtle/60 pt-2.5">
-                <span className="text-[11px] font-medium text-fg-strong">{t('media.episode.actions')}</span>
-                {/* BUG-204：图片编辑收进统一面板（episode-images-manage），
-                    编辑态不再渲染第二个图片入口；浏览态保留原按钮。 */}
-                {!editingEpisode ? (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 px-2.5 text-[11px]"
-                    onClick={() => setAttachingEpisodeId(cur.id)}
-                    data-testid="episode-attach-images"
-                  >
-                    <ImagePlus className="h-3 w-3" />
-                    {t('media.attachImages')}
-                  </Button>
-                ) : null}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 px-2.5 text-[11px]"
-                  onClick={() => gotoItem(cur)}
-                  data-testid="episode-goto-item"
-                >
-                  {t('media.episode.gotoItem')}
-                </Button>
-                {!hasMediaBytes(cur) ? (
-                  (() => {
-                    // BUG-261：判据 = 这一集是否有任一可用来源（候选含备用源 ref），
-                    // 不再绑「当前主源」——主源 local、备用源 tg 时同样可用。
-                    const cand = episodeRecacheCandidates(cur)[0]
-                    return (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="h-7 px-2.5 text-[11px]"
-                        disabled={!cand}
-                        onClick={() => recacheEpisode(cur)}
-                        title={
-                          cand
-                            ? t('media.recache')
-                            : t('media.episode.recacheNoRoute', {
-                                source: t(sourceLabelKey(cur.source)),
-                              })
-                        }
-                        data-testid="episode-recache"
-                      >
-                        <CloudOff className="h-3 w-3" />
-                        {t('media.recache')}
-                      </Button>
-                    )
-                  })()
-                ) : null}
-              </div>
+              {/* BUG-350：上移/下移/移除与「操作」组（挂图/前往条目/重缓存）已并入
+                  主区动作条（episode-primary-zone）—— 此前管理动作散布右栏三处，
+                  与展示块交错平铺 8 段。 */}
 
               {/* 合并溯源 */}
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-muted">
@@ -1411,6 +1420,7 @@ export function SeriesDetail(props: {
                       : ''}
                   </span>
                 ) : null}
+              </div>
               </div>
             </>
           )}
