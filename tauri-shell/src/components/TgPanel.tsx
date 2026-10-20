@@ -129,8 +129,13 @@ interface FeedItem {
    * 「已下载的 .jpg 被判成 file/视频」正是漏了它造成的。
    */
   filePath?: string
-  /** TG 相册分组 ID（grouped_id；同组相邻消息聚合为一个相册气泡，v0.4.2） */
-  groupId?: number
+  /**
+   * TG 相册分组 ID（grouped_id；同组相邻消息聚合为一个相册气泡，v0.4.2）。
+   *
+   * **string**（BUG-345）：group_id ~1.4e16 > JS 2^53，number 过 JSON 界即丢
+   * 精度（活库 62/70 个组键任务被污染差 1）；后端串界序列化 + 宽容反序列化。
+   */
+  groupId?: string
   downloaded?: boolean
 }
 
@@ -389,20 +394,10 @@ export function TgPanel(
    */
   const [alive, setAlive] = useState(false)
   const [channels, setChannels] = useState<TgChannel[]>([])
-  /**
-   * 订阅列表是否已首次取到（BUG-330 TGM-02 + BUG-318 纪律）：
-   * 监听链状态条的频道数在取到前渲染 `—` 而不是 `0` —— 把「取不到」渲染成 0
-   * 会让用户以为真的没有频道。只有首次 fetchDialogs 真正 resolve 后才置 true。
-   */
-  const [channelsResolved, setChannelsResolved] = useState(false)
   /** 用户自定义分组（含 channelIds = Telegram pin 顺序，用于组内 pin 置顶排序） */
   const [folders, setFolders] = useState<TgFolder[]>([])
   const [scanning, setScanning] = useState(false)
   const [monitoredList, setMonitoredList] = useState<TgMonitoredChannel[]>([])
-  /** 监控列表是否已首次取到（BUG-330 TGM-02 + BUG-318：取不到渲染 `—` 不渲染 0） */
-  const [monitoredResolved, setMonitoredResolved] = useState(false)
-  /** 筛选规则是否已首次取到（同上） */
-  const [filtersResolved, setFiltersResolved] = useState(false)
   /** 监控列表折叠状态（默认展开） */
   const [monitorOpen, setMonitorOpen] = useState(true)
   /**
@@ -671,7 +666,6 @@ export function TgPanel(
     void (async () => {
       try {
         const cached = await fetchDialogs(false)
-        setChannelsResolved(true)
         // 冷启动：缓存为空 → 自动补一次后台扫描（后端 total==0 时同样会自扫，双保险）
         if (cached === 0) await fetchDialogs(true)
       } catch {
@@ -682,7 +676,6 @@ export function TgPanel(
     listTgMonitoredChannels()
       .then((m) => {
         setMonitoredList(m)
-        setMonitoredResolved(true)
       })
       .catch(() => {
         // BUG-167：同上，后台监控列表加载失败静默，不打脸连接灯。
@@ -779,22 +772,6 @@ export function TgPanel(
   )
 
   /*
-   * 监听链状态条三数（BUG-330 TGM-02，设计 §2.0/§2.1）：
-   * 分别取 channels（订阅扫描）/ monitored（监控列表）/ filters（命中合计）三个 list
-   * 端点真值 —— 侧栏每一个数必须与 API 真值是同一个数，不许自己再算一套（BUG-125/133）。
-   */
-  const chainChannelCount = channels.length
-  const chainMonitoredCount = monitoredList.length
-  const chainHitTotal = useMemo(() => filters.reduce((s, f) => s + f.hits, 0), [filters])
-  const chainNewTotal = useMemo(
-    () =>
-      monitoredRows.reduce((s, r) => s + (r.newCount ?? 0), 0) +
-      filters.reduce((s, f) => s + (f.newHits ?? 0), 0),
-    [monitoredRows, filters],
-  )
-  /** 监控行的行内溯源（L2→L1 出处，设计 §2.3）：频道可属多个分组，取订阅列表里记录的分组 */
-  const folderOfChannel = (id: number) => channels.find((c) => c.id === id)?.folder
-
   /*
    * 数据驱动首落点（TGM-03；nav/index.ts::DEFAULT_TG_MODE 注释同源）：
    * 默认 tgMode='channels' 且本会话还没为用户选过屏时，落到第一个监控频道
@@ -1474,7 +1451,6 @@ export function TgPanel(
   const refreshFilters = useCallback(async () => {
     try {
       setFilters(await listTgMonitorFilters())
-      setFiltersResolved(true)
     } catch {
       // BUG-167：后台加载失败静默（顶部可用性横幅是唯一真相源）。
     }
@@ -1915,64 +1891,12 @@ export function TgPanel(
         <>
       <aside className="flex w-72 shrink-0 flex-col border-r border-border-subtle bg-surface/30">
         {/*
-         * 监听链状态条（BUG-330 TGM-02，设计 §2.0「两序分离」）：
-         * 构建序（频道 → 监控 → 筛选）由这条常驻可点的状态条承载；三节版面按**消费序**排
-         * （③ 筛选 → ② 监控 → ① 频道）。三数分别取 channels / monitored / filters 三个
-         * list 端点真值 —— 侧栏每一个数必须与 API 真值是同一个数（BUG-125/133）。
-         * 不是新导航位（BUG-314）：点阶段 = 展开并滚至对应节。
+         * 单一滚动容器（设计 §2.1）：撤掉监控节的 max-h-56 与分组节的 flex-1 各自限高
+         * ——「规则多了挤垮分组」在结构上不可能发生（诉求②的结构性修法）。
+         * 消费序：③ 筛选（每日第一眼）→ ② 监控 → ① 频道（默认折叠 = 优先级表达）。
+         * （BUG-330 第三次复报：监听链状态条与 ①②③ 漏斗编号为无授权元素，已撤——
+         *  元素授权台账见 BUG-330 复报记录；常量计数仍与 API 真值同源。）
          */}
-        <div
-          data-testid="tg-chain-bar"
-          aria-label={t('tg.chainAria')}
-          className="flex shrink-0 items-center gap-1 border-b border-border-subtle/60 px-2.5 py-1.5 text-[12px] text-muted"
-        >
-          <button
-            type="button"
-            title={t('tg.chainGoChannels')}
-            onClick={() => {
-              setChannelOpen(true)
-              document.getElementById('tg-section-channels')?.scrollIntoView({ block: 'start' })
-            }}
-            className="rounded px-1 py-0.5 tabular-nums transition-colors hover:bg-surface-2 hover:text-fg-strong"
-          >
-            {/* BUG-318：取不到渲染 `—`，不得渲染 0（「没有频道」与「还没问到」是两件事） */}
-            {channelsResolved ? t('tg.chainChannels', { n: chainChannelCount }) : '—'}
-          </button>
-          <span aria-hidden="true">→</span>
-          <button
-            type="button"
-            title={t('tg.chainGoMonitor')}
-            onClick={() => {
-              setMonitorOpen(true)
-              document.getElementById('tg-section-monitor')?.scrollIntoView({ block: 'start' })
-            }}
-            className="rounded px-1 py-0.5 tabular-nums transition-colors hover:bg-surface-2 hover:text-fg-strong"
-          >
-            {monitoredResolved ? t('tg.chainMonitored', { n: chainMonitoredCount }) : '—'}
-          </button>
-          <span aria-hidden="true">→</span>
-          <button
-            type="button"
-            title={t('tg.chainGoFilter')}
-            onClick={() => {
-              setFilterOpen(true)
-              document.getElementById('tg-section-filter')?.scrollIntoView({ block: 'start' })
-            }}
-            className="rounded px-1 py-0.5 tabular-nums transition-colors hover:bg-surface-2 hover:text-fg-strong"
-          >
-            {filtersResolved ? t('tg.chainHits', { n: chainHitTotal }) : '—'}
-          </button>
-          {chainNewTotal > 0 ? (
-            <span
-              data-testid="tg-chain-new"
-              title={t('tg.monitorNewHint', { n: chainNewTotal })}
-              className="ml-auto shrink-0 rounded-md border border-accent/40 bg-accent/10 px-1.5 py-0.5 font-semibold tabular-nums text-accent"
-            >
-              {t('tg.chainNew', { n: chainNewTotal })}
-            </span>
-          ) : null}
-        </div>
-
         {/*
          * 单一滚动容器（设计 §2.1）：撤掉监控节的 max-h-56 与分组节的 flex-1 各自限高
          * ——「规则多了挤垮分组」在结构上不可能发生（诉求②的结构性修法）。
@@ -2002,29 +1926,32 @@ export function TgPanel(
                   <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
                 )}
               </button>
-              {/* 漏斗深度编号（设计 §2.5）：③ 最窄在顶 = 产出端 */}
-              <span aria-hidden="true" className="shrink-0 text-[12px] text-muted">③</span>
               <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold text-fg-strong">
-                {t('tg.filterHeading')} ({filtersResolved ? filters.length : '—'})
+                {t('tg.filterHeading')}
               </h3>
               {/*
-               * v3 新建入口（用户 2026-10-20 裁定）：节标题**右上角「+ 新建」按钮 → 弹窗**。
-               * 撤掉规则列表下方常驻的「一行 Input + 添加按钮」——用户原话「当前下方一行
-               * 的方式严重破坏了整体设计」。添加是偶发动作，不占常驻版面；节首屏只剩规则
-               * 本体。弹窗内控件沿用 BUG-329 既有 testid（验收 selector 不变）。
+               * 节头动作钮 token（BUG-344）：h-7 + 有边框有底色（secondary）。
+               * BUG-327「存在≠可用」与 BUG-344「按钮过大/右边还有文字」的共同解 =
+               * **可见性由边框+底色承担，不由尺寸+文字承担**：v3 的 h-9 图标+文字是
+               * 对 BUG-327 的过度矫正（把「看得见」错当成「要大要有字」）；收敛为
+               * 28px 图标钮 + secondary 边框底色后，既是真按钮又不占版面。
+               * v3 新建入口（用户 2026-10-20 裁定）：节标题右上角图标钮 → 弹窗。
+               * 撤掉规则列表下方常驻的「一行 Input + 添加按钮」——用户原话「当前下方
+               * 一行的方式严重破坏了整体设计」。弹窗内控件沿用 BUG-329 既有 testid
+               * （验收 selector 不变）。
                */}
               <div className="relative shrink-0">
                 <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 w-7 shrink-0 p-0"
+                  variant="secondary"
+                  size="icon-sm"
+                  className="shrink-0"
                   aria-label={t('tg.filterNewDlgTitle')}
                   aria-expanded={filterDlgOpen}
                   aria-haspopup="dialog"
                   data-testid="tg-filter-new"
                   onClick={() => setFilterDlgOpen((v) => !v)}
                 >
-                  <Plus className="h-4 w-4" aria-hidden="true" />
+                  <Plus className="h-3.5 w-3.5" aria-hidden="true" />
                 </Button>
                 {filterDlgOpen && (
                   <div
@@ -2087,7 +2014,6 @@ export function TgPanel(
             </div>
             {filterOpen && (
               <div id="tg-filter-list-body" className="px-1.5 pb-1.5">
-                <p className="px-2 pb-1 text-[12px] text-muted">{t('tg.filterSub')}</p>
                 {/* 节内检索框（常驻）：规则量级 ≤ 几百，纯客户端过滤。
                     BUG-320 纪律：入口可见性不搞「规则多了才出现」。 */}
                 <div className="px-1 pb-1">
@@ -2151,12 +2077,6 @@ export function TgPanel(
                               {!sameAsKeyword && (
                                 <p className="truncate text-[12px] text-muted">“{f.keyword}”</p>
                               )}
-                              {/* 行内溯源（设计 §2.4，L3→L2 依赖）：N = monitored 端点真值 */}
-                              {monitoredResolved && (
-                                <p className="truncate text-[12px] text-muted">
-                                  {t('tg.filterScopeMonitored', { n: chainMonitoredCount })}
-                                </p>
-                              )}
                             </div>
                             {/* +N 新命中徽标（TGM-04 新增；0 不渲染——同 BUG-329 徽标纪律） */}
                             {f.newHits && f.newHits > 0 ? (
@@ -2178,8 +2098,8 @@ export function TgPanel(
                           </button>
                           <Button
                             variant="ghost"
-                            size="sm"
-                            className="h-8 w-8 shrink-0 p-0 text-[12px] text-muted hover:text-danger"
+                            size="icon-sm"
+                            className="shrink-0 text-muted hover:text-danger"
                             onClick={() => void removeFilter(f.id)}
                             title={t('tg.filterRemove')}
                             aria-label={t('tg.filterRemove')}
@@ -2234,15 +2154,13 @@ export function TgPanel(
                   <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
                 )}
               </button>
-              <span aria-hidden="true" className="shrink-0 text-[12px] text-muted">②</span>
               {/* 设计 §2.1 图标纪律：节头禁 emoji —— 原此处 `⭐`（全仓唯一节头 emoji）已清除 */}
               <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold text-fg-strong">
-                {t('tg.navMonitor')} ({monitoredResolved ? monitoredList.length : '—'})
+                {t('tg.navMonitor')}
               </h3>
               <Button
-                variant="ghost"
-                size="sm"
-                className="h-7 px-2 text-[11px]"
+                variant="secondary"
+                size="xs"
                 onClick={doSync}
                 disabled={syncing || monitoredList.length === 0}
               >
@@ -2255,16 +2173,11 @@ export function TgPanel(
                 data-testid="tg-monitor-list"
                 className="p-1.5"
               >
-                <p className="px-2 pb-1 text-[12px] text-muted">{t('tg.monitorSecSub')}</p>
                 {monitoredRows.length === 0 ? (
                   <p className="px-2 py-4 text-center text-xs text-muted">{t('tg.monitorEmpty')}</p>
                 ) : (
                   monitoredRows.map((ch) => {
                     const active = selectedId === ch.id && !activeFilter
-                    const folder = folderOfChannel(ch.id)
-                    const fromGroup = t('tg.monitorFromGroup', {
-                      group: folder ?? t('tg.ungrouped'),
-                    })
                     return (
                       <div
                         key={ch.id}
@@ -2285,14 +2198,6 @@ export function TgPanel(
                             <p className="truncate text-[13px] font-medium text-fg-strong">
                               {ch.title}
                             </p>
-                            {ch.username || folder !== undefined ? (
-                              /* 行内溯源（设计 §2.3，L2→L1 出处）：频道可属多个分组，
-                                 取订阅列表记录的分组；无 username 时溯源独占副行。 */
-                              <p className="truncate text-[12px] text-muted">
-                                {ch.username ? `@${ch.username}` : fromGroup}
-                                {ch.username ? ` · ${fromGroup}` : ''}
-                              </p>
-                            ) : null}
                           </div>
                           {/* 未读徽标（BUG-329）：口径 =「自上次点开以来新增」。
                               0 条时不渲染 —— 一排「+0」既占位又暗示有新内容。 */}
@@ -2335,39 +2240,35 @@ export function TgPanel(
                   <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
                 )}
               </button>
-              <span aria-hidden="true" className="shrink-0 text-[12px] text-muted">①</span>
               <h3 className="min-w-0 flex-1 truncate text-[13px] font-semibold text-fg-strong">
-                {t('tg.navChannels')} ({channelsResolved ? channels.length : '—'})
+                {t('tg.navChannels')}
               </h3>
-              <span className="shrink-0 text-[12px] tabular-nums text-muted">
-                {monitoredResolved ? t('tg.monitoredCount', { n: chainMonitoredCount }) : '—'}
-              </span>
-              {scanning ? (
-                <span className="flex items-center gap-1.5 px-1 text-[10px] text-muted">
-                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
-                  {t('tg.scanning')}
-                </span>
-              ) : (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 px-2 text-[11px]"
-                  onClick={() =>
-                    // BUG-167：用户主动重扫失败仍给全局反馈（这是用户在等的动作结果，
-                    // 与后台静默加载不同）；后台加载路径见挂载/轮询 effect 的静默分支。
-                    void fetchDialogs(true).catch((e) =>
-                      setError(e instanceof Error ? e.message : String(e)),
-                    )
-                  }
-                  disabled={!alive}
-                >
-                  {t('tg.refresh')}
-                </Button>
-              )}
+              {/*
+               * BUG-340（2026-10-20 夜用户报障）：节头原有三样全撤——① `(524)` dialogs
+               * 全量扫描原始计数（用户原话「数字…全是错误内容」）；②「N 个监控中」
+               * （监控规模归监控节，这里是重复且易误读的二手数）；③「正在后台扫描订阅
+               * 列表…」+ 脉冲点（后台状态文本，用户判定破坏样式）。连同筛选/监控节头的
+               * `(N)` 计数与 `—` 兜底一并撤除（v4 元素授权台账：面板只放用户点过名的
+               * 元素；数据未就绪 = 不渲染，从来没有 `(-)` 的需求——BUG-318 纪律）。
+               * 节头只留标题 + 动作钮（刷新）。
+               */}
+              <Button
+                variant="secondary"
+                size="xs"
+                onClick={() =>
+                  // BUG-167：用户主动重扫失败仍给全局反馈（这是用户在等的动作结果，
+                  // 与后台静默加载不同）；后台加载路径见挂载/轮询 effect 的静默分支。
+                  void fetchDialogs(true).catch((e) =>
+                    setError(e instanceof Error ? e.message : String(e)),
+                  )
+                }
+                disabled={!alive}
+              >
+                {t('tg.refresh')}
+              </Button>
             </div>
             {channelOpen && (
               <div id="tg-channel-list" className="p-1.5">
-                <p className="px-2 pb-1 text-[12px] text-muted">{t('tg.channelSecSub')}</p>
                 {groupSections.map((sec) => {
                   const active = groupMode === sec.key
                   return (
@@ -2421,8 +2322,8 @@ export function TgPanel(
               </span>
               <Button
                 variant="ghost"
-                size="sm"
-                className="h-7 shrink-0 px-2 text-[11px]"
+                size="xs"
+                className="shrink-0"
                 onClick={() => {
                   clearGlobalSearch()
                   // TGM-03：清除 = 退出瞬态 'search' 模式，回到进来之前的那一屏
@@ -2619,8 +2520,8 @@ export function TgPanel(
               {cameFromListRef.current !== null && (
                 <Button
                   variant="ghost"
-                  size="sm"
-                  className="h-7 shrink-0 px-2 text-[11px]"
+                  size="xs"
+                  className="shrink-0"
                   onClick={() => {
                     // 回到进来之前的分组列表（TGM-03：瞬态前模式同款语义）
                     const back = cameFromListRef.current ?? 'channels'
@@ -2654,8 +2555,8 @@ export function TgPanel(
                    */}
                   <Button
                     variant="ghost"
-                    size="sm"
-                    className="h-7 shrink-0 px-2 text-[11px] text-muted hover:text-danger"
+                    size="xs"
+                    className="shrink-0 text-muted hover:text-danger"
                     onClick={() => {
                       if (selectedId !== null) void removeMonitor(selectedId)
                     }}
@@ -2668,8 +2569,7 @@ export function TgPanel(
               ) : (
                 <Button
                   variant="secondary"
-                  size="sm"
-                  className="h-7 text-[11px]"
+                  size="xs"
                   onClick={() => void addMonitor(selectedChannel)}
                 >
                   {t('tg.addMonitor')}

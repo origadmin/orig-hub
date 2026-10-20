@@ -1,23 +1,32 @@
 'use strict'
 /**
- * BUG-330 TGM-02 探针：左栏消费序重排（③筛选→②监控→①频道 + 监听链状态条 +
- * 单一滚动容器 + 节折叠真控件 + 行内溯源 + §2.7 单一写面）。
+ * BUG-330 TGM-02 探针（2026-10-20 第三次复报后重写）：左栏消费序 + 元素授权台账。
  *
- * 判据（真实渲染 + 与 API 真值对比，不允许「存在即通过」）：
- *   P1 监听链状态条存在，三数与 API 真值逐项相等（dialogs 数 / monitored 数 /
- *      filters 命中合计）—— 证伪「侧栏自己算一套」。
- *   P2 消费序：DOM 上筛选节在监控节前、监控节在频道节前（compareDocumentPosition）。
- *   P3 频道节默认折叠（aria-expanded=false 且组行不渲染）；点击真控件后展开。
- *   P4 监控节副标为用户口径文案；至少一行监控行带「来自 <分组>」溯源。
- *   P5 左栏内不再有「取消监控」按钮（§2.7 单一写面：② 只读投影）。
- *   P6 单一滚动容器：三节同属一个 overflow-y-auto 容器；监控列表 computed
- *      max-height 为 none（撤掉旧的 max-h-56 各自限高）。
- *   P7 三个节头 h3 不含 emoji（⭐ 已清除）。
- *   P8 主列频道实体行有「取消监控」按钮（取消能力的唯一写面之一）。
- *   P9 +N 新徽标（有样本时）数字 === API newCount/newHits 合计；无样本时 SKIP 不冒充。
+ * 第三次复报（用户原话）：「524 频道→3 监控→12 命中 什么逻辑谁说要这个了?」
+ * 「③ 这3个数字出现的意义是什么?」「来源——加监控在主列频道页/管理列表完成
+ * 这些说明我记得规则有强烈限制不允许」「①频道(… 显示不全」。
+ * ⇒ 判据从「验证我方设计的机制存在」翻转为「**无授权元素必须不存在**」。
  *
- * 反向证伪（--expect-legacy）：反置 P2（期望旧版面序：监控在筛选前）与 P3
- *（期望频道节默认展开）⇒ 必须 FAIL 且 exit 1。
+ * 判据（真实渲染 + 与 API 真值对比）：
+ *   P1a 监听链状态条（tg-chain-bar）不存在（无授权元素，BUG-330 台账）；
+ *   P1b ①②③ 漏斗编号不存在（无授权）；
+ *   P1c 常驻说明/溯源文案不存在：aside 全文不得含「来自」「搜 N 个监控频道」
+ *       「来源——」「每条规则就是一条监控」「只检查这些频道的实时更新」（BUG-148）；
+ *   P2 消费序：DOM 上筛选节在监控节、监控节在频道节前；
+ *   P3 频道节默认折叠（aria-expanded=false 且组行不渲染）；点真控件后展开；
+ *   P4 节头**无污染**（BUG-340，2026-10-20 夜用户报障「(524) 3 个监控中 正在后台
+ *      扫描订阅列表… 数字,监控数,扫描,这些全是错误内容」+「数据异常时显示(-)…
+ *      从来没有需要显示(-)的要求」）：频道节头无原始计数/无「N 个监控中」/无
+ *      「正在后台扫描」状态文本/无脉冲点；全左栏无 `—` 占位；节头零截断；
+ *   P5 左栏无「取消监控」按钮（§2.7 单一写面）；
+ *   P6 三节同属一个 overflow-y-auto 容器；监控列表 computed max-height 为 none；
+ *   P7 三个节头 h3 不含 emoji；
+ *   P8 主列频道实体行有「取消监控」按钮；
+ *   P9 行内 +N 徽标合计 === API newCount/newHits 合计（无样本 SKIP）。
+ *
+ * 反向证伪（--expect-legacy）：反置 P2/P3（旧版面序/旧默认展开）、
+ * P1a/P1c（期望状态条与溯源文案**存在**——第二次复报前的形态）与
+ * P4（期望节头污染存在——BUG-340 前的形态）⇒ 必须 FAIL exit 1。
  *
  * 用法：node tauri-shell/verify/_probe_tgm02_left_column.cjs [--expect-legacy]
  * 前置：dev 5180 + daemon 19786（orig-tg 19787）。产物 verify_shots/tgm02-left-column/
@@ -39,7 +48,9 @@ async function getJson(url) {
   return res.json()
 }
 
-/** 等左栏真的渲染出来（等行出现，不是等容器——BUG-324 探针竞态纪律）。 */
+/** 等左栏真的渲染出来（等行出现，不是等容器——BUG-324 探针竞态纪律）。
+ *  BUG-340 后节头不再渲染任何计数/状态文本 ⇒ 只等监控行出现即视为就绪
+ *  （计数曾用「未就绪渲染 `—`」表达，现已整个撤除：没有就不渲染）。 */
 async function openTgPanel(page) {
   await page.evaluate(() => {
     const el = document.querySelector('[data-testid="nav-tg"]')
@@ -51,11 +62,7 @@ async function openTgPanel(page) {
   )
 }
 
-const CHAIN_SNAP = () => {
-  const bar = document.querySelector('[data-testid="tg-chain-bar"]')
-  if (!bar) return null
-  const btns = Array.from(bar.querySelectorAll('button'))
-  const newBadge = bar.querySelector('[data-testid="tg-chain-new"]')
+const LEFT_SNAP = () => {
   const sections = ['tg-section-filter', 'tg-section-monitor', 'tg-section-channels'].map(
     (id) => document.getElementById(id),
   )
@@ -68,20 +75,39 @@ const CHAIN_SNAP = () => {
           sections[1].compareDocumentPosition(sections[2]) & Node.DOCUMENT_POSITION_FOLLOWING,
         )
       : false
-  const chToggle = document.querySelector('[data-testid="channel-collapse-toggle"]')
+  // DOM 里有两个 <aside>：全局导航侧栏 + TG 面板自己的左栏（含 tg-filter-row）。
+  // 必须选**含 tg-filter-row 的那个**——2026-10-20 之前这里用
+  // querySelector('aside')（命中全局导航），P1c/P4b/P5 三条护栏实际上在对
+  // 全局侧栏断言：那些元素从来不在全局侧栏里 ⇒ 恒绿、从来没有牙。
+  const aside = Array.from(document.querySelectorAll('aside')).find((a) =>
+    a.querySelector('[data-testid="tg-filter-row"]'),
+  )
+  const asideText = aside ? aside.textContent.replace(/\s+/g, ' ') : ''
   const h3s = Array.from(document.querySelectorAll('section h3')).map((h) => h.textContent.trim())
-  const aside = document.querySelector('aside')
   const unmonitorInAside = aside
     ? Array.from(aside.querySelectorAll('button')).filter(
         (b) => (b.getAttribute('aria-label') || '').includes('取消监控'),
       ).length
     : -1
   const monList = document.querySelector('[data-testid="tg-monitor-list"]')
-  const rows = Array.from(document.querySelectorAll('[data-testid="tg-monitor-row"]'))
-  const sources = rows.map((r) => {
-    const ps = Array.from(r.querySelectorAll('p')).map((p) => p.textContent.trim())
-    return ps.find((s) => s.includes('来自')) || null
-  })
+  // BUG-340：频道节头污染检测（用户点名的四样：数字/监控数/扫描/脉冲点）。
+  // 节头 = section 的第一个 div（flex 行）；动作按钮（重新扫描订阅）是授权
+  // 元素，其文案含「扫描」但不含「正在后台扫描」状态短语，不误伤。
+  const chSec = document.getElementById('tg-section-channels')
+  const chHeader = chSec ? chSec.querySelector('div') : null
+  const chHeaderText = chHeader ? chHeader.textContent.replace(/\s+/g, ' ').trim() : ''
+  const chPollution = {
+    rawCount: /\(\d+\)/.test(chHeaderText),
+    monitoredCount: /\d+\s*个监控中/.test(chHeaderText),
+    scanStatus: chHeaderText.includes('正在后台扫描'),
+    pulseDot: chHeader ? !!chHeader.querySelector('.animate-pulse') : false,
+  }
+  // BUG-340：`—` 兜底整个撤除（「数据没有获取时就应该不显示」）
+  const dashInAside = asideText.includes('—')
+  // 节头截断（复报「①频道(… 显示不全」判据）：标题一律不得溢出
+  const truncated = Array.from(document.querySelectorAll('section h3'))
+    .filter((el) => el.scrollWidth > el.clientWidth + 1)
+    .map((el) => ({ text: el.textContent.trim().slice(0, 30), sw: el.scrollWidth, cw: el.clientWidth }))
   // 三节是否同属一个 overflow-y-auto 滚动容器
   const scrollParent = (() => {
     let el = document.getElementById('tg-section-filter')
@@ -93,22 +119,32 @@ const CHAIN_SNAP = () => {
     return null
   })()
   return {
-    chainTexts: btns.map((b) => b.textContent.trim()),
-    chainNew: newBadge ? newBadge.textContent.trim() : null,
+    chainBarCount: document.querySelectorAll('[data-testid="tg-chain-bar"]').length,
+    funnelNums: h3s.filter((s) => /^[①②③]/.test(s)).length,
+    bannedCopy: ['来自', '搜 ', '个监控频道', '来源', '每条规则就是一条监控', '只检查这些频道的实时更新']
+      .filter((k) => asideText.includes(k)),
     orderOk,
-    chExpanded: chToggle ? chToggle.getAttribute('aria-expanded') : null,
-    chListExists: !!document.getElementById('tg-channel-list'),
+    chExpanded: document.querySelector('[data-testid="channel-collapse-toggle"]')
+      ? document.querySelector('[data-testid="channel-collapse-toggle"]').getAttribute('aria-expanded')
+      : null,
+    chPollution,
+    dashInAside,
+    truncated,
     h3s,
     emojiInH3: h3s.some((s) => /\p{Extended_Pictographic}/u.test(s)),
     unmonitorInAside,
-    monSub: monList ? (monList.querySelector('p') || {}).textContent : null,
-    sources,
     scrollParentHasAll: !!scrollParent
       ? ['tg-section-filter', 'tg-section-monitor', 'tg-section-channels'].every((id) =>
           scrollParent.contains(document.getElementById(id)),
         )
       : false,
     monMaxHeight: monList ? getComputedStyle(monList).maxHeight : null,
+    rowBadges: Array.from(
+      document.querySelectorAll('[data-testid="tg-monitor-new-badge"], [data-testid="tg-filter-new-badge"]'),
+    ).reduce((s, el) => s + (Number(el.getAttribute('data-count')) || 0), 0),
+    badgeCount: document.querySelectorAll(
+      '[data-testid="tg-monitor-new-badge"], [data-testid="tg-filter-new-badge"]',
+    ).length,
   }
 }
 
@@ -118,50 +154,26 @@ async function main() {
   try {
     const page = await browser.newPage()
     await page.setViewport({ width: 900, height: 600 })
-    await page.goto(APP)
+    // vite 文件变更后首次整页加载可 >30s（与改动无关的已知现象）：超时放宽。
+    await page.goto(APP, { timeout: 90000 })
     await openTgPanel(page)
-    // BUG-318：等三个 list 端点都取到再比数字（未取到时状态条渲染 `—`，不是 0）
-    await page.waitForFunction(
-      () => {
-        const bar = document.querySelector('[data-testid="tg-chain-bar"]')
-        if (!bar) return false
-        const texts = Array.from(bar.querySelectorAll('button')).map((b) => b.textContent.trim())
-        return texts.length >= 3 && texts.every((t) => t !== '—' && /\d/.test(t))
-      },
-      { timeout: 45000 },
-    )
     await sleep(600)
 
-    // API 真值（与前端同一批端点）
-    // API 真值（与前端同一批端点、同一种翻页口径：limit=200 翻到 hasMore=false）
-    const dlgItems = await (async () => {
-      const all = []
-      let offset = 0
-      for (let page = 0; page < 10; page++) {
-        const r = await getJson(`${TG}/api/tg/dialogs?limit=200${offset ? `&offset=${offset}` : ''}`)
-        const items = Array.isArray(r) ? r : r.items || []
-        all.push(...items)
-        if (!r.hasMore || items.length === 0) break
-        offset += items.length
-      }
-      return all
-    })()
+    // API 真值（徽标合计判据用；BUG-340 后节头不再渲染计数，无需 dialogs 全量）
     const [monitored, filtersPage] = await Promise.all([
       getJson(`${TG}/api/tg/monitor/channels`),
       getJson(`${TG}/api/tg/monitor/filters`),
     ])
-    // filters 端点是分页形状 { items }；老构建没有 newHits 字段（TGM-05/06 新增）⇒ 兜底 0
     const filters = (Array.isArray(filtersPage) ? filtersPage : filtersPage.items || []).map((f) => ({
       ...f,
       hits: Number(f.hits) || 0,
       newHits: Number(f.newHits) || 0,
     }))
-    const hitTotal = filters.reduce((s, f) => s + (f.hits || 0), 0)
     const newTotal =
       monitored.reduce((s, m) => s + (m.newCount || 0), 0) +
       filters.reduce((s, f) => s + (f.newHits || 0), 0)
 
-    const snap = await page.evaluate(CHAIN_SNAP)
+    const snap = await page.evaluate(LEFT_SNAP)
     const problems = []
     const results = []
     const push = (name, ok, detail) => {
@@ -169,71 +181,69 @@ async function main() {
       if (!ok) problems.push(name)
     }
 
-    // P1 状态条三数与 API 真值逐项相等
-    const wantTexts = [
-      `${dlgItems.length} 频道`,
-      `${monitored.length} 监控`,
-      `${hitTotal} 命中`,
-    ]
-    const chainOk =
-      !!snap &&
-      snap.chainTexts.length >= 3 &&
-      wantTexts.every((w, i) => (snap.chainTexts[i] || '').includes(String(w.split(' ')[0]))) &&
-      snap.chainTexts[0].includes('频道') &&
-      snap.chainTexts[1].includes('监控') &&
-      snap.chainTexts[2].includes('命中')
-    push('P1 监听链三数=API 真值', chainOk, `渲染 ${snap ? snap.chainTexts.join(' | ') : 'null'} vs API ${wantTexts.join(' | ')}`)
+    // P1 无授权元素必须不存在（legacy 反置 = 期望它们存在）
+    const wantAbsent = EXPECT_LEGACY ? false : true
+    push('P1a 监听链状态条不存在（无授权）', (snap.chainBarCount === 0) === wantAbsent, `count=${snap.chainBarCount}`)
+    push('P1b ①②③ 漏斗编号不存在（无授权）', (snap.funnelNums === 0) === wantAbsent, `count=${snap.funnelNums}`)
+    push('P1c 常驻说明/溯源文案不存在（BUG-148）', (snap.bannedCopy.length === 0) === wantAbsent, `命中=${JSON.stringify(snap.bannedCopy)}`)
 
     // P2 消费序（旧版面序 = 监控在筛选前 ⇒ legacy 反置时必须 FAIL）
     const wantOrder = EXPECT_LEGACY ? false : true
-    push('P2 消费序 ③②①', !!snap && snap.orderOk === wantOrder, `orderOk=${snap && snap.orderOk}`)
+    push('P2 消费序（筛选→监控→频道）', snap.orderOk === wantOrder, `orderOk=${snap.orderOk}`)
 
     // P3 频道节默认折叠
     const wantExpanded = EXPECT_LEGACY ? 'true' : 'false'
-    push('P3 ① 频道节默认折叠', !!snap && snap.chExpanded === wantExpanded, `aria-expanded=${snap && snap.chExpanded}`)
+    push('P3 频道节默认折叠', snap.chExpanded === wantExpanded, `aria-expanded=${snap.chExpanded}`)
 
-    // P4 副标 + 行内溯源
-    const subOk = !!snap && typeof snap.monSub === 'string' && snap.monSub.includes('实时更新')
-    push('P4 监控节副标口径文案', subOk, `副标="${snap && snap.monSub}"`)
-    const srcOk = !!snap && snap.sources.some((s) => !!s)
-    push('P4b 监控行「来自 <分组>」溯源', srcOk, `样本=${JSON.stringify((snap && snap.sources.slice(0, 3)) || [])}`)
+    // P4 节头无污染（BUG-340；legacy 反置 = 期望污染存在——报障前的形态）
+    const wantClean = EXPECT_LEGACY ? false : true
+    const anyPollution = Object.values(snap.chPollution).some(Boolean)
+    push(
+      'P4a 频道节头无原始计数/「N 个监控中」/「正在后台扫描」/脉冲点',
+      (!anyPollution) === wantClean,
+      JSON.stringify(snap.chPollution),
+    )
+    push(
+      'P4b 左栏无 `—` 占位（数据未就绪 = 不渲染）',
+      (!snap.dashInAside) === wantClean,
+      `dashInAside=${snap.dashInAside}`,
+    )
+    push('P4c 节头零截断（scrollWidth≤clientWidth）', snap.truncated.length === 0, JSON.stringify(snap.truncated))
 
     // P5 左栏无取消监控按钮
-    push('P5 左栏②只读投影（无取消按钮）', !!snap && snap.unmonitorInAside === 0, `aside 内取消按钮=${snap && snap.unmonitorInAside}`)
+    push('P5 左栏只读投影（无取消按钮）', snap.unmonitorInAside === 0, `aside 内取消按钮=${snap.unmonitorInAside}`)
 
     // P6 单一滚动容器 + 无 max-height 限高
-    push('P6 三节同一滚动容器', !!snap && snap.scrollParentHasAll, `scrollParentHasAll=${snap && snap.scrollParentHasAll}`)
-    const maxhOk = !!snap && (snap.monMaxHeight === 'none' || snap.monMaxHeight === '0px')
-    push('P6b 监控列表无限高', maxhOk, `computed maxHeight=${snap && snap.monMaxHeight}`)
+    push('P6 三节同一滚动容器', snap.scrollParentHasAll, `scrollParentHasAll=${snap.scrollParentHasAll}`)
+    push('P6b 监控列表无限高', snap.monMaxHeight === 'none' || snap.monMaxHeight === '0px', `computed maxHeight=${snap.monMaxHeight}`)
 
     // P7 节头无 emoji
-    push('P7 节头无 emoji', !!snap && snap.emojiInH3 === false, `h3=${JSON.stringify(snap && snap.h3s)}`)
+    push('P7 节头无 emoji', snap.emojiInH3 === false, `h3=${JSON.stringify(snap.h3s)}`)
 
-    // P8 主列频道实体行有取消监控入口（点第一个监控行进主列）
+    // P8 主列频道实体行有取消监控入口（限定在频道头内——全局 find 会被
+    // 「左栏回归加回按钮」蒙混，P5 已钉左栏没有，这里钉主列必须有）
     await page.evaluate(() => {
       const row = document.querySelector('[data-testid="tg-monitor-row"]')
       if (row) row.click()
     })
     await sleep(500)
     const unmonitorBtn = await page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll('button'))
+      const header = document.querySelector('[data-testid="tg-channel-header"]')
+      const btns = header ? Array.from(header.querySelectorAll('button')) : []
       const b = btns.find((x) => (x.getAttribute('aria-label') || '').includes('取消监控'))
       if (!b) return null
       const r = b.getBoundingClientRect()
       return { w: Math.round(r.width), h: Math.round(r.height), text: b.textContent.trim() }
     })
-    push(
-      'P8 主列频道实体行有「取消监控」',
-      !!unmonitorBtn && unmonitorBtn.h >= 28,
-      JSON.stringify(unmonitorBtn),
-    )
+    // h === 28：BUG-344 的 xs token（h-7）。原 >=28 是给「声明 h-7 实际渲染
+    // 32px」的坏形态放水的判据（cn 裸 join，h-7 override 被 h-8 按源序赢掉）。
+    push('P8 主列频道实体行有「取消监控」', !!unmonitorBtn && unmonitorBtn.h === 28, JSON.stringify(unmonitorBtn))
 
-    // P9 +N 新徽标与 API 一致（无样本 SKIP，不冒充 PASS）
+    // P9 行内 +N 徽标合计 === API 真值（无样本 SKIP，不冒充 PASS）
     if (newTotal > 0) {
-      const badgeOk = !!snap && snap.chainNew !== null && snap.chainNew.includes(String(newTotal))
-      push('P9 状态条 +N=API newCount/newHits 合计', badgeOk, `渲染=${snap && snap.chainNew} API=${newTotal}`)
+      push('P9 行内 +N 徽标合计=API', snap.rowBadges === newTotal, `渲染=${snap.rowBadges} API=${newTotal}`)
     } else {
-      results.push(`SKIP P9 无新命中样本（API newTotal=0）`)
+      results.push(`SKIP P9 无新命中样本（API newTotal=0，徽标数=${snap.badgeCount}）`)
     }
 
     // 折叠控件交互：点频道节控件应真的展开
@@ -258,7 +268,7 @@ async function main() {
       console.log(`\nFAIL: ${problems.join(', ')}（--expect-legacy=${EXPECT_LEGACY}）`)
       process.exitCode = 1
     } else {
-      console.log(`\nALL PASS（--expect-legacy=${EXPECT_LEGACY}）`)
+      console.log(`\n ALL PASS（--expect-legacy=${EXPECT_LEGACY}）`.trim())
     }
   } finally {
     await browser.close()

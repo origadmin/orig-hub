@@ -483,11 +483,15 @@ export async function getCacheTasksForItems(
  *    返回 `{ alreadyIngested: true }`（零字节重下、零新任务行）；调用方据此提示「已入库」。
  *
  * 传 `groupId` 表示整组（相册）缓存；缺省为单条。
+ *
+ * `groupId` 是 **string**（BUG-345）：TG group_id ~1.4e16 > JS 2^53，number
+ * 过 `JSON.stringify`/`parse` 边界即丢精度（活库 62/70 个组键任务的 item_key
+ * 曾被污染差 1）⇒ 端到端走字符串，后端对两种形状都收。
  */
 export async function enqueueCacheTask(opts: {
   chatId: number
   messageIds: number[]
-  groupId?: number
+  groupId?: string
 }): Promise<TgCacheTask & { alreadyIngested?: boolean }> {
   return request<TgCacheTask & { alreadyIngested?: boolean }>('/api/tg/cache/tasks', {
     method: 'POST',

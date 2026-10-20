@@ -236,8 +236,15 @@ export interface TgMediaItem {
   date?: number
   /** 媒体时长（秒；视频/音频才有，v0.4.1） */
   duration?: number
-  /** TG 相册分组 ID（grouped_id；同组消息构成一个相册，v0.4.2） */
-  groupId?: number
+  /**
+   * TG 相册分组 ID（grouped_id；同组消息构成一个相册，v0.4.2）。
+   *
+   * **string 而非 number**（BUG-345）：group_id 量级 ~1.4e16 > JS
+   * `Number.MAX_SAFE_INTEGER`（2^53-1），以 JSON number 过界会被 `JSON.parse`
+   * 舍入成相邻双精度（活库实证 62/70 个组键缓存任务的 item_key 因此比真值差
+   * 1）。后端串界序列化 + 宽容反序列化；本类型及其余 4 处 groupId 同此。
+   */
+  groupId?: string
   /** 是否含媒体附件 */
   hasMedia?: boolean
 }
@@ -286,7 +293,7 @@ export interface TgMonitorFilterHit {
   downloaded: boolean
   channelTitle?: string
   /** TG 相册分组 id（同组消息构成一个相册；无则单条）。前端据此「按组入库」而非按单条扁平化。 */
-  groupId?: number
+  groupId?: string
   /** MIME 类型（BUG-330 / TGM-05：命中行展开预览的数据基础） */
   mimeType?: string
   /** 落盘路径（无 = 未缓存；「缺字节」判据，BUG-080） */
@@ -312,7 +319,7 @@ export interface TgStoredMessage {
   /** 已缓存文件绝对路径（downloaded 时有值，v0.4.1） */
   filePath?: string
   /** TG 相册分组 ID（grouped_id；同组消息构成一个相册，v0.4.2） */
-  groupId?: number
+  groupId?: string
 }
 
 /** 缓存库聚合行（GET /api/tg/stored）：媒体消息 + 所属频道标题 */
@@ -338,7 +345,7 @@ export interface TgCacheTask {
   id: number
   chatId: number
   /** 相册分组 id（单条缓存时缺省） */
-  groupId?: number
+  groupId?: string
   /** 去重键：g:{chat}:{group} / m:{chat}:{msg} */
   itemKey: string
   messageIds: number[]
@@ -404,7 +411,7 @@ export interface TgCacheTask {
 export interface TgQueuedTask {
   id: number
   chatId: number
-  groupId?: number
+  groupId?: string
   messageIds: number[]
   total: number
 }

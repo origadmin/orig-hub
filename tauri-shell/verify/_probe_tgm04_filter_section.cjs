@@ -142,14 +142,38 @@ async function main() {
     const f1 = await page.evaluate(() => {
       const btn = document.querySelector('[data-testid="tg-filter-new"]')
       const r = btn ? btn.getBoundingClientRect() : null
+      const cs = btn ? getComputedStyle(btn) : null
       return {
         exists: !!btn,
         w: r ? Math.round(r.width) : 0,
         h: r ? Math.round(r.height) : 0,
+        text: btn ? btn.textContent.trim() : '',
         hasPopup: btn ? btn.getAttribute('aria-haspopup') : null,
+        borderW: cs ? cs.borderTopWidth : null,
+        bg: cs ? cs.backgroundColor : null,
       }
     })
-    push('F1a 「+ 新建」真按钮 ≥24px 热区', f1.exists && f1.w >= 24 && f1.h >= 24, JSON.stringify(f1))
+    // BUG-344（用户 2026-10-20 夜：「按钮过大」「筛选右边还有文字…按钮长宽高都
+    // 需要规范化」）：token = h-7（28px）**图标钮**，无文字标签。可见性由
+    // **边框 + 底色**承担（secondary variant）——这是 BUG-327「存在≠可用」
+    // （初版 28px 裸图标被当成空白）与 BUG-344「过大 + 有字」的共同解：
+    // 不再用尺寸 + 文字标签证明按钮存在。
+    // 2026-10-20 收紧为**精确 28×28**：原 24–32 宽松区间放过了「声明 h-7 实际
+    // 渲染 32px」的形态（cn 裸 join，调用方 h-7 被 sizeClasses 的 h-8 按样式表
+    // 源序赢掉）⇒ 现改一等 size token（icon-sm）。reverse 变异（装回 h-9 带字
+    // 形态 = 36px+文字，或装回 h-7 override 被 h-8 赢 = 32px）必须 FAIL。
+    push(
+      'F1a 「+ 新建」图标钮 token：28×28 无文字标签且有边框底色（BUG-344）',
+      f1.exists &&
+        f1.w === 28 &&
+        f1.h === 28 &&
+        f1.text.length === 0 &&
+        f1.hasPopup === 'dialog' &&
+        f1.borderW === '1px' &&
+        f1.bg !== 'rgba(0, 0, 0, 0)' &&
+        f1.bg !== 'transparent',
+      JSON.stringify(f1),
+    )
     await realClick(page, '[data-testid="tg-filter-new"]')
     const dlg = await page.evaluate(() => {
       const d = document.querySelector('[data-testid="tg-filter-dialog"]')
@@ -335,20 +359,13 @@ async function main() {
       JSON.stringify(f6b),
     )
 
-    // ── F7：行内溯源 = API monitored 真值 ──
-    const monitored = await tgApi('GET', '/api/tg/monitor/channels')
+    // ── F7：无授权溯源文案已撤（第三次复报）──
     const f7 = await page.evaluate(() => {
-      const row = document.querySelector('[data-testid="tg-filter-row"]')
-      const line = row
-        ? Array.from(row.querySelectorAll('p')).map((p) => p.textContent.trim()).find((s) => s.includes('监控频道'))
-        : null
-      return line
+      const aside = document.querySelector('aside')
+      const txt = aside ? aside.textContent.replace(/\s+/g, ' ') : ''
+      return ['搜 ', '个监控频道', '来自', '来源'].filter((k) => txt.includes(k))
     })
-    push(
-      `F7 行内溯源「搜 N 个监控频道」N === API（${monitored.length}）`,
-      !!f7 && f7.includes(String(monitored.length)),
-      JSON.stringify({ dom: f7, api: monitored.length }),
-    )
+    push('F7 左栏无「搜 N 个监控频道/来自/来源」溯源文案（BUG-148）', f7.length === 0, JSON.stringify(f7))
 
     // ── F8：+N 徽标 0 不渲染 ──
     const f8 = await page.evaluate(() => {

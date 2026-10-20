@@ -1414,7 +1414,10 @@ async fn import_cached_file(
     // 空串是刻意的：`upsert_media_item` 的 `ON CONFLICT` 用
     // `COALESCE(NULLIF(excluded.title, ''), media_item.title)` —— 重新缓存一条
     // 早期已落文件名的旧行时，空串不会覆盖它，也不会把「没有标题」写成非空假值。
-    let title = caption_title.unwrap_or_default();
+    //
+    // BUG-342：条目标题与下载面板行标题**同源同规则**过 `clean_title` 白名单
+    // （emoji/书括号/URL 不上库卡片）；空串纪律不变——清后为空 = 没有标题。
+    let title = caption_title.as_deref().map(clean_title).unwrap_or_default();
     let description = caption_desc;
     let kind = crate::media::classify_ext(&ext)
         .map(str::to_string)
@@ -1464,7 +1467,14 @@ struct EnqueueCacheReq {
     #[serde(rename = "messageIds")]
     message_ids: Vec<i64>,
     /// 相册分组 id（整组缓存时传，用于同组去重）。
-    #[serde(rename = "groupId", default)]
+    ///
+    /// BUG-345：收 string 也收 number——串界修复后前端发字符串（group_id
+    /// ~1.4e16 > JS 2^53，number 过界即丢精度），陈旧标签页发的 number 照收。
+    #[serde(
+        rename = "groupId",
+        default,
+        deserialize_with = "crate::store::deserialize_group_id_opt"
+    )]
     group_id: Option<i64>,
     #[serde(rename = "dir", default)]
     dir: Option<String>,
@@ -1596,8 +1606,8 @@ async fn cache_task_titles(
         .unwrap_or_default()
 }
 
-/// 取任务的标题（BUG-280 两遍选取）：**先**扫全组找第一条有非空 caption 的消息；
-/// 全组都无 caption 才退回 file_name（BUG-220 兜底，不得退回频道名）。
+/// 取任务的标题（BUG-280 两遍选取 + BUG-342 清洗）：**先**扫全组找第一条有非空
+/// caption 的消息；全组都无 caption 才退回 file_name（BUG-220 兜底，不得退回频道名）。
 /// 两者皆无 ⇒ None（前端退回 `频道名 #<msg>` 链）。
 ///
 /// 为什么不是 first-match：相册组的 caption 常只挂在**靠后**的一条消息上
@@ -1605,29 +1615,107 @@ async fn cache_task_titles(
 /// 而靠前消息的 file_name（`manifest.mp4`）会在 first-match 里抢在它前面 ——
 /// 用户看到的就是「队列标题是个无意义的文件名」。caption 与 file_name 分两遍
 /// 选取后，「有 caption」才真正优先于「有文件名」。
-fn cache_task_title<'a>(
+///
+/// 返回 **owned** String：标题要过 `clean_title` 白名单（BUG-342）——下载面板
+/// 行标题直接给用户看，emoji/书括号/URL 不得原样上榜。
+fn cache_task_title(
     t: &CacheTask,
-    titles: &'a std::collections::HashMap<(i64, i64), crate::store::MsgTitleSources>,
-) -> Option<&'a str> {
+    titles: &std::collections::HashMap<(i64, i64), crate::store::MsgTitleSources>,
+) -> Option<String> {
     // 第一遍：caption 优先（按 message_ids 序的第一条非空 caption）。
     let caption = t
         .message_ids
         .iter()
         .filter_map(|m| titles.get(&(t.chat_id, *m)))
-        .find_map(|s| non_empty(&s.caption));
+        .find_map(|s| non_empty(&s.caption))
+        .map(clean_title)
+        .filter(|s| !s.is_empty());
     caption.or_else(|| {
-        // 第二遍：全组无 caption 才回退 file_name（BUG-220：文件名就是内容名，
-        // 回退到它才是「显示内容」而非退回裸频道名）。
+        // 第二遍：全组无 caption（或清洗后为空）才回退 file_name（BUG-220：
+        // 文件名就是内容名，回退到它才是「显示内容」而非退回裸频道名）。
         t.message_ids
             .iter()
             .filter_map(|m| titles.get(&(t.chat_id, *m)))
             .find_map(|s| non_empty(&s.file_name))
+            .map(clean_title)
+            .filter(|s| !s.is_empty())
     })
 }
 
 /// 非空（trim 后）才认——空串等价于「没有这个来源」。
 fn non_empty(s: &str) -> Option<&str> {
     (!s.trim().is_empty()).then_some(s)
+}
+
+/// 标题清洗（BUG-342，用户 2026-10-20 裁定「特殊符号、书括号这些异常字符，都应该过滤掉」）。
+///
+/// 活库实证的污染形态（`media_message.caption` 首行抽样）：
+/// ```text
+/// 🌟🔥《飘飘欲仙 富二代征服校园母狗》EP7 原档无二次水印 连载中 ⭐⭐⭐
+/// ❗️❗️❗️❗️《多啦B梦大冒险》 EP1-8
+/// 📱 \u{a0} 《岳母交换计划》 第2集
+/// ⚡️ 【阳光合租屋：暧昧同居】 新剧首更 ⚡️ #黄果短剧 #阳光合租屋 #AI短剧
+/// 📱新剧首更 【王校长的淫乱契约】第1-5集 #ai短剧 #魔改短剧 #网红魔改
+/// Ai商城https://t.me/Aishangchengbot
+/// ```
+///
+/// 规则（确定性白名单，不逐 case 打补丁）：
+///   ① URL 删除（`://` 处截断保留前缀词；`t.me/…` 直连词整词删）——促销/引流行
+///      **不是标题的一部分**，只删符号会把 URL 剩成一串裸字母数字；
+///   ② 字符白名单：字母数字（含 CJK / 西里尔）、`-.,!?'"&+()`、`，。！？、；：·`；
+///      其余一律删——emoji、变体选择符、`《》【》「」『』`（用户点名的书括号）、
+///      `…`、`*`、`_`、全角括号、NBSP 等装饰字符全在这一类；
+///   ③ 空白折叠为单空格 + trim。
+///
+/// **`#标签` 的文字保留、只删 `#` 字符**：这批频道的 caption 用 hashtag 做剧名/
+/// 演员标注（`#《快门沦陷》EP5` 的剧名就在 hashtag 里，BUG-152 的真实链同款），
+/// 整词删会把标题本身删没；删字符后 `#《快门沦陷》` ⇒ `快门沦陷`。
+///
+/// **不清洗 `normalized_series_name` 的输出**：那是剧集**身份键**的一部分
+/// （`episodic_group_key` = `tg:named:{chat}:{name}`），在里面清洗会让存量剧集
+/// 键失配 ⇒ 同一部剧裂成两部。显示侧清洗只发生在不参与身份的标题落点
+/// （本函数的两个调用方：下载面板行标题、媒体库条目标题）。
+///
+/// 清空 ≠ 报错：全符号标题清后为空 = 如实表达「没有标题」（BUG-154 纪律），
+/// 由调用方的回退链（文件名 → 频道名）接手。
+pub(crate) fn clean_title(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for tok in raw.split_whitespace() {
+        // ① URL：从 scheme **起点**截断（保留 `Ai商城https://…` 里的 `Ai商城`）；
+        //    `t.me/` 直连词（无 scheme）整词删。
+        let cut = ["https://", "http://"]
+            .iter()
+            .filter_map(|s| tok.find(s))
+            .min();
+        let tok = match cut {
+            Some(i) => &tok[..i],
+            None => tok,
+        };
+        if tok.is_empty() || tok.contains("t.me/") {
+            continue;
+        }
+        // ② 字符白名单过滤
+        let mut kept = String::with_capacity(tok.len());
+        for ch in tok.chars() {
+            if ch.is_alphanumeric()
+                || matches!(
+                    ch,
+                    '-' | '.' | ',' | '!' | '?' | '\'' | '"' | '&' | '+' | '(' | ')'
+                )
+                || matches!(ch, '，' | '。' | '！' | '？' | '、' | '；' | '：' | '·')
+            {
+                kept.push(ch);
+            }
+        }
+        // ③ 拼回（空白已由 split_whitespace 归一）
+        if !kept.is_empty() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&kept);
+        }
+    }
+    out
 }
 
 /// 标题自愈（BUG-220 + BUG-246 合流根因）：队列读到**无标题**任务 ⇒ 后台补登记其消息
@@ -1759,7 +1847,9 @@ async fn cache_tasks_payload(st: &AppState) -> serde_json::Value {
             json!({
                 "id": t.id,
                 "chatId": t.chat_id,
-                "groupId": t.group_id,
+                // BUG-345：group_id > JS 2^53 ⇒ 串界下发（number 过界即丢精度，
+                // 活库 62/70 个组键任务曾被污染）。None 序列化为 null。
+                "groupId": t.group_id.map(|g| g.to_string()),
                 "messageIds": t.message_ids,
                 "total": t.total,
             })
@@ -1800,7 +1890,7 @@ async fn list_all_cache_tasks(State(st): State<Arc<AppState>>) -> Result<impl In
     let tasks: Vec<serde_json::Value> = tasks
         .iter()
         .map(|t| {
-            let mut v = task_with_progress(&st, t, cache_task_title(t, &titles));
+            let mut v = task_with_progress(&st, t, cache_task_title(t, &titles).as_deref());
             if let Some(s) = summaries.get(&t.id) {
                 if v.is_object() {
                     v["manifest"] = json!(s);
@@ -1820,7 +1910,7 @@ async fn cache_task_by_id(
     match st.store.get_cache_task(id).await {
         Ok(Some(t)) => {
             let titles = cache_task_titles(&st, std::slice::from_ref(&t)).await;
-            Ok(Json(task_with_progress(&st, &t, cache_task_title(&t, &titles))))
+            Ok(Json(task_with_progress(&st, &t, cache_task_title(&t, &titles).as_deref())))
         }
         Ok(None) => Err(ApiError::new(StatusCode::NOT_FOUND, "cache task not found")),
         Err(e) => Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
@@ -1882,7 +1972,7 @@ async fn cache_task_by_item(
                         serde_json::to_value(task_with_progress(
                             &st,
                             &t,
-                            cache_task_title(&t, &titles),
+                            cache_task_title(&t, &titles).as_deref(),
                         ))
                         .unwrap_or(serde_json::Value::Null)
                     }
@@ -1913,7 +2003,7 @@ async fn cache_task_by_item(
     match st.store.cache_task_for_item(chat_id, message_id).await {
         Ok(Some(t)) => {
             let titles = cache_task_titles(&st, std::slice::from_ref(&t)).await;
-            Ok(Json(json!({ "task": task_with_progress(&st, &t, cache_task_title(&t, &titles)) })))
+            Ok(Json(json!({ "task": task_with_progress(&st, &t, cache_task_title(&t, &titles).as_deref()) })))
         }
         Ok(None) => Ok(Json(json!({ "task": null }))),
         Err(e) => Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())),
@@ -6845,6 +6935,7 @@ mod tests {
     use super::download_limits;
     use super::delivery_due_secs;
     use super::cache_tasks_payload;
+    use super::clean_title;
     use super::create_media_series;
     use super::list_all_cache_tasks;
     use super::list_episode_bindings;
@@ -7429,6 +7520,53 @@ mod tests {
             normalized_series_name("📱 《遥控器：操控全城女神》 第1-9集"),
             "📱 《遥控器：操控全城女神》"
         );
+    }
+
+    /// BUG-342：标题清洗——输入全部取自**活库 caption 首行抽样**（不是臆造用例）。
+    ///
+    /// 用户裁定原话：「下载中可以看到特殊符号,书括号这些异常字符,都应该过滤掉」。
+    /// 判据双向：① 活数据形态必须清成无符号形态；② 正常标题（数字剧名、ASCII
+    /// 标点、集号区间）不得被误伤——清洗是白名单过滤，不是「删一切非中文」。
+    #[test]
+    fn clean_title_strips_symbols_on_live_caption_shapes() {
+        // emoji + 书括号 + 尾部星级 + 促销尾缀
+        assert_eq!(
+            clean_title("🌟🔥《飘飘欲仙 富二代征服校园母狗》EP7 原档无二次水印 连载中 ⭐⭐⭐"),
+            "飘飘欲仙 富二代征服校园母狗EP7 原档无二次水印 连载中"
+        );
+        assert_eq!(clean_title("❗️❗️❗️❗️《多啦B梦大冒险》 EP1-8"), "多啦B梦大冒险 EP1-8");
+        // NBSP（`\u{a0}`）+ 手机 emoji + 书名号
+        assert_eq!(
+            clean_title("📱 \u{a0} 《岳母交换计划》 第2集"),
+            "岳母交换计划 第2集"
+        );
+        // 【】方括号 + hashtag 只删 `#` 字符（tag 文字是标题内容，见函数文档①）
+        assert_eq!(
+            clean_title(
+                "⚡️ 【阳光合租屋：暧昧同居】 新剧首更  ⚡️ #黄果短剧 #阳光合租屋 #AI短剧 #成人短剧 #暧昧同居"
+            ),
+            "阳光合租屋：暧昧同居 新剧首更 黄果短剧 阳光合租屋 AI短剧 成人短剧 暧昧同居"
+        );
+        // hashtag 本身就是剧名（BUG-152 真实链同款形态）：文字必须留下
+        assert_eq!(clean_title("😀😀😀😀😀😀😀😀  #《快门沦陷》 EP5-6"), "快门沦陷 EP5-6");
+        assert_eq!(
+            clean_title("📱新剧首更 【王校长的淫乱契约】第1-5集  #ai短剧  #魔改短剧 #网红魔改 #王校长的淫乱契约"),
+            "新剧首更 王校长的淫乱契约第1-5集 ai短剧 魔改短剧 网红魔改 王校长的淫乱契约"
+        );
+        // URL 整删（含无 scheme 的 t.me 直连词），前缀词保留
+        assert_eq!(clean_title("Ai商城https://t.me/Aishangchengbot"), "Ai商城");
+        assert_eq!(clean_title("https://t.me/foo bar"), "bar");
+        assert_eq!(clean_title("promo t.me/joinchat/abc end"), "promo end");
+        // 正常标题零误伤：数字剧名、集号区间、ASCII 标点、扩展名
+        assert_eq!(clean_title("普通标题 第1集"), "普通标题 第1集");
+        assert_eq!(clean_title("1990-2020 经典回顾"), "1990-2020 经典回顾");
+        assert_eq!(clean_title("妻善3.mp4"), "妻善3.mp4");
+        assert_eq!(clean_title("EP01-02 (全集)"), "EP01-02 (全集)");
+        // 全符号 ⇒ 空 = 如实「没有标题」（BUG-154 纪律，交回退链接手）
+        assert_eq!(clean_title("🌟🌟🌟"), "");
+        assert_eq!(clean_title("《》"), "");
+        assert_eq!(clean_title("   "), "");
+        assert_eq!(clean_title(""), "");
     }
 
     /// 交付约束的**直接**判据：不论批次怎么切，规范化剧集名都一致 ——
@@ -10748,8 +10886,10 @@ mod tests {
         let task = enqueue_fixture_task(&st, &[81, 82, 83], Some(CACHE_FIXTURE_GROUP)).await;
         let titles = cache_task_titles(&st, std::slice::from_ref(&task)).await;
         assert_eq!(
-            cache_task_title(&task, &titles),
-            Some("🌟《温柔的妈妈被我弄哭了》EP1-8 频道连载中"),
+            cache_task_title(&task, &titles).as_deref(),
+            // BUG-342：期望值随清洗规则更新（emoji/《》删除）；「靠后真 caption
+            // 赢过靠前 file_name」的 BUG-280 判据本身不变。
+            Some("温柔的妈妈被我弄哭了EP1-8 频道连载中"),
             "靠后的真 caption 必须赢过靠前的 file_name，且只取首行（不得是 manifest.mp4）"
         );
     }
@@ -10793,7 +10933,7 @@ mod tests {
         let task = enqueue_fixture_task(&st, &[84, 85], Some(CACHE_FIXTURE_GROUP)).await;
         let titles = cache_task_titles(&st, std::slice::from_ref(&task)).await;
         assert_eq!(
-            cache_task_title(&task, &titles),
+            cache_task_title(&task, &titles).as_deref(),
             Some("妻善3.mp4"),
             "全组无 caption 时必须回退第一个 file_name（BUG-220）"
         );
@@ -10825,7 +10965,7 @@ mod tests {
         let task = enqueue_fixture_task(&st, &[86, 87], Some(CACHE_FIXTURE_GROUP)).await;
         let titles = cache_task_titles(&st, std::slice::from_ref(&task)).await;
         assert_eq!(
-            cache_task_title(&task, &titles),
+            cache_task_title(&task, &titles).as_deref(),
             None,
             "两者皆空必须是 None（前端回退链的触发条件）"
         );
@@ -11020,6 +11160,32 @@ mod tests {
                 .is_none(),
             "显式清空的介绍不得被 strengthen 写回（既有 own-caption 行为原样保留）"
         );
+    }
+
+    /// BUG-345：入队请求的 `groupId` 收 **string**（串界修复后的前端形状）也收
+    /// **number**（陈旧标签页）——两个形状必须解到同一个 i64。group_id 量级
+    /// ~1.4e16 > JS 2^53，只收 number 的旧契约正是活库 62/70 个组键任务被
+    /// 舍入污染的上游。
+    #[test]
+    fn enqueue_group_id_accepts_string_and_number() {
+        let from_str: EnqueueCacheReq = serde_json::from_str(
+            r#"{"chatId":-1004493170102,"messageIds":[4728],"groupId":"14315949991671397"}"#,
+        )
+        .expect("string groupId must deserialize");
+        assert_eq!(
+            from_str.group_id,
+            Some(14315949991671397),
+            "字符串形态必须精确落到 i64（number 形态在这里就已经丢精度了）"
+        );
+        let from_num: EnqueueCacheReq = serde_json::from_str(
+            r#"{"chatId":-1004493170102,"messageIds":[4728],"groupId":14315949991671396}"#,
+        )
+        .expect("number groupId must still deserialize");
+        assert_eq!(from_num.group_id, Some(14315949991671396));
+        let missing: EnqueueCacheReq =
+            serde_json::from_str(r#"{"chatId":-1004493170102,"messageIds":[4728]}"#)
+                .expect("missing groupId must default");
+        assert_eq!(missing.group_id, None);
     }
 
     /// 调用入队端点并解构为 `(状态码, 任务 JSON)`。

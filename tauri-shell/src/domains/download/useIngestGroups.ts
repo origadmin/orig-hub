@@ -11,7 +11,6 @@ import {
   groupIngestTasks,
   ingestActionsFor,
   isCacheActive,
-  isCacheStalled,
   summarizeGroups,
   type IngestAction,
   type IngestGroup,
@@ -32,12 +31,29 @@ import {
  *     仅 `sources.cache.available=false`，前端照常渲染其余来源。
  *
  * 轮询三律（AGENTS.md §5）：
- *   ① **有活才轮**：列表里还有在传/停滞的对象才续轮，全部已结束 ⇒ 停轮；
+ *   ① **有活才轮**：列表里还有**在传**（queued/running）的对象才续轮，没有在传
+ *      的 ⇒ 停轮（停滞的 failed/interrupted 不算活：它永远不会自己变好，见
+ *      `hasWork` 声明处；行照常显示，只是不轮）；
  *      **例外（BUG-318）**：最近一次拉取是「来源不可用」（orig-tg 取不到）时必须续轮
  *      —— 未知状态若停轮，orig-tg 恢复后不会自动回血，用户看到的「数据丢失」
  *      将一直持续到手动刷新；
  *   ② **等值短路**：签名（id|status|done|error|priority）不变则不 setState，避免每拍重渲染；
  *   ③ **卸载即停**：组件卸载后不再回写状态。
+ *
+ * ## BUG-343：未知态退避续轮 + 停滞不停轮（2026-10-20 用户报障「一直在请求、
+ * ## 数据永远不动」——报障时的活库状态：一条 interrupted 任务躺在feed 里）
+ *
+ * ①的例外在 orig-tg 不可用窗口（监督重启实测约每 10-15 分钟一次）会 3s 一次
+ * 死磕一个连不上的端口：请求不停、行冻结、用户完全看不出在干什么。修法三档——
+ *   - **有活（queued/running）** ⇒ 3s 基础节奏不变（进度要跟手）；
+ *   - **无活 + 来源未知** ⇒ 续轮但退避 3s→15s→30s（自动回血保留，请求量降一个
+ *     量级；恢复后最多迟 30s 被看见，期间 banner 一直直出不可用原因）；
+ *   - **无活 + 来源已知** ⇒ **停轮休眠**（一个请求都不发，等 `refresh()` /
+ *     切回在场 / 用户动作再拉）——用户口径「更不需要调用任何接口」。
+ *
+ * 「无活」的判定因此从「在传/停滞」收紧为**只在传**：停滞任务不会自己变好
+ * （重启只把残留降级成 interrupted，不自动重跑），3s 轮询它正是用户报障的
+ * 「一直在请求、数据完全不更新」。显示不变（行照常摊在概览），只是不轮。
  *
  * ## 按视图在场门控（2026-10-16 用户裁定「不在其位不谋其政」）
  *
@@ -137,7 +153,17 @@ export function useIngestGroups(
    */
   const sourceUnknown = useRef(false)
   /**
-   * 是否有活（在传/停滞）需要续轮 —— 由数据推导，不额外维护状态。
+   * 连续「来源不可用」的拉取次数（BUG-343 退避档位）：
+   * 1 次 ⇒ 3s 内快速回探；2 次 ⇒ 15s；≥3 次 ⇒ 30s 封顶。任一成功拉取归零。
+   */
+  const unknownStreakRef = useRef(0)
+  /**
+   * 是否有活（在传/停滞）需要**跟手轮询** —— 由数据推导，不额外维护状态。
+   *
+   * 只数真实在跑的任务，**不含**「来源未知」：两者是不同的轮询理由（跟手进度 /
+   * 等恢复回血），混进同一个布尔会让退避分支变成死代码——`schedule` 的
+   * `!active && sourceUnknown` 永真不了，不可用窗口照旧 3s 死磕（BUG-343
+   * 修的就是这个，探针 `_probe_bug343_polling.cjs` 的退避档位断言守它）。
    *
    * 初值**必须是 true**：首轮无论如何都要拉一次，否则「无活 ⇒ 不拉 ⇒ 永远无活」
    * 是死锁（实测表现：下载页永久停在「加载中…」）。
@@ -151,6 +177,7 @@ export function useIngestGroups(
     // 仍被本门控挡住 —— 语义正确：调用方在场才需要刷新。
     if (!enabled) return
     let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
     /**
      * @param guarded 是否启用重入保护。
      *
@@ -174,10 +201,12 @@ export function useIngestGroups(
         if (srcUnavailable) {
           // 取到不取到都不知道 ⇒ 绝不清空已拉到的行（清空即用户观感的数据丢失），
           // 只把原因交给 banner；行继续显示为「断开前的最后快照」。
+          unknownStreakRef.current = Math.min(unknownStreakRef.current + 1, 8)
           setUnavailable(cacheSrc?.error ?? 'TG 入库任务暂时无法读取')
           setError(null)
           return
         }
+        unknownStreakRef.current = 0
         setUnavailable(null)
         setError(null)
         const next = (Array.isArray(data?.tasks) ? data.tasks : [])
@@ -193,21 +222,46 @@ export function useIngestGroups(
         if (cancelled) return
         // daemon 都没通：同样是「未知」⇒ 续轮（恢复后自动回血），行不动。
         sourceUnknown.current = true
+        unknownStreakRef.current = Math.min(unknownStreakRef.current + 1, 8)
         setError(e instanceof Error ? e.message : String(e))
       } finally {
         inFlight.current = false
         if (!cancelled) setLoading(false)
       }
     }
-    void pull(false)
-    const h = setInterval(() => {
-      // 有活才轮：全部已结束（done/cancelled）时停轮，等下一次用户可见触发。
-      if (!hasWork.current) return
-      void pull(true)
-    }, intervalMs)
+
+    /**
+     * 自调度轮询（BUG-343）：取代固定 3s setInterval——节奏由状态推导：
+     *   ① 无活 + 来源已知 ⇒ **休眠**（一个请求都不发；`refresh()` 重激活）；
+     *   ② 无活 + 来源未知 ⇒ 续轮但退避（3s→15s→30s，BUG-318 回血保留、
+     *      请求量降一个量级——用户报障的「3s 死磕、数据不动」正解）；
+     *   ③ 有活 ⇒ 3s 基础节奏（进度跟手）。
+     * 休眠态不续排定时器：门在回调里，命中即不再 schedule。
+     *
+     * `hasWork` 只数真实在跑的任务（见其声明处）：来源未知是**另一个**轮询
+     * 理由，走 ② 的退避档，不并进 ③ 的跟手档。
+     */
+    const schedule = () => {
+      if (cancelled) return
+      const work = hasWork.current
+      let delay = intervalMs
+      if (!work && sourceUnknown.current) {
+        // streak = 已连续取不到的次数：1 次 ⇒ 3s 内快速回探（监督重启实测
+        // 5s 内拉回，别错过恢复窗口），2 次 ⇒ 15s，≥3 次 ⇒ 30s 封顶。
+        const streak = unknownStreakRef.current
+        delay = streak >= 3 ? 30_000 : streak === 2 ? 15_000 : intervalMs
+      }
+      timer = setTimeout(() => {
+        if (cancelled) return
+        if (!hasWork.current && !sourceUnknown.current) return
+        void pull(true).then(schedule, schedule)
+      }, delay)
+    }
+
+    void pull(false).then(schedule, schedule)
     return () => {
       cancelled = true
-      clearInterval(h)
+      if (timer) clearTimeout(timer)
     }
   }, [intervalMs, tick, enabled])
 
@@ -215,14 +269,21 @@ export function useIngestGroups(
   const overview = useMemo(() => summarizeGroups(groups), [groups])
 
   /**
-   * 有活才轮 + **未知态续轮**（BUG-318）：全部终态 ⇒ 停轮；但最近一次拉取是
-   * 「取不到」（orig-tg 不可用 / daemon 没通）时必须续 —— 否则服务恢复后
-   * 没有人再拉，行一直停在断开前的快照，用户看到的就是「数据丢了」。
+   * 有活才轮 + **未知态退避续轮**（BUG-318 + BUG-343）：没有在传的任务且来源
+   * 已知 ⇒ 停轮休眠；来源未知（orig-tg 不可用 / daemon 没通）时轮询理由切到
+   * 「等恢复」，走退避档位（3s→15s→30s）而不是 3s 死磕，恢复后自动回血不停。
+   *
+   * 两个判定分属不同的 ref：`hasWork` 只数**在传**（queued/running）任务，
+   * `sourceUnknown` 不并进来（并进来退避分支就永不可达，见 `schedule` 注释）。
+   *
+   * **为什么停滞（failed/interrupted）不算「有活」**（BUG-343 用户报障的实地
+   * 形态）：停滞任务永远不会自己变好——orig-tg 重启时把残留 running 降级成
+   * `interrupted` 且**不**自动重跑（main.rs 的 stale 降级 + RETRYABLE_STATES
+   * 只响应显式 retry）。对它 3s 轮询 = 用户原话「一直在请求、数据完全不更新」：
+   * 行照样摊在概览里（显示不变），但没有任何可跟手的进度。只有用户重试
+   * （或另一个在场窗口代劳）才该把节奏拉回 3s——那一刻它就是 running 了。
    */
-  hasWork.current =
-    groups.some(
-      (g) => isCacheActive(g.latest.status) || isCacheStalled(g.latest.status),
-    ) || sourceUnknown.current
+  hasWork.current = groups.some((g) => isCacheActive(g.latest.status))
 
   const refresh = useCallback(() => {
     // 停轮后重新起轮：先解掉「无活」门禁，再触发一次即时拉取。

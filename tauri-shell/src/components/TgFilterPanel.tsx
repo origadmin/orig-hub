@@ -1,5 +1,5 @@
 /**
- * 文字筛选结果面板（BUG-329，用户 2026-10-19 诉求②）。
+ * 文字筛选结果面板（BUG-329，用户 2026-10-19 诉求②；BUG-341 起命中按**相册组**呈现）。
  *
  * 定位：一条筛选规则 = **一条虚拟监控频道**。用户原话「多次作为多条，不是单一过滤。
  * 一条相当于一条监控」——所以这里呈现的是一份**独立条目**的命中列表，不是「在某个
@@ -11,6 +11,17 @@
  * 默认勾选口径沿用 BUG-327 的裁定：**缺字节 = 要下载的 ⇒ 默认全选**，用户只做减法。
  * 「手动勾选」指提交动作由用户触发，不是指初始零选中——零选中配灰按钮正是上一轮
  * 被投诉的形态（「选中的=要下载的，实际全部非选中」）。
+ *
+ * ## BUG-341：组是呈现与勾选的单位（用户「强调很多次」的缺陷）
+ *
+ * 活库实证：相册的组级 caption 只落在组内**一条**消息上（满员组 10 条仅 1 条带
+ * caption）。旧链路三层都对「组」不负责——后端逐条匹配每组只现 1 行、前端平铺、
+ * 入库只传 1 个 messageId ⇒ 组结构与组内内容双丢失。现在：
+ *   - 后端 `filter_messages` 组内任一 member 匹配即整组入列，分页按单元（组永不跨页）；
+ *   - 本面板把同一 `(channelId, groupId)` 的命中收敛成**一个相册行**（可展开看全部成员），
+ *     无 group_id 的单条仍是单行；
+ *   - 勾选 = **组级**（勾相册 = 整组，展开仅作预览）；提交时整组 messageIds 一次入队。
+ *     组内已有字节的成员不下发（worker 侧 BUG-308 幂等兜底），只补缺的。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronDown, ChevronRight } from 'lucide-react'
@@ -29,7 +40,7 @@ interface Props {
   onIngested?: (queued: number) => void
 }
 
-/** 条目键：`<chatId>:<messageId>`（跨频道，故不能只用 messageId） */
+/** 消息键：`<chatId>:<messageId>`（跨频道，故不能只用 messageId） */
 const keyOf = (h: TgMonitorFilterHit) => `${h.channelId}:${h.messageId}`
 
 /** 标题兜底：caption 首行 → 文件名 → 消息号。
@@ -47,24 +58,71 @@ function typeLabel(type?: string): string {
   return type === 'photo' ? '图片' : type === 'video' ? '视频' : type === 'audio' ? '音频' : '文件'
 }
 
-/** 每页条数（BUG-330 / TGM-07 分页）：与旧版 `limit=200` 硬顶保持一致 ——
- *  首屏一页、翻页走复合游标，不再「一次拉全部 + 后端 clamp」。 */
-const PAGE_SIZE = 200
+/** 每页**单元**数（BUG-341：limit 数相册/单条，不数消息——组永不被页边界切开）。
+ *  旧版 200 是消息数口径；组级分页后 200 个相册一页渲染过重，取 50。 */
+const PAGE_SIZE = 50
+
+/** 呈现单元（BUG-341）：一个相册（groupId 非空）或一条单消息。 */
+interface HitUnit {
+  /** `g:<chatId>:<groupId>` / `m:<chatId>:<messageId>` —— 勾选与展开的唯一键 */
+  key: string
+  channelId: number
+  /** BUG-345：string（group_id > JS 2^53，number 过 JSON 界丢精度） */
+  groupId?: string
+  /** 组内全部消息（单条单元 = 1 项）；顺序 = 后端返回序（组内 message_id 降序） */
+  members: TgMonitorFilterHit[]
+}
+
+/** 把平铺命中收敛成单元（保序：后端保证同单元相邻，首次出现序即单元序）。 */
+function groupHits(hits: TgMonitorFilterHit[]): HitUnit[] {
+  const out: HitUnit[] = []
+  const idx = new Map<string, HitUnit>()
+  for (const h of hits) {
+    const key = h.groupId != null ? `g:${h.channelId}:${h.groupId}` : `m:${h.channelId}:${h.messageId}`
+    let u = idx.get(key)
+    if (!u) {
+      u = { key, channelId: h.channelId, groupId: h.groupId ?? undefined, members: [] }
+      idx.set(key, u)
+      out.push(u)
+    }
+    u.members.push(h)
+  }
+  return out
+}
+
+/** 单元标题：组内第一条带 caption 的（相册标题只落在那一条上）→ 文件名 → 相册计数。 */
+function unitTitle(u: HitUnit): string {
+  for (const m of u.members) {
+    const cap = (m.caption ?? '').split('\n')[0].trim()
+    if (cap) return cap
+  }
+  for (const m of u.members) {
+    const name = (m.fileName ?? '').trim()
+    if (name) return name
+  }
+  return t('tg.albumN', { n: u.members.length })
+}
 
 export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
   const [hits, setHits] = useState<TgMonitorFilterHit[]>([])
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
-  /** 还有没有下一页（仅当上一页是满页时才可能有；短页 = 到底） */
+  /** 还有没有下一页（满一页单元才可能有；短页 = 到底） */
   const [hasMore, setHasMore] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  /** 勾选态 = **单元键**集合（BUG-341：组是勾选单位） */
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [ingesting, setIngesting] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
-  /** 已展开（就地预览）的命中行（BUG-151 范式：点行 = 展开，勾选/入库是各自独立的动作） */
+  /** 已展开（就地预览）的单元（BUG-151 范式：点行 = 展开，勾选/入库是各自独立的动作） */
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   /** 首屏默认全选是否已执行（翻页增量勾选不得重跑它，否则用户的减法被还原） */
   const didInitSelect = useRef(false)
+  /** 用户显式改过勾选的单元（BUG-341：翻页把同一相册的后续成员带回来时，
+   *  不得把用户减掉的勾选静默还原——增量只补没被用户碰过的单元）。 */
+  const touchedRef = useRef<Set<string>>(new Set())
+
+  const units = useMemo(() => groupHits(hits), [hits])
 
   useEffect(() => {
     let cancelled = false
@@ -76,12 +134,14 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
     setHasMore(false)
     // 换规则 = 新工作台：默认全选态复位，等首屏到位后重来（见下方 didInitSelect）。
     didInitSelect.current = false
+    touchedRef.current = new Set()
     void (async () => {
       try {
         const items = await listTgMonitorFilterMessages(filter.id, PAGE_SIZE)
         if (!cancelled) {
           setHits(items)
-          setHasMore(items.length === PAGE_SIZE)
+          // hasMore 按**单元**数判（满页单元 ⇒ 可能有下一页）。
+          setHasMore(groupHits(items).length === PAGE_SIZE)
         }
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e))
@@ -94,9 +154,8 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
     }
   }, [filter.id])
 
-  /** 「加载更多」（TGM-07）：用当前列表最后一行的复合游标续页。
-   *  游标三元组缺一不可（date 理论上恒有——定序就是 COALESCE(msg_date, created_at)；
-   *  万一没有就老实停下，不拿半截游标去翻）。 */
+  /** 「加载更多」（BUG-341 单元级分页）：游标仍取当前列表最后一行的复合三元组，
+   *  后端据此解析该行所属单元并从**该单元之后**续页——组永远不会被切成两半。 */
   const loadMore = useCallback(async () => {
     if (loadingMore || !hasMore) return
     const last = hits[hits.length - 1]
@@ -114,13 +173,19 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
       setHits((prev) => [...prev, ...items])
       // 翻页**不重置**已选（BUG-327「用户只做减法」）：用户翻页前取消的勾选
       // 不能被「加载更多」静默还原——那等于替用户把减法加回去。新页只做
-      // 增量默认勾选（缺字节 = 要下载的），老页的勾选态原样带过去。
+      // 增量默认勾选（缺字节 = 要下载的），老页的勾选态原样带过去；
+      // 且跳过用户显动过的单元（BUG-341：同相册跨页带回时不得还原）。
+      const fresh = groupHits(items)
       setSelected((prev) => {
         const next = new Set(prev)
-        for (const h of items) if (!h.downloaded) next.add(keyOf(h))
+        for (const u of fresh) {
+          if (touchedRef.current.has(u.key)) continue
+          if (u.members.some((m) => !m.downloaded)) next.add(u.key)
+        }
         return next
       })
-      setHasMore(items.length === PAGE_SIZE)
+      // hasMore 与首屏同判据：本页满单元才可能有下一页（后端 limit 即单元数）。
+      setHasMore(fresh.length === PAGE_SIZE)
     } catch (e) {
       setNotice(e instanceof Error ? e.message : String(e))
       setHasMore(false)
@@ -138,27 +203,24 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
     })
   }, [])
 
-  /** 可入库 = 还没有字节。图片与视频一样可勾选、可下载入缓存（用户「选 1」裁定）：
-   *  若在这里按 `type === 'photo'` 把照片整行禁掉，就会出现「第一张是图片就仿佛整个
-   *  列表无法入库」的假象。图片是否进「剧集」媒体库不由本面板决定——那是**后端**
-   *  `file_items_into_series` 的 kind 预切（只收 video）保证的：图片只留 `media_item`
-   *  作库内内容 / 挂视频集图片位，永不占集号。 */
-  const selectable = useMemo(
-    () => hits.filter((h) => !h.downloaded),
-    [hits],
+  /** 可勾选 = 组内还有缺字节成员的单元（图片同样可下载；是否进「剧集」由后端
+   *  kind 预切决定）。整组都已入库的单元不再可勾。 */
+  const selectableUnits = useMemo(
+    () => units.filter((u) => u.members.some((m) => !m.downloaded)),
+    [units],
   )
 
-  // 默认全选可入库条目（BUG-327 裁定：选中的 = 要下载的，用户只做减法）。
-  // 只在**首屏到位后执行一次**：不能随 `selectable` 变化重跑——翻页追加新页时
+  // 默认全选可入库单元（BUG-327 裁定：选中的 = 要下载的，用户只做减法）。
+  // 只在**首屏到位后执行一次**：不能随 `units` 变化重跑——翻页追加新单元时
   // 那会把用户已取消的勾选全部还原（见 loadMore 的增量合并）。
   useEffect(() => {
-    if (didInitSelect.current || loading || hits.length === 0) return
+    if (didInitSelect.current || loading || units.length === 0) return
     didInitSelect.current = true
-    setSelected(new Set(selectable.map(keyOf)))
-  }, [loading, hits, selectable])
+    setSelected(new Set(selectableUnits.map((u) => u.key)))
+  }, [loading, units, selectableUnits])
 
-  const allChecked = selectable.length > 0 && selectable.every((h) => selected.has(keyOf(h)))
-  const someChecked = selectable.some((h) => selected.has(keyOf(h)))
+  const allChecked = selectableUnits.length > 0 && selectableUnits.every((u) => selected.has(u.key))
+  const someChecked = selectableUnits.some((u) => selected.has(u.key))
   const selectAllRef = useRef<HTMLInputElement>(null)
   // 半选只能走 DOM 属性：`<input checked>` 表达不了 indeterminate，
   // 半选与「没选」长得一模一样，用户会以为自己没勾上（BUG-327）。
@@ -167,6 +229,7 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
   }, [someChecked, allChecked])
 
   const toggle = useCallback((key: string) => {
+    touchedRef.current.add(key)
     setSelected((prev) => {
       const next = new Set(prev)
       if (next.has(key)) next.delete(key)
@@ -176,44 +239,46 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
   }, [])
 
   const toggleAll = useCallback(() => {
-    setSelected(allChecked ? new Set() : new Set(selectable.map(keyOf)))
-  }, [allChecked, selectable])
+    for (const u of selectableUnits) touchedRef.current.add(u.key)
+    setSelected(allChecked ? new Set() : new Set(selectableUnits.map((u) => u.key)))
+  }, [allChecked, selectableUnits])
 
   /**
-   * 提交入库：按**相册（group_id）**分组，一组一次请求（BUG-329 裁定①）。
+   * 提交入库：按**单元**一组一次请求（BUG-341；组 = 相册，即用户口径的「组数据」）。
    *
    * 之前按 `channelId` 把所有命中拍平成一个任务——同一频道里的多个相册被混成一条，
-   * 相册结构丢失。现在以 `group_id` 为分组键：同一个相册的命中合并成一个带 `groupId`
-   * 的缓存任务（保留相册结构），无 `group_id` 的单条自成一组。图片照常入缓存；能否
-   * 成「剧集」由后端 `file_items_into_series` 的 kind 预切决定，与是否勾选无关。
+   * 相册结构丢失。现在以 `(channelId, groupId)` 为分组键：同一个相册的命中合并成
+   * 一个带 `groupId` 的缓存任务（保留相册结构），无 `groupId` 的单条自成一组。
+   * 图片照常入缓存；能否成「剧集」由后端 `file_items_into_series` 的 kind 预切
+   * 决定，与是否勾选无关。
+   *
+   * 下发的 messageIds = 组内**缺字节**的成员（已有字节的不重下；worker 侧
+   * BUG-308 对已登记条目幂等跳过，只补缺的）。
    *
    * `POST /api/tg/cache/tasks` 一次只接受一个 `chatId`（`EnqueueCacheReq`），
    * 跨频道批量只能拆开——这不是本面板能绕过的。
    */
   const ingest = useCallback(async () => {
-    const picked = hits.filter((h) => selected.has(keyOf(h)))
+    const picked = units.filter((u) => selected.has(u.key))
     if (picked.length === 0) {
       setNotice(t('tg.filterIngestNone'))
       return
-    }
-    const groups = new Map<number, { chatId: number; groupId?: number; messageIds: number[] }>()
-    for (const h of picked) {
-      const key = h.groupId ?? -1
-      let g = groups.get(key)
-      if (!g) {
-        g = { chatId: h.channelId, groupId: h.groupId, messageIds: [] }
-        groups.set(key, g)
-      }
-      g.messageIds.push(h.messageId)
     }
     setIngesting(true)
     setNotice(null)
     let queued = 0
     const failures: string[] = []
-    for (const g of groups.values()) {
+    for (const u of picked) {
+      // 组 = 入库单位：整组缺字节成员一次入队（不是「匹配到的那一条」）。
+      const ids = u.members.filter((m) => !m.downloaded).map((m) => m.messageId)
+      if (ids.length === 0) continue
       try {
-        const r = await enqueueCacheTask({ chatId: g.chatId, messageIds: g.messageIds, groupId: g.groupId })
-        if (!r?.alreadyIngested) queued += g.messageIds.length
+        const r = await enqueueCacheTask({
+          chatId: u.channelId,
+          messageIds: ids,
+          groupId: u.groupId,
+        })
+        if (!r?.alreadyIngested) queued += ids.length
       } catch (e) {
         failures.push(e instanceof Error ? e.message : String(e))
       }
@@ -226,7 +291,7 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
     }
     setNotice(queued === 0 ? t('tg.filterIngestNone') : t('tg.filterIngestDone', { n: queued }))
     onIngested?.(queued)
-  }, [hits, selected, onIngested])
+  }, [units, selected, onIngested])
 
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-testid="tg-filter-panel">
@@ -234,7 +299,7 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
         <Button
           variant="ghost"
           size="sm"
-          className="h-8 shrink-0 px-2 text-[12px]"
+          className="shrink-0"
           onClick={onClose}
           data-testid="tg-filter-back"
         >
@@ -244,7 +309,7 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
           {t('tg.filterTitle', { label: filter.label })}
         </h3>
         <span className="shrink-0 rounded-md border border-border-subtle px-2 py-0.5 text-[12px] tabular-nums text-fg-mid">
-          {t('tg.filterHits', { n: hits.length })}
+          {t('tg.filterHits', { n: units.length })}
         </span>
       </header>
 
@@ -261,27 +326,33 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
           <p className="px-2 py-6 text-center text-[13px] text-muted">{t('tg.filterLoading')}</p>
         ) : error ? (
           <p className="px-2 py-6 text-center text-[13px] text-danger">{error}</p>
-        ) : hits.length === 0 ? (
+        ) : units.length === 0 ? (
           <p className="px-2 py-6 text-center text-[13px] text-muted">{t('tg.filterNoHits')}</p>
         ) : (
-          hits.map((h) => {
-            const k = keyOf(h)
+          units.map((u) => {
+            const k = u.key
             const checked = selected.has(k)
             const open = expanded.has(k)
-            // 可勾 = 缺字节（图片同样可下载；是否进「剧集」由后端 kind 预切决定）。
-            const pickable = !h.downloaded
-            const thumbable = h.type === 'photo' || h.type === 'video'
+            const isAlbum = u.groupId != null
+            // 可勾 = 组内还有缺字节成员（整组已入库的不可勾）。
+            const pickable = u.members.some((m) => !m.downloaded)
+            const newest = u.members.reduce<TgMonitorFilterHit | null>(
+              (acc, m) => (acc == null || (m.date ?? 0) > (acc.date ?? 0) ? m : acc),
+              null,
+            )
+            const totalSize = u.members.reduce((sum, m) => sum + (m.size ?? 0), 0)
             return (
               <div
                 key={k}
-                data-testid="tg-filter-hit"
+                data-testid={isAlbum ? 'tg-filter-group' : 'tg-filter-hit'}
                 className={cn(
                   'rounded-md transition-colors',
                   checked ? 'bg-accent/5' : 'hover:bg-surface-2/60',
                 )}
               >
                 <div className="flex items-start gap-2 px-2 py-2">
-                  {/* 勾选区是独立热区：点行 = 展开预览，不再整行劫持勾选 */}
+                  {/* 勾选区是独立热区：点行 = 展开预览，不再整行劫持勾选。
+                      BUG-341：勾选 = **组级**——勾相册即整组，展开仅作预览。 */}
                   <label
                     className={cn(
                       'flex shrink-0 cursor-pointer items-center pt-0.5',
@@ -311,13 +382,29 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
                       <ChevronRight className="mt-0.5 h-4 w-4 shrink-0 text-muted" aria-hidden="true" />
                     )}
                     <div className="min-w-0 flex-1">
-                      <p className="truncate text-[13px] font-medium text-fg-strong">{hitTitle(h)}</p>
+                      <p className="truncate text-[13px] font-medium text-fg-strong">
+                        {unitTitle(u)}
+                      </p>
                       <p className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[12px] text-muted">
-                        <span className="max-w-[45%] truncate">{h.channelTitle ?? '—'}</span>
-                        <span>{typeLabel(h.type)}</span>
-                        <span className="tabular-nums">{fmtSize(h.size)}</span>
-                        <span className="tabular-nums">{fmtTime(h.date)}</span>
-                        {h.downloaded ? (
+                        {/* BUG-340：channelTitle 缺失 = 不渲染该段，不渲染 `—` 占位
+                            （用户「从来没有需要显示(-)的要求」）。 */}
+                        {u.members[0]?.channelTitle ? (
+                          <span className="max-w-[45%] truncate">{u.members[0].channelTitle}</span>
+                        ) : null}
+                        {isAlbum ? (
+                          <span className="font-medium text-accent">
+                            {t('tg.albumN', { n: u.members.length })}
+                          </span>
+                        ) : (
+                          <span>{typeLabel(u.members[0]?.type)}</span>
+                        )}
+                        {totalSize > 0 ? (
+                          <span className="tabular-nums">{fmtSize(totalSize)}</span>
+                        ) : null}
+                        {newest?.date != null ? (
+                          <span className="tabular-nums">{fmtTime(newest.date)}</span>
+                        ) : null}
+                        {!pickable ? (
                           <span className="text-success">{t('tg.downloaded')}</span>
                         ) : null}
                       </p>
@@ -325,48 +412,93 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
                   </button>
                 </div>
                 {open ? (
-                  /* 就地预览（TGM-07 / 诉求①「筛选出来的内容无法看到内容信息」）：
-                     完整说明 + 文件名 + MIME + 时长 + 缩略图。播放入口留在频道
-                     内容流与全局搜索（BUG-151 范式在那两处已成范式，不在这里
-                     再开第三个播放入口）。 */
-                  <div
-                    className="mx-2 mb-2 rounded-md border border-border-subtle/60 bg-surface/40 p-2"
-                    data-testid="tg-filter-hit-detail"
-                  >
-                    {h.caption ? (
-                      <p className="whitespace-pre-wrap break-words text-[12px] leading-relaxed text-fg-mid">
-                        {h.caption}
-                      </p>
-                    ) : null}
-                    {h.fileName ? (
-                      <p className="mt-1 break-all text-[12px] text-muted">
-                        {h.fileName}
-                        {h.mimeType ? ` · ${h.mimeType}` : ''}
-                      </p>
-                    ) : null}
-                    <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[12px] text-muted">
-                      <span>{typeLabel(h.type)}</span>
-                      <span className="tabular-nums">{fmtSize(h.size)}</span>
-                      {h.duration ? (
-                        <span className="tabular-nums">{t('tg.cacheCountUnit', { n: h.duration })}</span>
+                  isAlbum ? (
+                    /* 相册展开 = 组内全部成员（BUG-341「必须显示组数据」：
+                        成员行供预览核对，勾选在组行上，不拆成逐条可勾——
+                        组是入库单位，逐条勾选会把「组数据」又变回单条语义）。 */
+                    <div
+                      className="mx-2 mb-2 rounded-md border border-border-subtle/60 bg-surface/40 p-2"
+                      data-testid="tg-filter-members"
+                    >
+                      {u.members.map((m) => {
+                        const thumbable = m.type === 'photo' || m.type === 'video'
+                        return (
+                          <div
+                            key={keyOf(m)}
+                            data-testid="tg-filter-member"
+                            className="flex items-center gap-2 py-1"
+                          >
+                            {thumbable ? (
+                              <img
+                                src={tgThumbUrl(m.channelId, m.messageId)}
+                                alt=""
+                                className="h-10 w-10 shrink-0 rounded border border-border-subtle/60 object-cover"
+                                loading="lazy"
+                              />
+                            ) : null}
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-[12.5px] text-fg-strong">
+                                {hitTitle(m)}
+                              </p>
+                              <p className="truncate text-[12px] text-muted">
+                                {typeLabel(m.type)}
+                                {m.size ? ` · ${fmtSize(m.size)}` : ''}
+                                {m.downloaded ? ` · ${t('tg.downloaded')}` : ''}
+                              </p>
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  ) : (
+                    /* 单条就地预览（BUG-151 范式）：完整说明 + 文件名 + MIME +
+                       时长 + 缩略图。播放入口留在频道内容流与全局搜索（BUG-151
+                       范式在那两处已成范式，不在这里再开第三个播放入口）。 */
+                    <div
+                      className="mx-2 mb-2 rounded-md border border-border-subtle/60 bg-surface/40 p-2"
+                      data-testid="tg-filter-hit-detail"
+                    >
+                      {u.members[0].caption ? (
+                        <p className="whitespace-pre-wrap break-words text-[12px] leading-relaxed text-fg-mid">
+                          {u.members[0].caption}
+                        </p>
                       ) : null}
-                      <span className="tabular-nums">{fmtTime(h.date)}</span>
-                      <span className="max-w-[50%] truncate">{h.channelTitle ?? '—'}</span>
-                      {h.downloaded ? (
-                        <span className="text-success">{t('tg.downloaded')}</span>
-                      ) : (
-                        <span>{t('tg.bytesMissing')}</span>
-                      )}
-                    </p>
-                    {thumbable ? (
-                      <img
-                        src={tgThumbUrl(h.channelId, h.messageId)}
-                        alt={hitTitle(h)}
-                        className="mt-1.5 max-h-48 rounded-md border border-border-subtle/60 object-contain"
-                        loading="lazy"
-                      />
-                    ) : null}
-                  </div>
+                      {u.members[0].fileName ? (
+                        <p className="mt-1 break-all text-[12px] text-muted">
+                          {u.members[0].fileName}
+                          {u.members[0].mimeType ? ` · ${u.members[0].mimeType}` : ''}
+                        </p>
+                      ) : null}
+                      <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[12px] text-muted">
+                        <span>{typeLabel(u.members[0].type)}</span>
+                        <span className="tabular-nums">{fmtSize(u.members[0].size)}</span>
+                        {u.members[0].duration ? (
+                          <span className="tabular-nums">
+                            {t('tg.cacheCountUnit', { n: u.members[0].duration })}
+                          </span>
+                        ) : null}
+                        {u.members[0].date != null ? (
+                          <span className="tabular-nums">{fmtTime(u.members[0].date)}</span>
+                        ) : null}
+                        {u.members[0].channelTitle ? (
+                          <span className="max-w-[50%] truncate">{u.members[0].channelTitle}</span>
+                        ) : null}
+                        {u.members[0].downloaded ? (
+                          <span className="text-success">{t('tg.downloaded')}</span>
+                        ) : (
+                          <span>{t('tg.bytesMissing')}</span>
+                        )}
+                      </p>
+                      {u.members[0].type === 'photo' || u.members[0].type === 'video' ? (
+                        <img
+                          src={tgThumbUrl(u.members[0].channelId, u.members[0].messageId)}
+                          alt={hitTitle(u.members[0])}
+                          className="mt-1.5 max-h-48 rounded-md border border-border-subtle/60 object-contain"
+                          loading="lazy"
+                        />
+                      ) : null}
+                    </div>
+                  )
                 ) : null}
               </div>
             )
@@ -374,7 +506,7 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
         )}
         {hasMore ? (
           <div className="px-2 py-2">
-            {/* 「加载更多」（TGM-07 分页）：取代旧版一次拉全部 + 后端 clamp 500 硬顶 */}
+            {/* 「加载更多」（BUG-341 单元级分页）：整组一起翻，组不会被切成两半 */}
             <Button
               variant="secondary"
               size="sm"

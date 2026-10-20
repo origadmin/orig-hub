@@ -133,7 +133,13 @@ pub struct MediaItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<i64>,
     /// TG 相册分组 id（同一相册的多条媒体共享同值，v0.4.2；单发媒体为 None）。
-    #[serde(rename = "groupId", skip_serializing_if = "Option::is_none")]
+    /// BUG-345：group_id ~1.4e16 > JS 2^53，number 过 JSON 界会被前端丢精度
+    /// （活库 62/70 个组键任务被污染）⇒ 过界走字符串，见 `store::serialize_group_id_opt`。
+    #[serde(
+        rename = "groupId",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::store::serialize_group_id_opt"
+    )]
     pub group_id: Option<i64>,
     /// 是否含可在线流式播放/预览的媒体。
     #[serde(rename = "hasMedia")]

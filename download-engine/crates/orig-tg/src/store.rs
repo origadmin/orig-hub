@@ -12,9 +12,56 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use libsql::params::IntoParams;
 use libsql::{params, Connection, Row};
+use serde::Deserialize;
 use serde::Serialize;
+use serde::Deserializer;
+use serde::Serializer;
 
 use crate::login::Channel;
+
+/// BUG-345：相册组 id（TG `group_id`，量级 ~1.4e16）**超过** JS
+/// `Number.MAX_SAFE_INTEGER`（2^53-1 ≈ 9.007e15）。
+///
+/// 以 JSON **number** 过边界时，前端 `JSON.parse` 会把它化入相邻的可表示双精度
+/// 浮点：活库实证 70 个组键缓存任务里 **62 个**的 `item_key`/`group_id` 比真值
+/// 差 1（如 14337318082994317 → …316）。后果不是显示问题——去重键与相册身份
+/// 对不上，「同一相册」在系统里分裂成两个身份（BUG-341 整组入库正好要把这个 id
+/// 原样回传）。修法（让错误状态不可表达）：group_id 过界一律走**字符串**
+/// （GitHub node_id 同款先例），反序列化保持宽容（string/number 都收），
+/// 旧客户端（重部署窗口里的陈旧标签页）不被击。
+///
+/// 序列化点 ×4（`TgMedia` / `MonitorFilterHit` / `StoredMessage` / `CacheTask`）
+/// 与反序列化点 ×1（`EnqueueCacheReq.group_id`）共用这两个函数。
+pub fn serialize_group_id_opt<S: Serializer>(
+    v: &Option<i64>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(g) => s.serialize_str(&g.to_string()),
+        None => s.serialize_none(),
+    }
+}
+
+pub fn deserialize_group_id_opt<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        Num(i64),
+        Str(String),
+    }
+    match Option::<NumOrStr>::deserialize(d)? {
+        None => Ok(None),
+        Some(NumOrStr::Num(n)) => Ok(Some(n)),
+        Some(NumOrStr::Str(s)) => s
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
 
 /// 监控中的频道（`monitored_channel` 行）。
 #[derive(Debug, Clone, Serialize)]
@@ -88,7 +135,14 @@ pub struct MonitorFilterHit {
     pub channel_title: Option<String>,
     /// TG 相册分组 id（同组消息构成一个相册；无则单条）。前端据此「按组入库」而非按单条
     /// 扁平化——同一频道内的多相册必须各自成任务，保留相册结构（BUG-329 裁定①）。
-    #[serde(rename = "groupId", skip_serializing_if = "Option::is_none")]
+    ///
+    /// BUG-345：过 JSON 边界走**字符串**——group_id ~1.4e16 > 2^53，number 过界
+    /// 会被前端 JSON.parse 化掉精度（活库 62/70 个组键任务被污染）。
+    #[serde(
+        rename = "groupId",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_group_id_opt"
+    )]
     pub group_id: Option<i64>,
     /// MIME 类型（BUG-330 / TGM-05：命中行预览的数据基础）。
     ///
@@ -129,7 +183,12 @@ pub struct StoredMessage {
     #[serde(rename = "filePath", skip_serializing_if = "Option::is_none")]
     pub file_path: Option<String>,
     /// TG 相册分组 id（同一相册共享同值，v0.4.2 新增列，旧行为 NULL）。
-    #[serde(rename = "groupId", skip_serializing_if = "Option::is_none")]
+    /// BUG-345：过界走字符串（见 `serialize_group_id_opt`）。
+    #[serde(
+        rename = "groupId",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_group_id_opt"
+    )]
     pub group_id: Option<i64>,
 }
 
@@ -231,7 +290,12 @@ pub struct CacheTask {
     #[serde(rename = "chatId")]
     pub chat_id: i64,
     /// 相册分组 id（单条缓存为 NULL）。
-    #[serde(rename = "groupId", skip_serializing_if = "Option::is_none")]
+    /// BUG-345：过界走字符串（见 `serialize_group_id_opt`）。
+    #[serde(
+        rename = "groupId",
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_group_id_opt"
+    )]
     pub group_id: Option<i64>,
     /// 去重键：`g:{chat}:{group}`（整组）或 `m:{chat}:{msg}`（单条）。
     #[serde(rename = "itemKey")]
@@ -507,6 +571,80 @@ async fn migrate_dialog_cache_blank_titles(conn: &Connection) -> libsql::Result<
     Ok(n)
 }
 
+/// BUG-345 迁移：修复 group id 精度损失污染的**存量** `cache_task` 键。
+///
+/// 前端曾以 JSON number 收发 group_id（~1.4e16 > JS 2^53 ⇒ `JSON.parse` 丢 1），
+/// 活库实证 70 个组键任务里 62 个的 `item_key`/`group_id` 比真值差 1。串界修复
+/// （`serialize_group_id_opt`）后新任务恒真值，但存量污染键不修就会与真值**分裂
+/// 成两个身份**——同一相册的旧任务再也按真键找不到（前端相册气泡/筛选整组入库
+/// 都按真键比对）。修法：按任务首条消息在 `media_message` 里的**真** group_id
+/// 重写 `item_key` 与 `group_id` 两列。
+///
+/// 口径：
+///   - 真值取不到的行（首条消息已被清理 / 该行无组）**不动**——宁可保留旧键，
+///     也不按猜测写一个身份；
+///   - 单行 UPDATE 失败（如撞 `cache_task_active_uniq` 的极端并发）跳过并继续，
+///     迁移不阻断启动（自愈性质，同 BUG-304 容错口径）；
+///   - 幂等：修过的键再跑是 no-op（判据 = 键已等于真值键）。
+async fn repair_group_key_precision(conn: &Connection) -> libsql::Result<usize> {
+    let mut rows = conn
+        .query(
+            "SELECT id, chat_id, item_key, items FROM cache_task WHERE item_key LIKE 'g:%'",
+            (),
+        )
+        .await?;
+    // (task_id, chat_id, true_gid)
+    let mut pending: Vec<(i64, i64, i64)> = Vec::new();
+    while let Some(r) = rows.next().await? {
+        let id: i64 = r.get(0)?;
+        let chat_id: i64 = r.get(1)?;
+        let item_key: String = r.get(2)?;
+        let items: String = r.get(3)?;
+        let mids: Vec<i64> = serde_json::from_str(&items).unwrap_or_default();
+        let Some(first) = mids.first().copied() else {
+            continue;
+        };
+        // 真值唯一来源：首条消息行里的 group_id（行不在 / 无组 ⇒ 不动）。
+        let Some(tr) = conn
+            .query(
+                "SELECT group_id FROM media_message WHERE channel_id = ?1 AND message_id = ?2",
+                params![chat_id, first],
+            )
+            .await?
+            .next()
+            .await?
+        else {
+            continue;
+        };
+        let true_gid: Option<i64> = tr.get(0).ok();
+        let Some(true_gid) = true_gid else {
+            continue;
+        };
+        if item_key != format!("g:{chat_id}:{true_gid}") {
+            pending.push((id, chat_id, true_gid));
+        }
+    }
+    let mut repaired = 0usize;
+    for (id, chat_id, true_gid) in pending {
+        let key = format!("g:{chat_id}:{true_gid}");
+        match conn
+            .execute(
+                "UPDATE cache_task SET item_key = ?1, group_id = ?2 WHERE id = ?3",
+                params![key, true_gid, id],
+            )
+            .await
+        {
+            Ok(_) => repaired += 1,
+            Err(e) => {
+                eprintln!(
+                    "[store] BUG-345: skip repairing cache_task {id} (non-fatal): {e}"
+                );
+            }
+        }
+    }
+    Ok(repaired)
+}
+
 /// 按 `list_messages`/`get_message` 的 SELECT 列顺序映射一行。
 /// 列顺序：channel_id, message_id, caption, mime_type, size, downloaded, created_at,
 ///         media_type, msg_date, duration, file_path, group_id
@@ -687,6 +825,16 @@ impl Store {
         .await?;
         // 旧库（v0.3.x）的 media_message 缺 media_type/msg_date：幂等补列，不删数据。
         migrate_media_message(&conn).await?;
+        // BUG-341：相册组按 (channel_id, group_id) 的成员扩展查询（筛选命中整组
+        // 入列、组级分页的 join）依赖它；无索引时每组一次全表扫。
+        // **必须在 migrate_media_message 之后建**：group_id 是老库补的列，建在
+        // 补列前 = 旧库每次启动都「no such column: group_id」直接打不开。
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS media_message_group_idx
+                 ON media_message(channel_id, group_id)",
+            (),
+        )
+        .await?;
         // 旧库的 cache_task 缺 priority：幂等补列，不删数据（BUG-277）。
         migrate_cache_task_priority(&conn).await?;
         // 旧库的 monitored_channel 缺 last_read_message_id：幂等补列 + 存量视为已读。
@@ -698,6 +846,14 @@ impl Store {
         let healed = migrate_dialog_cache_blank_titles(&conn).await?;
         if healed > 0 {
             eprintln!("[store] BUG-194: backfilled {healed} blank dialog_cache titles");
+        }
+        // BUG-345：修复 group id 精度损失污染的存量 cache_task 键（JS 2^53 舍入，
+        // 活库实证 62/70 个组键任务被污染差 1）。幂等；修不了的行跳过不阻断启动。
+        let repaired_keys = repair_group_key_precision(&conn).await?;
+        if repaired_keys > 0 {
+            eprintln!(
+                "[store] BUG-345: repaired {repaired_keys} cache_task key(s) corrupted by group-id precision loss"
+            );
         }
         // 媒体资料库（内容/剧集/标签）：与 TG 流水同库、职责分离。
         crate::media::migrate(&conn).await?;
@@ -1127,14 +1283,24 @@ impl Store {
         Ok(out)
     }
 
-    /// 单条规则的命中条数（跨全部监控频道，caption **或** file_name）。
+    /// 单条规则的命中**单元**条数（跨全部监控频道；BUG-341：组内任一 member 的
+    /// caption **或** file_name 匹配 ⇒ 整个相册算 1 个单元；无 group_id 的单条
+    /// 消息算 1 个）。与 `filter_messages` 的呈现粒度同源——UI 显示组，计数就必须
+    /// 数组，否则左栏「命中 200」与面板「25 个相册」永远对不上。
     async fn count_filter_hits(&self, keyword: &str) -> libsql::Result<i64> {
         let row = self
             .row_opt(
-                "SELECT COUNT(*)
-                   FROM media_message m
-                   JOIN monitored_channel c ON c.channel_id = m.channel_id
-                  WHERE m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\'",
+                "SELECT
+                   (SELECT COUNT(DISTINCT m.channel_id || ':' || m.group_id)
+                      FROM media_message m
+                      JOIN monitored_channel c ON c.channel_id = m.channel_id
+                     WHERE m.group_id IS NOT NULL
+                       AND (m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\'))
+                 + (SELECT COUNT(*)
+                      FROM media_message m
+                      JOIN monitored_channel c ON c.channel_id = m.channel_id
+                     WHERE m.group_id IS NULL
+                       AND (m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\'))",
                 params![like_pattern(keyword)],
             )
             .await?;
@@ -1144,11 +1310,12 @@ impl Store {
         }
     }
 
-    /// 自 `last_read_at` 以来**新增**的命中条数（BUG-330 / TGM-06）。
+    /// 自 `last_read_at` 以来**新增**的命中单元数（BUG-330 / TGM-06；BUG-341 起
+    /// 按单元口径）。
     ///
-    /// 口径与 `count_filter_hits` 相同，只加时间条件
-    /// `COALESCE(msg_date, created_at) > last_read_at`——与命中定序同源，
-    /// 跨频道可比（message_id 游标做不到，见 `MonitorFilter::new_hits` 注释）。
+    /// 单元的「新」判据 = **unit_date > last_read_at**，unit_date 取整组最新消息
+    /// 时间（与 `filter_messages` 的定序同源）：组里来了新消息（哪怕它自己不匹配），
+    /// 这个相册也是「有新东西」——用户看到的是组，不是当初匹配上的那一条。
     ///
     /// **秒粒度边界**（游标与 msg_date 同为 unix 秒）：与点开同一秒内到达的命中
     /// 落在 `>` 边界上不计 +N。消息本身仍在命中列表（费的只是徽标），且监控同步
@@ -1157,11 +1324,26 @@ impl Store {
     async fn count_filter_new_hits(&self, keyword: &str, last_read_at: i64) -> libsql::Result<i64> {
         let row = self
             .row_opt(
-                "SELECT COUNT(*)
-                   FROM media_message m
-                   JOIN monitored_channel c ON c.channel_id = m.channel_id
-                  WHERE (m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\')
-                    AND COALESCE(m.msg_date, m.created_at) > ?2",
+                "SELECT COUNT(*) FROM (
+                    SELECT g.channel_id, g.group_id
+                      FROM (SELECT DISTINCT m.channel_id, m.group_id
+                              FROM media_message m
+                              JOIN monitored_channel c ON c.channel_id = m.channel_id
+                             WHERE m.group_id IS NOT NULL
+                               AND (m.caption LIKE ?1 ESCAPE '\\'
+                                OR m.file_name LIKE ?1 ESCAPE '\\')) g
+                     WHERE (SELECT MAX(COALESCE(x.msg_date, x.created_at))
+                              FROM media_message x
+                             WHERE x.channel_id = g.channel_id
+                               AND x.group_id = g.group_id) > ?2
+                    UNION ALL
+                    SELECT m.channel_id, m.message_id
+                      FROM media_message m
+                      JOIN monitored_channel c ON c.channel_id = m.channel_id
+                     WHERE m.group_id IS NULL
+                       AND (m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\')
+                       AND COALESCE(m.msg_date, m.created_at) > ?2
+                 )",
                 params![like_pattern(keyword), last_read_at],
             )
             .await?;
@@ -1212,15 +1394,15 @@ impl Store {
         }
     }
 
-    /// 「点开某条规则」= 把已读游标推到**当前命中集合的最大日期**，`new_hits` 随之
-    /// 归零（BUG-330 / TGM-06）。
+    /// 「点开某条规则」= 把已读游标推到**当前命中单元集合的最大 unit_date**，
+    /// `new_hits` 随之归零（BUG-330 / TGM-06；BUG-341 起按单元口径）。
     ///
     /// **为什么不像 `mark_channel_read` 那样直接用墙钟 `now()`**：消息的
     /// `msg_date` 是 **TG 服务器时钟**，与本机墙钟有秒级时差是常态；时钟超前时
     /// （或测试里的未来日期），`now()` 置的游标**清不掉**这些行 ⇒ 徽标永远归不了零。
     /// 与频道侧同范式：推到**库里实际存在的最大 message_id**（那里抗时差），这里推到
-    /// **当前命中集合里实际存在的最大 `COALESCE(msg_date, created_at)`**——「点开」的
-    /// 语义是「列表里现在有的我都看过了」，不是「墙钟走到哪了」。
+    /// **当前命中集合里实际存在的最大 unit_date**——「点开」的语义是「列表里现在有
+    /// 的我都看过了」，不是「墙钟走到哪了」。
     ///
     /// `MAX(last_read_at, …)` 只进不退：消息被清理（行删除）后命中集合变小，直接赋值
     /// 等于把已读的旧命中重新变成新的；重放/坏时钟同理。
@@ -1239,11 +1421,25 @@ impl Store {
             .execute(
                 "UPDATE monitor_filter
                     SET last_read_at = MAX(last_read_at, COALESCE(
-                          (SELECT MAX(COALESCE(m.msg_date, m.created_at))
-                             FROM media_message m
-                             JOIN monitored_channel c ON c.channel_id = m.channel_id
-                            WHERE m.caption LIKE ?1 ESCAPE '\\'
-                               OR m.file_name LIKE ?1 ESCAPE '\\'),
+                          (SELECT MAX(u.unit_date) FROM (
+                              SELECT (SELECT MAX(COALESCE(x.msg_date, x.created_at))
+                                        FROM media_message x
+                                       WHERE x.channel_id = g.channel_id
+                                         AND x.group_id = g.group_id) AS unit_date
+                                FROM (SELECT DISTINCT m.channel_id, m.group_id
+                                        FROM media_message m
+                                        JOIN monitored_channel c ON c.channel_id = m.channel_id
+                                       WHERE m.group_id IS NOT NULL
+                                         AND (m.caption LIKE ?1 ESCAPE '\\'
+                                           OR m.file_name LIKE ?1 ESCAPE '\\')) g
+                              UNION ALL
+                              SELECT COALESCE(m.msg_date, m.created_at)
+                                FROM media_message m
+                                JOIN monitored_channel c ON c.channel_id = m.channel_id
+                               WHERE m.group_id IS NULL
+                                 AND (m.caption LIKE ?1 ESCAPE '\\'
+                                   OR m.file_name LIKE ?1 ESCAPE '\\')
+                           ) u),
                           last_read_at))
                   WHERE id = ?2",
                 params![like_pattern(&keyword), id],
@@ -1260,18 +1456,30 @@ impl Store {
         Ok(())
     }
 
-    /// 某条筛选规则的命中列表（新→旧，BUG-330 / TGM-05 补预览字段与复合游标）。
+    /// 某条筛选规则的命中列表（新→旧，BUG-330 / TGM-05 补预览字段与复合游标；
+    /// BUG-341 起**命中单元 = 相册组**）。
     ///
     /// 匹配字段由用户 2026-10-19 裁定：**标题/说明（caption）+ 文件名（file_name）**。
     /// 只查本地已同步消息（查询语义，不做网络回补）；规则不存在返回空集而非报错。
     ///
-    /// `before` = 复合游标 `(date, channel_id, message_id)`：
-    /// - `date` = `COALESCE(msg_date, created_at)`——与定序同源、跨频道可比；
-    /// - `channel_id` 必须在游标里：**message_id 跨频道不唯一**，只带 message_id
-    ///   会在同刻跨频道行上重复/跳过（同 BUG-329 对单频道游标的相反约束）。
-    /// 定序相应改为 `(date, channel_id, message_id)` 全降序——原定序缺 channel_id，
-    /// 同 `(date, message_id)` 跨频道两行的先后不确定，游标分页必然漏重。
+    /// ## BUG-341：组是命中与分页的单位
+    ///
+    /// 旧实现逐条匹配：相册的组级 caption 只落在组内**一条**消息上（活库实证：
+    /// 满员组 10 条仅 1 条带 caption）⇒ 每个相册只现 1 行、入库只传 1 个
+    /// messageId，组结构与组内内容双丢失（用户「强调很多次」的缺陷）。
+    ///
+    /// 新语义：**组内任一 member 匹配 ⇒ 整组是一个命中单元，组内全部消息入列**；
+    /// 无 `group_id` 的单条消息自成单元。分页随之改为**单元级**——游标落在
+    /// 「光标消息所属的单元」之后，组永远不会被页边界切成两半（半截组 = 又一类
+    /// 「显示单条错误数据」）。
+    ///
+    /// `before` = 复合游标 `(date, channel_id, message_id)`（上一页最后一行的
+    /// 三元组；`date` = `COALESCE(msg_date, created_at)`）。三元组里真正定位的
+    /// 只有 `(channel_id, message_id)`——后端据此解析该消息所属单元（有组取组、
+    /// 无组取自身），`date` 仅在光标消息已不存在时兜底比较。
     /// `before = None` = 第一页（从最新开始）。
+    ///
+    /// `limit` 的语义随单元级分页改变：**每页单元数**（相册/单条），不再是消息数。
     pub async fn filter_messages(
         &self,
         filter_id: i64,
@@ -1290,26 +1498,94 @@ impl Store {
         let keyword: String = r.get(0)?;
         // 游标条件按「展开式」写而不用行值比较 `(a,b,c) < (?,?,?)`：判据要在旧版
         // libsql 上也能跑，且展开式在 EXPLAIN 下与行值等价。
+        // 比较基准是**单元**三元组（unit_date, channel_id, COALESCE(group_id,
+        // message_id)）——由 cursor_unit 从光标消息解析；消息不在了则退回传入的
+        // (date, channel, message) 直接比（宁可重复半页，不可整页截空）。
         let cursor_sql = if before.is_some() {
             " AND (
-                   COALESCE(m.msg_date, m.created_at) < ?3
-                OR (COALESCE(m.msg_date, m.created_at) = ?3 AND m.channel_id < ?4)
-                OR (COALESCE(m.msg_date, m.created_at) = ?3 AND m.channel_id = ?4 AND m.message_id < ?5)
+                   u.unit_date < COALESCE((SELECT unit_date FROM cursor_unit), ?3)
+                OR (u.unit_date = COALESCE((SELECT unit_date FROM cursor_unit), ?3)
+                    AND u.channel_id < ?4)
+                OR (u.unit_date = COALESCE((SELECT unit_date FROM cursor_unit), ?3)
+                    AND u.channel_id = ?4
+                    AND COALESCE(u.group_id, u.message_id)
+                        < COALESCE((SELECT unit_key FROM cursor_unit), ?5))
                )"
         } else {
             ""
         };
+        // 组级分支：先取「有 member 匹配」的组（DISTINCT 防同组多 member 匹配时
+        // 重复成多个单元），unit_date 取**整组**最新消息时间（与 UI 显示的相册
+        // 日期同源）；最终 join 再按 (channel_id, group_id) 展开全部成员。
+        // 单条分支：无 group_id 且自身匹配，单元即消息自身。
         let sql = format!(
-            "SELECT m.channel_id, m.message_id, m.caption, m.file_name, m.media_type,
-                    m.size, m.duration, m.msg_date, m.downloaded, c.title, m.group_id,
-                    m.mime_type, m.file_path
-               FROM media_message m
-               JOIN monitored_channel c ON c.channel_id = m.channel_id
-              WHERE (m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\'){cursor_sql}
-              ORDER BY COALESCE(m.msg_date, m.created_at) DESC, m.channel_id DESC, m.message_id DESC
-              LIMIT ?2"
+            "WITH hit_groups AS (
+                SELECT DISTINCT m.channel_id, m.group_id
+                  FROM media_message m
+                  JOIN monitored_channel c ON c.channel_id = m.channel_id
+                 WHERE m.group_id IS NOT NULL
+                   AND (m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\')
+             ),
+             hit_units AS (
+                SELECT g.channel_id AS channel_id,
+                       g.group_id   AS group_id,
+                       NULL         AS message_id,
+                       (SELECT MAX(COALESCE(x.msg_date, x.created_at))
+                          FROM media_message x
+                         WHERE x.channel_id = g.channel_id
+                           AND x.group_id = g.group_id) AS unit_date
+                  FROM hit_groups g
+                UNION ALL
+                SELECT m.channel_id, NULL, m.message_id,
+                       COALESCE(m.msg_date, m.created_at)
+                  FROM media_message m
+                  JOIN monitored_channel c ON c.channel_id = m.channel_id
+                 WHERE m.group_id IS NULL
+                   AND (m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\')
+             ),
+             cursor_unit AS (
+                SELECT cu.channel_id AS channel_id,
+                       cu.unit_date  AS unit_date,
+                       COALESCE(cu.group_id, cu.message_id) AS unit_key
+                  FROM (SELECT m.channel_id, m.group_id, m.message_id,
+                               CASE WHEN m.group_id IS NOT NULL
+                                    THEN (SELECT MAX(COALESCE(x.msg_date, x.created_at))
+                                            FROM media_message x
+                                           WHERE x.channel_id = m.channel_id
+                                             AND x.group_id = m.group_id)
+                                    ELSE COALESCE(m.msg_date, m.created_at)
+                               END AS unit_date
+                          FROM media_message m
+                         WHERE m.channel_id = ?4 AND m.message_id = ?5) cu
+             ),
+             page_units AS (
+                SELECT u.channel_id AS channel_id,
+                       u.group_id   AS group_id,
+                       u.message_id AS message_id,
+                       u.unit_date  AS unit_date,
+                       COALESCE(u.group_id, u.message_id) AS unit_key
+                  FROM hit_units u
+                 WHERE 1=1{cursor_sql}
+                 ORDER BY u.unit_date DESC, u.channel_id DESC,
+                          COALESCE(u.group_id, u.message_id) DESC
+                 LIMIT ?2
+             )
+            SELECT m.channel_id, m.message_id, m.caption, m.file_name, m.media_type,
+                   m.size, m.duration, m.msg_date, m.downloaded, c.title, m.group_id,
+                   m.mime_type, m.file_path
+              FROM page_units u
+              JOIN media_message m
+                ON m.channel_id = u.channel_id
+               AND ((u.group_id IS NOT NULL AND m.group_id = u.group_id)
+                 OR (u.group_id IS NULL AND m.message_id = u.message_id))
+              JOIN monitored_channel c ON c.channel_id = m.channel_id
+             ORDER BY u.unit_date DESC, u.channel_id DESC, u.unit_key DESC,
+                      m.message_id DESC"
         );
         let stmt = self.conn.prepare(&sql).await?;
+        // 参数恒为 5 个：SQL 里的 cursor_unit CTE 无条件引用 ?4/?5（无游标时它解析
+        // 不到行 = 空集，而 cursor_sql 也不含比较条件）。无游标传 (0,0) 哨兵——
+        // message_id 0 在 Telegram 不存在 ⇒ cursor_unit 恒空，绝不可能误中一行。
         let mut rows = match before {
             Some((d, c, m)) => {
                 stmt.query(params![
@@ -1322,8 +1598,14 @@ impl Store {
                 .await?
             }
             None => {
-                stmt.query(params![like_pattern(&keyword), limit.clamp(1, 500) as i64])
-                    .await?
+                stmt.query(params![
+                    like_pattern(&keyword),
+                    limit.clamp(1, 500) as i64,
+                    0i64,
+                    0i64,
+                    0i64
+                ])
+                .await?
             }
         };
         let mut out = Vec::new();
@@ -3703,6 +3985,279 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].mime_type.as_deref(), Some("video/mp4"));
         assert_eq!(hits[0].file_path.as_deref(), Some("D:/Verify/proxies/f.mp4"));
+    }
+
+    /// BUG-345：group_id（活库实测 ~1.4e16 > JS `Number.MAX_SAFE_INTEGER`）
+    /// 过 JSON 界必须是**字符串**——number 过界会被前端 `JSON.parse` 舍入成相邻
+    /// 双精度（活库实证 70 个组键缓存任务里 62 个的 item_key 因此比真值差 1，
+    /// 同一相册分裂成两个身份）。
+    #[tokio::test]
+    async fn group_id_crosses_json_as_string() {
+        let hit = MonitorFilterHit {
+            channel_id: -1004493170102,
+            message_id: 4728,
+            caption: None,
+            file_name: None,
+            media_type: None,
+            size: None,
+            duration: None,
+            date: None,
+            downloaded: false,
+            channel_title: None,
+            group_id: Some(14315949991671397),
+            mime_type: None,
+            file_path: None,
+        };
+        let v = serde_json::to_value(&hit).unwrap();
+        assert_eq!(
+            v.get("groupId").and_then(|g| g.as_str()),
+            Some("14315949991671397"),
+            "groupId 必须是 JSON 字符串：number 过界即丢精度（BUG-345）"
+        );
+    }
+
+    /// BUG-345：存量污染键按**真** group_id 重写 `item_key` 与 `group_id` 两列
+    /// （活库 62/70）；真值取不到的行不动；幂等（修过再跑 no-op）。
+    #[tokio::test]
+    async fn repairs_group_keys_corrupted_by_js_precision() {
+        let s = store("bug345_key_repair").await;
+        s.add_channel(-1004493170102, "麻豆短剧", None)
+            .await
+            .unwrap();
+        for mid in 1..=3i64 {
+            s.upsert_message(
+                -1004493170102,
+                mid,
+                None,
+                None,
+                None,
+                None,
+                Some(1000 + mid),
+                None,
+                Some(14315949991671397),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        // 前端 number 过界后 …397 → …396（JS 双精度舍入），污染键照活库实证复刻。
+        let (task, created) = s
+            .enqueue_cache_task(
+                -1004493170102,
+                Some(14315949991671396),
+                "g:-1004493170102:14315949991671396",
+                &[1, 2, 3],
+                ".",
+            )
+            .await
+            .unwrap()
+            .expect("task must be created");
+        assert!(created, "首入队必须新建");
+        let id = task.id;
+
+        let repaired = repair_group_key_precision(&s.conn).await.unwrap();
+        assert_eq!(repaired, 1, "正好一行污染键被修");
+        let after = s.get_cache_task(id).await.unwrap().unwrap();
+        assert_eq!(after.item_key, "g:-1004493170102:14315949991671397");
+        assert_eq!(
+            after.group_id,
+            Some(14315949991671397),
+            "group_id 列必须与键同源回到真值"
+        );
+        // 幂等：再跑一次 no-op。
+        assert_eq!(repair_group_key_precision(&s.conn).await.unwrap(), 0);
+
+        // 真值取不到的任务（首条消息不在库 / 无组）不动其键。
+        let (orphan, _) = s
+            .enqueue_cache_task(
+                -1004493170102,
+                Some(14315949991671396),
+                "g:-1004493170102:14315949991671396",
+                &[999],
+                ".",
+            )
+            .await
+            .unwrap()
+            .expect("orphan task must be created");
+        assert_eq!(repair_group_key_precision(&s.conn).await.unwrap(), 0);
+        let orphan_after = s.get_cache_task(orphan.id).await.unwrap().unwrap();
+        assert_eq!(orphan_after.item_key, "g:-1004493170102:14315949991671396");
+    }
+
+    /// BUG-341：相册组是命中单元——组内任一 member 匹配 ⇒ **整组入列**。
+    ///
+    /// 活库实证的缺陷形态：相册的组级 caption 只落在组内**一条**消息上（满员组
+    /// 10 条仅 1 条带 caption）⇒ 旧逐条匹配实现每个相册只现 1 行、入库只传 1 个
+    /// messageId，组结构与组内内容双丢失（用户「强调很多次」的缺陷）。
+    #[tokio::test]
+    async fn filter_group_hit_returns_whole_album() {
+        let s = store("filter_group_album").await;
+        s.add_channel(1, "相册频道", None).await.unwrap();
+        // 10 条组内消息，只有 1 条带 caption（命中词）——活库里相册的真实形态。
+        for mid in 1..=10i64 {
+            let cap = if mid == 5 {
+                Some("合集 命中词 特辑")
+            } else {
+                None
+            };
+            s.upsert_message(
+                1,
+                mid,
+                cap,
+                None,
+                None,
+                None,
+                Some(1000 + mid),
+                None,
+                Some(77),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let id = s.add_filter("合集", "命中词").await.unwrap();
+        let hits = s.filter_messages(id, 100, None).await.unwrap();
+        assert_eq!(hits.len(), 10, "组内任一 member 匹配 ⇒ 整组 10 条全部入列");
+        assert!(
+            hits.iter().all(|h| h.group_id == Some(77)),
+            "入列的必须是整组成员（实测 {:?}）",
+            hits.iter().map(|h| h.message_id).collect::<Vec<_>>()
+        );
+        // 计数按**单元**（相册）计：1 个相册 = 1，不是 10 条消息、也不是旧实现的 1 行。
+        let listed = s.list_filters().await.unwrap();
+        assert_eq!(listed[0].hits, 1, "命中数按单元（相册）计，与呈现粒度同源");
+    }
+
+    /// BUG-341：组级分页——`limit` 数**单元**不数消息；组永不被页边界切开
+    /// （半截组 = 又一类「显示单条错误数据」）。
+    #[tokio::test]
+    async fn filter_group_pagination_never_splits_album() {
+        let s = store("filter_group_page").await;
+        s.add_channel(1, "Ch", None).await.unwrap();
+        // 两个相册（各 5 条，仅 1 条带命中 caption）+ 两条单条，全部同频道。
+        for g in [10i64, 20] {
+            for k in 1..=5i64 {
+                let cap = if k == 1 { Some("命中词 组") } else { None };
+                s.upsert_message(
+                    1,
+                    g + k,
+                    cap,
+                    None,
+                    None,
+                    None,
+                    Some(2000 + g + k),
+                    None,
+                    Some(g),
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        s.upsert_message(
+            1,
+            100,
+            Some("命中词 单条A"),
+            None,
+            None,
+            None,
+            Some(3000),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        s.upsert_message(
+            1,
+            101,
+            Some("命中词 单条B"),
+            None,
+            None,
+            None,
+            Some(2900),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let id = s.add_filter("x", "命中词").await.unwrap();
+
+        // limit=1 个单元/页，四页必须正好翻完 4 个单元、12 条消息。
+        let p1 = s.filter_messages(id, 1, None).await.unwrap();
+        assert_eq!((p1.len(), p1[0].message_id), (1, 100), "最新单元 = 单条A");
+        let p2 = s
+            .filter_messages(id, 1, Some((3000, 1, 100)))
+            .await
+            .unwrap();
+        assert_eq!((p2.len(), p2[0].message_id), (1, 101), "第二单元 = 单条B");
+        let p3 = s
+            .filter_messages(id, 1, Some((2900, 1, 101)))
+            .await
+            .unwrap();
+        assert_eq!(
+            p3.len(),
+            5,
+            "limit=1 数单元：第三单元是相册20，整组 5 条一起回（不被切成半截）"
+        );
+        assert!(p3.iter().all(|h| h.group_id == Some(20)));
+        let last = p3.last().unwrap();
+        let p4 = s
+            .filter_messages(id, 1, Some((last.date.unwrap(), last.channel_id, last.message_id)))
+            .await
+            .unwrap();
+        assert_eq!(p4.len(), 5, "第四单元 = 相册10 整组");
+        assert!(p4.iter().all(|h| h.group_id == Some(10)));
+        let last = p4.last().unwrap();
+        let p5 = s
+            .filter_messages(id, 1, Some((last.date.unwrap(), last.channel_id, last.message_id)))
+            .await
+            .unwrap();
+        assert!(p5.is_empty(), "翻完必须正好为空（无重复无跳过）");
+    }
+
+    /// BUG-341：`+N 新命中` 按单元计——组里到了**新消息**（哪怕它自身不匹配），
+    /// 整个相册单元也算「新」：用户看到的是组，不是当初匹配上的那一条。
+    #[tokio::test]
+    async fn filter_new_hits_counts_units() {
+        let s = store("filter_group_new").await;
+        s.add_channel(1, "Ch", None).await.unwrap();
+        for k in 1..=3i64 {
+            let cap = if k == 1 { Some("命中词 组") } else { None };
+            s.upsert_message(
+                1,
+                k,
+                cap,
+                None,
+                None,
+                None,
+                Some(1000 + k),
+                None,
+                Some(50),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let id = s.add_filter("x", "命中词").await.unwrap();
+        assert_eq!(
+            s.list_filters().await.unwrap()[0].new_hits,
+            0,
+            "建规则时存量相册已读"
+        );
+        // 组里新到一条**自身不匹配**的消息：unit_date 前进 ⇒ 该单元算 +1 新。
+        let later = now() + 30;
+        s.upsert_message(1, 9, None, None, None, None, Some(later), None, Some(50), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.list_filters().await.unwrap()[0].new_hits,
+            1,
+            "组内新消息让整个相册单元算新——用户看的是组"
+        );
+        s.mark_filter_read(id).await.unwrap();
+        assert_eq!(s.list_filters().await.unwrap()[0].new_hits, 0, "点开后归零");
     }
 
     /// BUG-330 / TGM-06：老库升级后存量规则全为已读（不得一屏假「新命中」）。
