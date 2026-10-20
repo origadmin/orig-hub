@@ -62,8 +62,10 @@ let tgProbeCancel: (() => void) | null = null
 function tgServiceKey(a: TgServiceState): string {
   // BUG-351：链路健康与自愈历史一并参与等值判定 —— 重启次数变化必须能刷新界面，
   // 否则「刚重启过」这条事实会被短路掉（界面继续恒绿）。
+  // BUG-354：纳入 `known` —— 初始 `known:false` 与后来 `known:true` 必须能区分，
+  // 否则「配置未确认」会被短路成「已确认禁用」。
   const l = a.link
-  return `${a.enabled}|${a.running}|${a.port ?? ''}|${a.lastError ?? ''}|${
+  return `${a.known ? 'K' : '-'}|${a.enabled}|${a.running}|${a.port ?? ''}|${a.lastError ?? ''}|${
     l ? `${l.link_down}|${l.down_streak}|${l.restarts}|${l.last_restart_at ?? ''}|${l.reason ?? ''}` : ''
   }`
 }
@@ -342,7 +344,7 @@ export const useStore = create<DownloadState>((set, get) => ({
   // 入口级门控（`resolveTgFeatureReady`）只由服务层决定：开关开着 **且** daemon 说
   // 进程在服务才显示。daemon 不可达 / 插件关闭 / 拉起失败时入口保持隐藏 ——
   // 不可用就不展示（不呈现死按钮，违反设计）。
-  tgService: { enabled: false, running: false, port: null, lastError: null },
+  tgService: { known: false, enabled: false, running: false, port: null, lastError: null },
   tgLink: { state: 'unknown', reason: null },
   accounts: loadAccounts(),
 
@@ -416,6 +418,7 @@ export const useStore = create<DownloadState>((set, get) => ({
       set({
         categories: cats,
         tgService: {
+          known: true,
           enabled: cfg.tg_enabled,
           running: cfg.tg_running,
           port: cfg.tg_port ?? null,
@@ -614,6 +617,7 @@ export const useStore = create<DownloadState>((set, get) => ({
       if (typeof res.tg_port === 'number') setTgPort(res.tg_port)
       set({
         tgService: {
+          known: true,
           enabled: res.tg_enabled,
           running: res.tg_running,
           port: res.tg_port ?? get().tgService.port,
@@ -634,6 +638,7 @@ export const useStore = create<DownloadState>((set, get) => ({
       if (typeof res.tg_port === 'number') setTgPort(res.tg_port)
       set({
         tgService: {
+          known: true,
           enabled: res.tg_enabled,
           running: res.tg_running,
           port: res.tg_port ?? get().tgService.port,
@@ -687,6 +692,7 @@ export const useStore = create<DownloadState>((set, get) => ({
     if (typeof cfg.port === 'number') setDaemonPort(cfg.port)
     if (typeof cfg.tg_port === 'number') setTgPort(cfg.tg_port)
     const svc: TgServiceState = {
+      known: true,
       enabled: cfg.tg_enabled,
       running: cfg.tg_running,
       port: cfg.tg_port ?? null,

@@ -169,6 +169,21 @@ export interface TgSession {
  * 本来就在说两件事。进程层只回答「服务在不在」，进程不在 = 模块不显示。
  */
 export interface TgServiceState {
+  /**
+   * 是否已从 daemon 取得过**确定性**的 `enabled` 结论。
+   *
+   * 为什么必须有它（BUG-354）：`enabled` 初始为 `false`，而 `refreshTgState`
+   * 仅在 `getConfig()` **成功**时落盘；daemon 不可达 / 配置尚未加载时 `getConfig`
+   * 抛错、提前 return，`tgService` 保留初始 `enabled:false`。若「未启用」卡直接读
+   * `!enabled`，则「服务未启动 / daemon 不可达」会被错误地渲染成「用户把插件关了」，
+   * 并给出只能跳设置页、按核心设计本就启动不了服务的「启用」按钮（逻辑不自恰）。
+   *
+   * `known` 把两种根因不同的 `enabled:false` 区分开：
+   *  - `known && !enabled` → 用户确实关了插件，给「启用」出口（合法）；
+   *  - `!known`（配置未确认 / daemon 不可达）→ 归 daemon 职责，渲染「正在启动 / 正在连接」
+   *    而非「采集未启用」，绝不给用户一个启动不了服务的死按钮。
+   */
+  known: boolean
   /** 用户开关（持久化在 download-engine.toml） */
   enabled: boolean
   /** 进程是否真的在服务（daemon 探活，不是前端猜的） */

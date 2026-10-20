@@ -353,7 +353,13 @@ export function TgPanel(
    * 「主动关着」要劝用户去启用，「正在拉起」只需要等（daemon 独占进程
    * 生命周期，无手动重试入口，BUG-178）。二者混为空面板就是假象。
    */
-  const tgEnabled = tgService.enabled
+  /**
+   * 「采集未启用」卡（带「启用 Telegram 采集」按钮）只应在**已确认用户主动关掉插件**
+   * 时出现：`known && !enabled`。`!known`（配置尚未确认 / daemon 不可达 / 服务未启动）
+   * 一律不算「用户禁用」，归 daemon 职责，落到下方 `!tgReady` 的「正在启动」提示，
+   * 绝不给一个按核心设计本就启动不了服务的死按钮（BUG-354）。
+   */
+  const tgDisabled = tgService.known && !tgService.enabled
   const tgReady = resolveTgFeatureReady(tgService)
   /** 后端原文（仅用于日志与分类），绝不直接渲染 */
   const rawReason = tgBroken ? tgLink.reason : null
@@ -1715,7 +1721,8 @@ export function TgPanel(
         1. `tgUnbound`：服务在跑、没有登录会话 → 未绑定引导（判据见上）。
         2. `tgBroken`：链路真断 → 红色故障卡（这是「配好了但连不上」，
            与「没启用」不是一类事，故排在启用态之前）。
-        3. `!tgEnabled`：用户主动关着插件 → 引导去启用。
+        3. `tgDisabled`（`known && !enabled`）：用户主动关着插件 → 引导去启用。
+           （`!known` 的「服务未启动 / daemon 不可达」不算禁用，归下方「正在启动」。）
         4. `needConfig && !alive`：APP 首启缺凭证 → 原有配置表单。
         5. `!tgReady`：开着但 daemon 还没拉起 → 「正在启动」。
         6. 其余：正常两栏。
@@ -1748,7 +1755,7 @@ export function TgPanel(
             )}
           </div>
         </div>
-      ) : !tgEnabled ? (
+      ) : tgDisabled ? (
         /*
          * 插件未启用（M0-T05）：入口常驻后这里必须给出行动出口。
          * 「启用 Telegram 采集」跳到设置·Telegram —— 复用唯一的开关实现，
