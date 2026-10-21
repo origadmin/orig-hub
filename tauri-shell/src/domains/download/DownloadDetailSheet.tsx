@@ -82,19 +82,16 @@ export function DownloadDetailSheet({
     >
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
       <div className="relative z-10 flex max-h-[86vh] w-full flex-col overflow-hidden rounded-t-2xl border border-border-subtle bg-surface shadow-2xl">
-        {/* 顶部细强调线（拖拽手柄暗示，内嵌无空洞） */}
-        <div
-          className="h-1 w-full"
-          style={{
-            background: `linear-gradient(90deg, ${NIC_PALETTE.slice(0, ifaces.length || 1).join(', ')})`,
-          }}
-        />
-
-        {/* 表头：内嵌抓手 + 文件名 + 状态徽标 + 关闭 */}
+        {/*
+          表头：**标题必须是第一个元素**（BUG-374，用户第四次提出「标题不在第一行」）。
+          此处删掉两样压在标题前面的东西：
+          ① 顶部那条网卡配色渐变强调线 —— 它与 `IngestDetailSheet`（无此线）不一致，
+             用户问「为什么有的有蓝色顶框,有的没有」并直言其丑陋，故**去掉**而不是
+             给另一边加上（统一取向残缺更少的那一侧）；
+          ② 抓手 `⠿` —— 它排在标题**前面**，且带 `title="拖拽"`，而 Sheet 根本不能拖，
+             是一句「说了做不到」的提示（2026-10-20 已在入库侧清掉同一句谎言）。
+        */}
         <div className="flex items-center gap-2 px-4 py-3">
-          <span className="select-none text-lg leading-none text-muted" title="拖拽">
-            ⠿
-          </span>
           <p className="min-w-0 flex-1 truncate text-sm font-semibold text-fg-strong">
             {item.filename || '未知文件'}
           </p>

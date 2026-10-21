@@ -209,19 +209,14 @@ export function IngestDetailSheet({
     >
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
       <div className="relative z-10 flex max-h-[86vh] w-full flex-col overflow-hidden rounded-t-2xl border border-border-subtle bg-surface shadow-2xl">
-        {/* 抓手：**纯视觉暗示**（底部弹出面板的通用形态），不实现拖拽。
-            原先写了 `title="拖拽"` —— 面板根本不能拖，这个提示是在骗人
-            （2026-10-20 清理：不要做「说了做不到」的交互提示）。 */}
-        <div className="flex items-center gap-2 px-4 pt-3">
-          <span className="select-none text-lg leading-none text-muted" aria-hidden="true">
-            ⠿
-          </span>
-        </div>
-
-        {/* 表头：对象名 + 状态徽标 + 关闭（BUG-372：标题必须是第一行第一个元素，
-            原先「TG 入库」徽标压在标题前面——用户「标题不在第一行」；与引擎
-            DownloadDetailSheet 表头同构：␣抓手 + 标题 + 状态 + 关闭）。 */}
-        <div className="flex items-center gap-2 px-4 pb-2">
+        {/*
+          表头：**标题必须是第一个元素**（BUG-374，用户第四次提出「标题不在第一行」）。
+          原先抓手 `⠿` **单独占一行**排在标题上方，把标题挤到第二行；底部弹出的形态
+          由 `rounded-t-2xl` + 遮罩已经足够表达，抓手是纯装饰且妨碍标题归位，故删除。
+          标题行 `pb-2` → `py-3`：删掉抓手行后标题行需要上边距，取值与引擎侧表头
+          `py-3` 一致（两个 Sheet 表头内边距同值）。
+        */}
+        <div className="flex items-center gap-2 px-4 py-3">
           <p
             className="min-w-0 flex-1 truncate text-sm font-semibold text-fg-strong"
             title={latest.title || latest.itemKey}
