@@ -1595,10 +1595,16 @@ async fn enqueue_cache_task(
 /// 任务行标题（BUG-232 v2）：**入库内容的 caption**，数据源是消息同步时已落库的
 /// `media_message`——不是媒体库条目（v1 的错误修法：按 by-ref 反查成品，只覆盖已入库的任务，
 /// 且把服务端一次 SQL 变成客户端逐行补数据）。
+/// 单任务端点的标题来源：按频道现查（**不在 5s 轮询路径上**，与
+/// [`crate::state::AppState::cache_task_titles_snapshot`] 的批量快照是两条路）。
+///
+/// 返回值包一层 `Option` 只为与 `cache_task_title` 的入参类型对齐 —— 这条路是
+/// 现查的，命中的行都真有标题，包 `Some`；没查到的频道不进表（键不存在）。
+/// 它**不参与**增量合并，所以不需要 `None`（「解析过但无标题」）这个状态。
 async fn cache_task_titles(
     st: &AppState,
     tasks: &[CacheTask],
-) -> std::collections::HashMap<(i64, i64), crate::store::MsgTitleSources> {
+) -> std::collections::HashMap<(i64, i64), Option<crate::store::MsgTitleSources>> {
     let mut chans: Vec<i64> = tasks.iter().map(|t| t.chat_id).collect();
     chans.sort_unstable();
     chans.dedup();
@@ -1606,6 +1612,9 @@ async fn cache_task_titles(
         .message_captions_for_channels(&chans)
         .await
         .unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| (k, Some(v)))
+        .collect()
 }
 
 /// 取任务的标题（BUG-280 两遍选取 + BUG-342 清洗）：**先**扫全组找第一条有非空
@@ -1622,13 +1631,15 @@ async fn cache_task_titles(
 /// 行标题直接给用户看，emoji/书括号/URL 不得原样上榜。
 fn cache_task_title(
     t: &CacheTask,
-    titles: &std::collections::HashMap<(i64, i64), crate::store::MsgTitleSources>,
+    titles: &std::collections::HashMap<(i64, i64), Option<crate::store::MsgTitleSources>>,
 ) -> Option<String> {
     // 第一遍：caption 优先（按 message_ids 序的第一条非空 caption）。
+    // `Option<Option<..>>` 压平：外层 = 键在不在（解析过没有），内层 = 有没有标题来源。
     let caption = t
         .message_ids
         .iter()
         .filter_map(|m| titles.get(&(t.chat_id, *m)))
+        .flatten()
         .find_map(|s| non_empty(&s.caption))
         .map(clean_title)
         .filter(|s| !s.is_empty());
@@ -1638,6 +1649,7 @@ fn cache_task_title(
         t.message_ids
             .iter()
             .filter_map(|m| titles.get(&(t.chat_id, *m)))
+            .flatten()
             .find_map(|s| non_empty(&s.file_name))
             .map(clean_title)
             .filter(|s| !s.is_empty())
@@ -1746,7 +1758,7 @@ const MAX_TITLE_BACKFILL_ATTEMPTS: u8 = 3;
 fn spawn_title_selfheal(
     st: &Arc<AppState>,
     tasks: &[CacheTask],
-    titles: &std::collections::HashMap<(i64, i64), crate::store::MsgTitleSources>,
+    titles: &std::collections::HashMap<(i64, i64), Option<crate::store::MsgTitleSources>>,
 ) {
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
@@ -2122,6 +2134,11 @@ async fn ensure_message_rows(st: &Arc<AppState>, chat_id: i64, msg_ids: &[i64]) 
 /// 按 (chat,msg) 最多 `MAX_TITLE_BACKFILL_ATTEMPTS` 次——补到即止（`message_has_title`
 /// 命中），补不到就永久放弃，绝不每轮轮询都去打扰 MTProto。
 async fn backfill_message_titles(st: &Arc<AppState>, chat_id: i64, msg_ids: &[i64]) {
+    // 本轮回合**真正写库**的引用（BUG-375）：自愈补回的标题必须让快照重新解析，
+    // 否则增量合并的快照里这些引用早已是「解析过、无标题」，补回来的 caption
+    // 会被永久挡在快照外 —— 界面看不到，`spawn_title_selfheal` 也不再触发
+    // （它只扫无标题任务，而那时标题已经在库里了）。
+    let mut wrote: Vec<(i64, i64)> = Vec::new();
     for msg_id in msg_ids {
         if matches!(st.store.message_has_title(chat_id, *msg_id).await, Ok(true)) {
             continue;
@@ -2135,7 +2152,7 @@ async fn backfill_message_titles(st: &Arc<AppState>, chat_id: i64, msg_ids: &[i6
             *n += 1;
         }
         if let Ok(Some(meta)) = st.client.message_meta(chat_id, *msg_id).await {
-            let _ = st
+            let ok = st
                 .store
                 .upsert_message(
                     chat_id,
@@ -2150,7 +2167,13 @@ async fn backfill_message_titles(st: &Arc<AppState>, chat_id: i64, msg_ids: &[i6
                     meta.file_name.as_deref(),
                 )
                 .await;
+            if ok.is_ok() {
+                wrote.push((chat_id, *msg_id));
+            }
         }
+    }
+    if !wrote.is_empty() {
+        st.invalidate_cache_task_titles(&wrote).await;
     }
 }
 
@@ -8256,6 +8279,7 @@ mod tests {
     // ---- byte-ownership P1：登记前移（metadata-first ingest） ----
 
     use super::run_one_cache_task;
+    use super::backfill_message_titles;
 
     use std::collections::HashMap;
 
@@ -11265,6 +11289,267 @@ mod tests {
         assert_eq!(
             crate::state::CACHE_TASK_SNAPSHOT_LIMIT, 500,
             "快照上限必须等于 /tasks/all 的契约上限 500"
+        );
+    }
+
+    /// BUG-375 判据 3（**规模实测**）：用户的要求是「获取当前进度是毫秒级需求」。
+    /// 在 ≈ 真实量级（400 任务 / 4000 条带标题消息）上分别量写路径与读路径，
+    /// 把数字打进测试输出 —— 「毫秒级」在这里是**断言**，不是形容词。
+    ///
+    /// 阈值取**宽松上界**而非贴线值：CI 机器抖动不该让这条无故变红，但旧实现
+    /// （读路径逐条查库、与写事务抢同一条 libsql 连接）在同一数据量下实测
+    /// 3.18s，宽松上界依然把它拦在门外 —— 这条判据有牙。
+    ///
+    /// 库用 `:memory:`：本条要测的是「读路径碰不碰库」，磁盘快慢只会污染数字，
+    /// 内存库把变量消掉。（墙钟类用例仍须落文件 DB，见 MEMORY.md。）
+    #[tokio::test]
+    async fn all_cache_tasks_payload_is_millisecond_scale_bug375() {
+        const TASKS: i64 = 400;
+        const PER_TASK: i64 = 10;
+        let dir = scratch_dir("bug375_latency_scale");
+        let st = cache_fixture_state(&dir, vec![], vec![]).await;
+
+        // 先铺消息（标题来源）再入队任务 —— 与真实「扫描到消息 → 用户选条目入库」同序。
+        for t in 0..TASKS {
+            let mut ids = Vec::new();
+            for m in 0..PER_TASK {
+                let mid = t * PER_TASK + m + 1;
+                st.store
+                    .upsert_message(
+                        CACHE_FIXTURE_CHAT,
+                        mid,
+                        Some(&format!("BUG-375 标题 {t}/{m}")),
+                        Some("video/mp4"),
+                        Some(1024),
+                        Some("video"),
+                        Some(1_700_000_000 + mid),
+                        None,
+                        None,
+                        Some(&format!("bug375_{t}_{m}.mp4")),
+                    )
+                    .await
+                    .unwrap();
+                ids.push(mid);
+            }
+            st.store
+                .enqueue_cache_task(
+                    CACHE_FIXTURE_CHAT,
+                    None,
+                    &format!("m:{CACHE_FIXTURE_CHAT}:{}", ids[0]),
+                    &ids,
+                    &st.config.download_dir.to_string_lossy(),
+                )
+                .await
+                .expect("enqueue must succeed")
+                .expect("task must be created");
+        }
+
+        // ── 写路径：逐条 SQL 计时，再测整体刷新 ──
+        // 分解是必须的：`refresh_cache_tasks` 现在是三条 SQL，其中
+        // `task_manifest_summaries` 是**本次新搬到写路径**的（原先它在读路径上，
+        // 由 `/tasks/all` 每次请求各跑一遍）。不分解就说不清「写点到底新增了多少」，
+        // 而写点多付出的每一毫秒都压在用户点击后的响应和墙钟类用例的阈值上。
+        let q0 = std::time::Instant::now();
+        let tasks = st
+            .store
+            .list_cache_tasks(crate::state::CACHE_TASK_SNAPSHOT_LIMIT)
+            .await
+            .unwrap();
+        let list_ms = q0.elapsed().as_secs_f64() * 1000.0;
+
+        let refs: Vec<(i64, i64)> = tasks
+            .iter()
+            .flat_map(|t| t.message_ids.iter().map(move |m| (t.chat_id, *m)))
+            .collect();
+        let q1 = std::time::Instant::now();
+        let _titles = st.store.message_captions_for_refs(&refs).await.unwrap();
+        let titles_ms = q1.elapsed().as_secs_f64() * 1000.0;
+
+        let q2 = std::time::Instant::now();
+        let _sums = st.store.task_manifest_summaries().await.unwrap();
+        let manifest_ms = q2.elapsed().as_secs_f64() * 1000.0;
+
+        let w0 = std::time::Instant::now();
+        st.refresh_cache_tasks().await;
+        let write_ms = w0.elapsed().as_secs_f64() * 1000.0;
+
+        // ── 稳态刷新（下载循环内「每完成一条目」那一次的真实形态）──
+        // 第一次刷新后所有引用都已解析，之后没有新引用 ⇒ 标题一条 SQL 都不该打。
+        let mut steady = Vec::new();
+        for _ in 0..5 {
+            let s0 = std::time::Instant::now();
+            st.refresh_cache_tasks().await;
+            steady.push(s0.elapsed().as_secs_f64() * 1000.0);
+        }
+        steady.sort_by(|a, b| a.partial_cmp(b).expect("samples must be finite"));
+        let steady_ms = steady[steady.len() / 2];
+
+        // ── 对照组：把全部引用打回「未解析」后再刷一次 ──
+        // **判据必须负载无关**：322 个用例并行跑时这台机器上任何绝对时间都会涨
+        // 2～3 倍（实测稳态 11.8ms → 32.6ms），拿绝对阈值当判据就是拿 CI 抖动
+        // 当功能缺陷。所以这里用**同一份代码、同一时刻**的两次测量互相比：
+        // 稳态那次没有新引用（标题零 SQL），对照组把引用全部置回未解析
+        // （标题必须真的去查）。两者相差的就是标题查询本身。
+        // 把「只查未解析引用」改回全量重查 ⇒ 两次做完全一样的活 ⇒ 比值趋近 1，
+        // 判据立刻红。机器快慢只同比例放大两边，不动比值。
+        let all_refs: Vec<(i64, i64)> = tasks
+            .iter()
+            .flat_map(|t| t.message_ids.iter().map(move |m| (t.chat_id, *m)))
+            .collect();
+        st.invalidate_cache_task_titles(&all_refs).await;
+        let c0 = std::time::Instant::now();
+        st.refresh_cache_tasks().await;
+        let requery_ms = c0.elapsed().as_secs_f64() * 1000.0;
+        // 复原：对照组已把引用全部标回未解析，之后的读路径测量要回到稳态。
+        st.refresh_cache_tasks().await;
+
+        // ── 读路径：一次完整 payload（零 DB）──
+        // 跑 5 次取中位数：单次调度抖动会把数字讲错，而中位数对一条离群值不敏感。
+        // 全部任务都带标题 ⇒ `spawn_title_selfheal` 直接返回，不会有后台自愈
+        // 在读路径计时期间抢连接污染读数。
+        let mut samples = Vec::new();
+        let mut n = 0usize;
+        for _ in 0..5 {
+            let r0 = std::time::Instant::now();
+            let v = all_cache_tasks_payload(&st).await;
+            samples.push(r0.elapsed().as_secs_f64() * 1000.0);
+            n = v["tasks"].as_array().map(Vec::len).unwrap_or(0);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).expect("samples must be finite"));
+        let median_ms = samples[samples.len() / 2];
+
+        println!(
+            "BUG-375 规模实测：{TASKS} 任务 / {msgs} 条带标题消息（{profile} 构建）\n  \
+             写路径 list_cache_tasks({limit})      = {list_ms:>8.2} ms\n  \
+             写路径 message_captions_for_refs   = {titles_ms:>8.2} ms\n  \
+             写路径 task_manifest_summaries     = {manifest_ms:>8.2} ms\n  \
+             写路径 refresh_cache_tasks（首刷） = {write_ms:>8.2} ms\n  \
+             写路径 refresh_cache_tasks（稳态） = {steady_ms:>8.2} ms ← 下载循环内每条目一次\n  \
+             写路径 refresh_cache_tasks（对照） = {requery_ms:>8.2} ms ← 引用全部置回未解析\n  \
+             读路径 all_cache_tasks_payload     = {median_ms:>8.2} ms（中位数，5 次：{all}）",
+            profile = if cfg!(debug_assertions) { "debug" } else { "release" },
+            msgs = TASKS * PER_TASK,
+            limit = crate::state::CACHE_TASK_SNAPSHOT_LIMIT,
+            all = samples
+                .iter()
+                .map(|v| format!("{v:.2}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+
+        assert_eq!(n, TASKS as usize, "快照必须含全部任务（上限 500 未被触发）");
+        assert!(
+            write_ms < 500.0,
+            "写路径在 {TASKS} 任务量级必须 < 500ms，实测 {write_ms:.2}ms —— \
+             这条守的是「别把开销转嫁给写点」（墙钟类用例的时序阈值在写路径上）"
+        );
+        // 以下绝对上界都取**很宽的值**：322 个用例并行时机器负载能让任何耗时涨
+        // 2～3 倍（实测：读 19.7→52.3ms、稳态 11.8→32.6ms）。拿贴线阈值当判据，
+        // 红的是 CI 抖动而不是功能缺陷。所以绝对界只负责「数量级没崩」，
+        // 真正的牙齿在下面两条**比值**判据和 `all_cache_tasks_payload_reads_snapshot_not_store_bug375`
+        // （那条直接证明读路径不碰库，与机器快慢无关）。
+        assert!(
+            median_ms < 250.0,
+            "读路径不得退回到百毫秒级（实测 {median_ms:.2}ms）—— 旧实现等锁时实测 3.18s"
+        );
+        // 分解出来的单条 SQL 也各有上界：任一条失控都会顺着写路径
+        // 打到用户点击后的响应上（`run_one_cache_task` 一个任务生命周期要刷 6 次）。
+        assert!(
+            manifest_ms < 300.0,
+            "task_manifest_summaries 必须 < 300ms，实测 {manifest_ms:.2}ms —— \
+             它是本次新搬到写路径的聚合查询（json_each join 全任务）"
+        );
+        assert!(
+            titles_ms < 200.0,
+            "message_captions_for_refs 必须 < 200ms，实测 {titles_ms:.2}ms —— \
+             按需查询（只取任务实际引用的消息）是把它从 34ms/次 全频道扫描降下来的前提"
+        );
+        // ★ 比值判据（**负载无关**）：稳态刷新 vs 「引用全部置回未解析」的对照刷新。
+        // 稳态那次没有新引用 ⇒ 标题零 SQL；对照组必须真的去查。两者只差标题查询，
+        // 所以稳态必须明显更便宜。改回全量重查 ⇒ 两次做一样的活 ⇒ 比值趋近 1 ⇒ 红。
+        // 机器快慢同比例放大两边，不动比值 —— 这就是它比绝对阈值可靠的原因。
+        assert!(
+            requery_ms > steady_ms * 1.5,
+            "稳态刷新必须明显便宜于「全部重新查标题」的对照：\
+             稳态 {steady_ms:.2}ms vs 对照 {requery_ms:.2}ms。\
+             若这条红，说明「只查未解析引用」被改回了全量重查 —— \
+             下载循环内每完成一条目就要多付一次标题查询（400 引用实测 45ms）"
+        );
+    }
+
+    /// BUG-375 判据 4（**增量合并的牙齿**）：标题自愈补回的 caption 必须能进快照。
+    ///
+    /// 「只查未解析引用」省掉了稳态下的标题查询，代价是：一条消息第一次被解析成
+    /// 「无标题」后，之后从 Telegram 补回来的 caption 不会自己出现。
+    /// 这条路只有 `backfill_message_titles` 末尾那次
+    /// `invalidate_cache_task_titles` 接着 —— 漏了它，自愈就白做：
+    /// 界面看不到标题，而 `spawn_title_selfheal` 也不再触发（标题已在库里）。
+    ///
+    /// 本测试**走真实自愈路径**（直接调 `backfill_message_titles`，夹具客户端的
+    /// `message_meta` 会返回预置的 caption）而不是在测试里手动调失效接口 ——
+    /// 否则「生产代码漏了挂钩」这件事测试照样绿，牙齿就没了。
+    /// 证伪方式：把 `backfill_message_titles` 末尾的 `invalidate_cache_task_titles`
+    /// 那行删掉，最后一条断言立刻红。
+    #[tokio::test]
+    async fn selfhealed_title_reaches_the_snapshot_bug375() {
+        let dir = scratch_dir("bug375_selfheal_invalidate");
+        // 夹具客户端**有**这条消息的 caption（自愈要从这里补），但库里先放一行
+        // 不带任何标题来源的数据 —— 正是「登记过、标题还缺」的现场。
+        let st = cache_fixture_state(
+            &dir,
+            vec![],
+            vec![fixture_msg(
+                777,
+                "video",
+                "video/mp4",
+                Some("自愈补回的标题"),
+                None,
+            )],
+        )
+        .await;
+        st.store
+            .upsert_message(
+                CACHE_FIXTURE_CHAT,
+                777,
+                None,
+                Some("video/mp4"),
+                Some(1024),
+                Some("video"),
+                Some(1_700_000_000),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let _task = enqueue_fixture_task(&st, &[777], None).await;
+
+        st.refresh_cache_tasks().await;
+        let v1 = all_cache_tasks_payload(&st).await;
+        assert!(
+            v1["tasks"][0]["title"].is_null(),
+            "无标题来源时不得伪造标题（BUG-154）"
+        );
+        // 此刻快照里该引用已被解析为「无标题」——正是增量合并要跳过的状态。
+        assert!(
+            st.cache_task_titles_snapshot()
+                .await
+                .get(&(CACHE_FIXTURE_CHAT, 777))
+                .is_some_and(|v| v.is_none()),
+            "首刷后引用必须被标记为「解析过、无标题」，否则稳态优化不成立"
+        );
+
+        // 自愈：走真实路径（`backfill_message_titles` 内部从客户端取 caption 写库）。
+        backfill_message_titles(&st, CACHE_FIXTURE_CHAT, &[777]).await;
+        st.refresh_cache_tasks().await;
+
+        let v2 = all_cache_tasks_payload(&st).await;
+        assert_eq!(
+            v2["tasks"][0]["title"].as_str(),
+            Some("自愈补回的标题"),
+            "自愈补回的标题必须经失效 + 刷新进入快照 —— \
+             漏了 backfill_message_titles 末尾的 invalidate_cache_task_titles \
+             就会停在这里（界面永远看不到，且自愈不再触发）"
         );
     }
 

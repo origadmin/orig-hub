@@ -123,7 +123,10 @@ pub struct AppState {
     ///
     /// 与 `cache_tasks` 同一理由（BUG-375）：`/api/tg/cache/tasks/all` 在轮询读
     /// 路径上，标题不能再按频道逐条查库 —— 那既慢又与 worker 的写争用同一连接。
-    cache_task_titles: Arc<RwLock<Arc<HashMap<(i64, i64), MsgTitleSources>>>>,
+    ///
+    /// 值是 `Option`：增量合并用「键在不在」区分「还没解析」与「解析过但无标题」，
+    /// 见 [`Self::refresh_cache_tasks`] 与 [`Self::invalidate_cache_task_titles`]。
+    cache_task_titles: Arc<RwLock<Arc<HashMap<(i64, i64), Option<MsgTitleSources>>>>>,
     /// 任务级组清单摘要快照（`task_id -> ManifestSummary`）。同上，读路径零 DB。
     cache_task_summaries: Arc<RwLock<Arc<HashMap<i64, crate::media::ManifestSummary>>>>,
     /// 缓存 worker 单飞门禁：同一时刻至多一个 worker 协程在跑（进程内判定；
@@ -375,8 +378,20 @@ impl AppState {
     /// 无法读取 / 进度不动 / 卡顿」。而同文件的 `/api/tg/cache/tasks`（单任务端点）
     /// 早已改读 `cache_tasks` 内存快照、零 DB —— **快的那条的成果没有辐射到慢的那条**。
     ///
-    /// 代价：每个写点多两三条只读聚合（实测标题约 33ms、摘要约 1ms）。写点本就是
-    /// 低频 DB 操作，把这份成本从**每次轮询**移到**每次写**是正确的方向。
+    /// 代价：每个写点多两三条只读聚合。写点本就是低频 DB 操作，把这份成本从
+    /// **每次轮询**移到**每次写**是正确的方向。
+    ///
+    /// 但「写点」里有一条**高频**路径必须单独治：`run_one_cache_task` 下载循环内
+    /// **每下载完一条目就刷一次**（`routes.rs` 两处 `done += 1` 之后）。若每次都
+    /// 全量重查标题，实测 400 任务 / 4000 引用下标题查询 43ms ⇒ 单任务 10 条目
+    /// 就要多 430ms，且全程占着那条唯一的 libsql 连接 —— 那等于把 BUG-375 的
+    /// 等锁从读路径搬到了下载循环里。**修读路径不能变成拖慢下载。**
+    ///
+    /// 所以标题走**增量合并**：标题来源是 Telegram caption，一条消息解析过一次
+    /// 就不会变（只有自愈补写才会变，那条路显式 [`Self::invalidate_cache_task_titles`]）。
+    /// 只查快照里**还没解析过**的引用；稳态下（每条目刷新）新增引用为 0，
+    /// 一条 SQL 都不打。`None` 值 = 「查过了，确实没有标题」，与「键不存在」
+    /// （还没查）区分开 —— 否则无标题消息会被每次刷新反复查。
     pub async fn refresh_cache_tasks(&self) {
         let tasks = self
             .store
@@ -385,19 +400,30 @@ impl AppState {
             .unwrap_or_default();
         // 标题来源：只取任务**实际涉及**的消息（BUG-375：旧的「按频道全扫」会把每个
         // 频道所有有标题的消息全拉回来 —— 实测 10 频道 3768 行 / 33ms，而任务列表只用
-        // 其中几百行。写点不该背这个开销）。
-        let refs: Vec<(i64, i64)> = tasks
+        // 其中几百行。写点不该背这个开销）。且只取**尚未解析过**的引用（增量合并）。
+        let mut titles = self.cache_task_titles.read().await.clone();
+        let mut refs: std::collections::HashSet<(i64, i64)> = tasks
             .iter()
             .flat_map(|t| t.message_ids.iter().map(move |m| (t.chat_id, *m)))
+            .filter(|r| !titles.contains_key(r))
             .collect();
-        let titles = self
-            .store
-            .message_captions_for_refs(&refs)
-            .await
-            .unwrap_or_default();
+        if !refs.is_empty() {
+            let fresh: Vec<(i64, i64)> = refs.drain().collect();
+            let got = self
+                .store
+                .message_captions_for_refs(&fresh)
+                .await
+                .unwrap_or_default();
+            let m = Arc::make_mut(&mut titles);
+            // 查到的写入 `Some`，没查到的标记 `None`（解析过、无标题）——
+            // 两者都不会在下次刷新被重复查。
+            for r in &fresh {
+                m.insert(*r, got.get(r).cloned());
+            }
+        }
         let summaries = self.store.task_manifest_summaries().await.unwrap_or_default();
         *self.cache_tasks.write().await = Arc::new(tasks);
-        *self.cache_task_titles.write().await = Arc::new(titles);
+        *self.cache_task_titles.write().await = titles;
         *self.cache_task_summaries.write().await = Arc::new(summaries);
     }
 
@@ -407,10 +433,31 @@ impl AppState {
     }
 
     /// 读标题来源快照（零 DB）。
+    ///
+    /// 值为 `Option`：`None` = 「查过了，这条消息确实没有标题」，与「键不存在」
+    /// （还没解析过）是两件事 —— 前者不再重查，后者下次刷新会查。
     pub async fn cache_task_titles_snapshot(
         &self,
-    ) -> Arc<HashMap<(i64, i64), MsgTitleSources>> {
+    ) -> Arc<HashMap<(i64, i64), Option<MsgTitleSources>>> {
         self.cache_task_titles.read().await.clone()
+    }
+
+    /// 让指定引用的标题**重新解析**（BUG-375）。
+    ///
+    /// 唯一的调用方是标题自愈 `backfill_message_titles`：它从 Telegram 补回 caption
+    /// 并写库，而增量合并的快照里这些引用此前已被解析成「无标题」。若不显式失效，
+    /// 自愈补回来的标题会被永久挡在快照外 —— 界面永远看不到它，
+    /// 而 `spawn_title_selfheal` 也不会再触发（它只扫无标题任务，标题已在）。
+    pub async fn invalidate_cache_task_titles(&self, refs: &[(i64, i64)]) {
+        if refs.is_empty() {
+            return;
+        }
+        let mut g = self.cache_task_titles.write().await;
+        // `g` 是写 guard，`make_mut` 要的是里面的 `Arc` —— 解引用一次。
+        let m = Arc::make_mut(&mut *g);
+        for r in refs {
+            m.remove(r);
+        }
     }
 
     /// 读组清单摘要快照（零 DB）。
