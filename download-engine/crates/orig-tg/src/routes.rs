@@ -2173,7 +2173,9 @@ async fn backfill_message_titles(st: &Arc<AppState>, chat_id: i64, msg_ids: &[i6
         }
     }
     if !wrote.is_empty() {
-        st.invalidate_cache_task_titles(&wrote).await;
+        // 不是「打回未解析」而是**当场重新解析并写回快照**（BUG-375）：只移除键会让
+        // 标题在下一次写点前一直不可见，而自愈又因「库里已有标题」不再触发 ⇒ 永久看不到。
+        st.resolve_cache_task_titles(&wrote).await;
     }
 }
 
@@ -11477,19 +11479,22 @@ mod tests {
         );
     }
 
-    /// BUG-375 判据 4（**增量合并的牙齿**）：标题自愈补回的 caption 必须能进快照。
+    /// BUG-375 判据 4（**有牙**）：标题自愈补回的 caption 必须能进快照。
     ///
     /// 「只查未解析引用」省掉了稳态下的标题查询，代价是：一条消息第一次被解析成
     /// 「无标题」后，之后从 Telegram 补回来的 caption 不会自己出现。
-    /// 这条路只有 `backfill_message_titles` 末尾那次
-    /// `invalidate_cache_task_titles` 接着 —— 漏了它，自愈就白做：
-    /// 界面看不到标题，而 `spawn_title_selfheal` 也不再触发（标题已在库里）。
+    /// 这条路只有 `backfill_message_titles` 末尾那次重新解析接着 —— 漏了它，
+    /// 自愈就白做：界面看不到标题，而 `spawn_title_selfheal` 也不会再触发
+    /// （它只扫无标题任务，而那时标题已经在库里了）。
     ///
     /// 本测试**走真实自愈路径**（直接调 `backfill_message_titles`，夹具客户端的
-    /// `message_meta` 会返回预置的 caption）而不是在测试里手动调失效接口 ——
-    /// 否则「生产代码漏了挂钩」这件事测试照样绿，牙齿就没了。
-    /// 证伪方式：把 `backfill_message_titles` 末尾的 `invalidate_cache_task_titles`
-    /// 那行删掉，最后一条断言立刻红。
+    /// `message_meta` 返回预置 caption），且**刻意不调 `refresh_cache_tasks`** ——
+    /// 生产里 `/tasks/all` 之后同样没有任何东西会刷（写点可能几小时不来），
+    /// 所以「补回的标题要可见」不能依赖刷新。在测试里补一次 refresh、或只把引用
+    /// 打回未解析，都会把「生产代码漏了这一步」放过去 ⇒ 牙齿就没了。
+    ///
+    /// 证伪方式：把 `backfill_message_titles` 末尾的 `resolve_cache_task_titles`
+    /// 改回「只 remove 键」（本方法的第一版正是如此），最后一条断言立刻红。
     #[tokio::test]
     async fn selfhealed_title_reaches_the_snapshot_bug375() {
         let dir = scratch_dir("bug375_selfheal_invalidate");
@@ -11541,15 +11546,15 @@ mod tests {
 
         // 自愈：走真实路径（`backfill_message_titles` 内部从客户端取 caption 写库）。
         backfill_message_titles(&st, CACHE_FIXTURE_CHAT, &[777]).await;
-        st.refresh_cache_tasks().await;
 
+        // **不调 refresh_cache_tasks**：生产里 `/tasks/all` 之后同样没人会刷。
         let v2 = all_cache_tasks_payload(&st).await;
         assert_eq!(
             v2["tasks"][0]["title"].as_str(),
             Some("自愈补回的标题"),
-            "自愈补回的标题必须经失效 + 刷新进入快照 —— \
-             漏了 backfill_message_titles 末尾的 invalidate_cache_task_titles \
-             就会停在这里（界面永远看不到，且自愈不再触发）"
+            "自愈补回的标题必须**不依赖刷新**就进入快照 —— \
+             只把引用打回未解析的话，它要等到下一次写点才可见，\
+             而自愈又因「库里已有标题」不再触发 ⇒ 永久看不到"
         );
     }
 

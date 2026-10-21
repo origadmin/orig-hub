@@ -442,12 +442,46 @@ impl AppState {
         self.cache_task_titles.read().await.clone()
     }
 
-    /// 让指定引用的标题**重新解析**（BUG-375）。
+    /// 重新解析指定引用的标题并**写回快照**（BUG-375）。
     ///
-    /// 唯一的调用方是标题自愈 `backfill_message_titles`：它从 Telegram 补回 caption
-    /// 并写库，而增量合并的快照里这些引用此前已被解析成「无标题」。若不显式失效，
-    /// 自愈补回来的标题会被永久挡在快照外 —— 界面永远看不到它，
-    /// 而 `spawn_title_selfheal` 也不会再触发（它只扫无标题任务，标题已在）。
+    /// 唯一调用方是标题自愈 `backfill_message_titles`：它从 Telegram 补回 caption
+    /// 并写库，而增量合并的快照里这些引用此前已被解析成「无标题」，不处理就永远
+    /// 看不到补回来的标题。
+    ///
+    /// **为什么必须是「重新解析」而不是「打回未解析」**（本方法的第一版就是只
+    /// `remove`，那是个真 bug）：只移除键的话，`/tasks/all` 读快照时这些引用不见了
+    /// ⇒ 标题消失；下一轮 `spawn_title_selfheal` 看到无标题再去自愈，而
+    /// `message_has_title` 已经为真 ⇒ 直接跳过、不写库、也就不再触发任何解析
+    /// ⇒ **标题在下一次写点前永久不可见**。而写点可能几个小时都不来（全部任务终态时
+    /// 没有任何 DB 写入）。所以这里当场查库并把结果写回快照，标题立即可见。
+    pub async fn resolve_cache_task_titles(&self, refs: &[(i64, i64)]) {
+        if refs.is_empty() {
+            return;
+        }
+        let got = self
+            .store
+            .message_captions_for_refs(refs)
+            .await
+            .unwrap_or_default();
+        let mut g = self.cache_task_titles.write().await;
+        // `g` 是写 guard，`make_mut` 要的是里面的 `Arc` —— 解引用一次。
+        let m = Arc::make_mut(&mut *g);
+        for r in refs {
+            m.insert(*r, got.get(r).cloned());
+        }
+    }
+
+    /// 把指定引用的标题**打回未解析**（BUG-375）—— 只移除键，不查库。
+    ///
+    /// 与 [`Self::resolve_cache_task_titles`] 的分工（**别混用**）：
+    /// - `invalidate` = 「下次刷新时重新查」。调用方**必须**容忍「直到下次写点
+    ///   才可见」这段窗口，否则就该用 `resolve`。
+    /// - `resolve` = 「现在就查并写回快照」。自愈补写走这条（生产里没人会接着刷）。
+    ///
+    /// 现役调用方只有规模实测测试的对照组（把全部引用打回未解析，量「全量重查」
+    /// 的代价，用来证明稳态优化有牙）。**生产代码不要用它来做自愈后的失效** ——
+    /// 那正是本方法第一版的 bug：标题等到下次写点才可见，而自愈又因「库里已有
+    /// 标题」不再触发 ⇒ 永久看不到。
     pub async fn invalidate_cache_task_titles(&self, refs: &[(i64, i64)]) {
         if refs.is_empty() {
             return;
