@@ -1876,23 +1876,33 @@ async fn list_cache_tasks(State(st): State<Arc<AppState>>) -> Result<impl IntoRe
 // （download-engine/crates/orig-daemon/src/activity.rs:157-161）只反序列化 `tasks`，
 // 从不读取 `counts`——原 `count_cache_tasks()` 的结果每次 5s 轮询都被丢弃，纯属白跑一条
 // 全表 count。这里直接砍掉 counts 字段与其查询，保留 tasks 本身即可。
-async fn list_all_cache_tasks(State(st): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
-    let tasks = st
-        .store
-        .list_cache_tasks(500)
-        .await
-        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
-    let titles = cache_task_titles(&st, &tasks).await;
+//
+// BUG-375：**读路径改走内存快照，零 DB**。
+//
+// 旧实现每次请求打三条 SQL（`list_cache_tasks(500)` + 逐频道标题 + 清单摘要聚合），
+// 而 `st.store` 与下载 worker **共用同一条 libsql 连接** —— worker 持写事务时读只能
+// 排队等锁。实测同一请求 3.18s / 0.03s / **13.70s**（无写竞争时三条合计仅 36ms），
+// daemon 出向客户端总超时 4s ⇒ 大量请求被切成 `request orig-tg: error sending
+// request for url`，用户侧即「TG 入库任务暂时无法读取 / 进度完全不动 / 卡顿」。
+//
+// 同文件的 `/api/tg/cache/tasks`（单任务端点）早已读 `cache_tasks` 快照、注释写明
+// 「读路径 O(1)：服务内存快照，不碰 SQLite —— 这是前端 1s 轮询的高频端点，读走内存
+// 是流畅度的底线」。本端点同在轮询路径上（daemon 每 5s 拉一次），却没有享受同等待遇
+// —— **快的那条的成果没有辐射到慢的那条**，这就是缺陷本身。
+//
+// 现在三个快照（tasks / 标题来源 / 清单摘要）都由「唯一写者」在每次 DB 变更后经
+// `refresh_cache_tasks` 同步重建，读方 clone `Arc` 即返回：零 DB、零锁竞争。
+/// 内核：纯读快照，不碰 `st.store`（测试直接驱动，用「有牙」的判据证明不走库）。
+async fn all_cache_tasks_payload(st: &Arc<AppState>) -> serde_json::Value {
+    let tasks = st.cache_tasks_snapshot().await;
+    let titles = st.cache_task_titles_snapshot().await;
+    let summaries = st.cache_task_summaries_snapshot().await;
     // 无标题 ⇒ 后台自愈补登记，下轮轮询即拿到 caption（别再退回频道名）。
-    spawn_title_selfheal(&st, &tasks, &titles);
-    // D22-A②（BUG-296）：任务级组清单**摘要** —— 一条聚合 SQL 覆盖全部任务（不是逐任务
-    // 查 + 逐条 stat），因为本端点在轮询路径上（对齐 BUG-085 的「别白跑」纪律）。
-    // 摘要只报「编入了几条」，不含字节真值。
-    let summaries = st.store.task_manifest_summaries().await.unwrap_or_default();
-    let tasks: Vec<serde_json::Value> = tasks
+    spawn_title_selfheal(st, &tasks, &titles);
+    let out: Vec<serde_json::Value> = tasks
         .iter()
         .map(|t| {
-            let mut v = task_with_progress(&st, t, cache_task_title(t, &titles).as_deref());
+            let mut v = task_with_progress(st.as_ref(), t, cache_task_title(t, &titles).as_deref());
             if let Some(s) = summaries.get(&t.id) {
                 if v.is_object() {
                     v["manifest"] = json!(s);
@@ -1901,7 +1911,11 @@ async fn list_all_cache_tasks(State(st): State<Arc<AppState>>) -> Result<impl In
             v
         })
         .collect();
-    Ok(Json(json!({ "tasks": tasks })))
+    json!({ "tasks": out })
+}
+
+async fn list_all_cache_tasks(State(st): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(all_cache_tasks_payload(&st).await))
 }
 
 /// GET /api/tg/cache/tasks/:id — 读取单个任务（轮询用，避免每次拉全量列表）。
@@ -7056,6 +7070,7 @@ mod tests {
     use super::delete_media_item;
     use super::download_limits;
     use super::delivery_due_secs;
+    use super::all_cache_tasks_payload;
     use super::cache_tasks_payload;
     use super::clean_title;
     use super::create_media_series;
@@ -11183,6 +11198,76 @@ mod tests {
         );
     }
 
+    // ── BUG-375：`/api/tg/cache/tasks/all` 读路径必须零 DB（毫秒级） ──────────
+
+    /// BUG-375 判据 1（**有牙**）：`all_cache_tasks_payload` 只读内存快照，
+    /// 不碰 `st.store`。
+    ///
+    /// 为什么这条判据能证伪：入队后**故意不调 `refresh_cache_tasks`** ——
+    /// 此刻 DB 里明明有 1 条任务，而快照是空的。若实现仍走库（旧行为），
+    /// payload 会返回 1 条；只有读快照才返回 0 条。⇒ 把实现改回查库，本断言立刻 FAIL。
+    ///
+    /// 背景（实测）：旧实现每次请求打三条 SQL，而 `st.store` 与下载 worker 共用同一条
+    /// libsql 连接，worker 持写事务时读只能排队等锁 —— 同一请求实测 3.18s / 0.03s /
+    /// **13.70s**（无写竞争时三条合计仅 36ms）。daemon 出向客户端总超时 4s ⇒ 大量
+    /// 请求被切成 `request orig-tg: error sending request for url`，用户侧即
+    /// 「TG 入库任务暂时无法读取 / 进度完全不动 / 卡顿」。
+    #[tokio::test]
+    async fn all_cache_tasks_payload_reads_snapshot_not_store_bug375() {
+        let dir = scratch_dir("bug375_all_tasks_snapshot");
+        let st = cache_fixture_state(&dir, vec![], vec![]).await;
+        st.store
+            .upsert_message(
+                CACHE_FIXTURE_CHAT,
+                201,
+                Some("BUG-375 快照标题"),
+                Some("video/mp4"),
+                Some(1),
+                Some("video"),
+                Some(1),
+                None,
+                None,
+                Some("bug375.mp4"),
+            )
+            .await
+            .unwrap();
+        let task = enqueue_fixture_task(&st, &[201], Some(CACHE_FIXTURE_GROUP)).await;
+
+        // 此刻 DB 有 1 条任务，但快照尚未刷新。
+        let before = all_cache_tasks_payload(&st).await;
+        assert_eq!(
+            before["tasks"].as_array().map(Vec::len),
+            Some(0),
+            "未刷新快照时必须返回 0 条 —— 走库就会返回 DB 里那 1 条（旧行为）"
+        );
+
+        // 写者刷新后，同一次读必须拿到全部三类数据（任务 + 标题 + 清单摘要）。
+        st.refresh_cache_tasks().await;
+        let after = all_cache_tasks_payload(&st).await;
+        let arr = after["tasks"].as_array().expect("tasks must be an array");
+        assert_eq!(arr.len(), 1, "刷新后快照必须含刚入队的任务");
+        assert_eq!(arr[0]["id"].as_i64(), Some(task.id));
+        assert_eq!(
+            arr[0]["title"].as_str(),
+            Some("BUG-375 快照标题"),
+            "标题也必须来自快照（不再按频道逐条查库）"
+        );
+        assert!(
+            arr[0].get("manifest").is_some(),
+            "组清单摘要同样必须来自快照"
+        );
+    }
+
+    /// BUG-375 判据 2：快照条数上限与端点契约一致（500），
+    /// 不能被某个更小的常量悄悄砍掉 —— 那会让界面无故少显示任务。
+    #[test]
+    fn snapshot_limit_matches_the_endpoint_contract_bug375() {
+        assert_eq!(
+            crate::state::CACHE_TASK_SNAPSHOT_LIMIT, 500,
+            "快照上限必须等于 /tasks/all 的契约上限 500"
+        );
+    }
+
     // ── BUG-281：相册组的分集介绍继承组级 caption 正文 ───────────────────────
 
     /// BUG-281 判据 1（**可证伪**）：组里只有一条消息带多行 caption ⇒ 入库后
@@ -11657,6 +11742,9 @@ mod tests {
             .enqueue_cache_task(-1001, None, "m:-1001:55", &[55], &std::env::temp_dir().to_string_lossy())
             .await
             .unwrap();
+        // BUG-375：本端点已改读内存快照 ⇒ 入队后必须由「写者」刷一次，
+        // 否则读到的是空快照（这正是新契约：读零 DB，写在写点刷）。
+        st.refresh_cache_tasks().await;
 
         let resp = list_all_cache_tasks(State(st.clone()))
             .await

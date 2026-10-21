@@ -1134,6 +1134,69 @@ impl Store {
         Ok(out)
     }
 
+    /// 按**任务实际涉及的消息**取标题来源（BUG-375）。
+    ///
+    /// 与 [`Self::message_captions_for_channels`] 的差别只有一个 `message_id IN (...)`，
+    /// 但这一项决定了它能不能上轮询路径：
+    ///
+    /// - 旧查询把该频道**所有**有 caption/file_name 的消息全拉回来。实测 10 个频道
+    ///   拉回 **3768 行**、耗时 **33ms** —— 而调用方（任务列表）只用其中几百行。
+    /// - 新查询只取任务 `message_ids` 覆盖的那几百行，实测降到亚毫秒级。
+    ///
+    /// 为什么必须省这 33ms：BUG-375 把 `/api/tg/cache/tasks/all` 的读路径改成内存快照后，
+    /// 这三条聚合被移到**写点**（`AppState::refresh_cache_tasks`）。33ms 每次写足以把
+    /// 墙钟类用例推过阈值（实测 `wall_clock_accumulates_across_restarts…` 由 3 次重启
+    /// 掉到 2 次）—— 写点开销必须低到不影响既有时序，否则「修读路径」会变成「拖慢写路径」。
+    ///
+    /// 分批（每批 400）防 SQLite 变量数上限；`media_message_group_idx` 覆盖
+    /// `(channel_id, message_id)` 前缀，走索引。
+    pub async fn message_captions_for_refs(
+        &self,
+        refs: &[(i64, i64)],
+    ) -> libsql::Result<std::collections::HashMap<(i64, i64), MsgTitleSources>> {
+        let mut out = std::collections::HashMap::new();
+        if refs.is_empty() {
+            return Ok(out);
+        }
+        // 按频道分组：每频道一条 `message_id IN (...)`（频道数是个位数～十位数）。
+        let mut by_ch: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
+        for (ch, mid) in refs {
+            by_ch.entry(*ch).or_default().push(*mid);
+        }
+        for (ch, mut ids) in by_ch {
+            ids.sort_unstable();
+            ids.dedup();
+            for batch in ids.chunks(400) {
+                let placeholders = batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "SELECT message_id, caption, file_name \
+                     FROM media_message \
+                     WHERE channel_id = ? AND message_id IN ({placeholders}) \
+                       AND (caption IS NOT NULL AND caption <> '' OR file_name IS NOT NULL AND file_name <> '')"
+                );
+                let mut params: Vec<libsql::Value> = Vec::with_capacity(batch.len() + 1);
+                params.push(ch.into());
+                for m in batch {
+                    params.push((*m).into());
+                }
+                let mut rows = self.conn.query(&sql, params).await?;
+                while let Some(r) = rows.next().await? {
+                    let mid: i64 = r.get(0)?;
+                    let cap: Option<String> = r.get(1)?;
+                    let fname: Option<String> = r.get(2)?;
+                    out.insert(
+                        (ch, mid),
+                        MsgTitleSources {
+                            caption: first_line(cap.as_deref()),
+                            file_name: first_line(fname.as_deref()),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// 列出某频道已入库消息（新→旧）。
     ///
     /// `before_id` 为历史游标（exclusive）：`Some(id)` 只返回 message_id < id 的行，

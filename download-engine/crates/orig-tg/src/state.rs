@@ -9,7 +9,13 @@ use tokio::sync::{Notify, RwLock};
 
 use crate::config::Config;
 use crate::login::Client;
-use crate::store::{CacheTask, Store};
+use crate::store::{CacheTask, MsgTitleSources, Store};
+
+/// 缓存任务快照的条数上限。
+///
+/// 与 `GET /api/tg/cache/tasks/all` 的契约一致（该端点历史上直接查库时的 limit
+/// 也是 500）—— 否则「读改走快照」会顺带把条数砍到 50，界面少显示 450 条。
+pub const CACHE_TASK_SNAPSHOT_LIMIT: u32 = 500;
 
 /// 内存环形日志缓冲（诊断用，不持久化）。容量上限防内存增长。
 pub struct RingLog {
@@ -113,6 +119,13 @@ pub struct AppState {
     /// 快照由「唯一写者」在每次 DB 变更后同步刷新（`refresh_cache_tasks`），
     /// 读方 clone `Arc` 即返回——零 DB、零锁竞争（RwLock 读锁纳秒级）。
     cache_tasks: Arc<RwLock<Arc<Vec<CacheTask>>>>,
+    /// 任务标题来源快照（`(chat_id, message_id) -> caption/file_name`）。
+    ///
+    /// 与 `cache_tasks` 同一理由（BUG-375）：`/api/tg/cache/tasks/all` 在轮询读
+    /// 路径上，标题不能再按频道逐条查库 —— 那既慢又与 worker 的写争用同一连接。
+    cache_task_titles: Arc<RwLock<Arc<HashMap<(i64, i64), MsgTitleSources>>>>,
+    /// 任务级组清单摘要快照（`task_id -> ManifestSummary`）。同上，读路径零 DB。
+    cache_task_summaries: Arc<RwLock<Arc<HashMap<i64, crate::media::ManifestSummary>>>>,
     /// 缓存 worker 单飞门禁：同一时刻至多一个 worker 协程在跑（进程内判定；
     /// DB 侧 `has_running_cache_task` 是跨请求的慢判定，两者配合防双跑）。
     cache_worker_alive: AtomicBool,
@@ -235,6 +248,8 @@ impl AppState {
             mock,
             dialog_scanning: AtomicBool::new(false),
             cache_tasks: Arc::new(RwLock::new(Arc::new(Vec::new()))),
+            cache_task_titles: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
+            cache_task_summaries: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
             cache_worker_alive: AtomicBool::new(false),
             sync_inflight: AtomicBool::new(false),
             log_throttle: Mutex::new(HashMap::new()),
@@ -349,14 +364,60 @@ impl AppState {
     }
 
     /// 从 DB 重建缓存任务快照（每次 DB 变更后由唯一写者调用）。
+    ///
+    /// BUG-375：一并重建**标题来源**与**组清单摘要**两个快照。
+    ///
+    /// 起因：`GET /api/tg/cache/tasks/all`（daemon `/api/activity` 的 cache 源每 5s
+    /// 拉一次）原先每次都打三条 SQL，而它与下载 worker **共用同一条 libsql 连接** ——
+    /// worker 一持写事务，读就排在后面等锁。实测同一请求 3.18s / 0.03s / **13.70s**
+    /// （无写竞争时全三条合计仅 36ms），daemon 出向客户端总超时 4s ⇒ 大量请求被切成
+    /// `request orig-tg: error sending request for url`，用户侧即「TG 入库任务暂时
+    /// 无法读取 / 进度不动 / 卡顿」。而同文件的 `/api/tg/cache/tasks`（单任务端点）
+    /// 早已改读 `cache_tasks` 内存快照、零 DB —— **快的那条的成果没有辐射到慢的那条**。
+    ///
+    /// 代价：每个写点多两三条只读聚合（实测标题约 33ms、摘要约 1ms）。写点本就是
+    /// 低频 DB 操作，把这份成本从**每次轮询**移到**每次写**是正确的方向。
     pub async fn refresh_cache_tasks(&self) {
-        let tasks = self.store.list_cache_tasks(50).await.unwrap_or_default();
+        let tasks = self
+            .store
+            .list_cache_tasks(CACHE_TASK_SNAPSHOT_LIMIT)
+            .await
+            .unwrap_or_default();
+        // 标题来源：只取任务**实际涉及**的消息（BUG-375：旧的「按频道全扫」会把每个
+        // 频道所有有标题的消息全拉回来 —— 实测 10 频道 3768 行 / 33ms，而任务列表只用
+        // 其中几百行。写点不该背这个开销）。
+        let refs: Vec<(i64, i64)> = tasks
+            .iter()
+            .flat_map(|t| t.message_ids.iter().map(move |m| (t.chat_id, *m)))
+            .collect();
+        let titles = self
+            .store
+            .message_captions_for_refs(&refs)
+            .await
+            .unwrap_or_default();
+        let summaries = self.store.task_manifest_summaries().await.unwrap_or_default();
         *self.cache_tasks.write().await = Arc::new(tasks);
+        *self.cache_task_titles.write().await = Arc::new(titles);
+        *self.cache_task_summaries.write().await = Arc::new(summaries);
     }
 
     /// 读快照（零 DB；clone Arc，无深拷贝）。
     pub async fn cache_tasks_snapshot(&self) -> Arc<Vec<CacheTask>> {
         self.cache_tasks.read().await.clone()
+    }
+
+    /// 读标题来源快照（零 DB）。
+    pub async fn cache_task_titles_snapshot(
+        &self,
+    ) -> Arc<HashMap<(i64, i64), MsgTitleSources>> {
+        self.cache_task_titles.read().await.clone()
+    }
+
+    /// 读组清单摘要快照（零 DB）。
+    pub async fn cache_task_summaries_snapshot(
+        &self,
+    ) -> Arc<HashMap<i64, crate::media::ManifestSummary>> {
+        self.cache_task_summaries.read().await.clone()
     }
 
     pub fn push_log(&self, line: impl AsRef<str>) {
