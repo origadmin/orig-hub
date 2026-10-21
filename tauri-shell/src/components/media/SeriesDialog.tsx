@@ -56,7 +56,7 @@ export function CreateSeriesDialog(props: {
         onClick={(e) => e.stopPropagation()}
         data-testid="series-create-dialog"
       >
-        <h4 className="text-[13px] font-semibold text-fg-strong">新建剧集</h4>
+        <h2 className="text-base font-semibold text-fg-strong">新建剧集</h2>
         <div className="mt-3 space-y-2">
           <Input
             value={title}

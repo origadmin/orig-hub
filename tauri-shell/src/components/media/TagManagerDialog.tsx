@@ -179,11 +179,11 @@ export function BulkTagDialog(props: {
         className="w-full max-w-md rounded-lg border border-border-subtle bg-surface p-4 shadow-lg"
         onClick={(e) => e.stopPropagation()}
       >
-        <h4 className="text-[13px] font-semibold text-fg-strong">
+        <h2 className="text-base font-semibold text-fg-strong">
           {isSeries
             ? t('media.seriesBulkTagTitle', { n: count })
             : t('media.bulkTagTitle', { n: count })}
-        </h4>
+        </h2>
         <p className="mt-1 text-[11px] text-muted">
           {isSeries ? t('media.seriesBulkTagHint') : t('media.bulkTagHint')}
         </p>
@@ -292,7 +292,7 @@ export function TagManagerDialog(props: {
         onClick={(e) => e.stopPropagation()}
       >
         <header className="shrink-0 border-b border-border-subtle/60 px-4 py-3">
-          <h4 className="text-[13px] font-semibold text-fg-strong">{t('media.manageTags')}</h4>
+          <h2 className="text-base font-semibold text-fg-strong">{t('media.manageTags')}</h2>
           <p className="mt-0.5 text-[11px] text-muted">
             {t('media.tag.description')}
           </p>

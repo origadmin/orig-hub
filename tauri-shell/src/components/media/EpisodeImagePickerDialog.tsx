@@ -69,9 +69,9 @@ export function EpisodeImagePickerDialog(props: {
         data-testid="episode-image-picker"
       >
         <div className="mb-2 flex items-center justify-between">
-          <h4 className="text-[13px] font-semibold text-fg-strong">
+          <h2 className="text-base font-semibold text-fg-strong">
             {t('media.episodeImagesTitle', { no: episode.episodeNo })}
-          </h4>
+          </h2>
           <button
             type="button"
             onClick={onClose}

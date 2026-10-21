@@ -124,7 +124,7 @@ export function ItemEditDialog(props: {
         onClick={(e) => e.stopPropagation()}
         data-testid="item-edit-dialog"
       >
-        <h4 className="text-[13px] font-semibold text-fg-strong">{t('media.item.editMeta')}</h4>
+        <h2 className="text-base font-semibold text-fg-strong">{t('media.item.editMeta')}</h2>
 
         <div className="mt-3 flex gap-3">
           <div className="h-20 w-36 shrink-0 overflow-hidden rounded-md bg-surface-2">

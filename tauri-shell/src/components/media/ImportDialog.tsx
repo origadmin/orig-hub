@@ -97,7 +97,7 @@ export function ImportDialog(props: {
         onClick={(e) => e.stopPropagation()}
       >
         <header className="shrink-0 border-b border-border-subtle/60 px-4 py-3">
-          <h4 className="text-[13px] font-semibold text-fg-strong">导入本地目录</h4>
+          <h2 className="text-base font-semibold text-fg-strong">导入本地目录</h2>
           <p className="mt-0.5 text-[11px] text-muted">
             扫描目录中的视频/图片/音频并登记到资料库，原文件保留在原位不会被移动。
           </p>

@@ -148,7 +148,7 @@ export function ExportPreviewDialog(props: {
         onClick={(e) => e.stopPropagation()}
         data-testid="export-preview-dialog"
       >
-        <h4 className="text-[13px] font-semibold text-fg-strong">{t('media.exportPreview')}</h4>
+        <h2 className="text-base font-semibold text-fg-strong">{t('media.exportPreview')}</h2>
 
         {/* 选择区：勾选要校验的剧集（默认全选；全选 = 全库校验） */}
         <div className="mt-3 flex items-center justify-between">
