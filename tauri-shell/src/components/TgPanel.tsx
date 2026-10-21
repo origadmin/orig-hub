@@ -1234,9 +1234,14 @@ export function TgPanel(
   // 请求那一整条链）。
 
   /** 滚到顶部：按当前最旧消息 id 加载更早一页并 prepend */
-  const loadOlder = useCallback(async () => {
+  const loadOlder = useCallback(async (): Promise<boolean> => {
     const src = feedSourceRef.current
-    if (!src || loadingOlder || !hasMore || feed.length === 0) return
+    // BUG-364：返回值 = 「这一轮是否真的发起了一次翻页」。定位循环据此计预算：
+    // 面板未就绪（feed 空）/ 上一页仍在途 / 已无更多历史时的早退是**空转**，
+    // 旧实现里这些空转也消耗 `LOCATE_MAX_PAGES` 预算 —— 冷面板下 300ms×20≈6s
+    // 就烧光 20 页，而首屏要 4–19s 才到，循环在「加载媒体中…」的同屏里误报
+    // `tg.locateFailed`。现在空转不计数，预算只对真实翻页生效。
+    if (!src || loadingOlder || !hasMore || feed.length === 0) return false
     setLoadingOlder(true)
     prependAnchorRef.current = scrollRef.current?.scrollHeight ?? 0
     const oldest = feed[0].messageId
@@ -1268,6 +1273,8 @@ export function TgPanel(
     } finally {
       setLoadingOlder(false)
     }
+    // 翻页已发起（哪怕后端失败）—— 对定位循环记一次真实预算，防无限重试。
+    return true
   }, [feed, loadingOlder, hasMore, setError, applyStoredSnapshot])
 
   /*
@@ -1280,6 +1287,16 @@ export function TgPanel(
   hasMoreRef.current = hasMore
   const loadOlderRef = useRef(loadOlder)
   loadOlderRef.current = loadOlder
+  // BUG-364：定位循环的「面板就绪」判据 —— 首屏已落定**且**有内容（或确认无更多）。
+  // 渲染期镜像（与 hasMoreRef 同款）：切频道后 feedLoading=true ⇒ 未就绪，循环
+  // 只等待不翻页；首屏到达（或频道确实为空 / 加载失败已由 feedErrorRef 另行处理）
+  // 后才进入翻页。冷面板首屏 4–19s 的窗口由此不再烧预算。
+  const feedReadyRef = useRef(false)
+  feedReadyRef.current = !feedLoading && (feed.length > 0 || !hasMore)
+  // BUG-364：面板内联加载失败（BUG-167 的面板内提示）—— 定位循环见到即如实
+  // 中止并 surfaced 该失败，绝不把「面板没加载出来」说成「消息找不到」。
+  const feedErrorRef = useRef(feedError)
+  feedErrorRef.current = feedError
 
   const handleScroll = useCallback(() => {
     const el = scrollRef.current
@@ -1540,6 +1557,18 @@ export function TgPanel(
    *
    * 为什么是轮询而不是「等 feed 变化」：切频道后 feed 异步到达，且目标消息
    * 可能不在第一页（要连续翻几页）；一个循环同时覆盖「等加载 / 翻页 / 命中」。
+   *
+   * BUG-364（误报根因修法）：旧循环把「没命中 + hasMore」一律当「该翻页」，
+   * 而 `loadOlder` 在 feed 为空（面板未就绪）时早退 —— 早退不翻页却**照扣
+   * 预算**，300ms×20≈6s 烧光 20 页，冷面板首屏（4–19s）还没到就判
+   * `tg.locateFailed`（toast 与「加载媒体中…」同屏，且消息实证在库）。
+   * 新契约四态分离，每态只做自己该做的事：
+   *   ① 命中            ⇒ 高亮 + 滚动 + 清焦点（成功路径不变）；
+   *   ② 面板加载失败    ⇒  surfaced 失败本身（`feedError`），不伪装成「找不到」；
+   *   ③ 面板未就绪      ⇒ **只等待**（locateReq 仍在 ⇒ 界面显示「正在定位」），
+   *                        不翻页、不扣预算；用户切走/回列表 ⇒ 焦点失效静默取消；
+   *   ④ 就绪后翻页      ⇒ 只有 `loadOlder` 真发起了一次翻页才扣一页预算；
+   *      预算尽/无更多   ⇒ 此时「不在可加载范围内」才是事实，才报 locateFailed。
    */
   useEffect(() => {
     if (!locateReq) return
@@ -1567,11 +1596,34 @@ export function TgPanel(
           requestAnimationFrame(() => hit.el.scrollIntoView({ block: 'center' }))
           return
         }
-        if (hasMoreRef.current && pages < LOCATE_MAX_PAGES) {
-          pages += 1
-          await loadOlderRef.current()
+        // ② 面板内容流加载失败 ⇒ 定位无从谈起：如实 surfaced 失败原因，
+        //    绝不把「面板没加载出来」写成「消息找不到」（误报的直接来源）。
+        if (feedErrorRef.current) {
+          setLocateReq(null)
+          setError(feedErrorRef.current)
           return
         }
+        // ③ 面板已离开目标频道（用户切到别的频道 / 回列表）⇒ 焦点失效，
+        //    静默取消——不拿旧频道的结论报新频道的案，也不误报「找不到」。
+        const src = feedSourceRef.current
+        if (!src || src.chatId !== chatId) {
+          setLocateReq(null)
+          return
+        }
+        // ③b 目标频道首屏未就绪 ⇒ 只等待。冷面板首屏 4–19s，旧实现在这里
+        //      空转烧光预算；现在预算一分不花，界面持续显示「正在定位」。
+        if (!feedReadyRef.current) return
+        // ④ 就绪后翻页：仅当 loadOlder 真发起了一次翻页才扣预算
+        //      （空转/在途/无更多都不扣 —— 预算只对真实翻页生效）。
+        if (hasMoreRef.current && pages < LOCATE_MAX_PAGES) {
+          const started = await loadOlderRef.current()
+          if (started) {
+            pages += 1
+          }
+          return
+        }
+        // ④b 走到这里 = 面板就绪、真实翻页已尽（或本就可加载范围已穷）：
+        //      「不在可加载范围内」此时才是事实。
         setLocateReq(null)
         setError(t('tg.locateFailed'))
       } finally {
@@ -1972,6 +2024,11 @@ export function TgPanel(
                               )
                               void markTgFilterRead(f.id).catch(() => {})
                             }}
+                            aria-label={t('tg.filterRowA11y', {
+                              label: f.label,
+                              n: f.hits,
+                            })}
+                            data-testid="tg-filter-chip"
                             className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left"
                           >
                             <div className="min-w-0 flex-1">
@@ -1993,20 +2050,29 @@ export function TgPanel(
                                 +{f.newHits}
                               </span>
                             ) : null}
+                            {/* 命中计数（BUG-360）：`aria-hidden` —— 它已由行的 aria-label
+                                说明（「命中 N 条」）。不藏的话辅助技术会把标签与计数读成
+                                一串无分隔的文字（"琼明神女录14 条"），正是用户报的
+                                「展示的内容也是混乱的」在可访问性上的同一件事。 */}
                             <span
                               data-testid="tg-filter-hits-count"
+                              aria-hidden="true"
                               className="shrink-0 rounded-md border border-border-subtle px-1.5 py-0.5 text-[12px] tabular-nums text-fg-mid"
                             >
                               {t('tg.filterHits', { n: f.hits })}
                             </span>
                           </button>
+                          {/* 删除钮（BUG-360）：命中区从 28×28 提到 36×36（BUG-327 的
+                              「整行可点、命中区 ≥36px」对行内次要动作同样成立）——
+                              28px 的 ✕ 在 192px 侧栏里既难点中也读不出是按钮。 */}
                           <Button
                             variant="ghost"
-                            size="icon-sm"
+                            size="icon"
                             className="shrink-0 text-muted hover:text-danger"
                             onClick={() => void removeFilter(f.id)}
                             title={t('tg.filterRemove')}
                             aria-label={t('tg.filterRemove')}
+                            data-testid="tg-filter-remove"
                           >
                             ✕
                           </Button>
@@ -2489,9 +2555,13 @@ export function TgPanel(
               className="min-h-0 flex-1 overflow-y-auto px-4 py-4"
             >
               <div className="mx-auto flex max-w-2xl flex-col gap-3">
-                {/* 顶部：历史加载状态 */}
+                {/* 顶部：历史加载状态 / 定位中（BUG-364） */}
                 <div className="flex h-6 items-center justify-center">
-                  {loadingOlder ? (
+                  {locateReq ? (
+                    <span className="text-[11px] text-accent" data-testid="tg-locating">
+                      {t('tg.locating')}
+                    </span>
+                  ) : loadingOlder ? (
                     <span className="text-[11px] text-muted">{t('tg.historyOlder')}</span>
                   ) : feed.length > 0 && !hasMore ? (
                     <span className="text-[11px] text-muted">{t('tg.historyNoMore')}</span>
@@ -2663,7 +2733,11 @@ const MessageBubble = memo(function MessageBubble(props: {
           highlighted ? 'border-accent ring-2 ring-accent/70' : 'border-border-subtle',
         )}
       >
-        {m.type === 'photo' && <PhotoBlock item={m} onPreview={() => onPreview(m)} />}
+        {m.type === 'photo' && (
+          /* BUG-359：图片块只做预览；缓存入口在下方操作行（与视频同构的一处），
+             不再往图上压一个黑框按钮 —— 同一动作两个入口就是「不清楚用途」的来源。 */
+          <PhotoBlock item={m} onPreview={() => onPreview(m)} />
+        )}
         {m.type === 'video' && (
           <VideoBlock
             item={m}
@@ -3012,6 +3086,11 @@ const AlbumBubble = memo(function AlbumBubble(props: {
   a.items === b.items &&
   a.cacheTargets === b.cacheTargets &&
   a.cachedTargets === b.cachedTargets &&
+  // BUG-364：`highlighted` 必须参与比较——定位命中时只有它翻转（false→true），
+  // 漏了它 = 比较器判「相等」⇒ React 跳过重渲染 ⇒ 相册根拿不到
+  // `data-tg-highlight`，「在 TG 中查看」点了不亮（单条消息走默认浅比较不受害，
+  // 所以这个缺陷只在相册目标上现形，极易漏测）。
+  a.highlighted === b.highlighted &&
   a.progress?.done === b.progress?.done &&
   a.progress?.total === b.progress?.total &&
   a.progress?.queued === b.progress?.queued &&
@@ -3021,7 +3100,25 @@ const AlbumBubble = memo(function AlbumBubble(props: {
 )
 
 /** 图片块：列表用轻量缩略图（自然比例不裁切），点击弹遮罩看原图 */
-function PhotoBlock({ item, onPreview }: { item: FeedItem; onPreview: () => void }) {
+/**
+ * 图片块：**只做预览**（BUG-359）。
+ *
+ * 图片与视频是**两条互不相干的分支**（2026-10-21 用户裁定）：
+ * - **剧集线（EP）**：图片永不进入（BUG-044 的触发器硬门）——「图片不入剧集」的
+ *   全部含义到此为止，它**不**推导出「不下载」；
+ * - **展示线**：图片必须能展示，而可靠展示依赖**本地字节**：未落盘时只能靠 `/raw`
+ *   现场代理 TG，链路一断整库图片全瞎。所以图片同样要缓存，只是不参与成剧。
+ *
+ * 历史包袱：BUG-049 曾把「不入剧集」误扩成「不缓存」，气泡只剩预览、没有任何动作；
+ * 引擎侧已由 BUG-352 改正（图片照常落盘）。入口补在**气泡操作行**（与视频同构，
+ * 见 `MessageBubble` 尾部那一行）—— 不在图上再压一个黑框按钮：同一个动作两个入口、
+ * 其中一个是压在内容上的半透明黑片，正是 BUG-359 用户报的「有黑框，不清楚用途」。
+ */
+function PhotoBlock(props: {
+  item: FeedItem
+  onPreview: () => void
+}) {
+  const { item, onPreview } = props
   const [err, setErr] = useState(false)
   if (err) {
     return (
@@ -3035,6 +3132,7 @@ function PhotoBlock({ item, onPreview }: { item: FeedItem; onPreview: () => void
     )
   }
   return (
+    <div className="relative">
       <button
         type="button"
         onClick={onPreview}
@@ -3042,14 +3140,25 @@ function PhotoBlock({ item, onPreview }: { item: FeedItem; onPreview: () => void
         data-testid="tg-photo-preview"
         data-message-id={item.messageId}
       >
-      <img
-        src={tgThumbUrl(item.chatId, item.messageId)}
-        alt={item.caption || ''}
-        loading="lazy"
-        onError={() => setErr(true)}
-        className="mx-auto h-auto max-h-[60vh] w-auto max-w-full object-contain"
-      />
-    </button>
+        <img
+          src={tgThumbUrl(item.chatId, item.messageId)}
+          alt={item.caption || ''}
+          loading="lazy"
+          onError={() => setErr(true)}
+          className="mx-auto h-auto max-h-[60vh] w-auto max-w-full object-contain"
+        />
+      </button>
+      {/*
+        BUG-359：撤掉压在图上的「⬇ 缓存」黑框按钮。
+        原形态是 `absolute right-1.5 top-1.5` + `bg-black/65` 的半透明黑片，与气泡
+        操作行里那个「缓存」按钮是**同一个动作的两个入口** —— 用户原话
+        「详情内容无法选择，但是有黑框，不清楚用途」：图上一个黑框、图下一行按钮，
+        同一件事给两个控件，其中一个是压在内容上的装饰性黑块，自然读不出用途。
+        判据（BUG-328 同族）：压在内容上的常驻动作条不进 DOM，动作只留流式那一处。
+        缓存三态在图上一并撤掉：气泡操作行已有 Chip（已缓存/缺字节/失败）与按钮文案
+        （缓存中/排队中/重试缓存/缓存）承载同一组状态，不因撤掉黑框丢信息。
+      */}
+    </div>
   )
 }
 

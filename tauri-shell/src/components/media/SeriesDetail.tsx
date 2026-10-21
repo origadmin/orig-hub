@@ -11,7 +11,6 @@ import {
   Pencil,
   Play,
   Scissors,
-  Send,
   Tag,
   Trash2,
 } from 'lucide-react'
@@ -629,8 +628,25 @@ export function SeriesDetail(props: {
           <p className="text-[11px] text-muted" data-testid="series-meta">
             {kindLabel(detail.kind)}
             {detail.year ? ` · ${detail.year}` : ''} ·{' '}
-            {t('media.episodeCount', { n: detail.episodeCount })} ·{' '}
-            {t('media.series.seasonCount', { n: detail.seasonCount })}
+            {/*
+              BUG-365：这里原先渲染 `media.episodeCount`（`{n} 集`），而
+              `episodeCount` 的口径是「集数 + 集级挂图」（BUG-255 设计：混编组的
+              海报/截图也计入，否则「1 预告片 + N 海报」只数到 1 集）。
+              于是「2 视频 + 1 挂图」的剧集在详情页显示「3 集」，而左栏选集器只有
+              **2 行** —— 用户按「3 集」去找第 3 集，只找到 2 行加一张挂在 EP2 上的
+              挂图，判定「其中 1 个文件丢失」（2026-10-22 复报原话）。
+              同一次复报里剧集卡已经显示「视频 2 · 图片 1」（BUG-220 修的正是这个
+              口径），**详情页与卡片互相矛盾** = 同一部剧两个数。
+              修为与卡片同源：视频数 + 图片数分列，视频数可与左栏行数一一对上。
+              老后端不下发这两个字段时退回原 `episodeCount`（不编造 0）。
+            */}
+            {detail.videoCount != null || detail.photoCount != null
+              ? t('player.mixedCount', {
+                  v: detail.videoCount ?? 0,
+                  p: detail.photoCount ?? 0,
+                })
+              : t('media.episodeCount', { n: detail.episodeCount })}{' '}
+            · {t('media.series.seasonCount', { n: detail.seasonCount })}
           </p>
 
           {detail.tags.length > 0 ? (
@@ -836,8 +852,6 @@ export function SeriesDetail(props: {
               detail.episodes.map((ep, i) => {
               const on = ep.id === cur?.id
               const photo = isPhotoEpisode(ep)
-              // BUG-305：本行的 TG 源坐标（应用内跳转用；解析不出 ⇒ 不渲染入口）。
-              const epTgAt = parseSourceRef(ep.ref, ep.source)
               // BUG-254：字节态决定这一行尾列是「时长」还是「未缓存」。无字节分集不显示时长
               // （那是假信息，会误导用户以为可播），改用 `episode-nobytes` 标记。
               const withBytes = hasMediaBytes(ep)
@@ -1003,33 +1017,13 @@ export function SeriesDetail(props: {
                         )
                       })()
                     )}
-                    {/* BUG-305：行内「在 TG 中查看」（媒体库列表行级入口）。
-                        行本身是 button，嵌套 button 非法 ⇒ 与上方 `episode-nobytes`
-                        同构：span + role="button" + stopPropagation（不切右栏焦点）。
-                        坐标缺失/本地来源 ⇒ 不渲染（无 TG 消息可跳）。 */}
-                    {epTgAt && props.onViewInTg ? (
-                      <span
-                        role="button"
-                        tabIndex={0}
-                        onClick={(e: ReactMouseEvent) => {
-                          e.stopPropagation()
-                          props.onViewInTg?.(epTgAt)
-                        }}
-                        onKeyDown={(e: ReactKeyboardEvent) => {
-                          if (e.key === 'Enter' || e.key === ' ') {
-                            e.stopPropagation()
-                            e.preventDefault()
-                            props.onViewInTg?.(epTgAt)
-                          }
-                        }}
-                        className="flex max-w-[120px] shrink-0 cursor-pointer items-center rounded px-1 py-0.5 text-[10px] text-accent hover:bg-accent/10"
-                        title={t('media.viewInTg')}
-                        data-testid="episode-row-view-tg"
-                      >
-                        <Send className="mr-0.5 h-3 w-3 shrink-0" />
-                        <span className="truncate">{t('media.viewInTg')}</span>
-                      </span>
-                    ) : null}
+                    {/* BUG-364：行级「在 TG 中查看」（episode-row-view-tg）撤销。
+                        它与右栏来源块 `episode-source-jump-tg` 指向**同一坐标**，
+                        是同一动作的两个入口（用户报「按钮的问题」时看到的三个
+                        同文案入口之一），且 10px 字号违反 BUG-327 可读性门槛。
+                        应用内跳转收敛为「每颗来源一颗」——来源块主版本行 + 各备用
+                        源行（入口贴着它解释的那条来源，BUG-285 原则不变）；
+                        BUG-305 判据3 的行级入口由本登记 supersede。 */}
                     </span>
                   </button>
                 </div>
@@ -1080,15 +1074,33 @@ export function SeriesDetail(props: {
                 编辑入口仍是同一开关（BUG-197/202 语义不变，testid 不变）。
               */}
               <div data-zone="primary" data-testid="episode-primary-zone" className="flex flex-col gap-2">
+                {/* BUG-364：主按钮按 kind 分支 —— 照片集没有可播的流，「播放」
+                    文案 + Play 图标是错承诺（media.episode.viewImage 键此前定义了
+                    没用上）。照片 ⇒ 「查看大图」+ 图标 + 进图册灯箱（与 deck 放大
+                    入口 openFocusLightbox 同一条路）；视频 ⇒ 原行为不变。 */}
                 <Button
                   className="h-9 w-full gap-1.5 text-[13px]"
                   disabled={!hasMediaBytes(cur)}
-                  onClick={() => playEpisode(cur)}
-                  title={hasMediaBytes(cur) ? t('media.episode.play') : t('media.fileMissingHint')}
+                  onClick={() =>
+                    isPhotoEpisode(cur)
+                      ? openPhotoLightbox(Math.max(0, photoEps.indexOf(cur)))
+                      : playEpisode(cur)
+                  }
+                  title={
+                    hasMediaBytes(cur)
+                      ? isPhotoEpisode(cur)
+                        ? t('media.episode.viewImage')
+                        : t('media.episode.play')
+                      : t('media.fileMissingHint')
+                  }
                   data-testid="episode-play"
                 >
-                  <Play className="h-3 w-3" />
-                  {t('media.episode.play')}
+                  {isPhotoEpisode(cur) ? (
+                    <ImageIcon className="h-3 w-3" />
+                  ) : (
+                    <Play className="h-3 w-3" />
+                  )}
+                  {isPhotoEpisode(cur) ? t('media.episode.viewImage') : t('media.episode.play')}
                 </Button>
                 <div className="flex flex-wrap items-center gap-1.5">
                   {/* 单一编辑入口（原标题行按钮下移，BUG-197/202 同一开关） */}
@@ -1317,7 +1329,11 @@ export function SeriesDetail(props: {
                       BUG-285 判据①a 依赖该 testid 与 href 形状）。
                       BUG-350：应用内跳转按钮**视觉降级为次要样式**（与外链同款灰边）
                       —— 「去 TG 看」是次内容：左栏选集器每行已有该入口，右栏来源行
-                      再放高亮主位按钮就是主次颠倒（用户 2026-10-21）。 */}
+                      再放高亮主位按钮就是主次颠倒（用户 2026-10-21）。
+                      BUG-364：两个入口文案曾**完全相同**（「在 TG 中查看」×2 相邻），
+                      用户分不出哪个会离开应用 —— 外链改「在浏览器打开」
+                      （新键 media.episode.openInBrowser；testid/href 形状不变，
+                      BUG-285 判据①a 不回归，①d 的文案值由本登记 supersede）。 */}
                   {curTgAt && props.onViewInTg ? (
                     <button
                       type="button"
@@ -1338,7 +1354,7 @@ export function SeriesDetail(props: {
                       title={curTgUrl}
                       data-testid="episode-source-view-tg"
                     >
-                      {t('media.episode.viewInTg')}
+                      {t('media.episode.openInBrowser')}
                     </a>
                   ) : null}
                 </div>
@@ -1394,7 +1410,7 @@ export function SeriesDetail(props: {
                               title={sTgUrl}
                               data-testid="episode-source-view-tg"
                             >
-                              {t('media.episode.viewInTg')}
+                              {t('media.episode.openInBrowser')}
                             </a>
                           ) : null}
                         </li>
