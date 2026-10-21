@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { DownloadStatus, DownloadStatusValue } from '../../types'
 import type { DlFilter } from '../../nav'
-import { DownloadList } from './DownloadList'
+import { DownloadItem } from './DownloadItem'
 import { IngestGroupRow } from './IngestGroupRow'
 import type { UseIngestGroupsResult } from './useIngestGroups'
 import { groupInBucket, ingestActionsFor } from './ingestGroups'
@@ -64,6 +64,18 @@ interface Props {
    */
   onOpenMedia?: () => void
 }
+
+/**
+ * BUG-372：下载域统一行模型 —— engine 下载行与 TG 入库组行**同表滚动**。
+ *
+ * 旧结构把 engine 行包在 `shrink-0` 块里钉在滚动器**外面**：入库源不可达时
+ * （orig-tg 抖动期 `ingestRows=0`）整个面板没有任何 overflow 容器，鼠标滚轮
+ * 压哪儿都不滚（用户 2026-10-22：「他为什么不滚」连问四遍）；两者都在时也
+ * 只有入库那一条窄条能滚，engine 区是滚不动死区。
+ */
+type DLRow =
+  | { kind: 'engine'; item: DownloadStatus }
+  | { kind: 'ingest'; group: IngestGroup }
 
 const RUNNING: DownloadStatusValue[] = ['downloading', 'queued', 'idle']
 
@@ -136,10 +148,20 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
     [groups, dlFilter],
   )
 
+  /**
+   * BUG-372：engine 行 + 入库行合成**一个**窗口化列表（见 `DLRow` 注释）。
+   * 行键带 `e:`/`i:` 前缀，与选中集合 `selected` 同一套命名空间。
+   */
+  const dlRows = useMemo<DLRow[]>(
+    () => [
+      ...engineRows.map((item): DLRow => ({ kind: 'engine', item })),
+      ...ingestRows.map((group): DLRow => ({ kind: 'ingest', group })),
+    ],
+    [engineRows, ingestRows],
+  )
+
   // BUG-366：来源切片与概览两块常驻占位已撤（用户 2026-10-22：「上面死占2垃圾」）。
   // 实测两块合计占 61px 首屏纵向空间，且全 0 时仍原样占位。撤后列表直接置顶。
-  const showEngine = engineRows.length > 0
-  const showIngest = ingestRows.length > 0
   const total = engineRows.length + ingestRows.length
 
   /**
@@ -367,54 +389,52 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
           </p>
         </div>
       ) : (
-        <div className="flex min-h-0 flex-1 flex-col gap-2.5">
-          {showEngine && (
-            <div className="shrink-0">
-              <DownloadList
-                items={engineRows}
-                selectedIds={engineSel}
+        /*
+         * BUG-372：engine 行与入库行合并进**同一个** VirtualList —— 一个滚动区
+         * 全覆盖（旧结构把 engine 行钉在 `shrink-0` 块里置于滚动器外，入库源
+         * 抖动取不到时整个面板无从滚动，用户观感「他为什么不滚」）。
+         *
+         * 窗口化沿用 BUG-316 段②：estimate 取 engine 行实测高 116px，入库折叠
+         * 行 108px / 展开行 432px 由 VirtualList 内 measure-and-cache 逐帧收敛；
+         * 行间距 10px 烘进 rowClassName（pb-2.5）。行键 `e:`/`i:` 前缀与选中
+         * 集合同一套命名空间，防跨来源撞名。
+         */
+        <VirtualList<DLRow>
+          className="min-h-0 flex-1 overflow-y-auto"
+          testId="dl-group-list"
+          items={dlRows}
+          estimate={116}
+          overscan={6}
+          keyOf={(r) => (r.kind === 'engine' ? `e:${r.item.id}` : `i:${r.group.key}`)}
+          rowClassName="pb-2.5"
+          renderItem={(r) =>
+            r.kind === 'engine' ? (
+              <DownloadItem
+                item={r.item}
+                selected={engineSel.has(r.item.id)}
                 onToggleSelect={(id) => toggleSelect('e:' + id)}
               />
-            </div>
-          )}
-          {showIngest && (
-            /*
-             * 入库组行窗口化（BUG-316 段②）：实测 104 行 × 折叠 108px 全量渲染
-             * ⇒ 单次 longtask ~240ms。estimate 取折叠行实测高；展开行 432px 由
-             * measure-and-cache 逐帧收敛（VirtualList 内 RO）。间距沿用原
-             * space-y-2.5（10px 烘进 wrapper padding）。契约：容器
-             * data-total = ingestRows.length（验收脚本据此断言渲染行数 < 总数）。
-             */
-            <VirtualList<IngestGroup>
-              className="min-h-0 flex-1 overflow-y-auto"
-              testId="dl-group-list"
-              items={ingestRows}
-              estimate={108}
-              overscan={6}
-              keyOf={(g) => g.key}
-              rowClassName="pb-2.5"
-              renderItem={(g) => (
-                <IngestGroupRow
-                  group={g}
-                  selected={ingestSel.has(g.key)}
-                  onToggleSelect={(key) => toggleSelect('i:' + key)}
-                  onAction={(task, action) => {
-                    void run(task, action).catch(fail)
-                  }}
-                  onRemove={(task) => {
-                    void remove(task).catch(fail)
-                  }}
-                  onGoLibrary={(task) => {
-                    void goLibrary(task)
-                  }}
-                  onDownloadSelected={(chatId, messageIds) => {
-                    void downloadSelected(chatId, messageIds)
-                  }}
-                />
-              )}
-            />
-          )}
-        </div>
+            ) : (
+              <IngestGroupRow
+                group={r.group}
+                selected={ingestSel.has(r.group.key)}
+                onToggleSelect={(key) => toggleSelect('i:' + key)}
+                onAction={(task, action) => {
+                  void run(task, action).catch(fail)
+                }}
+                onRemove={(task) => {
+                  void remove(task).catch(fail)
+                }}
+                onGoLibrary={(task) => {
+                  void goLibrary(task)
+                }}
+                onDownloadSelected={(chatId, messageIds) => {
+                  void downloadSelected(chatId, messageIds)
+                }}
+              />
+            )
+          }
+        />
       )}
     </div>
   )

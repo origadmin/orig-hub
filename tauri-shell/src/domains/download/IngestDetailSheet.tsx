@@ -28,6 +28,24 @@ const entryMeta: Record<ManifestState, { label: string; tone: string }> = {
   missing: { label: '无条目', tone: 'text-muted' },
 }
 
+/**
+ * 条目可勾选判据（BUG-368，用户**第三次**提出「图片无法选择」）。
+ *
+ * 旧判据 `!e.hasBytes` 对**照片**漏了一种态：BUG-049 例外分支下「已落盘的历史
+ * 图片」`hasBytes=true` 但并未入库（`state=registered_unslotted`）—— 它们在
+ * Sheet 里看得见却一个复选框都没有，点不动也没法随「下载选中」入队，用户观感
+ * 就是「图片无法选择」。照片补上「有字节但未入库」这一支；后端 enqueue 幂等
+ * （BUG-308：已入库 ⇒ `alreadyIngested` 零字节跳过），多给一个勾选不会重下。
+ * 视频判据不变（有字节 = 已入库，无下载需求）。
+ */
+function isSelectableEntry(e: {
+  hasBytes: boolean
+  mediaType?: string | null
+  state: ManifestState
+}): boolean {
+  return !e.hasBytes || (e.mediaType === 'photo' && e.state === 'registered_unslotted')
+}
+
 function stamp(sec: number): string {
   if (!sec) return '—'
   const d = new Date(sec * 1000)
@@ -116,7 +134,7 @@ export function IngestDetailSheet({
          */
         if (!isCacheActive(latest.status)) {
           setSelected(
-            new Set(m.entries.filter((e) => !e.hasBytes).map((e) => e.messageId)),
+            new Set(m.entries.filter(isSelectableEntry).map((e) => e.messageId)),
           )
         }
       })
@@ -140,7 +158,8 @@ export function IngestDetailSheet({
     latest.total > 0 ? Math.min(100, (latest.done / latest.total) * 100) : 0
 
   /**
-   * 可选集合 = 缺字节条目（已入库的没有下载需求，不参与选择）。
+   * 可选集合 = 未入库条目（缺字节，或 BUG-049 例外下「有字节但未入库」的照片，
+   * 见 `isSelectableEntry`）。已入库的没有下载需求，不参与选择。
    *
    * 提到渲染之外算，是为了让「全选 / 半选」的状态只算一次 —— 原来两个状态算在
    * JSX 的 IIFE 里，`<input>` 只能表达 checked，没有 indeterminate，于是
@@ -148,7 +167,7 @@ export function IngestDetailSheet({
    * 「全选和选中偏离」）。半选必须看得见，否则「全选」是个说谎的开关。
    */
   const selectableIds = manifest
-    ? manifest.entries.filter((e) => !e.hasBytes).map((e) => e.messageId)
+    ? manifest.entries.filter(isSelectableEntry).map((e) => e.messageId)
     : []
   const allChecked =
     selectableIds.length > 0 && selectableIds.every((id) => selected.has(id))
@@ -199,9 +218,10 @@ export function IngestDetailSheet({
           </span>
         </div>
 
-        {/* 表头：对象名 + 状态徽标 + 关闭 */}
+        {/* 表头：对象名 + 状态徽标 + 关闭（BUG-372：标题必须是第一行第一个元素，
+            原先「TG 入库」徽标压在标题前面——用户「标题不在第一行」；与引擎
+            DownloadDetailSheet 表头同构：␣抓手 + 标题 + 状态 + 关闭）。 */}
         <div className="flex items-center gap-2 px-4 pb-2">
-          <Badge variant="secondary" className="text-[12px]">TG 入库</Badge>
           <p
             className="min-w-0 flex-1 truncate text-sm font-semibold text-fg-strong"
             title={latest.title || latest.itemKey}
@@ -258,7 +278,7 @@ export function IngestDetailSheet({
             >
               {isActive
                 ? '整批入库中：条目级停止不存在（传输以整批任务为最小单位），要停请用列表行的「取消」'
-                : '缺字节的条目已经全部选中；取消勾选你不想下的，只有选中的才会下载'}
+                : '未入库的条目已经全部选中；取消勾选你不想下的，只有选中的才会下载'}
             </p>
             {loading && <p className="text-[12px] text-muted">加载中…</p>}
             {err && <p className="text-[12px] text-danger">{err}</p>}
@@ -339,7 +359,9 @@ export function IngestDetailSheet({
                   const byteBadge = !e.hasBytes
                     ? { label: '缺字节', tone: 'text-warning' as const }
                     : em
-                  const downloadable = !e.hasBytes
+                  // BUG-368：照片「有字节但未入库」也可勾选（历史落盘图未入媒体库），
+                  // 判据统一定义在 isSelectableEntry。
+                  const downloadable = isSelectableEntry(e)
                   const isSelected = selected.has(e.messageId)
                   return (
                     <li

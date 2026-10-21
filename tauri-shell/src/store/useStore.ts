@@ -408,9 +408,16 @@ export const useStore = create<DownloadState>((set, get) => ({
       (evt) => {
         const list = Array.isArray(evt.data) ? evt.data : [evt.data]
         if (list.length === 0) return
+        // BUG-372：事件引用了 store 里没有的行（任务在别处创建 / 本端启动晚于
+        // 任务 / 删后重建）时，旧代码用 `{...(cur ?? {}), ...item}` 拿事件里的
+        // 残缺字段造记录 —— completed 事件只有 {id,status,hash}，没有 filename
+        // ⇒ 列表与详情 Sheet 标题显示「未知文件」（用户 2026-10-22 截图实录）。
+        // 这里只打标记，set 之后补一次全量刷新把完整记录拿回来。
+        let needBackfill = false
         set((s) => {
           const map = new Map(s.downloads.map((d) => [d.id, d]))
           for (const item of list) {
+            if (!map.has(item.id) && evt.event !== 'deleted') needBackfill = true
             if (evt.event === 'completed') {
               // Completed 事件：{id, hash_sha256, path} → 标记 completed
               const cur = map.get(item.id)
@@ -446,6 +453,7 @@ export const useStore = create<DownloadState>((set, get) => ({
           }
           return { downloads: [...map.values()] }
         })
+        if (needBackfill) void get().refresh()
       },
       // SSE 连上 = 与 daemon 的通信真的通了 → alive 反推为 true（BUG-090，零新增请求）
       () => {
