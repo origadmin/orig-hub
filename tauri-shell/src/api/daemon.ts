@@ -156,30 +156,17 @@ export interface DaemonConfig {
     mode: 'direct' | 'system' | 'custom'
     url: string | null
   }
-  /** TG 可选插件开关（daemon [tg] enabled）；false 时前端隐藏 TG 模块 */
-  tg_enabled: boolean
-  /** orig-tg 子服务是否实际在运行（daemon 探活） */
-  tg_running: boolean
-  /** orig-tg 实际监听端口（daemon 是唯一真源；可被 ORIG_TG_PORT 迁移，前端不得再猜 9877） */
-  tg_port?: number
   /**
-   * 最近一次拉起/自愈失败的原因（null = 最近一次成功）。
-   * 服务不可用时侧栏没有 TG 入口，原因必须摆在设置页开关旁，否则用户只会以为功能没了。
+   * **插件清单**（BUG-358）—— `/api/config` 里**不再**出现 `tg_enabled` 这类把插件名
+   * 写进契约的键。
+   *
+   * 用户裁定（2026-10-21，原话）：「"tg_enabled"这些都是什么？毫无共通性，最初定义就是
+   * 以共通插件化来做…我把TG改成BB，这个还能用吗？插件是要即插即用的」。
+   *
+   * ⇒ 前端只按 `id` 取自己那一份（[`TG_PLUGIN_ID`]），**不认识的 id 直接跳过**；
+   * 换插件（TG→BB）时前端零改动，只换 id 常量或按 id 匹配到的实现。
    */
-  tg_last_error?: string | null
-  /**
-   * 链路健康 + 自愈历史（BUG-351）：`restarts`/`last_restart_at` 让界面能如实说
-   * 「最近重启过 N 次」—— 只有瞬时 `tg_running` 时，「系统每 5 分钟重启一次
-   * orig-tg」完全不可见（重启窗口仅几百 ms），关于页因此恒绿。
-   */
-  tg_link?: {
-    link_down: boolean
-    down_streak: number
-    confirms_required: number
-    restarts: number
-    last_restart_at: number | null
-    reason: string | null
-  } | null
+  plugins?: DaemonPlugin[]
   /**
    * 调试日志路径（BUG-243）：由 daemon 下发**绝对路径**，设置-关于页直接展示，
    * 用户出错时照路径就能翻到日志，不必先问「日志在哪」。前端不拼路径——
@@ -192,6 +179,50 @@ export interface DaemonConfig {
     orig_tg: string
     errors: string
   }
+}
+
+/**
+ * 一个可选插件的运行态（`/api/config` 的 `plugins[]` 元素）。
+ *
+ * 字段与插件无关：新增插件（BB/其他）走同一形状，前端渲染逻辑不用改。
+ */
+export interface DaemonPlugin {
+  /** 稳定标识（`tg` / `bb` …）—— 前端**唯一**的识别依据 */
+  id: string
+  /** 展示名（界面文案真源，前端不自己写「Telegram」） */
+  label: string
+  /** 用户是否开启（持久化在 daemon 配置里） */
+  enabled: boolean
+  /** 子服务是否实际在跑（daemon 探活） */
+  running: boolean
+  /** 子服务实际监听端口（daemon 是唯一真源；可能被 env 迁移或保留区顺延） */
+  port?: number
+  /** 最近一次拉起/自愈失败的原因（null = 最近一次成功） */
+  lastError?: string | null
+  /**
+   * 链路健康 + 自愈历史（BUG-351）：`restarts`/`lastRestartAt` 让界面能如实说
+   * 「最近重启过 N 次」—— 只有瞬时 `running` 时，「系统每 5 分钟重启一次」
+   * 完全不可见（重启窗口仅几百 ms），关于页因此恒绿。
+   */
+  health?: {
+    linkDown: boolean
+    downStreak: number
+    confirmsRequired: number
+    restarts: number
+    lastRestartAt: number | null
+    reason: string | null
+  } | null
+}
+
+/** TG 插件的 id —— 前端唯一允许出现 `tg` 字面量的地方（换插件只改这里）。 */
+export const TG_PLUGIN_ID = 'tg'
+
+/** 从 `/api/config` 的 `plugins[]` 里按 id 取一个；没有就返回 `undefined`。 */
+export function findPlugin(
+  cfg: { plugins?: DaemonPlugin[] } | null | undefined,
+  id: string = TG_PLUGIN_ID,
+): DaemonPlugin | undefined {
+  return cfg?.plugins?.find((p) => p.id === id)
 }
 
 /** 代理配置（HTTP 下载） */
@@ -347,46 +378,46 @@ export function saveDownloadConfig(req: { dir: string }): Promise<{
  * 的调用都应在编译期失败，而不是跑到运行期拿一个 422。
  */
 
-/** PUT /api/config/tg — 启停 TG 可选插件（运行时生效 + 持久化；同时拉起/终止 orig-tg 子服务） */
-export function saveTgConfig(req: {
-  enabled: boolean
-}): Promise<{
-  ok: boolean
-  tg_enabled: boolean
-  tg_running: boolean
-  tg_port?: number
-  tg_last_error?: string | null
-}> {
-  return request<{
-    ok: boolean
-    tg_enabled: boolean
-    tg_running: boolean
-    tg_port?: number
-    tg_last_error?: string | null
-  }>('/api/config/tg', {
-    method: 'PUT',
-    body: JSON.stringify(req),
-  }).then((r) => {
+/**
+ * `PUT /api/plugins/:id/enabled` — 启停一个可选插件（运行时生效 + 持久化；
+ * 同时拉起/终止它托管的子服务）。
+ *
+ * BUG-358：路径与入参都与插件无关，`id` 是唯一区分。旧路径 `PUT /api/config/tg`
+ * 仍可用（daemon 侧是别名），但新代码一律走这里 —— 换插件不用改函数名。
+ */
+export function setPluginEnabled(
+  id: string,
+  req: { enabled: boolean },
+): Promise<{ ok: boolean; plugins?: DaemonPlugin[] }> {
+  return request<{ ok: boolean; plugins?: DaemonPlugin[] }>(
+    `/api/plugins/${encodeURIComponent(id)}/enabled`,
+    {
+      method: 'PUT',
+      body: JSON.stringify(req),
+    },
+  ).then((r) => {
     invalidateConfig()
     return r
   })
 }
 
 /**
- * POST /api/tg/restart — 请 daemon 重启它托管的 orig-tg（**daemon 是唯一执行者**）。
+ * POST /api/plugins/:id/restart — 请 daemon 重启它托管的子服务（**daemon 是唯一执行者**）。
  *
- * 为什么前端还要留这个口（BUG-178）：凭证保存 / 网络修好后必须重启 orig-tg 才生效
- * （它只在启动时连一次 Telegram）。但动作是 daemon 执行的 —— 前端只是**请求**，
+ * 为什么前端还要留这个口（BUG-178）：凭证保存 / 网络修好后必须重启子服务才生效
+ * （它只在启动时连一次）。但动作是 daemon 执行的 —— 前端只是**请求**，
  * 不再自己 spawn/kill 进程，也不再让用户去点「启动服务」。
  */
-export function restartTgService(): Promise<{
-  ok: boolean
-  tg_enabled: boolean
-  tg_running: boolean
-  tg_port?: number
-  tg_last_error?: string | null
-}> {
-  return request('/api/tg/restart', { method: 'POST', body: '{}' })
+export function restartPlugin(
+  id: string,
+): Promise<{ ok: boolean; plugins?: DaemonPlugin[] }> {
+  return request<{ ok: boolean; plugins?: DaemonPlugin[] }>(
+    `/api/plugins/${encodeURIComponent(id)}/restart`,
+    { method: 'POST', body: '{}' },
+  ).then((r) => {
+    invalidateConfig()
+    return r
+  })
 }
 
 /** GET /health */

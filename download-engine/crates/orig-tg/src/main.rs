@@ -209,6 +209,15 @@ async fn main() {
 
     let state = Arc::new(AppState::new(client, config.clone(), availability.clone(), mock, store));
 
+    // 2026-10-21 用户裁定「内部文件不入治理」：库根搬进引擎工作区 `.orighub/`，
+    // 下载根顶层只留用户内容 —— 这样成品扫描只需排 `.` 开头就是结构性正确，
+    // 不再靠 `library`/`.orighub` 名字白名单兜底（白名单必漏）。
+    // 必须排在下面那次「顶层普通文件 → legacy-downloads」迁移之前。
+    {
+        let root = state.store.download_root().await;
+        orig_tg::store::Store::migrate_library_into_engine_dir(&root);
+    }
+
     // BUG-323：存量受管根迁移（引擎写过的旧落点 → 下载路径之内）。
     //
     // 库根改为派生值后不迁移 = 存量字节整片失联：库根相对路径的条目在新根下

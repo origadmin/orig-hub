@@ -6710,8 +6710,8 @@ mod tests {
         let lib = s.library_root().await;
         assert_eq!(
             lib,
-            dl.join(Store::LIBRARY_SUBDIR),
-            "夹具前提：库根必须派生自下载根"
+            Store::default_library_root(&dl),
+            "夹具前提：库根必须派生自下载根（住在引擎工作区 `.orighub/` 下）"
         );
         lib
     }

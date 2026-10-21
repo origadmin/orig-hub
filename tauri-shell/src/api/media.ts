@@ -375,6 +375,20 @@ export function mediaItemUrl(id: number): string {
 }
 
 /**
+ * 网格/封面用的**服务端缩略图**地址（`?w=` 限宽，高度按比例）。
+ *
+ * 为什么不能拿 `mediaItemUrl()` 当缩略图：`/raw` 投递的是**原图**（BUG-117 的语义），
+ * 一屏 50 格就是几百 MB，滚动态把同源连接全占满 ⇒ 整页发卡。缩略图端点由服务端缩放
+ * 并落盘缓存，单格 20–40KB。
+ *
+ * 取不到时（未落盘的照片、HEIC 等解不动的格式）服务端返回 404，调用方应**回落
+ * `/raw`**，不能让「没有缩略图」变成「图没了」。
+ */
+export function mediaThumbUrl(id: number, w = 480): string {
+  return `${mediaBase()}/api/media/items/${id}/thumb?w=${Math.round(w)}`
+}
+
+/**
  * 内容兼容流地址（BUG-208）：浏览器解不动的编码（HEVC 等）走服务端按需实时转码
  * H.264。首次为直播（转码即播），完成后同地址自动命中代理缓存（秒开 + Range 可拖）。
  */

@@ -741,76 +741,178 @@ async fn activity(
 }
 
 /// GET /api/config — 当前 daemon 配置（供设置页初始化）。
+///
+/// **出参纪律（BUG-357）**：所有**路径**字段一律走 [`dir_out`] —— 同一响应里曾同时出现
+/// `D:/OrigDown`、`D:\OrigDown`、`C:\Users\…` 三种斜杠形态，而前端要拿它们做「是否
+/// 同一目录」的比较与展示 ⇒ 必然误判（用户原话「返回的路径混乱错误」）。
 async fn get_config(State(st): State<Arc<AppState>>) -> axum::Json<serde_json::Value> {
-    let tg_running = st.tg_is_running().await;
-    let cfg = st.config.read().unwrap();
-    let map = cfg.classify.merged_map();
-    let mut sorted: Vec<(String, String)> = map.into_iter().collect();
-    sorted.sort();
-    let rules: serde_json::Map<String, serde_json::Value> = sorted
-        .into_iter()
-        .map(|(k, v)| (k, serde_json::Value::String(v)))
-        .collect();
-    axum::Json(serde_json::json!({
-        // daemon 实际监听端口（可能与配置端口不同：保留区顺延，BUG-178）。
-        // 前端与桌面壳一律读它，不得各自硬编码 9876。
-        "port": st.port,
-        "download_dir": cfg.download_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        // BUG-323（用户 2026-10-16 裁定）：库根 = `<生效下载路径>/library`，**派生值**。
-        // 键名由 `library_dir` 改为 `library_root` —— 值语义变了（不再是可配项），
-        // 沿用旧键名会让调用方以为它还能被写回去。
-        "library_root": crate::config::library_root(&cfg).to_string_lossy().into_owned(),
-        // 生效下载路径（= 受管根 / 权限边界）：配置值或平台默认。前端「当前生效」
-        // 直出它，不自己拼（拼出来必然与引擎漂移）。
-        "effective_download_root": crate::config::effective_download_root(&cfg)
-            .to_string_lossy()
-            .into_owned(),
-        // BUG-323：手动下载**未配置** `download_dir` 时的实际默认根
-        // （= 名义默认过禁用盘规则后的值：`~/Downloads` 在 C: 上 ⇒ D:\OrigDown）。
-        // 前端用它作占位，不自己拼路径。
-        "manual_download_root": crate::config::manual_download_root(&cfg)
-            .to_string_lossy()
-            .into_owned(),
-        // **名义**系统默认下载目录（Windows = SHGetKnownFolderPath(FOLDERID_Downloads)，
-        // 如 C:\Users\<user>\Downloads）—— 仅名义值：用户 2026-10-19 裁定
-        // 「~/Downloads是默认设置,但是不使用,改用加载配置的D盘设置」，实际落点看
-        // `manual_download_root` / `effective_download_root`（两者都会把 C: 改道到 D:）。
-        // 保留下发只为让前端能显示「默认是什么」，不得直接当写点。
-        "default_download_dir": orig_core::paths::default_download_dir().to_string_lossy().into_owned(),
-        "max_connections": cfg.max_connections,
-        "classify_enabled": cfg.classify.enabled,
-        "classify_rules": rules,
-        "proxy": {
-            "mode": match cfg.proxy.mode {
+    // 先把配置读成一个**不含 guard 的快照**：`plugins_snapshot` 要 await（探活子进程），
+    // 而 `RwLockReadGuard` 跨 await 会让整个 future 变成 !Send ⇒ axum 直接报
+    // `Handler` 未实现（实测踩过，报错完全看不出根因是 guard）。
+    let (
+        download_dir,
+        library_root,
+        effective_root,
+        manual_root,
+        max_connections,
+        classify_enabled,
+        classify_rules,
+        proxy_mode,
+        proxy_url,
+    ) = {
+        let cfg = st.config.read().unwrap();
+        let map = cfg.classify.merged_map();
+        let mut sorted: Vec<(String, String)> = map.into_iter().collect();
+        sorted.sort();
+        let rules: serde_json::Map<String, serde_json::Value> = sorted
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        (
+            cfg.download_dir.as_deref().map(dir_out),
+            dir_out(&crate::config::library_root(&cfg)),
+            dir_out(&crate::config::effective_download_root(&cfg)),
+            dir_out(&crate::config::manual_download_root(&cfg)),
+            cfg.max_connections,
+            cfg.classify.enabled,
+            rules,
+            match cfg.proxy.mode {
                 orig_core::protocol::ProxyMode::Direct => "direct",
                 orig_core::protocol::ProxyMode::System => "system",
                 orig_core::protocol::ProxyMode::Custom => "custom",
             },
-            "url": cfg.proxy.url,
+            cfg.proxy.url.clone(),
+        )
+    };
+    let plugins = plugins_snapshot(&st).await;
+    let logs_dir = log_dir();
+    axum::Json(serde_json::json!({
+        // daemon 实际监听端口（可能与配置端口不同：保留区顺延，BUG-178）。
+        // 前端与桌面壳一律读它，不得各自硬编码 9876。
+        "port": st.port,
+        "download_dir": download_dir,
+        // BUG-323（用户 2026-10-16 裁定）：库根 = `<生效下载路径>/.orighub/library`，
+        // **派生值**（2026-10-21「内部文件不入治理」把它挪进引擎工作区，下载根顶层
+        // 只留用户内容）。
+        // 键名由 `library_dir` 改为 `library_root` —— 值语义变了（不再是可配项），
+        // 沿用旧键名会让调用方以为它还能被写回去。
+        "library_root": library_root,
+        // 生效下载路径（= 受管根 / 权限边界）：配置值或平台默认。前端「当前生效」
+        // 直出它，不自己拼（拼出来必然与引擎漂移）。
+        "effective_download_root": effective_root,
+        // BUG-323：手动下载**未配置** `download_dir` 时的实际默认根
+        // （= 名义默认过禁用盘规则后的值：`~/Downloads` 在 C: 上 ⇒ D:/OrigDown）。
+        // 前端用它作占位，不自己拼路径。
+        "manual_download_root": manual_root,
+        // **名义**系统默认下载目录（Windows = SHGetKnownFolderPath(FOLDERID_Downloads)，
+        // 如 C:/Users/<user>/Downloads）—— 仅名义值：用户 2026-10-19 裁定
+        // 「~/Downloads是默认设置,但是不使用,改用加载配置的D盘设置」，实际落点看
+        // `manual_download_root` / `effective_download_root`（两者都会把 C: 改道到 D:）。
+        // 保留下发只为让前端能显示「默认是什么」，不得直接当写点。
+        "default_download_dir": dir_out(&orig_core::paths::default_download_dir()),
+        "max_connections": max_connections,
+        "classify_enabled": classify_enabled,
+        "classify_rules": classify_rules,
+        "proxy": {
+            "mode": proxy_mode,
+            "url": proxy_url,
         },
-        "tg_enabled": cfg.tg_enabled,
-        "tg_running": tg_running,
-        // orig-tg 实际监听端口（BUG-177 / BUG-178）：前端不得再各自猜 9877 —— 端口可被
-        // `ORIG_TG_PORT` 迁移，也可能因保留区顺延，daemon 是唯一真源。
-        "tg_port": st.tg_port_state(),
-        // 拉起/自愈失败的原因（null = 最近一次成功）。入口级门控「服务可用才显示 TG」
-        // 会让 TG 不可用时侧栏没有入口，原因必须在设置页可见，否则用户只会以为功能没了。
-        "tg_last_error": st.tg_last_error(),
-        // BUG-351：链路健康 + 自愈历史。只有瞬时 `tg_running` 时，「系统每 5 分钟
-        // 重启一次 orig-tg」在界面上完全不可见（重启窗口仅几百 ms），用户看到的是
-        // 「TG 莫名挂了」与关于页两个绿点并存。界面据 `restarts`/`last_restart_at`
-        // 如实呈现「最近重启过 N 次」，不再恒绿。
-        "tg_link": st.tg_link_status(),
+        // 插件清单（BUG-358）：契约里**不得**再出现 `tg_enabled` 这类把插件名写死的键
+        // （用户原话：「"tg_enabled"这些都是什么？毫无共通性…我把TG改成BB，这个还能用吗？」）。
+        // 前端按 `id` 取自己那一份，不认识就跳过 ⇒ 换插件不需要改前端。
+        "plugins": plugins,
         // 调试日志（BUG-243）：把**路径**下发给设置-关于页，用户出错时能直接去查，
         // 不必先问「日志在哪」。目录与文件同源（`state::log_dir()`），前端不拼路径。
         // orig-tg.log = 子进程完整 stdout/stderr（启动失败原因就在里面）；
-        // errors.log  = daemon 记录的核心错误（含每一次 tg_last_error，append-only）。
+        // errors.log  = daemon 记录的核心错误（append-only）。
         "logs": {
-            "dir": log_dir().to_string_lossy().into_owned(),
-            "orig_tg": log_dir().join("orig-tg.log").to_string_lossy().into_owned(),
-            "errors": log_dir().join("errors.log").to_string_lossy().into_owned(),
+            "dir": dir_out(&logs_dir),
+            "orig_tg": dir_out(&logs_dir.join("orig-tg.log")),
+            "errors": dir_out(&logs_dir.join("errors.log")),
         },
     }))
+}
+
+/// 路径字段的统一出参形态（BUG-357）。
+///
+/// 正向斜杠 + 折叠重复分隔符。**只作用于下发的字符串**，不改内部语义：
+/// 边界判定/落点仍用 `PathBuf`，但凡是"给外面看/给外面比"的路径，形态必须唯一 ——
+/// `D:\OrigDown` 与 `D:/OrigDown` 是同一个目录，前端按字符串比较却会判成两个。
+fn dir_out(p: &std::path::Path) -> String {
+    orig_core::paths::normalize_dir_path(p)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// 插件注册表 —— **契约的唯一声明点**（BUG-358）。
+///
+/// 用户 2026-10-21 裁定：「最初定义就是以共通插件化来做…我把TG改成BB，这个还能用吗？
+/// 插件是要即插即用的，当前设计实现完全错误」。
+///
+/// 加一个插件 = 这里加一行 + 实现它的监督器（spawn/探活/重启）。**前端与
+/// `/api/config` 契约都不需要改** —— 它们只认 `id`，不认 `tg`。
+struct PluginSpec {
+    /// 稳定标识（前端按它取；**不得**出现在 `/api/config` 的顶层键里）。
+    id: &'static str,
+    /// 展示名（界面文案的唯一来源，前端不再自己写「Telegram」）。
+    label: &'static str,
+}
+
+const PLUGIN_TG: &str = "tg";
+
+const PLUGINS: &[PluginSpec] = &[PluginSpec { id: PLUGIN_TG, label: "Telegram" }];
+
+/// 插件运行态快照（`/api/config` 与启停/重启端点的**同一份**出参）。
+///
+/// 字段名用 camelCase：这是给前端消费的契约，与其它 HTTP 边界一致（BUG 族：
+/// snake/camel 混用会让参数被静默忽略）。`health` 只有实现了链路巡检的插件才有。
+async fn plugins_snapshot(st: &Arc<AppState>) -> Vec<serde_json::Value> {
+    let mut out = Vec::with_capacity(PLUGINS.len());
+    for spec in PLUGINS {
+        // 监督器按 id 分派：目前只有 TG 一家实现了 spawn/探活/自愈。
+        // 新增插件时在这里加一条分支（前端无感），而不是在契约里加 `bb_enabled`。
+        //
+        // 读配置必须在**独立语句块**里取完：`RwLockReadGuard` 跨 await 会让 future
+        // 变成 !Send（axum 只报「Handler 未实现」，看不出根因）。
+        let enabled = if spec.id == PLUGIN_TG {
+            let v = st.config.read().unwrap().tg_enabled;
+            v
+        } else {
+            false
+        };
+        let (running, port, last_error, health) = if spec.id == PLUGIN_TG {
+            (
+                st.tg_is_running().await,
+                st.tg_port_state(),
+                st.tg_last_error(),
+                Some(st.tg_link_status()),
+            )
+        } else {
+            (false, 0u16, None, None)
+        };
+        let mut entry = serde_json::json!({
+            "id": spec.id,
+            "label": spec.label,
+            "enabled": enabled,
+            "running": running,
+            "port": port,
+            "lastError": last_error,
+        });
+        if let Some(h) = health {
+            // BUG-351：链路健康 + 自愈历史（`restarts`/`lastRestartAt` 让界面能如实说
+            // 「最近重启过 N 次」，而不是在几百 ms 的重启窗口里恒绿）。
+            entry["health"] = serde_json::json!({
+                "linkDown": h["link_down"],
+                "downStreak": h["down_streak"],
+                "confirmsRequired": h["confirms_required"],
+                "restarts": h["restarts"],
+                "lastRestartAt": h["last_restart_at"],
+                "reason": h["reason"],
+            });
+        }
+        out.push(entry);
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -929,8 +1031,9 @@ async fn put_config_library(
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
     Err((
         StatusCode::UNPROCESSABLE_ENTITY,
-        "library_dir is derived from the download directory (<download_dir>/library) \
-         and cannot be set independently; set the download directory instead (BUG-323)"
+        "library_dir is derived from the download directory \
+         (<download_dir>/.orighub/library) and cannot be set independently; \
+         set the download directory instead (BUG-323)"
             .to_string(),
     ))
 }
@@ -1091,78 +1194,107 @@ async fn verify_proxy(
     Ok(resp.status())
 }
 
-/// PUT /api/config/tg — 启停 TG 可选插件（运行时生效 + 持久化到 download-engine.toml）。
-/// body: {"enabled": bool}
-/// enabled=true 拉起 orig-tg 子进程（注入主配置代理）；false 终止子进程。
+/// 插件启停请求体（与插件无关：所有插件都是「开/关」两个动作）。
 #[derive(Deserialize)]
 pub struct TgUpdateReq {
     pub enabled: bool,
 }
 
-async fn put_config_tg(
+/// PUT /api/plugins/:id/enabled — 启停一个可选插件（运行时生效 + 持久化）。
+/// body: {"enabled": bool}
+///
+/// BUG-358：契约里不再出现 `tg` —— 前端只认 `id`（见 [`PLUGINS`]）。旧路径
+/// `PUT /api/config/tg` 保留为别名（桌面壳与旧版前端仍在调，不做破坏性移除）。
+async fn put_plugin_enabled(
     State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<TgUpdateReq>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
-    let running = if req.enabled {
+    if !PLUGINS.iter().any(|p| p.id == id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("unknown plugin id: {id}"),
+        ));
+    }
+    // 目前只有 TG 一家有监督器；新增插件在此加分支（前端无感）。
+    if req.enabled {
         {
             let mut cfg = st.config.write().unwrap();
             cfg.tg_enabled = true;
             cfg.save_tg("download-engine.toml").map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("persist tg config: {e}"))
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("persist plugin config: {e}"))
             })?;
         }
         st.tg_start().await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("start orig-tg: {e}"))
-        })?
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("start {id}: {e}"))
+        })?;
     } else {
         {
             let mut cfg = st.config.write().unwrap();
             cfg.tg_enabled = false;
             cfg.save_tg("download-engine.toml").map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("persist tg config: {e}"))
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("persist plugin config: {e}"))
             })?;
         }
         st.tg_stop().await;
-        false
-    };
+    }
     Ok(axum::Json(serde_json::json!({
         "ok": true,
-        "tg_enabled": req.enabled,
-        "tg_running": running,
-        "tg_port": st.tg_port_state(),
-        "tg_last_error": st.tg_last_error(),
+        "plugins": plugins_snapshot(&st).await,
     })))
 }
 
-/// POST /api/tg/restart — 重启 orig-tg（**daemon 是唯一执行者**）。
+/// POST /api/plugins/:id/restart — 重启一个插件（**daemon 是唯一执行者**）。
 ///
 /// 为什么单独开一个端点（BUG-178）：orig-tg 只在启动时连一次 Telegram，凭证补齐 /
 /// 网络修好后**必须重启**才生效。以前这个动作散在桌面壳 `ensure_tg` 与前端
 /// 「重试连接」两处，TG 进程因此有两个主人、互相 kill。现在只有这一个入口：
 /// 凭证保存 / 链路恢复 / 用户点「重新连接」都归一到这里，由 daemon 独占执行。
-async fn post_tg_restart(
+async fn post_plugin_restart(
     State(st): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    if !PLUGINS.iter().any(|p| p.id == id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("unknown plugin id: {id}"),
+        ));
+    }
     let enabled = st.config.read().unwrap().tg_enabled;
     if !enabled {
         return Err((
             StatusCode::CONFLICT,
-            "tg plugin is disabled; enable it before restarting".into(),
+            format!("plugin {id} is disabled; enable it before restarting"),
         ));
     }
-    let running = st.tg_restart().await.map_err(|e| {
+    st.tg_restart().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("restart orig-tg: {e}"),
+            format!("restart {id}: {e}"),
         )
     })?;
     Ok(axum::Json(serde_json::json!({
         "ok": true,
-        "tg_enabled": enabled,
-        "tg_running": running,
-        "tg_port": st.tg_port_state(),
-        "tg_last_error": st.tg_last_error(),
+        "plugins": plugins_snapshot(&st).await,
     })))
+}
+
+/// 旧路径别名：`PUT /api/config/tg` → [`put_plugin_enabled`]（id 固定 `tg`）。
+///
+/// 保留原因：桌面壳与旧版前端仍调它；破坏性移除会让「壳能起、界面报错」。
+/// 新代码一律走 `/api/plugins/:id/enabled`。
+async fn put_config_tg(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<TgUpdateReq>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    put_plugin_enabled(State(st), axum::extract::Path(PLUGIN_TG.to_string()), Json(req)).await
+}
+
+/// 旧路径别名：`POST /api/tg/restart` → [`post_plugin_restart`]（id 固定 `tg`）。
+async fn post_tg_restart(
+    State(st): State<Arc<AppState>>,
+) -> Result<axum::Json<serde_json::Value>, (StatusCode, String)> {
+    post_plugin_restart(State(st), axum::extract::Path(PLUGIN_TG.to_string())).await
 }
 
 /// `/api/interfaces` 结果缓存（BUG-092）。
@@ -1322,6 +1454,10 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         // D23-A⑥：设置页「库根目录」同步写 daemon（与 TG 共用同一受管根）。
         .route("/api/config/library", axum::routing::put(put_config_library))
         .route("/api/proxy/verify", axum::routing::post(post_proxy_verify))
+        // BUG-358：插件启停/重启走**插件无关**的路径（前端只认 id）。
+        .route("/api/plugins/:id/enabled", axum::routing::put(put_plugin_enabled))
+        .route("/api/plugins/:id/restart", axum::routing::post(post_plugin_restart))
+        // 旧路径别名（桌面壳仍在调）：内部转调上面两个处理器，语义完全一致。
         .route("/api/config/tg", axum::routing::put(put_config_tg))
         .route("/api/tg/restart", axum::routing::post(post_tg_restart))
         .layer(middleware::from_fn_with_state(

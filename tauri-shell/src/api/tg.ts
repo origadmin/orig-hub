@@ -110,9 +110,27 @@ export function tgHealth(): Promise<{ status: string }> {
   return request('/health')
 }
 
-/** GET /api/tg/session — 登录阶段快照 */
+/**
+ * GET /api/tg/session — 登录阶段快照。
+ *
+ * **在途去重**（与 `getConfig` 同一套思路）：`refreshTgState` 被 AccountsPanel /
+ * SettingsPanel / TgPanel 三处挂载各调一次，dev 下 StrictMode 还会双挂 ⇒ 冷启动
+ * 同时打出多条本请求（实测 2–6 条）。这些调用拿到的是同一时刻的同一份快照，
+ * 没必要各发一条。这里只合并**同时在飞**的调用：先到的那个 promise 被后来者共享，
+ * 结束后即释放，故不引入任何陈旧窗口（登录态变化后下一次调用照样现拉）。
+ */
+let sessionInFlight: Promise<TgSession> | null = null
+
 export function getTgSession(): Promise<TgSession> {
-  return request('/api/tg/session')
+  if (sessionInFlight) return sessionInFlight
+  const p = request<TgSession>('/api/tg/session')
+  sessionInFlight = p
+  // 成功失败都释放：失败尤其不能留，否则一次网络抖动会被后续调用反复复用。
+  const release = () => {
+    if (sessionInFlight === p) sessionInFlight = null
+  }
+  p.then(release, release)
+  return p
 }
 
 /** POST /api/tg/start — 发送验证码到指定手机号（E.164，如 +8613912345678） */

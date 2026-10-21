@@ -1854,8 +1854,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             st.store.library_root().await,
-            dl.join(crate::store::Store::LIBRARY_SUBDIR),
-            "夹具前提：库根必须派生自下载根"
+            crate::store::Store::default_library_root(&dl),
+            "夹具前提：库根必须派生自下载根（住在引擎工作区 `.orighub/` 下）"
         );
     }
 
@@ -1972,9 +1972,9 @@ mod tests {
     async fn house_moves_bytes_into_library_root_with_deterministic_name() {
         let dl = tmp_dir("house_ok");
         let st = state().await;
-        // BUG-323：库根派生自下载根（`<下载根>/library`），`library_dir` 已无写入口。
+        // BUG-323：库根派生自下载根（`<下载根>/.orighub/library`），`library_dir` 已无写入口。
         pin_download_root(&st, &dl).await;
-        let lib = dl.join(crate::store::Store::LIBRARY_SUBDIR);
+        let lib = crate::store::Store::default_library_root(&dl);
 
         let src = dl.join("download").join("src.mp4");
         std::fs::create_dir_all(src.parent().unwrap()).unwrap();
@@ -2008,8 +2008,10 @@ mod tests {
     async fn house_falls_back_to_original_location_when_library_root_unusable() {
         let dl = tmp_dir("house_fallback");
         let st = state().await;
-        // 把派生的库根占成真实文件：create_dir_all(<下载根>/library) 会失败。
-        std::fs::write(dl.join(crate::store::Store::LIBRARY_SUBDIR), b"occupant").unwrap();
+        // 把派生的库根占成真实文件：create_dir_all(<下载根>/.orighub/library) 会失败。
+        let lib_path = crate::store::Store::default_library_root(&dl);
+        std::fs::create_dir_all(lib_path.parent().unwrap()).unwrap();
+        std::fs::write(&lib_path, b"occupant").unwrap();
         pin_download_root(&st, &dl).await;
 
         let src = dl.join("keep-here.mp4");

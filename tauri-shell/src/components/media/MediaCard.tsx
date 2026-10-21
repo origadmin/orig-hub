@@ -12,7 +12,7 @@ import {
   ZoomIn,
 } from 'lucide-react'
 import type { MediaItem } from '../../api/media'
-import { kindLabelKey, mediaItemUrl } from '../../api/media'
+import { kindLabelKey, mediaItemUrl, mediaThumbUrl } from '../../api/media'
 import { useTranslation } from '../../i18n'
 import { resolveDisplayName } from '../../lib/displayName'
 import {
@@ -154,6 +154,8 @@ function MediaCardBase(props: {
   } = props
   const [poster, setPoster] = useState<string | null>(item.poster ?? null)
   const [genFailed, setGenFailed] = useState(false)
+  /** 服务端缩略图不可用（未落盘 / HEIC 等解不动）⇒ 回落原图，只回落一次。 */
+  const [thumbUnavailable, setThumbUnavailable] = useState(false)
   const boxRef = useRef<HTMLDivElement | null>(null)
 
   /**
@@ -262,7 +264,7 @@ function MediaCardBase(props: {
 
     const attempt = () => {
       if (!alive || !visible) return
-      requestImageThumb(key, mediaItemUrl(item.id), 480).then(
+      requestImageThumb(key, mediaThumbUrl(item.id, 480), 480).then(
         (u) => {
           if (!alive) return
           setPoster(u)
@@ -274,7 +276,18 @@ function MediaCardBase(props: {
             if (visible) retryTimer = setTimeout(attempt, 1500)
             return
           }
-          setGenFailed(true)
+          // 服务端缩略图不可用（未落盘 / HEIC 等解不动）⇒ 用**原图**再抽一次，
+          // 别让「没有缩略图」变成「图没了」。
+          requestImageThumb(`${key}-raw`, mediaItemUrl(item.id), 480).then(
+            (u) => {
+              if (!alive) return
+              setPoster(u)
+              onPosterReady?.({ id: item.id, poster: u })
+            },
+            () => {
+              if (alive) setGenFailed(true)
+            },
+          )
         },
       )
     }
@@ -304,7 +317,9 @@ function MediaCardBase(props: {
   }, [item.id, item.kind, poster, genFailed, playable])
 
   const thumbSrc =
-    playable && item.kind === 'photo' ? poster ?? mediaItemUrl(item.id) : poster
+    playable && item.kind === 'photo'
+      ? poster ?? (thumbUnavailable ? mediaItemUrl(item.id) : mediaThumbUrl(item.id, 480))
+      : poster
 
   const recacheable = !playable && Boolean(onRecache)
 
@@ -381,6 +396,10 @@ function MediaCardBase(props: {
                 src={thumbSrc}
                 alt={displayName}
                 loading="lazy"
+                /* 缩略图端点 404（未落盘/解不动）⇒ 回落原图一次，之后不再试缩略图 */
+                onError={() => {
+                  if (item.kind === 'photo' && !poster && !thumbUnavailable) setThumbUnavailable(true)
+                }}
                 /* 图片类 `object-contain`：卡片几何统一（16:9），但图片**不裁切** */
                 className={`h-full w-full ${coverFit(item.kind)}`}
               />

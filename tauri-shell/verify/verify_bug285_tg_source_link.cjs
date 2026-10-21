@@ -13,7 +13,10 @@
  *      ①a 它是**可点链接**（tagName === 'A' 且 href 非空）；
  *      ①b href === `https://t.me/c/<chat>/<msg>`（与夹具 ref 逐字一致）；
  *      ①c 入口与被解释的来源**同一行**（是主版本行的后代节点，非独立区块/弹窗）；
- *      ①d 可见文案 === "View in TG"（i18n 键 media.episode.viewInTg，非回退 key 名）。
+ *      ①d 可见文案 === "Open in browser"（i18n 键 media.episode.openInBrowser，非回退
+ *          key 名）。BUG-364 起由原键 media.episode.viewInTg（"View in TG"）改键改名：
+ *          来源块内应用内跳转与外链文案曾完全相同，用户分不出哪个会离开应用；
+ *          testid 与 href 形状（①a/①b）不变，仅文案值由 BUG-364 supersede。
  *   ② **本地来源行无入口**：聚焦本地集时，同一块内 `[data-testid="episode-source-view-tg"]`
  *      数量为 0（无 TG 消息可跳 ⇒ 不给入口）。
  *   ③ **en-US 无硬编码中文**：整块可见文本 CJK 汉字数 = 0（夹具标题全 ASCII）。
@@ -52,7 +55,9 @@ const TG_CHAT = '100000001'
 const TG_MSG = '4242'
 const TG_REF = `${TG_CHAT}:${TG_MSG}`
 const TG_URL = `https://t.me/c/${TG_CHAT}/${TG_MSG}`
-const EXPECT_LABEL_EN = 'View in TG'
+// BUG-364：外链文案由 "View in TG"（media.episode.viewInTg）改为 "Open in browser"
+// （media.episode.openInBrowser）—— 与相邻的应用内跳转「View in TG」区分开。
+const EXPECT_LABEL_EN = 'Open in browser'
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms))
 
@@ -333,7 +338,7 @@ async function main() {
     check('①c 入口与被解释的来源同一行（主版本行的后代，非独立区块/弹窗）',
       !!tg.link && tg.link.inPrimaryRow === true,
       `inPrimaryRow=${tg.link && tg.link.inPrimaryRow} primaryRowText=${JSON.stringify(tg.primaryRowText)}`)
-    check('①d 文案 === "View in TG"（media.episode.viewInTg，非回退 key 名）',
+    check('①d 文案 === "Open in browser"（media.episode.openInBrowser，非回退 key 名；BUG-364 supersede 文案值）',
       !!tg.link && tg.link.text === EXPECT_LABEL_EN, `text=${JSON.stringify(tg.link && tg.link.text)}`)
     check('①e 入口在新标签打开（target="_blank"）',
       !!tg.link && tg.link.target === '_blank', `target=${JSON.stringify(tg.link && tg.link.target)}`)

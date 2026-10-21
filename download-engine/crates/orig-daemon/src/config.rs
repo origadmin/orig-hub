@@ -628,13 +628,24 @@ pub fn effective_download_root(cfg: &Config) -> PathBuf {
     norm
 }
 
-/// **受管库根** = `<生效下载路径>/library` —— 派生值，**不可独立配置**（BUG-323）。
+/// **受管库根** = `<生效下载路径>/.orighub/library` —— 派生值，**不可独立配置**（BUG-323）。
 ///
-/// 与 orig-tg 侧 `Store::library_root()` 是同一条规则的两端（子目录名必须一致：
-/// 引擎与桌面壳不得各算一套）。库根不设独立入口，是为了让「库根脱离下载路径」
-/// 在结构上不可表达。
+/// 与 orig-tg 侧 `Store::library_root()` 是同一条规则的两端：**必须调同一个派生
+/// 函数** `orig_core::paths::library_root_of`，不得各算一套。库根不设独立入口，
+/// 是为了让「库根脱离下载路径」在结构上不可表达。
+///
+/// 2026-10-21「内部文件不入治理」把库根从 `<根>/library` 挪进引擎工作区
+/// `.orighub/library`（下载根顶层只留用户内容，成品扫描靠 `.` 前缀结构性排除）。
 pub fn library_root(cfg: &Config) -> PathBuf {
-    effective_download_root(cfg).join("library")
+    // BUG-356(续)/BUG-357：`effective_download_root` 已归一化为正向斜杠（如
+    // `D:/OrigDown`），但 Rust 在 Windows 上对带 `/` 的基路径 `join` 会拼出混合
+    // 分隔符（`D:/OrigDown\library`）。下游 `download_dir` / `effective_download_root`
+    // / `manual_download_root` 都已走 `normalize_dir_path` 统一成 `/`，唯独库根漏了
+    // → 前端「库根」行显示成混合斜杠，且与 orig-tg 侧字符串不一致（边界判定按字符串
+    // 比较）。派生后必须再归一化，保证全链路同一字面形态。
+    orig_core::paths::normalize_dir_path(&orig_core::paths::library_root_of(
+        &effective_download_root(cfg),
+    ))
 }
 
 /// Three-layer resolution: request dir → config download_dir → platform default
@@ -699,6 +710,7 @@ pub fn resolve_output_classified(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn cfg_with(classify: ClassifyConfig) -> Config {
         Config { classify, ..Config::default() }
@@ -1036,10 +1048,10 @@ mod tests {
         // ③ D: 配置照原样生效（不得被改道改错）
         let cfg = cfg_with_dirs(Some("D:/OrigDown"), None);
         assert_eq!(effective_download_root(&cfg), PathBuf::from("D:/OrigDown"));
-        // ④ 库根从属于它
+        // ④ 库根从属于它（住在引擎工作区 `.orighub/` 下，见 2026-10-21 裁定）
         assert_eq!(
             library_root(&cfg),
-            PathBuf::from("D:/OrigDown").join("library")
+            orig_core::paths::library_root_of(Path::new("D:/OrigDown"))
         );
     }
 
@@ -1095,25 +1107,28 @@ mod tests {
         };
         let def = default_download_dir();
         let default_lib = if orig_core::paths::is_forbidden_content_drive(&def) {
-            orig_core::paths::content_root().join("library")
+            orig_core::paths::library_root_of(&orig_core::paths::content_root())
         } else {
-            def.join("library")
+            orig_core::paths::library_root_of(&def)
         };
         assert_eq!(
             library_root(&cfg),
             default_lib,
-            "未配置下载目录时库根 = 默认下载根/library（默认根过禁用盘规则）"
+            "未配置下载目录时库根 = 默认下载根/.orighub/library（默认根过禁用盘规则）"
         );
 
         cfg.download_dir = Some(PathBuf::from("D:/Videos"));
         assert_eq!(effective_download_root(&cfg), PathBuf::from("D:/Videos"));
-        assert_eq!(library_root(&cfg), PathBuf::from("D:/Videos").join("library"));
+        assert_eq!(
+            library_root(&cfg),
+            orig_core::paths::library_root_of(Path::new("D:/Videos"))
+        );
 
         // 历史字段不得把库根带出下载路径
         cfg.library_dir = Some(PathBuf::from("C:/somewhere/else"));
         assert_eq!(
             library_root(&cfg),
-            PathBuf::from("D:/Videos").join("library"),
+            orig_core::paths::library_root_of(Path::new("D:/Videos")),
             "历史 library_dir 不得影响库根（BUG-323）"
         );
         // BUG-323 复报 4：手动下载落点同样过禁用盘规则（不得回到 C: 的平台默认）
@@ -1141,7 +1156,10 @@ mod tests {
 
         let cfg = Config::load_from(path.to_str().unwrap());
         assert_eq!(cfg.library_dir, Some(PathBuf::from("D:/My Library")));
-        assert_eq!(library_root(&cfg), PathBuf::from("D:/dl").join("library"));
+        assert_eq!(
+            library_root(&cfg),
+            orig_core::paths::library_root_of(Path::new("D:/dl"))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

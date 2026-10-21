@@ -22,7 +22,9 @@
  *   daemon : env DAEMON_URL / ORIG_DAEMON_API        -> http://127.0.0.1:19786
  *   app    : env APP_URL / ORIG_APP_API              -> http://127.0.0.1:5180
  *   tg     : env TG_URL / ORIG_TG_API (explicit, used by the negative control)
- *            -> `tg_port` read from GET <daemon>/api/config   (source of truth)
+ *            -> orig-tg port read from GET <daemon>/api/config   (source of truth)
+ *               BUG-358 起 config 改插件契约：先读旧键 `tg_port`，再读
+ *               `plugins[]` 里 `id="tg"` 的 `port`；两者皆无才 FATAL。
  *
  * FAILURE POLICY
  * --------------
@@ -121,14 +123,27 @@ async function resolve() {
   } catch (e) {
     fatal(`daemon config endpoint ${configUrl} did not return JSON (${e.message}).`)
   }
-  if (!Number.isInteger(config.tg_port) || config.tg_port <= 0) {
+  // orig-tg 端口解析：旧契约 `tg_port`（BUG-358 前）→ 新契约 `plugins[]` 的
+  // id="tg".port（BUG-358 后，插件化即插即用）。两者皆无才 FATAL —— 绝不猜 19787。
+  let tgPort = null
+  if (Number.isInteger(config.tg_port) && config.tg_port > 0) {
+    tgPort = config.tg_port
+  } else if (Array.isArray(config.plugins)) {
+    const tgPlugin = config.plugins.find((p) => p && p.id === 'tg')
+    if (tgPlugin && Number.isInteger(tgPlugin.port) && tgPlugin.port > 0) {
+      tgPort = tgPlugin.port
+    }
+  }
+  if (tgPort === null) {
     fatal(
-      `daemon config ${configUrl} has no usable numeric "tg_port" (got ${JSON.stringify(config.tg_port)}).`,
+      `daemon config ${configUrl} has no usable orig-tg port ` +
+        `(neither numeric "tg_port" nor plugins[] entry id="tg" with numeric port). ` +
+        `Refusing to guess the orig-tg port.`,
     )
   }
 
   const overrideTg = stripSlash(process.env.TG_URL || process.env.ORIG_TG_API || '')
-  const tg = overrideTg || `http://127.0.0.1:${config.tg_port}`
+  const tg = overrideTg || `http://127.0.0.1:${tgPort}`
   const app = stripSlash(process.env.APP_URL || process.env.ORIG_APP_API || DEFAULT_APP)
 
   /**
@@ -172,7 +187,7 @@ async function resolve() {
       fatal(
         `orig-tg endpoint ${tg} is not reachable (${e.message}). ` +
           (overrideTg ? 'TG_URL override is wrong. ' : '') +
-          `Resolved from ${configUrl} (tg_port=${config.tg_port}). ` +
+          `Resolved from ${configUrl} (tg port=${tgPort}). ` +
           `Refusing to run a probe that would report 0 requests.`,
       )
     }
@@ -180,12 +195,11 @@ async function resolve() {
       fatal(
         `orig-tg endpoint ${tg}/health did not answer as orig-tg (${why}). ` +
           (overrideTg ? 'TG_URL override is wrong. ' : '') +
-          `Resolved from ${configUrl} (tg_port=${config.tg_port}).`,
+          `Resolved from ${configUrl} (tg port=${tgPort}).`,
       )
     }
   }
 
-  const tgPort = config.tg_port
   let tgOrigin
   try {
     tgOrigin = new URL(tg)

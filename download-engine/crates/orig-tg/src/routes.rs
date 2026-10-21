@@ -150,6 +150,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         )
         .route("/api/media/items/:id/tags", axum::routing::put(set_media_item_tags))
         .route("/api/media/items/:id/raw", get(media_item_raw))
+        // 网格/封面用的**真缩略图**（`?w=`）：原图当缩略图是媒体库卡顿的根因。
+        .route("/api/media/items/:id/thumb", get(media_item_thumb))
         // BUG-208：浏览器无硬件 HEVC 时的兼容流（按需实时转码 H.264 + 代理缓存）。
         .route("/api/media/items/:id/stream", get(media_item_stream))
         .route("/api/media/items/by-ref", get(media_item_by_ref))
@@ -2225,9 +2227,22 @@ async fn register_media_item_t0(
             let desc = desc.or_else(|| group_desc.map(str::to_string));
             // BUG-049 照片条目的可读兜底标题（旧 import_photo_item 同款）；
             // 非照片维持空串（BUG-154：不拿内部文件名伪装标题）。
+            //
+            // BUG-362：兜底标题必须带**频道名**。旧形态 `TG 图片 #{msg_id}` 只说了
+            // 「这是 TG 的一张图」—— 媒体库列表里它和 `NanaZip_xxx.zip`、
+            // `未命名视频 #1574 SE4`、真 caption 并排成五种互不相干的题命名方式，
+            // 用户原话「样式混乱：NanaZip 在第一行，TG弹窗标题在第二行」：
+            // 他要看的是**这条内容来自哪个 TG 会话**，而旧标题把它抹成了编号。
+            // 取不到频道名时才退回 `TG {chat_id}`（与剧集命名同一把尺子，见
+            // `channel_title` 的调用处），绝不退回空串（空标题不可辨识）。
             let title = match title {
                 Some(t) => t,
-                None if photo_rule => format!("TG 图片 #{msg_id}"),
+                None if photo_rule => {
+                    let base = channel_title(st, chat_id)
+                        .await
+                        .unwrap_or_else(|| format!("TG {chat_id}"));
+                    format!("{base} · 图片 #{msg_id}")
+                }
                 None => String::new(),
             };
             match st
@@ -2305,8 +2320,15 @@ async fn strengthen_registered_item(
         .unwrap_or((None, None));
     let patch_title = match title {
         Some(t) if existing_blank => Some(t),
-        // 没有 caption 的照片：BUG-049 兜底标题（`TG 图片 #{msg_id}`）同样只在标题仍空时补。
-        None if existing_blank && photo_rule => Some(format!("TG 图片 #{msg_id}")),
+        // 没有 caption 的照片：BUG-049 兜底标题同样只在标题仍空时补。
+        // BUG-362：与 `register_media_item_t0` 的新登记同一把尺子 —— 兜底标题带
+        // **频道名**（`{频道} · 图片 #{msg_id}`），不再是无从辨认的 `TG 图片 #{msg_id}`。
+        None if existing_blank && photo_rule => {
+            let base = channel_title(st, msg.channel_id)
+                .await
+                .unwrap_or_else(|| format!("TG {}", msg.channel_id));
+            Some(format!("{base} · 图片 #{msg_id}"))
+        }
         _ => None,
     };
     // kind 只单向升级：`file` 是从「没有元数据」推出来的占位，被更有信息量的判定替换
@@ -4561,6 +4583,108 @@ fn resolve_raw_locator(
 ///   [`resolve_raw_locator`] 返回定位，不再直接调用传输域。
 ///
 /// 原图取不到时**如实报错**并留痕，绝不静默给一张缩略图充数。
+#[derive(Deserialize)]
+struct ThumbQuery {
+    /// 目标宽度（像素）；高度按比例。缺省 320，夹在 48..=1024。
+    w: Option<u32>,
+}
+
+/// 缩略图响应头（与 `/raw` 的差异：这里允许浏览器缓存一天，因为它是**派生字节**，
+/// 原图不变则缩略图不变）。
+fn thumb_response(bytes: Vec<u8>) -> Response {
+    let mut res = Response::new(axum::body::Body::from(bytes));
+    res.headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"));
+    res.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=86400"),
+    );
+    res
+}
+
+/// GET /api/media/items/:id/thumb?w=320 —— 网格/封面用的**真缩略图**。
+///
+/// 为什么必须有这个端点：媒体库照片网格此前直接拿 `/raw`（**原图**，MB 级）当缩略图。
+/// 一屏 50 格就是几百 MB 挤在同一个源的 6 条连接上，滚动态整页发卡 —— 这是「请求爆炸」
+/// 里比 TG 缩略图更重的一档。本端点把单格字节压到 20–40KB，并**落盘缓存**，
+/// 第二次浏览近乎零成本。
+///
+/// 语义边界（都是刻意为之，别顺手改）：
+/// - **只服务 `kind == "photo"`**：视频封面由前端抽帧，不走这里。
+/// - 未落盘的照片**不在这里回源**（那会把网格变成远端取图队列）⇒ 404，前端回落 `/raw`。
+/// - 解不动（HEIC 等）⇒ 404 回落，**不让「没有缩略图」变成「图没了」**。
+/// - `/raw` 与 `/stream` 的语义不受影响：它们仍投递原图/原流（BUG-117）。
+async fn media_item_thumb(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    Query(q): Query<ThumbQuery>,
+) -> Result<Response, ApiError> {
+    let w = q.w.unwrap_or(320).clamp(48, 1024);
+    let item = st
+        .store
+        .get_media_item(id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "media item not found"))?;
+    if item.kind != "photo" {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "thumbnail endpoint only applies to photos",
+        ));
+    }
+    let RawLocator::LocalPath(p) = resolve_raw_locator(&item) else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "photo has no local bytes (grid falls back to /raw)",
+        ));
+    };
+    let lib_root = st.store.library_root().await;
+    let download_root = st.store.download_root().await;
+    let path = crate::cache::resolve_managed_path(&download_root, &lib_root, &p).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::FORBIDDEN,
+            "media file path is outside the managed download root (BUG-323)",
+        )
+    })?;
+
+    // 落盘缓存：同一 (条目, 宽度) 只解码一次。目录与 TG 缩略图缓存同级。
+    let cache_path = st
+        .config
+        .db_path
+        .parent()
+        .map(|d| d.join("thumb-cache").join(format!("media_{id}_{w}.jpg")));
+    if let Some(cp) = &cache_path {
+        if let Ok(bytes) = std::fs::read(cp) {
+            return Ok(thumb_response(bytes));
+        }
+    }
+
+    // 解码 + 缩放放阻塞线程池：单张 4MP JPEG 解码约几十毫秒，不能占着 async runtime
+    // 影响 TG 控制面（`/api/tg/*` 全在同一个 runtime 上）。
+    let src = path.to_path_buf();
+    let encoded = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let data = std::fs::read(&src).map_err(|e| format!("read failed: {e}"))?;
+        let img = image::load_from_memory(&data).map_err(|e| format!("decode failed: {e}"))?;
+        let thumb = img.thumbnail(w, u32::MAX);
+        let mut out = Vec::new();
+        thumb
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Jpeg)
+            .map_err(|e| format!("encode failed: {e}"))?;
+        Ok(out)
+    })
+    .await
+    .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &format!("thumb task failed: {e}")))?
+    .map_err(|e| ApiError::new(StatusCode::NOT_FOUND, &e))?;
+
+    if let Some(cp) = &cache_path {
+        if let Some(dir) = cp.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(cp, &encoded);
+    }
+    Ok(thumb_response(encoded))
+}
+
 async fn media_item_raw(
     State(st): State<Arc<AppState>>,
     Path(id): Path<i64>,
@@ -10685,19 +10809,109 @@ mod tests {
         assert_eq!(video.title, "先登记的一集 标题行", "标题取 caption 首行");
         assert_eq!(video.description.as_deref(), Some("说明行"));
 
-        wait_title(&st, photo_id, "TG 图片 #12").await;
+        // BUG-362：无 caption 的照片兜底标题 = `{频道名} · 图片 #{msg_id}`。
+        // 夹具没有为 424242 建监控频道 ⇒ `channel_title` 取不到 ⇒ 退回 `TG {chat_id}`
+        // （与剧集命名同一把尺子）。旧口径 `TG 图片 #12` 已废：它在媒体库列表里
+        // 与 `NanaZip_xxx.zip` / 真 caption 并排，五种题命名方式互相不可辨。
+        wait_title(&st, photo_id, "TG 424242 · 图片 #12").await;
         let photo = st.store.get_media_item(photo_id).await.unwrap().unwrap();
         assert_eq!(photo.file_path, None);
         assert_eq!(photo.kind, "photo");
         assert_eq!(
-            photo.title, "TG 图片 #12",
-            "photo 兜底标题口径必须与 worker 一致（BUG-049）"
+            photo.title, "TG 424242 · 图片 #12",
+            "photo 兜底标题口径必须与 worker 一致（BUG-049 / BUG-362）"
         );
 
         // 剧集槽位不在入队时刻登记（没有剧集上下文），worker 处理时才建。
         assert_eq!(
             video.series_id, None,
             "入队只登记事实，槽位归 worker（本用例 worker 未启动）"
+        );
+    }
+
+    /// BUG-362：无 caption 的照片兜底标题必须带**频道名**。
+    ///
+    /// 用户 2026-10-21 原话：「样式混乱 "NanaZip_7.0.1843.0_Binaries.zip" 在第一行.
+    /// TG弹窗标题在第二行」—— 媒体库列表里他要看的是**这条内容来自哪个 TG 会话**，
+    /// 而旧兜底 `TG 图片 #{msg_id}` 只说了「这是 TG 的一张图」，会话名被抹成编号。
+    ///
+    /// 判据（反向证伪）：把频道名换成另一个值，标题必须跟着变 —— 证明频道名真的
+    /// 进了标题，而不是碰巧等于某个常量。
+    #[tokio::test]
+    async fn photo_fallback_title_names_the_channel_bug362() {
+        let dir = scratch_dir("bug362_photo_title_channel");
+        let st = cache_fixture_state(
+            &dir,
+            vec![],
+            vec![fixture_msg(31, "photo", "image/jpeg", None, None)],
+        )
+        .await;
+        assert!(st.claim_cache_worker(), "占住单飞门禁：只测登记，不跑 worker");
+
+        st.store
+            .add_channel(CACHE_FIXTURE_CHAT, "每日沙雕墙", Some("woshadiao"))
+            .await
+            .expect("夹具频道必须可建");
+
+        let (status, _task) = enqueue_call(
+            st.clone(),
+            EnqueueCacheReq {
+                chat_id: CACHE_FIXTURE_CHAT,
+                message_ids: vec![31],
+                group_id: None,
+                dir: None,
+            },
+        )
+        .await
+        .expect("入队不得因登记失败而报错");
+        assert_eq!(status, StatusCode::OK);
+
+        let ref_key = format!("{CACHE_FIXTURE_CHAT}:31");
+        let id = wait_item_id(&st, &ref_key).await;
+        let item = st.store.get_media_item(id).await.unwrap().unwrap();
+        assert_eq!(
+            item.title, "每日沙雕墙 · 图片 #31",
+            "兜底标题必须带频道名（BUG-362）：取不到才退 TG {{chat_id}}"
+        );
+        assert_ne!(
+            item.title, "TG 424242 · 图片 #31",
+            "反向证伪：频道名在场时不得退化成 chat_id"
+        );
+
+        // 频道名变化 ⇒ 标题里的频道名必须跟着变（证明它真的来自频道表）。
+        st.store
+            .add_channel(CACHE_FIXTURE_CHAT, "另一个频道", None)
+            .await
+            .expect("改标题必须幂等");
+        // 已坐实的标题不被改写（保守规则：只补空标题），故这里只证**新登记**走新名。
+        let dir2 = scratch_dir("bug362_photo_title_channel_renamed");
+        let st2 = cache_fixture_state(
+            &dir2,
+            vec![],
+            vec![fixture_msg(41, "photo", "image/jpeg", None, None)],
+        )
+        .await;
+        st2.store
+            .add_channel(CACHE_FIXTURE_CHAT, "另一个频道", None)
+            .await
+            .expect("夹具频道必须可建");
+        let (status2, _t2) = enqueue_call(
+            st2.clone(),
+            EnqueueCacheReq {
+                chat_id: CACHE_FIXTURE_CHAT,
+                message_ids: vec![41],
+                group_id: None,
+                dir: None,
+            },
+        )
+        .await
+        .expect("入队不得因登记失败而报错");
+        assert_eq!(status2, StatusCode::OK);
+        let id2 = wait_item_id(&st2, &format!("{CACHE_FIXTURE_CHAT}:41")).await;
+        let item2 = st2.store.get_media_item(id2).await.unwrap().unwrap();
+        assert_eq!(
+            item2.title, "另一个频道 · 图片 #41",
+            "频道名必须真的进标题（换名即换题）"
         );
     }
 

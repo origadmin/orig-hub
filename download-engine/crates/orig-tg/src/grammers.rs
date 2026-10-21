@@ -76,6 +76,13 @@ const MEDIA_META_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 /// 缩略图字节缓存容量 / TTL（缩略图不可变，TTL 可以更长）。
 const THUMB_CACHE_CAP: usize = 512;
 const THUMB_TTL: std::time::Duration = std::time::Duration::from_secs(1800);
+/// 同时向 Telegram 发起取图的缩略图上限（**防爆闸**，不是节流阀）。
+///
+/// 取值必须 **≥ 浏览器同源连接上限（6）**，否则闸门自己变成瓶颈：一个频道视图
+/// 22 张冷图，闸门 4 ⇒ 要 6 波才出完（实测单张 5–16s，末张 60s 后才出现，用户看到
+/// 的就是「图都显示不出来」）。真正的连接池隔离由**独立字节源**解决（按用途分源），
+/// 不靠压低并发。这里只挡「多窗口 × 多视图」把 MTProto 打爆的病态并发。
+const THUMB_MAX_CONCURRENCY: usize = 8;
 
 /// 缩略图整段拉取的字节上限（正常缩略图远小于此，超出则截断保护）。
 static THUMB_MAX_BYTES: usize = 512 * 1024;
@@ -196,6 +203,22 @@ pub struct GrammersClient {
     media_meta: crate::lru::TtlLru<(i64, i64), MediaMeta>,
     /// 缩略图字节缓存（BUG-028）：缩略图不可变，字节级缓存让 feed 重渲染零 TG 流量。
     thumb_cache: crate::lru::TtlLru<(i64, i64), Arc<Vec<u8>>>,
+    /// 缩略图**全局并发闸门**（卡顿根治）。
+    ///
+    /// 一个频道视图一次会发 20+ 张缩略图（实测 22 张/视图）。无上限时它们同时打
+    /// MTProto，把浏览器**同源 6 连接**占满 ⇒ 同源其它请求全排队：实测
+    /// `/api/tg/cache/tasks` 中位 2.0s、`/health` 9.2s、`/api/tg/session` 9.3s，
+    /// 用户体感就是「界面卡死」。闸门把真正在飞的取图压到 `THUMB_MAX_CONCURRENCY`。
+    thumb_gate: tokio::sync::Semaphore,
+    /// **同 key 合并**表：同一 `(chat, message)` 的并发请求只发一次 RPC，其余等结果。
+    /// 没有它时同一张图被列表重渲染 + 详情预览各要一次，白跑两遍 5–19s。
+    thumb_locks: tokio::sync::Mutex<HashMap<(i64, i64), Arc<tokio::sync::Mutex<()>>>>,
+    /// 缩略图**落盘缓存**目录（`None` = 不落盘）。
+    ///
+    /// 内存 LRU 只有 512 条且进程重启即清空 ⇒ 每次重启后首屏重新全冷（单张 6–19s）。
+    /// 落盘后重启首屏直接命中，毫秒级返回。目录跟随 `db_path`（应用数据目录，与
+    /// 会话/监控库同级），**不写用户媒体目录、不写 C 盘内容根**。
+    thumb_disk: Option<std::path::PathBuf>,
 }
 
 impl GrammersClient {
@@ -328,6 +351,19 @@ impl GrammersClient {
             peer_cache: tokio::sync::Mutex::new(HashMap::new()),
             media_meta: crate::lru::TtlLru::new(MEDIA_META_CAP, MEDIA_META_TTL),
             thumb_cache: crate::lru::TtlLru::new(THUMB_CACHE_CAP, THUMB_TTL),
+            thumb_gate: tokio::sync::Semaphore::new(THUMB_MAX_CONCURRENCY),
+            thumb_locks: tokio::sync::Mutex::new(HashMap::new()),
+            thumb_disk: {
+                // 与应用数据目录同级（`<db 所在目录>/thumb-cache`）；建目录失败就退化为
+                // 纯内存缓存，不让缓存能力影响取图本身。
+                let dir = cfg
+                    .db_path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| p.join("thumb-cache"))
+                    .filter(|p| std::fs::create_dir_all(p).is_ok());
+                dir
+            },
         })
     }
 
@@ -934,25 +970,61 @@ impl Client for GrammersClient {
         Ok(out)
     }
 
-    /// 缩略图：优先命中字节缓存（BUG-028），未命中才走 `thumb_fetch` 实拉。
+    /// 缩略图：三级缓存 + 同 key 合并 + 并发闸门。
+    ///
+    /// 顺序：内存 LRU → 落盘 → 合并取图（闸门内）。
+    /// 每一级都为了同一件事：**别让列表渲染变成几十个 5–19s 的并发 RPC**，
+    /// 那会把同源连接池占满，连 `/health` 都要排 9s（用户体感＝界面卡死）。
     async fn thumb(
         &self,
         chat_id: i64,
         message_id: i64,
     ) -> Result<Option<Thumbnail>, ClientError> {
-        // 缩略图字节缓存（BUG-028）：feed 每次渲染/翻页都会请求同一批缩略图，
-        // 字节不可变 → 命中即零 RPC、零 TG 流量。
         let key = (chat_id, message_id);
+        // ① 内存（BUG-028）：feed 每次渲染/翻页都会请求同一批缩略图，字节不可变 → 命中零 RPC。
         if let Some(bytes) = self.thumb_cache.get(&key) {
             return Ok(Some(Thumbnail {
                 content_type: "image/jpeg".into(),
                 bytes: (*bytes).clone(),
             }));
         }
-
-        let fetched = self.thumb_fetch(chat_id, message_id).await?;
+        // ② 落盘：重启后首屏不再全冷。
+        if let Some(bytes) = self.thumb_disk_read(key) {
+            let arc = Arc::new(bytes);
+            self.thumb_cache.insert(key, arc.clone());
+            return Ok(Some(Thumbnail {
+                content_type: "image/jpeg".into(),
+                bytes: (*arc).clone(),
+            }));
+        }
+        // ③ 同 key 合并：同一张图的并发请求只发一次 RPC，后来者等第一个写完缓存。
+        let key_lock = {
+            let mut m = self.thumb_locks.lock().await;
+            m.entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let guard = key_lock.lock().await;
+        // 等锁期间别人可能已经取回来了：二次查缓存，避免白跑一趟。
+        if let Some(bytes) = self.thumb_cache.get(&key) {
+            drop(guard);
+            self.thumb_unlock(key, &key_lock).await;
+            return Ok(Some(Thumbnail {
+                content_type: "image/jpeg".into(),
+                bytes: (*bytes).clone(),
+            }));
+        }
+        // ④ 并发闸门：真正打 Telegram 的并发数封顶。
+        let _permit = self.thumb_gate.acquire().await.ok();
+        let fetched = self.thumb_fetch(chat_id, message_id).await;
+        drop(_permit);
+        drop(guard);
+        self.thumb_unlock(key, &key_lock).await;
+        let fetched = fetched?;
         if let Some(t) = &fetched {
-            self.thumb_cache.insert(key, Arc::new(t.bytes.clone()));
+            let arc = Arc::new(t.bytes.clone());
+            self.thumb_cache.insert(key, arc);
+            self.thumb_disk_write(key, &t.bytes);
         }
         Ok(fetched)
     }
@@ -1262,6 +1334,35 @@ impl Client for GrammersClient {
 
 /// 通过订阅枚举建立「频道 id -> 分组标题」映射（取首个命中；失败降级为空映射）。
 impl GrammersClient {
+    /// 释放同 key 合并表条目（只剩表内那一个引用时才移除，避免无界增长）。
+    async fn thumb_unlock(&self, key: (i64, i64), held: &Arc<tokio::sync::Mutex<()>>) {
+        let mut m = self.thumb_locks.lock().await;
+        if let Some(cur) = m.get(&key) {
+            if Arc::ptr_eq(cur, held) && Arc::strong_count(cur) <= 2 {
+                m.remove(&key);
+            }
+        }
+    }
+
+    /// 落盘缓存读（小文件、阻塞 IO 可接受；读失败等同未命中）。
+    fn thumb_disk_read(&self, key: (i64, i64)) -> Option<Vec<u8>> {
+        let path = self.thumb_disk_path(key)?;
+        std::fs::read(path).ok()
+    }
+
+    /// 落盘缓存写（失败只降级为「下次重新取」，不影响本次返回）。
+    fn thumb_disk_write(&self, key: (i64, i64), bytes: &[u8]) {
+        if let Some(path) = self.thumb_disk_path(key) {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
+
+    fn thumb_disk_path(&self, (chat_id, message_id): (i64, i64)) -> Option<std::path::PathBuf> {
+        self.thumb_disk
+            .as_ref()
+            .map(|d| d.join(format!("{chat_id}_{message_id}.jpg")))
+    }
+
     /// 缩略图实际拉取（`thumb()` 的缓存未命中路径）：解析消息 → 选最小可用尺寸 →
     /// 64KiB 分块拉取。放在 inherent impl，避免被 async_trait 视作 trait 成员。
     async fn thumb_fetch(

@@ -6,31 +6,70 @@ import type {
   DownloadStatus,
   LanguageValue,
   TgAccount,
-  TgLinkHealth,
   TgLinkInfo,
   TgServiceState,
   TgSession,
 } from '../types'
 import {
   DAEMON_PORT,
+  TG_PLUGIN_ID,
   addDownload as apiAddDownload,
   downloadAction as apiDownloadAction,
+  findPlugin,
   getConfig,
   listDownloads,
   listInterfaces,
   removeDownload as apiRemoveDownload,
+  restartPlugin,
   retryDownload as apiRetryDownload,
-  restartTgService as apiRestartTg,
-  saveTgConfig,
   setDaemonPort,
+  setPluginEnabled,
   subscribeEvents,
 } from '../api/daemon'
 import { getTgSession, setTgPort } from '../api/tg'
+import type { DaemonPlugin } from '../api/daemon'
 import { logTgReason } from '../lib/tgReason'
 import type { AddDownloadRequest, ViewerItem } from '../types'
 
 const SETTINGS_KEY = 'orig-hub:settings'
 const ACCOUNTS_KEY = 'orig-hub:accounts'
+
+/**
+ * `/api/config` 的 `plugins[]` → TG 服务态（**唯一**适配点，BUG-358）。
+ *
+ * 契约里不再有 `tg_enabled` / `tg_running` / `tg_port` / `tg_last_error` / `tg_link`
+ * 这些把插件名写死的键（用户原话：「"tg_enabled"这些都是什么？毫无共通性…我把TG
+ * 改成BB，这个还能用吗？」）。daemon 只下发 `plugins: [{id, label, enabled,
+ * running, port, lastError, health}]`，前端按 `id` 取。
+ *
+ * 为什么把映射收在这一处：`TgServiceState` / `TgLinkHealth` 是既有界面与选择器的
+ * 通用形状（snake_case），改它们要动几十处 UI。**只换适配层**，上层零改动 ——
+ * 这也正是「插件化」要的可替换性：换插件只改这里的一行 id。
+ */
+function tgServiceFromPlugins(
+  cfg: { plugins?: DaemonPlugin[] } | null | undefined,
+): TgServiceState | null {
+  const p = findPlugin(cfg, TG_PLUGIN_ID)
+  if (!p) return null
+  const h = p.health
+  return {
+    known: true,
+    enabled: p.enabled,
+    running: p.running,
+    port: p.port ?? null,
+    lastError: p.lastError ?? null,
+    link: h
+      ? {
+          link_down: h.linkDown,
+          down_streak: h.downStreak,
+          confirms_required: h.confirmsRequired,
+          restarts: h.restarts,
+          last_restart_at: h.lastRestartAt,
+          reason: h.reason,
+        }
+      : null,
+  }
+}
 
 /**
  * 文件域库级动作注册表（BUG-317 / 任务 #9）。
@@ -324,6 +363,18 @@ interface DownloadState {
   setToast: (msg: string) => void
 }
 
+/**
+ * `/api/events` 订阅句柄（**单例**）。
+ *
+ * `init()` 由 `MainLayout` 的 effect 调用，而 dev 下 `main.tsx` 开着 `React.StrictMode`
+ * （effect 双挂），HMR 也会重跑 —— 旧写法把 `subscribeEvents()` 的返回值**丢弃**，
+ * 于是每多一次 init 就多一条 SSE 长连接，且**永不关闭**。每条都占着 daemon 源的一个
+ * 连接名额（浏览器同源 6 条），断线还各自退避重连 ⇒ 表现为「/api/events 一直在请求」。
+ *
+ * 句柄存在即视为已订阅：重复调用 `init()` 不再新建连接。
+ */
+let sseUnsub: (() => void) | null = null
+
 export const useStore = create<DownloadState>((set, get) => ({
   downloads: [],
   daemon: null,
@@ -351,8 +402,9 @@ export const useStore = create<DownloadState>((set, get) => ({
   init: async () => {
     // 0. system 主题实时跟随系统配色
     watchSystemTheme(() => get().settings.theme)
-    // 1. 订阅 SSE 实时进度
-    subscribeEvents(
+    // 1. 订阅 SSE 实时进度（**只订阅一次**：句柄已存在就复用，见 `sseUnsub` 注释）
+    if (!sseUnsub) {
+      sseUnsub = subscribeEvents(
       (evt) => {
         const list = Array.isArray(evt.data) ? evt.data : [evt.data]
         if (list.length === 0) return
@@ -404,7 +456,8 @@ export const useStore = create<DownloadState>((set, get) => ({
         void get().refreshTgState()
       },
       () => set({ connected: false }),
-    )
+      )
+    }
     // 2. 拉取当前列表
     await get().refresh()
     // 3. 拉取分类清单 + TG 插件开关状态（供侧边栏「全部文件」下钻与 TG 模块显隐）
@@ -414,16 +467,12 @@ export const useStore = create<DownloadState>((set, get) => ({
       // 端口以 daemon 为准（可能顺延）：拿到即刻校准两个 base，之后的请求才不会
       // 打到一个不存在（或属于别人）的端口上（BUG-178）。
       if (typeof cfg.port === 'number') setDaemonPort(cfg.port)
-      if (typeof cfg.tg_port === 'number') setTgPort(cfg.tg_port)
+      // BUG-358：插件态只认 `plugins[]`（按 id 取），契约里已经没有 `tg_*` 了。
+      const svc = tgServiceFromPlugins(cfg)
+      if (svc?.port != null) setTgPort(svc.port)
       set({
         categories: cats,
-        tgService: {
-          known: true,
-          enabled: cfg.tg_enabled,
-          running: cfg.tg_running,
-          port: cfg.tg_port ?? null,
-          lastError: cfg.tg_last_error ?? null,
-        },
+        ...(svc ? { tgService: svc } : {}),
       })
     } catch (e) {
       // 配置不可达：分类暂不列出（菜单退化）。失败**分类留痕**，不静默吞掉（BUG-097）；
@@ -610,20 +659,13 @@ export const useStore = create<DownloadState>((set, get) => ({
   tgCacheManagerOpen: false,
   setTgCacheManagerOpen: (v) => set({ tgCacheManagerOpen: v }),
 
-  /** 启停 TG 插件：写 daemon（拉起/终止 orig-tg 子服务），成功同步服务层状态 */
+  /** 启停插件：写 daemon（拉起/终止它托管的子服务），成功同步服务层状态（BUG-358 走 id） */
   setTgEnabled: async (enabled) => {
     try {
-      const res = await saveTgConfig({ enabled })
-      if (typeof res.tg_port === 'number') setTgPort(res.tg_port)
-      set({
-        tgService: {
-          known: true,
-          enabled: res.tg_enabled,
-          running: res.tg_running,
-          port: res.tg_port ?? get().tgService.port,
-          lastError: res.tg_last_error ?? null,
-        },
-      })
+      const res = await setPluginEnabled(TG_PLUGIN_ID, { enabled })
+      const svc = tgServiceFromPlugins({ plugins: res.plugins })
+      if (svc?.port != null) setTgPort(svc.port)
+      if (svc) set({ tgService: svc })
       return true
     } catch (e) {
       set({ toast: e instanceof Error ? e.message : String(e) })
@@ -631,21 +673,14 @@ export const useStore = create<DownloadState>((set, get) => ({
     }
   },
 
-  /** 请 daemon 重启它托管的 orig-tg（前端不碰进程；BUG-178） */
+  /** 请 daemon 重启它托管的子服务（前端不碰进程；BUG-178 / BUG-358 走 id） */
   restartTg: async () => {
     try {
-      const res = await apiRestartTg()
-      if (typeof res.tg_port === 'number') setTgPort(res.tg_port)
-      set({
-        tgService: {
-          known: true,
-          enabled: res.tg_enabled,
-          running: res.tg_running,
-          port: res.tg_port ?? get().tgService.port,
-          lastError: res.tg_last_error ?? null,
-        },
-      })
-      return res.tg_running
+      const res = await restartPlugin(TG_PLUGIN_ID)
+      const svc = tgServiceFromPlugins({ plugins: res.plugins })
+      if (svc?.port != null) setTgPort(svc.port)
+      if (svc) set({ tgService: svc })
+      return svc?.running ?? false
     } catch (e) {
       // 原文只进日志：Rust/HTTP 报文不进界面
       logTgReason(e instanceof Error ? e.message : String(e), 'tg-restart')
@@ -690,16 +725,12 @@ export const useStore = create<DownloadState>((set, get) => ({
     }
     // 端口真源：daemon 可能顺延，两个 base 都必须跟着它走。
     if (typeof cfg.port === 'number') setDaemonPort(cfg.port)
-    if (typeof cfg.tg_port === 'number') setTgPort(cfg.tg_port)
-    const svc: TgServiceState = {
-      known: true,
-      enabled: cfg.tg_enabled,
-      running: cfg.tg_running,
-      port: cfg.tg_port ?? null,
-      lastError: cfg.tg_last_error ?? null,
-      // BUG-351：链路健康 + 自愈历史（daemon 唯一真源）。
-      link: (cfg.tg_link ?? null) as TgLinkHealth | null,
-    }
+    // BUG-358：插件态从 `plugins[]` 按 id 取（契约里没有 `tg_*`）；
+    // 取不到 = daemon 还没登记这个插件 ⇒ 保持上次值，不臆断成「被用户关了」。
+    const mapped = tgServiceFromPlugins(cfg)
+    if (!mapped) return
+    if (mapped.port != null) setTgPort(mapped.port)
+    const svc: TgServiceState = mapped
     if (tgServiceKey(get().tgService) !== tgServiceKey(svc)) set({ tgService: svc })
 
     // 服务不在 → 链路无从谈起。这里**不**再去连 orig-tg：连也只是失败，

@@ -117,6 +117,27 @@ pub fn content_root() -> PathBuf {
     PathBuf::from(CONTENT_ROOT)
 }
 
+/// 引擎自有物目录名（`<下载根>/.orighub`）—— **两端唯一真源**。
+///
+/// 2026-10-21 用户裁定「内部文件不入治理」：引擎自己写的东西（库根、转码代理、
+/// 备份、缩略图缓存）全部收进这个隐藏目录，下载根顶层只留用户内容。这样「成品
+/// 扫描」只需排除 `.` 开头的条目就是**结构性**正确，不再依赖名字白名单 ——
+/// 白名单注定漏（实测顶层一个 `_backup_store_before_move.db` 就漏进了文件管理）。
+pub const ENGINE_DIR_NAME: &str = ".orighub";
+
+/// 库根在引擎工作区下的子目录名。
+pub const LIBRARY_DIR_NAME: &str = "library";
+
+/// 受管库根 = `<下载根>/.orighub/library`。
+///
+/// **两端必须调同一个函数**：orig-tg 侧 `Store::library_root()` 与 orig-daemon 侧
+/// `config::library_root()` 是同一条规则的两端（BUG-323）。2026-10-21 把库根从
+/// `<下载根>/library` 挪进引擎工作区时，若只改一端，前端显示的库根就会和引擎实际
+/// 写盘位置分家 —— 边界判定按字符串前缀比较，会把引擎自己写的文件判成越界。
+pub fn library_root_of(download_root: &Path) -> PathBuf {
+    download_root.join(ENGINE_DIR_NAME).join(LIBRARY_DIR_NAME)
+}
+
 /// Drives that must **never** hold content bytes (ruling 2026-10-19).
 ///
 /// The OS drive is the one that "exploded"; it holds the OS, page file and the

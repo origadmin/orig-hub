@@ -13,8 +13,9 @@
  *   2. 不离开应用：点击不产生框架导航 / 新标签，URL 不变、页面可见；
  *      t.me 外链降为**次要出口**（独立 <a target="_blank">，BUG-285 回归保持）。
  *   3. 条目级与剧集级都可跳：MediaCard 入口（`item-view-tg`）+
- *      SeriesDetail 来源块（`episode-source-jump-tg`）与列表行
- *      （`episode-row-view-tg`）—— 两类都定位到同一频道同一消息。
+ *      SeriesDetail 来源块（`episode-source-jump-tg`）—— 两类都定位到同一频道同一消息。
+ *      （BUG-364：原列表行第三入口 `episode-row-view-tg` 撤销 —— 与来源块跳转同坐标、
+ *      同文案、10px 违反可读性门槛；应用内跳转收敛为「每颗来源一颗」。）
  *   4. 本地 / 无坐标不渲染入口：本地条目卡片、本地剧集来源块与列表行 0 入口。
  *   5. 错误坐标必 FAIL：伪 messageId / 伪 chatId 注入 ⇒ 无高亮、无静默成功，
  *      焦点被一次性消费、失败有如实反馈（global-toast）。
@@ -503,8 +504,8 @@ async function main() {
   const L = {
     viewInTgZh: zh['media.viewInTg'],
     viewInTgEn: en['media.viewInTg'],
-    epViewInTgZh: zh['media.episode.viewInTg'],
-    epViewInTgEn: en['media.episode.viewInTg'],
+    epViewInTgZh: zh['media.episode.openInBrowser'],
+    epViewInTgEn: en['media.episode.openInBrowser'],
     locateFailedZh: zh['tg.locateFailed'],
     locateNoChannelZh: zh['tg.locateNoChannel'],
     navAllZh: zh['tg.navAll'],
@@ -641,7 +642,7 @@ async function main() {
   )
 
   // i18n 键（两个 locale 都要有，新文案不许硬编码）
-  const i18nKeys = ['media.viewInTg', 'media.episode.viewInTg', 'tg.locateFailed', 'tg.locateNoChannel']
+  const i18nKeys = ['media.viewInTg', 'media.episode.openInBrowser', 'tg.locateFailed', 'tg.locateNoChannel']
   const missingKeys = i18nKeys.filter((k) => !zh[k] || !en[k])
   check(
     'i18n 四个新键在两个 locale 均存在且非空',
@@ -794,8 +795,10 @@ async function main() {
       `jump=${JSON.stringify(tgSeriesDom.jump)}`,
     )
     check(
-      '判据3 剧集列表行也有入口（episode-row-view-tg）',
-      tgSeriesDom.row !== null,
+      // BUG-364：行级入口已撤销（supersede 判据3 原「列表行也有入口」）——
+      // 应用内跳转收敛为来源块一颗；本地剧集同样为 0。
+      '判据3 BUG-364：剧集列表行不再渲染行级入口（episode-row-view-tg = 0，已撤销）',
+      tgSeriesDom.row === null,
       `row=${JSON.stringify(tgSeriesDom.row)}`,
     )
     check(

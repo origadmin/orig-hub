@@ -38,6 +38,9 @@ tracing-subscriber = "0.3"
 axum = "0.7"
 tower-http = { version = "0.6", features = ["cors"] }
 thiserror.workspace = true
+# 缩略图解码/缩放（`/api/media/items/:id/thumb`）：只启用常用静态图格式，
+# 关掉默认特性避免把 tiff/hdr/dds 等一整套编解码器拖进构建。
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 
 # MTProto 用户客户端（个人订阅归档拉取层）
 grammers-client = { version = "0.10", features = ["proxy"] }

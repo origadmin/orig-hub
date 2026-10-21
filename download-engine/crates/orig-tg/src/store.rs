@@ -1703,11 +1703,16 @@ impl Store {
     // 库根因此不再是独立配置项，而是 `<下载路径>/library` 的派生值 ——
     // 「库根跑到下载路径之外」在结构上不可表达（用户：让错误状态不可表达）。
 
-    /// 库根在下载路径下的子目录名。
-    pub const LIBRARY_SUBDIR: &str = "library";
+    /// 库根在**引擎工作区**下的子目录名。
+    ///
+    /// 2026-10-21 用户裁定「内部文件不入治理」：引擎自有物一律收进 `.orighub/`，
+    /// 下载根顶层只留用户内容。这样「成品扫描」只需排除 `.` 开头的条目就是**结构性**
+    /// 正确，不再依赖 `library`/`.orighub` 这种名字白名单 —— 白名单注定漏（实测
+    /// 顶层一个 `_backup_store_before_move.db` 就漏进了文件管理）。
+    pub const LIBRARY_SUBDIR: &str = orig_core::paths::LIBRARY_DIR_NAME;
 
     /// 引擎工作区子目录名（`<下载路径>/.orighub`，隐藏，不进库、不进成品扫描）。
-    pub const ENGINE_SUBDIR: &str = ".orighub";
+    pub const ENGINE_SUBDIR: &str = orig_core::paths::ENGINE_DIR_NAME;
 
     /// 存量搬迁落点：旧默认下载目录（`<TG 数据目录>/downloads`）里的字节搬到这里。
     ///
@@ -1793,12 +1798,64 @@ impl Store {
                 return norm_root(&orig_core::paths::expand_tilde(v.trim()));
             }
         }
-        self.download_root().await.join(Self::LIBRARY_SUBDIR)
+        Self::default_library_root(&self.download_root().await)
     }
 
-    /// 纯函数形式（供不可 async 的调用点与单测）：`<下载路径>/library`。
+    /// 纯函数形式（供不可 async 的调用点与单测）：`<下载路径>/.orighub/library`。
+    ///
+    /// 库根住在引擎工作区之内 —— 下载根顶层只留用户内容（2026-10-21 裁定）。
+    /// 派生规则本身在 `orig_core::paths::library_root_of`，daemon 侧调同一个函数。
+    ///
+    /// **派生后必须再归一化**（BUG-356/357 同款）：`download_root()` 返回的是正向
+    /// 斜杠形态（`D:/OrigDown`），Windows 上对带 `/` 的基路径 `join` 会拼出混合分隔符
+    /// （`D:/OrigDown\.orighub\library`）⇒ 与 daemon 侧 `config::library_root()` 的
+    /// 字面形态不一致，而边界判定/前端「库根」行都按字符串比较。多一级 join 就多一次
+    /// 混合斜杠的机会，故在这里统一。
     pub fn default_library_root(download_root: &Path) -> PathBuf {
-        download_root.join(Self::LIBRARY_SUBDIR)
+        orig_core::paths::normalize_dir_path(&orig_core::paths::library_root_of(download_root))
+    }
+
+    /// 存量搬迁：`<下载路径>/library` → `<下载路径>/.orighub/library`。
+    ///
+    /// 幂等：目标已存在则什么都不做（宁可留着旧目录让人工判断，也不合并两份库）。
+    /// 同卷 `rename` 是原子的、不搬字节；跨卷（用户把下载根换过盘）才退化为复制。
+    ///
+    /// 为什么必须在启动时做：库根的相对路径（`media_item.file_path` 是库根相对的）
+    /// 只有在**整根一起移动**时才保持有效；漏搬会让整个媒体库指向不存在的文件。
+    pub fn migrate_library_into_engine_dir(download_root: &Path) {
+        let old = download_root.join(Self::LIBRARY_SUBDIR);
+        let new = Self::default_library_root(download_root);
+        if !old.is_dir() {
+            return;
+        }
+        if new.exists() {
+            // 两代落点并存：合并需要逐项冲突判定（同名不覆盖），不是启动期该做的
+            // 静默动作 —— 留着旧目录并**明确告警**，别让它无声无息地消失。
+            tracing::warn!(
+                target: "orig_tg::store",
+                "both library layouts exist ({} and {}); keeping both, merge manually",
+                old.display(),
+                new.display()
+            );
+            return;
+        }
+        if let Some(parent) = new.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::rename(&old, &new) {
+            Ok(()) => tracing::info!(
+                target: "orig_tg::store",
+                "library moved into engine dir: {} -> {}",
+                old.display(),
+                new.display()
+            ),
+            Err(e) => tracing::warn!(
+                target: "orig_tg::store",
+                "library move failed ({} -> {}): {e}; keeping old location",
+                old.display(),
+                new.display()
+            ),
+        }
     }
 
     /// 完整受管根集合：下载根（locked，primary 取存储值或默认 true）+ 用户根。
@@ -2029,7 +2086,8 @@ impl Store {
     /// 用户观感即「路径选了完全无效」（原话）。本函数补上「变更即迁移」。
     ///
     /// 迁移内容（旧根 A → 新根 B）：
-    /// ① `<A>/library` → `<B>/library`（归仓字节；相对记录随之自动恢复）；
+    /// ① `<A>/.orighub/library`（现布局）与 `<A>/library`（旧布局）→ `<B>/.orighub/library`
+    ///    （归仓字节；相对记录随之自动恢复）；
     /// ② `<A>/legacy-downloads` → `<B>/legacy-downloads`（旧搬迁落点里的缓存成品）；
     /// ③ A 顶层的**普通文件**（引擎下载成品）→ `<B>/legacy-downloads`；
     /// ④ DB 绝对路径前缀 A→B 改写（`media_item` / `media_message` / `cache_task`）。
@@ -2072,11 +2130,26 @@ impl Store {
         let mut skipped = 0usize;
         let mut touched = false;
         // ① 旧库根 → 新库根
-        let old_lib = old_root.join(Self::LIBRARY_SUBDIR);
+        //
+        // 2026-10-21「内部文件不入治理」把库根从 `<根>/library` 挪进
+        // `<根>/.orighub/library`。所以**旧根上的库可能有两代落点**：
+        // 新版 `.orighub/library`（本轮之后）与旧版 `library`（迁移前装机）。
+        // 两个都要搬 —— 只认新版会让「升级前改过下载根」的用户整库失联
+        // （相对路径记录在新根下解析不到 = 媒体库整片「无字节」）。
         let new_lib = self.library_root().await;
-        if old_lib.is_dir() && !paths_equal(&old_lib, &new_lib) {
-            move_dir_contents(&old_lib, &new_lib, 0, &mut moved, &mut skipped)?;
-            touched = true;
+        for old_lib in [
+            Self::default_library_root(&old_root),
+            old_root.join(Self::LIBRARY_SUBDIR),
+        ] {
+            if old_lib.is_dir() && !paths_equal(&old_lib, &new_lib) {
+                let before = moved + skipped;
+                move_dir_contents(&old_lib, &new_lib, 0, &mut moved, &mut skipped)?;
+                // `touched` 只认**真的搬/跳过过东西**：上一轮搬完会留下空目录，
+                // 空目录不算「有迁移」——否则第二次调用照样报 Some，幂等判据失效。
+                if moved + skipped > before {
+                    touched = true;
+                }
+            }
         }
         // ② 旧 legacy-downloads → 新 legacy-downloads
         let old_ld = old_root.join(Self::LEGACY_DOWNLOADS_SUBDIR);
@@ -4375,8 +4448,23 @@ mod tests {
         };
         assert_eq!(
             s.library_root().await,
-            expect_default.join(Store::LIBRARY_SUBDIR),
-            "未配置下载路径时库根必须是 名义默认(过禁用盘规则)/library"
+            Store::default_library_root(&expect_default),
+            "未配置下载路径时库根必须是 名义默认(过禁用盘规则)/.orighub/library"
+        );
+        // 结构判据（2026-10-21「内部文件不入治理」）：库根必须住在引擎工作区之内。
+        // 只断言字面值不够 —— 有人把 ENGINE_SUBDIR 改回普通名字，这条会一起漂。
+        assert_eq!(
+            s.library_root().await.file_name().and_then(|n| n.to_str()),
+            Some(Store::LIBRARY_SUBDIR)
+        );
+        assert_eq!(
+            s.library_root()
+                .await
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some(Store::ENGINE_SUBDIR),
+            "库根的父目录必须是引擎工作区 `.orighub`（下载根顶层只留用户内容）"
         );
 
         // 配置下载路径 → 库根**跟随**（不是并列、更不是各走各的）。
@@ -4386,8 +4474,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             s.library_root().await,
-            dl.join(Store::LIBRARY_SUBDIR),
+            Store::default_library_root(&dl),
             "库根必须跟随下载路径"
+        );
+        assert!(
+            !dl.join(Store::LIBRARY_SUBDIR).exists()
+                && s.library_root().await != dl.join(Store::LIBRARY_SUBDIR),
+            "库根不得留在下载根顶层（旧布局），否则内部目录会漏进成品扫描"
         );
 
         // 反向证伪：历史两级（app_setting / config.json）均不得再把库根带出下载路径。
@@ -4405,7 +4498,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             s.library_root().await,
-            dl.join(Store::LIBRARY_SUBDIR),
+            Store::default_library_root(&dl),
             "历史两级配置不得把库根带出下载路径（BUG-323）"
         );
         assert!(
@@ -4431,7 +4524,7 @@ mod tests {
         let base = fx.path().to_path_buf();
         let old_root = base.join("appdata/tg/library");
         let dl = base.join("Downloads");
-        let new_root = dl.join(Store::LIBRARY_SUBDIR);
+        let new_root = Store::default_library_root(&dl);
         std::fs::create_dir_all(old_root.join("chat--1")).unwrap();
         std::fs::create_dir_all(new_root.join("chat--1")).unwrap();
         // 旧根两项：`10-a.mp4` 在新根已有同名（内容不同 ⇒ 必须不覆盖）；
@@ -4511,6 +4604,52 @@ mod tests {
         assert_eq!(again.rewritten(), 0, "重复调用不得再改路径");
     }
 
+    /// 2026-10-21「内部文件不入治理」：库根从 `<下载根>/library` 搬进
+    /// `<下载根>/.orighub/library`，启动时整根 `rename`。
+    ///
+    /// 为什么必须是**整根**移动：`media_item.file_path` 是库根相对路径，只有根整体
+    /// 挪位才继续解析得到；漏搬 = 整个媒体库「无字节」。
+    /// 判据含幂等与「两代并存不静默合并」（合并要逐项冲突判定，不能启动期偷做）。
+    #[test]
+    fn library_moves_into_engine_dir_on_startup() {
+        let base = fixture_base("lib_into_engine");
+        let dl = base.join("dl");
+        let old = dl.join(Store::LIBRARY_SUBDIR);
+        let new = Store::default_library_root(&dl);
+        std::fs::create_dir_all(old.join("chat--1")).unwrap();
+        std::fs::write(old.join("chat--1/7-x.mp4"), b"BYTES").unwrap();
+
+        Store::migrate_library_into_engine_dir(&dl);
+        assert_eq!(
+            std::fs::read(new.join("chat--1/7-x.mp4")).unwrap(),
+            b"BYTES",
+            "整根必须搬到 `.orighub/library`，相对路径才继续解析得到"
+        );
+        assert!(!old.exists(), "同卷 rename 后旧目录不得残留");
+
+        // 幂等：再跑一次不报错、不动字节
+        Store::migrate_library_into_engine_dir(&dl);
+        assert_eq!(
+            std::fs::read(new.join("chat--1/7-x.mp4")).unwrap(),
+            b"BYTES"
+        );
+
+        // 两代并存：不静默合并（保留两侧，交人工判断）
+        std::fs::create_dir_all(old.join("chat--1")).unwrap();
+        std::fs::write(old.join("chat--1/8-y.mp4"), b"OLD").unwrap();
+        Store::migrate_library_into_engine_dir(&dl);
+        assert!(
+            old.join("chat--1/8-y.mp4").exists(),
+            "两代并存时不得静默搬/并（同名冲突无判据）"
+        );
+        assert!(
+            !new.join("chat--1/8-y.mp4").exists(),
+            "并存状态下不得把旧目录内容混进新根"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// BUG-323 复报（2026-10-19）：下载根**运行中变更**的迁移。
     ///
     /// 复报现象（活栈实证）：用户把下载路径改到 `D:\OrigDown` 后 ——
@@ -4522,11 +4661,16 @@ mod tests {
         let base = fx.path().to_path_buf();
         let old_root = base.join("oldroot");
         let new_root = base.join("newroot");
-        let old_lib = old_root.join(Store::LIBRARY_SUBDIR);
+        let old_lib = Store::default_library_root(&old_root);
         // 旧根内容：库根一项、legacy-downloads 一项、顶层成品一个、未知子目录一个、
         // 引擎工作区一个（后两者**不得**被搬）。
         std::fs::create_dir_all(old_lib.join("chat--1")).unwrap();
         std::fs::write(old_lib.join("chat--1/11-b.mp4"), b"MOVED").unwrap();
+        // 旧布局（2026-10-21 之前）的库根也在这个旧根上 —— 两代落点必须都搬，
+        // 否则「升级前改过下载根」的用户整库失联。
+        let old_lib_legacy = old_root.join(Store::LIBRARY_SUBDIR);
+        std::fs::create_dir_all(old_lib_legacy.join("chat--1")).unwrap();
+        std::fs::write(old_lib_legacy.join("chat--1/12-legacy.mp4"), b"OLDLAYOUT").unwrap();
         std::fs::create_dir_all(old_root.join(Store::LEGACY_DOWNLOADS_SUBDIR)).unwrap();
         std::fs::write(
             old_root.join(Store::LEGACY_DOWNLOADS_SUBDIR).join("99-c.zip"),
@@ -4573,11 +4717,18 @@ mod tests {
             .expect("root change must report a migration");
 
         // ① 库根字节搬到新库根；DB 绝对路径改写
-        let new_lib = new_root.join(Store::LIBRARY_SUBDIR);
+        assert_eq!(m.moved, 4, "两代库根各 1 项 + legacy-downloads 1 项 + 顶层成品 1 项");
+        assert_eq!(m.skipped, 0, "无同名冲突时不得跳过");
+        let new_lib = Store::default_library_root(&new_root);
         assert_eq!(
             std::fs::read(new_lib.join("chat--1/11-b.mp4")).unwrap(),
             b"MOVED",
             "库根字节必须搬进新库根"
+        );
+        assert_eq!(
+            std::fs::read(new_lib.join("chat--1/12-legacy.mp4")).unwrap(),
+            b"OLDLAYOUT",
+            "旧布局 `<旧根>/library` 的字节也必须一起搬（两代落点都认）"
         );
         let p1: String = s
             .conn
@@ -4640,7 +4791,7 @@ mod tests {
         // 库根从属于它，同样单一形态
         assert_eq!(
             s.library_root().await,
-            PathBuf::from("D:/OrigDown").join(Store::LIBRARY_SUBDIR)
+            Store::default_library_root(Path::new("D:/OrigDown"))
         );
     }
 
@@ -4664,7 +4815,7 @@ mod tests {
     fn platform_default_legacy_roots_lists_only_engine_subdirs_bug325() {
         let default_dir = Path::new("C:/Users/u/Downloads");
         let dl = Path::new("D:/OrigDown");
-        let lib = dl.join(Store::LIBRARY_SUBDIR);
+        let lib = Store::default_library_root(dl);
         let roots = Store::platform_default_legacy_roots(default_dir, dl, &lib);
         assert_eq!(
             roots.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(),

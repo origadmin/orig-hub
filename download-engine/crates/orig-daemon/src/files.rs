@@ -185,10 +185,12 @@ fn to_fact(path: &Path, cfg: &crate::config::Config) -> Option<FileFact> {
 /// 递归枚举一个根（深度受限）。目录读失败按「此处为空」处理（权限/占用都不是
 /// 整个端点的失败理由——与 activity 聚合的跨进程容错同一立场）。
 fn walk(root: &Path, cfg: &crate::config::Config, out: &mut Vec<FileFact>) {
-    /// 受管根**根层**下由引擎自己管理的子目录名（BUG-323）：库根（归仓媒体库）
-    /// 与引擎工作区（转码代理等）。它们同住在下载路径之内 —— 用户裁定「所有文件
-    /// 不允许脱离下载路径」—— 但**不是「下载成品」**：混进成品枚举会让下载页
-    /// 冒出媒体库文件，两个视图互相污染。
+    /// 受管根**根层**下由引擎自己管理的子目录名（BUG-323）。
+    ///
+    /// 2026-10-21 用户裁定「内部文件不入治理」之后，引擎自有物已全部收进 `.orighub/`
+    /// （库根 = `.orighub/library`），根层不再有 `library` —— 真正的判据是
+    /// **`.` 开头一律不进成品**（结构性规则）。这里保留两个名字只是**过渡期兜底**：
+    /// 库根迁移失败（跨卷复制失败等）时旧目录仍可能在根层，别让它漏进文件管理。
     const ENGINE_OWNED_SUBDIRS: [&str; 2] = ["library", ".orighub"];
 
     fn rec(dir: &Path, depth: usize, cfg: &crate::config::Config, out: &mut Vec<FileFact>) {

@@ -15,7 +15,7 @@
 import { clearCacheItem, enqueueCacheTask, tgDiag } from '../api/tg'
 import type { TgCacheTask } from '../types'
 import { ensureDaemon } from '../api/tauri'
-import { restartTgService } from '../api/daemon'
+import { TG_PLUGIN_ID, restartPlugin } from '../api/daemon'
 import { getLibraryStats } from '../api/media'
 import { cacheKey, cached, invalidateCache } from './fetchCache'
 import {
@@ -87,7 +87,7 @@ const tgAdapter: SourceAdapter = {
    * 现在前端只发请求、daemon 执行。
    */
   async ensureAvailable() {
-    await restartTgService()
+    await restartPlugin(TG_PLUGIN_ID)
   },
   parseRef(ref) {
     return parseTgRef(ref)
