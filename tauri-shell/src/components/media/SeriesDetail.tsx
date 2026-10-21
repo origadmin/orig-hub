@@ -714,7 +714,41 @@ export function SeriesDetail(props: {
           {/* 总览操作（规范 v3 leftPane：编辑剧集 + 标签，置于总览块内）。
               合并/导出/删除是**本剧集实体**的操作 ⇒ 必须落在实体表面（此卡），
               禁止上提到页面工具栏（工具栏 = 库级语义；用户 2026-09-29 裁定）。 */}
+          {/*
+            BUG-262 拍板 A（2026-10-10）+ BUG-369 复报（2026-10-22）：
+            「▶ 播放全部」**从未落地** —— 全仓原本搜不到 `series-play-all`
+            / `播放全部`，左栏一个播放入口都没有，而唯一播放在右栏。
+            用户 2026-10-22 原话：「现在右边播放是错误,左边缺少播放也是错误」——
+            两个状态同时为错，目标态就是**播放归左栏**。
+
+            语义与 BUG-262 裁定逐字一致：
+            - 起点 = **首个可播集**（不是第一个 episode —— 图片集不进播放序列 P6，
+              也未必有字节；`playEps[0]` 才是用户心里那个「第 1 集」）；
+            - 连播能力早已存在（`MediaLibraryPanel.playItems` 会把选中项扩成整部
+              剧集），所以这里是**入口**不是新能力；
+            - 与右栏 `episode-play` 的区分：右栏文案改「从本集开始播放」（BUG-262
+              追加解读 ①：两者文案必须可区分，否则同一命令两个同文案主按钮）。
+          */}
           <div className="flex flex-wrap gap-1.5">
+            <Button
+              size="sm"
+              className="h-7 px-2.5 text-[11px]"
+              onClick={() => {
+                // 起点 = 首个可播集在**全量序列**里的下标（父层 onPlay 收的是它）
+                const first = playEps[0]
+                if (first) props.onPlay(detail.episodes.indexOf(first))
+              }}
+              disabled={playEps.length === 0}
+              title={
+                playEps.length > 0
+                  ? t('media.series.playAllHint')
+                  : t('media.fileMissingHint')
+              }
+              data-testid="series-play-all"
+            >
+              <Play className="h-3.5 w-3.5" />
+              {t('media.series.playAll')}
+            </Button>
             <Button
               size="sm"
               className="h-7 px-2.5 text-[11px]"

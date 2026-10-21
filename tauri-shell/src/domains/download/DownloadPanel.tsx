@@ -67,19 +67,9 @@ interface Props {
 
 const RUNNING: DownloadStatusValue[] = ['downloading', 'queued', 'idle']
 
-/** 来源切片：与侧栏状态树**正交**（状态是纵向分档，来源是横向切片）。 */
-type SourceFilter = 'all' | 'download' | 'ingest'
-
-const SOURCE_LABELS: Record<SourceFilter, string> = {
-  all: '全部',
-  download: '下载',
-  ingest: 'TG 入库',
-}
-
 export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
   const { setError, cancel } = useStore()
-  const { groups, overview, loading, error, unavailable, downloadUnavailable, refresh, run, remove } = ingest
-  const [source, setSource] = useState<SourceFilter>('all')
+  const { groups, loading, error, unavailable, downloadUnavailable, refresh, run, remove } = ingest
   /**
    * BUG-353：下载域的**选中**控制面。
    *
@@ -146,9 +136,11 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
     [groups, dlFilter],
   )
 
-  const showEngine = source !== 'ingest' && engineRows.length > 0
-  const showIngest = source !== 'download' && ingestRows.length > 0
-  const total = (showEngine ? engineRows.length : 0) + (showIngest ? ingestRows.length : 0)
+  // BUG-366：来源切片与概览两块常驻占位已撤（用户 2026-10-22：「上面死占2垃圾」）。
+  // 实测两块合计占 61px 首屏纵向空间，且全 0 时仍原样占位。撤后列表直接置顶。
+  const showEngine = engineRows.length > 0
+  const showIngest = ingestRows.length > 0
+  const total = engineRows.length + ingestRows.length
 
   /**
    * 来源健康：orig-tg 不可达 ⇒ 拉取必然失败。
@@ -276,13 +268,6 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
     return s
   }, [selected])
 
-  const counts: Record<SourceFilter, number> = {
-    all: (source !== 'ingest' ? engineRows.length : 0) +
-    (source !== 'download' ? ingestRows.length : 0),
-    download: engineRows.length,
-    ingest: ingestRows.length,
-  }
-
   if (loading && total === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-24 text-muted">
@@ -318,47 +303,6 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
      * 因面板 h-full 自然变 no-op。
      */
     <div className="flex h-full min-h-0 flex-col gap-3">
-      {/* 概览（笼统的数据）：先给结论级计数，再列具体对象 */}
-      <div
-        className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-border-subtle bg-surface px-3 py-2 text-[11px] text-muted"
-        data-testid="dl-overview"
-      >
-        <span className="font-mono text-fg-mid" data-testid="dl-overview-total">
-          入库对象 {overview.total}
-        </span>
-        <span className="font-mono text-accent" data-testid="dl-overview-active">
-          在传 {overview.active}
-        </span>
-        <span className="font-mono text-warning" data-testid="dl-overview-stalled">
-          待处理 {overview.stalled}
-        </span>
-        <span className="font-mono text-success" data-testid="dl-overview-done">
-          已完成 {overview.done}
-        </span>
-        <span className="font-mono" data-testid="dl-overview-cancelled">
-          已取消 {overview.cancelled}
-        </span>
-      </div>
-
-      {/* 来源切片 */}
-      <div className="flex shrink-0 flex-wrap items-center gap-2" data-testid="dl-source-filter">
-        {(Object.keys(SOURCE_LABELS) as SourceFilter[]).map((k) => (
-          <button
-            key={k}
-            onClick={() => setSource(k)}
-            data-testid={`dl-source-${k}`}
-            className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${
-              source === k
-                ? 'border-accent bg-accent/10 text-accent'
-                : 'border-border-subtle text-muted hover:text-fg-mid'
-            }`}
-          >
-            {SOURCE_LABELS[k]}
-            <span className="ml-1 font-mono">{counts[k]}</span>
-          </button>
-        ))}
-      </div>
-
       {/* BUG-353：下载域选中控制面。选中任意行后出现，批量「取消选中」。 */}
       {selected.size > 0 && (
         <div

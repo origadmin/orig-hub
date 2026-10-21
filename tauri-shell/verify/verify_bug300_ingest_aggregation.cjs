@@ -139,6 +139,10 @@ const T = {
   sourceDownload: 'dl-source-download',
   overviewTotal: 'dl-overview-total',
   overviewCancelled: 'dl-overview-cancelled',
+  // BUG-366：来源切片与概览撤除后，面板挂载锚改用这三个仍存在的契约元素之一
+  ingestGroupRow: 'ingest-group-row',
+  downloadItem: 'download-item',
+  dlEmpty: 'dl-empty',
   row: 'ingest-group-row',
   name: 'ingest-group-name',
   progress: 'ingest-group-progress',
@@ -575,12 +579,19 @@ async function main() {
       (sel) => window.__click(sel),
       `[data-testid="${T.navDownload}"]`,
     )
-    await page.waitForFunction((sel) => window.__exists(sel), {
-      args: [`[data-testid="${T.sourceFilter}"]`],
-      timeout: 10000,
-    })
+    await page.waitForFunction(
+      (sels) => sels.some((sel) => window.__exists(sel)),
+      {
+        args: [[
+          `[data-testid="${T.ingestGroupRow}"]`,
+          `[data-testid="${T.downloadItem}"]`,
+          `[data-testid="${T.dlEmpty}"]`,
+        ]],
+        timeout: 10000,
+      },
+    )
     check(
-      `UI：点 ${T.navDownload} 后下载域挂载（${T.sourceFilter} 出现）`,
+      `UI：点 ${T.navDownload} 后下载域挂载（行/空态出现；来源切片已按 BUG-366 撤除）`,
       clickedNav === true,
     )
 
@@ -636,15 +647,18 @@ async function main() {
       `maxRuns=${maxRuns}`,
     )
 
-    // 概览 = 「笼统的数据」：对象总数必须与顶层行数同源
-    const overviewText = await page.evaluate(
-      (sel) => window.__text(sel),
-      `[data-testid="${T.overviewTotal}"]`,
+    // BUG-366：概览块已撤（用户 2026-10-22「上面死占2垃圾」）。
+    // 原判据「概览『入库对象 N』== 顶层行数」随块一起作废 —— 不是能力回退，
+    // 是呈现件撤销。同源性改由 `collected.count` 与 data-total 契约承担（下方已有）。
+    check(
+      `UI：概览块已按 BUG-366 撤除（不再占首屏）`,
+      !(await page.evaluate((sel) => window.__exists(sel), `[data-testid="${T.overviewTotal}"]`)),
+      'dl-overview-total 不存在',
     )
     check(
-      `UI：概览「入库对象 N」== 顶层行数（同源）`,
-      overviewText === `入库对象 ${collected.count}`,
-      `overview="${overviewText}" rows=${collected.count}`,
+      `UI：顶层行数自身可数（data-total 契约）`,
+      collected.count > 0,
+      `rows=${collected.count}`,
     )
 
     await page.screenshot(path.join(OUT, '01-ingest-aggregated.png'))
@@ -755,23 +769,15 @@ async function main() {
     await new Promise((r) => setTimeout(r, 400))
     await page.screenshot(path.join(OUT, '03-ingest-merged-history.png'))
 
-    // ── 反证：来源切片真的在分派 ────────────────────────────────────────
-    await page.evaluate(
-      (sel) => window.__click(sel),
-      `[data-testid="${T.sourceDownload}"]`,
+    // ── 反证（BUG-366 supersede）────────────────────────────────────────
+    // 原反证 = 点来源 chip 看行数变化；chip 已撤 ⇒ 反证改为「面板里再也搜不到
+    // 来源切片控件」。撤能力必须留下「它真的不在了」的判据，否则下次又长回来。
+    const sliceGone = await page.evaluate(
+      (sel) => !window.__exists(sel),
+      `[data-testid="${T.sourceFilter}"]`,
     )
-    await page.waitForFunction(() => window.__rows().length === 0, {
-      timeout: 6000,
-    })
-    check('反证：切来源「下载」⇒ 入库行 0（chip 真在分派）', true)
-
-    await page.evaluate(
-      (sel) => window.__click(sel),
-      `[data-testid="${T.sourceAll}"]`,
-    )
-    await page.waitForFunction(() => window.__rows().length > 0, {
-      timeout: 6000,
-    })
+    check('反证（BUG-366）：来源切片控件已不存在（不会静默长回来）', sliceGone)
+    await new Promise((r) => setTimeout(r, 400))
     // 窗口化适配：「行恢复」的判据 = data-total 契约回到全量档（切片切走时
     // VirtualList 整体卸载、状态清空；切回重挂后 data-total 必须 == 聚合数）。
     const restored = await page.evaluate(() => window.__rows())
@@ -824,15 +830,12 @@ async function main() {
       (sel) => !window.__exists(sel),
       `[data-testid="${T.navChildDl}-cancelled"]`,
     )
-    const cancelledText = await page.evaluate(
-      (sel) => window.__text(sel),
-      `[data-testid="${T.overviewCancelled}"]`,
-    )
-    const cancelledN = Number(/已取消\s+(\d+)/.exec(cancelledText || '')?.[1] ?? NaN)
+    // BUG-366：概览「已取消 N」已撤 ⇒ 读数改从滚动全程累积集自身取（同一真源）。
     // 窗口化适配：cancelled 行数在滚动全程累积集里数（全列，非首屏窗口）。
     const visibleCancelled = collected.rows.filter((r) => r.status === 'cancelled').length
+    const cancelledN = visibleCancelled
     check(
-      `UI（BUG-314）：侧栏无「已取消」树档；取消行在「全部」档可见且数=概览（概览 ${cancelledN}，实列 ${visibleCancelled}）`,
+      `UI（BUG-314）：侧栏无「已取消」树档；取消行在「全部」档可见且可数（实列 ${visibleCancelled}；概览已按 BUG-366 撤除）`,
       bucketGone === true && Number.isFinite(cancelledN) && visibleCancelled === cancelledN,
       `bucketGone=${bucketGone} overview=${cancelledText} visible=${visibleCancelled}`,
     )

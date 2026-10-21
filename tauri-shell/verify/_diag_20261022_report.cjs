@@ -135,6 +135,7 @@ async function main() {
       return {
         ingestRows: groups.length,
         engineRows: engine.length,
+        // BUG-366：两块已撤（用户 2026-10-22「上面死占2垃圾」）
         hasOverview: !!overview,
         hasSourceFilter: !!srcFilter,
         hasEmpty: !!empty,

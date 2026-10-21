@@ -45,7 +45,8 @@ let TG_PORT = 19787
 
 const T = {
   navDownload: 'nav-download',
-  sourceFilter: 'dl-source-filter',
+  // BUG-366：来源切片已撤 ⇒ 挂载锚改用仍存在的面板契约元素
+  panelMounted: ['ingest-group-row', 'download-item', 'dl-empty'],
   row: 'ingest-group-row',
   tgDown: 'dl-tg-unavailable',
 }
@@ -173,8 +174,8 @@ async function main() {
     await installHelpers(page)
 
     await page.evaluate((sel) => window.__click(sel), `[data-testid="${T.navDownload}"]`)
-    await page.waitForFunction((sel) => window.__exists(sel), {
-      args: [`[data-testid="${T.sourceFilter}"]`],
+    await page.waitForFunction((sels) => sels.some((sel) => window.__exists(sel)), {
+      args: [T.panelMounted.map((x) => `[data-testid="${x}"]`)],
       timeout: 10000,
     })
     await page.waitForFunction(() => window.__rows().length > 0, { timeout: 14000 })
