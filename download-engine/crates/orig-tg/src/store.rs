@@ -1018,12 +1018,15 @@ impl Store {
                         (SELECT COUNT(*) FROM media_message m
                           WHERE m.channel_id = c.channel_id
                             AND m.message_id > c.last_read_message_id),
-                        (SELECT COALESCE(sc.backfill_until, 0) FROM sync_cursor sc
-                          WHERE sc.channel_id = c.channel_id),
-                        (SELECT COALESCE(sc.backfill_before_id, 0) FROM sync_cursor sc
-                          WHERE sc.channel_id = c.channel_id),
-                        (SELECT COALESCE(sc.last_message_id, 0) FROM sync_cursor sc
-                          WHERE sc.channel_id = c.channel_id)
+                        /* BUG-388: COALESCE 必须包住整个标量子查询 —— 空集（该频道还没有
+                           sync_cursor 行）的标量子查询返回 NULL，内层 COALESCE
+                           包不住「没有行」，r.get::<i64> 读 NULL 即 Null value。 */
+                        COALESCE((SELECT sc.backfill_until FROM sync_cursor sc
+                          WHERE sc.channel_id = c.channel_id), 0),
+                        COALESCE((SELECT sc.backfill_before_id FROM sync_cursor sc
+                          WHERE sc.channel_id = c.channel_id), 0),
+                        COALESCE((SELECT sc.last_message_id FROM sync_cursor sc
+                          WHERE sc.channel_id = c.channel_id), 0)
                  FROM monitored_channel c ORDER BY c.added_at",
             )
             .await?;
@@ -1052,12 +1055,15 @@ impl Store {
                         (SELECT COUNT(*) FROM media_message m
                           WHERE m.channel_id = c.channel_id
                             AND m.message_id > c.last_read_message_id),
-                        (SELECT COALESCE(sc.backfill_until, 0) FROM sync_cursor sc
-                          WHERE sc.channel_id = c.channel_id),
-                        (SELECT COALESCE(sc.backfill_before_id, 0) FROM sync_cursor sc
-                          WHERE sc.channel_id = c.channel_id),
-                        (SELECT COALESCE(sc.last_message_id, 0) FROM sync_cursor sc
-                          WHERE sc.channel_id = c.channel_id)
+                        /* BUG-388: COALESCE 必须包住整个标量子查询 —— 空集（该频道还没有
+                           sync_cursor 行）的标量子查询返回 NULL，内层 COALESCE
+                           包不住「没有行」，r.get::<i64> 读 NULL 即 Null value。 */
+                        COALESCE((SELECT sc.backfill_until FROM sync_cursor sc
+                          WHERE sc.channel_id = c.channel_id), 0),
+                        COALESCE((SELECT sc.backfill_before_id FROM sync_cursor sc
+                          WHERE sc.channel_id = c.channel_id), 0),
+                        COALESCE((SELECT sc.last_message_id FROM sync_cursor sc
+                          WHERE sc.channel_id = c.channel_id), 0)
                  FROM monitored_channel c WHERE c.channel_id = ?1",
                 params![channel_id],
             )
@@ -6004,6 +6010,30 @@ mod tests {
     /// BUG-278：真实数据目录（store.db 父目录 = 程序数据：库文件/会话/凭据）
     /// 与派生的 proxy_dir（媒体字节）严格区分。
     /// BUG-323：代理落点已迁入**下载路径之内**（`<下载路径>/.orighub/proxies`）。
+    /// BUG-388：`add_channel` 不建 `sync_cursor` 行，而 list_channels 的标量子
+    /// 查询在**零匹配行**时返回 NULL（内层 COALESCE 包不住空集）——刚添加、还没
+    /// 跑过同步的频道会让整个监控列表接口报 Null value。修复 = COALESCE 外移到
+    /// 子查询整体之外，空集显式落 0。本测试钉住：无 cursor 行的频道必须能列出，
+    /// 且三个游标字段为 0 而非 Err。
+    #[tokio::test]
+    async fn monitored_channel_list_without_cursor_row_bug388() {
+        let s = store("bug388cursor").await;
+        s.add_channel(-1003969766003, "黄果短剧|AICR短剧", None).await.unwrap();
+        // 此刻 sync_cursor 没有该频道的行 —— 旧实现（COALESCE 在子查询内）
+        // 在这里返回 Err(InvalidColumnType::Null)，列表整体不可用。
+        let rows = s.list_channels().await.unwrap();
+        assert_eq!(rows.len(), 1, "无 cursor 行的频道必须仍可列出");
+        let ch = &rows[0];
+        assert_eq!(ch.channel_id, -1003969766003);
+        assert_eq!(ch.backfill_until, 0, "空集必须落 0（backfillUntil）");
+        assert_eq!(ch.backfill_before_id, 0, "空集必须落 0（backfillBeforeId）");
+        assert_eq!(ch.last_message_id, 0, "空集必须落 0（lastMessageId）");
+        // row_opt 单频道路径同一断言（同一 SQL，两处都要活）。
+        let one = s.get_channel(-1003969766003).await.unwrap().expect("row must exist");
+        assert_eq!(one.last_message_id, 0);
+        assert_eq!(one.backfill_before_id, 0);
+    }
+
     #[tokio::test]
     async fn data_dir_is_library_root_not_proxy_dir_bug278() {
         let dir = std::env::temp_dir().join(format!("orig_tg_datadir_{}", std::process::id()));

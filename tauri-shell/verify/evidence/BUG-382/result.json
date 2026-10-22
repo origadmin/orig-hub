@@ -1,0 +1,25 @@
+{
+  "date": "2026-10-22T18:09:42.578Z",
+  "results": [
+    {
+      "name": "A1 monitor/channels 带 backfillBeforeId/lastMessageId 数值字段",
+      "ok": true
+    },
+    {
+      "name": "A2 真源存在非零同步游标（lastMessageId>0）",
+      "ok": true
+    },
+    {
+      "name": "A3-i TG 面板与监控列表渲染",
+      "ok": true
+    },
+    {
+      "name": "A3-ii 当前无回溯中频道，双边界行条件渲染未触发（如实记录，API 字段已由 A1 覆盖）",
+      "ok": true
+    },
+    {
+      "name": "A4 夹具清理：监控列表还原为空（残留=0）",
+      "ok": true
+    }
+  ]
+}
