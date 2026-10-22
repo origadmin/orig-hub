@@ -87,6 +87,19 @@ pub struct MonitoredChannel {
     /// 否则用户点了「回溯到 1 月」之后没有任何反馈，只会以为按钮没生效。
     #[serde(rename = "backfillUntil", default)]
     pub backfill_until: i64,
+    /// 回溯游标（向旧翻到的最新消息号，0 = 还没开始翻/没有待回溯）。
+    ///
+    /// BUG-382：用户「无法确认上次回溯点」——只有目标日期（`backfillUntil`）
+    /// 时，界面说得出「要回溯到哪」却说不出「已经回溯到哪」。游标是真值：
+    /// 每翻一页 `advance_backfill` 推进一次。
+    #[serde(rename = "backfillBeforeId", default)]
+    pub backfill_before_id: i64,
+    /// 增量同步游标（最新已同步消息号，0 = 从没同步过）。
+    ///
+    /// BUG-382：「最新」边界 —— 与回溯游标成对出现，用户才能同时回答
+    /// 「最新到哪、历史到哪」。
+    #[serde(rename = "lastMessageId", default)]
+    pub last_message_id: i64,
 }
 
 /// 文字筛选规则（`monitor_filter` 行）。
@@ -1006,6 +1019,10 @@ impl Store {
                           WHERE m.channel_id = c.channel_id
                             AND m.message_id > c.last_read_message_id),
                         (SELECT COALESCE(sc.backfill_until, 0) FROM sync_cursor sc
+                          WHERE sc.channel_id = c.channel_id),
+                        (SELECT COALESCE(sc.backfill_before_id, 0) FROM sync_cursor sc
+                          WHERE sc.channel_id = c.channel_id),
+                        (SELECT COALESCE(sc.last_message_id, 0) FROM sync_cursor sc
                           WHERE sc.channel_id = c.channel_id)
                  FROM monitored_channel c ORDER BY c.added_at",
             )
@@ -1020,6 +1037,8 @@ impl Store {
                 added_at: r.get(3)?,
                 new_count: r.get(4)?,
                 backfill_until: r.get(5)?,
+                backfill_before_id: r.get(6)?,
+                last_message_id: r.get(7)?,
             });
         }
         Ok(out)
@@ -1034,6 +1053,10 @@ impl Store {
                           WHERE m.channel_id = c.channel_id
                             AND m.message_id > c.last_read_message_id),
                         (SELECT COALESCE(sc.backfill_until, 0) FROM sync_cursor sc
+                          WHERE sc.channel_id = c.channel_id),
+                        (SELECT COALESCE(sc.backfill_before_id, 0) FROM sync_cursor sc
+                          WHERE sc.channel_id = c.channel_id),
+                        (SELECT COALESCE(sc.last_message_id, 0) FROM sync_cursor sc
                           WHERE sc.channel_id = c.channel_id)
                  FROM monitored_channel c WHERE c.channel_id = ?1",
                 params![channel_id],
@@ -1047,6 +1070,8 @@ impl Store {
                 added_at: r.get(3)?,
                 new_count: r.get(4)?,
                 backfill_until: r.get(5)?,
+                backfill_before_id: r.get(6)?,
+                last_message_id: r.get(7)?,
             })),
             None => Ok(None),
         }

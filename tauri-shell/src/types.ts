@@ -308,6 +308,14 @@ export interface TgMonitoredChannel {
    * 否则用户点了「回溯到 1 月」之后毫无反馈，只会以为按钮没生效。
    */
   backfillUntil?: number
+  /**
+   * 回溯游标（向旧翻到的最新消息号，0 = 还没开始翻/没有待回溯）。
+   * BUG-382：「已回溯至哪」的真值 —— 只有目标日期时界面说得出「要到哪」、
+   * 说不出「已到哪」，用户无法确认回溯进度。
+   */
+  backfillBeforeId?: number
+  /** 增量同步游标（最新已同步消息号）——「最新」边界（BUG-382）。 */
+  lastMessageId?: number
 }
 
 /** 文字筛选规则（GET/POST /api/tg/monitor/filters）。

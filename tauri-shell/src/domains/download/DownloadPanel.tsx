@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { DownloadStatus, DownloadStatusValue } from '../../types'
+import type { DownloadStatus } from '../../types'
 import type { DlFilter } from '../../nav'
 import { DownloadItem } from './DownloadItem'
 import { IngestGroupRow } from './IngestGroupRow'
 import type { UseIngestGroupsResult } from './useIngestGroups'
 import { groupInBucket, ingestActionsFor } from './ingestGroups'
+import { engineRowsInBucket } from './dlBuckets'
 import { useStore } from '../../store/useStore'
 import { useGoLibrary } from '../../hooks/useGoLibrary'
 import { enqueueCacheTask } from '../../api/tg'
@@ -77,8 +78,6 @@ type DLRow =
   | { kind: 'engine'; item: DownloadStatus }
   | { kind: 'ingest'; group: IngestGroup }
 
-const RUNNING: DownloadStatusValue[] = ['downloading', 'queued', 'idle']
-
 export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
   const { setError, cancel } = useStore()
   const { groups, loading, error, unavailable, downloadUnavailable, refresh, run, remove } = ingest
@@ -116,31 +115,12 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
     refresh()
   }, [refresh])
 
-  const engineRows = useMemo(() => {
-    switch (dlFilter) {
-      case 'running':
-        return items.filter((d) => RUNNING.includes(d.status))
-      case 'paused':
-        return items.filter((d) => d.status === 'paused')
-      case 'done':
-        return items.filter((d) => d.status === 'completed')
-      case 'all':
-      default:
-        // 全部任务 = 三档 + 取消/失败/中断兜底（cancelled 与 error 只在此可见 ——
-        // BUG-314 撤档后取消记录没有独立树档，可见性由本档承担）。
-        // `interrupted` 必须在此列：它是 BUG-319 持久化留下的新状态，漏了它
-        // 就等于「记录存下来了但哪儿都不显示」—— 又是一次数据丢失的观感。
-        return items.filter(
-          (d) =>
-            RUNNING.includes(d.status) ||
-            d.status === 'paused' ||
-            d.status === 'completed' ||
-            d.status === 'cancelled' ||
-            d.status === 'error' ||
-            d.status === 'interrupted',
-        )
-    }
-  }, [dlFilter, items])
+  /**
+   * 引擎任务按树档过滤。**条件不在本文件写第二份** —— 侧栏徽标与状态栏读数
+   * 由 `MainLayout` 用同一个 `countEngineBucket` 数，两处共用 `dlBuckets.ts`
+   * 才不会有「徽标 3、列表 0」（BUG-377）。
+   */
+  const engineRows = useMemo(() => engineRowsInBucket(items, dlFilter), [dlFilter, items])
 
   /** 入库对象：按 `itemKey` 聚合后的顶层行，再按树档过滤。 */
   const ingestRows = useMemo(

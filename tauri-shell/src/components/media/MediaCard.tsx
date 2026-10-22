@@ -410,9 +410,16 @@ function MediaCardBase(props: {
             )}
 
             {/* 悬浮操作层：图标按类型分流（BUG-123），不再是统一播放三角 */}
-            <span className="absolute inset-0 flex items-center justify-center bg-black/45 opacity-0 transition-opacity group-hover:opacity-100">
+            <span className="absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-black/45 opacity-0 transition-opacity group-hover:opacity-100">
               <span className="flex h-9 w-9 items-center justify-center rounded-full bg-white/90 text-black">
                 <ActionIcon className="h-4 w-4" aria-hidden="true" />
+              </span>
+              {/* BUG-381：把「单击封面就是浏览入口」写成可见文字。用户报
+                  「方格图小了、没有浏览功能」——浏览（MediaViewer 灯箱）
+                  一直都在，但 200px 小图 + 无文字暗示让入口不可发现。
+                  图放大（grid 240px）+ 这句话，两件事一起修。 */}
+              <span className="rounded bg-black/70 px-1.5 text-[10px] font-medium text-white">
+                {t('media.cardOpenHint')}
               </span>
             </span>
 

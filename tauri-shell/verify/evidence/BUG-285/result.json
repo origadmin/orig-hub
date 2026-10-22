@@ -9,7 +9,7 @@
     {
       "name": "⓪ 夹具成立：一集 TG（带 ref）＋一集本地（无坐标）",
       "ok": true,
-      "detail": "tgEp=816/tg/100000001:4242 localEp=817/local/\"C:\\\\Users\\\\godcong\\\\AppData\\\\Local\\\\Temp\\\\orighub-bug285-1791832026564-local.mp4\""
+      "detail": "tgEp=1049/tg/100000001:4242 localEp=1050/local/\"C:\\\\Users\\\\godcong\\\\AppData\\\\Local\\\\Temp\\\\orighub-bug285-1792683912233-local.mp4\""
     },
     {
       "name": "⓪b en-US 已生效（<html lang>）",
@@ -19,12 +19,12 @@
     {
       "name": "⓪c 剧集内页已打开（episode-source-info 可见）",
       "ok": true,
-      "detail": "series=367"
+      "detail": "series=538"
     },
     {
       "name": "①a TG 来源行有可点入口（<a> 且 href 非空）",
       "ok": true,
-      "detail": "link={\"tag\":\"A\",\"href\":\"https://t.me/c/100000001/4242\",\"target\":\"_blank\",\"text\":\"View in TG\",\"inPrimaryRow\":true}"
+      "detail": "link={\"tag\":\"A\",\"href\":\"https://t.me/c/100000001/4242\",\"target\":\"_blank\",\"text\":\"Open in browser\",\"inPrimaryRow\":true}"
     },
     {
       "name": "①b href === https://t.me/c/100000001/4242（ref 100000001:4242 还原出的 t.me 深链）",
@@ -34,12 +34,12 @@
     {
       "name": "①c 入口与被解释的来源同一行（主版本行的后代，非独立区块/弹窗）",
       "ok": true,
-      "detail": "inPrimaryRow=true primaryRowText=\"Primary ZZ-BUG285-TG-1791832026486 TG View in TG\""
+      "detail": "inPrimaryRow=true primaryRowText=\"Primary ZZ-BUG285-TG-1792683912145 TG View in TG Open in browser\""
     },
     {
-      "name": "①d 文案 === \"View in TG\"（media.episode.viewInTg，非回退 key 名）",
+      "name": "①d 文案 === \"Open in browser\"（media.episode.openInBrowser，非回退 key 名；BUG-364 supersede 文案值）",
       "ok": true,
-      "detail": "text=\"View in TG\""
+      "detail": "text=\"Open in browser\""
     },
     {
       "name": "①e 入口在新标签打开（target=\"_blank\"）",
@@ -47,19 +47,19 @@
       "detail": "target=\"_blank\""
     },
     {
-      "name": "② 本地来源行无入口（linkCount = 0，聚焦 ep=817）",
+      "name": "② 本地来源行无入口（linkCount = 0，聚焦 ep=1050）",
       "ok": true,
-      "detail": "linkCount=0 focusTitle=\"ZZ-BUG285-LOCAL-1791832026486\" primaryRowText=\"Primary ZZ-BUG285-LOCAL-1791832026486 Local\""
+      "detail": "linkCount=0 focusTitle=\"ZZ-BUG285-SER-1792683912145 S1E2\" primaryRowText=\"Primary ZZ-BUG285-LOCAL-1792683912145 Local\""
     },
     {
       "name": "②b 本地来源行仍显示来源标签（未因无入口而整行消失）",
       "ok": true,
-      "detail": "\"Primary ZZ-BUG285-LOCAL-1791832026486 Local\""
+      "detail": "\"Primary ZZ-BUG285-LOCAL-1792683912145 Local\""
     },
     {
       "name": "③ en-US 来源块可见文本 CJK 汉字数 = 0（夹具标题全 ASCII）",
       "ok": true,
-      "detail": "tg=0 local=0 localText=\"Sources Primary ZZ-BUG285-LOCAL-1791832026486 Local\""
+      "detail": "tg=0 local=0 localText=\"Sources Primary ZZ-BUG285-LOCAL-1792683912145 Local\""
     },
     {
       "name": "④P 证伪锚点存在（SeriesDetail.tsx 含目标行）",
@@ -69,22 +69,22 @@
     {
       "name": "④a 红态读数：TG 来源行入口消失（判据①a/①b 按预期失败）",
       "ok": true,
-      "detail": "linkCount=0 primaryRowText=\"Primary ZZ-BUG285-TG-1791832026486 TG\""
+      "detail": "linkCount=0 primaryRowText=\"Primary ZZ-BUG285-TG-1792683912145 TG View in TG\""
     },
     {
       "name": "④b 红态读数：块内已无 \"View in TG\" 文案",
       "ok": true,
-      "detail": "\"Sources Primary ZZ-BUG285-TG-1791832026486 TG\""
+      "detail": "\"Sources Primary ZZ-BUG285-TG-1792683912145 TG View in TG\""
     },
     {
       "name": "④c 字节级还原：sha256 与改前一致",
       "ok": true,
-      "detail": "before=1424cad6934c after=1424cad6934c"
+      "detail": "before=13ac61313660 after=13ac61313660"
     },
     {
       "name": "④d 还原后复跑：入口回来、href 正确、文案正确",
       "ok": true,
-      "detail": "link={\"tag\":\"A\",\"href\":\"https://t.me/c/100000001/4242\",\"target\":\"_blank\",\"text\":\"View in TG\",\"inPrimaryRow\":true}"
+      "detail": "link={\"tag\":\"A\",\"href\":\"https://t.me/c/100000001/4242\",\"target\":\"_blank\",\"text\":\"Open in browser\",\"inPrimaryRow\":true}"
     },
     {
       "name": "④e 还原后复跑：本地来源行仍无入口",

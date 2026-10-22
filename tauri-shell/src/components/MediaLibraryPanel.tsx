@@ -1621,7 +1621,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
                 )}
               </div>
             ) : (
-              <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4">
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-4">
                 {series.map((s) => (
                   <SeriesCard
                     key={s.id}
@@ -1668,6 +1668,9 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             // 选择模式（任务 #9）：已有 ≥1 条选中时，行双击与「打开」按钮
             // 不进入播放/系统打开（覆盖层会冲掉隐形的选择上下文）。
             selectionMode={selected.size > 0}
+            // BUG-385：行级「在 TG 中查看」—— 文件域筛选落地视图的跳转出口
+            // （与 SeriesDetail 来源块入口同一个 `viewInTg` 回调、同一套坐标门控）。
+            onViewInTg={viewInTg}
           />
         ) : items.length === 0 && !loading ? (
           emptyState
@@ -1676,7 +1679,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             <div className="min-h-0 flex-1 overflow-y-auto p-3">
               <div
                 data-testid="media-grid"
-                className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4"
+                className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-4"
               >
                 {items.map((item) => (
                   <MediaCard

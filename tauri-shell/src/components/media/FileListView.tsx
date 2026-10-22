@@ -7,7 +7,7 @@ import { isTauri } from '../../lib/env'
 import { VirtualList } from '../ui/virtual-list'
 // 媒体库组件的格式化/来源工具一律从 mediaSources 取（该文件是唯一 import
 // `lib/tgmedia` 的地方，通用工具已在其中 re-export）——与本目录其他组件同一纪律。
-import { fmtDate, fmtSize, hasMediaBytes, sourceLabelKey } from '../../lib/mediaSources'
+import { fmtDate, fmtSize, hasMediaBytes, parseSourceRef, sourceLabelKey } from '../../lib/mediaSources'
 
 /**
  * **文件列表（Explorer 显示）** —— 文件域父行（全部文件）的唯一呈现形态。
@@ -59,6 +59,12 @@ export interface FileListViewProps {
    * 行单击 / 复选框 / 打开目录 / 删除不受影响。
    */
   selectionMode?: boolean
+  /**
+   * BUG-385：「在 TG 中查看」—— 行内应用内跳转（`setPendingTgFocus` + 切 TG 域）。
+   * 只有 ref 能解析出 TG 坐标的行才渲染入口（`parseSourceRef` 门控），
+   * 本地来源没有可跳的消息 ⇒ 不渲染（点了也没有坐标）。
+   */
+  onViewInTg?: (coords: { chatId: number; messageId: number }) => void
 }
 
 /**
@@ -74,13 +80,16 @@ const FileRow = memo(function FileRow(props: {
   onDelete: (item: MediaItem) => void
   onReveal?: (item: MediaItem) => void
   selectionMode?: boolean
+  onViewInTg?: (coords: { chatId: number; messageId: number }) => void
 }) {
   const { t } = useTranslation()
-  const { item, selected, onSelectToggle, onOpen, onDelete, onReveal, selectionMode = false } = props
+  const { item, selected, onSelectToggle, onOpen, onDelete, onReveal, selectionMode = false, onViewInTg } = props
   const name = resolveDisplayName({ item })
   const fullPath = item.absolutePath ?? item.filePath ?? ''
   const hasBytes = hasMediaBytes(item)
   const icon = kindIcon(item.kind)
+  // BUG-385：TG 坐标可解析才给跳转入口（本地/无 ref ⇒ 不渲染）。
+  const tgAt = parseSourceRef(item.ref, item.source)
 
   const reveal = useCallback(
     (e: React.MouseEvent) => {
@@ -180,6 +189,24 @@ const FileRow = memo(function FileRow(props: {
             {t('media.fileList.openDir')}
           </button>
         ) : null}
+        {/* BUG-385：行级「在 TG 中查看」—— 文件域筛选结果的落地视图此前
+            零跳转入口（items 网格按 BUG-307 设计锁不烤入、剧集链路入口在
+            来源块），用户在「筛选 → 这一条」路径上回不到 TG 原消息。
+            坐标不可解析（本地来源）⇒ 不渲染。 */}
+        {tgAt && onViewInTg ? (
+          <button
+            type="button"
+            className="rounded px-1.5 py-0.5 text-[11px] text-muted hover:bg-surface-2 hover:text-fg-strong"
+            onClick={(e) => {
+              e.stopPropagation()
+              onViewInTg(tgAt)
+            }}
+            title={t('media.viewInTg')}
+            data-testid={`file-list-view-tg-${item.id}`}
+          >
+            {t('media.viewInTg')}
+          </button>
+        ) : null}
         <button
           type="button"
           className="rounded px-1.5 py-0.5 text-[11px] text-muted hover:bg-surface-2 hover:text-destructive"
@@ -196,7 +223,7 @@ const FileRow = memo(function FileRow(props: {
 
 export function FileListView(props: FileListViewProps) {
   const { t } = useTranslation()
-  const { items, selected, total, onSelectToggle, onOpen, onDelete, onError, selectionMode = false } =
+  const { items, selected, total, onSelectToggle, onOpen, onDelete, onError, selectionMode = false, onViewInTg } =
     props
 
   /**
@@ -266,6 +293,7 @@ export function FileListView(props: FileListViewProps) {
             onDelete={onDelete}
             onReveal={reveal}
             selectionMode={selectionMode}
+            onViewInTg={onViewInTg}
           />
         )}
       />

@@ -3,6 +3,7 @@ import { Sidebar } from './Sidebar'
 import { DownloadPanel } from '../domains/download/DownloadPanel'
 import { AddDownloadDialog } from '../domains/download/AddDownloadDialog'
 import { useIngestGroups } from '../domains/download/useIngestGroups'
+import { countEngineBucket } from '../domains/download/dlBuckets'
 import { SettingsPanel } from '../components/SettingsPanel'
 import { TgPanel } from '../components/TgPanel'
 import { FilesPanel } from '../domains/files/FilesPanel'
@@ -15,6 +16,7 @@ import { selectActiveSpeedLabel, selectHasActiveSpeed } from '../store/selectors
 import { CONN_DOT, CONN_LABEL, useConnState } from '../store/connState'
 import { useEvent } from '../hooks/useEvent'
 import { useTranslation } from '../i18n'
+import { copyToClipboard } from '../lib/env'
 import {
   DEFAULT_NAV,
   navigate,
@@ -111,11 +113,22 @@ export function MainLayout() {
   }, [tgService.enabled, refreshTgState, probeTg])
 
   // 全局错误 toast：按钮/操作失败时的用户可见反馈（自动消失）
+  // BUG-384：错误必须「可读、可复制、可跟踪」——旧形态 4 秒固定消失，
+  // 用户第 5 次报「错误没有数据支撑，无法说明具体、无法排错」。
+  // 现在：悬浮/聚焦暂停消失（读得完）、带时间戳（对得上发生时刻）、
+  // 一键复制诊断串（贴进报告即有 时间+原文）。
+  const [toastPaused, setToastPaused] = useState(false)
+  const [toastCopied, setToastCopied] = useState(false)
   useEffect(() => {
-    if (!toast) return
+    if (!toast || toastPaused) return
     const t = setTimeout(() => clearToast(), 4000)
     return () => clearTimeout(t)
-  }, [toast, clearToast])
+  }, [toast, toastPaused, clearToast])
+  useEffect(() => {
+    if (!toastCopied) return
+    const t = setTimeout(() => setToastCopied(false), 1500)
+    return () => clearTimeout(t)
+  }, [toastCopied])
 
   // BUG-134: 状态栏下载速度改读 `selectActiveSpeedLabel`（store/selectors.ts），与全局速度文案同源，
   // 不再在此处用 `active.reduce` 自算一套口径。
@@ -153,21 +166,39 @@ export function MainLayout() {
     undefined,
     view === 'download' || (view === 'tg' && !cacheManagerOpen),
   )
-  /** 概览 = 「笼统的数据」：按**内容对象**计数，不是按原始任务记录数。 */
+  /** BUG-384：toast 时间戳（本地 HH:MM:SS）—— 错误可跟踪的第一项数据。 */
+function fmtClock(ts: number): string {
+  const d = new Date(ts)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+/** 概览 = 「笼统的数据」：按**内容对象**计数，不是按原始任务记录数。 */
   const overview = ingest.overview
 
-  const downloadingBucket = downloads.filter(
-    (d) => d.status === 'downloading' || d.status === 'queued' || d.status === 'idle',
-  )
-  const paused = downloads.filter((d) => d.status === 'paused')
-  const completed = downloads.filter((d) => d.status === 'completed')
-  // error 与 cancelled 同属「未成功终态」。**只服务状态栏读数**（下方 `main.status` 的
-  // `{failed}` 占位符）—— 侧栏树档已按 BUG-314 撤档（曾误设「已取消」独立档，
-  // 越权解读用户「记录不消失」诉求；记录可见性由「全部」档承担），这条只读不导航。
+  /**
+   * 引擎任务按树档计数 —— **与下载域列表同一个谓词**（`dlBuckets.ts`）。
+   *
+   * BUG-377：这三行原先各自手写 `d.status === '...'`，而列表在 `DownloadPanel`
+   * 里另写一份 switch ⇒ 改一处就分裂成「徽标 3、列表 0」。现在共用
+   * `countEngineBucket`，「数出来的 = 筛出来的」由构造保证。
+   */
+  const downloadingCount = countEngineBucket(downloads, 'running')
+  const pausedCount = countEngineBucket(downloads, 'paused')
+  const completedCount = countEngineBucket(downloads, 'done')
+  // error / cancelled / interrupted 同属「未成功终态」。**只服务状态栏读数**
+  // （下方 `main.status` 的 `{failed}` 占位符）—— 侧栏树档已按 BUG-314 撤档
+  // （曾误设「已取消」独立档，越权解读用户「记录不消失」诉求；记录可见性由
+  // 「全部」+「已暂停」档承担），这条只读不导航。
   // 删掉这行 tsc 照样绿（占位符缺失只显示空字符串），状态栏的失败数会静默消失
-  // —— 典型假绿，勿删。
-  const failed = downloads.filter((d) => d.status === 'error' || d.status === 'cancelled')
+  // —— 典型假绿，勿删。`interrupted`（BUG-319）必须在内：它是「进程消失留下的行」，
+  // 漏了它状态栏就少报一类失败。
+  const failed = downloads.filter(
+    (d) => d.status === 'error' || d.status === 'cancelled' || d.status === 'interrupted',
+  )
   // 全局聚合进度（BUG-004）：管理中任务（下载中/排队/已暂停）的累计字节占比。
+  // 这是**字节口径**，不是树档 —— 停止项里只有 `paused` 有可续传的字节，
+  // error/cancelled/interrupted 的残片不进分母，否则进度条会因失败任务而失真。
   const aggregate = downloads.filter(
     (d) => d.status === 'downloading' || d.status === 'queued' || d.status === 'paused',
   )
@@ -258,9 +289,11 @@ export function MainLayout() {
           counts={{
             files: filesCounts.files,
             // 下载域各桶 = 引擎任务 + 入库对象（M3/BUG-300，口径见上方 overview 注释）
-            downloading: downloadingBucket.length + overview.active,
-            paused: paused.length,
-            completed: completed.length + overview.done,
+            // BUG-377：「已暂停」档 = 所有停止项 ⇒ 徽标必须把入库侧的停止项
+            // （stalled + cancelled）也数进来，否则徽标 0 而列表 5 行。
+            downloading: downloadingCount + overview.active,
+            paused: pausedCount + overview.stalled + overview.cancelled,
+            completed: completedCount + overview.done,
             series: filesCounts.series,
             tags: filesCounts.tags,
           }}
@@ -364,9 +397,9 @@ export function MainLayout() {
               */}
               {t('main.status', {
                 // M3/BUG-300：状态栏与侧栏徽标、下载域树档三处同源（含入库任务）
-                active: downloadingBucket.length + overview.active,
-                paused: paused.length,
-                completed: completed.length + overview.done,
+                active: downloadingCount + overview.active,
+                paused: pausedCount + overview.stalled + overview.cancelled,
+                completed: completedCount + overview.done,
                 failed: failed.length + overview.stalled,
               })}
             </span>
@@ -394,13 +427,44 @@ export function MainLayout() {
 
       <AddDownloadDialog open={addOpen} onClose={() => setAddOpen(false)} />
 
-      {/* 全局错误 toast（按钮/操作失败可见反馈） */}
+      {/* 全局错误 toast（按钮/操作失败可见反馈）
+          BUG-384：可读（hover 暂停消失）+ 可跟踪（时间戳）+ 可复制（诊断串）。 */}
       {toast && (
         <div
-          className="pointer-events-none fixed left-1/2 top-4 z-[100] -translate-x-1/2 rounded-lg border border-danger/40 bg-danger/15 px-4 py-2 text-sm text-danger shadow-lg backdrop-blur-sm"
+          className="pointer-events-auto fixed left-1/2 top-4 z-[100] max-w-[min(92vw,680px)] -translate-x-1/2 rounded-lg border border-danger/40 bg-danger/15 px-4 py-2 text-sm text-danger shadow-lg backdrop-blur-sm"
           data-testid="global-toast"
+          onMouseEnter={() => setToastPaused(true)}
+          onMouseLeave={() => setToastPaused(false)}
+          onFocus={() => setToastPaused(true)}
+          onBlur={() => setToastPaused(false)}
         >
-          {toast}
+          <div className="flex items-start gap-2">
+            <span className="min-w-0 flex-1 break-words">{toast}</span>
+            <span className="shrink-0 font-mono text-[10px] leading-5 text-danger/70">
+              {fmtClock(Date.now())}
+            </span>
+            <button
+              type="button"
+              className="shrink-0 rounded px-1 text-[11px] leading-5 text-danger/80 hover:bg-danger/20"
+              title={t('global.copyDiag')}
+              data-testid="global-toast-copy"
+              onClick={() => {
+                void copyToClipboard(`[${new Date().toISOString()}] ${toast}`)
+                setToastCopied(true)
+              }}
+            >
+              {toastCopied ? t('global.copied') : t('global.copyDiag')}
+            </button>
+            <button
+              type="button"
+              className="shrink-0 rounded px-1 text-[11px] leading-5 text-danger/80 hover:bg-danger/20"
+              title={t('global.dismiss')}
+              data-testid="global-toast-close"
+              onClick={clearToast}
+            >
+              ✕
+            </button>
+          </div>
         </div>
       )}
     </div>

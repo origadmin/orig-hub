@@ -53,6 +53,20 @@ export function isCacheSettled(status: string): boolean {
   return status === 'done' || status === 'cancelled'
 }
 
+/**
+ * 已停止 = **非在传、非完成**（BUG-377，2026-10-22 用户裁定）。
+ *
+ * 用户原话：「全部下载 -> 已暂停没有看到暂停内容（失败、取消、错误），
+ * **所有停止项都应该在里面**」。
+ *
+ * 写成「取反」而不是「列举 failed/interrupted/cancelled」：后端将来多一个终态词
+ * （历史上就新增过 `interrupted`，BUG-319），列举式会静默漏掉它 ⇒ 那条记录
+ * 既不在在传、也不在完成、也不在停止 ⇒ 从所有视图消失。取反式天然兜住新词。
+ */
+export function isCacheStopped(status: string): boolean {
+  return !isCacheActive(status) && status !== 'done'
+}
+
 /** 排行序：在传 → 停滞 → 已结束。 */
 function rank(status: string): number {
   if (isCacheActive(status)) return 0
@@ -184,19 +198,24 @@ export function ingestActionsFor(status: string, priority = 0): IngestAction[] {
 export type IngestAction = 'retry' | 'cancel' | 'prefer' | 'unprefer'
 
 /**
- * 树档过滤：入库对象归入哪个状态档（`paused` 无对应 ⇒ 恒不显示）。
+ * 树档过滤：入库对象归入哪个状态档。
  *
  * 档位集合单一真源 = `DlFilter`（`nav/index.ts`）。2026-10-15 曾按 BUG-300 复报③
  * 增设 `cancelled` 独立档，因越权解读用户「取消后记录不消失」的诉求（用户要的是
  * 记录可见，不是新导航位）已于 BUG-314 撤档：取消/中止记录在 `all` 档可见、可数、
  * 可重试，概览区另有「已取消」读数 —— 不设独立树档。
+ *
+ * **`paused` 档 = 所有停止项**（BUG-377）：原实现 `return false`（「paused 无对应
+ * ⇒ 恒不显示」），导致 failed/cancelled/interrupted **任何档都看不见** ——
+ * 用户报「已暂停没有看到暂停内容（失败、取消、错误）」。现按 `isCacheStopped` 收，
+ * 与引擎侧 `dlBuckets.ts::engineInBucket` 同构。
  */
 export function groupInBucket(status: string, f: DlFilter): boolean {
   switch (f) {
     case 'running':
       return isCacheActive(status)
     case 'paused':
-      return false
+      return isCacheStopped(status)
     case 'done':
       return status === 'done'
     case 'all':

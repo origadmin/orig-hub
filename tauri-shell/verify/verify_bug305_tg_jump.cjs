@@ -12,7 +12,7 @@
  *      且被高亮（`data-tg-highlight="true"`）且已滚进可视区。
  *   2. 不离开应用：点击不产生框架导航 / 新标签，URL 不变、页面可见；
  *      t.me 外链降为**次要出口**（独立 <a target="_blank">，BUG-285 回归保持）。
- *   3. 条目级与剧集级都可跳：MediaCard 入口（`item-view-tg`）+
+ *   3. 条目级与剧集级都可跳：cat-all 文件行入口（`file-list-view-tg-*`，BUG-385）+
  *      SeriesDetail 来源块（`episode-source-jump-tg`）—— 两类都定位到同一频道同一消息。
  *      （BUG-364：原列表行第三入口 `episode-row-view-tg` 撤销 —— 与来源块跳转同坐标、
  *      同文案、10px 违反可读性门槛；应用内跳转收敛为「每颗来源一颗」。）
@@ -26,8 +26,22 @@
  * ## 目标选取（运行时从 API 派生，不写死任何 id）
  *
  *   ① 监控频道列表（`/api/tg/monitor/channels`）非空 —— 空则 Loud FAIL；
+ *   入口面沿革（2026-10-22 探针腐烂修正，判据编号不变、断言面改基到现行契约）：
+ *   - BUG-305 落地时（2026-10-14）：条目卡片 `item-view-tg` 是入口面之一；
+ *   - BUG-307 设计锁（同日用户拍板）：「视频 = 通用类，TG 跳转 = 剧集链路专有」
+ *     ⇒ items 网格 MediaCard **不烤** onViewInTg，卡片级判据反转为「必须没有」；
+ *   - BUG-385（2026-10-22）：入口面 = cat-all 文件行 `file-list-view-tg-*` +
+ *     剧集链路（SeriesDetail 来源块 `episode-source-jump-tg`）。
+ *   条目级跳转/证伪/复绿全部改走 cat-all 文件行；`item-view-tg` 仅作 BUG-307
+ *   锁的反向断言（网格恒无入口）。
  *   ② 媒体库条目里选一条 **TG 来源 + ref 可解析 + 频道已监控 + 有字节 +
- *      属于某剧集** 的条目（剧集级判据需要它）；
+ *      属于某剧集** 的条目（剧集级判据需要它）；BUG-364 起若库态没有同时满足
+ *      「剧集 + 监控流可达 + 标题可派生搜索词」三条件的条目（2026-10-21 实测
+ *      即此：缓存窗口内的剧集条目全是 BUG-362 兜底标题不可搜，可搜的都在窗口
+ *      外），先自造夹具（TG 源登记 + 无 caption video 锚点 + 『〖B』唯一可搜
+ *      标题，BUG-304 导入自动归档建剧，再经引擎缓存任务给锚点补**真字节**
+ *      —— 否则 UI 搜索与 deriveSearchTerm 的 hasBytes 门都看不见它），
+ *      判据全跑完后自删（C1 断言条目/剧集/缓存任务记录/落盘字节残留 = 0）；
  *   ③ 该消息必须真的在监控消息流里（翻页可达）—— 否则 Loud FAIL
  *      （目标不可定位却跑判据 = 假绿）；
  *   ④ 负样本：一条本地来源 + 有字节的条目，及其所在剧集（本地分集）。
@@ -72,27 +86,96 @@ function check(name, ok, detail = '') {
 }
 
 /** Loud failure：没有可验证目标时绝不跑判据（跳过伪装成通过 = 假绿）。 */
+/**
+ * FATAL = 判据空转，不许当通过。改为 throw（带标记）而非 process.exit ——
+ * BUG-364 起探针有库内夹具，硬退会漏删夹具；throw 让 main 的收尾清理
+ * （cleanupFixture）与 .catch 都能跑到，行为对调用方不变（仍是非零退出）。
+ */
 function fatal(msg) {
-  console.error(`\n[bug305] FATAL: ${msg}`)
-  process.exit(2)
+  const e = new Error(`[bug305] FATAL: ${msg}`)
+  e.bug305Fatal = true
+  throw e
+}
+
+/** POST/DELETE 等写操作（夹具生命周期用）；回环、带超时。status 0 = 网络层失败。 */
+async function httpJsonOnce(method, url, body, timeoutMs = 20000) {
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: ctrl.signal,
+    })
+    const text = await res.text()
+    let json = null
+    try {
+      json = text ? JSON.parse(text) : null
+    } catch (_e) {
+      /* 非 JSON 响应保留 text 供判读 */
+    }
+    return { status: res.status, json, text }
+  } catch (e) {
+    return { status: 0, json: null, text: String((e && e.message) || e) }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** 写操作 + 网络层重试（停摆窗口数秒；幂等 ⇒ 重试安全）。 */
+async function httpJson(method, url, body, timeoutMs = 20000) {
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    const r = await httpJsonOnce(method, url, body, timeoutMs)
+    if (r.status !== 0 || attempt === 4) return r
+    await delay(2000)
+  }
 }
 
 // ─────────────────────────── HTTP（仅回环，读真值 / 派生目标） ───────────────────────────
 
-async function apiGet(base, p, timeoutMs = 20000) {
-  const ctrl = new AbortController()
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
-  try {
-    const res = await fetch(base + p, {
-      headers: { accept: 'application/json' },
-      signal: ctrl.signal,
-    })
-    const text = await res.text()
-    if (!res.ok) throw new Error(`${p} -> HTTP ${res.status} ${text.slice(0, 120)}`)
-    return text ? JSON.parse(text) : null
-  } finally {
-    clearTimeout(timer)
+/**
+ * 网络层重试（本机 orig-tg 已知间歇停摆：TCP 接受层面偶发数秒不响应，
+ * curl 与 Node 交替命中——2026-10-21 实测多次，进程始终健康）。
+ * 只对**网络错误**重试（fetch 抛错 / status 0），HTTP 状态码错误不重试
+ * （404/422 等是产品的确定性回答，重试会掩盖语义）。全部用法均幂等：
+ * GET 无害；POST 按 (source,ref) upsert；DELETE 幂等 ⇒ 重试安全。
+ */
+async function withNetRetry(fn, attempts = 4, gapMs = 2000) {
+  let lastErr = null
+  for (let i = 1; i <= attempts; i += 1) {
+    try {
+      return await fn()
+    } catch (e) {
+      lastErr = e
+      // 带 httpStatus 的错是产品的确定性回答（404/422…）—— 原样抛出，不重试
+      if (e && e.httpStatus) throw e
+      if (i < attempts) await delay(gapMs)
+    }
   }
+  throw lastErr
+}
+
+async function apiGet(base, p, timeoutMs = 20000) {
+  return withNetRetry(async () => {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+    try {
+      const res = await fetch(base + p, {
+        headers: { accept: 'application/json' },
+        signal: ctrl.signal,
+      })
+      const text = await res.text()
+      if (!res.ok) {
+        const e = new Error(`${p} -> HTTP ${res.status} ${text.slice(0, 120)}`)
+        e.httpStatus = res.status
+        throw e
+      }
+      return text ? JSON.parse(text) : null
+    } finally {
+      clearTimeout(timer)
+    }
+  })
 }
 
 /** 翻页遍历媒体库条目（offset 分页；同一批 id 重复出现即止，防呆）。 */
@@ -142,6 +225,86 @@ async function deriveSearchTerm(tg, item) {
     if (items.length >= 1 && items.some((x) => x.id === item.id)) return { term, total: r.total }
   }
   return null
+}
+
+/**
+ * 给夹具补**真字节**（BUG-364 复跑的决定性一步）。
+ *
+ * 为什么必须补：UI 媒体库搜索与 `deriveSearchTerm` 都带 `hasBytes=true`
+ * （MediaLibraryPanel.tsx 实证；后端口径 = `file_path IS NOT NULL`，见
+ * media.rs `ItemQuery::has_bytes` 的说明）—— 无字节条目进不了成品列表，
+ * 夹具没有字节 ⇒ 搜索框判据与卡片判据同时失去对象（等卡片等到超时）。
+ *
+ * 走**真实产品路径**而非任何后门：`POST /api/tg/cache/tasks` 入队 →
+ * worker T0 登记按 (tg, ref) 复用夹具条目（`register_media_item_t0` 的
+ * `item_id_by_ref` 分支，标题非空不覆盖）→ 下载完成由
+ * `backfill_item_bytes_with_blob` 回填 `file_path`。轮询以条目
+ * `bytesPresence === 'present'` 为准（BUG-132 三态探测 = 唯一真相）。
+ *
+ * 返回 `{ taskId, ownRecord, absolutePath }`：
+ *   taskId      = 入队响应给出的任务 id（`alreadyIngested` 时为 null）；
+ *   ownRecord   = 该任务行是否由本次探针**新建**（入队前 by-item 查无记录，
+ *                 且响应是恰好覆盖锚点一条的单消息任务）—— requeue 复用的
+ *                 旧行 / 相册组行不删，那是既有产品状态，探针无权抹掉；
+ *   absolutePath = 回填后的字节绝对路径（C1 残留断言用）。
+ */
+async function cacheAnchorForBytes(ep, anchor, itemId, timeoutMs = 240000) {
+  const ref = `${anchor.chatId}:${anchor.messageId}`
+  // 入队前先查：已有任务记录 ⇒ 即便响应是同一行也不是我们建的（requeue 复用）
+  const pre = await apiGet(ep.tg, `/api/tg/cache/tasks/by-item?refs=${encodeURIComponent(ref)}`)
+  const preExists = !!(pre && pre.tasks && pre.tasks[ref])
+  const enc = await httpJson('POST', `${ep.tg}/api/tg/cache/tasks`, {
+    chatId: anchor.chatId,
+    messageIds: [anchor.messageId],
+  })
+  if (enc.json && enc.json.alreadyIngested === true) {
+    // 并发写者已缓存过这条消息：字节已在盘，没有新任务行要清
+    const back = await apiGet(ep.tg, `/api/media/items/${itemId}`)
+    fixtureCache = { taskId: null, ownRecord: false, absolutePath: (back && back.absolutePath) || null, ref }
+    return fixtureCache
+  }
+  const taskId = enc.json && typeof enc.json.id === 'number' ? enc.json.id : null
+  if (enc.status >= 300 || !taskId) {
+    fatal(
+      `cache enqueue for fixture anchor ${ref} failed: ` +
+        `${enc.status}/${String(enc.text).slice(0, 160)}`,
+    )
+  }
+  const sole =
+    Array.isArray(enc.json.messageIds) &&
+    enc.json.messageIds.length === 1 &&
+    enc.json.messageIds[0] === anchor.messageId &&
+    String(enc.json.itemKey) === `m:${anchor.chatId}:${anchor.messageId}`
+  // 先落账再轮询：轮询途中 fatal（任务失败 / 超时）时，.catch 的
+  // cleanupFixture 也能凭这条记录删掉任务行与字节——不靠调用方记得传参。
+  fixtureCache = { taskId, ownRecord: !preExists && sole, absolutePath: null, ref }
+  const deadline = Date.now() + timeoutMs
+  let lastItem = null
+  let lastTask = null
+  while (Date.now() < deadline) {
+    lastItem = await apiGet(ep.tg, `/api/media/items/${itemId}`)
+    if (lastItem && lastItem.bytesPresence === 'present') {
+      fixtureCache.absolutePath = lastItem.absolutePath || null
+      return fixtureCache
+    }
+    const byItem = await apiGet(
+      ep.tg,
+      `/api/tg/cache/tasks/by-item?refs=${encodeURIComponent(ref)}`,
+    )
+    lastTask = (byItem && byItem.tasks && byItem.tasks[ref]) || null
+    if (lastTask && ['failed', 'cancelled', 'interrupted'].includes(lastTask.status)) {
+      fatal(
+        `cache task ${taskId} for ${ref} ended "${lastTask.status}" ` +
+          `(${lastTask.error || 'no error field'}) — fixture cannot get bytes`,
+      )
+    }
+    await delay(2000)
+  }
+  fatal(
+    `fixture bytes never became present within ${timeoutMs}ms ` +
+      `(task=${taskId} status=${lastTask && lastTask.status} ` +
+      `bytesPresence=${lastItem && lastItem.bytesPresence})`,
+  )
 }
 
 /** 解析 `<chat>:<msg>`（与前端 parseTgRef 同口径；不符返回 null，不兜底成 0）。 */
@@ -240,11 +403,20 @@ const INSTALL_HELPERS = (tgOrigin) => {
       b.click()
       return true
     },
-    /** 组内频道行 = 面板第二列（section）里的按钮；左栏监控行天然不在内。 */
+    /**
+     * 组内频道行 = 面板**第二列**（`tg-panel-root > div > section`，直接子级）
+     * 里的按钮。
+     *
+     * 为什么不能写 `panel.querySelector('section')`：左栏 aside 内部就有三个
+     * `<section>`（筛选/监控/订阅），document 顺序全在第二列之前 —— 旧写法取到
+     * 的是「文字筛选」节（2026-10-22 实证：预切频道 4  attempts 全失败，
+     * 点到的是筛选节按钮，频道头永不更新）。`>:scope > div > section` 只命中
+     * 第二列（aside 是同级 <aside>，其内 section 是孙级）。
+     */
     groupChannelTexts() {
       const panel = document.querySelector('[data-testid="tg-panel-root"]')
       if (!panel) return []
-      const col = panel.querySelector('section')
+      const col = panel.querySelector(':scope > div > section')
       if (!col) return []
       return Array.from(col.querySelectorAll('button'))
         .map((b) => (b.innerText || '').trim())
@@ -253,7 +425,7 @@ const INSTALL_HELPERS = (tgOrigin) => {
     clickChannelByText(text) {
       const panel = document.querySelector('[data-testid="tg-panel-root"]')
       if (!panel) return false
-      const col = panel.querySelector('section')
+      const col = panel.querySelector(':scope > div > section')
       if (!col) return false
       const b = Array.from(col.querySelectorAll('button')).find(
         (x) => (x.innerText || '').trim() === text,
@@ -328,19 +500,141 @@ async function forceLanguage(page, appUrl, lang) {
     localStorage.setItem('orig-hub:settings', JSON.stringify(cur))
   }, lang)
   await page.goto(appUrl, { settleMs: 1800 })
+  await waitForAppMount(page)
   await page.evaluate(INSTALL_HELPERS)
 }
 
-/** 打开文件域条目视图（父行 cat-all ⇒ items 视图，搜索框只在 items 视图渲染）。 */
-async function openItemsView(page) {
+/**
+ * 等应用**真正挂载**（`nav-files` 出现 = shell 已渲染）。
+ *
+ * 为什么不能只靠 goto 内部的 `#root` 子节点等待：加载态/半挂载同样往 #root
+ * 里渲染节点，会把「壳有了」误判成「应用好了」。2026-10-22 实证：并发提交
+ * （大批 shell 改动）后探针首跑，vite 冷转换把真实挂载甩到 openItemsView 的
+ * 25s 窗口外 ⇒ FATAL；同一序列 warm 后 3-7s 全过。挂载等待不属于任何判据，
+ * 只是保证判据有页面可跑；超时报错带 readyState / body 片段 / 页面错误，
+ * 不把「冷加载」和「产品真挂了」混成同一个无信息超时。
+ */
+async function waitForAppMount(page, timeoutMs = 90000) {
+  try {
+    await page.waitForFunction(() => !!document.querySelector('[data-testid="nav-files"]'), {
+      timeout: timeoutMs,
+      intervalMs: 300,
+    })
+  } catch (_e) {
+    const st = await page.evaluate(() => ({
+      ready: document.readyState,
+      root: (document.querySelector('#root') || { childElementCount: -1 }).childElementCount,
+      body: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 200),
+    }))
+    throw new Error(
+      `app did not mount within ${timeoutMs}ms (ready=${st.ready} rootChildren=${st.root} ` +
+        `body="${st.body}") pageErrors=${JSON.stringify(page.pageErrors().slice(0, 3))}`,
+    )
+  }
+}
+
+/**
+ * 打开文件域条目视图的**卡片网格**。
+ *
+ * BUG-299（2026-10-15 用户裁定）起 cat-all 渲染的是 FileListView **行**，
+ * media-card 网格只在**分类 tab** 渲染 —— 旧探针只点 nav-files 落 cat-all，
+ * 永远等不到 media-card（2026-10-22 实证 FATAL：探针腐烂，非产品回归）。
+ * 故显式进分类 tab：`cat='video'`（夹具锚点是 video）/ `'image'`（负样本
+ * 本地条目是 photo ⇒ image 档）。
+ */
+async function openItemsView(page, cat = 'video') {
+  await waitForAppMount(page)
   await page.evaluate(() => {
     const el = document.querySelector('[data-testid="nav-files"]')
     if (el) el.click()
   })
-  await page.waitForFunction(() => !!document.querySelector('[data-testid="media-search-input"]'), {
+  // 分类子项只在文件树展开态渲染；折叠态先开展（ Chevron 恒在）。
+  await page.evaluate(() => {
+    if (!document.querySelector('[data-testid="nav-child-cat-video"]') &&
+        !document.querySelector('[data-testid="nav-child-image"]')) {
+      const chevron = document.querySelector('[data-testid="files-chevron"]')
+      if (chevron) chevron.click()
+    }
+  })
+  const testid = cat === 'video' ? 'nav-child-cat-video' : `nav-child-${cat}`
+  await page.waitForFunction((t) => !!document.querySelector(`[data-testid="${t}"]`), {
+    timeout: 15000,
+    args: [testid],
+  })
+  await page.evaluate((t) => {
+    const el = document.querySelector(`[data-testid="${t}"]`)
+    if (el) el.click()
+  }, testid)
+  try {
+    await page.waitForFunction(() => !!document.querySelector('[data-testid="media-search-input"]'), {
+      timeout: 25000,
+    })
+  } catch (_e) {
+    const st = await page.evaluate(() => ({
+      navFiles: !!document.querySelector('[data-testid="nav-files"]'),
+      body: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 200),
+    }))
+    throw new Error(
+      `media-search-input did not appear within 25s after clicking ${testid} ` +
+        `(navFiles=${st.navFiles} body="${st.body}") ` +
+        `pageErrors=${JSON.stringify(page.pageErrors().slice(0, 3))}`,
+    )
+  }
+  await delay(700)
+}
+
+/**
+ * 打开 cat-all **文件行**视图（BUG-385 起「在 TG 中查看」的行级入口面；
+ * BUG-307 锁后 items 网格不承载 TG 跳转 ⇒ 条目级判据的现行落点）。
+ * 搜索框在 items 视图恒渲染，cat-all 行集 = `items`（含 q 过滤）⇒ 可搜。
+ */
+async function openCatAllRows(page) {
+  await waitForAppMount(page)
+  await page.evaluate(() => {
+    const el = document.querySelector('[data-testid="nav-files"]')
+    if (el) el.click()
+  })
+  await page.waitForFunction(() => !!document.querySelector('[data-testid="file-list-row"]'), {
     timeout: 25000,
   })
   await delay(700)
+}
+
+/**
+ * 在 cat-all 行列表里**滚动找到**指定条目行（有界，触底即停）。
+ *
+ * 为什么必须滚：cat-all 行集 = 搜索过滤后的媒体条目 ∪ **全部**下载成品行
+ * （成品行当前不参与 q 过滤，BUG-386 已登记；按日期混排）⇒ 目标行可能落在
+ * 虚拟窗口（视口 ± overscan）之外，纯 waitForFunction 会假超时（2026-10-22 实证：
+ * total=39，254 在第 ~20 位、scrollTop=603 处）。
+ */
+async function scrollToFileRow(page, itemId, timeoutMs = 30000) {
+  const t0 = Date.now()
+  while (Date.now() - t0 < timeoutMs) {
+    const found = await page.evaluate((id) => {
+      const row = document.querySelector(`[data-testid="file-list-row"][data-item-id="${id}"]`)
+      if (row) {
+        row.scrollIntoView({ block: 'center' })
+        return true
+      }
+      const scroller = document.querySelector('[data-testid="file-list-scroll"]')
+      if (!scroller) return false
+      const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2
+      if (atBottom) {
+        // 触底后最后一批行可能刚渲染：再给一拍，仍没有才算真没有
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            resolve(!!document.querySelector(`[data-testid="file-list-row"][data-item-id="${id}"]`))
+          }, 400)
+        })
+      }
+      scroller.scrollTop += 600
+      return false
+    }, itemId)
+    if (found) return true
+    await delay(150)
+  }
+  return false
 }
 
 /** 打开剧集墙并进入指定剧集详情（等来源块出现）。 */
@@ -374,6 +668,14 @@ async function preswitchOtherChannel(page, ctx) {
     timeout: 25000,
   })
   await delay(900)
+  // 「频道 · 来源」节**默认折叠**（channelOpen=false）⇒ 组行（全部订阅…）
+  // 不渲染。先幂等展开（aria-expanded=false 才点），否则 asideButtonByText
+  // 找不到「全部订阅」而 Loud FAIL（2026-10-22 实证的探针腐烂点）。
+  await page.evaluate(() => {
+    const toggle = document.querySelector('[data-testid="channel-collapse-toggle"]')
+    if (toggle && toggle.getAttribute('aria-expanded') === 'false') toggle.click()
+  })
+  await delay(400)
   const opened = await page.evaluate((label) => window.__b305.asideButtonByText(label), ctx.navAllLabel)
   if (!opened) throw new Error(`cannot open subscription group list (${ctx.navAllLabel})`)
   await page.waitForFunction(() => window.__b305.groupChannelTexts().length > 0, { timeout: 30000 })
@@ -494,9 +796,80 @@ function assertLocate(label, res, ctx) {
 
 // ─────────────────────────── 主流程 ───────────────────────────
 
+/**
+ * BUG-364 supersede 复跑夹具（模块级：main 与 .catch 的清理都要用）。
+ *
+ * 为什么需要夹具：2026-10-21 实测库态里**没有**同时满足选靶三条件的条目——
+ * 监控缓存窗口内的剧集条目全是 BUG-362 兜底标题（展示层 fill-empty、不入库
+ * 不可搜），可搜的又都在缓存窗口外。夹具 = TG 源登记 + 无 caption 的 video
+ * 消息锚点 + 唯一可搜标题 + **引擎缓存补真字节**（UI 搜索与 deriveSearchTerm
+ * 都过 hasBytes 门，无字节夹具不可见）；BUG-304「导入即成剧」自动给它建剧集。
+ *
+ * 清理策略（精确制导，不用基线差分）：只删「装着夹具条目」的剧集 + 夹具
+ * 条目本身 + 探针自己入队的缓存任务记录 + 落盘字节 —— 并发写者的在飞夹具
+ * 可能同窗口新建，基线差分会误删别人的东西；requeue 复用的旧任务行是既有
+ * 产品状态，同样不删（ownRecord 标记区分）。
+ */
+let fixture = null
+let epRef = null
+let fixtureCache = null
+
+async function cleanupFixture(ep) {
+  if (!fixture) return ['fixture was never created']
+  const problems = []
+  // ① 落盘字节：只删字节、记录保留（422 = 已无可清；404 = 条目已没了）。
+  //    不做的话 C1 的「残留=0」只覆盖了库内行，磁盘上还留着探针下载的视频。
+  const cb = await httpJson('DELETE', `${ep.tg}/api/cache/items/${fixture.itemId}`)
+  if (cb.status >= 300 && cb.status !== 422 && cb.status !== 404) {
+    problems.push(`cache item clear -> ${cb.status}`)
+  }
+  // ② 缓存任务记录：仅删探针自己新建的那行（ownRecord）。删除端点任何状态
+  //    可删（内部先置 cancelled 再删行），不会把 worker 留在悬空 id 上。
+  if (fixtureCache && fixtureCache.ownRecord && typeof fixtureCache.taskId === 'number') {
+    const dt = await httpJson('DELETE', `${ep.tg}/api/cache/tasks/${fixtureCache.taskId}`)
+    if (dt.status >= 300 && dt.status !== 404) problems.push(`cache task delete -> ${dt.status}`)
+    try {
+      const byItem = await apiGet(
+        ep.tg,
+        `/api/tg/cache/tasks/by-item?refs=${encodeURIComponent(fixture.ref)}`,
+      )
+      if (byItem && byItem.tasks && byItem.tasks[fixture.ref]) {
+        problems.push('cache task record still present after delete')
+      }
+    } catch (_e) {
+      /* 查询失败不篡夺删除结果的事实，交由上面状态码判据 */
+    }
+  }
+  const seriesList = await apiGet(ep.tg, '/api/media/series?limit=500')
+  for (const s of seriesList.items || []) {
+    const sd = await apiGet(ep.tg, `/api/media/series/${s.id}`)
+    if ((sd.episodes || []).some((e) => e.itemId === fixture.itemId)) {
+      const d = await httpJson('DELETE', `${ep.tg}/api/media/series/${s.id}`)
+      if (d.status >= 300) problems.push(`series ${s.id} delete -> ${d.status}`)
+    }
+  }
+  const di = await httpJson('DELETE', `${ep.tg}/api/media/items/${fixture.itemId}`)
+  if (di.status >= 300 && di.status !== 404) problems.push(`item delete -> ${di.status}`)
+  try {
+    await apiGet(ep.tg, `/api/media/items/${fixture.itemId}`)
+    problems.push('fixture item still readable after delete')
+  } catch (_e) {
+    /* 404 = 删净 */
+  }
+  // ③ 磁盘真值：清字节/删条目都会在引用归零时 unlink——直接 stat 落点，
+  //    不靠「API 说 200」推断字节没了（取不到 ≠ 没有，真值只有一个）。
+  if (fixtureCache && fixtureCache.absolutePath) {
+    if (fs.existsSync(fixtureCache.absolutePath)) {
+      problems.push(`fixture bytes still on disk: ${fixtureCache.absolutePath}`)
+    }
+  }
+  return problems
+}
+
 async function main() {
   fs.mkdirSync(OUT, { recursive: true })
   const ep = await endpoints.resolve()
+  epRef = ep
   console.log(`[bug305] app=${ep.app} tg=${ep.tg} out=${OUT}`)
 
   const zh = JSON.parse(fs.readFileSync(LOCALE_ZH, 'utf8'))
@@ -526,11 +899,106 @@ async function main() {
     `channels=${monitored.map((c) => `${c.channelId}:${c.title}`).join(' | ')}`,
   )
 
+  // ── 夹具：库态无「剧集+可达+可搜」三元目标时自造自删（BUG-364 复跑）──
+  // 锚点选**各监控频道第一页的无 caption video 消息**：第一页 = 深度 1 必然
+  // 可达；无 caption 是因为服务端「以流水 caption 为准」（import_media_items），
+  // 有 caption 会覆盖夹具标题 ⇒ 不可搜。非相册消息（无 groupId）优先：单条
+  // 缓存语义最干净，不牵动组内其它消息。标题用『〖B』开头：全库唯一，搜索
+  // 一词命中且只命中它（2026-10-21 实测 total=1）。
+  const itemsBefore = await listAllItems(ep.tg)
+  const refsBefore = new Set(itemsBefore.map((i) => i.ref))
+  const anchors = []
+  for (const c of monitored) {
+    const r = await apiGet(ep.tg, `/api/tg/monitor/messages?channelId=${c.channelId}&limit=30`)
+    for (const m of r.items || []) {
+      if (m.type !== 'video') continue
+      if (m.caption && m.caption.trim()) continue
+      const ref = `${c.channelId}:${m.messageId}`
+      if (refsBefore.has(ref)) continue
+      anchors.push({
+        ref,
+        chatId: c.channelId,
+        messageId: m.messageId,
+        grouped: !!m.groupId,
+        size: typeof m.size === 'number' ? m.size : Number.MAX_SAFE_INTEGER,
+      })
+    }
+  }
+  if (anchors.length === 0) {
+    fatal('fixture: no caption-less video message on any monitored channel first page')
+  }
+  // 非相册优先（单条缓存语义最干净）；同级按体积小优先——夹具要真下载字节，
+  // 撞上超大视频会把轮询窗口拖爆（那是选靶失误，不是产品回归）。
+  anchors.sort((x, y) => Number(x.grouped) - Number(y.grouped) || x.size - y.size)
+  const fixtureTitle = '〖BUG305〗夹具靶点'
+  let created = null
+  for (const a of anchors.slice(0, 5)) {
+    // 竞态再确认：listing 与建条目之间，并发写者可能已占同一 ref ——
+    // POST 是 (source,ref) upsert，会**覆盖**别人的标题，必须先查再建。
+    const pre2 = await apiGet(
+      ep.tg,
+      `/api/media/items/by-ref?source=tg&ref=${encodeURIComponent(a.ref)}`,
+    )
+    if (pre2 && typeof pre2.id === 'number') continue
+    const res = await httpJson('POST', `${ep.tg}/api/media/items`, {
+      items: [{ source: 'tg', ref: a.ref, kind: 'video', title: fixtureTitle }],
+    })
+    const id = res.json && Array.isArray(res.json.ids) ? res.json.ids[0] : null
+    if (!id) fatal(`fixture item create failed: ${res.status}/${res.text.slice(0, 120)}`)
+    let back = null
+    try {
+      back = await apiGet(ep.tg, `/api/media/items/${id}`)
+    } catch (e) {
+      // 别把半成品留在库里（读回失败也要删）
+      await httpJson('DELETE', `${ep.tg}/api/media/items/${id}`)
+      throw e
+    }
+    if (String((back && back.title) || '') !== fixtureTitle) {
+      // 消息其实有 caption，标题被服务端覆盖 —— 删掉换下一个锚点
+      await httpJson('DELETE', `${ep.tg}/api/media/items/${id}`)
+      continue
+    }
+    // 先落账再补字节：此后任何一步 fatal（无剧集 / 缓存失败 / 轮询超时），
+    // .catch 的 cleanupFixture 都知道要删什么——夹具生命周期对 FATAL 路径
+    // 同样封闭，不会「建到一半躺库里」。
+    fixture = { itemId: id, ref: a.ref, chatId: a.chatId, messageId: a.messageId, title: fixtureTitle }
+    if (typeof back.seriesId !== 'number') {
+      fatal(
+        `fixture item ${id} has no series (BUG-304 auto-filing missing) — ` +
+          'series-level criteria would be vacuous',
+      )
+    }
+    // 补真字节（UI 搜索与 deriveSearchTerm 的 hasBytes 门都要求它）；
+    // 内部自行维护 fixtureCache（含 FATAL 路径可清的任务行落账）。
+    await cacheAnchorForBytes(ep, a, id)
+    created = { itemId: id, ...a }
+    break
+  }
+  if (!created) fatal('fixture: every anchor produced a caption-overridden title')
+  fixture = { ...created, title: fixtureTitle }
+
   const items = await listAllItems(ep.tg)
+  const fixtureItem = items.find((i) => i.id === fixture.itemId) || null
+  if (!fixtureItem) {
+    fatal(`fixture item ${fixture.itemId} vanished from the listing right after creation`)
+  }
+  if (fixtureItem.bytesPresence !== 'present') {
+    // 缓存轮询说 present 这里却说没有 ⇒ 探测口径不一致，必须当场红灯，
+    // 绝不能带着「其实不可搜」的夹具往下跑（搜索框判据会变成假绿）。
+    fatal(
+      `fixture item ${fixture.itemId} has no bytes in listing ` +
+        `(bytesPresence=${fixtureItem.bytesPresence}) — cacheAnchorForBytes lied`,
+    )
+  }
+  // 夹具已补真字节 ⇒ 它本身就过 hasBytes 门，会出现在自然候选里；置顶前
+  // 先去重，避免同一 id 两颗候选（选靶结果仍对，但 candidates=N 读数会虚）。
+  // 其余候选仍按「有字节」过滤：无字节条目在 UI 成品列表里不可见，
+  // 拿它当判据对象 = 等一张永远不会出现的卡片。
   const tgCandidates = items
-    .filter((i) => i.source === 'tg' && i.bytesPresence === 'present')
+    .filter((i) => i.source === 'tg' && i.bytesPresence === 'present' && i.id !== fixture.itemId)
     .map((i) => ({ item: i, at: parseRef(i.ref) }))
     .filter((x) => x.at && monSet.has(x.at.chatId))
+  tgCandidates.unshift({ item: fixtureItem, at: parseRef(fixtureItem.ref) })
   if (tgCandidates.length === 0) {
     fatal(
       `no tg-sourced library item from a monitored channel (scanned ${items.length} items). ` +
@@ -543,19 +1011,35 @@ async function main() {
   const ordered = [...withSeries, ...others]
   let picked = null
   let reach = null
-  for (const cand of ordered.slice(0, 12)) {
-    const r = await monitorMessageReachable(ep.tg, cand.at.chatId, cand.at.messageId, 6)
-    if (r.found && typeof cand.item.seriesId === 'number') {
-      picked = cand
-      reach = r
-      break
-    }
+  let itemTerm = null
+  // 可达窗口 12 页（= helper 默认值）：监控缓存随新消息增长，旧消息自然变深——
+  // 2026-10-21 实测全部剧集候选已沉到 6 页外（目标 4837 深度=7），
+  // 调用方原先写死 6 页会把这个探针永远 FATAL 在选靶上（库态增长的非产品回归）。
+  // 12 页仍远小于产品定位循环的 LOCATE_MAX_PAGES=20，选靶余量不变紧。
+  // 选靶三条件缺一不可（缺任一即该类判据空转，按本探针反假绿设计 FATAL）：
+  //   ① 属于剧集（剧集级判据的对象）；
+  //   ② 监控流可达（定位判据的对象）；
+  //   ③ 标题可派生搜索词（搜索框判据的对象）——BUG-362 起兜底标题
+  //      （`未命名视频 #1574`）是展示层 fill-empty、不入库不可搜，而候选按
+  //      newest-first 排，头条目经常正是它；不把③纳入选靶就会 FATAL 在
+  //      deriveSearchTerm 上（2026-10-21 实测即此）。
+  for (const cand of ordered) {
+    if (typeof cand.item.seriesId !== 'number') continue
+    const r = await monitorMessageReachable(ep.tg, cand.at.chatId, cand.at.messageId, 12)
+    if (!r.found) continue
+    const term = await deriveSearchTerm(ep.tg, cand.item)
+    if (!term) continue
+    picked = cand
+    reach = r
+    itemTerm = term
+    break
   }
   if (!picked) {
     fatal(
       'no reachable tg item from a monitored channel that belongs to a series ' +
-        `(candidates=${tgCandidates.length}). A target that cannot be located would make ` +
-        'criterion 1 vacuous — refusing to report a skip as a pass.',
+        `and has a searchable title (candidates=${tgCandidates.length}). ` +
+        'A target that cannot be located would make criterion 1 vacuous — ' +
+        'refusing to report a skip as a pass.',
     )
   }
   check(
@@ -582,7 +1066,7 @@ async function main() {
     fatal('picked target item has no series — series-level criterion would be vacuous')
   }
 
-  const itemTerm = await deriveSearchTerm(ep.tg, picked.item)
+  // itemTerm 已在选靶循环里派生（选靶条件③）——target 不可搜根本进不来。
   if (!itemTerm) {
     fatal(`cannot derive a search term that uniquely finds item ${picked.item.id} in the API`)
   }
@@ -634,6 +1118,10 @@ async function main() {
     itemTerm: itemTerm.term,
     localItemId: localItem.id,
     localItemTerm: localTerm.term,
+    // cat-all 行级门控用**全标题**：短前缀在「全部文件」全类目下命中数超分页
+    // （PAGE=60，虚拟列表只渲染视口行）⇒ 目标行被挤出已加载页，等到超时。
+    // 全标题唯一命中 ⇒ 行必在第一页（2026-10-22 实证修法）。
+    localItemFullTitle: String(localItem.title || ''),
     localSeriesId: localSeries.id,
     navAllLabel: L.navAllZh,
   }
@@ -665,6 +1153,10 @@ async function main() {
     check('⓪b zh-CN 已生效（<html lang>）', String(langNow).toLowerCase().startsWith('zh'), `lang=${langNow}`)
 
     // ── 判据 4（条目级）：有坐标 ⇒ 渲染；本地 ⇒ 不渲染 ──
+    // 入口面以 **BUG-307 设计锁**（2026-10-14 用户拍板）为准：「视频 = 通用类，
+    // TG 跳转 = 剧集链路专有 ⇒ items 网格 MediaCard 不烤 onViewInTg」。
+    // 旧判据「卡片有入口」随该锁失效（探针腐烂，2026-10-22 修）；现行入口面 =
+    // cat-all 文件行（BUG-385）+ 剧集链路（SeriesDetail 来源块）。
     await openItemsView(page)
     await page.evaluate((t) => window.__b305.setInput('[data-testid="media-search-input"]', t), ctx.itemTerm)
     await page.waitForFunction(
@@ -681,26 +1173,49 @@ async function main() {
       }),
       ctx.itemId,
     )
-    await page.screenshot(path.join(OUT, '1_media_library_entry.png'))
+    await page.screenshot(path.join(OUT, '1_media_grid_no_entry_bug307.png'))
     check(
-      '判据4 TG 来源条目卡片渲染「在 TG 中查看」入口（有坐标就给入口）',
-      tgCardEntry.entry !== null && tgCardEntry.entry.tag === 'BUTTON',
+      '判据4a（BUG-307 锁）items 网格卡片不烤入 TG 入口（视频=通用类，反向证伪旧判据）',
+      tgCardEntry.cards >= 1 && tgCardEntry.entry === null,
       `cards=${tgCardEntry.cards} entry=${JSON.stringify(tgCardEntry.entry)}`,
     )
+
+    // 现行入口面：cat-all 文件行（BUG-385）——有坐标才渲染
+    await openCatAllRows(page)
+    await page.evaluate((t) => window.__b305.setInput('[data-testid="media-search-input"]', t), ctx.itemTerm)
+    const tgRowFound = await scrollToFileRow(page, ctx.itemId)
+    await delay(500)
+    const tgRowEntry = await page.evaluate(
+      (id) => ({
+        rows: window.__b305.present('[data-testid="file-list-row"]'),
+        entry: window.__b305.entryInfo(
+          `[data-testid="file-list-row"][data-item-id="${id}"] [data-testid^="file-list-view-tg-"]`,
+        ),
+      }),
+      ctx.itemId,
+    )
+    await page.screenshot(path.join(OUT, '1_media_library_row_entry.png'))
     check(
-      '判据4 入口文案走 i18n（zh-CN = 在 TG 中查看）',
-      tgCardEntry.entry !== null && tgCardEntry.entry.text === L.viewInTgZh,
-      `text=${tgCardEntry.entry && tgCardEntry.entry.text}`,
+      '判据4b（BUG-385 现行面）TG 来源文件行渲染「在 TG 中查看」入口（有坐标就给入口）',
+      tgRowFound && tgRowEntry.rows >= 1 && tgRowEntry.entry !== null && tgRowEntry.entry.tag === 'BUTTON',
+      `rowFound=${tgRowFound} rows=${tgRowEntry.rows} entry=${JSON.stringify(tgRowEntry.entry)}`,
+    )
+    check(
+      '判据4b 入口文案走 i18n（zh-CN = 在 TG 中查看）',
+      tgRowEntry.entry !== null && tgRowEntry.entry.text === L.viewInTgZh,
+      `text=${tgRowEntry.entry && tgRowEntry.entry.text}`,
     )
     check(
       '判据2 应用内入口是 button（无 href / target，本身不离开应用）',
-      tgCardEntry.entry !== null &&
-        tgCardEntry.entry.tag === 'BUTTON' &&
-        !tgCardEntry.entry.href &&
-        !tgCardEntry.entry.target,
-      `entry=${JSON.stringify(tgCardEntry.entry)}`,
+      tgRowEntry.entry !== null &&
+        tgRowEntry.entry.tag === 'BUTTON' &&
+        !tgRowEntry.entry.href &&
+        !tgRowEntry.entry.target,
+      `entry=${JSON.stringify(tgRowEntry.entry)}`,
     )
 
+    // 负样本是本地 **photo** ⇒ 切 image 档再搜（video 档里永远看不到它）
+    await openItemsView(page, 'image')
     await page.evaluate((t) => window.__b305.setInput('[data-testid="media-search-input"]', t), ctx.localItemTerm)
     await page.waitForFunction(
       (id) => !!document.querySelector(`[data-testid="media-card"][data-item-id="${id}"]`),
@@ -719,9 +1234,33 @@ async function main() {
     )
     await page.screenshot(path.join(OUT, '1b_local_card_no_entry.png'))
     check(
-      '判据4 本地来源条目卡片不渲染入口（点了也没有坐标可跳）',
+      '判据4 本地来源条目卡片不渲染入口（BUG-307 锁下网格恒无入口，反向佐证）',
       localCard.cards >= 1 && localCard.entries === 0,
       `cards=${localCard.cards} cardEntries=${localCard.entries} anyEntry=${localCard.anyEntry}`,
+    )
+
+    // 坐标门控的真判据面（BUG-385）：本地来源的 cat-all **行**同样不渲染入口
+    await openCatAllRows(page)
+    await page.evaluate(
+      (t) => window.__b305.setInput('[data-testid="media-search-input"]', t),
+      ctx.localItemFullTitle,
+    )
+    const localRowFound = await scrollToFileRow(page, ctx.localItemId)
+    await delay(500)
+    const localRow = await page.evaluate(
+      (id) => ({
+        rows: window.__b305.present('[data-testid="file-list-row"]'),
+        entries: window.__b305.present(
+          `[data-testid="file-list-row"][data-item-id="${id}"] [data-testid^="file-list-view-tg-"]`,
+        ),
+        anyEntry: window.__b305.present('[data-testid^="file-list-view-tg-"]'),
+      }),
+      ctx.localItemId,
+    )
+    check(
+      '判据4c（BUG-385 门控）本地来源文件行不渲染入口（无坐标可跳）',
+      localRowFound && localRow.rows >= 1 && localRow.entries === 0,
+      `rowFound=${localRowFound} rows=${localRow.rows} rowEntries=${localRow.entries} anyEntry=${localRow.anyEntry}`,
     )
 
     // ── 判据 1/2/7（条目级跳转）──
@@ -732,23 +1271,21 @@ async function main() {
       otherChannelId !== String(ctx.targetChatId),
       `preswitched=${otherChannelId} target=${ctx.targetChatId}`,
     )
-    await openItemsView(page)
+    // 条目级跳转的现行入口 = cat-all 文件行（BUG-385；items 网格按 BUG-307 锁不承载）
+    await openCatAllRows(page)
     await page.evaluate((t) => window.__b305.setInput('[data-testid="media-search-input"]', t), ctx.itemTerm)
-    await page.waitForFunction(
-      (id) => !!document.querySelector(`[data-testid="media-card"][data-item-id="${id}"]`),
-      { timeout: 25000, args: [ctx.itemId] },
-    )
+    const jumpRowFound = await scrollToFileRow(page, ctx.itemId)
     await delay(400)
     const itemRes = await clickEntryAndAwaitLocate(
       page,
       ctx,
-      `[data-testid="media-card"][data-item-id="${ctx.itemId}"] [data-testid="item-view-tg"]`,
+      `[data-testid="file-list-row"][data-item-id="${ctx.itemId}"] [data-testid^="file-list-view-tg-"]`,
     )
     await page.screenshot(path.join(OUT, '2_item_jump_located.png'))
     check(
       '判据1 条目级：入口可点且定位到目标消息',
-      itemRes.clicked === true && itemRes.key === ctx.expectedKey,
-      `clicked=${itemRes.clicked} key=${itemRes.key} expected=${ctx.expectedKey}`,
+      jumpRowFound && itemRes.clicked === true && itemRes.key === ctx.expectedKey,
+      `rowFound=${jumpRowFound} clicked=${itemRes.clicked} key=${itemRes.key} expected=${ctx.expectedKey}`,
     )
     assertLocate('条目级', itemRes, ctx)
     check(
@@ -977,25 +1514,22 @@ async function main() {
       await enPage.evaluate(INSTALL_HELPERS)
       const enLang = await enPage.evaluate(() => window.__b305.lang())
       check('⓪c en-US 已生效（<html lang>）', String(enLang).toLowerCase().startsWith('en'), `lang=${enLang}`)
-      await openItemsView(enPage)
+      await openCatAllRows(enPage)
       await enPage.evaluate((t) => window.__b305.setInput('[data-testid="media-search-input"]', t), ctx.itemTerm)
-      await enPage.waitForFunction(
-        (id) => !!document.querySelector(`[data-testid="media-card"][data-item-id="${id}"]`),
-        { timeout: 25000, args: [ctx.itemId] },
-      )
+      const enRowFound = await scrollToFileRow(enPage, ctx.itemId)
       await delay(500)
       const enEntry = await enPage.evaluate(
         (id) =>
           window.__b305.entryInfo(
-            `[data-testid="media-card"][data-item-id="${id}"] [data-testid="item-view-tg"]`,
+            `[data-testid="file-list-row"][data-item-id="${id}"] [data-testid^="file-list-view-tg-"]`,
           ),
         ctx.itemId,
       )
       await enPage.screenshot(path.join(OUT, '6_en_us_entry.png'))
       check(
         'i18n en-US 会话入口文案 === "View in TG"（非中文硬编码）',
-        enEntry !== null && enEntry.text === L.viewInTgEn,
-        `entry=${JSON.stringify(enEntry)}`,
+        enRowFound && enEntry !== null && enEntry.text === L.viewInTgEn,
+        `rowFound=${enRowFound} entry=${JSON.stringify(enEntry)}`,
       )
       const enErrs = enPage.pageErrors().slice(0, 5)
       check('无未捕获页面错误（en-US 会话）', enErrs.length === 0, enErrs.join(' | '))
@@ -1021,30 +1555,28 @@ async function main() {
         fs.writeFileSync(MEDIA_LIBRARY_PANEL_TSX, beforeText.replace(TAMPER_FROM, TAMPER_TO))
         await delay(1000) // 等 vite watch 失效模块缓存
         await page.goto(ep.app, { settleMs: 1800 })
+        await waitForAppMount(page)
         await page.evaluate(INSTALL_HELPERS)
-        await openItemsView(page)
+        await openCatAllRows(page)
         await page.evaluate((t) => window.__b305.setInput('[data-testid="media-search-input"]', t), ctx.itemTerm)
-        await page.waitForFunction(
-          (id) => !!document.querySelector(`[data-testid="media-card"][data-item-id="${id}"]`),
-          { timeout: 25000, args: [ctx.itemId] },
-        )
+        const redRowFound = await scrollToFileRow(page, ctx.itemId)
         await delay(400)
         const redEntry = await page.evaluate(
           (id) =>
             window.__b305.entryInfo(
-              `[data-testid="media-card"][data-item-id="${id}"] [data-testid="item-view-tg"]`,
+              `[data-testid="file-list-row"][data-item-id="${id}"] [data-testid^="file-list-view-tg-"]`,
             ),
           ctx.itemId,
         )
         check(
           '④a 红态：入口仍在且可点（证明红的不是「按钮没了」）',
-          redEntry !== null && redEntry.tag === 'BUTTON',
-          `entry=${JSON.stringify(redEntry)}`,
+          redRowFound && redEntry !== null && redEntry.tag === 'BUTTON',
+          `rowFound=${redRowFound} entry=${JSON.stringify(redEntry)}`,
         )
         const redRes = await clickEntryAndAwaitLocate(
           page,
           ctx,
-          `[data-testid="media-card"][data-item-id="${ctx.itemId}"] [data-testid="item-view-tg"]`,
+          `[data-testid="file-list-row"][data-item-id="${ctx.itemId}"] [data-testid^="file-list-view-tg-"]`,
           { locateTimeout: 30000 },
         )
         await page.screenshot(path.join(OUT, '7_red_state_no_locate.png'))
@@ -1078,31 +1610,40 @@ async function main() {
 
       await delay(1000)
       await page.goto(ep.app, { settleMs: 1800 })
+      await waitForAppMount(page)
       await page.evaluate(INSTALL_HELPERS)
-      await openItemsView(page)
+      await openCatAllRows(page)
       await page.evaluate((t) => window.__b305.setInput('[data-testid="media-search-input"]', t), ctx.itemTerm)
-      await page.waitForFunction(
-        (id) => !!document.querySelector(`[data-testid="media-card"][data-item-id="${id}"]`),
-        { timeout: 25000, args: [ctx.itemId] },
-      )
+      const greenRowFound = await scrollToFileRow(page, ctx.itemId)
       await delay(400)
       const greenRes = await clickEntryAndAwaitLocate(
         page,
         ctx,
-        `[data-testid="media-card"][data-item-id="${ctx.itemId}"] [data-testid="item-view-tg"]`,
+        `[data-testid="file-list-row"][data-item-id="${ctx.itemId}"] [data-testid^="file-list-view-tg-"]`,
       )
       await page.screenshot(path.join(OUT, '8_restore_green.png'))
       check(
         '④f 还原后复跑：条目级跳转重新定位到目标消息并高亮',
-        greenRes.key === ctx.expectedKey &&
+        greenRowFound &&
+          greenRes.key === ctx.expectedKey &&
           greenRes.after.channelId === String(ctx.targetChatId) &&
           greenRes.after.highlightedKey === 'true',
-        `key=${greenRes.key} channel=${greenRes.after.channelId} highlight=${greenRes.after.highlightedKey}`,
+        `rowFound=${greenRowFound} key=${greenRes.key} channel=${greenRes.after.channelId} highlight=${greenRes.after.highlightedKey}`,
       )
     }
   } finally {
     if (browser) await browser.close()
   }
+
+  // ── 夹具清理（C1：残留 = 0）——全部判据跑完才删，falsification 复跑也用得到 ──
+  const cleanupProblems = await cleanupFixture(ep)
+  check(
+    'C1 夹具残留 = 0（条目 + 装着它的剧集 + 探针入队的缓存任务记录 + 落盘字节，复查 404 / 不存在）',
+    cleanupProblems.length === 0,
+    cleanupProblems.join(' | ') ||
+      `item=${fixture ? fixture.itemId : '-'} ref=${fixture ? fixture.ref : '-'} ` +
+        `task=${fixtureCache && fixtureCache.taskId !== null ? fixtureCache.taskId : '-'} deleted`,
+  )
 
   const passed = checks.filter((c) => c.ok).length
   fs.writeFileSync(
@@ -1120,6 +1661,14 @@ async function main() {
           messageId: ctx.targetMessageId,
           expectedKey: ctx.expectedKey,
           monitorPagesToTarget: reach.pages,
+          fixture: fixture ? { itemId: fixture.itemId, ref: fixture.ref } : null,
+          fixtureCache: fixtureCache
+            ? {
+                taskId: fixtureCache.taskId,
+                ownRecord: fixtureCache.ownRecord,
+                bytesPath: fixtureCache.absolutePath,
+              }
+            : null,
         },
         checks,
       },
@@ -1131,7 +1680,17 @@ async function main() {
   process.exit(passed === checks.length ? 0 : 2)
 }
 
-main().catch((e) => {
+main().catch(async (e) => {
   console.error('FATAL', (e && e.stack) || e)
+  // fatal() 改 throw 后，夹具清理在这条路上也要跑（否则 FATAL 即泄漏）
+  if (fixture && epRef) {
+    try {
+      const problems = await cleanupFixture(epRef)
+      if (problems.length) console.error('[bug305] fixture cleanup problems:', problems.join(' | '))
+      else console.error(`[bug305] fixture cleaned on fatal path: item=${fixture.itemId}`)
+    } catch (_e) {
+      console.error('[bug305] fixture cleanup failed:', String((_e && _e.message) || _e))
+    }
+  }
   process.exit(2)
 })
