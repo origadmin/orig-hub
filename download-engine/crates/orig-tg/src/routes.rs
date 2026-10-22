@@ -2525,17 +2525,32 @@ impl IngestCtx {
     // 安全网——历史任务、入队时登记失败的消息、以及升级前入队的任务都靠它兜底。
     ensure_message_rows(st, task.chat_id, &task.message_ids).await;
     // BUG-281：组级 caption 正文只取一次（与 `ensure_series` 同一来源）——相册组
-    // 的 caption 通常只挂在一条消息上，正文分发给组内自己的 caption 没有正文的
+    // 的 caption 通常只挂一条消息上，正文分发给组内自己的 caption 没有正文的
     // 分集；标题不分发（BUG-154：不伪造标题）。
-    let group_desc = st
-        .store
-        .first_caption(task.chat_id, &task.message_ids)
-        .await
-        .ok()
-        .flatten()
+    // BUG-378：来源同样以 `media_message` 的**权威组**为准 —— 任务行 items 只是
+    // 当时入队的消息（单条任务不含组内有 caption 的那条），按 items 找会漏。
+    let group_desc = {
+        let anchor = task.message_ids.first().copied().unwrap_or(0);
+        let cap = if anchor != 0 {
+            st.store
+                .tg_group_facts(task.chat_id, anchor)
+                .await
+                .ok()
+                .and_then(|(_group, cap)| cap)
+        } else {
+            None
+        };
+        cap.or(
+            st.store
+                .first_caption(task.chat_id, &task.message_ids)
+                .await
+                .ok()
+                .flatten(),
+        )
         .as_deref()
         .map(crate::media::split_caption)
-        .and_then(|(_title, body)| body);
+        .and_then(|(_title, body)| body)
+    };
     let mut slot_msgs = Vec::new();
     let mut has_video = false;
         for msg_id in &task.message_ids {
@@ -2742,12 +2757,27 @@ impl IngestCtx {
             return None;
         }
         // 剧集标题与介绍来自**组内 caption**：首行标题、其余介绍（split_caption）。
-        let (title, desc) = match st
-            .store
-            .first_caption(self.chat_id, &self.task_msgs)
-            .await
-            .unwrap_or(None)
-        {
+        // BUG-378：来源以 `media_message` 的**权威组**为准 —— 任务行 items 只是
+        // 当时入队的消息集合（单条任务不含组内有 caption 的那条），按 items 找
+        // 会漏；漏了 name 就空，键退化成 `tg:group:{…}`，与整组任务的
+        // `tg:named:{剧名}` 裂成两部（生产：《时停手表》266/486，EP3 丢失）。
+        let anchor = self.task_msgs.first().copied().unwrap_or(0);
+        let group_caption = if anchor != 0 {
+            st.store
+                .tg_group_facts(self.chat_id, anchor)
+                .await
+                .ok()
+                .and_then(|(_group, cap)| cap)
+        } else {
+            None
+        };
+        let cap = group_caption.or(
+            st.store
+                .first_caption(self.chat_id, &self.task_msgs)
+                .await
+                .unwrap_or(None),
+        );
+        let (title, desc) = match cap {
             Some(cap) => crate::media::split_caption(&cap),
             None => (None, None),
         };
@@ -2765,10 +2795,21 @@ impl IngestCtx {
         // D22-A①（BUG-292）：幂等键统一为**规范化剧名**，相册 `group_id` 只作退化兜底。
         // 旧实现按 `task.group_id` 有无二选一 —— 同一部剧分批缓存两次入库键不等，
         // 于是裂成两部（实测生产库 3→5 对）。
+        // BUG-378：退化兜底的 group 分量同样以 `media_message` 权威组为先 ——
+        // 任务行 `task_group` 是入队快照，可能与消息事实不一致（实测 108≠109）。
+        let authoritative_group = if anchor != 0 {
+            st.store
+                .tg_group_facts(self.chat_id, anchor)
+                .await
+                .ok()
+                .and_then(|(group, _cap)| group)
+        } else {
+            None
+        };
         let key = episodic_group_key(
             self.chat_id,
             &norm,
-            self.task_group,
+            authoritative_group.or(self.task_group),
             self.task_msgs.first().copied().unwrap_or(0),
         );
         match st.store.find_series_by_source_key(&key).await {

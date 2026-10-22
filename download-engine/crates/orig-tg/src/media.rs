@@ -5045,10 +5045,9 @@ impl Store {
             return Ok((0, 0));
         }
         let index = self.cache_task_msg_index().await?;
-        // 组级剧名缓存：`(chat, group, first) -> 规范化剧名`。剧名取自**组内首条非空
-        // caption**（与 `ensure_series` 同一来源），不是各条自己的标题 —— 相册组的 caption
-        // 常只挂在一条消息上，按各条标题算键会把同组裂成多部。
-        let mut name_cache: std::collections::HashMap<(i64, Option<i64>, i64), String> =
+        // 组级剧名缓存：`(chat, 权威组) -> 规范化剧名`。组归属以 `media_message`
+        // 为权威（BUG-378），同组多条只打一次组内 caption 查询。
+        let mut name_cache: std::collections::HashMap<(i64, Option<i64>), String> =
             std::collections::HashMap::new();
         let mut created = 0i64;
         let mut attached = 0i64;
@@ -5083,24 +5082,44 @@ impl Store {
             let key = if source == "tg" {
                 match crate::routes::parse_tg_ref(&ref_key) {
                     Some((chat, msg)) => match index.get(&(chat, msg)) {
-                        Some((group, first, msgs)) => {
-                            let ck = (chat, *group, *first);
+                        Some((task_group, first, msgs)) => {
+                            // BUG-378：组归属与组级剧名以 `media_message` 为权威。
+                            // 任务行 `(group_id, items)` 是入队快照：items 只是当时
+                            // 入队的消息（单条任务不含组内有 caption 的那条）、
+                            // group_id 也可能陈旧（实测 108≠权威 109）。旧实现直接
+                            // 用快照 ⇒ name 空时退化成 `tg:group:{陈旧值}`，与整组
+                            // 任务的 `tg:named:{剧名}` 裂成两部（时停手表 266/486）。
+                            let (group, cap) = match self.tg_group_facts(chat, msg).await {
+                                Ok((g, cap)) => (g.or(*task_group), cap),
+                                Err(_) => (*task_group, None),
+                            };
+                            // 组级剧名按权威组缓存：同组多条只打一次组内查询
+                            // （`tg_group_facts` 的 group 点查是主键，留给每条）。
+                            let ck = (chat, group);
                             let name = match name_cache.get(&ck) {
                                 Some(n) => n.clone(),
                                 None => {
-                                    let n = self
-                                        .first_caption(chat, msgs)
-                                        .await
-                                        .ok()
-                                        .flatten()
+                                    let mut n = cap
                                         .as_deref()
                                         .map(crate::routes::normalized_series_name)
                                         .unwrap_or_default();
+                                    if n.is_empty() {
+                                        // 权威源也没有（media_message 缺行/组内全无
+                                        // caption）⇒ 退回任务 msgs 自己找，与旧行为等价。
+                                        n = self
+                                            .first_caption(chat, msgs)
+                                            .await
+                                            .ok()
+                                            .flatten()
+                                            .as_deref()
+                                            .map(crate::routes::normalized_series_name)
+                                            .unwrap_or_default();
+                                    }
                                     name_cache.insert(ck, n.clone());
                                     n
                                 }
                             };
-                            crate::routes::episodic_group_key(chat, &name, *group, *first)
+                            crate::routes::episodic_group_key(chat, &name, group, *first)
                         }
                         // 不在任何任务里（客户端直传 / 老数据）：用条目自己的标题当剧名，
                         // 无标题再退化成「这一条自己一组」。
@@ -5930,6 +5949,54 @@ impl Store {
             }
         }
         Ok(None)
+    }
+
+    /// BUG-378：按**消息事实**（`media_message`）取一条消息的权威相册组与组级
+    /// caption（原串，未规范化）。
+    ///
+    /// 为什么不能信任务行 `(group_id, items)`：
+    /// - `items` 只是**当时入队**的消息集合 —— 相册的 caption 常只挂一条，
+    ///   单条/子集任务的 items 不含它 ⇒ 组级剧名取空 ⇒ 键退化成
+    ///   `tg:group:{…}`，与整组任务的 `tg:named:{剧名}` 是两个命名空间
+    ///   ⇒ 同相册裂成两部剧（生产实例：《时停手表》EP1-3，EP3 落进 266，
+    ///   EP1/EP2 在 486，用户侧 EP3「丢失」）；
+    /// - 任务行 `group_id` 是入队那一刻的快照，可能与消息事实不一致
+    ///   （实测同一相册：任务行 108 vs `media_message` 权威 109）。
+    ///
+    /// 返回 `(权威组, 组级首条非空 caption)`；`media_message` 没有这条消息的行
+    /// 时返回 `(None, None)`，调用方用任务行值兜底（与旧行为等价的下探）。
+    pub async fn tg_group_facts(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> libsql::Result<(Option<i64>, Option<String>)> {
+        let row = self
+            .row_opt(
+                "SELECT group_id FROM media_message WHERE channel_id = ?1 AND message_id = ?2",
+                params![chat_id, message_id],
+            )
+            .await?;
+        let Some(r) = row else {
+            return Ok((None, None));
+        };
+        let group: Option<i64> = r.get(0)?;
+        let Some(g) = group else {
+            return Ok((None, None));
+        };
+        let stmt = self
+            .conn
+            .prepare(
+                "SELECT message_id FROM media_message
+                 WHERE channel_id = ?1 AND group_id = ?2 ORDER BY message_id ASC",
+            )
+            .await?;
+        let mut rows = stmt.query(params![chat_id, g]).await?;
+        let mut ids = Vec::new();
+        while let Some(r) = rows.next().await? {
+            ids.push(r.get::<i64>(0)?);
+        }
+        let caption = self.first_caption(chat_id, &ids).await?;
+        Ok((group, caption))
     }
 
     /// 把一批**标签名**并集式归档到剧集（不存在的标签自动创建）。
@@ -11698,6 +11765,84 @@ mod tests {
         // 视频条目再次归集（模拟自愈重复跑）⇒ 幂等。
         let (c, a) = s.file_items_into_series(&[id1]).await.unwrap();
         assert_eq!((c, a), (0, 0));
+    }
+
+    /// BUG-378 验收：**单条任务**导入的组内条目，必须与**整组任务**导入的同组
+    /// 条目落**同一部剧**。
+    ///
+    /// 生产形态（《时停手表》EP1-3）：EP3（102）先被单条任务缓存——任务行
+    /// `items=[102]` 不含组内有 caption 的那条（100）、任务行 `group_id` 还是
+    /// 陈旧快照（108，权威值是 109）⇒ 旧实现 name 取空 ⇒ 键退化成
+    /// `tg:group:777:108`，与整组任务的 `tg:named:777:某短剧` 裂成两部，
+    /// 用户打开剧集只见 2/3 集（EP3「丢失」）。
+    ///
+    /// **反向证伪**：把 `tg_group_facts` 调用删掉（回到任务行快照）⇒
+    /// 必建出 `tg:group:777:108` 第二部剧 ⇒ `created` 为 2 ⇒ FAIL。
+    #[tokio::test]
+    async fn file_items_into_series_single_task_merges_into_group_series_bug378() {
+        let s = Store::open(tmp_db("bug378_single_task_merge")).await.unwrap();
+        let now = now_secs();
+        // 消息事实：同组（权威 group=109），caption 只挂 100。
+        for (mid, caption) in [(100i64, Some("某短剧 EP01")), (101, None), (102, None)] {
+            s.conn
+                .execute(
+                    "INSERT INTO media_message (channel_id, message_id, caption, group_id, media_type, created_at)
+                     VALUES (?1, ?2, ?3, ?4, 'video', ?5)",
+                    params![777i64, mid, caption, 109i64, now],
+                )
+                .await
+                .unwrap();
+        }
+        // 两个任务：先单条（陈旧 group 108，只含 102），后整组（权威 group 109）。
+        for (group, items) in [(108i64, "[102]"), (109i64, "[100, 101]")] {
+            let total = (items.matches(',').count() + 1) as i64;
+            s.conn
+                .execute(
+                    "INSERT INTO cache_task (chat_id, group_id, item_key, items, total, done, status, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, 'queued', ?6, ?6)",
+                    params![777i64, group, format!("g:777:{group}"), items, total, now],
+                )
+                .await
+                .unwrap();
+        }
+        let ids = [
+            s.upsert_media_item("tg", "777:100", "EP1", "video", Some("/v/1"), Some(10), None, None).await.unwrap(),
+            s.upsert_media_item("tg", "777:101", "EP2", "video", Some("/v/2"), Some(10), None, None).await.unwrap(),
+            s.upsert_media_item("tg", "777:102", "EP3", "video", Some("/v/3"), Some(10), None, None).await.unwrap(),
+        ];
+        // EP3 先归集（模拟它先入库），再 EP1/EP2。
+        let (created, attached) = s.file_items_into_series(&[ids[2]]).await.unwrap();
+        let (created2, attached2) = s.file_items_into_series(&[ids[0], ids[1]]).await.unwrap();
+        assert_eq!(
+            (created + created2, attached + attached2),
+            (1, 3),
+            "三个条目必须落同一部剧（BUG-378：单条任务不得裂出第二部）"
+        );
+        let sid = s
+            .find_series_by_source_key("tg:named:777:某短剧")
+            .await
+            .unwrap()
+            .expect("键必须是 named 键（组级 caption 在 100 上，权威组兜底也要拿到）");
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(
+                s.count_one(
+                    "SELECT COUNT(*) FROM media_episode WHERE series_id = ?1 AND item_id = ?2",
+                    params![sid, id],
+                )
+                .await
+                .unwrap(),
+                1,
+                "EP{} 必须在该剧集里", i + 1
+            );
+        }
+        assert!(
+            s.find_series_by_source_key("tg:group:777:108")
+                .await
+                .unwrap()
+                .is_none(),
+            "陈旧任务行 group（108）不得成为键 —— 权威组是 109，且 name 非空时
+             根本不该走 group 键"
+        );
     }
 
     /// D22-A①（BUG-292）验收：同一部剧**分批缓存**（EP1-5 一批、EP6-10 一批）必须落

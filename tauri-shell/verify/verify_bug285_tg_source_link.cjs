@@ -7,7 +7,9 @@
  * ## 判据（对应 docs/bugs/BUG-285.md「验收证据」）
  *
  *   ⓪ 夹具自造自删：1 部剧集 + 2 集（E1 = TG 来源带 `<chat>:<msg>` ref；
- *      E2 = 本地来源，无 TG 坐标）。绝不碰用户数据。
+ *      E2 = 本地来源，无 TG 坐标）。绝不碰用户数据。导入即被 BUG-304
+ *      自动归档，故挂载前先撤销自动归档（`media_episode` 有 UNIQUE(item_id)，
+ *      详见 `detachCurrentEpisode` 注释）。
  *   ① **TG 来源行有入口**：聚焦 TG 集时，`episode-source-info` 块内存在一个
  *      `<a data-testid="episode-source-view-tg">`，且
  *      ①a 它是**可点链接**（tagName === 'A' 且 href 非空）；
@@ -130,6 +132,61 @@ async function addEpisode(seriesId, itemId, episodeNo, tg) {
     episodeNo,
   })
   return { status: r.status, raw: r.text.slice(0, 200) }
+}
+
+/**
+ * 撤掉条目被 BUG-304 自动归档的归属（若有），解放 `UNIQUE(item_id)` 槽位。
+ *
+ * 为什么必须有这一步：BUG-304「导入即成剧」—— `POST /api/media/items` 内部会
+ * `file_items_into_series` 把每条 video 条目自动归档进单集剧集（写
+ * `media_episode` 行）；而 `media_episode` 有 `UNIQUE(item_id)`
+ * （活库索引 `idx_media_episode_item_unique`，BUG-292/297 上线）。夹具再往
+ * 自己的剧集挂载 ⇒ INSERT 撞唯一约束 ⇒ 500
+ * `UNIQUE constraint failed: media_episode.item_id`。这是**产品既定行为**
+ * （导入即归档是对的口号），不是缺陷——探针必须适配：挂载前先撤销自动归档。
+ *
+ * 撤销手法：自动剧集只挂 our 条目（导入键 `item:{id}` / `tg:msgs:...` 均
+ * 夹具独有）⇒ 直接删整剧（`DELETE /api/media/series/:id` =
+ * `delete_series_explicit`：删剧且清墓碑）。**不摘单集**——
+ * `remove_episode` 会写带 `source_key` 的墓碑（BUG-126「删了又回来」保护，
+ * 设计上必须活过剪枝），探针每跑一轮就攒 2 条 inert 行；删剧路径零残留。
+ * 兜底：剧集里若还有别的内容（不该发生）⇒ 只摘自己那一集。
+ *
+ * 条目未被自动归档时（`seriesId` 为空）返回 `{ detached: false }`——
+ * 调用方照常挂载，让挂载结果自己说话。
+ */
+async function detachCurrentEpisode(itemId, tg) {
+  const item = await httpJson('GET', `${tg}/api/media/items/${itemId}`)
+  // MediaItem 是 `rename_all = "camelCase"` —— 归属字段叫 `seriesId`，
+  // 写成 `series_id` 会永远读到 undefined（静默误判「未归档」）。
+  const sid = item.json && typeof item.json.seriesId === 'number' ? item.json.seriesId : null
+  if (!sid) return { detached: false, reason: 'not-filed', itemStatus: item.status }
+  const detail = await httpJson('GET', `${tg}/api/media/series/${sid}`)
+  const eps = (detail.json && detail.json.episodes) || []
+  // EpisodeView 同是 camelCase：条目字段叫 `itemId`（不是 `item_id`）。
+  const mine = eps.filter((e) => e && (e.itemId === itemId || e.item_id === itemId))
+  if (mine.length !== 1) {
+    return { detached: false, reason: 'episode-row-missing', seriesId: sid, episodeCount: eps.length }
+  }
+  if (eps.length === 1) {
+    const del = await httpJson('DELETE', `${tg}/api/media/series/${sid}`)
+    return {
+      detached: del.status === 200,
+      reason: del.status === 200 ? 'auto-series-deleted' : `series-delete-${del.status}`,
+      seriesId: sid,
+      deleteStatus: del.status,
+      deleteRaw: del.text.slice(0, 200),
+    }
+  }
+  const del = await httpJson('DELETE', `${tg}/api/media/episodes/${mine[0].id}`)
+  return {
+    detached: del.status === 200,
+    reason: del.status === 200 ? 'detached' : `delete-${del.status}`,
+    seriesId: sid,
+    episodeId: mine[0].id,
+    deleteStatus: del.status,
+    deleteRaw: del.text.slice(0, 200),
+  }
 }
 
 // ─────────────────────────── 页面操作 ───────────────────────────
@@ -278,12 +335,19 @@ async function main() {
     await cleanup(ep.tg, [ser.id].filter(Boolean), [tgItem.id, localItem.id].filter(Boolean), localItem.filePath)
     process.exit(2)
   }
+  // BUG-304 适配：导入即自动归档 ⇒ 先撤销自动归档（删自动剧集），再往夹具
+  // 剧集挂载（详见 detachCurrentEpisode 的契约注释；UNIQUE(item_id) 是硬约束）。
+  const d1 = await detachCurrentEpisode(tgItem.id, ep.tg)
+  const d2 = await detachCurrentEpisode(localItem.id, ep.tg)
   const e1 = await addEpisode(ser.id, tgItem.id, 1, ep.tg)
   const e2 = await addEpisode(ser.id, localItem.id, 2, ep.tg)
   if (e1.status !== 200 || e2.status !== 200) {
-    console.error(`[bug285] 分集挂载失败: ${JSON.stringify({ e1, e2 })}`)
+    console.error(`[bug285] 分集挂载失败: ${JSON.stringify({ e1, e2, d1, d2 })}`)
     await cleanup(ep.tg, [ser.id], [tgItem.id, localItem.id], localItem.filePath)
     process.exit(2)
+  }
+  if (d1.detached || d2.detached) {
+    console.log(`[bug285] detached auto-filed episodes: TG=${JSON.stringify(d1)} LOCAL=${JSON.stringify(d2)}`)
   }
   const created = { series: [ser.id], items: [tgItem.id, localItem.id] }
   console.log(`[bug285] fixtures: SER=${SER_TITLE}(${ser.id}) TG=${tgItem.id}(${TG_REF}) LOCAL=${localItem.id}`)
