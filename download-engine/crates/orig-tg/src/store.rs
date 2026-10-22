@@ -95,7 +95,11 @@ pub struct MonitorFilter {
     pub keyword: String,
     #[serde(rename = "createdAt")]
     pub created_at: i64,
-    /// 命中条数（跨全部监控频道，匹配 caption **或** file_name）。
+    /// 命中条数（跨全部监控频道，**只匹配 caption**）。
+    ///
+    /// 文件名不参与匹配（用户 2026-10-22 改判：「我们筛选的是内容不是文件名，
+    /// 内容在消息中不在文件中」）。文件名是文件属性，用它凑命中率等于把不可读的
+    /// 随机名当成内容匹配。
     pub hits: i64,
     /// **自上次点开该规则以来**新增的命中条数（BUG-330 / TGM-06）。
     ///
@@ -110,9 +114,12 @@ pub struct MonitorFilter {
 
 /// 筛选命中行：媒体消息 + 所属频道标题。
 ///
-/// 与 [`MonitoredMessageHit`] 的区别：这里带出 `file_name`。用户裁定的匹配字段是
-/// 「标题/说明 + 文件名」，而大量视频消息**没有 caption、只有文件名**（BUG-220），
-/// 不把 file_name 送到前端，命中行就会显示成一排无名条目——「筛出来了」却看不出筛到了什么。
+/// 与 [`MonitoredMessageHit`] 的区别：这里带出 `file_name`。
+///
+/// **注意：`file_name` 只用于显示，不参与匹配**（用户 2026-10-22 改判：
+/// 「我们筛选的是内容不是文件名，内容在消息中不在文件中」）。带出它的唯一理由是
+/// 命中行需要能看出「这是什么」——caption 可能为空，此时前端用文件名兜底显示。
+/// 匹配条件见 [`Store::filter_messages`]：只有 `caption`。
 #[derive(Debug, Clone, Serialize)]
 pub struct MonitorFilterHit {
     #[serde(rename = "channelId")]
@@ -1358,12 +1365,12 @@ impl Store {
                       FROM media_message m
                       JOIN monitored_channel c ON c.channel_id = m.channel_id
                      WHERE m.group_id IS NOT NULL
-                       AND (m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\'))
+                       AND m.caption LIKE ?1 ESCAPE '\\')
                  + (SELECT COUNT(*)
                       FROM media_message m
                       JOIN monitored_channel c ON c.channel_id = m.channel_id
                      WHERE m.group_id IS NULL
-                       AND (m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\'))",
+                       AND m.caption LIKE ?1 ESCAPE '\\')",
                 params![like_pattern(keyword)],
             )
             .await?;
@@ -1393,8 +1400,7 @@ impl Store {
                               FROM media_message m
                               JOIN monitored_channel c ON c.channel_id = m.channel_id
                              WHERE m.group_id IS NOT NULL
-                               AND (m.caption LIKE ?1 ESCAPE '\\'
-                                OR m.file_name LIKE ?1 ESCAPE '\\')) g
+                               AND m.caption LIKE ?1 ESCAPE '\\') g
                      WHERE (SELECT MAX(COALESCE(x.msg_date, x.created_at))
                               FROM media_message x
                              WHERE x.channel_id = g.channel_id
@@ -1404,7 +1410,7 @@ impl Store {
                       FROM media_message m
                       JOIN monitored_channel c ON c.channel_id = m.channel_id
                      WHERE m.group_id IS NULL
-                       AND (m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\')
+                       AND m.caption LIKE ?1 ESCAPE '\\'
                        AND COALESCE(m.msg_date, m.created_at) > ?2
                  )",
                 params![like_pattern(keyword), last_read_at],
@@ -1493,15 +1499,13 @@ impl Store {
                                         FROM media_message m
                                         JOIN monitored_channel c ON c.channel_id = m.channel_id
                                        WHERE m.group_id IS NOT NULL
-                                         AND (m.caption LIKE ?1 ESCAPE '\\'
-                                           OR m.file_name LIKE ?1 ESCAPE '\\')) g
+                                         AND m.caption LIKE ?1 ESCAPE '\\') g
                               UNION ALL
                               SELECT COALESCE(m.msg_date, m.created_at)
                                 FROM media_message m
                                 JOIN monitored_channel c ON c.channel_id = m.channel_id
                                WHERE m.group_id IS NULL
-                                 AND (m.caption LIKE ?1 ESCAPE '\\'
-                                   OR m.file_name LIKE ?1 ESCAPE '\\')
+                                 AND m.caption LIKE ?1 ESCAPE '\\'
                            ) u),
                           last_read_at))
                   WHERE id = ?2",
@@ -1587,7 +1591,7 @@ impl Store {
                   FROM media_message m
                   JOIN monitored_channel c ON c.channel_id = m.channel_id
                  WHERE m.group_id IS NOT NULL
-                   AND (m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\')
+                   AND m.caption LIKE ?1 ESCAPE '\\'
              ),
              hit_units AS (
                 SELECT g.channel_id AS channel_id,
@@ -1604,7 +1608,7 @@ impl Store {
                   FROM media_message m
                   JOIN monitored_channel c ON c.channel_id = m.channel_id
                  WHERE m.group_id IS NULL
-                   AND (m.caption LIKE ?1 ESCAPE '\\' OR m.file_name LIKE ?1 ESCAPE '\\')
+                   AND m.caption LIKE ?1 ESCAPE '\\'
              ),
              cursor_unit AS (
                 SELECT cu.channel_id AS channel_id,
@@ -3806,16 +3810,23 @@ mod tests {
         );
     }
 
-    /// 筛选匹配字段 = **caption 或 file_name**（用户 2026-10-19 裁定）。
+    /// 筛选匹配字段 = **只有 caption（消息内容）**，文件名不参与。
     ///
-    /// 必须两条都测：大量视频消息没有 caption、只有文件名（BUG-220），
-    /// 只测 caption 的话「匹配文件名」这条口径是假的。
+    /// 用户 2026-10-22 改判原话：「我们筛选的是内容不是文件名,内容在消息中不在文件中。」
+    /// 2026-10-19 曾裁定「caption 或 file_name 都算」，理由是 BUG-220「大量视频没有
+    /// caption、只有文件名」。该理由在**显示**层仍成立（命中行要能看出是什么，故
+    /// `MonitorFilterHit` 仍带出 file_name），但在**筛选**层不成立：文件名是文件属性，
+    /// 不是内容；用它凑命中率等于把不可读的随机名（`C_DUM7FbyLchSjxK.mp4` 之类）
+    /// 当成内容来匹配。
+    ///
+    /// 断言必须同时覆盖「file_name 命中的那条不在结果里」——只断言数量会漏：
+    /// 把实现改回 `caption OR file_name` 时，若测试数据恰好只有一条命中，数量照样是 1。
     #[tokio::test]
-    async fn filter_matches_caption_and_file_name() {
+    async fn filter_matches_caption_only() {
         let s = store("filter_match").await;
         s.add_channel(1, "剧集频道", Some("drama")).await.unwrap();
         s.add_channel(2, "另一个频道", None).await.unwrap();
-        // ① 只有 caption 命中；② 只有 file_name 命中；③ 都不命中。
+        // ① 只有 caption 命中（应算）；② 只有 file_name 命中（不算）；③ 都不命中。
         s.upsert_message(1, 1, Some("第12集 完结"), None, None, None, None, None, None, None)
             .await
             .unwrap();
@@ -3839,17 +3850,24 @@ mod tests {
 
         let id = s.add_filter("第12集", "第12集").await.unwrap();
         let hits = s.filter_messages(id, 100, None).await.unwrap();
-        assert_eq!(hits.len(), 2, "caption 与 file_name 命中的都要算进来");
+        assert_eq!(hits.len(), 1, "只有 caption 命中的那条算进来，file_name 命中的不算");
+        assert_eq!(hits[0].message_id, 1, "命中的必须是 caption 那条");
+        assert!(
+            hits.iter().all(|h| h.message_id != 2),
+            "file_name 命中的消息不得进结果（筛选的是内容，不是文件名）"
+        );
         let titles: Vec<Option<String>> = hits.iter().map(|h| h.channel_title.clone()).collect();
         assert!(
-            titles.iter().any(|t| t.as_deref() == Some("剧集频道"))
-                && titles.iter().any(|t| t.as_deref() == Some("另一个频道")),
-            "命中应跨频道并带出来源频道标题（实测 {titles:?}）"
+            titles.iter().any(|t| t.as_deref() == Some("剧集频道")),
+            "命中应带出来源频道标题（实测 {titles:?}）"
         );
 
         let listed = s.list_filters().await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].hits, 2, "规则列表的命中数必须与实际命中一致");
+        assert_eq!(
+            listed[0].hits, 1,
+            "规则列表的命中数必须与实际命中一致，且不含文件名命中"
+        );
     }
 
     /// 关键词里的 `%` / `_` 按字面匹配，不得变成通配符。
