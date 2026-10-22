@@ -870,5 +870,6 @@
   "tg.backfillCancelHint": "只停止翻页，已入库的历史消息保留",
   "tg.backfillInvalidDate": "请选择日期",
   "tg.albumExpandHint": "点击展开 {n} 项",
-  "tg.albumCollapse": "收起"
+  "tg.albumCollapse": "收起",
+  "media.episode.playFromHere": "从本集开始播放"
 }

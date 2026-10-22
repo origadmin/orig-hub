@@ -870,5 +870,6 @@
   "tg.backfillCancelHint": "Stops paging only; already ingested history is kept",
   "tg.backfillInvalidDate": "Pick a date",
   "tg.albumExpandHint": "Open {n} items",
-  "tg.albumCollapse": "Collapse"
+  "tg.albumCollapse": "Collapse",
+  "media.episode.playFromHere": "Play from this episode"
 }

@@ -935,6 +935,57 @@ export function SeriesDetail(props: {
                         BUG-305：右列外包一层 flex，行内「在 TG 中查看」入口与既有内容
                         同行并列（同为 span+role=button+stopPropagation 模式）。 */}
                     <span className="flex items-center gap-1.5">
+                    {/*
+                      播放入口归**左栏**（BUG-369 用户裁定：「现在右边播放是错误,
+                      左边缺少播放也是错误」；BUG-369 第五次复报：右栏那颗满宽绿条
+                      仍在，用户圈的就是本行的这个位置）。
+
+                      行本身是 `<button episode-pick>`，HTML 不允许嵌套 button ⇒
+                      span + role=button（与 `episode-nobytes-cache` 同一模式），
+                      stopPropagation 保证不触发行聚焦切换。
+
+                      语义 = 「从本集开始播放」：连播由父层 `playItems` 把选中项扩成
+                      整部剧集，所以这是**入口**不是新能力（BUG-262 裁定）。
+                      无字节 / 无来源 ⇒ 不渲染（不做假按钮，BUG-324 复报）。
+                    */}
+                    {(() => {
+                      const photoEp = photo
+                      const canView = photoEp && withBytes
+                      const canPlay = !photoEp && withBytes
+                      if (!canPlay && !canView) return null
+                      const act = () => {
+                        if (canView) openPhotoLightbox(Math.max(0, photoEps.indexOf(ep)))
+                        else playEpisode(ep)
+                      }
+                      return (
+                        <span
+                          role="button"
+                          tabIndex={0}
+                          title={canView ? t('media.episode.viewImage') : t('media.episode.playFromHere')}
+                          data-testid="episode-row-play"
+                          data-episode-id={ep.id}
+                          data-kind={photoEp ? 'photo' : 'video'}
+                          onClick={(e: ReactMouseEvent) => {
+                            e.stopPropagation()
+                            act()
+                          }}
+                          onKeyDown={(e: ReactKeyboardEvent) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.stopPropagation()
+                              e.preventDefault()
+                              act()
+                            }
+                          }}
+                          className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-accent transition-colors hover:bg-accent/15"
+                        >
+                          {canView ? (
+                            <ImageIcon className="h-3.5 w-3.5" />
+                          ) : (
+                            <Play className="h-3.5 w-3.5" />
+                          )}
+                        </span>
+                      )
+                    })()}
                     {withBytes ? (
                       <span className="font-mono text-[10.5px] text-muted">
                         {!photo && ep.duration != null ? fmtDuration(ep.duration) : ''}
@@ -1112,31 +1163,40 @@ export function SeriesDetail(props: {
                     文案 + Play 图标是错承诺（media.episode.viewImage 键此前定义了
                     没用上）。照片 ⇒ 「查看大图」+ 图标 + 进图册灯箱（与 deck 放大
                     入口 openFocusLightbox 同一条路）；视频 ⇒ 原行为不变。 */}
-                <Button
-                  className="h-9 w-full gap-1.5 text-[13px]"
-                  disabled={!hasMediaBytes(cur)}
-                  onClick={() =>
-                    isPhotoEpisode(cur)
-                      ? openPhotoLightbox(Math.max(0, photoEps.indexOf(cur)))
-                      : playEpisode(cur)
-                  }
-                  title={
-                    hasMediaBytes(cur)
-                      ? isPhotoEpisode(cur)
-                        ? t('media.episode.viewImage')
-                        : t('media.episode.play')
-                      : t('media.fileMissingHint')
-                  }
-                  data-testid="episode-play"
-                >
-                  {isPhotoEpisode(cur) ? (
-                    <ImageIcon className="h-3 w-3" />
-                  ) : (
-                    <Play className="h-3 w-3" />
-                  )}
-                  {isPhotoEpisode(cur) ? t('media.episode.viewImage') : t('media.episode.play')}
-                </Button>
+                {/*
+                  BUG-369（用户第五次报「播放按钮位置不对」）：**右栏不再有满宽
+                  播放主按钮**。
+
+                  这里原来是一颗 `w-full h-9` 的实心主按钮 —— 它横贯整个右栏、
+                  独占一行，是面板里最显眼的东西。用户 2026-10-22 已裁定「现在
+                  右边播放是错误,左边缺少播放也是错误」，BUG-369 只补了左栏、
+                  把右栏这颗留着，于是用户看到的仍是「两个播放入口，且错的那个
+                  最显眼」。五次复报的根因不是位置没挪够，是**这颗不该在右栏**：
+                  右栏的职责是「这一集是什么」（展示 + 管理动作），播放归左栏
+                  （剧集级 `series-play-all` + 每条分集行 `episode-row-play`）。
+
+                  照片集的「查看大图」保留 —— 那是真能力（照片没有可播的流），
+                  但同样不再占满一行，降为动作条里的普通尺寸按钮。
+                */}
                 <div className="flex flex-wrap items-center gap-1.5">
+                  {isPhotoEpisode(cur) ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 px-2.5 text-[11px]"
+                      disabled={!hasMediaBytes(cur)}
+                      onClick={() => openPhotoLightbox(Math.max(0, photoEps.indexOf(cur)))}
+                      title={
+                        hasMediaBytes(cur)
+                          ? t('media.episode.viewImage')
+                          : t('media.fileMissingHint')
+                      }
+                      data-testid="episode-view-image"
+                    >
+                      <ImageIcon className="h-3 w-3" />
+                      {t('media.episode.viewImage')}
+                    </Button>
+                  ) : null}
                   {/* 单一编辑入口（原标题行按钮下移，BUG-197/202 同一开关） */}
                   <Button
                     variant="outline"

@@ -337,8 +337,13 @@ async function main() {
       const openedViewer = await page.evaluate((bEpId) => {
         const row = document.querySelector(`[data-testid="episode-pick"][data-episode-id="${bEpId}"]`)
         if (row) row.click()
-        const play = document.querySelector('[data-testid="episode-play"]')
-        if (!play || play.disabled) return 'no-play'
+        // BUG-369（第五次复报）：播放入口已移到**左栏分集行尾**（`episode-row-play`），
+        // 右栏那颗满宽的 `episode-play` 已按用户裁定「现在右边播放是错误」移除。
+        // 行内入口只在有字节时渲染 ⇒ 「找不到」本身即等于旧语义的 `disabled`。
+        const play = document.querySelector(
+          `[data-testid="episode-row-play"][data-episode-id="${bEpId}"]`,
+        )
+        if (!play) return 'no-play'
         play.click()
         return 'ok'
       }, bytesVid.id)
