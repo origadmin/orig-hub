@@ -108,6 +108,29 @@ python scripts/verify_path_wire.py                # 查活栈（12 个只读端�
 改成 `re.search` 后 10/10 通过。**这就是"反向证伪是验收的验收"的意义**：
 没有自检，这个洞会一直静默地让红变绿。
 
+### 第一次对活栈跑就抓到一个漏改字段（留档）
+
+用**改造前的二进制**（daemon 在跑、二进制还是旧的）跑门禁，`/api/downloads` 报：
+
+```
+[FAIL] /api/downloads   1 violation(s)
+         key=dest_path   D:/OrigDown\bug322ui.bin  (path-like key contains backslash)
+```
+
+`dest_path` 是 `DownloadStatus` 的对外字段，我第一轮只改了 `EngineRow.output`
+（`/api/activity` 用），**漏了 `/api/downloads` 这条腿**。补法三处：
+
+| 位置 | 改动 |
+| --- | --- |
+| `task_store.rs::record_from_row` | 读库出口规范化——**存量行**存的是旧形态，只改写入点等于「改了没生效」 |
+| `activity.rs` 库补行 | 同上（内存里没有、从库补的那些行） |
+| `status.rs` `dest_path` | `from_record` 与 `from_progress` 两个构造点都规范化 |
+
+这条**不可能靠读代码发现**：`/api/files` 与 `/api/activity` 都干净，只有
+`/api/downloads` 的字段名是 `dest_path`（不含 `output`），而我的第一轮清单是按
+「我记得的出口」列的，不是按「所有下发的路径字段」列的。**这正是运行时门禁
+存在的理由**。
+
 ### 端点不可用计失败，不计通过
 
 `[SKIP]` 与 `[FAIL]` 都让退出码为 1。"没检查"不能被读成"没问题"。

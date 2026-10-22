@@ -312,7 +312,10 @@ fn record_from_row(r: &Row) -> Option<EngineTaskRecord> {
         id: r.get(0).ok()?,
         url: r.get(1).ok()?,
         filename: r.get(2).ok()?,
-        output: r.get(3).ok()?,
+        // 存量行（本次改造之前写入的）存的是 `\` 形态。读出口统一规范化，
+        // 否则「重建二进制之后老任务仍显示 `D://OrigDown//x`」——用户看到的是
+        // 「改了没生效」，而真正没改的是库里的旧字符串。
+        output: orig_core::paths::to_wire_str(&r.get::<String>(3).ok()?),
         added_at: r.get(4).ok()?,
         updated_at: r.get(5).ok()?,
         max_concurrency: r.get::<i64>(6).ok()?.max(0) as u32,

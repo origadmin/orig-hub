@@ -104,7 +104,9 @@ impl DownloadStatus {
             id: row.id.clone(),
             url: row.url.clone(),
             filename: row.filename.clone(),
-            dest_path: Some(row.output.clone()),
+            // `/api/downloads` 的对外字段（门禁实测漏改项：旧二进制返回
+            // `D:/OrigDown\bug322ui.bin` —— 前半段已被 dir_out 规范化、后半段没有）。
+            dest_path: Some(orig_core::paths::to_wire_str(&row.output)),
             total_size: total,
             downloaded,
             progress,
@@ -167,7 +169,7 @@ impl DownloadStatus {
             id: id.to_string(),
             url: url.to_string(),
             filename: filename.to_string(),
-            dest_path,
+            dest_path: dest_path.map(|p| orig_core::paths::to_wire_str(&p)),
             total_size: total,
             downloaded,
             progress,

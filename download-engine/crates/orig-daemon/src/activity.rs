@@ -107,7 +107,7 @@ pub async fn engine_rows(st: &AppState) -> Vec<EngineRow> {
                 id: r.id.clone(),
                 url: r.url.clone(),
                 filename: r.filename.clone(),
-                output: r.output.clone(),
+                output: orig_core::paths::to_wire_str(&r.output),
                 total: r.total,
                 done: r.downloaded,
                 status: r.status.clone(),

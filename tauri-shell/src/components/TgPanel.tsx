@@ -422,6 +422,22 @@ export function TgPanel(
   /** 回溯请求在飞：只锁按钮，不锁整个面板。 */
   const [backfillBusy, setBackfillBusy] = useState(false)
   /**
+   * 已展开的相册（键 = `album-{首条 key}`）。
+   *
+   * 2026-10-22 用户第 3 点：默认只给 1 张封面，点击才加载整组。
+   * 展开态放在面板层（不是 AlbumBubble 内部）：气泡会随 feed 重渲染/重排，
+   * 状态留在内部会被重置，用户展开完一滚动又收回去。
+   */
+  const [expandedAlbums, setExpandedAlbums] = useState<Set<string>>(() => new Set())
+  const toggleAlbum = useCallback((key: string) => {
+    setExpandedAlbums((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }, [])
+  /**
    * 频道节折叠状态（BUG-330 TGM-02，设计 §2.6 优先级三机制）：
    * 频道 = 消费序最底、偶尔动作 ⇒ **默认折叠**。折叠是优先级表达，不是功能隐藏——
    * 节头计数与入口常驻可点（BUG-320）。
@@ -2754,6 +2770,8 @@ export function TgPanel(
                         key={`album-${unit[0].key}`}
                         items={unit}
                         highlighted={unit.some((u) => u.key === highlightKey)}
+                        expanded={expandedAlbums.has(`album-${unit[0].key}`)}
+                        onToggleExpand={() => toggleAlbum(`album-${unit[0].key}`)}
                         cacheTargets={
                           /* BUG-352：分母 = 组内**全部**条目（图片与视频都要落盘）。
                              此前把 photo 排除在外（BUG-049「图片不缓存」），代价是
@@ -3048,6 +3066,22 @@ const AlbumBubble = memo(function AlbumBubble(props: {
   /** 取消整组缓存（进行中时操作行显示「取消」） */
   onCancel?: (items: FeedItem[]) => void
   onPreview: (index: number, items: FeedItem[]) => void
+  /**
+   * 是否已展开（2026-10-22 用户第 3 点）。
+   *
+   * 折叠态**只渲染 1 张封面**：一个 10 张图的相册原本一次性发 10 个缩略图请求，
+   * 而服务端 `thumb` 端点**没有缓存**（每次实时回源 Telegram）⇒ 滚一屏就是
+   * 几十个 RPC。用户要的是「过滤下载」而不是「聊天浏览」，所以列表只给识别线索，
+   * 点了才加载整组。
+   */
+  expanded?: boolean
+  /**
+   * 展开/收起回调。
+   *
+   * **没给就恒展开**（不是「给了个点不动的按钮」）：宿主没接线时组件必须保持
+   * 旧行为，否则「能渲染的按钮做不了它承诺的事」——BUG-324 复报的死按钮。
+   */
+  onToggleExpand?: () => void
 }) {
   const {
     items,
@@ -3058,6 +3092,8 @@ const AlbumBubble = memo(function AlbumBubble(props: {
     onDownload,
     onCancel,
     onPreview,
+    expanded = false,
+    onToggleExpand,
   } = props
   const { t } = useTranslation()
   /* BUG-352：完成判据只有一条 —— **全部条目都有字节**。此前按组构成分叉
@@ -3065,6 +3101,17 @@ const AlbumBubble = memo(function AlbumBubble(props: {
      落盘，分叉就成了两套互斥的「完成」定义（同一组可以按一个口径算完成、按另一个
      算未完成）。分母恒为 `cacheTargets`（= 组内条目数，图片计入）。 */
   const allDone = cacheTargets > 0 && cachedTargets >= cacheTargets
+  /*
+   * 折叠判据三选一：
+   *  - 宿主没给回调 ⇒ 恒展开（不留点不动的按钮）；
+   *  - 定位高亮（BUG-305）⇒ 强制展开：用户要的是「回到这条内容」，
+   *    把目标藏在折叠态里等于定位失败；
+   *  - 单条 ⇒ 本身就是 1 张封面，没有「展开」可言。
+   */
+  const collapsible = items.length > 1 && !!onToggleExpand
+  const open = expanded || highlighted || !collapsible
+  const cover = items[0]
+  const coverTyp = cover.type ?? guessMediaType(cover.mimeType, cover.filePath)
   const caption = items.find((it) => it.caption?.trim())?.caption
   const totalSize = items.reduce((s, it) => s + (it.size ?? 0), 0)
   return (
@@ -3087,7 +3134,19 @@ const AlbumBubble = memo(function AlbumBubble(props: {
               {t('tg.albumPartial', { n: cachedTargets, total: cacheTargets })}
             </span>
           ) : null}
-          <span className="ml-auto text-muted">{fmtTime(items[0].date)}</span>
+          {collapsible && open ? (
+            <button
+              type="button"
+              onClick={onToggleExpand}
+              data-testid="album-collapse"
+              className="ml-auto text-[11px] text-fg-mid transition-colors hover:text-fg-strong"
+            >
+              {t('tg.albumCollapse')}
+            </button>
+          ) : null}
+          <span className={cn('text-muted', collapsible && open ? '' : 'ml-auto')}>
+            {fmtTime(items[0].date)}
+          </span>
         </div>
 
         {/*
@@ -3104,6 +3163,47 @@ const AlbumBubble = memo(function AlbumBubble(props: {
          *    的「最多 9 个内容 / 第 10 个被拆出去」）。现为 10 ⇒ 真实相册恒显示全量；
          *    `+N` 只对「> 10」起防御作用，其余图片在全屏浏览页里连翻。
          */}
+        {!open ? (
+          /*
+           * 折叠态：**只发一个缩略图请求**。点击 = 展开整组，不是打开大图 ——
+           * 用户原话「列表点击加载整个组内容」，所以第一次点击的语义是"把组摊开"。
+           */
+          <button
+            type="button"
+            onClick={onToggleExpand}
+            data-testid="album-cover"
+            data-count={items.length}
+            data-chat-id={cover.chatId}
+            data-message-id={cover.messageId}
+            className="relative block w-full overflow-hidden rounded-lg bg-surface-2"
+          >
+            {coverTyp === 'photo' || coverTyp === 'video' ? (
+              <img
+                src={tgThumbUrl(cover.chatId, cover.messageId)}
+                alt={cover.caption || ''}
+                loading="lazy"
+                className={cn(
+                  'mx-auto h-auto max-h-[40vh] w-auto max-w-full',
+                  coverFit(coverTyp),
+                )}
+              />
+            ) : (
+              <span className="flex aspect-video w-full items-center justify-center text-lg">
+                {coverTyp === 'audio' ? '🎵' : '📄'}
+              </span>
+            )}
+            {/* 数量角标：让用户在**展开之前**就知道这是一组，而不是一张 */}
+            <span
+              data-testid="album-cover-count"
+              className="absolute right-1.5 top-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white"
+            >
+              {items.length}
+            </span>
+            <span className="absolute bottom-1.5 left-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[11px] text-white/90">
+              {t('tg.albumExpandHint', { n: items.length })}
+            </span>
+          </button>
+        ) : (
         <div
           data-testid="album-grid"
           className={cn('grid gap-1.5', albumGridClass(items.length))}
@@ -3167,6 +3267,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
             )
           })}
         </div>
+        )}
 
         {caption && (
           <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-snug text-fg-strong">
