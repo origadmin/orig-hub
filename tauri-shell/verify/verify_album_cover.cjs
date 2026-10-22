@@ -61,9 +61,11 @@ async function main() {
     //   width/height 变成 undefined，CDP 直接回 "Invalid parameters" ——
     //   本脚本首次运行前就是栽在这里（首轮写完没跑过）。
     await page.setViewport(VIEWPORT)
-    // ★ 冷启动首屏可达 30s+（vite 侧刚改过文件时尤其明显），默认 30s 档会表现成
-    //   「Page.loadEventFired 超时」而不是「加载慢」 ⇒ 显式放宽 timeout 并允许重试。
-    await page.goto(APP, { waitForRoot: true, settleMs: 1500, timeout: 90000, attempts: 3 })
+    // ★ 用 `domcontentloaded` 而不是 `load`：TG 面板首屏会发几十个缩略图请求，
+    //   `load` 要等**全部**资源（含图片）结束 —— 任何一个缩略图慢/挂住，load 就永不触发，
+    //   表现为「Page.loadEventFired 超时」（实测 90s 都等不到）。后续判据本来就是
+    //   等具体 testid / 请求集合，不需要 load 语义。
+    await page.goto(APP, { waitUntil: 'domcontentloaded', waitForRoot: true, settleMs: 1500, timeout: 60000, attempts: 3 })
 
     // ★ 资源时间线默认只保留 250 条；TG 面板一屏就是几十个缩略图，跑久了早先的记录
     //   会被**静默挤掉** ⇒ 「封面没发请求」可能只是缓冲区溢出。先抬高上限。
@@ -213,6 +215,8 @@ async function main() {
       throw new Error('album-grid never appeared after clicking the cover — see diag above')
     }
     // 缩略图是异步拉取的：等请求数真的涨上来（有界等待，超时如实报红）
+    // ★ `THUMB_SNAPSHOT` 的元素是 `chatId:messageId`，瓦片上只有裸 `messageId`
+    //   ⇒ 必须补上 chatId 前缀再比对，否则永远不相等（首版就是漏了这一步，A2 恒红）。
     const deadline = Date.now() + 30000
     let afterSet = new Set()
     let groupIds = []
@@ -223,12 +227,12 @@ async function main() {
           (el) => el.getAttribute('data-message-id'),
         ),
       )
-      if (groupIds.length >= 2 && groupIds.every((id) => afterSet.has(id))) break
+      if (groupIds.length >= 2 && groupIds.every((id) => afterSet.has(`${sample.chatId}:${id}`))) break
       await new Promise((r) => setTimeout(r, 300))
     }
 
     // ── A2 其余 N-1 条的 thumb 请求全部出现
-    const missing = groupIds.filter((id) => !afterSet.has(id))
+    const missing = groupIds.filter((id) => !afterSet.has(`${sample.chatId}:${id}`))
     check(
       'A2 clicking the cover loads the whole group',
       groupIds.length === sample.count && missing.length === 0,
@@ -281,7 +285,11 @@ async function main() {
     await page.screenshot(path.join(OUT, '03-collapsed-again.png'))
 
     // 控制台错误也要算失败（白屏/异常不该被「判据全绿」掩盖）
-    const errors = (await page.consoleErrors()).concat(await page.pageErrors())
+    // ★ 排除 `favicon.ico` 的 404：浏览器隐式探测，与产品行为无关，
+    //   不过滤就永远是红（噪声吃掉真信号）。
+    const errors = (await page.consoleErrors())
+      .concat(await page.pageErrors())
+      .filter((e) => !/favicon\.ico/.test(String(e)))
     check('A7 no console/page errors', errors.length === 0, errors.slice(0, 3).join(' | '))
   } finally {
     const failed = results.filter((r) => !r.ok)

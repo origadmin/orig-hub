@@ -3352,12 +3352,18 @@ const AlbumBubble = memo(function AlbumBubble(props: {
   // `data-tg-highlight`，「在 TG 中查看」点了不亮（单条消息走默认浅比较不受害，
   // 所以这个缺陷只在相册目标上现形，极易漏测）。
   a.highlighted === b.highlighted &&
+  // BUG-376：`expanded` 必须参与比较 —— 与上面 `highlighted` **同型**的缺陷：
+  // 漏了它 ⇒ 点击封面时 `setExpandedAlbums` 确实生效（实测 `expandedAlbums.size=1`、
+  // 渲染侧 `has(key)=true`），但比较器判「相等」⇒ React 跳过重渲染 ⇒
+  // 折叠态**永远展不开**（用户报「点击展开按钮没有响应」）。
+  // 之所以偶尔「看起来能展开」，是那一刻恰好有别的 prop 变化（进度轮询）把
+  // 重渲染带了进来 —— 所以这个缺陷表现为**间歇性**，极难靠手感定位。
+  a.expanded === b.expanded &&
   a.progress?.done === b.progress?.done &&
   a.progress?.total === b.progress?.total &&
   a.progress?.queued === b.progress?.queued &&
   a.progress?.itemBytes === b.progress?.itemBytes &&
-  a.progress?.itemBytesTotal === b.progress?.itemBytesTotal &&
-  true,
+  a.progress?.itemBytesTotal === b.progress?.itemBytesTotal,
 )
 
 /** 图片块：列表用轻量缩略图（自然比例不裁切），点击弹遮罩看原图 */
