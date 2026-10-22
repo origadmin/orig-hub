@@ -1,0 +1,30 @@
+[
+  {
+    "name": "S1a 下载域选择条存在且为底部居中浮层",
+    "ok": true
+  },
+  {
+    "name": "S2 下载域有全选/全不选（`dl-select-all`/`dl-select-none`）",
+    "ok": true
+  },
+  {
+    "name": "S4a 下载行选择框 16×16",
+    "ok": true
+  },
+  {
+    "name": "S1b 剧集墙选择条同为底部居中浮层（同半径量级）",
+    "ok": true
+  },
+  {
+    "name": "S3 两域按钮高度与字号一致（≤28px / 11px）",
+    "ok": true
+  },
+  {
+    "name": "S1c 剧集墙(series)选择条=底部居中胶囊（与全部下载/items 同形、同半径）",
+    "ok": true
+  },
+  {
+    "name": "S2b 剧集墙(series)有全选/全不选（series-select-all/series-select-none）",
+    "ok": true
+  }
+]

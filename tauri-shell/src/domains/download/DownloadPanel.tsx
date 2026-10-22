@@ -11,6 +11,7 @@ import { useGoLibrary } from '../../hooks/useGoLibrary'
 import { enqueueCacheTask } from '../../api/tg'
 import { VirtualList } from '../../components/ui/virtual-list'
 import { Button } from '../../components/ui/button'
+import { SelectAllButtons, SelectionBar } from '../../components/ui/selection-bar'
 import type { IngestGroup } from './ingestGroups'
 
 /**
@@ -214,6 +215,14 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
     })
   }
   const clearSelection = () => setSelected(new Set())
+  /** 全选当前可见行（BUG-393：与剧集「全选本页」同语义——只填看得见的行）。 */
+  const selectAllVisible = () => {
+    const next = new Set(selected)
+    for (const r of dlRows) {
+      next.add(r.kind === 'engine' ? `e:${r.item.id}` : `i:${r.group.key}`)
+    }
+    setSelected(next)
+  }
 
   /**
    * 批量取消选中的下载（BUG-353）：把选中集合映射到各自来源的取消动作。
@@ -306,36 +315,46 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
      */
     <div className="flex h-full min-h-0 flex-col gap-3">
       {/* BUG-353：下载域选中控制面。选中任意行后出现，批量「取消选中」。 */}
-      {selected.size > 0 && (
-        <div
-          className="flex shrink-0 items-center justify-between gap-3 rounded-lg border border-accent/40 bg-accent/5 px-3 py-2 text-sm"
-          data-testid="dl-batch-bar"
+      {/*
+       * BUG-393：下载域选择条改用**全仓标准** `SelectionBar` —— 与剧集墙
+       * 同一位置（底部居中浮层）、同一容器、同尺寸按钮。此前这里是顶部方块条
+       * （`rounded-lg bg-accent/5 text-sm`）且**缺全选/全不选**（只有行勾 +
+       * 「清空/取消选中」），与剧集墙两套形态。
+       */}
+      <SelectionBar
+        count={selected.size}
+        testId="dl-batch-bar"
+        countTestId="dl-batch-count"
+      >
+        <SelectAllButtons
+          onSelectAll={selectAllVisible}
+          onSelectNone={clearSelection}
+          allLabel="全选本页"
+          noneLabel="全不选"
+          allTestId="dl-select-all"
+          noneTestId="dl-select-none"
+        />
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-7 px-2 text-[11px]"
+          onClick={clearSelection}
+          data-testid="dl-batch-clear"
+          title="清空选择"
         >
-          <span className="text-fg-mid" data-testid="dl-batch-count">
-            已选 {selected.size} 项
-          </span>
-          <div className="flex items-center gap-2">
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={clearSelection}
-              data-testid="dl-batch-clear"
-              title="清空选择"
-            >
-              清空
-            </Button>
-            <Button
-              size="sm"
-              variant="default"
-              onClick={() => void cancelSelected()}
-              data-testid="dl-batch-cancel"
-              title="取消选中的下载"
-            >
-              取消选中
-            </Button>
-          </div>
-        </div>
-      )}
+          清空
+        </Button>
+        <Button
+          size="sm"
+          variant="default"
+          className="h-7 px-2 text-[11px]"
+          onClick={() => void cancelSelected()}
+          data-testid="dl-batch-cancel"
+          title="取消选中的下载"
+        >
+          取消选中
+        </Button>
+      </SelectionBar>
 
       {tgUnavailable && (
         <div

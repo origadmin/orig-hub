@@ -1,11 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import {
-  cancelCacheTask,
-  deleteCacheTask,
-  retryCacheTask,
-  setCacheTaskPriority,
-} from '../../api/tg'
-import { fetchActivity, type ActivityTask } from '../../api/daemon'
+import { fetchDownloads, downloadControl, removeDownload, type ActivityTask } from '../../api/daemon'
 import type { TgCacheTask } from '../../types'
 import {
   groupIngestTasks,
@@ -197,7 +191,7 @@ export function useIngestGroups(
       if (guarded && inFlight.current) return
       inFlight.current = true
       try {
-        const data = await fetchActivity('all')
+        const data = await fetchDownloads('all')
         // BUG-318：先问「这一侧取到了吗」，再决定 tasks 能不能当「没有」读。
         // orig-tg 不可用（监督重启实测约每 10-15 分钟一次）时端点恒 200 但
         // cache 零条 —— 只读 tasks 就会把「取不到」渲染成「暂无传输任务」。
@@ -310,20 +304,16 @@ export function useIngestGroups(
         throw new Error(`该入库任务当前不支持操作：${action}`)
       }
       switch (action) {
+        // BUG-392：统一状态变更入口 —— 行 id 带来源前缀（`tg:` = 插件入库），
+        // 由 daemon 服务端分流到 orig-tg；前端不再自己认 orig-tg 端口。
         case 'retry':
-          await retryCacheTask(task.id)
-          break
         case 'cancel':
-          await cancelCacheTask(task.id)
+        case 'prefer':
+        case 'unprefer':
+          await downloadControl(`tg:${task.id}`, action)
           break
         // 优先下载（BUG-277）：置顶数值由**后端**算（当前最大 + 1），前端只表达
         // 意图；语义是「当前任务跑完后下一个跑它」，不抢占正在跑的任务。
-        case 'prefer':
-          await setCacheTaskPriority(task.id, { top: true })
-          break
-        case 'unprefer':
-          await setCacheTaskPriority(task.id, { priority: 0 })
-          break
       }
       refresh()
     },
@@ -332,7 +322,8 @@ export function useIngestGroups(
 
   const remove = useCallback(
     async (task: TgCacheTask) => {
-      await deleteCacheTask(task.id)
+      // BUG-392：删除同属状态变更，走同一入口。
+      await removeDownload(`tg:${task.id}`)
       refresh()
     },
     [refresh],

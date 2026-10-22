@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from './ui/button'
+import { SelectAllButtons, SelectionBar } from './ui/selection-bar'
 import { Input } from './ui/input'
 import { useTranslation } from '../i18n'
 import { useStore } from '../store/useStore'
@@ -1714,25 +1715,28 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
         )}
 
         {/*
-         * 剧集墙批量动作条（BUG-214）：选中 **≥1** 条即出现，浮在内容区**底部**。
-         *
-         * - 为什么 absolute 而不是 fixed：fixed 会被祖先的 transform / backdrop-filter
-         *   影响定位（本仓有过这类踩坑），absolute 相对 `.relative` 主区稳定可靠；
-         * - 为什么在底部而不是顶部：批量动作发生在「选完之后」，视线焦点就在网格里，
-         *   顶部 sticky 还会常驻占一行、挤压网格高度（BUG-214 修复方向已定档）；
-         * - z-30 < 弹窗 z-50：动作条永远不会盖住对话框，也不与遮罩抢层级。
+         * 剧集墙批量动作条（BUG-214 / BUG-393 统一化）：选中 **≥1** 条即出现，浮在内容区
+         * **底部居中** —— 与下载域、items 视图共用同一套 `SelectionBar` 标准组件
+         * （`docs/standards/style.md` §选择条）。`fixed` 视口相对 ⇒ 三处落点一致
+         * （BUG-393 S1b 实测：absolute 会因包含块不同产生 96px 偏移，旧实现正是
+         * `absolute`，所以此前与下载域/items 看着不一样）。
+         * 剧集专属动作（合并/打标/导出/删除/清空）仍经 children 传入组件。
          */}
         {view === 'series' && seriesBulkReady ? (
-          <div
-            data-testid="series-selection-bar"
-            className="absolute bottom-4 left-1/2 z-30 flex -translate-x-1/2 flex-wrap items-center gap-2 rounded-full border border-accent/40 bg-surface/95 px-3 py-2 shadow-lg backdrop-blur-md"
+          <SelectionBar
+            count={selectedSeriesList.length}
+            testId="series-selection-bar"
+            countTestId="series-selection-count"
           >
-            <span
-              data-testid="series-selection-count"
-              className="text-[11px] font-medium text-fg-strong"
-            >
-              {t('media.seriesSelectionCount', { n: selectedSeriesList.length })}
-            </span>
+            {/* BUG-393：全选/全不选并入标准组件（与下载域、items 同形）。 */}
+            <SelectAllButtons
+              onSelectAll={() => setSelectedSeries(new Set(series.map((s) => s.id)))}
+              onSelectNone={clearSeriesSelection}
+              allLabel={t('media.selectAll')}
+              noneLabel={t('media.selectNone')}
+              allTestId="series-select-all"
+              noneTestId="series-select-none"
+            />
             <Button
               size="sm"
               className="h-7 px-2 text-[11px]"
@@ -1785,7 +1789,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             >
               {t('media.seriesSelectionClear')}
             </Button>
-          </div>
+          </SelectionBar>
         ) : null}
 
         {/*
@@ -1806,37 +1810,23 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
          * 标题区右槽（BUG-317 四件套①②），任何视图恒定可用。
          */}
         {view === 'items' && selected.size > 0 ? (
-          <div
-            data-testid="items-selection-bar"
-            className="absolute bottom-4 left-1/2 z-30 flex -translate-x-1/2 flex-wrap items-center gap-2 rounded-full border border-accent/40 bg-surface/95 px-3 py-2 shadow-lg backdrop-blur-md"
+          /* BUG-393：容器与计数改用**全仓标准** `SelectionBar`（样式标准唯一真源）。 */
+          <SelectionBar
+            count={selected.size}
+            testId="items-selection-bar"
+            countTestId="items-selection-count"
           >
-            <span
-              data-testid="items-selection-count"
-              className="text-[11px] font-medium text-fg-strong"
-            >
-              {t('media.selected', { n: selected.size })}
-            </span>
             {/* 全选本页（BUG-155 语义保留）：填的是当前**可见** items 的 id。
                 testid 沿用 `media-select-all`（验收脚本的既有契约）。 */}
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 px-2 text-[11px]"
-              data-testid="media-select-all"
-              onClick={() => setSelected(new Set(visibleIds))}
-            >
-              {t('media.selectAll')}
-            </Button>
-            {/* 全不选（任务 #9 新增，用户点名「弹出当前缺少全选和全不选」）。 */}
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-7 px-2 text-[11px]"
-              data-testid="media-select-none"
-              onClick={clearSelection}
-            >
-              {t('media.selectNone')}
-            </Button>
+            {/* BUG-393：全选/全不选同样并入标准组件（成对出现，形态全仓一致）。 */}
+            <SelectAllButtons
+              onSelectAll={() => setSelected(new Set(visibleIds))}
+              onSelectNone={clearSelection}
+              allLabel={t('media.selectAll')}
+              noneLabel={t('media.selectNone')}
+              allTestId="media-select-all"
+              noneTestId="media-select-none"
+            />
             {/* 剧集收 video / photo（图片入浏览位）。含 audio/未知类型时禁用（后端 422 兜底） */}
             <Button
               variant="outline"
@@ -1886,7 +1876,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             >
               {t('media.clearSel')}
             </Button>
-          </div>
+          </SelectionBar>
         ) : null}
       </div>
 

@@ -1,0 +1,34 @@
+[
+  {
+    "name": "U1 /api/downloads 是统一快照（tasks+sources，不是裸数组）",
+    "ok": true
+  },
+  {
+    "name": "U1b 快照同时声明两个来源（download 原生/BT + cache 插件入库）",
+    "ok": true
+  },
+  {
+    "name": "U1c BUG-322 遗留 mock 夹具已清空（残留=0）",
+    "ok": true
+  },
+  {
+    "name": "U2 /api/downloads/native 仍是引擎原生投影（每行带 dest_path）",
+    "ok": true
+  },
+  {
+    "name": "U3a tg: 行 pause/resume → 422（走 TG 分支且不造假续传，不是 404）",
+    "ok": true
+  },
+  {
+    "name": "U3b tg: 行 cancel 打到不存在的 id → 502（请求确实代理去 orig-tg，未落引擎）",
+    "ok": true
+  },
+  {
+    "name": "U3c dl: 行落引擎侧（不存在的 uuid → 404）",
+    "ok": true
+  },
+  {
+    "name": "U4 下载域经统一端点渲染出行（>0）",
+    "ok": true
+  }
+]

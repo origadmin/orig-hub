@@ -51,8 +51,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 /** GET /api/downloads */
+/**
+ * GET /api/downloads/native — **引擎原生明细**（BUG-392）。
+ *
+ * `/api/downloads` 现在是**统一列表**（全来源快照 `{tasks, sources}`），不是数组；
+ * 引擎面（分块/连接/速度等原生字段）改由 `/native` 投影承担。store 的
+ * `downloads` 是引擎面派生（速度/进行中计数），必须取这一支。
+ */
 export function listDownloads(): Promise<DownloadStatus[]> {
-  return request('/api/downloads')
+  return request('/api/downloads/native')
 }
 
 /** GET /api/downloads/:id */
@@ -488,9 +495,34 @@ export interface ActivitySnapshot {
   generated_at: number
 }
 
-/** GET /api/activity?scope=active|all */
-export function fetchActivity(scope: 'active' | 'all' = 'active'): Promise<ActivitySnapshot> {
-  return request<ActivitySnapshot>(`/api/activity?scope=${scope}`)
+/**
+ * GET /api/downloads?scope=active|all — **统一列表接口**（BUG-392）。
+ *
+ * 全来源（插件/TG 入库 + 原生引擎 + BT）一个端点：此前与本函数等价的
+ * `/api/activity` 被读成「另一个列表端点」，而 UI 名义上的列表接口
+ * `/api/downloads` 实际只回引擎原生面（于是它只挂着 1 条遗留 mock 夹具）。
+ * 现在两者合流：列表只有 `/api/downloads`，`/api/activity` 退为已废弃别名
+ * （仅既有探针依赖，产品代码不再调用）。
+ */
+export function fetchDownloads(scope: 'active' | 'all' = 'active'): Promise<ActivitySnapshot> {
+  return request<ActivitySnapshot>(`/api/downloads?scope=${scope}`)
+}
+
+/**
+ * 统一**状态变更**接口（BUG-392）：`/api/downloads/:id`，按行 id 前缀
+ * （`dl:` = 原生引擎 / `tg:` = TG 插件入库）由服务端分流。
+ *
+ * 此前 TG 行的取消/重试/优先下载由前端直连 orig-tg，UI 同时认两个域 ——
+ * orig-tg 重启顺延端口后动作全打到空端口。现在 UI 只认这一个入口。
+ */
+export function downloadControl(
+  id: string,
+  action: 'pause' | 'resume' | 'cancel' | 'retry' | 'prefer' | 'unprefer',
+): Promise<{ id: string; action: string }> {
+  return request(
+    `/api/downloads/${encodeURIComponent(id)}?action=${action}`,
+    { method: 'POST' },
+  )
 }
 
 /**

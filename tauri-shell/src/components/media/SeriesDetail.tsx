@@ -83,6 +83,7 @@ import { TagPicker } from './TagManagerDialog'
 import { TagToken } from './TagToken'
 import { CoverImage } from './CoverImage'
 import { Button } from '../ui/button'
+import { RowCheckbox } from '../ui/selection-bar'
 import { useTranslation } from '../../i18n'
 import { seriesLabel } from '../../lib/displayTitle'
 import { resolveDisplayName } from '../../lib/displayName'
@@ -1648,12 +1649,14 @@ export function SeriesDetail(props: {
                     className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] hover:bg-surface-2"
                     data-testid="series-split-option"
                   >
-                    <input
-                      type="checkbox"
-                      className="h-3.5 w-3.5 shrink-0 accent-accent"
+                    {/* BUG-393：剧集行选择框同样并入标准组件（原 h-3.5 与下载行
+                        h-4 不同源，两处视觉尺寸不一致）。 */}
+                    <RowCheckbox
                       checked={checked}
                       disabled={splitting}
                       onChange={() => toggleSplitSelect(ep.itemId)}
+                      testId="series-split-select"
+                      ariaLabel="选中此集"
                     />
                     <span className="shrink-0 font-mono text-[10.5px] text-muted">
                       {episodeSlotLabel(ep)}

@@ -2,6 +2,11 @@
 
 本文件定义 AI 智能体与协作者在本仓库工作的统一规则，对标 `orig-cms-ee` 的治理范式。
 
+> **标准三件套（强制，2026-10-23 起）**：开发 [`docs/standards/dev.md`](docs/standards/dev.md) ·
+> 样式 [`docs/standards/style.md`](docs/standards/style.md) ·
+> 模块 [`docs/standards/module.md`](docs/standards/module.md)。
+> 三者是本文档 §5–§8 的可执行展开；**冲突以本文档为准**。新增控件/端点/模块前先读对应一份。
+
 ## 1. 仓库结构（双舱）
 
 | 舱 | 路径 | 说明 |

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Badge } from '../../components/ui/badge'
 import { Button } from '../../components/ui/button'
 import { Progress } from '../../components/ui/progress'
+import { RowCheckbox } from '../../components/ui/selection-bar'
 import {
   formatBytes,
   formatEta,
@@ -124,13 +125,12 @@ export function DownloadItem({
           onClick={(e) => e.stopPropagation()}
           title="选中此下载（用于批量取消）"
         >
-          <input
-            type="checkbox"
-            checked={selected}
+          {/* BUG-393：行选择框走全仓标准组件（尺寸/配色只有一处定义）。 */}
+          <RowCheckbox
+            checked={!!selected}
             onChange={() => onToggleSelect?.(item.id)}
-            className="h-4 w-4 cursor-pointer accent-accent"
-            data-testid="download-item-select"
-            aria-label="选中此下载"
+            testId="download-item-select"
+            ariaLabel="选中此下载"
           />
         </label>
         {/* 文件名 + URL */}

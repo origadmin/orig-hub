@@ -1045,9 +1045,13 @@ export function CacheManagerDialog(props: {
                 并把「选中 N 条 / 可重试 x / 可取消 y」如实摊开 —— 只发 x / y，剩下
                 N−x 条本次不受影响，绝不明发全量让后端 422、也绝不静默跳过。 */}
             {selectedIds.length > 0 ? (
-              <div
-                className="mt-2 flex flex-wrap items-center gap-2 rounded-md border border-accent/40 bg-accent/5 px-2.5 py-2 text-[11px] text-fg-muted"
-                data-testid="cache-batch-bar"
+              <>
+                {/* BUG-393：批量条形态全仓统一 —— 与 `SelectionBar` 同一胶囊/边框/背景（见
+                    `docs/standards/style.md` §选择条）。本条在模态内嵌，使用 `fixed` 会逸出
+                    对话框，故保留 inline（`mt-2`）但套用同一视觉形态，避免再出现「方块条 vs 胶囊条」。 */}
+                <div
+                  className="mt-2 flex flex-wrap items-center gap-2 rounded-full border border-accent/40 bg-surface/95 px-3 py-2 shadow-lg backdrop-blur-md text-[11px] text-fg-muted"
+                  data-testid="cache-batch-bar"
               >
                 <span
                   className="shrink-0 font-medium text-fg-strong"
@@ -1136,6 +1140,7 @@ export function CacheManagerDialog(props: {
                   {t('tg.cacheDeleteSelected', { n: selectedIds.length })}
                 </Button>
               </div>
+              </>
             ) : null}
 
             {/* 批量确认条（BUG-054 验收形态：任何删除都要确认，且如实报出活跃任务数） */}

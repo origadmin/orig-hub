@@ -645,6 +645,11 @@ async fn action(
     // 副作用在锁内、落库在锁外：持着任务表的锁去 await DB 会把整张表堵在后面。
     // 返回值是（响应里的动作标签，库里的状态）—— 两者刻意不同名：
     // 「resumed」是给调用方的人话，「downloading」是库内状态机的字面量。
+    // BUG-392：统一状态变更 —— `tg:<id>` 行由服务端代理到 orig-tg，
+    // UI 只认这一个入口（不再直连 orig-tg，避免端口顺延后动作对空端口发）。
+    if let Some(tg_id) = id.strip_prefix("tg:") {
+        return tg_control(&st, tg_id, &q.action).await.map(axum::Json);
+    }
     let (label, next_status) = {
         let tasks = st.tasks.lock().await;
         let dt = tasks.get(&id).ok_or(StatusCode::NOT_FOUND)?;
@@ -689,6 +694,10 @@ async fn delete_one(
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
     // 终态行已让出内存句柄（见 `spawn_task` 收尾）⇒ 必须「内存 + 库」两处都查，
     // 只查内存会让终态行删不掉 —— 而它恰恰是用户最想清掉的那一行。
+    // BUG-392：统一状态变更（删除同属状态变更，走同一入口）。
+    if let Some(tg_id) = id.strip_prefix("tg:") {
+        return tg_control(&st, tg_id, "delete").await.map(axum::Json);
+    }
     let dt = st.tasks.lock().await.remove(&id);
     if dt.is_none() && !st.record_exists(&id).await {
         return Err(StatusCode::NOT_FOUND);
@@ -738,6 +747,67 @@ async fn activity(
     Query(q): Query<ActivityQuery>,
 ) -> axum::Json<ActivitySnapshot> {
     axum::Json(activity::collect(&st, q.scope()).await)
+}
+
+/// BUG-392：**统一列表端点** —— 全来源（插件/TG 入库 + 原生引擎 + BT）一个列表。
+///
+/// 此前 `/api/downloads` 只回引擎原生面（于是它长期只挂着 1 条 mock 夹具，被读成
+/// 「数据只有一条」），统一聚合面却是另一个端点 `/api/activity`；UI 只认后者，
+/// 两个 endpoint 各说一半。用户共识：下载只有**一个列表接口**。
+/// 原引擎原生列表退居 `/api/downloads/native`（调试/详情投影，非 UI 列表路径）。
+async fn list_unified(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<ActivityQuery>,
+) -> axum::Json<ActivitySnapshot> {
+    axum::Json(activity::collect(&st, q.scope()).await)
+}
+
+/// BUG-392：**统一状态变更接口**的 TG 侧代理。
+///
+/// 共识是「一个列表接口 + 一个状态变更接口」。此前 TG 入库行的取消/重试/优先下载
+/// 由前端**直连 orig-tg**（`/api/tg/cache/tasks/...`），UI 同时认两个域 ——
+/// orig-tg 重启顺延端口后前端手里是旧端口，动作全失败而列表照常显示。
+/// 现在由 daemon 服务端分流：端口真源只有 `st.tg_port_state()` 一处（BUG-318）。
+///
+/// **不造假**：TG 无断点续传 ⇒ pause/resume 一律 422（activity.rs 五铁律④）。
+async fn tg_control(
+    st: &AppState,
+    id: &str,
+    action: &str,
+) -> Result<serde_json::Value, StatusCode> {
+    let base = format!("http://127.0.0.1:{}", st.tg_port_state());
+    let (method, url, body): (&str, String, Option<serde_json::Value>) = match action {
+        "cancel" | "delete" => ("DELETE", format!("{base}/api/tg/cache/tasks/{id}"), None),
+        "retry" => ("POST", format!("{base}/api/tg/cache/tasks/{id}/retry"), None),
+        // 优先下载（BUG-277）：置顶数值由 orig-tg 算，前端只给意图。
+        "prefer" => (
+            "POST",
+            format!("{base}/api/tg/cache/tasks/{id}/priority"),
+            Some(serde_json::json!({"top": true})),
+        ),
+        "unprefer" => (
+            "POST",
+            format!("{base}/api/tg/cache/tasks/{id}/priority"),
+            Some(serde_json::json!({"priority": 0})),
+        ),
+        "pause" | "resume" => return Err(StatusCode::UNPROCESSABLE_ENTITY),
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let mut req = match method {
+        "DELETE" => st.http.delete(&url),
+        _ => st.http.post(&url),
+    };
+    if let Some(b) = body {
+        // reqwest 未开 `json` feature：手写 content-type + body，语义等价。
+        req = req
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(b.to_string());
+    }
+    let resp = req.send().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
+    if !resp.status().is_success() {
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    Ok(serde_json::json!({"id": format!("tg:{id}"), "action": action}))
 }
 
 /// GET /api/config — 当前 daemon 配置（供设置页初始化）。
@@ -1428,7 +1498,10 @@ fn compute_interfaces() -> serde_json::Value {
 pub fn router(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()
         .route("/health", get(health))
-        .route("/api/downloads", get(list).post(add))
+        // BUG-392：GET 是**统一列表**（全来源）；POST（新增任务）语义不变。
+        .route("/api/downloads", get(list_unified).post(add))
+        // 引擎原生明细投影（分块/连接数等），调试与详情用；UI 列表不走这里。
+        .route("/api/downloads/native", get(list))
         .route(
             "/api/downloads/:id",
             get(get_one).post(action).delete(delete_one),

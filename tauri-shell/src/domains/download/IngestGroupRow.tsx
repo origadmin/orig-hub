@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Badge } from '../../components/ui/badge'
 import { Button } from '../../components/ui/button'
+import { RowCheckbox } from '../../components/ui/selection-bar'
 import { Progress } from '../../components/ui/progress'
 import { formatBytes } from '../../lib/utils'
 import { hasLibraryLocator } from '../../hooks/useGoLibrary'
@@ -174,13 +175,12 @@ export function IngestGroupRow({
             onClick={(e) => e.stopPropagation()}
             title="选中此入库对象（用于批量取消）"
           >
-            <input
-              type="checkbox"
-              checked={selected}
+            {/* BUG-393：行选择框走全仓标准组件。 */}
+            <RowCheckbox
+              checked={!!selected}
               onChange={() => onToggleSelect?.(group.key)}
-              className="h-4 w-4 cursor-pointer accent-accent"
-              data-testid="ingest-group-select"
-              aria-label="选中此入库对象"
+              testId="ingest-group-select"
+              ariaLabel="选中此入库对象"
             />
           </label>
           <div className="min-w-0 flex-1">
