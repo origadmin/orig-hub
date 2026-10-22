@@ -57,8 +57,19 @@ async function main() {
   const browser = await cdp.launch()
   const page = await browser.newPage()
   try {
-    await page.setViewport(VIEWPORT.width, VIEWPORT.height)
-    await page.goto(APP)
+    // ★ `Page.setViewport` 收的是**对象**（`{width, height}`）；传两个数字会让
+    //   width/height 变成 undefined，CDP 直接回 "Invalid parameters" ——
+    //   本脚本首次运行前就是栽在这里（首轮写完没跑过）。
+    await page.setViewport(VIEWPORT)
+    // ★ 冷启动首屏可达 30s+（vite 侧刚改过文件时尤其明显），默认 30s 档会表现成
+    //   「Page.loadEventFired 超时」而不是「加载慢」 ⇒ 显式放宽 timeout 并允许重试。
+    await page.goto(APP, { waitForRoot: true, settleMs: 1500, timeout: 90000, attempts: 3 })
+
+    // ★ 资源时间线默认只保留 250 条；TG 面板一屏就是几十个缩略图，跑久了早先的记录
+    //   会被**静默挤掉** ⇒ 「封面没发请求」可能只是缓冲区溢出。先抬高上限。
+    await page.evaluate(() => {
+      if (performance.setResourceTimingBufferSize) performance.setResourceTimingBufferSize(20000)
+    })
 
     // 进 TG 面板 → 点开第一个监控频道（内容流才会渲染）
     await page.evaluate(() => {
@@ -123,26 +134,84 @@ async function main() {
     )
 
     // ── A1 折叠态只发 1 个 thumb（封面那条）
-    const before = await page.evaluate(THUMB_SNAPSHOT)
-    const beforeSet = new Set(before)
+    // ★ 两个坑（首次跑就踩了）：
+    //   ① 封面是 `<img loading="lazy">`，**在视口外就永远不发请求** ⇒ 不滚动到视口内
+    //      就读成「没请求」，那是把「还没发生」当成「没发生」；
+    //   ② 有界等待，不用固定 sleep（超时仍如实报红并带上实测耗时）。
+    await page.evaluate((mid) => {
+      const el = document.querySelector(`[data-testid="album-cover"][data-message-id="${mid}"]`)
+      if (el) el.scrollIntoView({ block: 'center' })
+    }, sample.messageId)
+    await new Promise((r) => setTimeout(r, 400))
+
     const coverKey = `${sample.chatId}:${sample.messageId}`
+    const coverDeadline = Date.now() + 20000
+    const coverT0 = Date.now()
+    let beforeSet = new Set()
+    while (Date.now() < coverDeadline) {
+      beforeSet = new Set(await page.evaluate(THUMB_SNAPSHOT))
+      if (beforeSet.has(coverKey)) break
+      await new Promise((r) => setTimeout(r, 250))
+    }
+    const coverWaitMs = Date.now() - coverT0
     check(
       'A1 collapsed album requested only its cover',
       beforeSet.has(coverKey),
-      `cover ${coverKey} requested=${beforeSet.has(coverKey)}`,
+      `cover ${coverKey} requested=${beforeSet.has(coverKey)} waited=${coverWaitMs}ms all=[${[...beforeSet].join(',')}]`,
     )
 
-    await page.screenshot(path.join(OUT, '01-collapsed.png'))
+    // ★ 折叠态截图**不用 fullPage**：`captureBeyondViewport` 会让 Chromium 按整页高度
+    //   重排一次，消息列表随之重渲染，展开态可能因此丢失 —— 截图不该改变被测状态。
+    await page.screenshot(path.join(OUT, '01-collapsed.png'), { fullPage: false })
 
     // ── 点击封面 → 展开整组
-    await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="album-cover"]')
-      if (el) el.click()
-    })
-    await page.waitForFunction(
-      () => document.querySelectorAll('[data-testid="album-grid"]').length > 0,
-      { timeout: 30000 },
+    // ★ 必须点**这一组**（按 data-message-id 定位），并且「滚动 → 重新查询 → 点击」
+    //   放在**同一次** page.evaluate 里原子完成：
+    //   面板在轮询重渲染，等 20s 之后该消息可能已被移出渲染窗口 ⇒
+    //   querySelector 返回 null ⇒ 静默跳过点击 ⇒ 看起来就是「点了没反应」。
+    const clicked = await page.evaluate(async (mid) => {
+      const sel = `[data-testid="album-cover"][data-message-id="${mid}"]`
+      const first = document.querySelector(sel)
+      if (!first) return { ok: false, reason: 'cover not in DOM' }
+      first.scrollIntoView({ block: 'center' })
+      await new Promise((r) => setTimeout(r, 350))
+      const el = document.querySelector(sel)
+      if (!el) return { ok: false, reason: 'cover vanished after scroll' }
+      el.click()
+      return { ok: true, detached: !document.contains(el) }
+    }, sample.messageId)
+    check('A2pre0 the target album cover was found and clicked', clicked.ok === true, JSON.stringify(clicked))
+    // ★ 不用裸 waitForFunction（超时只会抛 FATAL，看不出到底发生了什么）：
+    //   快速轮询并记录**观测到的最大值** —— 若 grid 曾出现又消失，说明展开态被
+    //   后续轮询刷新覆盖（flapping），那是比「没展开」更严重的问题。
+    const gridDeadline = Date.now() + 15000
+    let gridUp = false
+    let maxGrid = 0
+    let maxTiles = 0
+    let diag = null
+    while (Date.now() < gridDeadline) {
+      diag = await page.evaluate(() => ({
+        grid: document.querySelectorAll('[data-testid="album-grid"]').length,
+        cover: document.querySelectorAll('[data-testid="album-cover"]').length,
+        tiles: document.querySelectorAll('[data-testid^="tg-album-tile-"]').length,
+      }))
+      maxGrid = Math.max(maxGrid, diag.grid)
+      maxTiles = Math.max(maxTiles, diag.tiles)
+      if (diag.grid > 0) {
+        gridUp = true
+        break
+      }
+      await new Promise((r) => setTimeout(r, 60))
+    }
+    check(
+      'A2pre clicking the cover expands the group (album-grid appears)',
+      gridUp,
+      `diag=${JSON.stringify(diag)} maxGrid=${maxGrid} maxTiles=${maxTiles}`,
     )
+    if (!gridUp) {
+      await page.screenshot(path.join(OUT, '02-expand-failed.png'))
+      throw new Error('album-grid never appeared after clicking the cover — see diag above')
+    }
     // 缩略图是异步拉取的：等请求数真的涨上来（有界等待，超时如实报红）
     const deadline = Date.now() + 30000
     let afterSet = new Set()
@@ -166,13 +235,27 @@ async function main() {
       `tiles=${groupIds.length} expected=${sample.count} missing=[${missing.join(',')}]`,
     )
 
-    // ── A6 折叠态点击是「展开」而不是「打开大图」
-    const previewOpen = await page.evaluate(
-      () =>
-        document.querySelectorAll('[data-testid="tg-photo-preview"]').length > 0 &&
-        document.querySelectorAll('[data-testid="album-grid"]').length === 0,
+    // ── A6 折叠态点击 = 「展开这一组」，不是「打开大图」
+    // ★ 旧写法数 `[data-testid="tg-photo-preview"]` —— 那是**单图气泡的缩略图按钮**
+    //   （`PhotoBlock` 里，每条图片消息一个），点之前就有十几个 ⇒ 恒真、恒假都测不出。
+    //   改成测可观测的落点：展开的是**被点的那一组**（grid 内含有该组封面的
+    //   messageId），且消息流仍在屏（没有被跳到播放器/别的视图）。
+    const a6 = await page.evaluate((mid) => {
+      const grid = document.querySelector('[data-testid="album-grid"]')
+      const ids = grid
+        ? Array.from(grid.querySelectorAll('[data-message-id]')).map((el) => el.getAttribute('data-message-id'))
+        : []
+      return {
+        gridUp: !!grid,
+        hasCoverMsg: ids.includes(mid),
+        feedStillHere: document.querySelectorAll('[data-testid="tg-monitor-row"]').length > 0,
+      }
+    }, sample.messageId)
+    check(
+      'A6 first click expands THAT album and stays in the message feed',
+      a6.gridUp && a6.hasCoverMsg && a6.feedStillHere,
+      JSON.stringify(a6),
     )
-    check('A6 first click expands instead of opening the viewer', previewOpen === false)
 
     await page.screenshot(path.join(OUT, '02-expanded.png'))
 
