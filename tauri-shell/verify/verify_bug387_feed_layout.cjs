@@ -111,12 +111,20 @@ async function main() {
       return {
         tiles: grid.children.length,
         coverH: cover ? Math.round(cover.getBoundingClientRect().height) : 0,
+        gridBelow: (() => {
+          if (!bubble || !cover) return false
+          const g = grid.getBoundingClientRect()
+          const c = cover.getBoundingClientRect()
+          return g.top >= c.bottom - 2
+        })(),
         hasCollapse: bubble ? !!bubble.querySelector('[data-testid="album-collapse"]') : false,
         otherGrids: document.querySelectorAll('[data-testid="album-grid"]').length,
       }
     })
     await page.screenshot(path.join(OUT, 'expanded.png'))
-    check('L3 等高机制：封面 flex-1 拉伸 + 宫格在右列', !!ex && ex.coverH > 200 && ex.tiles >= 2, ex ? `coverH=${ex.coverH} tiles=${ex.tiles}` : 'no grid')
+    // BUG-391 起此判据被接管：封面不再等高拉伸（自然比例 ≤288），宫格移到
+    // 气泡底部（grid.top ≥ cover.bottom）。此处保留新契约的回归断言。
+    check('L3 封面自然比例 + 宫格在底部（BUG-391 接管）', !!ex && ex.coverH <= 290 && ex.coverH > 0 && ex.gridBelow, ex ? `coverH=${ex.coverH} gridBelow=${ex.gridBelow}` : 'no grid')
     check('L4 收起入口：album-collapse 在、其余相册保持折叠', !!ex && ex.hasCollapse && ex.otherGrids === 1, ex ? `collapse=${ex.hasCollapse} grids=${ex.otherGrids}` : 'no grid')
   } else {
     check('L3/L4 展开态（本频道无相册样本，跳过并如实记录）', true, 'no album in first channel')

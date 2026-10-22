@@ -59,7 +59,6 @@ import type { EntryState } from '../lib/entryState'
 import {
   ALBUM_MAX_TILES,
   albumGridClass,
-  coverFit,
   fmtDuration,
   fmtSize,
   fmtTime,
@@ -3324,9 +3323,9 @@ const AlbumBubble = memo(function AlbumBubble(props: {
          * object-contain、瓦片 data-message-key 定位锚点（BUG-305）。
          */}
         <div className="flex gap-2.5">
-          {/* 2026-10-23 二报：封面列 flex 容器 —— 封面 flex-1 等高拉伸
-             （行高 = max(右列, min-h-32)），与 MessageBubble 左列同一修法。 */}
-          <div className="flex w-40 shrink-0 flex-col self-stretch">
+          {/* BUG-391：封面列不再 self-stretch/flex-1 等高拉伸 —— 首图是内容本体，
+              拉到行高（长 caption / 宫格高）会破坏纵横比。封面取自然比例。 */}
+          <div className="w-40 shrink-0">
             {collapsible ? (
               /* 折叠态：点击 = 展开整组，不是打开大图 —— 用户原话
                  「列表点击加载整个组内容」，第一次点击的语义是"把组摊开"；
@@ -3340,14 +3339,14 @@ const AlbumBubble = memo(function AlbumBubble(props: {
                 data-message-id={cover.messageId}
                 /* 2026-10-23 二报：flex-1 + min-h-32 —— 长 caption 时封面等高
                    拉伸，DOM 左右 = 视觉左右。 */
-                className="relative block min-h-32 w-full flex-1 overflow-hidden rounded-lg bg-surface-2"
+                className="relative block min-h-32 w-full overflow-hidden rounded-lg bg-surface-2"
               >
                 {coverTyp === 'photo' || coverTyp === 'video' ? (
                   <img
                     src={tgThumbUrl(cover.chatId, cover.messageId)}
                     alt={cover.caption || ''}
                     loading="lazy"
-                    className={cn('absolute inset-0 h-full w-full', coverFit(coverTyp))}
+                    className="h-auto max-h-72 w-full object-cover"
                   />
                 ) : (
                   <span className="flex h-full w-full items-center justify-center text-2xl">
@@ -3376,14 +3375,14 @@ const AlbumBubble = memo(function AlbumBubble(props: {
                 data-count={items.length}
                 data-chat-id={cover.chatId}
                 data-message-id={cover.messageId}
-                className="relative block min-h-32 w-full flex-1 overflow-hidden rounded-lg bg-surface-2"
+                className="relative block min-h-32 w-full overflow-hidden rounded-lg bg-surface-2"
               >
                 {coverTyp === 'photo' || coverTyp === 'video' ? (
                   <img
                     src={tgThumbUrl(cover.chatId, cover.messageId)}
                     alt={cover.caption || ''}
                     loading="lazy"
-                    className={cn('absolute inset-0 h-full w-full', coverFit(coverTyp))}
+                    className="h-auto max-h-72 w-full object-cover"
                   />
                 ) : (
                   <span className="flex h-full w-full items-center justify-center text-2xl">
@@ -3405,71 +3404,73 @@ const AlbumBubble = memo(function AlbumBubble(props: {
                 {caption}
               </p>
             )}
-            {open ? (
-            <div
-              data-testid="album-grid"
-              className={cn('mt-1.5 grid gap-1.5', albumGridClass(items.length))}
-            >
-          {items.slice(0, ALBUM_MAX_TILES).map((it, i) => {
-            const typ = it.type ?? guessMediaType(it.mimeType, it.filePath)
-            const dur = fmtDuration(it.duration)
-            const overflow = items.length - ALBUM_MAX_TILES
-            const isLastTile = i === ALBUM_MAX_TILES - 1 && overflow > 0
-            const single = items.length === 1
-            return (
-              <button
-                key={it.key}
-                type="button"
-                onClick={() => onPreview(i, items)}
-                data-testid={`tg-album-tile-${i}`}
-                data-message-id={it.messageId}
-                /* BUG-305：瓦片也带消息 key —— 相册内单条消息同样是定位锚点 */
-                data-message-key={it.key}
-                className={cn(
-                  'relative block w-full overflow-hidden rounded-lg bg-surface-2',
-                  // 单图给自然比例（整幅呈现）；多图用方形格保证网格整齐
-                  single ? '' : 'aspect-square',
-                  isLastTile && 'ring-1 ring-inset ring-white/10',
-                )}
-              >
-                {typ === 'photo' || typ === 'video' ? (
-                  <img
-                    src={tgThumbUrl(it.chatId, it.messageId)}
-                    alt={it.caption || ''}
-                    loading="lazy"
-                    className={cn(
-                      // 单图：自然比例、不放大（`w-auto` 而非 `w-full`，避免小图被拉糊）
-                      single ? 'mx-auto h-auto max-h-[60vh] w-auto max-w-full' : 'h-full w-full',
-                      coverFit(typ),
-                    )}
-                  />
-                ) : (
-                  <span className="flex h-full w-full items-center justify-center text-lg">
-                    {typ === 'audio' ? '🎵' : '📄'}
-                  </span>
-                )}
-                {typ === 'video' && dur && (
-                  <span className="absolute bottom-1 right-1 rounded bg-black/70 px-1 py-0.5 text-[9px] font-medium text-white">
-                    {dur}
-                  </span>
-                )}
-                {typ === 'video' && (
-                  <span className="absolute inset-0 flex items-center justify-center">
-                    <span className="flex h-8 w-8 items-center justify-center rounded-full bg-black/55 pl-0.5 text-xs text-white backdrop-blur-sm">
-                      {it.downloaded ? '▶' : '⬇'}
+          </div>
+        </div>
+        {/* BUG-391：展开宫格移出左右框架 —— 气泡**向下**拉伸（底部展开），
+            不再与封面分列左右；首图已作为封面呈现，不入宫格（宫格 =
+            items[1..]，瓦片 testid/preview 下标仍 = items 下标）。 */}
+        {open && items.length > 1 ? (
+          <div
+            data-testid="album-grid"
+            className={cn(
+              'mt-2 grid gap-1.5',
+              albumGridClass(Math.min(items.length - 1, ALBUM_MAX_TILES)),
+            )}
+          >
+            {items.slice(1, ALBUM_MAX_TILES + 1).map((it, i) => {
+              const typ = it.type ?? guessMediaType(it.mimeType, it.filePath)
+              const dur = fmtDuration(it.duration)
+              const shown = Math.min(items.length - 1, ALBUM_MAX_TILES)
+              const overflow = items.length - 1 - shown
+              const isLastTile = i === shown - 1 && overflow > 0
+              return (
+                <button
+                  key={it.key}
+                  type="button"
+                  onClick={() => onPreview(i + 1, items)}
+                  data-testid={`tg-album-tile-${i + 1}`}
+                  data-message-id={it.messageId}
+                  /* BUG-305：瓦片也带消息 key —— 相册内单条消息同样是定位锚点 */
+                  data-message-key={it.key}
+                  className={cn(
+                    'relative block aspect-square w-full overflow-hidden rounded-lg bg-surface-2',
+                    isLastTile && 'ring-1 ring-inset ring-white/10',
+                  )}
+                >
+                  {typ === 'photo' || typ === 'video' ? (
+                    <img
+                      src={tgThumbUrl(it.chatId, it.messageId)}
+                      alt={it.caption || ''}
+                      loading="lazy"
+                      className="h-full w-full object-cover"
+                    />
+                  ) : (
+                    <span className="flex h-full w-full items-center justify-center text-lg">
+                      {typ === 'audio' ? '🎵' : '📄'}
                     </span>
-                  </span>
-                )}
-                {isLastTile && (
-                  <span className="absolute inset-0 flex items-center justify-center bg-black/60 text-sm font-semibold text-white">
-                    +{overflow}
-                  </span>
-                )}
-              </button>
-            )
-          })}
-            </div>
-            ) : null}
+                  )}
+                  {typ === 'video' && dur && (
+                    <span className="absolute bottom-1 right-1 rounded bg-black/70 px-1 py-0.5 text-[9px] font-medium text-white">
+                      {dur}
+                    </span>
+                  )}
+                  {typ === 'video' && (
+                    <span className="absolute inset-0 flex items-center justify-center">
+                      <span className="flex h-8 w-8 items-center justify-center rounded-full bg-black/55 pl-0.5 text-xs text-white backdrop-blur-sm">
+                        {it.downloaded ? '▶' : '⬇'}
+                      </span>
+                    </span>
+                  )}
+                  {isLastTile && (
+                    <span className="absolute inset-0 flex items-center justify-center bg-black/60 text-sm font-semibold text-white">
+                      +{overflow}
+                    </span>
+                  )}
+                </button>
+              )
+            })}
+          </div>
+        ) : null}
 
         {/* 操作行：整组缓存 / 进度 / 首条消息号 + 总大小（按钮与缓存库同构：outline h-6） */}
         <div className="mt-1.5 flex items-center gap-2">
@@ -3535,8 +3536,6 @@ const AlbumBubble = memo(function AlbumBubble(props: {
               </Button>
             </div>
           )}
-        </div>
-          </div>
         </div>
       </div>
     </div>

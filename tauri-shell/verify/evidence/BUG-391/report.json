@@ -1,0 +1,26 @@
+[
+  {
+    "name": "P1a 折叠态封面自然比例（宽=160、高≤288 不被拉伸）",
+    "ok": true
+  },
+  {
+    "name": "前提：点击后相册进入展开态（含重试）",
+    "ok": true
+  },
+  {
+    "name": "P1b 展开态封面仍自然比例（≤288，不被宫格高度拉伸）",
+    "ok": true
+  },
+  {
+    "name": "P2 宫格在封面下方（grid.top ≥ cover.bottom ±2）",
+    "ok": true
+  },
+  {
+    "name": "P3 首图不入宫格（瓦片 data-message-id 全 ≠ 封面，testid 从 tile-1 起）",
+    "ok": true
+  },
+  {
+    "name": "P4 收起入口仍在",
+    "ok": true
+  }
+]
