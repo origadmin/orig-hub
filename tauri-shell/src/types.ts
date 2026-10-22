@@ -300,6 +300,14 @@ export interface TgMonitoredChannel {
    * 不是「库里共几条」，也不是「本轮同步加了几条」——口径见 docs/bugs/BUG-329.md。
    */
   newCount: number
+  /**
+   * 回溯目标日期（unix 秒，0/缺省 = 该频道没有待回溯）。
+   *
+   * 2026-10-22 用户第 2 点：增量同步只向新，频道数据只会加载最新一窗。
+   * 回溯是长跑（后台每轮每频道只翻一页），所以进度必须能从列表里看见——
+   * 否则用户点了「回溯到 1 月」之后毫无反馈，只会以为按钮没生效。
+   */
+  backfillUntil?: number
 }
 
 /** 文字筛选规则（GET/POST /api/tg/monitor/filters）。

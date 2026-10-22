@@ -17,6 +17,8 @@ import {
   removeTgMonitoredChannel,
   markTgChannelRead,
   listTgMonitorFilters,
+  startTgMonitorBackfill,
+  cancelTgMonitorBackfill,
   addTgMonitorFilter,
   removeTgMonitorFilter,
   markTgFilterRead,
@@ -64,6 +66,17 @@ import {
   guessMediaType,
   type MediaType,
 } from '../lib/tgmedia'
+
+/**
+ * unix 秒 → `YYYY-MM-DD`（**UTC**，与 `monitor::parse_date_utc` 同一口径）。
+ *
+ * 不用 `toLocaleDateString()`：那会按浏览器时区算，回溯边界与服务端的 UTC
+ * 解释差一天，用户会看到「我选 1 月 1 日，状态显示 12 月 31 日」。
+ */
+function fmtDateOnly(unixSec: number): string {
+  if (!unixSec || unixSec <= 0) return ''
+  return new Date(unixSec * 1000).toISOString().slice(0, 10)
+}
 
 /** 未分组的内部键（避免与真实分组标题冲突） */
 const UNGROUPED = '__ungrouped__'
@@ -145,6 +158,8 @@ interface MiddleChannel {
   folder?: string
   /** 仅监控行有值：自上次点开以来新增条数（未读徽标） */
   newCount?: number
+  /** 仅监控行有值：回溯目标日期（unix 秒，0/缺省 = 没有待回溯） */
+  backfillUntil?: number
 }
 
 /**
@@ -394,6 +409,18 @@ export function TgPanel(
   const [monitoredList, setMonitoredList] = useState<TgMonitoredChannel[]>([])
   /** 监控列表折叠状态（默认展开） */
   const [monitorOpen, setMonitorOpen] = useState(true)
+  /**
+   * 回溯表单：正在填日期的那一行（channel id）；null = 未展开。
+   *
+   * 2026-10-22 用户第 2 点：增量同步只向新 ⇒ 频道数据只有最新一窗。
+   * 回溯是**条目级动作**，所以表单挂在**行下方**（不上提到节头）——
+   * 层级纪律：条目级动作不得上提到入口级（BUG-324 裁定）。
+   */
+  const [backfillFor, setBackfillFor] = useState<number | null>(null)
+  /** 回溯目标日期（`YYYY-MM-DD`）。空串 = 用户还没选。 */
+  const [backfillDate, setBackfillDate] = useState('')
+  /** 回溯请求在飞：只锁按钮，不锁整个面板。 */
+  const [backfillBusy, setBackfillBusy] = useState(false)
   /**
    * 频道节折叠状态（BUG-330 TGM-02，设计 §2.6 优先级三机制）：
    * 频道 = 消费序最底、偶尔动作 ⇒ **默认折叠**。折叠是优先级表达，不是功能隐藏——
@@ -714,6 +741,7 @@ export function TgPanel(
         title: m.title,
         username: m.username,
         newCount: m.newCount,
+        backfillUntil: m.backfillUntil,
       })),
     [monitoredList],
   )
@@ -1658,6 +1686,51 @@ export function TgPanel(
   }
 
   /**
+   * 开始回溯：只登记目标 + 服务端立刻翻一页，剩下的由后台 tick 慢慢翻。
+   *
+   * `kicked=false` **不是失败**（另一路同步正在跑，下一轮接着翻）⇒ 不报错。
+   * 回执里的 `backfillUntil` 直接写回本地行，用户马上能看到「回溯中」状态。
+   */
+  const doBackfill = async (channelId: number) => {
+    if (backfillBusy) return
+    if (!backfillDate) {
+      setError(t('tg.backfillInvalidDate'))
+      return
+    }
+    setBackfillBusy(true)
+    try {
+      const res = await startTgMonitorBackfill(channelId, backfillDate)
+      setMonitoredList((prev) =>
+        prev.map((c) =>
+          c.channelId === channelId ? { ...c, backfillUntil: res.backfillUntil } : c,
+        ),
+      )
+      setBackfillFor(null)
+      setBackfillDate('')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBackfillBusy(false)
+    }
+  }
+
+  /** 取消回溯：只停翻页，已入库的历史消息保留（不回滚）。 */
+  const doCancelBackfill = async (channelId: number) => {
+    if (backfillBusy) return
+    setBackfillBusy(true)
+    try {
+      await cancelTgMonitorBackfill(channelId)
+      setMonitoredList((prev) =>
+        prev.map((c) => (c.channelId === channelId ? { ...c, backfillUntil: 0 } : c)),
+      )
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBackfillBusy(false)
+    }
+  }
+
+  /**
    * 单条缓存：入队服务端任务后立即返回。
    *
    * 不再 `await` 整个下载——那会把任务寿命绑在这次 fetch 上，刷新即断。
@@ -2148,9 +2221,11 @@ export function TgPanel(
                 ) : (
                   monitoredRows.map((ch) => {
                     const active = selectedId === ch.id && !activeFilter
+                    const backfillOpen = backfillFor === ch.id
+                    const backfillRunning = (ch.backfillUntil ?? 0) > 0
                     return (
+                      <div key={ch.id}>
                       <div
-                        key={ch.id}
                         className={cn(
                           'group flex items-center gap-1 rounded-md pr-1 transition-colors',
                           active ? 'bg-accent/10' : 'hover:bg-surface-2/70',
@@ -2182,8 +2257,93 @@ export function TgPanel(
                             </span>
                           ) : null}
                         </button>
+                        {/* 回溯入口：**条目级动作**，只在这一行，不上提到节头
+                            （层级纪律 BUG-324）。未在回溯时也渲染，只是不再展开表单。 */}
+                        <Button
+                          variant="ghost"
+                          size="xs"
+                          data-testid="tg-monitor-backfill-open"
+                          aria-expanded={backfillOpen}
+                          title={t('tg.backfill')}
+                          disabled={backfillBusy}
+                          onClick={() => {
+                            setBackfillFor(backfillOpen ? null : ch.id)
+                            setBackfillDate('')
+                          }}
+                          className="h-9 shrink-0 px-2 text-[12px]"
+                        >
+                          {t('tg.backfill')}
+                        </Button>
                         {/* §2.7 单一写面：行尾 ✕ 已撤 —— 取消监控的唯一入口上移到
                             主列频道实体行（与分组管理列表的 Switch 同写面）。 */}
+                      </div>
+                      {/*
+                       * 回溯进行中：进度**必须可见**。回溯是长跑（后台每轮一页），
+                       * 不显示状态的话用户点了「回溯到 1 月」之后毫无反馈，
+                       * 只会以为按钮没生效（BUG-327「存在≠可用」的同一个坑）。
+                       */}
+                      {backfillRunning ? (
+                        <div
+                          data-testid="tg-monitor-backfill-progress"
+                          data-until={ch.backfillUntil}
+                          className="mb-1 flex items-center gap-2 rounded-md bg-surface-2/60 px-2 py-1.5"
+                        >
+                          <span className="min-w-0 flex-1 truncate text-[12px] text-fg-mid">
+                            {t('tg.backfillRunning', { date: fmtDateOnly(ch.backfillUntil ?? 0) })}
+                          </span>
+                          <Button
+                            variant="ghost"
+                            size="xs"
+                            data-testid="tg-monitor-backfill-cancel"
+                            title={t('tg.backfillCancelHint')}
+                            disabled={backfillBusy}
+                            onClick={() => void doCancelBackfill(ch.id)}
+                            className="h-9 shrink-0 px-2 text-[12px]"
+                          >
+                            {t('tg.backfillCancel')}
+                          </Button>
+                        </div>
+                      ) : null}
+                      {/* 表单挂在行下方（不是弹窗）：弹窗要处理定位/遮挡/关闭，
+                          而这只是「选个日期 + 一个按钮」，内联更稳也更好测。 */}
+                      {backfillOpen ? (
+                        <div
+                          data-testid="tg-monitor-backfill-form"
+                          className="mb-1 rounded-md border border-border-subtle bg-surface-2/40 p-2"
+                        >
+                          <p className="mb-1.5 text-[12px] leading-relaxed text-muted">
+                            {t('tg.backfillHint')}
+                          </p>
+                          <div className="flex items-center gap-2">
+                            <label
+                              htmlFor={`tg-backfill-date-${ch.id}`}
+                              className="shrink-0 text-[12px] text-fg-mid"
+                            >
+                              {t('tg.backfillDateLabel')}
+                            </label>
+                            <input
+                              id={`tg-backfill-date-${ch.id}`}
+                              type="date"
+                              data-testid="tg-monitor-backfill-date"
+                              value={backfillDate}
+                              onChange={(e) => setBackfillDate(e.target.value)}
+                              className="h-9 min-w-0 flex-1 rounded-md border border-border-subtle bg-surface px-2 text-[13px] text-fg-strong"
+                            />
+                          </div>
+                          <div className="mt-2 flex justify-end">
+                            <Button
+                              variant="secondary"
+                              size="xs"
+                              data-testid="tg-monitor-backfill-start"
+                              disabled={backfillBusy}
+                              onClick={() => void doBackfill(ch.id)}
+                              className="h-9 px-3 text-[12px]"
+                            >
+                              {t('tg.backfillStart')}
+                            </Button>
+                          </div>
+                        </div>
+                      ) : null}
                       </div>
                     )
                   })

@@ -246,6 +246,38 @@ export function markTgChannelRead(channelId: number | string): Promise<{ ok: boo
   )
 }
 
+/**
+ * POST /api/tg/monitor/backfill — 开始（或改期）某监控频道的历史回溯。
+ *
+ * 只登记目标 + 服务端立刻翻一页；剩下的由后台 tick 慢慢翻（每轮一页）。
+ * 所以这里返回的 `kicked=false` **不是失败**：另一路同步正在跑，下一轮会接着翻。
+ *
+ * `untilDate` 只收 `YYYY-MM-DD`（服务端按 UTC 当日 00:00 解释）。契约见
+ * docs/design/PATH-WIRE-CONTRACT.md 同级的第 2 点评估文档。
+ */
+export function startTgMonitorBackfill(
+  channelId: number | string,
+  untilDate: string,
+): Promise<{ ok: boolean; channelId: number; backfillUntil: number; kicked: boolean }> {
+  return request('/api/tg/monitor/backfill', {
+    method: 'POST',
+    body: JSON.stringify({ channelId, untilDate }),
+  })
+}
+
+/**
+ * DELETE /api/tg/monitor/backfill/:id — 取消该频道的回溯。
+ *
+ * 只停翻页，**不回滚**已入库的历史消息（那些消息本来就属于「已入库范围」，
+ * 删掉会让用户已经看到的内容凭空消失）。
+ */
+export function cancelTgMonitorBackfill(channelId: number | string): Promise<{ ok: boolean }> {
+  return request(
+    `/api/tg/monitor/backfill/${encodeURIComponent(String(channelId))}`,
+    { method: 'DELETE' },
+  )
+}
+
 /** GET /api/tg/monitor/filters — 文字筛选规则（每条带自己的命中条数） */
 export async function listTgMonitorFilters(): Promise<TgMonitorFilter[]> {
   const res = await request<{ items?: TgMonitorFilter[] }>('/api/tg/monitor/filters')

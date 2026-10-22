@@ -859,5 +859,14 @@
   "tg.ungrouped": "Ungrouped",
   "tg.unmonitor": "Unmonitor",
   "tg.unreachableHint": "orig-tg is not running, so the sign-in state cannot be confirmed. Start it from Settings → Accounts and retry.",
-  "tg.view": "View"
+  "tg.view": "View",
+  "tg.backfill": "Backfill",
+  "tg.backfillTitle": "Backfill history ({title})",
+  "tg.backfillHint": "Pull older media messages of this channel into the library. It pages backwards in the background (one page per round); progress shows on the channel row.",
+  "tg.backfillDateLabel": "Backfill to",
+  "tg.backfillStart": "Start backfill",
+  "tg.backfillCancel": "Cancel backfill",
+  "tg.backfillRunning": "Backfilling (to {date})",
+  "tg.backfillCancelHint": "Stops paging only; already ingested history is kept",
+  "tg.backfillInvalidDate": "Pick a date"
 }

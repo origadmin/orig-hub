@@ -6,8 +6,24 @@
 //!      group_id/时长等新列，upsert 冲突时保留 downloaded/落盘路径）；
 //!   3. 仅 `id > 游标` 的计入新增（added），并推进游标到本轮所见最大 id。
 //!
-//! 游标缺失（首次）视为 0，即首轮全量入库最近窗口。拉取窗口外的更早消息
-//! 如需全量回溯，可后续扩展游标从底部向上增量；当前对「频道持续更新」场景足够。
+//! 游标缺失（首次）视为 0，即首轮全量入库最近窗口。
+//!
+//! # 历史回溯（2026-10-22 用户第 2 点）
+//!
+//! 增量同步**只向新**，所以「频道数据只会加载一部分」是结构性边界，不是缺陷：
+//! `messages(limit, None)` 永远只看最新 100 条，`sync_cursor` 也只记最大值。
+//! 用户要按筛选下载就必须能覆盖更早的消息，于是另加一条**向旧**的腿：
+//!
+//!   - `sync_cursor.backfill_until`：目标日期（unix 秒，0 = 不回溯）；
+//!   - `sync_cursor.backfill_before_id`：向旧翻页的游标（0 = 未开始）。
+//!
+//! [`run_backfill_pass`] **每轮每频道只翻一页**：回溯是长跑，把 RPC 摊到多个
+//! tick 上，避免「点一下回溯三个月」瞬间打出上百个请求触发 flood-wait。
+//! 两条腿共用同一把单飞门禁（[`sync_once`] / [`backfill_once`] 都走
+//! `claim_sync`）——它们打的是同一个账号的同一个 RPC 预算，不能并行。
+//!
+//! 回溯**必须由用户明确指定日期**才启动（`Store::set_backfill`），升级不自动开始：
+//! 否则会在用户毫无察觉的情况下塞进几十轮 RPC 和一堆他并不想要的历史数据。
 //!
 //! **单飞（BUG-102）**：本模块的触发源有三路（后台定时循环、前端 60s 轮询
 //! `POST /api/tg/monitor/sync`、用户手动点击），可同时打向同一批频道。
@@ -21,6 +37,13 @@ use crate::state::AppState;
 
 /// 每频道每轮增量同步拉取的最大**媒体**条数（增量窗口，受 messages clamp 上限 100 约束）。
 const SYNC_LIMIT: u32 = 100;
+
+/// 历史回溯每轮每频道拉取的条数。
+///
+/// 与增量窗口同量级（都受 `messages` clamp 上限 100 约束）。回溯是**慢**的：
+/// 一轮只翻一页，把 RPC 摊到多个 tick 上，避免「用户点一下回溯三个月」瞬间
+/// 打出上百个请求把账号打成 flood-wait。
+const BACKFILL_LIMIT: u32 = 100;
 
 /// 启动后台监控循环。调用方负责把 `state` 包成 `Arc` 传入共享。
 pub fn spawn(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
@@ -41,6 +64,19 @@ pub fn spawn(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
                     }
                 }
                 Err(e) => state.push_log(format!("monitor tick failed: {e}")),
+            }
+            // 回溯排在增量**之后**（优先级更低）：新消息先入库，历史慢慢补。
+            // 被挡下（Skipped）同样静默——那是「这一轮名额被别人用了」，不是失败。
+            match backfill_once(&state).await {
+                Ok(BackfillOutcome::Skipped) => {}
+                Ok(BackfillOutcome::Ran { stored, done }) => {
+                    if stored > 0 {
+                        state.push_log(format!(
+                            "monitor backfill: +{stored} media, {done} channel(s) finished"
+                        ));
+                    }
+                }
+                Err(e) => state.push_log(format!("monitor backfill failed: {e}")),
             }
         }
     })
@@ -144,6 +180,194 @@ async fn run_sync_pass(state: &Arc<AppState>) -> Result<u64, String> {
         }
     }
     Ok(total)
+}
+
+/// 单轮回溯的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackfillOutcome {
+    /// 真的跑了一轮：`stored` = 本轮入库条数，`done` = 本轮走到终点的频道数。
+    Ran { stored: u64, done: u64 },
+    /// 已有同步/回溯在跑，本次被单飞挡下（**未发起任何 Telegram RPC**）。
+    Skipped,
+}
+
+/// 单轮回溯：每个待回溯频道最多向旧翻**一页**。
+///
+/// 与 [`sync_once`] 共用同一把单飞门禁：两条腿打的是同一个账号的同一份
+/// RPC 预算，并行只会更快触发 flood-wait。
+pub async fn backfill_once(state: &Arc<AppState>) -> Result<BackfillOutcome, String> {
+    let Some(_guard) = state.claim_sync() else {
+        return Ok(BackfillOutcome::Skipped);
+    };
+    let (stored, done) = run_backfill_pass(state).await?;
+    Ok(BackfillOutcome::Ran { stored, done })
+}
+
+/// 真正执行一轮回溯（调用方**必须**已持有 [`crate::state::SyncGuard`]）。
+///
+/// 每个频道每轮只翻一页，四类终点都会 `clear_backfill`：
+/// 1. 拉不到更多消息（频道最早一条已入库）；
+/// 2. 本页最旧一条的日期已早于目标日期；
+/// 3. 游标没有向旧推进（`min_id >= before`）——这是**死循环防护**，
+///    不是「慢」：继续跑只会把 RPC 预算烧在一个不动的窗口上；
+/// 4. 用户主动取消（`DELETE /api/tg/monitor/backfill/:id`）。
+async fn run_backfill_pass(state: &Arc<AppState>) -> Result<(u64, u64), String> {
+    let pending = state
+        .store
+        .list_backfill_pending()
+        .await
+        .map_err(|e| e.to_string())?;
+    let (mut stored, mut done) = (0u64, 0u64);
+    for channel_id in pending {
+        let (saved_before, until_ts) = state
+            .store
+            .get_backfill(channel_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if until_ts <= 0 {
+            continue;
+        }
+        // 起点：本轮第一次跑时取「已同步到的最新 id」，从它下面开始向旧翻。
+        // 从没同步过就传 None —— `messages` 会从最新一页开始，方向仍是新→旧，
+        // 只是起点由 Telegram 决定（等价于「先补最近一页，再一路往回」）。
+        let before = if saved_before > 0 {
+            Some(saved_before)
+        } else {
+            state
+                .store
+                .get_cursor(channel_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .filter(|c| *c > 0)
+        };
+        let items = state
+            .client
+            .messages(channel_id, BACKFILL_LIMIT, before)
+            .await
+            .map_err(|e| e.to_string())?;
+        if items.is_empty() {
+            state
+                .store
+                .clear_backfill(channel_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            state.push_log(format!(
+                "backfill #{channel_id}: reached the oldest media message, done"
+            ));
+            done += 1;
+            continue;
+        }
+        let page_len = items.len() as u64;
+        let mut min_id = i64::MAX;
+        let mut min_date = i64::MAX;
+        for it in items {
+            // 与增量同步同一条 upsert：冲突时只回补缺失列，不碰 downloaded。
+            state
+                .store
+                .upsert_message(
+                    channel_id,
+                    it.id,
+                    it.caption.as_deref(),
+                    it.mime_type.as_deref(),
+                    it.size,
+                    it.media_type.as_deref(),
+                    it.date,
+                    it.duration,
+                    it.group_id,
+                    it.file_name.as_deref(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            min_id = min_id.min(it.id);
+            if let Some(d) = it.date {
+                min_date = min_date.min(d);
+            }
+        }
+        stored += page_len;
+        if min_date != i64::MAX && min_date < until_ts {
+            state
+                .store
+                .clear_backfill(channel_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            state.push_log(format!(
+                "backfill #{channel_id}: reached target date (+{page_len} media), done"
+            ));
+            done += 1;
+            continue;
+        }
+        if let Some(b) = before {
+            if min_id >= b {
+                state
+                    .store
+                    .clear_backfill(channel_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                state.push_log(format!(
+                    "backfill #{channel_id}: cursor did not move (min_id {min_id} >= before {b}), stopped"
+                ));
+                done += 1;
+                continue;
+            }
+        }
+        state
+            .store
+            .advance_backfill(channel_id, min_id)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok((stored, done))
+}
+
+/// `YYYY-MM-DD` → 该日 **UTC** 00:00 的 unix 秒；非法输入返回 `None`。
+///
+/// 为什么用 UTC 而不是本地时区：回溯边界差几个小时对「补历史」没有影响，
+/// 而引入时区就要处理夏令时（还要多一个依赖）。契约写死 UTC，
+/// 前端按同一口径显示与回填（`input[type=date]` 的值本身就是日期，不含时区）。
+pub fn parse_date_utc(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let mut parts = s.split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: i64 = parts.next()?.parse().ok()?;
+    let d: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || y < 1970 {
+        return None;
+    }
+    // 拒绝 2 月 31 日这类「数字合法、日期不存在」的输入：溢出到下个月会被
+    // 用户读成「我明明填了 2-31，怎么从 3 月 3 号开始回溯」。
+    let days = days_from_civil(y, m, d);
+    if civil_from_days(days) != (y, m, d) {
+        return None;
+    }
+    Some(days * 86_400)
+}
+
+/// 公历日期 → 距 1970-01-01 的天数（Howard Hinnant `days_from_civil`）。
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (m + 9) % 12; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// `days_from_civil` 的逆运算（仅用于校验日期真实存在）。
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]
@@ -463,5 +687,67 @@ mod tests {
             !st.is_sync_running(),
             "同步失败后名额必须归还 —— 否则后续所有触发源全部空转且无任何报错"
         );
+    }
+}
+
+/// 历史回溯的日期解析判据（2026-10-22 用户第 2 点）。
+///
+/// 只测**纯函数**：`run_backfill_pass` 的行为由 `sync_cursor` 的字段语义
+/// 决定，而"日期怎么变成秒"是最容易悄悄错一天的地方（闰年、时区、非法日期），
+/// 也是用户唯一会亲手输入的参数。
+#[cfg(test)]
+mod backfill_date_tests {
+    use super::*;
+
+    /// 已知日期的绝对值断言：**不是**用被测函数自己算期望值（那是自证循环）。
+    /// 期望值由独立实现给出（`datetime.date(2026,10,22) - date(1970,1,1)`）。
+    #[test]
+    fn parse_date_utc_maps_known_dates() {
+        assert_eq!(parse_date_utc("1970-01-01"), Some(0), "epoch 当天必须是 0");
+        assert_eq!(parse_date_utc("1970-01-02"), Some(86_400), "次日 = 86400");
+        assert_eq!(
+            parse_date_utc("2024-02-29"),
+            Some(1_709_164_800),
+            "闰日必须算进去（2024 是闰年）"
+        );
+        assert_eq!(parse_date_utc("2026-10-22"), Some(1_792_627_200));
+        // 首尾空白来自 `<input type=date>` 之外的粘贴输入，容忍但不改变语义。
+        assert_eq!(parse_date_utc("  2026-10-22  "), Some(1_792_627_200));
+    }
+
+    #[test]
+    fn parse_date_utc_rejects_garbage_and_impossible_dates() {
+        for bad in [
+            "",
+            "2026",
+            "2026-10",
+            "2026-13-01",       // 月份越界
+            "2026-02-31",       // 数字合法、日期不存在（不许溢出到 3 月）
+            "2025-02-29",       // 平年没有 2-29
+            "1969-12-31",       // 早于 epoch
+            "2026-10-22T00:00", // 带时间：契约只收日期
+            "x-y-z",
+        ] {
+            assert_eq!(parse_date_utc(bad), None, "必须拒绝 {bad:?}");
+        }
+    }
+
+    /// 反向证伪：把日期判据的"存在性校验"去掉，`2026-02-31` 必须能被抓出来。
+    ///
+    /// 这条不是重复测试，它证明上一条有牙齿 —— 如果 `days_from_civil` /
+    /// `civil_from_days` 的往返校验被删掉，`2026-02-31` 会静默变成 `2026-03-03`。
+    #[test]
+    fn days_from_civil_roundtrip_detects_overflow() {
+        // 2 月 31 日算出来的天数，反解回来一定是 3 月 3 日 ⇒ 不相等 ⇒ 被拒。
+        let days = days_from_civil(2026, 2, 31);
+        assert_ne!(
+            civil_from_days(days),
+            (2026, 2, 31),
+            "非法日期反解必须与原输入不同，否则存在性校验形同虚设"
+        );
+        // 合法日期必须逐字往返（否则所有合法输入都会被误拒）。
+        for (y, m, d) in [(1970, 1, 1), (2024, 2, 29), (2026, 10, 22), (1999, 12, 31)] {
+            assert_eq!(civil_from_days(days_from_civil(y, m, d)), (y, m, d));
+        }
     }
 }

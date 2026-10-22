@@ -838,10 +838,11 @@ async fn get_config(State(st): State<Arc<AppState>>) -> axum::Json<serde_json::V
 /// 正向斜杠 + 折叠重复分隔符。**只作用于下发的字符串**，不改内部语义：
 /// 边界判定/落点仍用 `PathBuf`，但凡是"给外面看/给外面比"的路径，形态必须唯一 ——
 /// `D:\OrigDown` 与 `D:/OrigDown` 是同一个目录，前端按字符串比较却会判成两个。
+///
+/// 2026-10-22：实现收敛到 [`orig_core::paths::to_wire`]（同一个规则只能有一份）。
+/// 保留本函数只是为了让调用点读起来仍是「出参形态」，逻辑不再重复。
 fn dir_out(p: &std::path::Path) -> String {
-    orig_core::paths::normalize_dir_path(p)
-        .to_string_lossy()
-        .into_owned()
+    orig_core::paths::to_wire(p)
 }
 
 /// 插件注册表 —— **契约的唯一声明点**（BUG-358）。
@@ -971,11 +972,11 @@ async fn put_config_download(
     let cfg = st.config.read().unwrap();
     Ok(axum::Json(serde_json::json!({
         "ok": true,
-        "download_dir": cfg.download_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        "default_download_dir": orig_core::paths::default_download_dir().to_string_lossy().into_owned(),
+        "download_dir": cfg.download_dir.as_ref().map(|p| dir_out(p)),
+        "default_download_dir": dir_out(&orig_core::paths::default_download_dir()),
         // 生效路径与派生的库根：前端据此刷新「当前生效」与库根展示，不自己拼。
-        "effective_download_root": eff.to_string_lossy().into_owned(),
-        "library_root": lib.to_string_lossy().into_owned(),
+        "effective_download_root": dir_out(&eff),
+        "library_root": dir_out(&lib),
         "tg_synced": tg_synced,
         "tg_error": tg_error,
     })))

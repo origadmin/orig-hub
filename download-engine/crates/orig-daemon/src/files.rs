@@ -172,7 +172,10 @@ fn to_fact(path: &Path, cfg: &crate::config::Config) -> Option<FileFact> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     Some(FileFact {
-        path: path.to_string_lossy().into_owned(),
+        // 出口一律 `/`（2026-10-22 用户报「`\` 和 `/` 使用混乱」）。
+        // 这里是文件域每一行的主键兼展示值，前端要拿它拼 URL / 传回 DELETE，
+        // `\` 在 JS 里是转义字符 ⇒ 必须规范化。入口侧两种都收（见 delete_file）。
+        path: orig_core::paths::to_wire(path),
         name,
         ext,
         kind: kind_of_category(&category).to_string(),
@@ -262,10 +265,9 @@ pub async fn list_files(State(st): State<Arc<AppState>>) -> Json<FilesResponse> 
     let roots = scan_roots(&cfg);
     let files = enumerate(&st).await;
     Json(FilesResponse {
-        roots: roots
-            .into_iter()
-            .map(|r| r.to_string_lossy().into_owned())
-            .collect(),
+        // 同上：`roots` 是前端展示「受管下载根」的原值，与 `files[].path`
+        // 必须同形态，否则同一屏会出现 `D:\OrigDown` 和 `D:/OrigDown`。
+        roots: roots.iter().map(|r| orig_core::paths::to_wire(r)).collect(),
         files,
     })
 }
@@ -310,7 +312,9 @@ pub async fn delete_file(
             tasks.remove(&id);
         }
     }
-    Ok(Json(serde_json::json!({"ok": true, "path": raw})))
+    // 回显也走规范化：调用方传进来可能是 `\`，但出口契约只有一种形态。
+    // 前端拿这个回显值去匹配本地列表（`files[].path`）时必须能对上。
+    Ok(Json(serde_json::json!({"ok": true, "path": orig_core::paths::to_wire_str(&raw)})))
 }
 
 #[cfg(test)]

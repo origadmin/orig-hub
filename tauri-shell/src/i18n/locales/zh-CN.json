@@ -859,5 +859,14 @@
   "tg.ungrouped": "未分组",
   "tg.unmonitor": "取消监控",
   "tg.unreachableHint": "orig-tg 没有在运行，因此无法确认登录状态。请到「设置 → 账号」中启动服务或重试。",
-  "tg.view": "查看"
+  "tg.view": "查看",
+  "tg.backfill": "回溯",
+  "tg.backfillTitle": "回溯历史（{title}）",
+  "tg.backfillHint": "把该频道更早的媒体消息补进库。回溯在后台慢慢翻页（每轮一页），进度显示在频道行上。",
+  "tg.backfillDateLabel": "回溯到",
+  "tg.backfillStart": "开始回溯",
+  "tg.backfillCancel": "取消回溯",
+  "tg.backfillRunning": "回溯中（至 {date}）",
+  "tg.backfillCancelHint": "只停止翻页，已入库的历史消息保留",
+  "tg.backfillInvalidDate": "请选择日期"
 }

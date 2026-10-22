@@ -80,6 +80,13 @@ pub struct MonitoredChannel {
     /// 之前它就已经被清零的下一轮覆盖）。故必须有**每频道已读游标**。
     #[serde(rename = "newCount")]
     pub new_count: i64,
+    /// 回溯目标日期（unix 秒，0 = 该频道没有待回溯）。
+    ///
+    /// 2026-10-22 用户第 2 点：「频道数据只会加载一部分数据，不符合过滤筛选需求」。
+    /// 回溯是**长跑**（每轮每频道只翻一页），所以进度必须能从列表里看见——
+    /// 否则用户点了「回溯到 1 月」之后没有任何反馈，只会以为按钮没生效。
+    #[serde(rename = "backfillUntil", default)]
+    pub backfill_until: i64,
 }
 
 /// 文字筛选规则（`monitor_filter` 行）。
@@ -548,6 +555,43 @@ async fn migrate_monitor_filter_last_read(conn: &Connection) -> libsql::Result<b
     Ok(true)
 }
 
+/// 迁移：为 `sync_cursor` 补历史回溯两列（2026-10-22 用户第 2 点）。
+///
+/// `backfill_before_id` / `backfill_until` 默认 **0 = 不回溯**。这一点是刻意的：
+/// 升级不能替用户决定「从今天开始往回拉三个月」——那会在用户毫无察觉的情况下
+/// 打出几十轮 Telegram RPC，并把库里塞进他并不想要的历史。回溯必须由用户
+/// 在界面上明确指定日期后才开始（`set_backfill`）。
+async fn migrate_sync_cursor_backfill(conn: &Connection) -> libsql::Result<bool> {
+    let mut rows = conn.query("PRAGMA table_info(sync_cursor)", ()).await?;
+    let mut have_before = false;
+    let mut have_until = false;
+    while let Some(r) = rows.next().await? {
+        let name: String = r.get(1)?;
+        if name == "backfill_before_id" {
+            have_before = true;
+        }
+        if name == "backfill_until" {
+            have_until = true;
+        }
+    }
+    drop(rows);
+    if !have_before {
+        conn.execute(
+            "ALTER TABLE sync_cursor ADD COLUMN backfill_before_id INTEGER NOT NULL DEFAULT 0",
+            (),
+        )
+        .await?;
+    }
+    if !have_until {
+        conn.execute(
+            "ALTER TABLE sync_cursor ADD COLUMN backfill_until INTEGER NOT NULL DEFAULT 0",
+            (),
+        )
+        .await?;
+    }
+    Ok(!(have_before && have_until))
+}
+
 /// BUG-194 迁移：把 `dialog_cache` 里**存量**的空/纯空白标题行补成可辨识兜底名。///
 /// 只改 `title` 为空的行 ⇒ 天然幂等（第二次执行影响 0 行），且已有 363 条
 /// 有名会话一字不动（doc 验收：频道/群组部分不受影响、不回归）。
@@ -777,7 +821,13 @@ impl Store {
             CREATE TABLE IF NOT EXISTS sync_cursor (
                 channel_id      INTEGER PRIMARY KEY,
                 last_message_id INTEGER NOT NULL DEFAULT 0,
-                updated_at      INTEGER NOT NULL
+                updated_at      INTEGER NOT NULL,
+                -- 历史回溯（2026-10-22 用户第 2 点）：0 = 未开始/不回溯。
+                -- `backfill_before_id` 是**向旧**翻页的游标（与 `last_message_id`
+                -- 方向相反），`backfill_until` 是目标日期（unix 秒，0 = 不回溯）。
+                -- 两个游标分开存：增量同步永远只向新，回溯永远只向旧，互不干扰。
+                backfill_before_id INTEGER NOT NULL DEFAULT 0,
+                backfill_until     INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS dialog_cache (
                 id       INTEGER PRIMARY KEY,
@@ -849,6 +899,9 @@ impl Store {
         // 旧库的 monitor_filter 缺 last_read_at（BUG-330 / TGM-06）：幂等补列 +
         // 存量初始化为迁移时刻 now（不初始化则升级后首屏全是假「新命中」）。
         migrate_monitor_filter_last_read(&conn).await?;
+        // 旧库的 sync_cursor 缺回溯两列（2026-10-22 第 2 点）：幂等补列，
+        // 默认 0 = 不回溯（升级后行为与升级前逐字一致，不擅自替用户开始回溯）。
+        migrate_sync_cursor_backfill(&conn).await?;
         // BUG-194：存量 dialog_cache 里的空标题行回填为可辨识兜底名（幂等）。
         let healed = migrate_dialog_cache_blank_titles(&conn).await?;
         if healed > 0 {
@@ -951,7 +1004,9 @@ impl Store {
                 "SELECT c.channel_id, c.title, c.username, c.added_at,
                         (SELECT COUNT(*) FROM media_message m
                           WHERE m.channel_id = c.channel_id
-                            AND m.message_id > c.last_read_message_id)
+                            AND m.message_id > c.last_read_message_id),
+                        (SELECT COALESCE(sc.backfill_until, 0) FROM sync_cursor sc
+                          WHERE sc.channel_id = c.channel_id)
                  FROM monitored_channel c ORDER BY c.added_at",
             )
             .await?;
@@ -964,6 +1019,7 @@ impl Store {
                 username: r.get(2)?,
                 added_at: r.get(3)?,
                 new_count: r.get(4)?,
+                backfill_until: r.get(5)?,
             });
         }
         Ok(out)
@@ -976,7 +1032,9 @@ impl Store {
                 "SELECT c.channel_id, c.title, c.username, c.added_at,
                         (SELECT COUNT(*) FROM media_message m
                           WHERE m.channel_id = c.channel_id
-                            AND m.message_id > c.last_read_message_id)
+                            AND m.message_id > c.last_read_message_id),
+                        (SELECT COALESCE(sc.backfill_until, 0) FROM sync_cursor sc
+                          WHERE sc.channel_id = c.channel_id)
                  FROM monitored_channel c WHERE c.channel_id = ?1",
                 params![channel_id],
             )
@@ -988,6 +1046,7 @@ impl Store {
                 username: r.get(2)?,
                 added_at: r.get(3)?,
                 new_count: r.get(4)?,
+                backfill_until: r.get(5)?,
             })),
             None => Ok(None),
         }
@@ -1927,7 +1986,11 @@ impl Store {
 
     /// 完整受管根集合：下载根（locked，primary 取存储值或默认 true）+ 用户根。
     pub async fn managed_roots(&self) -> Vec<ManagedRoot> {
-        let download_root = self.download_root().await.to_string_lossy().into_owned();
+        // 出参形态必须与用户根一致（用户根在 `user_managed_roots` 里已被
+        // `normalize_dir` 收敛成 `/`）。这里原来是 `to_string_lossy()` ⇒
+        // 同一个 `managed_roots` 数组里下载根是 `D:\OrigDown`、用户根是
+        // `D:/Other`，前端按字符串去重/比较全部失效（2026-10-22 报）。
+        let download_root = orig_core::paths::to_wire(&self.download_root().await);
         let user_roots = self.user_managed_roots().await;
         // 任一用户根标 primary ⇒ 下载根降级为非 primary。
         let download_primary = !user_roots.iter().any(|r| r.primary);
@@ -3383,6 +3446,86 @@ impl Store {
                  ON CONFLICT(channel_id) DO UPDATE
                    SET last_message_id = excluded.last_message_id, updated_at = excluded.updated_at",
                 params![channel_id, last_message_id, t],
+            )
+            .await?;
+        Ok(())
+    }
+
+    // ---- 历史回溯游标（2026-10-22 用户第 2 点） ----
+
+    /// 某频道的回溯进度 `(before_id, until_ts)`；两者皆 0 = 没有待回溯。
+    pub async fn get_backfill(&self, channel_id: i64) -> libsql::Result<(i64, i64)> {
+        let row = self
+            .row_opt(
+                "SELECT backfill_before_id, backfill_until FROM sync_cursor WHERE channel_id = ?1",
+                params![channel_id],
+            )
+            .await?;
+        match row {
+            Some(r) => Ok((r.get(0)?, r.get(1)?)),
+            None => Ok((0, 0)),
+        }
+    }
+
+    /// 待回溯的频道 id（`backfill_until > 0`）。后台循环据此跳过绝大多数频道。
+    pub async fn list_backfill_pending(&self) -> libsql::Result<Vec<i64>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT channel_id FROM sync_cursor WHERE backfill_until > 0 ORDER BY channel_id",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push(r.get(0)?);
+        }
+        Ok(out)
+    }
+
+    /// 开始（或改期）回溯到 `until_ts`。
+    ///
+    /// `backfill_before_id` 归零 = 「下一轮重新算起点」：真正的起点在
+    /// `monitor::run_backfill_pass` 里取**当前已同步到的最新 id**。这样
+    /// 「首次开始」与「改了日期重跑」走同一条路径，不会漏掉中间那段。
+    ///
+    /// 不动 `last_message_id`：增量游标与回溯游标是两条独立的腿。
+    pub async fn set_backfill(&self, channel_id: i64, until_ts: i64) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO sync_cursor
+                     (channel_id, last_message_id, updated_at, backfill_before_id, backfill_until)
+                 VALUES (?1, 0, ?2, 0, ?3)
+                 ON CONFLICT(channel_id) DO UPDATE
+                   SET backfill_before_id = 0,
+                       backfill_until = excluded.backfill_until,
+                       updated_at = excluded.updated_at",
+                params![channel_id, now(), until_ts],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// 向旧翻过一页后推进回溯游标。
+    pub async fn advance_backfill(&self, channel_id: i64, before_id: i64) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sync_cursor SET backfill_before_id = ?2, updated_at = ?3
+                  WHERE channel_id = ?1",
+                params![channel_id, before_id, now()],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// 结束回溯（到达目标日期 / 翻到频道最早一条 / 无法推进）：两列归零。
+    pub async fn clear_backfill(&self, channel_id: i64) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sync_cursor
+                    SET backfill_before_id = 0, backfill_until = 0, updated_at = ?2
+                  WHERE channel_id = ?1",
+                params![channel_id, now()],
             )
             .await?;
         Ok(())

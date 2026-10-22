@@ -403,7 +403,8 @@ impl AppState {
             id: dt.task.id.clone(),
             url: dt.url.clone(),
             filename: dt.filename.clone(),
-            output: dt.output.to_string_lossy().into_owned(),
+            // 同 activity.rs：出参形态统一 `/`。
+            output: orig_core::paths::to_wire(&dt.output),
             added_at: dt.added_at,
             updated_at,
             max_concurrency: dt.max_concurrency,

@@ -96,6 +96,17 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             "/api/tg/monitor/channels/:id",
             axum::routing::delete(remove_monitor_channel),
         )
+        // 历史回溯（2026-10-22 用户第 2 点）：设定目标日期 / 取消。
+        // 「开始」= 写游标 + 立刻翻一页（用户点了要马上看到有东西进库，
+        // 否则「按钮像没生效」——BUG-327「存在≠可用」的同一个坑）。
+        .route(
+            "/api/tg/monitor/backfill",
+            axum::routing::post(start_monitor_backfill),
+        )
+        .route(
+            "/api/tg/monitor/backfill/:id",
+            axum::routing::delete(cancel_monitor_backfill),
+        )
         // 「点开频道」= 已读游标推到最新（未读计数归零）。
         .route(
             "/api/tg/monitor/channels/:id/read",
@@ -905,11 +916,9 @@ async fn local_file(
 /// BUG-071）。此处不再自己拼第三条链 —— 下载路径是全部文件的唯一容器，
 /// 只允许一处解析（此前它读 `st.config.download_dir`，与 store 侧各算一套）。
 async fn effective_download_dir(st: &AppState) -> String {
-    st.store
-        .download_root()
-        .await
-        .to_string_lossy()
-        .into_owned()
+    // 出参形态统一 `/`（2026-10-22）：这个值会被写进 `GET /api/tg/config`
+    // 的 `downloadDir`，前端拿它与 `libraryDir`、受管根同屏比较。
+    orig_core::paths::to_wire(&st.store.download_root().await)
 }
 
 #[derive(Deserialize)]
@@ -929,7 +938,7 @@ async fn get_config(State(st): State<Arc<AppState>>) -> Result<impl IntoResponse
     let library_root = st.store.library_root().await;
     Ok(Json(json!({
         "downloadDir": download_dir,
-        "libraryDir": library_root.to_string_lossy(),
+        "libraryDir": orig_core::paths::to_wire(&library_root),
     })))
 }
 
@@ -992,7 +1001,7 @@ async fn put_config(
     let library_root = st.store.library_root().await;
     Ok(Json(json!({
         "downloadDir": dir,
-        "libraryDir": library_root.to_string_lossy(),
+        "libraryDir": orig_core::paths::to_wire(&library_root),
         "migration": migration,
         "migration_error": migration_error,
     })))
@@ -1094,7 +1103,7 @@ async fn list_fs_dir(
                 .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)),
         }));
     }
-    Ok(Json(json!({ "path": abs.to_string_lossy(), "entries": entries })))
+    Ok(Json(json!({ "path": orig_core::paths::to_wire(&abs), "entries": entries })))
 }
 
 async fn download(
@@ -1136,7 +1145,7 @@ async fn download(
 async fn resolve_cache_dir(st: &AppState, req_dir: Option<String>) -> Result<String, ApiError> {
     let root = st.store.download_root().await;
     let Some(raw) = req_dir.filter(|s| !s.trim().is_empty()) else {
-        return Ok(root.to_string_lossy().into_owned());
+        return Ok(orig_core::paths::to_wire(&root));
     };
     let raw = orig_core::paths::expand_tilde(raw.trim());
     let p = if raw.is_absolute() { raw } else { root.join(raw) };
@@ -1149,7 +1158,7 @@ async fn resolve_cache_dir(st: &AppState, req_dir: Option<String>) -> Result<Str
             ),
         ));
     }
-    Ok(crate::cache::lexical_normalize(&p).to_string_lossy().into_owned())
+    Ok(orig_core::paths::to_wire(&crate::cache::lexical_normalize(&p)))
 }
 
 /// 已缓存且落盘文件仍在时的路径（幂等跳过依据）。
@@ -1163,9 +1172,10 @@ async fn cached_path(st: &AppState, chat_id: i64, message_id: i64) -> Option<Str
     }
     let p = msg.file_path.clone()?;
     // P2 起个别路径可能是库根相对的：存在性判定必须先解析再 stat。
-    let p = crate::cache::resolve_item_path(&st.store.library_root().await, &p)
-        .to_string_lossy()
-        .into_owned();
+    let p = orig_core::paths::to_wire(&crate::cache::resolve_item_path(
+        &st.store.library_root().await,
+        &p,
+    ));
     if tokio::fs::metadata(&p).await.is_ok() {
         Some(p)
     } else {
@@ -3204,6 +3214,85 @@ async fn list_monitor_channels(
         .await
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
     Ok(Json(chs))
+}
+
+#[derive(Deserialize)]
+struct BackfillReq {
+    #[serde(rename = "channelId")]
+    channel_id: i64,
+    /// 目标日期 `YYYY-MM-DD`（按 **UTC** 当日 00:00 解释，见 `monitor::parse_date_utc`）。
+    ///
+    /// 契约只收日期不收时间戳：用户说的是「回溯到几月几号」，多出来的时分秒
+    /// 对他没有意义，却会让前后端各算一套时区。日期 → 秒的换算只在服务端做一次。
+    #[serde(rename = "untilDate")]
+    until_date: String,
+}
+
+/// POST /api/tg/monitor/backfill — 开始（或改期）某监控频道的历史回溯。
+///
+/// 只**登记目标**并立刻翻一页；剩下的由后台 tick 慢慢翻（每轮一页）。
+/// 长跑的理由见 `monitor::BACKFILL_LIMIT`：一次打完会触发 Telegram flood-wait。
+async fn start_monitor_backfill(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<BackfillReq>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_authorized(&st).await?;
+    let until = crate::monitor::parse_date_utc(&req.until_date).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "untilDate must be an existing date in YYYY-MM-DD (UTC)",
+        )
+    })?;
+    // 频道必须真的在被监控：给未监控频道回溯 = 把用户没要的数据塞进库。
+    if st
+        .store
+        .get_channel(req.channel_id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
+        .is_none()
+    {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "channel is not monitored",
+        ));
+    }
+    st.store
+        .set_backfill(req.channel_id, until)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    // 立刻翻一页：被单飞挡下**不是失败**（另一路正在跑，下一 tick 接着翻），
+    // 所以 `kicked` 只作为回执信息，不改变成功语义。
+    let kicked = matches!(
+        crate::monitor::backfill_once(&st).await,
+        Ok(crate::monitor::BackfillOutcome::Ran { .. })
+    );
+    st.push_log(format!(
+        "/monitor backfill channel {} until {until} (kicked={kicked})",
+        req.channel_id
+    ));
+    Ok(Json(json!({
+        "ok": true,
+        "channelId": req.channel_id,
+        "backfillUntil": until,
+        "kicked": kicked,
+    })))
+}
+
+/// DELETE /api/tg/monitor/backfill/:id — 取消该频道的回溯（已入库的保留）。
+///
+/// 「取消」只停翻页，**不回滚**已经进来的历史消息：那些消息本来就属于
+/// 「已入库范围」，删掉会让用户已经看到的内容凭空消失。
+async fn cancel_monitor_backfill(
+    State(st): State<Arc<AppState>>,
+    Path(channel_id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_authorized(&st).await?;
+    st.store
+        .clear_backfill(channel_id)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    st.push_log(format!("/monitor backfill cancel channel {channel_id}"));
+    Ok(Json(json!({ "ok": true, "channelId": channel_id })))
 }
 
 #[derive(Deserialize)]

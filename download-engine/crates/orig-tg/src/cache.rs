@@ -220,8 +220,11 @@ pub async fn house_downloaded_bytes(
     title: Option<&str>,
 ) -> HousedBytes {
     let fallback = || HousedBytes {
-        item_path: src.to_string(),
-        absolute_path: src.to_string(),
+        // 降级分支回填的是原落盘绝对路径（I2 降级条款）：它会被
+        // `mark_downloaded` 写进库、也会出现在日志/响应里 ⇒ 与成功分支
+        // 必须同形态（`/`），否则同一个字段一半 `\` 一半 `/`。
+        item_path: orig_core::paths::to_wire_str(src),
+        absolute_path: orig_core::paths::to_wire_str(src),
     };
     let lib_root = st.store.library_root().await;
     // chatSlug 取频道标题（未监控频道退化 "chat"）；titleSlug 取 caption 首行。
@@ -252,7 +255,7 @@ pub async fn house_downloaded_bytes(
             let rel = format!("{}/{}", chat_dir.replace('\\', "/"), final_name);
             HousedBytes {
                 item_path: rel,
-                absolute_path: final_abs.to_string_lossy().into_owned(),
+                absolute_path: orig_core::paths::to_wire(&final_abs),
             }
         }
         Err(e) => {
@@ -2018,8 +2021,12 @@ mod tests {
         std::fs::write(&src, b"bytes").unwrap();
         let housed = house_downloaded_bytes(&st, 7, 8, &src.to_string_lossy(), Some("t")).await;
 
-        assert_eq!(housed.item_path, src.to_string_lossy(), "降级必须回填原绝对路径");
-        assert_eq!(housed.absolute_path, src.to_string_lossy());
+        // 降级回填的是**对外形态**（`/`），不是 `to_string_lossy()` 的原样 ——
+        // 2026-10-22 起出口统一 `/`，断言跟着改成同一口径（否则这条测试会
+        // 把「两种分隔符并存」当成正确行为钉死）。
+        let wire_src = orig_core::paths::to_wire(&src);
+        assert_eq!(housed.item_path, wire_src, "降级必须回填原绝对路径");
+        assert_eq!(housed.absolute_path, wire_src);
         assert!(src.exists(), "降级 = 文件留原位");
         assert!(st.logs.recent(20).iter().any(|l| l.contains("house_bytes")), "降级必须留痕");
     }

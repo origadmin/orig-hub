@@ -103,8 +103,11 @@ fn browse(
         let entries: Vec<DirEntry> = fs_roots()
             .into_iter()
             .map(|p| DirEntry {
-                name: p.to_string_lossy().into_owned(),
-                path: p.to_string_lossy().into_owned(),
+                // 出口统一 `/`（用户 2026-10-22 报「`\` 和 `/` 使用混乱」）。
+                // 盘符根的 name 就是路径本身、没有独立语义，故与 path 一并统一，
+                // 避免同一屏出现「C:\」和「C:/」两种写法。
+                name: orig_core::paths::to_wire(&p),
+                path: orig_core::paths::to_wire(&p),
             })
             .collect();
         return Ok(ListDirsResp {
@@ -121,21 +124,21 @@ fn browse(
         return Err(err(
             StatusCode::UNPROCESSABLE_ENTITY,
             "not_absolute",
-            format!("需要绝对路径：{raw}"),
+            format!("需要绝对路径：{}", orig_core::paths::to_wire_str(raw)),
         ));
     }
     if !dir.exists() {
         return Err(err(
             StatusCode::NOT_FOUND,
             "not_found",
-            format!("目录不存在：{}", dir.to_string_lossy()),
+            format!("目录不存在：{}", orig_core::paths::to_wire(&dir)),
         ));
     }
     if !dir.is_dir() {
         return Err(err(
             StatusCode::UNPROCESSABLE_ENTITY,
             "not_a_directory",
-            format!("不是目录：{}", dir.to_string_lossy()),
+            format!("不是目录：{}", orig_core::paths::to_wire(&dir)),
         ));
     }
 
@@ -143,7 +146,7 @@ fn browse(
         err(
             StatusCode::FORBIDDEN,
             "unreadable",
-            format!("无权读取目录 {}：{e}", dir.to_string_lossy()),
+            format!("无权读取目录 {}：{e}", orig_core::paths::to_wire(&dir)),
         )
     })?;
 
@@ -169,18 +172,18 @@ fn browse(
         .take(MAX_ENTRIES)
         .map(|(name, p)| DirEntry {
             name,
-            path: p.to_string_lossy().into_owned(),
+            path: orig_core::paths::to_wire(&p),
         })
         .collect();
 
-    // 上级：盘根（C:\）与文件系统根为 null —— 前端据此禁用「上一级」。
+    // 上级：盘根（C:/）与文件系统根为 null —— 前端据此禁用「上一级」。
     let parent = dir
         .parent()
         .filter(|p| *p != dir.as_path() && !p.as_os_str().is_empty())
-        .map(|p| p.to_string_lossy().into_owned());
+        .map(|p| orig_core::paths::to_wire(&p));
 
     Ok(ListDirsResp {
-        path: Some(dir.to_string_lossy().into_owned()),
+        path: Some(orig_core::paths::to_wire(&dir)),
         parent,
         entries,
         truncated,
@@ -218,7 +221,7 @@ fn quick_roots(cfg: &Config) -> Vec<DirRoot> {
             if !p.is_dir() {
                 return;
             }
-            let s = p.to_string_lossy().into_owned();
+            let s = orig_core::paths::to_wire(&p);
             if out.iter().any(|r| r.path == s) {
                 return;
             }

@@ -1856,7 +1856,10 @@ pub async fn attach_bytes_presence(items: &mut [MediaItem], lib_root: &std::path
         it.absolute_path = it
             .file_path
             .as_deref()
-            .map(|p| crate::cache::resolve_item_path(lib_root, p).to_string_lossy().into_owned());
+            // 出口形态统一 `/`（2026-10-22）：`absolutePath` 会原样进前端，
+            // `\` 在 JS 里是转义字符。`Path::new("D:/x")` 在 Windows 上照样能用，
+            // 所以规范化不损失任何能力（`probe_cached_bytes` 照旧吃这个串）。
+            .map(|p| orig_core::paths::to_wire(&crate::cache::resolve_item_path(lib_root, p)));
         it.bytes_presence = match it.absolute_path.as_deref() {
             Some(p) => probe_cached_bytes(p).await,
             None => BytesPresence::Missing,
@@ -3821,9 +3824,10 @@ impl Store {
         tokio::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?).await?;
 
         Ok(ExportBundleResult {
-            target_dir: target_dir.to_string_lossy().into_owned(),
-            export_dir: export_dir.to_string_lossy().into_owned(),
-            manifest_path: manifest_path.to_string_lossy().into_owned(),
+            // 导出回执是纯展示值（用户拿去复制路径），出口形态统一 `/`。
+            target_dir: orig_core::paths::to_wire(&target_dir),
+            export_dir: orig_core::paths::to_wire(&export_dir),
+            manifest_path: orig_core::paths::to_wire(&manifest_path),
             series_count: exported_series.len(),
             files_copied,
         })
@@ -6593,7 +6597,9 @@ fn collect(
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
         out.push(ScannedFile {
-            path: path.to_string_lossy().to_string(),
+            // 出口形态统一 `/`（2026-10-22）；`dir` 下面已经是 `/`，
+            // 两者同屏出现时不能一个 `\` 一个 `/`。
+            path: orig_core::paths::to_wire(&path),
             name,
             kind: kind.to_string(),
             size: meta.len() as i64,

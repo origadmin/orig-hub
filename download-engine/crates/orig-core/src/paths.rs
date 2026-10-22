@@ -250,6 +250,30 @@ pub fn normalize_dir_path(path: &Path) -> PathBuf {
     }
 }
 
+/// 把一个文件系统路径转成**对外的字符串形态**（API 出口 / 存库 / 错误消息）。
+///
+/// 规则只有一条：**一律用 `/`**。
+///
+/// 为什么必须统一（用户 2026-10-22 报「返回的数据 `\` 和 `/` 使用混乱」）：
+/// - 前端跑在 WebView 里，`\` 在 JS 字符串 / URL / CSS 里是**转义字符**，不是分隔符；
+/// - Linux/macOS 上 `\` 根本不是分隔符，原样显示会变成文件名的一部分；
+/// - 而 Windows 的所有文件 API（`std::fs`、`CreateFileW`）**都接受 `/`**，
+///   所以统一成 `/` 不会丢失任何能力，只是把「两种都行」收敛成「一种形态」。
+///
+/// 与 [`normalize_dir`] 的分工：本函数接受 `&Path`（调用方手上通常已经是 PathBuf），
+/// 其余规则完全复用它——折叠连续分隔符、保留 UNC 的前导 `//`、修剪尾部分隔符。
+///
+/// **不要**用它处理用户输入的比较逻辑（那要先规范化再比），也不要拿它替换
+/// [`PathBuf`] 参与 `starts_with` 等路径运算——`/` 字符串只用于**出口**。
+pub fn to_wire(path: &Path) -> String {
+    normalize_dir(&path.to_string_lossy())
+}
+
+/// `to_wire` 的字符串版本：用于已经拼好的路径串（如请求里回显的原值）。
+pub fn to_wire_str(input: &str) -> String {
+    normalize_dir(input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +364,28 @@ mod tests {
         // UNC：前导双斜杠是服务器身份的一部分，不是分隔符连排
         assert_eq!(normalize_dir("\\\\server\\share\\x"), "//server/share/x");
         assert_eq!(normalize_dir("//server/share/"), "//server/share");
+    }
+
+    /// `to_wire` = `normalize_dir(to_string_lossy())`：**出口路径只有一种形态**。
+    ///
+    /// 用户 2026-10-22 报「返回的数据 `\` 和 `/` 使用混乱」：daemon 的目录浏览
+    /// （`fsbrowse`）与文件列表（`files`）直接 `to_string_lossy()`，吐 Windows 原生
+    /// `\`；而 config 与 orig-tg 的 `file_path` 早已是 `/`。这条测试锁住「出口不含
+    /// 反斜杠」——以后任何人再往出口塞 `to_string_lossy()` 的裸结果，这里会红。
+    #[test]
+    fn to_wire_emits_forward_slashes_only() {
+        assert_eq!(to_wire(Path::new(r"C:\Users\x\Videos")), "C:/Users/x/Videos");
+        assert_eq!(to_wire(Path::new(r"C:\a/b\\c")), "C:/a/b/c");
+        assert_eq!(to_wire(Path::new("D:/OrigDown")), "D:/OrigDown");
+        assert_eq!(to_wire(Path::new(r"\\server\share\dir")), "//server/share/dir");
+        assert_eq!(to_wire(Path::new("C:/")), "C:/");
+        for p in [r"C:\x", r"\\srv\share", r"D:\a\b\c"] {
+            assert!(
+                !to_wire(Path::new(p)).contains('\\'),
+                "{p} 的出口形态仍含反斜杠：{}",
+                to_wire(Path::new(p))
+            );
+        }
     }
 
     #[test]

@@ -80,7 +80,9 @@ pub async fn engine_rows(st: &AppState) -> Vec<EngineRow> {
                 id: dt.task.id.clone(),
                 url: dt.url.clone(),
                 filename: dt.filename.clone(),
-                output: dt.output.to_string_lossy().into_owned(),
+                // 出参形态统一 `/`（`/api/activity` 与 `/api/downloads` 共用
+                // `EngineRow`，两处必须同形态，否则同一任务在两个域显示成两个路径）。
+                output: orig_core::paths::to_wire(&dt.output),
                 total: prog.total,
                 done: prog.downloaded,
                 status: status_string(prog.status),
