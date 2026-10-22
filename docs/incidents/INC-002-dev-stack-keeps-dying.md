@@ -118,3 +118,46 @@ python scripts/stack_guard.py --status     # 退出码 0 = 三项在线，才可
 2. **BUG-373 的 supervisor 策略**（3 连败即杀）未改；当前实例启动后已无风暴（`link down`/`restarting` 计数为 0），但策略本身仍在。
 3. **开机自启未安装**：现在守护器只活到本次登录会话结束。需要跨重启常驻时，把 `start-stack.cmd` 放进「启动」文件夹即可（涉及用户环境改动，未擅自安装）。
 4. **daemon 的 `default_download_dir` 仍返回 `C:/Users/.../Downloads`**（名义默认值）。实际写点已按 D 盘规则改道内容根，此处不涉及写盘，未动。
+
+---
+
+## 五、改版（2026-10-22，用户裁定）
+
+**用户原话**：「还需要考虑一点,测试开发新编译和旧编译冲突,最好有一个手动启动入口执行脚本,我来控制,后续你就不用管自动监控. 这部分和正式二进制逻辑需要分开,这仅仅是为了方便测试的.」
+
+三条裁定，逐条落地：
+
+| 裁定 | 落地 |
+|---|---|
+| 我来控制，不要自动监控 | **删掉**常驻守护（`stack_guard.py --daemon`）、WMI 托管（`launch_detached.ps1`）、双击自动守护入口（`start-stack.cmd`）。新入口跑完即退，不留任何常驻进程。 |
+| 测试脚本与正式二进制逻辑分开 | 全部收进 **`scripts/dev/`**（dev-only 目录）：`dev_stack.py` + `dev-stack.cmd`。不链接进 `orig-daemon` / `orig-tg` / Tauri 壳，不改变任何发布产物的运行时行为。 |
+| 考虑新编译与旧编译冲突 | 见下节的两种冲突与判据。 |
+
+### 5.1 两种「新旧冲突」，是两件事
+
+| 冲突 | 表现 | 判据 | 解法 |
+|---|---|---|---|
+| **进程跑旧编译** | exe 已更新，但进程还是上一次启动的 | `exe.mtime > 进程启动时间 + 2s` | `restart` |
+| **产物比源码旧** | 源码改了没重建，重启也没用 | 本 crate + 依赖 crate 里有 `.rs`/`Cargo.toml` 比 exe 新 | `build` |
+
+只判前者会让「产物比源码旧」被一句「可以验收」盖掉——这是第一版判据的洞，已修：`status` 的结论按 **离线 → 产物旧 → 进程旧 → 全绿** 的顺序短路，任一条成立就退出码 1。
+
+### 5.2 为什么 `build` 必须先 `stop`
+
+Windows 上运行中的 `.exe` 被文件锁占住：`cargo build --release` 链接 `target/release/orig-daemon.exe` 会直接失败（Access is denied），`sync-sidecars.sh` 的 `cp -f` 同样失败。所以 `build` 动作固化为 **stop → cargo build → sync → 打印新指纹**，顺序不可换。
+
+### 5.3 实测与证伪
+
+- **真实命中**：首次 `status` 就抓到 `orig-tg: 产物比源码旧（crates/orig-tg/src/state.rs 更新）`。这证明磁盘上的 `orig-tg.exe`（06:15 构建）**不含提交 `88ede8a`** 的自愈即时解析修复——也就是本轮之前那次「端到端实测 BUG-375」跑的是 `ab02936` 的版本，不是最终版。判据第一次运行就抓到了人眼漏掉的事。
+- **反向证伪（进程跑旧编译）**：把 `orig-daemon.exe` 的 mtime 用 `os.utime` 推到进程启动之后（16:20:03 vs 启动 16:03:48）⇒ `status` 立刻输出「⚠ 跑的是旧编译：exe 在进程启动之后被改写过」且退出码 1；随后把 mtime 精确恢复为 `2026-10-21 19:12:02`，复测恢复正常。判据有牙，且改动可逆。
+
+### 5.4 用法（人控制，跑完即退）
+
+```
+scripts\dev\dev-stack.cmd            # 双击：菜单（起/重启/停/构建/只重建 tg/状态）
+dev-stack.cmd status                 # 也可直接带子命令
+python scripts/dev/dev_stack.py status|stop|start|restart|build|build-tg
+```
+
+`status` 退出码：`0` = 三项在线且产物与源码一致、进程跑的就是这份编译；`1` = 有任一不满足（并打印是哪一种）。
+
