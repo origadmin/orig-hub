@@ -721,6 +721,7 @@
   "tg.filterNewDlgTitle": "添加筛选规则",
   "tg.filterNoHits": "没有匹配的内容",
   "tg.filterNoRulesMatch": "没有匹配的规则",
+  "tg.filterScopeHint": "命中数只统计「监控中」频道的消息；当前没有监控频道，所以全部显示 0。添加监控后会按频道累计。",
   "tg.filterRemove": "删除这条筛选",
   "tg.filterRowA11y": "筛选规则：{label}，命中 {n} 条",
   "tg.filterSearchPlaceholder": "按名称 / 关键词检索规则…",

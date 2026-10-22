@@ -721,6 +721,7 @@
   "tg.filterNewDlgTitle": "Add filter rule",
   "tg.filterNoHits": "Nothing matched",
   "tg.filterNoRulesMatch": "No matching rules",
+  "tg.filterScopeHint": "Hit counts only cover monitored channels; none are monitored right now, so everything shows 0. Counts accumulate once channels are added.",
   "tg.filterRemove": "Delete this filter",
   "tg.filterRowA11y": "Filter rule: {label}, {n} hits",
   "tg.filterSearchPlaceholder": "Filter rules by name / keyword…",

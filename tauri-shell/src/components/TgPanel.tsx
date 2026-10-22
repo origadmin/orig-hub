@@ -2118,6 +2118,18 @@ export function TgPanel(
                     className="h-7 text-[12px]"
                   />
                 </div>
+                {/* BUG-390：命中数作用域可见性 —— count_filter_hits 只统计「监控中」
+                    频道的消息（filter_ignores_unmonitored_channels 钉死该语义），
+                    监控列表为空时全部关键词恒 0，被读成「数据全没了」。让 0 自带
+                    解释：无监控频道且有规则时渲染作用域提示，不改计数语义。 */}
+                {monitoredList.length === 0 && filters.length > 0 && (
+                  <p
+                    data-testid="tg-filter-scope-hint"
+                    className="mx-1 mb-1 rounded-md border border-border-subtle bg-surface-2/50 px-2 py-1.5 text-[12px] leading-relaxed text-muted"
+                  >
+                    {t('tg.filterScopeHint')}
+                  </p>
+                )}
                 {/* 文字筛选（BUG-329）：每条规则是**并列的一个条目**（用户裁定
                     「一条相当于一条监控」），不是单频道内叠加条件的复合过滤器。 */}
                 <div className="space-y-1" data-testid="tg-filter-list">
