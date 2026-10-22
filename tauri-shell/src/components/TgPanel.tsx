@@ -160,6 +160,14 @@ interface MiddleChannel {
   newCount?: number
   /** 仅监控行有值：回溯目标日期（unix 秒，0/缺省 = 没有待回溯） */
   backfillUntil?: number
+  /**
+   * 仅监控行有值：回溯游标（向旧翻到的最新消息号，0 = 还没开始翻）。
+   * BUG-382：「已回溯至哪」的真值 —— 只有目标日期时，界面说得出要到哪、
+   * 说不出已到哪，用户无法确认上次回溯点。
+   */
+  backfillBeforeId?: number
+  /** 仅监控行有值：增量同步游标（最新已同步消息号）——「最新」边界（BUG-382）。 */
+  lastMessageId?: number
 }
 
 /**
@@ -421,6 +429,17 @@ export function TgPanel(
   const [backfillDate, setBackfillDate] = useState('')
   /** 回溯请求在飞：只锁按钮，不锁整个面板。 */
   const [backfillBusy, setBackfillBusy] = useState(false)
+  /**
+   * BUG-382：本频道的「上次回溯」痕迹（目标日期 + 是否被取消）。
+   *
+   * 服务端回溯到达目标/最旧/游标不动就 `clear_backfill`（`backfillUntil` 归零），
+   * 进度条消失后行上不留任何痕迹 ⇒ 用户「无法确认上次回溯点」。本地痕迹是
+   * 纯展示记忆（不参与任何判定），刷新即丢，但服务端双边界（backfillBeforeId /
+   * lastMessageId）在运行中随时可查。
+   */
+  const [lastBackfill, setLastBackfill] = useState<Map<number, { date: string; cancelled: boolean }>>(
+    () => new Map(),
+  )
   /**
    * 已展开的相册（键 = `album-{首条 key}`）。
    *
@@ -758,6 +777,8 @@ export function TgPanel(
         username: m.username,
         newCount: m.newCount,
         backfillUntil: m.backfillUntil,
+        backfillBeforeId: m.backfillBeforeId,
+        lastMessageId: m.lastMessageId,
       })),
     [monitoredList],
   )
@@ -1626,6 +1647,13 @@ export function TgPanel(
         const el = document.querySelector(`[data-message-key="${k}"]`)
         if (el) return { k, el }
       }
+      // BUG-385：相册组内任一条命中 ⇒ 亮整组（组容器 `data-message-keys`
+      // 挂全部成员键，空格分隔）。单条消息键查不到时再走这条——用户从
+      // 文件域/剧集链路跳进来，目标常在组内非首条。
+      for (const k of keys) {
+        const el = document.querySelector(`[data-message-keys~="${k}"]`)
+        if (el) return { k, el }
+      }
       return null
     }
     const tick = async () => {
@@ -1721,6 +1749,13 @@ export function TgPanel(
           c.channelId === channelId ? { ...c, backfillUntil: res.backfillUntil } : c,
         ),
       )
+      // BUG-382：留下「本次回溯目标」痕迹（完成/取消后进度条消失，靠它回答
+      // 「上次回溯到哪」）。
+      setLastBackfill((prev) => {
+        const next = new Map(prev)
+        next.set(channelId, { date: backfillDate, cancelled: false })
+        return next
+      })
       setBackfillFor(null)
       setBackfillDate('')
     } catch (e) {
@@ -1739,6 +1774,18 @@ export function TgPanel(
       setMonitoredList((prev) =>
         prev.map((c) => (c.channelId === channelId ? { ...c, backfillUntil: 0 } : c)),
       )
+      // BUG-382：取消也要留痕（标 cancelled），否则用户取消后同样不知道自己
+      // 取消过一个到什么日期的回溯。
+      const untilSec = monitoredList.find((c) => c.channelId === channelId)?.backfillUntil
+      const prevDate = lastBackfill.get(channelId)?.date
+      setLastBackfill((prev) => {
+        const next = new Map(prev)
+        next.set(channelId, {
+          date: untilSec ? fmtDateOnly(untilSec) : (prevDate ?? '—'),
+          cancelled: true,
+        })
+        return next
+      })
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -2304,8 +2351,25 @@ export function TgPanel(
                           data-until={ch.backfillUntil}
                           className="mb-1 flex items-center gap-2 rounded-md bg-surface-2/60 px-2 py-1.5"
                         >
-                          <span className="min-w-0 flex-1 truncate text-[12px] text-fg-mid">
-                            {t('tg.backfillRunning', { date: fmtDateOnly(ch.backfillUntil ?? 0) })}
+                          <span className="min-w-0 flex-1 text-[12px] text-fg-mid">
+                            <span className="block truncate">
+                              {t('tg.backfillRunning', { date: fmtDateOnly(ch.backfillUntil ?? 0) })}
+                            </span>
+                            {/* BUG-382：双边界 —— 「已回溯至 #{游标}」+「最新 #{同步游标}」。
+                                旧形态只有目标日期：说得出「要到哪」、说不出「已到哪」，
+                                用户无法确认回溯进度，回溯结束后行上又毫无痕迹。 */}
+                            <span
+                              className="block truncate text-[11px] text-muted"
+                              data-testid="tg-monitor-backfill-bounds"
+                              data-before={ch.backfillBeforeId ?? 0}
+                              data-latest={ch.lastMessageId ?? 0}
+                            >
+                              {(ch.backfillBeforeId ?? 0) > 0
+                                ? t('tg.backfillReached', { id: ch.backfillBeforeId ?? 0 })
+                                : t('tg.backfillNotStarted')}
+                              {' · '}
+                              {t('tg.backfillLatest', { id: ch.lastMessageId ?? 0 })}
+                            </span>
                           </span>
                           <Button
                             variant="ghost"
@@ -2318,6 +2382,19 @@ export function TgPanel(
                           >
                             {t('tg.backfillCancel')}
                           </Button>
+                        </div>
+                      ) : lastBackfill.has(ch.id) ? (
+                        /* BUG-382：回溯完成/取消后的痕迹 —— 服务端 clear_backfill 后
+                           `backfillUntil` 归零、进度条消失，没有这行用户就不知道
+                           「上次回溯到哪/是否取消过」。 */
+                        <div
+                          data-testid="tg-monitor-backfill-last"
+                          data-cancelled={lastBackfill.get(ch.id)!.cancelled ? 'true' : 'false'}
+                          className="mb-1 truncate rounded-md bg-surface-2/40 px-2 py-1 text-[11px] text-muted"
+                        >
+                          {lastBackfill.get(ch.id)!.cancelled
+                            ? t('tg.backfillLastCancelled', { date: lastBackfill.get(ch.id)!.date })
+                            : t('tg.backfillLastDone', { date: lastBackfill.get(ch.id)!.date })}
                         </div>
                       ) : null}
                       {/* 表单挂在行下方（不是弹窗）：弹窗要处理定位/遮挡/关闭，
@@ -2897,6 +2974,66 @@ const MessageBubble = memo(function MessageBubble(props: {
   const cached = state === 'cached'
   const caching = state === 'caching'
   const queued = state === 'queued'
+  /**
+   * BUG-383：视频是否正在播放。播放态由 VideoBlock 上报——缩略图列里
+   * 播视频不可接受，此时气泡切回上下全宽布局。
+   */
+  const [videoPlaying, setVideoPlaying] = useState(false)
+  /*
+   * 左右布局用于**一切有媒体/文件块**的消息（photo/video/audio/file）；
+   * 2026-10-23 复报：file/audio 曾是 📄 行式横条（上下感），与左右条并存
+   * 「样式突兀」——现在它们也有同尺寸左列（图标块），四态归一。
+   * caption-only（无类型）消息没有媒体块可放，保持纯文字上下排。
+   * video 播放态仍回退上下全宽（缩略图列播视频不可接受，有意例外）。
+   */
+  const sideLayout = !videoPlaying && (m.type === 'photo' || m.type === 'video' || m.type === 'audio' || m.type === 'file')
+  /** 元信息 + 操作行（左右/上下两种布局共用一份，不各写一套）。 */
+  const bubbleMeta = () => (
+    <div className="mt-1.5 flex flex-wrap items-center gap-2">
+      <span className="font-mono text-[9px] text-muted">#{m.messageId}</span>
+      {m.size ? <span className="text-[10px] text-muted">{fmtSize(m.size)}</span> : null}
+      {/* 条目内字节（BUG-181）：下载中时 `已传/总量` 是唯一活着的证据 */}
+      {caching && progress?.itemBytesTotal ? (
+        <span className="text-[10px] text-accent" data-testid="bubble-item-bytes">
+          {fmtSize(progress.itemBytes ?? 0)}/{fmtSize(progress.itemBytesTotal)}
+        </span>
+      ) : null}
+      {/* 呈现状态角标（BUG-170 单源派生）：已缓存 / 缺字节 / 失败 三态如实呈现 */}
+      {cached && <Chip tone="success">{t('tg.downloaded')}</Chip>}
+      {state === 'bytesMissing' && <Chip tone="warn">{t('tg.bytesMissing')}</Chip>}
+      {state === 'failed' && <Chip tone="warn">{t('tg.statusFailed')}</Chip>}
+      <span className="ml-auto text-[10px] text-muted">{fmtTime(m.date)}</span>
+      {/* 缓存/播放按钮：视频与图片同构（BUG-046）——此前视频只靠海报上的 ⬇ 图标，
+          图片却有显式「缓存」按钮，逻辑倒置。海报点击行为不变（已缓存=播放，
+          缓存中=在线播放，未缓存=开始缓存），按钮是明确的兜底入口。 */}
+      {/* 操作按钮（BUG-352：图片与视频同一把尺子）——已落盘=播放；否则=缓存/排队中/
+          重试缓存。BUG-049 的「图片=加入图片库/已入库」分支已删除：图片同样是内容，
+          同样落盘（不成「剧集」这一点不变，那是 BUG-044 的规则）。 */}
+      {downloadedPath || m.downloaded ? (
+        <Button variant="secondary" size="sm" className="h-6 px-2 text-[10px]" onClick={() => onOpenDownloaded(m)}>
+          {t('tg.play')}
+        </Button>
+      ) : (
+        <Button
+          variant="secondary"
+          size="sm"
+          className="h-6 px-2 text-[10px]"
+          disabled={caching || queued}
+          onClick={() => onDownload(m)}
+        >
+          {/* 缺字节/失败 = 条目在、字节未就绪 → 动词是「重试缓存」（BUG-170 语义定稿）；
+              排队中（BUG-181）= 在单飞队列等待，禁用按钮防止重复入队误导。 */}
+          {caching
+            ? t('tg.caching')
+            : queued
+              ? t('tg.queued')
+              : state === 'bytesMissing' || state === 'failed'
+                ? t('tg.retryCache')
+                : t('tg.download')}
+        </Button>
+      )}
+    </div>
+  )
   return (
     <div
       className="flex flex-col"
@@ -2911,80 +3048,73 @@ const MessageBubble = memo(function MessageBubble(props: {
           highlighted ? 'border-accent ring-2 ring-accent/70' : 'border-border-subtle',
         )}
       >
-        {m.type === 'photo' && (
-          /* BUG-359：图片块只做预览；缓存入口在下方操作行（与视频同构的一处），
-             不再往图上压一个黑框按钮 —— 同一动作两个入口就是「不清楚用途」的来源。 */
-          <PhotoBlock item={m} onPreview={() => onPreview(m)} />
-        )}
-        {m.type === 'video' && (
-          <VideoBlock
-            item={m}
-            downloaded={cached}
-            downloading={caching || queued}
-            onDownload={() => onDownload(m)}
-          />
-        )}
-
-        {(m.type === 'audio' || m.type === 'file') && (
-          <div className="mb-1.5 flex items-center gap-2 rounded-lg bg-surface-2/60 px-3 py-2">
-            <span className="text-base">{m.type === 'audio' ? '🎵' : '📄'}</span>
-            <span className="min-w-0 flex-1 truncate text-[12px] text-fg-mid">
-              {m.caption || m.mimeType || `#${m.messageId}`}
-            </span>
-            <span className="shrink-0 text-[10px] text-muted">{fmtSize(m.size)}</span>
+        {sideLayout ? (
+          /* BUG-383：左右布局 —— 缩略图列 + 文字列。旧形态图/文上下堆叠，
+             一条带图消息占满整屏高（用户 2026-10-22：「图片和文字上下布局
+             太占地方……排版也需要变」）。audio/file 无媒体块，保持行式。 */
+          /* 2026-10-23 二报：左列改 flex 容器 —— 子块 flex-1 拉伸到行高
+             （行高 = max(右列, min-h-32)），短 caption 保底 128px、长 caption
+             等高裁切。h-full 链在无确定高度时回退固有比例（实测 160 宽图
+             撑到 284px），所以子块高度必须由 flex 布局给出，不靠 height:100%。 */
+          <div className="flex gap-2.5">
+            <div className="flex w-40 shrink-0 flex-col self-stretch">
+            {m.type === 'photo' && (
+              /* BUG-359：图片块只做预览；缓存入口在下方操作行（与视频同构的一处），
+                 不再往图上压一个黑框按钮 —— 同一动作两个入口就是「不清楚用途」的来源。 */
+              <PhotoBlock item={m} onPreview={() => onPreview(m)} compact />
+            )}
+            {m.type === 'video' && (
+              <VideoBlock
+                item={m}
+                downloaded={cached}
+                downloading={caching || queued}
+                onDownload={() => onDownload(m)}
+                compact
+                onPlayingChange={setVideoPlaying}
+              />
+            )}
+            {(m.type === 'audio' || m.type === 'file') && (
+              /* 2026-10-23 复报（BUG-383 追节）：file/audio 并入左右框架 ——
+                 左列图标块与图列同尺寸（w-40 h-32），消除「📄 行式横条」
+                 与左右条并存的突兀感。文件名/大小/动作在右列，与 photo/video
+                 同一套 meta 行（不各写一套）。
+                 2026-10-23 二报：flex-1 + min-h-32 等高拉伸（见上）。 */
+              <div className="flex min-h-32 flex-1 items-center justify-center rounded-lg bg-surface-2 text-2xl">
+                {m.type === 'audio' ? '🎵' : '📄'}
+              </div>
+            )}
           </div>
+            <div className="flex min-w-0 flex-1 flex-col">
+              {m.caption && (
+                <p className="whitespace-pre-wrap break-words text-[13px] leading-snug text-fg-strong">
+                  {m.caption}
+                </p>
+              )}
+              {bubbleMeta()}
+            </div>
+          </div>
+        ) : (
+          <>
+            {m.type === 'photo' && (
+              <PhotoBlock item={m} onPreview={() => onPreview(m)} />
+            )}
+            {m.type === 'video' && (
+              <VideoBlock
+                item={m}
+                downloaded={cached}
+                downloading={caching || queued}
+                onDownload={() => onDownload(m)}
+                onPlayingChange={setVideoPlaying}
+              />
+            )}
+            {m.caption && m.type !== 'audio' && m.type !== 'file' && (
+              <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-snug text-fg-strong">
+                {m.caption}
+              </p>
+            )}
+            {bubbleMeta()}
+          </>
         )}
-
-        {m.caption && m.type !== 'audio' && m.type !== 'file' && (
-          <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-snug text-fg-strong">
-            {m.caption}
-          </p>
-        )}
-
-        <div className="mt-1.5 flex items-center gap-2">
-          <span className="font-mono text-[9px] text-muted">#{m.messageId}</span>
-          {m.size ? <span className="text-[10px] text-muted">{fmtSize(m.size)}</span> : null}
-          {/* 条目内字节（BUG-181）：下载中时 `已传/总量` 是唯一活着的证据 */}
-          {caching && progress?.itemBytesTotal ? (
-            <span className="text-[10px] text-accent" data-testid="bubble-item-bytes">
-              {fmtSize(progress.itemBytes ?? 0)}/{fmtSize(progress.itemBytesTotal)}
-            </span>
-          ) : null}
-          {/* 呈现状态角标（BUG-170 单源派生）：已缓存 / 缺字节 / 失败 三态如实呈现 */}
-          {cached && <Chip tone="success">{t('tg.downloaded')}</Chip>}
-          {state === 'bytesMissing' && <Chip tone="warn">{t('tg.bytesMissing')}</Chip>}
-          {state === 'failed' && <Chip tone="warn">{t('tg.statusFailed')}</Chip>}
-          <span className="ml-auto text-[10px] text-muted">{fmtTime(m.date)}</span>
-          {/* 缓存/播放按钮：视频与图片同构（BUG-046）——此前视频只靠海报上的 ⬇ 图标，
-              图片却有显式「缓存」按钮，逻辑倒置。海报点击行为不变（已缓存=播放，
-              缓存中=在线播放，未缓存=开始缓存），按钮是明确的兜底入口。 */}
-          {/* 操作按钮（BUG-352：图片与视频同一把尺子）——已落盘=播放；否则=缓存/排队中/
-              重试缓存。BUG-049 的「图片=加入图片库/已入库」分支已删除：图片同样是内容，
-              同样落盘（不成「剧集」这一点不变，那是 BUG-044 的规则）。 */}
-          {downloadedPath || m.downloaded ? (
-            <Button variant="secondary" size="sm" className="h-6 px-2 text-[10px]" onClick={() => onOpenDownloaded(m)}>
-              {t('tg.play')}
-            </Button>
-          ) : (
-            <Button
-              variant="secondary"
-              size="sm"
-              className="h-6 px-2 text-[10px]"
-              disabled={caching || queued}
-              onClick={() => onDownload(m)}
-            >
-              {/* 缺字节/失败 = 条目在、字节未就绪 → 动词是「重试缓存」（BUG-170 语义定稿）；
-                  排队中（BUG-181）= 在单飞队列等待，禁用按钮防止重复入队误导。 */}
-              {caching
-                ? t('tg.caching')
-                : queued
-                  ? t('tg.queued')
-                  : state === 'bytesMissing' || state === 'failed'
-                    ? t('tg.retryCache')
-                    : t('tg.download')}
-            </Button>
-          )}
-        </div>
       </div>
     </div>
   )
@@ -3115,7 +3245,15 @@ const AlbumBubble = memo(function AlbumBubble(props: {
   const caption = items.find((it) => it.caption?.trim())?.caption
   const totalSize = items.reduce((s, it) => s + (it.size ?? 0), 0)
   return (
-    <div className="flex flex-col" data-tg-highlight={highlighted ? 'true' : undefined}>
+    <div
+      className="flex flex-col"
+      data-tg-highlight={highlighted ? 'true' : undefined}
+      /* BUG-385：相册组内**每一条**的定位键都挂在组容器上（空格分隔）。
+         单条消息的 `data-message-key` 覆盖不到组内非首条，而「在 TG 中查看」
+         要跳的往往正是组内某一条（实测 209092 在组 14340124445628985 内，
+         旧契约下定位循环翻完预算只能报 locateFailed）。 */
+      data-message-keys={items.map((it) => it.key).join(' ')}
+    >
       <div
         className={cn(
           'max-w-[88%] rounded-2xl rounded-tl-md border bg-surface p-2.5 shadow-sm',
@@ -3135,13 +3273,18 @@ const AlbumBubble = memo(function AlbumBubble(props: {
             </span>
           ) : null}
           {collapsible && open ? (
+            /* 2026-10-23 复报（BUG-383 追节）：「缺少收起」= 入口不显著。
+               原形态是状态行右侧 11px 小字，用户点了展开找不到回去的路。
+                现在三处均可收起：①这个按钮（加大点击面积 + ⌃ 前缀）②左列封面
+                图本身（展开态点击 = 收起，符合「点开的再点回去」直觉）③展开态
+                封面 hint 文案明示「点击收起」。 */
             <button
               type="button"
               onClick={onToggleExpand}
               data-testid="album-collapse"
-              className="ml-auto text-[11px] text-fg-mid transition-colors hover:text-fg-strong"
+              className="ml-auto rounded px-1.5 py-0.5 text-[11px] text-fg-mid transition-colors hover:bg-surface-2 hover:text-fg-strong"
             >
-              {t('tg.albumCollapse')}
+              ⌃ {t('tg.albumCollapse')}
             </button>
           ) : null}
           <span className={cn('text-muted', collapsible && open ? '' : 'ml-auto')}>
@@ -3150,64 +3293,111 @@ const AlbumBubble = memo(function AlbumBubble(props: {
         </div>
 
         {/*
-         * 组内宫格：列数**按数量自适应**（1→单图 / 2→2列 / 3→3列 / 4→2×2 /
-         * 5..10→3 列，即 5–10 宫格），图片一律 `object-contain`。
+         * 2026-10-23 复报（BUG-383 追节）：相册并入消息流统一的**左右框架**。
+         * 旧形态两处不在框架内：折叠态 = 全宽大图封面 + caption 全宽在下
+         * （上下大块）；展开态 = 全宽宫格（实测 569×378）。与单条左右条、
+         * file 行式同屏并存 ⇒ 用户「部分上下部分左右、样式突兀」
+         * 「展开后变成上下了，需要重新设计」。
          *
-         * 两处都改必然性、而非调数值：
-         *  - 旧版固定 `grid-cols-2` + `aspect-square` + `object-cover`：4 图以上永远
-         *    2 列（9 张图排成 5 行的长条），且 cover 把每张图**裁掉边缘** —— 用户报的
-         *    「图片被截取、没有九宫格」就是这个组合造成的。宫格形状是数量决定的函数，
-         *    不是写死的常量。
-         *  - `ALBUM_MAX_TILES` **必须 ≥ 10**（BUG-160）：TG 相册上限 10，宫格上限一旦低于
-         *    平台上限，满员相册的第 10 个内容就会被折进 `+N`、不作为独立瓦片出现（用户报
-         *    的「最多 9 个内容 / 第 10 个被拆出去」）。现为 10 ⇒ 真实相册恒显示全量；
-         *    `+N` 只对「> 10」起防御作用，其余图片在全屏浏览页里连翻。
+         * 新形态（折叠/展开同一框架，与 MessageBubble 单条同构）：
+         *  - 左列 w-40 h-32 封面（与单条 PhotoBlock compact 同尺寸）：
+         *    多样本点击 = 展开/收起 toggle（底条文案随之切换，收起入口
+         *    从 11px 状态行小字变为封面通栏底条 + 状态行 ⌃ 按钮两处）；
+         *    单样本（不可折叠）点击 = 看大图，testid 另起 album-cover-single，
+         *    不带 album-cover —— verify_album_cover.cjs A5「无 count==1
+         *    封面」据此不挂。
+         *  - 右列：caption（全量）+ 展开态宫格（限右列宽）+ 操作行。
+         * 宫格语义不变：ALBUM_MAX_TILES=10（BUG-160）、albumGridClass
+         * 数量自适应（1→单图/2→2列/3→3列/4→2×2/5-10→3列）、瓦片
+         * object-contain、瓦片 data-message-key 定位锚点（BUG-305）。
          */}
-        {!open ? (
-          /*
-           * 折叠态：**只发一个缩略图请求**。点击 = 展开整组，不是打开大图 ——
-           * 用户原话「列表点击加载整个组内容」，所以第一次点击的语义是"把组摊开"。
-           */
-          <button
-            type="button"
-            onClick={onToggleExpand}
-            data-testid="album-cover"
-            data-count={items.length}
-            data-chat-id={cover.chatId}
-            data-message-id={cover.messageId}
-            className="relative block w-full overflow-hidden rounded-lg bg-surface-2"
-          >
-            {coverTyp === 'photo' || coverTyp === 'video' ? (
-              <img
-                src={tgThumbUrl(cover.chatId, cover.messageId)}
-                alt={cover.caption || ''}
-                loading="lazy"
-                className={cn(
-                  'mx-auto h-auto max-h-[40vh] w-auto max-w-full',
-                  coverFit(coverTyp),
+        <div className="flex gap-2.5">
+          {/* 2026-10-23 二报：封面列 flex 容器 —— 封面 flex-1 等高拉伸
+             （行高 = max(右列, min-h-32)），与 MessageBubble 左列同一修法。 */}
+          <div className="flex w-40 shrink-0 flex-col self-stretch">
+            {collapsible ? (
+              /* 折叠态：点击 = 展开整组，不是打开大图 —— 用户原话
+                 「列表点击加载整个组内容」，第一次点击的语义是"把组摊开"；
+                 展开态同一按钮再点 = 收起（2026-10-23 复报的收起入口）。 */
+              <button
+                type="button"
+                onClick={onToggleExpand}
+                data-testid="album-cover"
+                data-count={items.length}
+                data-chat-id={cover.chatId}
+                data-message-id={cover.messageId}
+                /* 2026-10-23 二报：flex-1 + min-h-32 —— 长 caption 时封面等高
+                   拉伸，DOM 左右 = 视觉左右。 */
+                className="relative block min-h-32 w-full flex-1 overflow-hidden rounded-lg bg-surface-2"
+              >
+                {coverTyp === 'photo' || coverTyp === 'video' ? (
+                  <img
+                    src={tgThumbUrl(cover.chatId, cover.messageId)}
+                    alt={cover.caption || ''}
+                    loading="lazy"
+                    className={cn('absolute inset-0 h-full w-full', coverFit(coverTyp))}
+                  />
+                ) : (
+                  <span className="flex h-full w-full items-center justify-center text-2xl">
+                    {coverTyp === 'audio' ? '🎵' : '📄'}
+                  </span>
                 )}
-              />
+                {/* 数量角标：让用户在**展开之前**就知道这是一组，而不是一张 */}
+                <span
+                  data-testid="album-cover-count"
+                  className="absolute right-1.5 top-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white"
+                >
+                  {items.length}
+                </span>
+                {/* 通栏底条：折叠=展开语义、展开=收起语义（显著化，替代旧左下角小条） */}
+                <span className="absolute inset-x-0 bottom-0 bg-black/60 px-1.5 py-0.5 text-center text-[11px] text-white/90">
+                  {open ? t('tg.albumCollapse') : t('tg.albumExpandHint', { n: items.length })}
+                </span>
+              </button>
             ) : (
-              <span className="flex aspect-video w-full items-center justify-center text-lg">
-                {coverTyp === 'audio' ? '🎵' : '📄'}
-              </span>
+              /* 单样本：本身就是 1 张封面，没有「展开」可言（首修注释的判据）。
+                 点击 = 看大图；testid 不带 album-cover（A5：单条不折叠）。 */
+              <button
+                type="button"
+                onClick={() => onPreview(0, items)}
+                data-testid="album-cover-single"
+                data-count={items.length}
+                data-chat-id={cover.chatId}
+                data-message-id={cover.messageId}
+                className="relative block min-h-32 w-full flex-1 overflow-hidden rounded-lg bg-surface-2"
+              >
+                {coverTyp === 'photo' || coverTyp === 'video' ? (
+                  <img
+                    src={tgThumbUrl(cover.chatId, cover.messageId)}
+                    alt={cover.caption || ''}
+                    loading="lazy"
+                    className={cn('absolute inset-0 h-full w-full', coverFit(coverTyp))}
+                  />
+                ) : (
+                  <span className="flex h-full w-full items-center justify-center text-2xl">
+                    {coverTyp === 'audio' ? '🎵' : '📄'}
+                  </span>
+                )}
+                <span
+                  data-testid="album-cover-count"
+                  className="absolute right-1.5 top-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white"
+                >
+                  {items.length}
+                </span>
+              </button>
             )}
-            {/* 数量角标：让用户在**展开之前**就知道这是一组，而不是一张 */}
-            <span
-              data-testid="album-cover-count"
-              className="absolute right-1.5 top-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white"
+          </div>
+          <div className="flex min-w-0 flex-1 flex-col">
+            {caption && (
+              <p className="whitespace-pre-wrap break-words text-[13px] leading-snug text-fg-strong">
+                {caption}
+              </p>
+            )}
+            {open ? (
+            <div
+              data-testid="album-grid"
+              className={cn('mt-1.5 grid gap-1.5', albumGridClass(items.length))}
             >
-              {items.length}
-            </span>
-            <span className="absolute bottom-1.5 left-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[11px] text-white/90">
-              {t('tg.albumExpandHint', { n: items.length })}
-            </span>
-          </button>
-        ) : (
-        <div
-          data-testid="album-grid"
-          className={cn('grid gap-1.5', albumGridClass(items.length))}
-        >
           {items.slice(0, ALBUM_MAX_TILES).map((it, i) => {
             const typ = it.type ?? guessMediaType(it.mimeType, it.filePath)
             const dur = fmtDuration(it.duration)
@@ -3266,14 +3456,8 @@ const AlbumBubble = memo(function AlbumBubble(props: {
               </button>
             )
           })}
-        </div>
-        )}
-
-        {caption && (
-          <p className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-snug text-fg-strong">
-            {caption}
-          </p>
-        )}
+            </div>
+            ) : null}
 
         {/* 操作行：整组缓存 / 进度 / 首条消息号 + 总大小（按钮与缓存库同构：outline h-6） */}
         <div className="mt-1.5 flex items-center gap-2">
@@ -3340,6 +3524,8 @@ const AlbumBubble = memo(function AlbumBubble(props: {
             </div>
           )}
         </div>
+          </div>
+        </div>
       </div>
     </div>
   )
@@ -3384,26 +3570,37 @@ const AlbumBubble = memo(function AlbumBubble(props: {
 function PhotoBlock(props: {
   item: FeedItem
   onPreview: () => void
+  /** BUG-383：左右布局的缩略图列（固定高裁切，非全宽大图）。 */
+  compact?: boolean
 }) {
-  const { item, onPreview } = props
+  const { item, onPreview, compact = false } = props
   const [err, setErr] = useState(false)
   if (err) {
     return (
       <button
         type="button"
         onClick={onPreview}
-        className="flex h-28 w-full items-center justify-center rounded-lg bg-surface-2 text-[11px] text-muted"
+        className={cn(
+          'flex w-full items-center justify-center rounded-lg bg-surface-2 text-[11px] text-muted',
+          // 2026-10-23 二报：flex-1 + min-h-32 —— 左列 flex-col 下的等高拉伸
+          compact ? 'min-h-32 flex-1' : 'h-28',
+        )}
       >
         <PhotoPlaceholder />
       </button>
     )
   }
   return (
-    <div className="relative">
+    <div className={cn('relative', compact && 'min-h-32 flex-1')}>
       <button
         type="button"
         onClick={onPreview}
-        className="block w-full overflow-hidden rounded-lg bg-surface-2"
+        /* 2026-10-23 二报：absolute 铺满根块（根块高度由 flex 布局给出）——
+           img 不参与高度计算，从根上杜绝「图片固有比例撑高卡片」。 */
+        className={cn(
+          'overflow-hidden rounded-lg bg-surface-2',
+          compact ? 'absolute inset-0' : 'block w-full',
+        )}
         data-testid="tg-photo-preview"
         data-message-id={item.messageId}
       >
@@ -3412,19 +3609,11 @@ function PhotoBlock(props: {
           alt={item.caption || ''}
           loading="lazy"
           onError={() => setErr(true)}
-          className="mx-auto h-auto max-h-[60vh] w-auto max-w-full object-contain"
+          className={cn(
+            compact ? 'h-full w-full object-cover' : 'mx-auto h-auto max-h-[60vh] w-auto max-w-full object-contain',
+          )}
         />
       </button>
-      {/*
-        BUG-359：撤掉压在图上的「⬇ 缓存」黑框按钮。
-        原形态是 `absolute right-1.5 top-1.5` + `bg-black/65` 的半透明黑片，与气泡
-        操作行里那个「缓存」按钮是**同一个动作的两个入口** —— 用户原话
-        「详情内容无法选择，但是有黑框，不清楚用途」：图上一个黑框、图下一行按钮，
-        同一件事给两个控件，其中一个是压在内容上的装饰性黑块，自然读不出用途。
-        判据（BUG-328 同族）：压在内容上的常驻动作条不进 DOM，动作只留流式那一处。
-        缓存三态在图上一并撤掉：气泡操作行已有 Chip（已缓存/缺字节/失败）与按钮文案
-        （缓存中/排队中/重试缓存/缓存）承载同一组状态，不因撤掉黑框丢信息。
-      */}
     </div>
   )
 }
@@ -3441,8 +3630,12 @@ function VideoBlock(props: {
   downloaded: boolean
   downloading: boolean
   onDownload: () => void
+  /** BUG-383：左右布局的缩略图列（固定高裁切，非全宽大图）。播放态不受此约束。 */
+  compact?: boolean
+  /** BUG-383：播放态变化上报（气泡据此切全宽——缩略图列里播视频不可接受）。 */
+  onPlayingChange?: (playing: boolean) => void
 }) {
-  const { item, downloaded, downloading, onDownload } = props
+  const { item, downloaded, downloading, onDownload, compact = false, onPlayingChange } = props
   const { t } = useTranslation()
   const [playing, setPlaying] = useState<'off' | 'local' | 'online'>('off')
   const [posterErr, setPosterErr] = useState(false)
@@ -3450,6 +3643,11 @@ function VideoBlock(props: {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const thumb = tgThumbUrl(item.chatId, item.messageId)
   const dur = fmtDuration(item.duration)
+
+  // BUG-383：播放态上报给气泡（左右布局 ↔ 全宽的切换依据）。
+  useEffect(() => {
+    onPlayingChange?.(playing !== 'off')
+  }, [playing, onPlayingChange])
 
   // 倍速即时生效；视频重挂载（本地↔在线降级）后由 onLoadedMetadata 兜底再应用
   useEffect(() => {
@@ -3501,10 +3699,20 @@ function VideoBlock(props: {
         else if (downloading) setPlaying('online')
         else onDownload()
       }}
-      className="relative block w-full overflow-hidden rounded-lg bg-black"
+      /* 2026-10-23 二报：compact 下 flex-1 + min-h-32（左列 flex-col 拉伸）；
+         海报 img absolute 铺满，不参与高度计算（防固有比例撑高卡片）。 */
+      className={cn(
+        'relative block w-full overflow-hidden rounded-lg bg-black',
+        compact ? 'min-h-32 flex-1' : 'aspect-video',
+      )}
     >
       {posterErr ? (
-        <span className="flex aspect-video w-full items-center justify-center text-[11px] text-white/50">
+        <span
+          className={cn(
+            'flex w-full items-center justify-center text-[11px] text-white/50',
+            compact ? 'absolute inset-0' : 'aspect-video',
+          )}
+        >
           {t('tg.thumbUnavailable')}
         </span>
       ) : (
@@ -3513,7 +3721,11 @@ function VideoBlock(props: {
           alt={item.caption || ''}
           loading="lazy"
           onError={() => setPosterErr(true)}
-          className="mx-auto h-auto w-full max-h-[50vh] object-contain"
+          className={cn(
+            compact
+              ? 'absolute inset-0 h-full w-full object-cover'
+              : 'mx-auto h-auto max-h-[50vh] w-auto object-contain',
+          )}
         />
       )}
       {dur && (
