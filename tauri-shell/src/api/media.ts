@@ -276,8 +276,17 @@ export interface MergeSkipped {
 
 /** 剧集合并结果 */
 export interface MergeResult {
-  /** 实际搬移的分集数 */
+  /** 实际占用了**新集号**的分集数 */
   added: number
+  /**
+   * 被判为**同一集**、降为目标分集备用源 / 挂图的条目数（BUG-407 / BUG-408）。
+   *
+   * 这些条目**没有**新增集号，所以不计入 `added` —— 只报 `added` 会让用户以为
+   * 「少搬了东西」。视频那部分同时计入 `sourcesAttached`。
+   */
+  mergedSameEpisode?: number
+  /** 作为备用来源挂到目标分集上的**视频**条目数 */
+  sourcesAttached?: number
   skippedCount: number
   skipped: MergeSkipped[]
 }
@@ -752,11 +761,14 @@ export async function appendEpisodes(
 }
 
 /**
- * 合并剧集：把 `sourceId` 的全部分集搬入 `seriesId` 末尾（各季续编集号）并**删除源剧集**。
+ * 合并剧集：把 `sourceId` 的全部分集并入 `seriesId` 并**删除源剧集**。
  *
- * 后端刻意不做内容级去重：文件名相同而内容不同、同一内容多源导入、`1-2` 与 `1,2` 并存、
- * 每批都带的预告 —— 一律原样保留。只有「同一条目已在目标同季」才跳过，
- * 且跳过明细在 `skipped` 里回传，调用方**必须**呈现给用户。
+ * 处置**全自动**（BUG-407 / BUG-408），没有手动「保留 / 删除」：
+ *  - 同季同集号、或视频内容 hash 相同 ⇒ 判为**同一集**，归并为「一集多源」，
+ *    **不占新集号**（结果里的 `mergedSameEpisode` 就是这批）；
+ *  - 两侧 hash 都有且不同 ⇒ 差异视频 ⇒ 各自保留，续编新集号（`added`）；
+ *  - 标题 / 介绍 / 封面 / 年份取「有值侧」，空值不覆盖已有值；
+ *  - 只有「同一条目（item_id）已在目标同季」才进 `skipped`，且**必须**呈现给用户。
  */
 export async function mergeSeries(seriesId: number, sourceId: number): Promise<MergeResult> {
   return request(`/api/media/series/${seriesId}/merge`, {
@@ -766,11 +778,14 @@ export async function mergeSeries(seriesId: number, sourceId: number): Promise<M
 }
 
 /**
- * 合并**多个**剧集（BUG-186）：把 `sourceIds` 里每个源剧集的**全部分集**搬入 `targetId`
- * 末尾（各季续编集号）并**删除**这些源剧集。
+ * 合并**多个**剧集（BUG-186）：把 `sourceIds` 里每个源剧集的**全部分集**并入 `targetId`
+ * 并**删除**这些源剧集。
  *
  * 后端契约：`POST /api/media/series/:targetId/merge`，body `{ "sourceIds": [12, 13] }`。
  * 与单源的 `mergeSeries`（`{ sourceId }`）**并存**：后者仍被剧集内页对话框使用，不得破坏。
+ *
+ * 同集归并语义与单源版**逐字一致**（两版共用引擎的 `merge_one_source_in_tx`，
+ * 见 `mergeSeries` 的说明）。
  *
  * 多源在**同一事务**里全成或全滚 —— 所以前端必须**只发这一个请求**：
  * 在前端循环调单源端点会丢掉原子性（中途失败会留下「合了一半」的中间态）。

@@ -38,6 +38,7 @@ import type {
   MediaSeries,
   MediaSeriesDetail,
   MediaTag,
+  MergeResult,
 } from '../api/media'
 import { MediaCard } from './media/MediaCard'
 import { FileListView } from './media/FileListView'
@@ -108,6 +109,30 @@ const PAGE = 120
  *     ≈100px 不溢出；窗口高降到 ≈680 以下才出现唯一一条大滚动条（用户裁定允许）。
  */
 const RAIL_TAG_LIMIT = 8
+
+/**
+ * 合并结果的一句话摘要（BUG-407 / BUG-408）。
+ *
+ * 三个数都必须说出来，缺一个就会误导：
+ *  - `added`：真的占了**新集号**的集数；
+ *  - `mergedSameEpisode`：被判为**同一集**、降为该集备用源 / 挂图的条目数 ——
+ *    它们**没有**新增集号，所以不在 `added` 里；只说 `added` 会让用户以为「少搬了」；
+ *  - `skipped`：一条都没进目标的条目（同一条目已在目标同季）。
+ *
+ * 单源与多源两个对话框共用：两者的引擎语义逐字一致，文案也就不该各写一套。
+ */
+function mergeSummary(
+  res: MergeResult,
+  t: (key: string, vars?: Record<string, string | number>, fallback?: string) => string,
+  base: string,
+): string {
+  const merged = res.mergedSameEpisode ?? 0
+  const skipped = res.skippedCount ?? res.skipped?.length ?? 0
+  let out = base
+  if (merged > 0) out += t('media.seriesMergeMergedPart', { m: merged })
+  if (skipped > 0) out += t('media.seriesMergeSkippedPart', { k: skipped })
+  return out
+}
 
 /**
  * 单个内容条目 → 播放项。
@@ -2012,12 +2037,16 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
           onDone={async (res, sourceTitle) => {
             await refreshAll()
             if (activeSeriesId) await openSeries(activeSeriesId)
-            // 跳过明细必须说出来：合并里唯一「少搬了东西」的地方，
-            // 静默会让用户以为全搬完了（与「已导入 N 项」同一反馈位）。
+            // 同集归并 / 跳过都必须说出来：合并里最容易让用户以为「少搬了东西」的两处。
             setError(
-              res.skippedCount > 0
-                ? `已把${seriesLabel(sourceTitle)}的 ${res.added} 集并入，${res.skippedCount} 集因已在剧中而跳过`
-                : `已把${seriesLabel(sourceTitle)}的 ${res.added} 集并入`,
+              mergeSummary(
+                res,
+                t,
+                t('media.seriesMergeDoneBase', {
+                  source: seriesLabel(sourceTitle),
+                  n: res.added,
+                }),
+              ),
             )
           }}
           onError={(m) => setError(m)}
@@ -2034,13 +2063,14 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             clearSeriesSelection()
             await refreshAll()
             setError(
-              res.skippedCount > 0
-                ? t('media.seriesMergeMultiDoneSkip', {
-                    target: seriesLabel(targetTitle),
-                    n: res.added,
-                    m: res.skippedCount,
-                  })
-                : t('media.seriesMergeMultiDone', { target: seriesLabel(targetTitle), n: res.added }),
+              mergeSummary(
+                res,
+                t,
+                t('media.seriesMergeMultiDone', {
+                  target: seriesLabel(targetTitle),
+                  n: res.added,
+                }),
+              ),
             )
           }}
           onError={(m) => setError(m)}
