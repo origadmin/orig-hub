@@ -3,7 +3,7 @@ import type { MediaItem } from '../../api/media'
 import { kindLabelKey } from '../../api/media'
 import { useTranslation } from '../../i18n'
 import { resolveDisplayName } from '../../lib/displayName'
-import { isTauri } from '../../lib/env'
+import { revealItemPath } from '../../lib/reveal'
 import { cn } from '../../lib/utils'
 import { VirtualList } from '../ui/virtual-list'
 // 媒体库组件的格式化/来源工具一律从 mediaSources 取（该文件是唯一 import
@@ -23,6 +23,13 @@ import { fmtDate, fmtSize, hasMediaBytes, parseSourceRef, sourceLabelKey } from 
  *
  * 交互取 Explorer 常识而非本仓旧例：**单击选中、双击打开**；复选框常驻可见
  * （BUG-040：入口禁纯 hover 显形）。删除走父级确认路径（含字节联动）。
+ *
+ * ⚠ **2026-10-23 用户裁定推翻上一条的「单击选中、双击打开」（BUG-403）**：
+ * 「文件管理点击内容应显示详情与可操作功能，而非选中」。现行语义 =
+ * **单击打开「内容详情」**（`ItemDetailDialog`：信息 + 播放/打开目录/在 TG 中查看/
+ * 编辑/删除），**选中只走复选框**（显式动作）；「双击打开」一并撤销 —— 单击已经
+ * 弹了覆盖层，再叠一次播放会同时出现两个东西，播放改为详情里的按钮。
+ * 别按上面那句旧例改回去。
  *
  * 非媒体成品（zip/exe/pdf）当前尚未进入数据源（BUG-299 M2-T00a/T01a 接入文件
  * 事实端点后本组件即承载它们）——本组件按「任意条目一视同仁」实现，不预设媒体。
@@ -63,7 +70,11 @@ export interface FileListViewProps {
   /** 选中集（item id）—— 与父面板批量工具栏同一个源。 */
   selected: Set<number>
   onSelectToggle: (id: number, shiftKey: boolean) => void
-  /** 双击行（或「打开」按钮）：媒体进全局播放器。 */
+  /**
+   * **单击行**（BUG-403）：打开内容详情。选中不再由行点击触发 —— 只有复选框能改选中。
+   */
+  onOpenDetail: (item: MediaItem) => void
+  /** 行内「打开」按钮：媒体进全局播放器（受管成品交系统默认程序）。 */
   onOpen: (item: MediaItem) => void
   /** 行内删除（父级弹确认，含字节联动）。 */
   onDelete: (item: MediaItem) => void
@@ -99,6 +110,7 @@ const FileRow = memo(function FileRow(props: {
   item: MediaItem
   selected: boolean
   onSelectToggle: (id: number, shiftKey: boolean) => void
+  onOpenDetail: (item: MediaItem) => void
   onOpen: (item: MediaItem) => void
   onDelete: (item: MediaItem) => void
   onReveal?: (item: MediaItem) => void
@@ -106,7 +118,7 @@ const FileRow = memo(function FileRow(props: {
   onViewInTg?: (coords: { chatId: number; messageId: number }) => void
 }) {
   const { t } = useTranslation()
-  const { item, selected, onSelectToggle, onOpen, onDelete, onReveal, selectionMode = false, onViewInTg } = props
+  const { item, selected, onSelectToggle, onOpenDetail, onOpen, onDelete, onReveal, selectionMode = false, onViewInTg } = props
   const name = resolveDisplayName({ item })
   const fullPath = item.absolutePath ?? item.filePath ?? ''
   const hasBytes = hasMediaBytes(item)
@@ -148,16 +160,11 @@ const FileRow = memo(function FileRow(props: {
       data-selected={selected ? 'true' : undefined}
       className={[
         FILE_ROW_GRID,
-        'border-b border-border-subtle/40 px-2 py-1.5 text-[12px] cursor-default select-none',
+        'border-b border-border-subtle/40 px-2 py-1.5 text-[12px] cursor-pointer select-none',
         selected ? 'bg-accent/10' : 'hover:bg-surface-2/60',
       ].join(' ')}
-      onClick={(e) => onSelectToggle(item.id, e.shiftKey)}
-      onDoubleClick={() => {
-        // 选择模式（任务 #9）：双击不进入播放/系统打开（覆盖层会冲掉隐形的
-        // 选择上下文），与 MediaCard 封面同一口径。
-        if (selectionMode) return
-        onOpen(item)
-      }}
+      // BUG-403：单击 = 看详情（不是选中）。选中只由复选框改；「双击打开」已撤销。
+      onClick={() => onOpenDetail(item)}
       title={fullPath || undefined}
     >
       {/* 复选框常驻可见（BUG-040：禁纯 hover 显形） */}
@@ -281,13 +288,24 @@ const SortHeader = memo(function SortHeader(props: {
 
 export function FileListView(props: FileListViewProps) {
   const { t } = useTranslation()
-  const { items, selected, onSelectToggle, onOpen, onDelete, onError, sort, onSortChange, selectionMode = false, onViewInTg } =
-    props
+  const {
+    items,
+    selected,
+    onSelectToggle,
+    onOpenDetail,
+    onOpen,
+    onDelete,
+    onError,
+    sort,
+    onSortChange,
+    selectionMode = false,
+    onViewInTg,
+  } = props
 
   /**
    * 「打开目录」（BUG-299 出口判据 7：文件域行内物理定位）。
-   * 与 `DownloadItem` 同一通道：Tauri 桌面壳内 `revealItemInDir`（打开所在文件夹
-   * 并选中文件）；网页调试模式无该通道，如实报错给父级 error（不静默失败）。
+   * 通道收口在 `lib/reveal`（网页调试模式无该通道，如实报错给父级 error，
+   * 不静默失败）。
    */
   const reveal = useCallback(
     (item: MediaItem) => {
@@ -296,18 +314,11 @@ export function FileListView(props: FileListViewProps) {
         onError?.(t('media.fileList.noPath'))
         return
       }
-      if (!isTauri()) {
-        onError?.(t('media.fileList.openDirWebUnsupported'))
-        return
-      }
-      void (async () => {
-        try {
-          const { revealItemInDir } = await import('@tauri-apps/plugin-opener')
-          await revealItemInDir(p)
-        } catch (e) {
-          onError?.(`${t('media.fileList.openDir')}${t('media.fileList.failed')}: ${e instanceof Error ? e.message : String(e)}`)
-        }
-      })()
+      void revealItemPath(p, {
+        onError: (msg) => onError?.(msg),
+        unsupported: t('media.fileList.openDirWebUnsupported'),
+        failed: `${t('media.fileList.openDir')}${t('media.fileList.failed')}`,
+      })
     },
     [onError, t],
   )
@@ -380,6 +391,7 @@ export function FileListView(props: FileListViewProps) {
             item={item}
             selected={selected.has(item.id)}
             onSelectToggle={onSelectToggle}
+            onOpenDetail={onOpenDetail}
             onOpen={onOpen}
             onDelete={onDelete}
             onReveal={reveal}

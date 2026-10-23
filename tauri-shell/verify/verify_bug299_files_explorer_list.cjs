@@ -12,7 +12,8 @@
  *      与 `catAllRows` 同口径）—— 双源实算，不是估值（牙：任一端点有数而 UI 少行 = FAIL）；
  *   ③ 列头含「名称/类型/大小/日期/来源」五列（文案从 locale 源码读，不从页面猜）；
  *   ④ 每行复选框常驻（BUG-040：禁纯 hover 显形）；
- *   ⑤ 单击行 = 选中（Explorer 语义，与网格的全选 toolbar 并行不互斥）。
+ *   ⑤ **单击行 = 打开内容详情，不是选中**（BUG-403，2026-10-23 用户裁定推翻
+ *      本脚本原先的「单击行 = 选中」判据 —— 见下方 ⑤ 段内注释）。
  *
  * 共通性（BUG-299 判据 7 的 UI 半，M2-T00a 读端点落地后新增）：
  *   ⑧ 「下载」成品行数 == `/api/files` 去重后期望数（`data-source` DOM 锚，不靠文案匹配），
@@ -205,15 +206,51 @@ async function main() {
     check('⑥ cat-all 下 media-grid 不存在（绝不视频海报墙）', all.grid === 0, `count=${all.grid}`)
     check('④ 每行复选框常驻可见（BUG-040）',
       all.rows > 0 && all.checks === all.rows, `checkbox=${all.checks} / rows=${all.rows}`)
+    /*
+     * ⑤ **判据已翻转**（BUG-403，2026-10-23 用户裁定）：
+     * 「文件管理点击内容应显示详情与可操作功能，而非选中」。
+     *
+     * 旧判据「单击行 = 选中（Explorer 语义）」与现诉求方向**相反** —— 留着它
+     * 就等于要求实现做用户明确否掉的事（BUG-320 同型：判据与诉求相反＝白改）。
+     * 现行判据：单击 ⇒ 详情对话框出现 + 选中数**仍为 0**；选中只由复选框触发。
+     */
     const clicked = await page.evaluate(() => window.__b299.clickFirstRow())
-    const sel = await page.evaluate(() => {
+    const afterClick = await page.evaluate(() => {
       const s = window.__b299.sel
       return {
+        dialog: window.__b299.present('[data-testid="item-detail-dialog"]'),
         sel: document.querySelectorAll(`[data-testid="${s.row}"][data-selected="true"]`).length,
+        name: (document.querySelector('[data-testid="item-detail-name"]') || {}).textContent || '',
+        actions: document.querySelectorAll('[data-testid^="item-detail-"]').length,
       }
     })
-    check('⑤ 单击行 = 选中（Explorer 语义）',
-      clicked === true && sel.sel === 1, `clicked=${clicked} selected=${sel.sel}`)
+    check('⑤ 单击行 = 打开内容详情（BUG-403）',
+      clicked === true && afterClick.dialog === 1, `clicked=${clicked} dialog=${afterClick.dialog}`)
+    check('⑤ 单击行**不**改选中（选中只走复选框）', afterClick.sel === 0, `selected=${afterClick.sel}`)
+    check('⑤ 详情给出名称与可操作入口', afterClick.name.trim().length > 0 && afterClick.actions >= 2,
+      `name=${afterClick.name} actions=${afterClick.actions}`)
+
+    await page.evaluate(() => document.querySelector('[data-testid="item-detail-close"]')?.click())
+    const afterCheck = await page.evaluate(async () => {
+      const s = window.__b299.sel
+      const cb = document.querySelector(`[data-testid="${s.row}"] input[type="checkbox"]`)
+      if (!cb) return { sel: -1, dialog: -1 }
+      cb.click()
+      await new Promise((r) => setTimeout(r, 300))
+      return {
+        sel: document.querySelectorAll(`[data-testid="${s.row}"][data-selected="true"]`).length,
+        dialog: window.__b299.present('[data-testid="item-detail-dialog"]'),
+      }
+    })
+    check('⑤ 复选框 = 选中（显式动作，且不弹详情）',
+      afterCheck.sel === 1 && afterCheck.dialog === 0,
+      `selected=${afterCheck.sel} dialog=${afterCheck.dialog}`)
+    // 复位选中：后续断言（尤其「选择模式下打开按钮禁用」）不该受这里影响。
+    await page.evaluate(async () => {
+      const s = window.__b299.sel
+      document.querySelector(`[data-testid="${s.row}"] input[type="checkbox"]`)?.click()
+      await new Promise((r) => setTimeout(r, 250))
+    })
 
     /* ── ② 行数 vs 双源列表端点（牙：API 有数而 UI 空 = FAIL） ──
      * cat-all 行集 = 媒体页（PAGE 上限）∪ 受管下载成品（`/api/files`，按绝对路径去重，

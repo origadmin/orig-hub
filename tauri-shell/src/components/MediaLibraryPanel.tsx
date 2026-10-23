@@ -30,6 +30,7 @@ import { subscribeEvents } from '../api/daemon'
 import { loadSeriesDetail, isSeriesNotFound } from '../hooks/useSeriesDetail'
 import { cacheKey, cached, invalidateCache } from '../lib/fetchCache'
 import { seriesLabel } from '../lib/displayTitle'
+import { revealItemPath } from '../lib/reveal'
 import type {
   LibraryStats,
   MediaItem,
@@ -50,6 +51,7 @@ import { AddToSeriesDialog, CreateSeriesDialog, MergeSeriesDialog, MergeSeriesMu
 import { ExportPreviewDialog } from './media/ExportPreviewDialog'
 import { OrganizeWizard } from './media/OrganizeWizard'
 import { ItemEditDialog } from './media/ItemEditDialog'
+import { ItemDetailDialog } from './media/ItemDetailDialog'
 import {
   isRawFileName,
   canRecacheFromSource,
@@ -451,6 +453,15 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   const [mergeMultiOpen, setMergeMultiOpen] = useState(false)
   const [editing, setEditing] = useState<MediaItem | null>(null)
   /**
+   * **内容详情**（BUG-403）：文件管理里单击一行打开的覆盖层。
+   *
+   * 2026-10-23 用户裁定「文件管理点击内容应显示详情与可操作功能，而非选中」——
+   * 于是行点击不再改选中集，而是把该行（可能是媒体条目，也可能是带 `fileFact`
+   * 的受管成品合成行）送进这里。`catAllRows` 的元素类型比 `MediaItem` 宽一格
+   * （多一个可选 `fileFact`），详情必须拿得到它，否则受管成品会显示成「无字节」。
+   */
+  const [detailItem, setDetailItem] = useState<(MediaItem & { fileFact?: FileFact }) | null>(null)
+  /**
    * 删除确认（唯一状态机，单条与批量共用）。
    *
    * `ids` 是**显式目标集**：卡片上的逐条删除与工具栏的批量删除走同一条确认路径，
@@ -789,6 +800,25 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
       onOpenTg?.()
     },
     [setPendingTgFocus, onOpenTg],
+  )
+  /**
+   * 详情/行内的「打开目录」（BUG-403）—— 与 `FileListView` 行内同一个通道
+   * （`lib/reveal`），受管成品取 `fileFact.path`，媒体条目取 `absolutePath`。
+   */
+  const revealItem = useCallback(
+    (item: MediaItem & { fileFact?: FileFact }) => {
+      const p = item.fileFact?.path ?? item.absolutePath ?? item.filePath
+      if (!p) {
+        setError(t('media.fileList.noPath'))
+        return
+      }
+      void revealItemPath(p, {
+        onError: setError,
+        unsupported: t('media.fileList.openDirWebUnsupported'),
+        failed: `${t('media.fileList.openDir')}${t('media.fileList.failed')}`,
+      })
+    },
+    [setError, t],
   )
   /** 逐条删除入口（稳定引用，同上）。 */
   const deleteItem = useCallback((item: MediaItem) => {
@@ -1678,7 +1708,12 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
            *
            * 2026-10-15 用户裁定：「文件管理是列表，是 Explorer 显示，但绝对不可
            * 能是视频」。据此，文件域的默认呈现从「媒体海报墙」改为「行列表」：
-           * 名称/类型/大小/日期/来源 + 行内动作，单击选中、双击打开。
+           * 名称/类型/大小/日期/来源 + 行内动作。
+           *
+           * ⚠ 2026-10-23 用户裁定推翻旧例的「单击选中、双击打开」（BUG-403）：
+           * 「文件管理点击内容应显示详情与可操作功能，而非选中」—— 单击行现在
+           * 打开 `ItemDetailDialog`（信息 + 播放/打开目录/在 TG 中查看/编辑/删除），
+           * 选中只走复选框，双击打开撤销。别按上面「Explorer 常识」改回去。
            *
            * 判据取 `tab === 'all'` 而不是 `view === 'items'`：分类子行（视频/图片/
            * 音频）仍是各自类型的浏览墙（MediaCard），只有「全部」这个**域级**父行
@@ -1691,6 +1726,8 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             items={catAllRows}
             selected={selected}
             onSelectToggle={toggleSelect}
+            // BUG-403：单击行 = 打开内容详情（不是选中）。选中只由复选框改。
+            onOpenDetail={setDetailItem}
             onOpen={openItem}
             onDelete={deleteItem}
             onError={setError}
@@ -2074,6 +2111,36 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             )
           }}
           onError={(m) => setError(m)}
+        />
+      ) : null}
+
+      {/*
+        内容详情（BUG-403）—— 文件管理单击行的落地覆盖层。
+        每个动作都**先关详情再执行**：播放器 / 编辑框 / 删除确认 / TG 域都是
+        覆盖层或整域切换，叠在详情上会出现两层遮罩，用户只能先点掉一层才知道
+        自己在哪（BUG-320 同族的信息层级问题）。
+      */}
+      {detailItem ? (
+        <ItemDetailDialog
+          item={detailItem}
+          onClose={() => setDetailItem(null)}
+          onOpen={(it) => {
+            setDetailItem(null)
+            openItem(it)
+          }}
+          onReveal={revealItem}
+          onDelete={(it) => {
+            setDetailItem(null)
+            deleteItem(it)
+          }}
+          onEdit={(it) => {
+            setDetailItem(null)
+            setEditing(it)
+          }}
+          onViewInTg={(coords) => {
+            setDetailItem(null)
+            viewInTg(coords)
+          }}
         />
       ) : null}
 
