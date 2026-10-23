@@ -266,8 +266,15 @@ async function main() {
       check('⑥ 成品行存在（`/api/files` 有成品才有这一行可验）', false, 'no fact row in cat-all')
     }
 
-    const errs = [...page.consoleErrors(), ...page.pageErrors()]
-    check('无未捕获页面错误', errs.length === 0, errs.slice(0, 2).join(' | '))
+    /*
+     * 排除 `favicon.ico` 的 404：浏览器对每个页面隐式探测该文件，与产品行为无关
+     * （仓库既有约定，见 verify_album_cover / verify_bug101 等同一句过滤）。
+     * 其余任何 console.error / pageerror 都算失败 —— 不因为「这次是小事」放宽。
+     */
+    const errs = [...page.consoleErrors(), ...page.pageErrors()].filter(
+      (e) => !/favicon\.ico/.test(String(e)),
+    )
+    check('无未捕获页面错误（favicon 除外）', errs.length === 0, errs.slice(0, 2).join(' | '))
   } finally {
     await browser.close()
   }
