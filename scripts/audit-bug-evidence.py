@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import argparse
+import posixpath
 import re
 import subprocess
 import sys
@@ -165,6 +166,26 @@ def resolve(token: str) -> list[str]:
     return []
 
 
+def untracked_refs(parsed: dict) -> list[str]:
+    """证据段里「磁盘上存在、但 git 没收录」的引用。
+
+    这是「BUG 丢失」的第二种形态：缺陷档已入库、证据文件却只在某一台机器上
+    （BUG-395/401/407/408 的验收脚本就是这样躺了一整天）。门禁只查 `exists`，
+    查不出这件事 —— 换台机器 clone 下来，证据立刻不存在。
+    """
+    body = parsed["sections"].get("验收证据") or ""
+    out = []
+    for token in RE_EXT.findall(body):
+        # 先规范化：`tauri-shell/../verify_shots/x.json` 也是本地证据，
+        # 只按前缀跳过会把它当成「未入库的源码证据」误报。
+        token = posixpath.normpath(token.replace("\\", "/").lstrip("./"))
+        if token.startswith(("verify_shots/", "docs/preview/", "../")):
+            continue
+        if (ROOT / token).exists() and token not in FILES:
+            out.append(token)
+    return out
+
+
 def candidates(parsed: dict) -> list[str]:
     """修复/验收段优先；两段都没有可用路径时退回全文（老条目常把落点写在「根因/现象」）。"""
     bodies = [
@@ -246,8 +267,22 @@ def main() -> int:
             changed += 1
         print(f"\n已补写 {changed} 个文件（`## 验收证据`）")
 
-    if args.check and unresolved:
-        print(f"\nFAIL — {len(unresolved)} 条终态缺陷仍无任何可核验证据")
+    # 证据文件未入库：另一类「丢失」，与「没有证据」分开报
+    ghosts: list[tuple[str, list[str]]] = []
+    for doc in sorted(BUGS.glob("BUG-*.md")):
+        parsed = parse_doc(doc)
+        if parsed["status"] not in DONE:
+            continue
+        refs = untracked_refs(parsed)
+        if refs:
+            ghosts.append((doc.name, refs))
+    print(f"\n证据引用了未入库文件：{len(ghosts)}")
+    for name, refs in ghosts:
+        print(f"    {name} → {', '.join(refs)}")
+
+    if args.check and (unresolved or ghosts):
+        print(f"\nFAIL — {len(unresolved)} 条终态缺陷无可核验证据，"
+              f"{len(ghosts)} 条证据引用了未入库文件")
         return 1
     return 0
 
