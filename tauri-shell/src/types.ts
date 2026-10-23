@@ -316,6 +316,12 @@ export interface TgMonitoredChannel {
   backfillBeforeId?: number
   /** 增量同步游标（最新已同步消息号）——「最新」边界（BUG-382）。 */
   lastMessageId?: number
+  /**
+   * 库内最老已入库消息日期（unix 秒；0/缺省 = 该频道还没有入库数据）。
+   * BUG-394：回溯表单默认日期的真源 —— 展开表单时用它预填（UTC 口径），
+   * 用户不再凭记忆猜「回溯到几号」。
+   */
+  oldestMessageDate?: number
 }
 
 /** 文字筛选规则（GET/POST /api/tg/monitor/filters）。

@@ -167,6 +167,11 @@ interface MiddleChannel {
   backfillBeforeId?: number
   /** 仅监控行有值：增量同步游标（最新已同步消息号）——「最新」边界（BUG-382）。 */
   lastMessageId?: number
+  /**
+   * 仅监控行有值：库内最老已入库消息日期（unix 秒；0/缺省 = 还没有入库数据）。
+   * BUG-394：回溯表单默认日期的真源 —— 展开表单时用它预填，用户不再凭记忆猜。
+   */
+  oldestMessageDate?: number
 }
 
 /**
@@ -778,6 +783,7 @@ export function TgPanel(
         backfillUntil: m.backfillUntil,
         backfillBeforeId: m.backfillBeforeId,
         lastMessageId: m.lastMessageId,
+        oldestMessageDate: m.oldestMessageDate,
       })),
     [monitoredList],
   )
@@ -2342,7 +2348,13 @@ export function TgPanel(
                           disabled={backfillBusy}
                           onClick={() => {
                             setBackfillFor(backfillOpen ? null : ch.id)
-                            setBackfillDate('')
+                            // BUG-394：默认 = 库内最老已入库消息日期（UTC 口径，
+                            // 与服务端 parse_date_utc 同一把尺，避免差一天）。
+                            // 用户在此基础上往更早调，而不是从空白猜起；
+                            // 频道还没有数据（=0）时才保持空白。
+                            setBackfillDate(
+                              ch.oldestMessageDate ? fmtDateOnly(ch.oldestMessageDate) : '',
+                            )
                           }}
                           className="h-9 shrink-0 px-2 text-[12px]"
                         >

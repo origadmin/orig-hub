@@ -1,0 +1,21 @@
+{
+  "date": "2026-10-23T08:32:52.432Z",
+  "results": [
+    {
+      "name": "B1-i monitor/channels 带 oldestMessageDate 数值字段（旧引擎无此字段 ⇒ 必败）",
+      "ok": true
+    },
+    {
+      "name": "B1-ii 真源存在非零最老数据日期（无入库样本则 Loud FAIL）",
+      "ok": true
+    },
+    {
+      "name": "B2-i TG 面板监控列表渲染且回溯表单可展开",
+      "ok": true
+    },
+    {
+      "name": "B2-ii 回溯日期默认 = API oldestMessageDate 的 UTC 日期（非空白/非占位符）",
+      "ok": true
+    }
+  ]
+}

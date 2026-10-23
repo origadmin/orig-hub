@@ -100,6 +100,15 @@ pub struct MonitoredChannel {
     /// 「最新到哪、历史到哪」。
     #[serde(rename = "lastMessageId", default)]
     pub last_message_id: i64,
+    /// 库内**最老**已入库消息的日期（unix 秒；0 = 该频道还没有入库数据）。
+    ///
+    /// BUG-394：回溯表单的默认日期必须有真源 —— 没有它，展开表单只能给空白
+    /// 输入框，用户凭记忆猜「回溯到几号」。取 `MIN(COALESCE(msg_date, created_at))`：
+    /// `msg_date` 是消息真实日期、可能为 NULL（旧数据迁移前只有 created_at），
+    /// 两者取其一即为该条消息的日期口径。空集落 0（BUG-388 同型坑：标量子查询
+    /// 空集返 NULL，内层 COALESCE 包不住「没有行」）。
+    #[serde(rename = "oldestMessageDate", default)]
+    pub oldest_message_date: i64,
 }
 
 /// 文字筛选规则（`monitor_filter` 行）。
@@ -1026,7 +1035,11 @@ impl Store {
                         COALESCE((SELECT sc.backfill_before_id FROM sync_cursor sc
                           WHERE sc.channel_id = c.channel_id), 0),
                         COALESCE((SELECT sc.last_message_id FROM sync_cursor sc
-                          WHERE sc.channel_id = c.channel_id), 0)
+                          WHERE sc.channel_id = c.channel_id), 0),
+                        /* BUG-394: 库内最老已入库消息日期（回溯表单默认值真源）。
+                           COALESCE 包住整个标量子查询（空集返 NULL，BUG-388 同型）。 */
+                        COALESCE((SELECT MIN(COALESCE(m.msg_date, m.created_at)) FROM media_message m
+                          WHERE m.channel_id = c.channel_id), 0)
                  FROM monitored_channel c ORDER BY c.added_at",
             )
             .await?;
@@ -1042,6 +1055,7 @@ impl Store {
                 backfill_until: r.get(5)?,
                 backfill_before_id: r.get(6)?,
                 last_message_id: r.get(7)?,
+                oldest_message_date: r.get(8)?,
             });
         }
         Ok(out)
@@ -1063,7 +1077,10 @@ impl Store {
                         COALESCE((SELECT sc.backfill_before_id FROM sync_cursor sc
                           WHERE sc.channel_id = c.channel_id), 0),
                         COALESCE((SELECT sc.last_message_id FROM sync_cursor sc
-                          WHERE sc.channel_id = c.channel_id), 0)
+                          WHERE sc.channel_id = c.channel_id), 0),
+                        /* BUG-394: 同 list_channels。 */
+                        COALESCE((SELECT MIN(COALESCE(m.msg_date, m.created_at)) FROM media_message m
+                          WHERE m.channel_id = c.channel_id), 0)
                  FROM monitored_channel c WHERE c.channel_id = ?1",
                 params![channel_id],
             )
@@ -1078,6 +1095,7 @@ impl Store {
                 backfill_until: r.get(5)?,
                 backfill_before_id: r.get(6)?,
                 last_message_id: r.get(7)?,
+                oldest_message_date: r.get(8)?,
             })),
             None => Ok(None),
         }
