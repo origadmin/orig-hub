@@ -84,6 +84,7 @@
   "download.done": "Completed",
   "download.paused": "Paused",
   "download.running": "Downloading",
+  "download.selectedCount": "{n} selected",
   "download.toggleBuckets": "Expand/collapse download buckets",
   "downloads.addCat": "Add category",
   "downloads.addCatHint": "Separate multiple extensions with comma/semicolon/space, e.g. mp4, mkv; avi; rmvb. When one extension belongs to multiple categories, the last saved wins.",

@@ -1799,6 +1799,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
         {view === 'series' && seriesBulkReady ? (
           <SelectionBar
             count={selectedSeriesList.length}
+            countLabel={t('media.seriesSelectionCount', { n: selectedSeriesList.length })}
             testId="series-selection-bar"
             countTestId="series-selection-count"
           >
@@ -1887,6 +1888,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
           /* BUG-393：容器与计数改用**全仓标准** `SelectionBar`（样式标准唯一真源）。 */
           <SelectionBar
             count={selected.size}
+            countLabel={t('media.selected', { n: selected.size })}
             testId="items-selection-bar"
             countTestId="items-selection-count"
           >

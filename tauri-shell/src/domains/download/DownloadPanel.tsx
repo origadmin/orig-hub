@@ -12,6 +12,7 @@ import { enqueueCacheTask } from '../../api/tg'
 import { VirtualList } from '../../components/ui/virtual-list'
 import { Button } from '../../components/ui/button'
 import { SelectAllButtons, SelectionBar } from '../../components/ui/selection-bar'
+import { useTranslation } from '../../i18n'
 import type { IngestGroup } from './ingestGroups'
 
 /**
@@ -80,6 +81,9 @@ type DLRow =
   | { kind: 'ingest'; group: IngestGroup }
 
 export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
+  /* 计数文案走 i18n（BUG-406）：裸数字「2」没有上下文，用户不知道它数的是什么。
+     本文件其余按钮文案仍是历史硬编码中文（不在本条范围），新文案不再添一份。 */
+  const { t } = useTranslation()
   const { setError, cancel } = useStore()
   const { groups, loading, error, unavailable, downloadUnavailable, refresh, run, remove } = ingest
   /**
@@ -323,6 +327,7 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
        */}
       <SelectionBar
         count={selected.size}
+        countLabel={t('download.selectedCount', { n: selected.size })}
         testId="dl-batch-bar"
         countTestId="dl-batch-count"
       >

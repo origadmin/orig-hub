@@ -11,8 +11,13 @@
  * 标准形态（与剧集墙逐项对齐，见 `docs/standards/style.md` §选择条）：
  *   - 位置：可视区**底部居中**浮层（`absolute bottom-4 left-1/2 -translate-x-1/2`）；
  *   - 容器：`rounded-full border border-accent/40 bg-surface/95 shadow-lg backdrop-blur-md`；
- *   - 计数：`text-[11px] font-medium text-fg-strong`；
+ *   - 计数：`countLabel` 语义文案（`text-[11px] font-medium text-fg-strong`）；
  *   - 按钮：`size="sm"`，`h-7 px-2 text-[11px]`（次要动作 `variant="ghost"`）。
+ *
+ * 计数**必须带语义文案**（BUG-406）：BUG-393 统一形态时把它渲染成裸数字「2」，
+ * 用户看不懂这个孤立数字是什么（剧集合并流程里尤其突兀）。文案由调用方经
+ * `countLabel` 传入 —— 各域量词不同（items「项」/ 剧集「条」/ 下载「项」），
+ * 组件不猜；prop 设为必填，漏传即 TS 报错，不会静默退回裸数字。
  *
  * 只做容器与计数，**批量动作由调用方以 children 传入**（各域动作不同，
  * 塞进组件里就会长出「一批用不上的按钮」）。
@@ -22,12 +27,18 @@ import { Button } from './button'
 
 export function SelectionBar({
   count,
+  countLabel,
   testId,
   countTestId,
   children,
 }: {
   /** 已选数量。0 时不渲染（「没选东西却挂着一条栏」= 噪音）。 */
   count: number
+  /**
+   * 计数节点的语义文案（如「已选 2 项」），由调用方用 i18n 生成。
+   * 必填：裸数字是 BUG-406 的缺陷形态，不给默认值就是为了让漏传在编译期红。
+   */
+  countLabel: string
   /** 容器 testid（各域沿用既有契约，避免打断验收脚本） */
   testId: string
   countTestId: string
@@ -43,7 +54,7 @@ export function SelectionBar({
       className="fixed bottom-4 left-1/2 z-40 flex -translate-x-1/2 flex-wrap items-center gap-2 rounded-full border border-accent/40 bg-surface/95 px-3 py-2 shadow-lg backdrop-blur-md"
     >
       <span data-testid={countTestId} className="text-[11px] font-medium text-fg-strong">
-        {count}
+        {countLabel}
       </span>
       {children}
     </div>

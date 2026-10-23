@@ -84,6 +84,7 @@
   "download.done": "已完成",
   "download.paused": "已暂停",
   "download.running": "下载中",
+  "download.selectedCount": "已选 {n} 项",
   "download.toggleBuckets": "展开/收起下载档位",
   "downloads.addCat": "添加分类",
   "downloads.addCatHint": "多个后缀用逗号/分号/顿号分隔，如：mp4, mkv；avi；rmvb。同一后缀属于多个分类时以最后保存的为准。",
