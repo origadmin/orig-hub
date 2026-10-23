@@ -1158,28 +1158,36 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   }
 
   /**
-   * cat-all 显示行 = 已登记媒体 ∪ 受管成品（M2-T00a/M2-T01a）。
+   * cat-all 显示行 = **受管下载根成品**（BUG-334，2026-10-24 修复）。
    *
-   * - **去重按绝对路径**（`absolutePath ?? filePath` 规范化后比较）：手动导入过
-   *   的下载成品同时在两边的，只认媒体条目那一份（它有更完整的元数据）；
-   * - 成品行带 `fileFact` 标记 —— 打开/删除据此分派（系统程序打开 / 删文件本体），
-   *   见 `openItem` / `deleteItem` / `doDeleteItems`；
-   * - `kindLabel` 直接给分类键（`category.Archives` 等），类型列不落到
-   *   「doc/archive/other 三落 file」的有损映射（BUG-299 违反标记的兑现）。
+   * 2026-10-20 用户原话：「文件管理管理内容混乱，内部库流出，非管理文件被显示。」
+   * 旧实现是「已登记媒体 ∪ 受管成品」并集（BUG-299 M2-T00a 的权宜），实测这份并集
+   * **一个真实文件都没多带进来**，只把三类不该出现的东西带进了文件管理：
+   *
+   * | 分类 | 条数 | 该不该在文件管理 |
+   * |---|---|---|
+   * | `media_item.file_path` 落在引擎自用子目录（`.orighub/library`、`.blobs`、`library`） | 119 | 否 —— 内部库，用户原话「内部库流出」 |
+   * | 路径在受管根**外**（如 `D:/test_videos/*`，本地导入） | 226 | 否 —— 非管理文件，用户原话「非管理文件被显示」 |
+   * | 受管根内的普通路径 | 37 | 其中 26 个**已被 daemon `/api/files` 枚举**，11 个磁盘上已不存在 |
+   *
+   * 也就是说：媒体那一半与受管成品取交集后**净增 0 行**（26/26 已覆盖），
+   * 剩下的全是噪声与幽灵行。文件管理因此只认 daemon 枚举的受管成品 ——
+   * 内部库内容回它该在的地方（媒体库 / 剧集），非受管文件不占文件管理。
+   *
+   * 成品行带 `fileFact` 标记：打开走系统默认程序、删除删文件本体，
+   * 见 `openItem` / `deleteItem` / `doDeleteItems`。
    */
   const catAllRows = useMemo<(MediaItem & { fileFact?: FileFact; kindLabel?: string })[]>(() => {
     if (tab !== 'all') return items
-    const norm = (p?: string | null) => (p ?? '').replace(/\\/g, '/').toLowerCase()
-    const taken = new Set(items.map((i) => norm(i.absolutePath ?? i.filePath)).filter(Boolean))
+    const needle = search.trim().toLowerCase()
     const facts = downloadFiles
-      .filter((f) => !taken.has(norm(f.path)))
+      .filter((f) => !needle || f.name.toLowerCase().includes(needle))
       .map((f): MediaItem & { fileFact: FileFact; kindLabel: string } => ({
         id: factId(f.path),
         source: 'download',
         ref: '',
         title: f.name,
-        kind:
-          f.kind === 'video' || f.kind === 'photo' || f.kind === 'audio' ? f.kind : 'file',
+        kind: f.kind === 'video' || f.kind === 'photo' || f.kind === 'audio' ? f.kind : 'file',
         filePath: f.path,
         absolutePath: f.path,
         // 0 字节也是事实：照常列出并带「缺字节」标记（BUG-132 同款诚实口径）。
@@ -1190,30 +1198,26 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
         kindLabel: `category.${f.category}`,
         fileFact: f,
       }))
-    if (facts.length === 0) return items
-    // 「最近添加」是默认排序：两源按日期真合并（下载成品 mtime vs 媒体 addedAt）；
-    // 其余排序媒体侧走服务端，成品行附后（M2-T02 六分类归一后再统一）。
-    if (sort === 'recent') {
-      return [...items, ...facts].sort((a, b) => (b.addedAt ?? 0) - (a.addedAt ?? 0))
-    }
-    if (sort === 'oldest') {
-      return [...items, ...facts].sort((a, b) => (a.addedAt ?? 0) - (b.addedAt ?? 0))
-    }
-    return [...items, ...facts]
-  }, [tab, items, downloadFiles, sort])
+    // 排序只动成品行（daemon 枚举本来就带 mtime）；媒体侧排序在别的 tab 上。
+    if (sort === 'recent') return facts.sort((a, b) => (b.addedAt ?? 0) - (a.addedAt ?? 0))
+    if (sort === 'oldest') return facts.sort((a, b) => (a.addedAt ?? 0) - (b.addedAt ?? 0))
+    return facts
+  }, [tab, items, downloadFiles, search, sort])
 
   /**
-   * 页面提示串（「单击选中，双击打开」+ 分页事实「显示 n/total」，BUG-400 收拢到
-   * 全局底栏）。切视图即重写，面板卸载清空 —— 不跨视图遗留。
-   * 声明必须在 `catAllRows` 之后（TDZ）。
+   * 页面提示串（BUG-403：单击看详情、勾选框选中 + 文件域范围说明）。
+   * cat-all 的行数就是受管成品数 —— 不再拿服务端 `total`（媒体条目）冒充，
+   * 那个数对「文件管理里有多少文件」这句话是**假的**（BUG-299 §F4 同源）。
    */
   useEffect(() => {
     const parts: string[] = []
-    if (view === 'items' && tab === 'all' && catAllRows.length > 0) parts.push(t('media.fileList.dblHint'))
-    if (view === 'items') {
-      const shown = tab === 'all' ? Math.max(items.length, catAllRows.length) : items.length
-      const totalAll = tab === 'all' ? total + Math.max(0, catAllRows.length - items.length) : total
-      if (shown > 0 && totalAll > shown) parts.push(t('media.showing', { n: shown, total: totalAll }))
+    if (view === 'items' && tab === 'all' && catAllRows.length > 0) {
+      parts.push(t('media.fileList.dblHint'))
+      parts.push(t('media.fileList.managedScope', { n: catAllRows.length }))
+    }
+    if (view === 'items' && tab !== 'all') {
+      const shown = items.length
+      if (shown > 0 && total > shown) parts.push(t('media.showing', { n: shown, total }))
     }
     useLibraryReadout.getState().setNote(parts.length > 0 ? parts.join(' · ') : null)
   }, [view, tab, items, total, catAllRows, t])

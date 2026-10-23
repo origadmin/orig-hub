@@ -283,6 +283,7 @@
   "media.fileList.failed": "失败",
   "media.fileList.kind": "类型",
   "media.fileList.missing": "缺字节",
+  "media.fileList.managedScope": "受管成品 {n} 个 · 不含内部库与受管根外的文件",
   "media.fileList.name": "名称",
   "media.fileList.noPath": "这条内容暂无本地路径，无法打开目录",
   "media.fileList.open": "打开",

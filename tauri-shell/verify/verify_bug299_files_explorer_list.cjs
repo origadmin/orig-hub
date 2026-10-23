@@ -118,9 +118,22 @@ async function main() {
         if (!r.ok) throw new Error(p + ' -> HTTP ' + r.status)
         return r.json()
       },
+      /**
+       * 等「列表真的出现」再往下走，不拿固定 sleep 当「等它发生」：
+       * vite 首次编译慢 / HMR  reload 时，1500ms 可能一行都没渲染，
+       * 后续所有断言就集体红成「功能坏了」，而其实是脚本自己没等（实测踩过）。
+       */
+      async waitRows(timeout = 20000) {
+        const t0 = Date.now()
+        while (Date.now() - t0 < timeout) {
+          if (document.querySelectorAll('[data-testid="file-list-row"]').length > 0) return true
+          await new Promise((r) => setTimeout(r, 120))
+        }
+        return false
+      },
       async enterCatAll() {
         document.querySelector('[data-testid="nav-files"]')?.click()
-        await new Promise((r) => setTimeout(r, 1500))
+        await this.waitRows()
       },
       async enterCatVideo() {
         // 分类子行只在 filesOpen 时渲染；未展开先点 chevron。
@@ -129,7 +142,12 @@ async function main() {
           await new Promise((r) => setTimeout(r, 400))
         }
         document.querySelector('[data-testid="nav-child-cat-video"]')?.click()
-        await new Promise((r) => setTimeout(r, 1500))
+        // 视频分类是网格（media-grid），等卡片而不是等列表行。
+        const t0 = Date.now()
+        while (Date.now() - t0 < 20000) {
+          if (document.querySelectorAll('[data-testid="media-card"]').length > 0) return
+          await new Promise((r) => setTimeout(r, 120))
+        }
       },
       async clickFirstRow() {
         const row = document.querySelector('[data-testid="' + this.sel.row + '"]')
@@ -252,33 +270,29 @@ async function main() {
       await new Promise((r) => setTimeout(r, 250))
     })
 
-    /* ── ② 行数 vs 双源列表端点（牙：API 有数而 UI 空 = FAIL） ──
-     * cat-all 行集 = 媒体页（PAGE 上限）∪ 受管下载成品（`/api/files`，按绝对路径去重，
-     * 与 `catAllRows` 同一口径）。期望值在 Node 侧用两个端点实算 —— 不是估值。
+    /* ── ② 行数 vs 受管成品端点（判据已翻转：BUG-334，2026-10-24） ──
+     * **旧判据**：data-total == 媒体页 + 受管成品（双源同口径，按路径去重）。
+     * 用户 2026-10-20 原话「文件管理管理内容混乱，内部库流出，非管理文件被显示」
+     * ⇒ 文件管理只列受管根成品。旧判据方向与诉求**相反**（BUG-320 同型：
+     * 判据与诉求相反＝白改），故翻转为「data-total == `/api/files` 实算数」。
+     * 并集那半边的实测依据见 `docs/bugs/BUG-334.md`：媒体条目里 119 条住引擎
+     * 自用子目录、226 条在受管根外，受管根内 37 条中 26 条已被 facts 覆盖 ——
+     * 净增 0 行，只带噪声。
      *
      * BUG-316 段②窗口化适配：DOM 里只渲染窗口行（全列断言必须滚动累积）。
      * 判据两道：① 容器 data-total（契约）== API 期望；② 滚到底累积数 == data-total
      * （窗口化既不丢行也不多渲染）。 */
     const norm = (p) => (p ?? '').replace(/\\/g, '/').toLowerCase()
-    const mediaPage = await page.evaluate(async () => {
-      const r = await window.__b299.api(
-        '/api/media/items?hasBytes=true&sort=recent&limit=' + window.__b299.page + '&offset=0',
-      )
-      return r
-    })
     const facts = await page.evaluate(async () => {
       const r = await window.__b299.apiDaemon('/api/files')
       return r.files || []
     })
-    const taken = new Set(
-      (mediaPage.items || []).map((i) => norm(i.absolutePath ?? i.filePath)).filter(Boolean),
-    )
-    const expectFacts = facts.filter((f) => !taken.has(norm(f.path)))
-    const expectRows = (mediaPage.items || []).length + expectFacts.length
+    const expectFacts = facts
+    const expectRows = expectFacts.length
     const collected = await page.evaluate(() => window.__b299.collectAll())
-    check('② 容器 data-total == 媒体页 + 受管成品（双源同口径，含路径去重）',
+    check('② 容器 data-total == 受管成品数（单源同口径：文件管理只列受管根成品）',
       collected.ok && collected.total === expectRows,
-      `ui=${collected.total} media=${(mediaPage.items || []).length} facts=${expectFacts.length}`)
+      `ui=${collected.total} facts=${expectFacts.length}`)
     check('② 滚到底累积行数 == data-total（窗口化不丢行、不多渲染）',
       collected.ok && collected.count === collected.total,
       `collected=${collected.count} total=${collected.total}`)

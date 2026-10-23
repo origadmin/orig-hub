@@ -283,6 +283,7 @@
   "media.fileList.failed": "failed",
   "media.fileList.kind": "Type",
   "media.fileList.missing": "Missing bytes",
+  "media.fileList.managedScope": "{n} managed files · excludes the internal library and files outside the managed root",
   "media.fileList.name": "Name",
   "media.fileList.noPath": "No local path for this item — cannot open its folder",
   "media.fileList.open": "Open",
