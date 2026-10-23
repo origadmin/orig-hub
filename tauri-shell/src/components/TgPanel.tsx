@@ -2446,7 +2446,23 @@ export function TgPanel(
                               className="h-9 min-w-0 flex-1 rounded-md border border-border-subtle bg-surface px-2 text-[13px] text-fg-strong"
                             />
                           </div>
-                          <div className="mt-2 flex justify-end">
+                          <div className="mt-2 flex items-center justify-between">
+                            {/* BUG-398：表单之前只有「开始回溯」一个出口 —— 不想起回溯时
+                                用户被卡在表单里、只能点开始。补显式「关闭」入口
+                                （toggle 仍可关，但必须有一个看得见的关闭钮）。 */}
+                            <Button
+                              variant="ghost"
+                              size="xs"
+                              data-testid="tg-monitor-backfill-close"
+                              disabled={backfillBusy}
+                              onClick={() => {
+                                setBackfillFor(null)
+                                setBackfillDate('')
+                              }}
+                              className="h-9 px-3 text-[12px]"
+                            >
+                              {t('tg.backfillClose')}
+                            </Button>
                             <Button
                               variant="secondary"
                               size="xs"
@@ -3358,7 +3374,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
                     src={tgThumbUrl(cover.chatId, cover.messageId)}
                     alt={cover.caption || ''}
                     loading="lazy"
-                    className="h-auto max-h-72 w-full object-cover"
+                    className="h-auto max-h-72 w-full object-contain"
                   />
                 ) : (
                   <span className="flex h-full w-full items-center justify-center text-2xl">
@@ -3394,7 +3410,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
                     src={tgThumbUrl(cover.chatId, cover.messageId)}
                     alt={cover.caption || ''}
                     loading="lazy"
-                    className="h-auto max-h-72 w-full object-cover"
+                    className="h-auto max-h-72 w-full object-contain"
                   />
                 ) : (
                   <span className="flex h-full w-full items-center justify-center text-2xl">
@@ -3454,7 +3470,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
                       src={tgThumbUrl(it.chatId, it.messageId)}
                       alt={it.caption || ''}
                       loading="lazy"
-                      className="h-full w-full object-cover"
+                      className="h-full w-full object-contain"
                     />
                   ) : (
                     <span className="flex h-full w-full items-center justify-center text-lg">
@@ -3633,7 +3649,7 @@ function PhotoBlock(props: {
           loading="lazy"
           onError={() => setErr(true)}
           className={cn(
-            compact ? 'h-full w-full object-cover' : 'mx-auto h-auto max-h-[60vh] w-auto max-w-full object-contain',
+            compact ? 'h-full w-full object-contain' : 'mx-auto h-auto max-h-[60vh] w-auto max-w-full object-contain',
           )}
         />
       </button>
@@ -3746,7 +3762,7 @@ function VideoBlock(props: {
           onError={() => setPosterErr(true)}
           className={cn(
             compact
-              ? 'absolute inset-0 h-full w-full object-cover'
+              ? 'absolute inset-0 h-full w-full object-contain'
               : 'mx-auto h-auto max-h-[50vh] w-auto object-contain',
           )}
         />

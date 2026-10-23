@@ -1290,15 +1290,17 @@ pub(crate) fn priority_target(req: &SetPriorityReq) -> Result<PriorityTarget, Ap
 
 /// 「置顶」对谁有意义：**排队中的任务**。
 ///
-/// 已置顶的任务（priority > 0）即使不再排队也**必须**允许取消置顶 ——
-/// 否则用户点了置顶之后就再也撤销不掉（任务终态后按钮还在、点了却 422，
-/// 那是界面与端点判据分裂，BUG-249 已吃过一次）。
-/// 其余情形（终态且未置顶）置顶没有任何可观察效果，给 422 而不是假装成功。
+/// 终态（done/cancelled/failed/interrupted）任务**不再携带任何优先状态** ——
+/// `finish_cache_task` / `cancel_cache_task` 在任务离队时已将 `priority` 归零
+/// （BUG-396：用户裁定「完成后就没有优先这个状态了」），所以正常数据流下
+/// 终态任务的 `priority` 必为 0，这里不会让它们「可取消置顶」。
+/// 仅当 `priority > 0` 且仍非终态（运行中/排队中被置顶）才允许取消置顶，
+/// 否则按钮还在、点了却 422，那是界面与端点判据分裂（BUG-249）。
 const PRIORITY_REJECT_MSG: &str =
     "priority only applies to queued tasks (or to unpinning an already pinned one)";
 
 fn prioritizable(t: &CacheTask) -> bool {
-    t.status == "queued" || t.priority > 0
+    t.status == "queued" || (t.priority > 0 && t.status != "done" && t.status != "cancelled")
 }
 
 /// 单条**置顶 / 取消置顶**的状态迁移内核（唯一真源）。

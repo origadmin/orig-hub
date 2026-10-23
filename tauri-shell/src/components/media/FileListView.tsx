@@ -4,6 +4,7 @@ import { kindLabelKey } from '../../api/media'
 import { useTranslation } from '../../i18n'
 import { resolveDisplayName } from '../../lib/displayName'
 import { isTauri } from '../../lib/env'
+import { cn } from '../../lib/utils'
 import { VirtualList } from '../ui/virtual-list'
 // 媒体库组件的格式化/来源工具一律从 mediaSources 取（该文件是唯一 import
 // `lib/tgmedia` 的地方，通用工具已在其中 re-export）——与本目录其他组件同一纪律。
@@ -27,6 +28,24 @@ import { fmtDate, fmtSize, hasMediaBytes, parseSourceRef, sourceLabelKey } from 
  * 事实端点后本组件即承载它们）——本组件按「任意条目一视同仁」实现，不预设媒体。
  */
 
+/**
+ * 排序值（与 `MediaListQuery.sort` 同一枚举；面板持有 state，本组件经列头驱动）。
+ */
+export type FilesSort = 'recent' | 'oldest' | 'title' | 'duration' | 'size'
+
+/**
+ * BUG-399（列头与行内容横向错位）的**结构性修复**：
+ *
+ * 列头与每一行**必须**是同一套列模板 —— 之前两边各写一份字面量相同的模板字符串，
+ * 但列头末列是空 `<span/>`，`auto` 轨道塌成 **0px**，而行末列是真实动作按钮
+ * （实测 212px）⇒ 名称列一头 812px 一头 589px，类型/大小/日期/来源全体错位；
+ * 且各行动作列宽还随「在 TG 中查看」有无各自伸缩，**行与行也互不对齐**。
+ * 修复：模板收敛为单一常量 + 动作列**定宽** 216px（实测最宽行动作簇 212px，
+ * 留 4px 余量），簇内 `justify-end` 右贴齐 —— 头、行、行与行全部共线。
+ */
+const FILE_ROW_GRID =
+  'grid grid-cols-[20px_24px_minmax(0,1fr)_64px_88px_104px_64px_216px] items-center gap-2'
+
 const KIND_ICON: Record<string, string> = {
   video: '🎬',
   photo: '🖼',
@@ -43,8 +62,6 @@ export interface FileListViewProps {
   items: MediaItem[]
   /** 选中集（item id）—— 与父面板批量工具栏同一个源。 */
   selected: Set<number>
-  /** 列表总条数（分页提示用）。 */
-  total: number
   onSelectToggle: (id: number, shiftKey: boolean) => void
   /** 双击行（或「打开」按钮）：媒体进全局播放器。 */
   onOpen: (item: MediaItem) => void
@@ -52,6 +69,12 @@ export interface FileListViewProps {
   onDelete: (item: MediaItem) => void
   /** 错误上报（打开目录失败等，走父级 error 通道）。 */
   onError?: (msg: string) => void
+  /**
+   * BUG-400：排序状态由父面板持有（与分类网格的排序下拉同一 state），
+   * 本组件经**列头点击**驱动（Explorer 语义：排序即列头交互）。
+   */
+  sort: FilesSort
+  onSortChange: (s: FilesSort) => void
   /**
    * **选择模式**（任务 #9 / BUG-317 选择模式裁定）：面板里已有 ≥1 条被选中
    * 时为 true。此时行双击与「打开」按钮**不进入播放/系统打开** —— 与
@@ -124,7 +147,7 @@ const FileRow = memo(function FileRow(props: {
       data-source={item.source}
       data-selected={selected ? 'true' : undefined}
       className={[
-        'grid grid-cols-[20px_24px_minmax(0,1fr)_64px_88px_104px_64px_auto] items-center gap-2',
+        FILE_ROW_GRID,
         'border-b border-border-subtle/40 px-2 py-1.5 text-[12px] cursor-default select-none',
         selected ? 'bg-accent/10' : 'hover:bg-surface-2/60',
       ].join(' ')}
@@ -163,7 +186,7 @@ const FileRow = memo(function FileRow(props: {
       <span className="text-right tabular-nums text-muted">{fmtSize(item.size)}</span>
       <span className="tabular-nums text-muted">{fmtDate(item.addedAt)}</span>
       <span className="truncate text-[11px] text-muted">{t(sourceLabelKey(item.source))}</span>
-      <span className="flex shrink-0 items-center gap-1">
+      <span className="flex shrink-0 items-center justify-end gap-1">
         <button
           type="button"
           className="rounded px-1.5 py-0.5 text-[11px] text-muted hover:bg-surface-2 hover:text-fg-strong disabled:cursor-not-allowed disabled:opacity-40"
@@ -221,9 +244,44 @@ const FileRow = memo(function FileRow(props: {
   )
 })
 
+/**
+ * 列头排序按钮（BUG-400：Explorer 语义 —— 排序即列头交互，独立排序下拉撤销）。
+ * 日期列是唯一的双向列：recent（最新在前）↔ oldest（最旧在前）点击互切；
+ * 名称/大小是单键列（方向由后端定义），激活时高亮。
+ * 模块级定义（组件体内定义会每渲染重挂 —— memo 失效）。
+ */
+const SortHeader = memo(function SortHeader(props: {
+  label: string
+  active: boolean
+  /** 仅日期列给方向箭头（recent=↓ 最新在前 / oldest=↑ 最旧在前） */
+  arrow?: 'asc' | 'desc'
+  onClick: () => void
+  testId: string
+  className?: string
+}) {
+  const { label, active, arrow, onClick, testId, className } = props
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      data-testid={testId}
+      aria-pressed={active}
+      className={cn(
+        'truncate rounded px-0.5 text-left hover:text-fg-strong',
+        active && 'text-fg-strong',
+        className,
+      )}
+      title={label}
+    >
+      {label}
+      {arrow === 'desc' ? ' ↓' : arrow === 'asc' ? ' ↑' : ''}
+    </button>
+  )
+})
+
 export function FileListView(props: FileListViewProps) {
   const { t } = useTranslation()
-  const { items, selected, total, onSelectToggle, onOpen, onDelete, onError, selectionMode = false, onViewInTg } =
+  const { items, selected, onSelectToggle, onOpen, onDelete, onError, sort, onSortChange, selectionMode = false, onViewInTg } =
     props
 
   /**
@@ -254,20 +312,51 @@ export function FileListView(props: FileListViewProps) {
     [onError, t],
   )
 
+  /**
+   * 列头排序按钮见模块级 `SortHeader`。
+   */
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-testid="file-list">
-      {/* 列头（Explorer 明细视图的列名行） */}
+      {/*
+        列头（Explorer 明细视图的列名行）。
+        BUG-399 两处对齐修复：
+        1. 列模板与行**同一常量**（FILE_ROW_GRID）—— 两份字面量必然漂移；
+        2. `overflow-y-scroll [scrollbar-gutter:stable]` —— 行在滚动容器里，垂直
+           滚动条吃掉 ~10px 宽度而列头在容器外，列头因此整体右偏。gutter stable
+           让列头也预留同样的滚动条槽，两边轨道逐像素对齐（列头无纵向溢出，
+           不画真实滚动条，只有等宽预留槽）。
+      */}
       <div
         role="row"
         data-testid="file-list-header"
-        className="grid grid-cols-[20px_24px_minmax(0,1fr)_64px_88px_104px_64px_auto] items-center gap-2 border-b border-border-subtle px-2 py-1.5 text-[11px] font-medium text-muted"
+        className={cn(
+          FILE_ROW_GRID,
+          'overflow-y-scroll [scrollbar-gutter:stable] border-b border-border-subtle px-2 py-1.5 text-[11px] font-medium text-muted',
+        )}
       >
         <span />
         <span />
-        <span>{t('media.fileList.name')}</span>
+        <SortHeader
+          label={t('media.fileList.name')}
+          active={sort === 'title'}
+          onClick={() => onSortChange('title')}
+          testId="file-sort-title"
+        />
         <span>{t('media.fileList.kind')}</span>
-        <span className="text-right">{t('media.fileList.size')}</span>
-        <span>{t('media.fileList.date')}</span>
+        <SortHeader
+          label={t('media.fileList.size')}
+          active={sort === 'size'}
+          onClick={() => onSortChange('size')}
+          testId="file-sort-size"
+          className="text-right"
+        />
+        <SortHeader
+          label={t('media.fileList.date')}
+          active={sort === 'recent' || sort === 'oldest'}
+          arrow={sort === 'oldest' ? 'asc' : sort === 'recent' ? 'desc' : undefined}
+          onClick={() => onSortChange(sort === 'recent' ? 'oldest' : 'recent')}
+          testId="file-sort-date"
+        />
         <span>{t('media.fileList.source')}</span>
         <span />
       </div>
@@ -276,9 +365,11 @@ export function FileListView(props: FileListViewProps) {
         ~230ms。行高实测 34px 均匀（bug316_row_geometry 探针），estimate 取实测值；
         overscan 10 行 ≈ 340px 快滚缓冲。契约：容器 data-total = items.length
         （验收脚本据此断言「渲染行数 < 总数」——全量渲染必 FAIL）。
+        `[scrollbar-gutter:stable]`（BUG-399）：短列表（无滚动条）时也预留滚动条
+        槽，行与列头在任何条数下都保持同宽轨道。
       */}
       <VirtualList
-        className="min-h-0 flex-1 overflow-y-auto"
+        className="min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]"
         testId="file-list-scroll"
         items={items}
         estimate={34}
@@ -297,10 +388,6 @@ export function FileListView(props: FileListViewProps) {
           />
         )}
       />
-      <div className="flex items-center justify-between gap-2 border-t border-border-subtle/40 px-2 py-1.5 text-[10px] text-muted/80">
-        <span>{t('media.fileList.dblHint')}</span>
-        {total > items.length ? <span>{t('media.showing', { n: items.length, total })}</span> : null}
-      </div>
     </div>
   )
 }

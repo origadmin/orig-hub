@@ -867,6 +867,7 @@
   "tg.backfillHint": "Pull older media messages of this channel into the library. It pages backwards in the background (one page per round); progress shows on the channel row.",
   "tg.backfillDateLabel": "Backfill to",
   "tg.backfillStart": "Start backfill",
+  "tg.backfillClose": "Close",
   "tg.backfillCancel": "Cancel backfill",
   "global.copyDiag": "Copy diagnostics",
   "global.copied": "Copied",

@@ -10,6 +10,7 @@ import {
   ingestActionsFor,
   ingestDisplayName,
   isCacheActive,
+  isCacheSettled,
   type IngestAction,
   type IngestGroup,
 } from './ingestGroups'
@@ -196,7 +197,8 @@ export function IngestGroupRow({
               <Badge variant={meta.variant}>{meta.label}</Badge>
               {/* 优先下载徽标（BUG-277）：「已优先下载」是这一行的**排序状态**，必须看得见
                   —— 否则用户点了优先下载，除了列表顺序以外没有任何反馈可核对。 */}
-              {(latest.priority ?? 0) > 0 && (
+              {/* BUG-396：终态（done/cancelled）任务不再有优先状态，徽标同步隐藏。 */}
+              {(latest.priority ?? 0) > 0 && !isCacheSettled(latest.status) && (
                 <span
                   className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent"
                   title="已优先下载：当前任务跑完后下一个跑它（不抢占）"

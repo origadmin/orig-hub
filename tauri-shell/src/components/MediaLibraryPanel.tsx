@@ -4,6 +4,8 @@ import { SelectAllButtons, SelectionBar } from './ui/selection-bar'
 import { Input } from './ui/input'
 import { useTranslation } from '../i18n'
 import { useStore } from '../store/useStore'
+import { useFilesSearch } from '../store/filesSearch'
+import { useLibraryReadout } from '../store/libraryReadout'
 import {
   deleteMediaItem,
   deleteEpisode,
@@ -48,7 +50,6 @@ import { ExportPreviewDialog } from './media/ExportPreviewDialog'
 import { OrganizeWizard } from './media/OrganizeWizard'
 import { ItemEditDialog } from './media/ItemEditDialog'
 import {
-  fmtSize,
   isRawFileName,
   canRecacheFromSource,
   recacheFromSource,
@@ -276,7 +277,12 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   const [view, setView] = useState<View>('series')
   const [activeSeriesId, setActiveSeriesId] = useState<number | null>(null)
   const [activeTagId, setActiveTagId] = useState<number | null>(null)
-  const [search, setSearch] = useState('')
+  /**
+   * 搜索关键词（BUG-400）：输入框在标题栏（`FilesGlobalSearch`），本面板只订阅
+   * 防抖后的 `committed`（store/filesSearch.ts，与 tgSearch 同一模式）。
+   * 本地 `search` state 已删 —— 两棵子树各存一份必漂移。
+   */
+  const search = useFilesSearch((s) => s.committed)
   const [sort, setSort] = useState<'recent' | 'oldest' | 'title' | 'duration' | 'size'>('recent')
   /* 左栏标签区（BUG-259）：默认收起 —— 只显示片数最多的 RAIL_TAG_LIMIT 个；
      展开后显示全部并出现过滤框。 */
@@ -359,6 +365,24 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
     // countsKey 是上面三个值的组合：变了的才推（eslint 需要显式依赖）
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [onCounts, countsKey])
+
+  /**
+   * 页面级读数上报（BUG-400）：渲染点在**全局状态栏**（MainLayout 的
+   * `LibraryReadout` 叶子），面板是数据生产者 —— 原始数字进 store，
+   * 格式化与 BUG-133 口径回退在叶子做（store 不持有展示串）。
+   */
+  useEffect(() => {
+    useLibraryReadout.getState().setStats(
+      stats
+        ? {
+            diskBytes: typeof stats.diskBytes === 'number' ? stats.diskBytes : null,
+            totalSize: typeof stats.totalSize === 'number' ? stats.totalSize : null,
+            truncated: !!stats.diskBytesTruncated,
+          }
+        : null,
+    )
+  }, [stats])
+
   const [selected, setSelected] = useState<Set<number>>(new Set())
   /**
    * 剧集墙的多选（BUG-186）：装的是**剧集 id**。
@@ -1052,7 +1076,9 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   // ---------- 渲染 ----------
   const clearFilters = useCallback(() => {
     setActiveTagId(null)
-    setSearch('')
+    // BUG-400：搜索 state 在 store（标题栏叶子订阅 input、面板订阅 committed），
+    // 清筛选必须走 store.clear() —— 两端一起空，不能只清一半。
+    useFilesSearch.getState().clear()
   }, [])
 
   // BUG-131：`activeTagId` 对 series 视图同样生效（`loadSeries` 消费它），故不加视图条件；
@@ -1120,6 +1146,30 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
     }
     return [...items, ...facts]
   }, [tab, items, downloadFiles, sort])
+
+  /**
+   * 页面提示串（「单击选中，双击打开」+ 分页事实「显示 n/total」，BUG-400 收拢到
+   * 全局底栏）。切视图即重写，面板卸载清空 —— 不跨视图遗留。
+   * 声明必须在 `catAllRows` 之后（TDZ）。
+   */
+  useEffect(() => {
+    const parts: string[] = []
+    if (view === 'items' && tab === 'all' && catAllRows.length > 0) parts.push(t('media.fileList.dblHint'))
+    if (view === 'items') {
+      const shown = tab === 'all' ? Math.max(items.length, catAllRows.length) : items.length
+      const totalAll = tab === 'all' ? total + Math.max(0, catAllRows.length - items.length) : total
+      if (shown > 0 && totalAll > shown) parts.push(t('media.showing', { n: shown, total: totalAll }))
+    }
+    useLibraryReadout.getState().setNote(parts.length > 0 ? parts.join(' · ') : null)
+  }, [view, tab, items, total, catAllRows, t])
+
+  useEffect(
+    () => () => {
+      useLibraryReadout.getState().setStats(null)
+      useLibraryReadout.getState().setNote(null)
+    },
+    [],
+  )
 
   /**
    * 「全选本页」的目标集 = **当前真正可见的行**（BUG-155 语义的直接延伸：
@@ -1214,22 +1264,10 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   ).length
 
   /**
-   * 占用空间的主口径与是否有两个口径（BUG-133）。
-   *
-   * `diskBytes` 缺失 = 后端还没提供磁盘真值，此时**回退登记值**并改口径说明，
-   * 而不是显示 0 或假装它就是磁盘占用。
+   * 占用/登记读数（BUG-400）已迁全局状态栏：面板只把原始数字写进
+   * `libraryReadout` store（见上方 effect），格式化与 BUG-133 口径回退在
+   * `shell/LibraryReadout.tsx` 叶子里做。此处不再保留展示态。
    */
-  const hasDiskBasis = typeof stats?.diskBytes === 'number'
-  const leadingBytes = hasDiskBasis ? (stats?.diskBytes ?? 0) : (stats?.totalSize ?? 0)
-  /**
-   * 占用空间的显示值。
-   *
-   * `fmtSize(0)` 返回 `—`（它的语义是「没有读数」）。但「磁盘占用真的归零了」
-   * 是一个**确定的事实**，不是缺读数 —— 显示成 `—` 会让刚清完缓存的用户以为
-   * 「读不出来 / 又坏了」，恰恰是 BUG-133 那类「数字不反映事实」的翻版。
-   * 故归零时显式写 `0 B`，只有**真的没有读数**时才轮到 `—`。
-   */
-  const fmtOccupancy = (b: number): string => (b > 0 ? fmtSize(b) : '0 B')
   const emptyState = (
     <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-10">
       {libraryEmpty ? (
@@ -1290,20 +1328,12 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
               ← {t('media.series.back')}
             </Button>
           ) : null}
-          {/* BUG-131：搜索与排序只对 items 视图生效，故只在 items 视图渲染 ——
-              恒渲染但恒无效，等于控件在撒谎（同排「仅未归集」早已是这种守卫写法）。 */}
-          {view === 'items' ? (
-            <div className="w-44 min-w-0">
-              <Input
-                data-testid="media-search-input"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder={t('media.search')}
-                className="h-7 text-xs"
-              />
-            </div>
-          ) : null}
-          {view === 'items' ? (
+          {/* BUG-400（用户裁定 2026-10-23）：搜索框上移标题栏（FilesGlobalSearch），
+              占用/登记读数下沉页脚状态栏 —— 本工具条不再承载它们。
+              排序下拉只对**网格分类视图**（tab!=='all'）保留：cat-all 是 Explorer
+              列表，排序溶入列头（FileListView 列头点击），整行工具条随之撤销 ——
+              只剩一个控件的整行就是「多余的栏」。 */}
+          {view === 'items' && tab !== 'all' ? (
             <select
               data-testid="media-sort-select"
               value={sort}
@@ -1320,32 +1350,6 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
           {/* BUG-304 / D18：原「只看散片（未归入剧集）」勾选框删除 —— 「未归档」状态本身
               取消（视频=剧集 ⇒ 单集即单集剧集），该筛选永远只会返回空集。
               后端 `?unassigned=` 参数保留（BUG-138 缓存键判据仍在用），只是前端不再有入口。 */}
-
-          {/*
-            M0-T03：占用空间读数从左栏底部**原样搬到工具条**（左栏已删）。
-            BUG-149：重构不是删能力的授权 —— 用户能看到的读数不随导航重整静默消失。
-            两个口径仍同时可查（BUG-133 判据 2，缺陷仍 open，此处只做位置迁移、
-            不改口径语义）：主口径 = 磁盘真值（清缓存后下降）；登记值显式标注
-            「不是本地磁盘占用」。`diskBytes` 缺失时主口径回退登记值并改说明，
-            不显示 0、不假装它是磁盘占用。
-
-            BUG-317 四件套③：这个读数是文件页的 **page-secondary-info**
-            （标题区下方的计数摘要，恒定口径）。库级按钮已在任务 #9 上移到
-            标题区右槽（ContextBar 的 files 分支），本工具条只余搜索/排序与本读数。
-          */}
-          {stats && (
-            <span
-              className="shrink-0 text-[11px] text-muted"
-              data-testid="page-secondary-info"
-              title={`${hasDiskBasis
-                ? '占用空间 = 文件管理在本机实际占用的磁盘字节（清缓存后会下降）'
-                : '占用空间 = 文件管理登记的内容大小（后端未提供磁盘占用读数；清缓存后此值不变）'}\n登记值 = 内容在源头的大小之和（未落盘/字节已清的内容仍计入），不是本地磁盘占用`}
-            >
-              占用 {fmtOccupancy(leadingBytes)}
-              {stats.diskBytesTruncated ? '（已截断）' : ''} · 登记{' '}
-              {typeof stats.totalSize === 'number' ? fmtSize(stats.totalSize) : '—'}
-            </span>
-          )}
 
         </header>
         {/*
@@ -1661,11 +1665,13 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
           <FileListView
             items={catAllRows}
             selected={selected}
-            total={total + Math.max(0, catAllRows.length - items.length)}
             onSelectToggle={toggleSelect}
             onOpen={openItem}
             onDelete={deleteItem}
             onError={setError}
+            // BUG-400：排序溶入列头（Explorer 语义），状态从本面板提升下发。
+            sort={sort}
+            onSortChange={setSort}
             // 选择模式（任务 #9）：已有 ≥1 条选中时，行双击与「打开」按钮
             // 不进入播放/系统打开（覆盖层会冲掉隐形的选择上下文）。
             selectionMode={selected.size > 0}
@@ -1705,14 +1711,16 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
                   />
                 ))}
               </div>
-              {total > items.length ? (
-                <p className="py-3 text-center text-[11px] text-muted">
-                  {t('media.showing', { n: items.length, total })}
-                </p>
-              ) : null}
             </div>
           </>
         )}
+
+        {/*
+         * 页面级读数与提示（BUG-400 用户裁定：占用/登记「应该在底栏显示状态」）：
+         * 渲染点在**全局状态栏**（MainLayout `<footer>` 的 LibraryReadout 叶子，
+         * 经 `libraryReadout` store 供数）—— 面板内不再造第二条底栏（双底栏正是
+         * 用户批评的「多余的栏」）。口径语义原样保留（BUG-133，叶子组件注释）。
+         */}
 
         {/*
          * 剧集墙批量动作条（BUG-214 / BUG-393 统一化）：选中 **≥1** 条即出现，浮在内容区

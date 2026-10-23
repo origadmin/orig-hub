@@ -189,7 +189,10 @@ export function ingestActionsFor(status: string, priority = 0): IngestAction[] {
   const acts: IngestAction[] = []
   if (isCacheActive(status)) acts.push('cancel')
   if (isCacheStalled(status) || status === 'cancelled') acts.push('retry')
-  if (priority > 0) acts.push('unprefer')
+  // BUG-396：完成后（done/cancelled）不再有「优先」状态 —— 终态任务即使残留
+  // priority>0 也不许取消优先（priority 已由引擎在离队时归零；此处是前/后端
+  // 判据对齐的最后一环，避免陈旧值在前端再冒出「已优先」徽标/按钮）。
+  if (priority > 0 && !isCacheSettled(status)) acts.push('unprefer')
   else if (status === 'queued') acts.push('prefer')
   return acts
 }

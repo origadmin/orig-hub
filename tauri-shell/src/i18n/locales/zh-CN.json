@@ -867,6 +867,7 @@
   "tg.backfillHint": "把该频道更早的媒体消息补进库。回溯在后台慢慢翻页（每轮一页），进度显示在频道行上。",
   "tg.backfillDateLabel": "回溯到",
   "tg.backfillStart": "开始回溯",
+  "tg.backfillClose": "关闭",
   "global.copyDiag": "复制诊断信息",
   "global.copied": "已复制",
   "global.dismiss": "关闭",

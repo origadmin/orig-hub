@@ -488,6 +488,12 @@ async fn migrate_media_message(conn: &Connection) -> libsql::Result<()> {
 ///
 /// `NOT NULL DEFAULT 0` 的存量语义：旧行一律 0 ⇒ 取序退化为 `id ASC`，
 /// 与迁移前**逐字一致**（判据 6）。
+///
+/// BUG-396 归一（同函数内追加，天然幂等）：`priority` 的合法语义是「排队中的
+/// 排序状态」，终态（done/cancelled）任务**没有优先状态**——`finish_cache_task`/
+/// `cancel_cache_task` 已在离队时清零（2026-10-23 修复），但修复前完成的**存量行**
+/// 会残留非 0 值（实测活库 1 条），wire 上持续撒谎。启动时一次性归零，
+/// 第二次执行影响 0 行。
 async fn migrate_cache_task_priority(conn: &Connection) -> libsql::Result<()> {
     let mut rows = conn.query("PRAGMA table_info(cache_task)", ()).await?;
     let mut have_priority = false;
@@ -497,11 +503,19 @@ async fn migrate_cache_task_priority(conn: &Connection) -> libsql::Result<()> {
             have_priority = true;
         }
     }
-    if have_priority {
-        return Ok(());
+    if !have_priority {
+        conn.execute(
+            "ALTER TABLE cache_task ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+            (),
+        )
+        .await?;
     }
+    // BUG-396：终态任务残留的 priority 归零（幂等；修复后离队路径已自清，这里只
+    // 兜存量）。failed/interrupted 与 done/cancelled 同为终态（isCacheSettled 同集），
+    // 一并归零 —— 「没有在跑的任务不存在排序状态」。
     conn.execute(
-        "ALTER TABLE cache_task ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+        "UPDATE cache_task SET priority = 0 \
+         WHERE status IN ('done','cancelled','failed','interrupted') AND priority != 0",
         (),
     )
     .await?;
@@ -3019,7 +3033,7 @@ impl Store {
         self.conn
             .execute(
                 &format!(
-                    "UPDATE cache_task SET status = 'cancelled', current_id = NULL, updated_at = ?2 \
+                    "UPDATE cache_task SET status = 'cancelled', current_id = NULL, priority = 0, updated_at = ?2 \
                      WHERE id = ?1 AND status IN {CACHE_TASK_ACTIVE_STATES}"
                 ),
                 params![id, now()],
@@ -3170,7 +3184,7 @@ impl Store {
         self.conn
             .execute(
                 &format!(
-                    "UPDATE cache_task SET status = ?2, error = ?3, current_id = NULL, updated_at = ?4 \
+                    "UPDATE cache_task SET status = ?2, error = ?3, current_id = NULL, priority = 0, updated_at = ?4 \
                      WHERE id = ?1 AND status IN {CACHE_TASK_ACTIVE_STATES}"
                 ),
                 params![id, status, error, now()],
@@ -3189,7 +3203,7 @@ impl Store {
             .conn
             .execute(
                 &format!(
-                    "UPDATE cache_task SET status = 'cancelled', current_id = NULL, updated_at = ?2 \
+                    "UPDATE cache_task SET status = 'cancelled', current_id = NULL, priority = 0, updated_at = ?2 \
                      WHERE id = ?1 AND status IN {CACHE_TASK_ACTIVE_STATES}"
                 ),
                 params![id, now()],

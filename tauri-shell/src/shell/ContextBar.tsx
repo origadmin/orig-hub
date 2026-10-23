@@ -4,6 +4,7 @@ import { libraryGroupOf, fileCategoryOf } from '../nav'
 import { ContextBarActions } from './ContextBarActions'
 import { ContextBarFilesActions } from './ContextBarFilesActions'
 import { ContextBarStatus } from './ContextBarStatus'
+import { FilesGlobalSearch } from './FilesGlobalSearch'
 import { TgGlobalSearch } from '../components/TgGlobalSearch'
 import { TgCacheEntry } from '../components/TgCacheEntry'
 import type { IngestOverview } from '../domains/download/ingestGroups'
@@ -164,8 +165,15 @@ export const ContextBar = memo(function ContextBar({
       {/* 中槽：TG 视图的全局监控查找（BUG-100 方案 A）。
           只在 tg 视图挂载；组件内部自判可用性与自持高频输入 state，本栏不订阅。
           三列网格而非 flex：左右两列同为 `1fr`，中槽才是**真正的居中** ——
-          flex 下中槽只在「标题之后到右槽之前」的剩余空间里居中，实测偏左 53px。 */}
+          flex 下中槽只在「标题之后到右槽之前」的剩余空间里居中，实测偏左 53px。
+
+          文件域 items 视图同位挂 `FilesGlobalSearch`（BUG-400 用户裁定：搜索
+          属标题栏）。剧集视图（lib-series）不挂 —— 搜索对剧集墙无效，
+          恒渲染但恒无效等于控件撒谎（BUG-131 同一口径）。 */}
       {view === 'tg' ? <TgGlobalSearch /> : null}
+      {view === 'files' && (nav.fmode === 'cat-all' || fileCategoryOf(nav.fmode) !== null) ? (
+        <FilesGlobalSearch />
+      ) : null}
       <div className="col-start-3 flex shrink-0 items-center justify-end gap-3">
         {/* TG 入口（2026-10-17 终裁）：**只有入口按钮本身** —— 点它开最初的
             「入库流水线」面板（功能一个不删），按钮上挂「在传/待处理/已缓存」

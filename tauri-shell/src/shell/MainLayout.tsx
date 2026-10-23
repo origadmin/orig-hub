@@ -11,6 +11,7 @@ import { MediaViewer } from '../components/MediaViewer'
 import { ErrorBoundary } from '../components/ui/ErrorBoundary'
 import { TitleBar } from './TitleBar'
 import { ContextBar } from './ContextBar'
+import { LibraryReadout } from './LibraryReadout'
 import { useStore } from '../store/useStore'
 import { selectActiveSpeedLabel, selectHasActiveSpeed } from '../store/selectors'
 import { CONN_DOT, CONN_LABEL, useConnState } from '../store/connState'
@@ -403,6 +404,13 @@ function fmtClock(ts: number): string {
                 failed: failed.length + overview.stalled,
               })}
             </span>
+            {/*
+              文件域页面级读数（BUG-400 用户裁定：占用/登记「应该在底栏显示状态」）。
+              「底栏」= 本全局状态栏 —— 不是面板内再造一条（面板内叠一条就是双底栏，
+              正是「多余的栏」）。数据由 MediaLibraryPanel 经 `libraryReadout` store
+              写入，本叶子自订阅（低频），MainLayout 不订阅、不因读数重渲染。
+            */}
+            <LibraryReadout />
             {/*
               连接状态点**唯一渲染点**（BUG-169 终裁 = 右下角）：全应用只有这里一个
               连接指示。底栏在 MainLayout 根部单次渲染、不按视图分叉——顶栏灯在
