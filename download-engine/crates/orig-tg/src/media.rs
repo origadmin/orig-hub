@@ -1750,11 +1750,31 @@ pub struct MergeReport {
     pub added: i64,
     /// 因「同季已有同一条目」而跳过的分集（同一份数据记录，非内容判定）。
     pub skipped: Vec<MergeSkipped>,
-    /// 挂在目标分集上作为备用来源的分集数（BUG-056 字段：当前实现下为 0，
-    /// 因源剧集内 `UNIQUE(series_id, season, episode_no)` 已保证同槽不重复；
-    /// 留作未来「多源同槽归并」扩展接口，避免再次破坏公共 API）。
+    /// 归并为「同一集」的条目数（BUG-407 / BUG-408）：这些条目**没有**占新集号，
+    /// 而是降为目标对应分集的备用源（视频）或挂图（图片）。视频那部分同时计入
+    /// [`Self::sources_attached`]，本字段是两者之和。
+    #[serde(default)]
+    pub merged_same_episode: i64,
+    /// 挂在目标分集上作为备用来源的**视频**条目数（BUG-056 起保留的公共字段；
+    /// BUG-407 之后不再恒为 0 —— 同集归并会真的写入 `media_episode_source`）。
     #[serde(default)]
     pub sources_attached: i64,
+}
+
+/// 合并时「同一集」的落位结果（BUG-407 / BUG-408）。
+///
+/// 合并处置**全自动**、无手动「保留 / 删除」：标题与介绍取「有值侧」，视频与图片
+/// 比内容 hash —— 相同 ⇒ 同一集的多源/多图，不同 ⇒ 各自成集。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SameEpisodeAttach {
+    /// 视频：已作为备用源挂到该集（`media_episode_source`）。
+    Video,
+    /// 图片：已作为该集的挂图（`media_episode_image`）。
+    Image,
+    /// 该集本来就有这份内容（幂等重放，未写库）。
+    Already,
+    /// `item_id` 已属**别的**集（全表 UNIQUE）⇒ 无法归并，调用方如实记入 skipped。
+    Conflict,
 }
 
 /// 人工**拆剧**（D22-A⑥）的结果。
@@ -2368,23 +2388,32 @@ impl Store {
     /// `file_path` + `content_hash`」，并回传是否归零。
     ///
     /// 返回 `Some(true)` = 该 blob 引用归零（调用方应 unlink 字节）；`Some(false)` =
-    /// 还有其他条目引用（字节必须留下）；`None` = 该条目原本没有 hash（存量未纳入，
-    /// 调用方按老语义「有字节就删」处理）。
+    /// 还有其他条目引用（字节必须留下）；`None` = 该条目**不是受管 blob**
+    /// （无 hash，或 hash 只作内容身份、字节在平铺目录 —— BUG-420），
+    /// 调用方按老语义「有字节就删」处理。
     ///
     /// release 与置空**必须同处** —— 分成两处（如 `release_blob` + `set_item_file_path`）
     /// 会让 `set_item_file_path_with_blob` 再 release 一次，引用计数双重扣减。
     pub async fn clear_item_bytes(&self, id: i64) -> libsql::Result<Option<bool>> {
-        let old: Option<String> = self
+        let (old, fp): (Option<String>, Option<String>) = self
             .row_opt(
-                "SELECT content_hash FROM media_item WHERE id = ?1",
+                "SELECT content_hash, file_path FROM media_item WHERE id = ?1",
                 params![id],
             )
             .await?
-            .and_then(|r| r.get::<Option<String>>(0).ok())
-            .flatten();
+            .map(|r| (r.get::<Option<String>>(0).ok().flatten(), r.get::<Option<String>>(1).ok().flatten()))
+            .unwrap_or((None, None));
+        // BUG-420：只有**字节真的落在 `.blobs` 下**的条目才有 refcount 可言。
+        // 平铺条目（存量回填 hash 后）在 `media_blob` 里没有行 —— `release_blob` 会
+        // 返回 `false`，被调用方读成「还有其他条目引用」⇒ 文件永不回收（静默泄漏）。
+        // 故这类条目按「非受管」返回 `None`，与无 hash 的存量条目同一处理。
+        let managed = fp
+            .as_deref()
+            .map(|p| p.contains(crate::blob::BLOB_DIR))
+            .unwrap_or(false);
         let orphan = match old.as_deref() {
-            Some(h) => Some(self.release_blob(Some(h)).await?),
-            None => None,
+            Some(h) if managed => Some(self.release_blob(Some(h)).await?),
+            _ => None,
         };
         self.conn
             .execute(
@@ -2395,16 +2424,95 @@ impl Store {
         Ok(orphan)
     }
 
+    /// 只写内容 hash、**不**动 blob 引用计数（BUG-420）。
+    ///
+    /// 与 [`Self::set_item_file_path_with_blob`] 的分工：那条路只给「字节真的落在
+    /// `<download_dir>/.blobs/ab/cd/<hash>`」的条目用 —— 它会 acquire 一行 refcount，
+    /// 而归零时调用方会去 unlink **blob 路径**。存量条目的字节还在平铺目录里
+    /// （旧库根相对路径 / 旧绝对路径），给它们记 hash 却不能记 refcount：否则
+    /// `media_blob` 里会多出一批「字节并不在 blob 路径上」的行，回收语义整片失真。
+    ///
+    /// 故本函数只写 `content_hash` 一列 —— **hash 是内容身份**（归并判据，BUG-407/408），
+    /// 与「字节存在哪」解耦。
+    pub async fn set_item_content_hash(&self, id: i64, hash: &str) -> libsql::Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE media_item SET content_hash = ?1 WHERE id = ?2",
+                params![hash, id],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// 待补 hash 的条目（`content_hash` 为空且有 `file_path`）—— BUG-420 回填的扫描集。
+    ///
+    /// 只按「有没有 hash」筛，**不**在这里判文件是否存在：存在性要触盘，属调用方
+    /// （`hash_backfill`）的事。`limit` 为 0 = 不限。
+    pub async fn list_items_missing_hash(&self, limit: usize) -> libsql::Result<Vec<(i64, String)>> {
+        let sql = if limit == 0 {
+            "SELECT id, file_path FROM media_item \
+             WHERE TRIM(COALESCE(content_hash,'')) = '' AND file_path IS NOT NULL ORDER BY id"
+        } else {
+            "SELECT id, file_path FROM media_item \
+             WHERE TRIM(COALESCE(content_hash,'')) = '' AND file_path IS NOT NULL ORDER BY id LIMIT ?1"
+        };
+        let stmt = self.conn.prepare(sql).await?;
+        let mut rows = if limit == 0 {
+            stmt.query(()).await?
+        } else {
+            stmt.query(params![limit as i64]).await?
+        };
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await? {
+            out.push((r.get::<i64>(0)?, r.get::<String>(1)?));
+        }
+        Ok(out)
+    }
+
+    /// 内容 hash 覆盖率（BUG-420 的体检口径，`GET /api/media/hashes` 用它报数）。
+    ///
+    /// 四档互斥：`hashed` / `missing`（有路径无 hash）/ `no_file_path`（从未下载）。
+    /// `missing` 里**包含**「路径悬空」的条目 —— 那是路径问题不是 hash 问题，
+    /// 回填会跳过并单独计数，见 `hash_backfill::BackfillReport`。
+    pub async fn content_hash_coverage(&self) -> libsql::Result<(i64, i64, i64)> {
+        let row = self
+            .row_opt(
+                "SELECT \
+                   SUM(CASE WHEN TRIM(COALESCE(content_hash,'')) <> '' THEN 1 ELSE 0 END), \
+                   SUM(CASE WHEN TRIM(COALESCE(content_hash,'')) = '' AND file_path IS NOT NULL THEN 1 ELSE 0 END), \
+                   SUM(CASE WHEN TRIM(COALESCE(content_hash,'')) = '' AND file_path IS NULL THEN 1 ELSE 0 END) \
+                 FROM media_item",
+                (),
+            )
+            .await?;
+        Ok(row
+            .map(|r| {
+                (
+                    r.get::<Option<i64>>(0).ok().flatten().unwrap_or(0),
+                    r.get::<Option<i64>>(1).ok().flatten().unwrap_or(0),
+                    r.get::<Option<i64>>(2).ok().flatten().unwrap_or(0),
+                )
+            })
+            .unwrap_or((0, 0, 0)))
+    }
+
     /// 按权威算法重建 `media_blob.refcount`（D24-A / BUG-309 §2.2）。
     ///
     /// 权威 = `SELECT COUNT(*) FROM media_item WHERE content_hash = hash`；`refcount`
     /// 只是它的缓存。启动对账 / 迁移收尾 / 恢复后各跑一次，**不报错、不告警**（以权威为准）。
+    ///
+    /// BUG-420：权威口径**必须**限定「字节落在 `.blobs` 下」的条目。存量回填会给
+    /// 平铺条目写 `content_hash`（内容身份），但它们的字节不在内容寻址区 —— 不设闸
+    /// 的话，启动对账会凭空造出 120 行「指向不存在 blob 文件」的 `media_blob` 行，
+    /// 而 refcount 归零的回收动作就会去 unlink 一个从不存在的路径。
     pub async fn recount_blobs(&self) -> libsql::Result<usize> {
         // ① 条目已不再引用的 blob 行 → 删（引用计数归零）。
         self.conn
             .execute(
                 "DELETE FROM media_blob WHERE hash NOT IN \
-                    (SELECT content_hash FROM media_item WHERE content_hash IS NOT NULL)",
+                    (SELECT content_hash FROM media_item \
+                      WHERE content_hash IS NOT NULL AND instr(file_path, '.blobs') > 0)",
                 (),
             )
             .await?;
@@ -2418,17 +2526,18 @@ impl Store {
             .execute(
                 "INSERT INTO media_blob (hash, size, refcount, created_at, last_seen_at) \
                  SELECT content_hash, COALESCE(MAX(size), 0), COUNT(*), ?1, ?1 FROM media_item \
-                  WHERE content_hash IS NOT NULL \
+                  WHERE content_hash IS NOT NULL AND instr(file_path, '.blobs') > 0 \
                   GROUP BY content_hash \
                   ON CONFLICT(hash) DO NOTHING",
                 params![now_secs()],
             )
             .await?;
-        // ③ 重算引用计数。
+        // ③ 重算引用计数（口径与 ①② 逐字一致：只数 `.blobs` 下的字节）。
         self.conn
             .execute(
                 "UPDATE media_blob SET refcount = \
-                    (SELECT COUNT(*) FROM media_item WHERE content_hash = media_blob.hash)",
+                    (SELECT COUNT(*) FROM media_item \
+                      WHERE content_hash = media_blob.hash AND instr(file_path, '.blobs') > 0)",
                 (),
             )
             .await?;
@@ -2692,18 +2801,12 @@ impl Store {
             .prepare(
                 "SELECT s.id, s.title, s.description, s.kind, s.poster, s.year,
                         s.created_at, s.updated_at,
-                        -- BUG-255：集数 = 本剧集内**全部媒体条目**的去重计数。
-                        -- 既含「分集主条目」（`media_episode`），也含混编组挂在分集上的
-                        -- 「集级挂图」（`media_episode_image`，BUG-168）——否则典型的
-                        -- 「1 预告片 + N 海报/截图」相册只数到 1 集，与真实媒体数不符。
-                        -- 备用源（`media_episode_source`）是同一内容的另一缓存副本，不计入。
-                        (SELECT COUNT(DISTINCT item_id) FROM (
-                            SELECT item_id FROM media_episode WHERE series_id = s.id
-                            UNION
-                            SELECT m.item_id FROM media_episode_image m
-                              JOIN media_episode e ON e.id = m.episode_id
-                             WHERE e.series_id = s.id
-                        )),
+                        -- BUG-411：集数在 Rust 侧按「集号区间展开 + 去重」计算
+                        -- （`episode_number_counts`），此处仅占位以保持列序不变。
+                        -- 口径（用户 2026-10-23 裁定，修订 BUG-255）：只算分集
+                        -- （`media_episode`）；集级挂图由 `photo_count` 表达、不计入集数；
+                        -- 多源（`media_episode_source`）是同一内容副本，不计。
+                        0,
                         (SELECT COUNT(DISTINCT e.season) FROM media_episode e WHERE e.series_id = s.id),
                         -- 封面条目：优先任一**图片集**（photo 文件即封面，免抽帧），回退首集。
                         COALESCE(
@@ -2793,8 +2896,51 @@ impl Store {
                 tags: Vec::new(),
             });
         }
+        // BUG-411：集数 = 分集按集号区间展开后的去重集号数（不含挂图 / 多源）。
+        if !out.is_empty() {
+            let counts = self.episode_number_counts().await?;
+            for v in out.iter_mut() {
+                v.episode_count = counts.get(&v.id).copied().unwrap_or(0);
+            }
+        }
         self.attach_series_tags(&mut out).await?;
         Ok(out)
+    }
+
+    /// BUG-411：每个剧集的「去重集号数」——把 `media_episode` 的
+    /// `episode_no..=COALESCE(episode_no_end, episode_no)` 区间展开，按
+    /// `(season, 集号)` 去重后取大小。
+    ///
+    /// 只数**分集**：集级挂图（`media_episode_image`）由 `photo_count` 表达、
+    /// 不计入集数；多源（`media_episode_source`）是同一内容的另一副本，不计。
+    /// 这是对 BUG-255「挂图计入集数」口径的**修订**（用户 2026-10-23 裁定）：
+    /// 集数只回答「有多少集」，图由 `photo_count` 回答，卡片本就并列展示两者。
+    async fn episode_number_counts(
+        &self,
+    ) -> libsql::Result<std::collections::HashMap<i64, i64>> {
+        let stmt = self
+            .conn
+            .prepare(
+                "SELECT series_id, season, episode_no, COALESCE(episode_no_end, episode_no)
+                   FROM media_episode",
+            )
+            .await?;
+        let mut rows = stmt.query(()).await?;
+        let mut sets: std::collections::HashMap<i64, std::collections::HashSet<(i64, i64)>> =
+            std::collections::HashMap::new();
+        while let Some(r) = rows.next().await? {
+            let sid: i64 = r.get(0)?;
+            let season: i64 = r.get(1)?;
+            let start: i64 = r.get(2)?;
+            let end: i64 = r.get(3)?;
+            // 防御脏数据里的异常大区间：单行最多展开 10_000 集。
+            let end = end.max(start).min(start.saturating_add(10_000));
+            let set = sets.entry(sid).or_default();
+            for n in start..=end {
+                set.insert((season, n));
+            }
+        }
+        Ok(sets.into_iter().map(|(k, v)| (k, v.len() as i64)).collect())
     }
 
     async fn attach_series_tags(&self, list: &mut [SeriesView]) -> libsql::Result<()> {
@@ -3951,22 +4097,28 @@ impl Store {
 
     /// 合并剧集（BUG-037）：把 `source_id` 的**全部分集**搬到 `target_id` 末尾，再删除源剧集。
     ///
-    /// ## 语义边界（刻意划死的）
+    /// ## 语义边界（BUG-407 / BUG-408 起：**同集归并**，全自动）
     ///
-    /// **只搬移与重编位置，不做任何内容判定。** 唯一允许的跳过依据是
-    /// `item_id` 在目标**同季**已存在 —— 那是「同一条数据库记录」，属事实而非启发式。
-    /// 以下情况**一律保留、绝不合并**，因为它们都可能是合法的独立观看项：
+    /// 合并**不是**「一律续编新集号」。每个源条目先做一次**同一性判定**，命中就归并、
+    /// 不命中才占新集号。判据**只有一条**：`content_hash` 相同 ⇒ 同一个视频 ⇒ 同一集，
+    /// 与集号无关（hash 是防重复的核心设计）。
     ///
-    /// - 文件名/标题相同但内容不同（分散保存时的常见情况）；
-    /// - 同一内容从多个源进来（tg 缓存 + 本地导入 → 两条 item 记录）；
-    /// - `1-2` 与 `1, 2` 并存（前者是并成单文件的版本，**重叠 ≠ 重复**）；
-    /// - 每批都附带的预告。
+    /// **没有 hash 就是没有文件**（hash 由文件内容算出）。两边都没文件不存在「合并」，
+    /// 一侧有一侧没有同样不是同一份内容 —— 这些情况一律各自续编，**绝不按集号瞎猜**。
+    /// 两侧 hash 都有但不同 ⇒ 差异视频 ⇒ 不同集，各自保留（BUG-408）。
+    ///
+    /// 归并的落位：视频进 `media_episode_source`（备用源）、图片进 `media_episode_image`
+    /// （挂图）。**不存在手动「保留 / 删除」** —— 用户 2026-10-23 裁定：这套判定必须
+    /// 由 hash 自动完成，把本应自动的事丢给用户本身就是缺陷。
+    ///
+    /// 元数据同理取「有值侧」：标题 / 介绍 / 封面 / 年份都是缺失侧不覆盖有值侧
+    /// （「缺失」含 NULL 与空串两种落法）。
     ///
     /// ## 集号
     ///
-    /// 集号是**位置**而非身份：目标各季从现有 `MAX(episode_no)` 续编，源剧集的原始集号
-    /// 写入 `origin_episode_no`、来源剧集标题写入 `origin_series_title`（快照，因为源剧集
-    /// 会被删除）。这样重编后用户仍能分辨哪条是从哪儿并过来的。
+    /// 没被归并的条目才续编：目标各季从现有 `MAX(episode_no)` 之后取位，源剧集的原始
+    /// 集号写入 `origin_episode_no`、来源剧集标题写入 `origin_series_title`（快照，
+    /// 因为源剧集会被删除）。这样重编后用户仍能分辨哪条是从哪儿并过来的。
     ///
     /// 全流程在 `BEGIN IMMEDIATE` 内；任何一步失败即 `ROLLBACK`，不留半成品。
     pub async fn merge_series(
@@ -4194,15 +4346,31 @@ impl Store {
         target_id: i64,
         source_id: i64,
     ) -> libsql::Result<MergeReport> {
-        // ── 读源分集（带条目标题：跳过明细要能让人认出是哪一条）──
+        // ── 读源分集（带条目标题 / kind / 内容 hash）──
         //
         // BUG-056：必须把 `episode_no_end` 也读出来 —— 合集「EP01-02」在源剧集里
         // 占两槽，合并后若丢区间，下一集会撞位（参见 `append_episodes_ranged` 的
         // `COALESCE(episode_no_end, episode_no)` 占用快照）。
+        //
+        // BUG-407 / BUG-408：同一性判定按 **内容 hash** 走（用户 2026-10-23 裁定：
+        // 「hash 是视频防重复的核心设计，合并处置自动化、无手动保留 / 删除」），
+        // 故这里把 `kind` 与 `content_hash` 一并读出；`e.id` 用于把该集挂的备用源 /
+        // 挂图重映射到目标分集（BUG-103 正修）。
+        struct SrcEp {
+            ep_id: i64,
+            item_id: i64,
+            season: i64,
+            episode_no: i64,
+            episode_no_end: Option<i64>,
+            title: Option<String>,
+            kind: Option<String>,
+            hash: Option<String>,
+        }
         let stmt = self
             .conn
             .prepare(
-                "SELECT e.item_id, e.season, e.episode_no, e.episode_no_end, i.title
+                "SELECT e.id, e.item_id, e.season, e.episode_no, e.episode_no_end,
+                        i.title, i.kind, i.content_hash
                    FROM media_episode e
                    LEFT JOIN media_item i ON i.id = e.item_id
                   WHERE e.series_id = ?1
@@ -4210,12 +4378,62 @@ impl Store {
             )
             .await?;
         let mut rows = stmt.query(params![source_id]).await?;
-        // (item_id, season, episode_no, episode_no_end, title)
-        let mut src: Vec<(i64, i64, i64, Option<i64>, Option<String>)> = Vec::new();
+        let mut src: Vec<SrcEp> = Vec::new();
         while let Some(r) = rows.next().await? {
-            src.push((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?));
+            src.push(SrcEp {
+                ep_id: r.get(0)?,
+                item_id: r.get(1)?,
+                season: r.get(2)?,
+                episode_no: r.get(3)?,
+                episode_no_end: r.get(4)?,
+                title: r.get(5)?,
+                kind: r.get(6)?,
+                hash: r.get(7)?,
+            });
         }
         drop(rows);
+
+        // 源分集各自挂的备用源 / 挂图（BUG-103 正修：必须随分集一起搬到目标，
+        // 不能像止血那样「只清不搬」—— 否则用户视角里那些内容凭空消失）。
+        //
+        // 两张表语义不同故分开取：`media_episode_source` 是**播放来源**（只认 video，
+        // BUG-044 触发器），`media_episode_image` 是**浏览位挂图**（BUG-168）。
+        let mut src_alt_videos: HashMap<i64, Vec<i64>> = HashMap::new();
+        {
+            let stmt = self
+                .conn
+                .prepare(
+                    "SELECT s.episode_id, s.item_id FROM media_episode_source s
+                      WHERE s.episode_id IN (SELECT id FROM media_episode WHERE series_id = ?1)
+                      ORDER BY s.id ASC",
+                )
+                .await?;
+            let mut rows = stmt.query(params![source_id]).await?;
+            while let Some(r) = rows.next().await? {
+                src_alt_videos
+                    .entry(r.get::<i64>(0)?)
+                    .or_default()
+                    .push(r.get(1)?);
+            }
+        }
+        let mut src_alt_images: HashMap<i64, Vec<i64>> = HashMap::new();
+        {
+            let stmt = self
+                .conn
+                .prepare(
+                    "SELECT im.episode_id, im.item_id FROM media_episode_image im
+                      WHERE im.episode_id IN (SELECT id FROM media_episode WHERE series_id = ?1)
+                      ORDER BY im.sort_no ASC, im.item_id ASC",
+                )
+                .await?;
+            let mut rows = stmt.query(params![source_id]).await?;
+            while let Some(r) = rows.next().await? {
+                src_alt_images
+                    .entry(r.get::<i64>(0)?)
+                    .or_default()
+                    .push(r.get(1)?);
+            }
+        }
 
         // 源剧集标题快照（源稍后会被删，必须在事务里先取走）。
         let source_title: Option<String> = {
@@ -4233,29 +4451,46 @@ impl Store {
         let mut report = MergeReport::default();
 
         let outcome: libsql::Result<()> = async {
-            // 目标各季续编起点。
+            // 目标各季的占用快照 + 内容 hash 索引。
             //
             // BUG-056：占用快照必须含合集终点，否则合集条目「EP01-02」之后
             // 把下一集编成 2，会与合集内的第 2 槽撞位。复用
             // `append_episodes_ranged` 的 `COALESCE(episode_no_end, episode_no)`
             // 规则，三条路径（`add_episode_ranged` / `append_episodes_ranged` /
             // `merge_series`）现在共用同一条「下一个可用位」计算。
+            //
+            // BUG-407：`hash_index` 是**唯一**的「同一集」判据 ——
+            // 「同季里有没有字节完全相同的内容」。**没有 hash 就等于没有文件**
+            // （hash 由文件内容算出），两边都没文件不存在「合并」这回事，
+            // 因此这里只索引**单集**且有非空 hash 的行：合集占多槽，不参与归并。
             let stmt = self
                 .conn
                 .prepare(
-                    "SELECT season, episode_no, COALESCE(episode_no_end, episode_no)
-                       FROM media_episode WHERE series_id = ?1",
+                    "SELECT e.id, e.item_id, e.season, e.episode_no,
+                            COALESCE(e.episode_no_end, e.episode_no), i.content_hash
+                       FROM media_episode e
+                       LEFT JOIN media_item i ON i.id = e.item_id
+                      WHERE e.series_id = ?1",
                 )
                 .await?;
             let mut rows = stmt.query(params![target_id]).await?;
             let mut occupied: HashMap<i64, HashSet<i64>> = HashMap::new();
             let mut next: HashMap<i64, i64> = HashMap::new();
+            let mut hash_index: HashMap<(i64, String), (i64, i64)> = HashMap::new();
             while let Some(r) = rows.next().await? {
-                let season: i64 = r.get(0)?;
-                let no: i64 = r.get(1)?;
-                let end: i64 = r.get(2)?;
+                let ep_id: i64 = r.get(0)?;
+                let item_id: i64 = r.get(1)?;
+                let season: i64 = r.get(2)?;
+                let no: i64 = r.get(3)?;
+                let end: i64 = r.get(4)?;
+                let hash: Option<String> = r.get(5)?;
                 for n in no..=end {
                     occupied.entry(season).or_default().insert(n);
+                }
+                if end <= no {
+                    if let Some(h) = hash.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+                        hash_index.entry((season, h.to_string())).or_insert((ep_id, item_id));
+                    }
                 }
                 let next_slot = next.entry(season).or_insert(0);
                 if end > *next_slot {
@@ -4276,14 +4511,78 @@ impl Store {
             }
             drop(rows);
 
-            for (item_id, season, episode_no, episode_no_end, item_title) in &src {
-                if have.get(season).is_some_and(|s| s.contains(item_id)) {
+            for ep in &src {
+                let item_id = ep.item_id;
+                let season = ep.season;
+                let episode_no = ep.episode_no;
+                if have.get(&season).is_some_and(|s| s.contains(&item_id)) {
                     report.skipped.push(MergeSkipped {
-                        item_id: *item_id,
-                        title: item_title.clone(),
-                        season: *season,
-                        episode_no: *episode_no,
+                        item_id,
+                        title: ep.title.clone(),
+                        season,
+                        episode_no,
                     });
+                    continue;
+                }
+
+                // ── ① 同一集判定（BUG-407 / BUG-408）──
+                //
+                // 合并处置**全自动**，不存在手动「保留 / 删除」（用户 2026-10-23 裁定）。
+                // 判据**只有一条**：内容 hash 相同 ⇒ 同一个视频 ⇒ 同一集，与集号无关。
+                //
+                // **没有 hash 就是没有文件**（hash 由文件内容算出）——
+                // 两边都没文件不存在「合并」这回事，一律各自续编，绝不按集号瞎猜。
+                // 一侧有文件、另一侧没有，同样不是同一份内容，也各自续编。
+                // 两侧 hash 都有但不同 ⇒ 差异视频 ⇒ 不同集，各自保留（BUG-408）。
+                //
+                // 用户 2026-10-23 追加裁定：「文件怎么可能没有 hash，没有 hash 说明没有文件，
+                // 两边都是空，不存在合并。」⇒ 集号（L1）**不构成**同一性依据。
+                let declared_end = ep.episode_no_end.filter(|e| *e >= episode_no);
+                let src_hash = ep
+                    .hash
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty());
+                let mut same_as: Option<(i64, i64)> = None;
+                if let Some(h) = src_hash {
+                    if let Some(&(eid, iid)) = hash_index.get(&(season, h.to_string())) {
+                        same_as = Some((eid, iid));
+                    }
+                }
+
+                if let Some((dst_ep, dst_item)) = same_as {
+                    // 同一集：源条目**不占新集号**，降为该集的备用源（视频）或挂图（图片）。
+                    // `dst_item == item_id` 只可能来自 hash 自映射（同一条记录），无操作。
+                    if dst_item != item_id {
+                        match self
+                            .merge_attach_same_episode(dst_ep, item_id, ep.kind.as_deref())
+                            .await?
+                        {
+                            SameEpisodeAttach::Video => {
+                                report.merged_same_episode += 1;
+                                report.sources_attached += 1;
+                            }
+                            SameEpisodeAttach::Image | SameEpisodeAttach::Already => {
+                                report.merged_same_episode += 1;
+                            }
+                            // `item_id` 已属别的集（全表 UNIQUE）—— 无法归并，如实回报，
+                            // 绝不静默丢（BUG-103 判据：跳过必须可见）。
+                            SameEpisodeAttach::Conflict => {
+                                report.skipped.push(MergeSkipped {
+                                    item_id,
+                                    title: ep.title.clone(),
+                                    season,
+                                    episode_no,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    // 该源分集自己挂的备用源 / 挂图一并搬到同一集（BUG-103 正修）。
+                    self.merge_carry_children(ep.ep_id, dst_ep, &src_alt_videos, &src_alt_images)
+                        .await?;
+                    // BUG-126：合并是用户显式操作 ⇒ 清掉该内容的墓碑。
+                    self.clear_episode_tombstones(target_id, &[item_id]).await?;
                     continue;
                 }
 
@@ -4292,21 +4591,19 @@ impl Store {
                 // 源条目声明的区间（`episode_no_end` 若为 NULL 视为单集）：
                 //   - 完整空闲 → 落在声明位（合集区间保留 = BUG-056 主目标）；
                 //   - 否则 → 回退到「最大终点之后」的下一空闲位，**保留声明宽度**——
-                //     这样合集条目不会被打成单集（续编两集 = BUG-103 暂取路径，
-                //     同槽归并是 BUG-103 待拍板的另一路径，本轮不强制）。
+                //     这样合集条目不会被打成单集（合集无法与单集归并：它占多槽）。
                 //
                 // 关键：`slot_end` 必须**与源一致**——源是单集就 NULL，源是合集
                 // 才存 `Some(end)`，否则会把单集意外标成 `Some(slot)`（语义错误，
                 // `get_series` / UI 会以为是合集）。
-                let declared_end = episode_no_end.filter(|e| *e >= *episode_no);
-                let occupied_season = occupied.entry(*season).or_default();
-                let declared_free = (*episode_no..=declared_end.unwrap_or(*episode_no))
+                let occupied_season = occupied.entry(season).or_default();
+                let declared_free = (episode_no..=declared_end.unwrap_or(episode_no))
                     .all(|n| !occupied_season.contains(&n));
                 let (slot, slot_end) = if declared_free {
-                    (*episode_no, declared_end)
+                    (episode_no, declared_end)
                 } else {
-                    let base = next.get(season).copied().unwrap_or(0) + 1;
-                    let end = declared_end.map(|e| base + (e - *episode_no));
+                    let base = next.get(&season).copied().unwrap_or(0) + 1;
+                    let end = declared_end.map(|e| base + (e - episode_no));
                     (base, end)
                 };
 
@@ -4316,39 +4613,55 @@ impl Store {
                 self.conn
                     .execute(
                         "DELETE FROM media_episode WHERE series_id = ?1 AND item_id = ?2",
-                        params![source_id, *item_id],
+                        params![source_id, item_id],
                     )
                     .await?;
                 // 刻意用纯 INSERT 而非 `add_episode`（后者带 ON CONFLICT DO UPDATE）：
                 // 集号若算错，宁可撞唯一约束让整个事务回滚，也**绝不能静默覆盖**目标已有分集。
-                self.conn
-                    .execute(
-                        "INSERT INTO media_episode
-                           (series_id, item_id, season, episode_no, episode_no_end,
-                            origin_series_title, origin_episode_no)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        params![
+                //
+                // BUG-189：`RETURNING id` 把「插入」与「取新 id」合成一条语句 —— 拿到
+                // 新分集 id 才能把源分集的备用源 / 挂图重映射过去（BUG-103 正修）。
+                let new_ep: i64 = {
+                    let stmt = self
+                        .conn
+                        .prepare(
+                            "INSERT INTO media_episode
+                               (series_id, item_id, season, episode_no, episode_no_end,
+                                origin_series_title, origin_episode_no)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                             RETURNING id",
+                        )
+                        .await?;
+                    let mut rows = stmt
+                        .query(params![
                             target_id,
-                            *item_id,
-                            *season,
+                            item_id,
+                            season,
                             slot,
                             slot_end,
                             source_title.clone(),
-                            *episode_no
-                        ],
-                    )
+                            episode_no
+                        ])
+                        .await?;
+                    match rows.next().await? {
+                        Some(r) => r.get(0)?,
+                        None => return Err(libsql::Error::QueryReturnedNoRows),
+                    }
+                };
+                // BUG-103 正修：源分集挂的备用源 / 挂图跟着这一集走。
+                self.merge_carry_children(ep.ep_id, new_ep, &src_alt_videos, &src_alt_images)
                     .await?;
                 // BUG-126：合并是**用户显式**操作 → 清掉目标剧集上该内容的墓碑。
                 // 否则用户刚并进来的内容仍被系统当作「已摘除」，后续自动路径会莫名跳过它。
-                self.clear_episode_tombstones(target_id, &[*item_id]).await?;
+                self.clear_episode_tombstones(target_id, &[item_id]).await?;
                 report.added += 1;
-                have.entry(*season).or_default().insert(*item_id);
-                let occupied_season = occupied.entry(*season).or_default();
+                have.entry(season).or_default().insert(item_id);
+                let occupied_season = occupied.entry(season).or_default();
                 let final_end = slot_end.unwrap_or(slot);
                 for n in slot..=final_end {
                     occupied_season.insert(n);
                 }
-                let next_slot = next.entry(*season).or_insert(0);
+                let next_slot = next.entry(season).or_insert(0);
                 if final_end > *next_slot {
                     *next_slot = final_end;
                 }
@@ -4363,37 +4676,61 @@ impl Store {
                 )
                 .await?;
 
-            // 元数据**仅在目标缺失时继承**：不覆盖用户已设的介绍/年份/封面。
+            // ── 元数据处置（BUG-408：取「有值侧」，全自动、无人工）──
+            //
+            // 标题 / 总介绍 / 封面 / 年份四类同一规则：**缺失侧不覆盖有值侧**。
+            // 「缺失」在本仓有两种落法 —— NULL 与空串（用户清空 / 上游空 caption），
+            // 故判据是 `TRIM(COALESCE(x,'')) = ''` 而不是裸 `IS NULL`；否则目标侧
+            // 存着空串时，源侧那段真实介绍永远继承不过来（BUG-408 的「总介绍」一项）。
+            //
+            // 标题两边都有值时**保留目标的**：目标就是用户在合并对话框里显式选的
+            // 「保留哪一条」，那一步才是标题的决策点，这里只补空。
             self.conn
                 .execute(
                     "UPDATE media_series SET
-                       description = COALESCE(description, (SELECT description FROM media_series WHERE id = ?2)),
-                       year        = COALESCE(year,        (SELECT year        FROM media_series WHERE id = ?2)),
-                       poster      = COALESCE(poster,      (SELECT poster      FROM media_series WHERE id = ?2))
+                       title = CASE WHEN TRIM(COALESCE(title, '')) = ''
+                                    THEN (SELECT title FROM media_series WHERE id = ?2)
+                                    ELSE title END,
+                       description = CASE WHEN TRIM(COALESCE(description, '')) = ''
+                                           THEN NULLIF((SELECT description FROM media_series WHERE id = ?2), '')
+                                           ELSE description END,
+                       year        = COALESCE(year, (SELECT year FROM media_series WHERE id = ?2)),
+                       poster      = CASE WHEN TRIM(COALESCE(poster, '')) = ''
+                                           THEN NULLIF((SELECT poster FROM media_series WHERE id = ?2), '')
+                                           ELSE poster END
                      WHERE id = ?1",
                     params![target_id, source_id],
                 )
                 .await?;
 
-            // ── BUG-103 止血：先清掉源分集挂的备用源行，再删源分集 ──
+            // ── 清掉源分集上**没搬走**的备用源行，再删源分集 ──
             //
-            // 为什么必须删：`media_episode_source.item_id` 是**全表 UNIQUE**（该表语义为
+            // BUG-103：`media_episode_source.item_id` 是**全表 UNIQUE**（该表语义为
             // 「同一内容只属某一集」）。源分集行一删，挂在其 `episode_id` 上的备用源行
             // 就成了孤儿行，却仍然占着这个 `item_id` 名额 —— 此后该条目**永远无法再挂到
             // 任何分集**：`attach_episode_source` 的 `ON CONFLICT(episode_id, item_id)
             // DO NOTHING` 只覆盖组合约束，拦不住 `item_id` 的 UNIQUE，libsql 直接返回
             // `UNIQUE constraint failed: media_episode_source.item_id`（报错，不是静默失败）。
-            // 该表无外键级联，孤儿行跨进程重启仍残留，用户无法自愈。
             //
-            // 本轮**只清不搬**：备用源不随合并进入目标剧集（剧集视角下仍会看到它不在了），
-            // 这是**止血**而非正修。正修（把备用源搬运/重映射到目标对应分集，或按
-            // BUG-103「同槽归并 vs 续编两集」的裁定改为同槽合并）待所有者拍板后另做。
+            // BUG-103 **正修已落地**：能搬的都在上面的循环里 `merge_carry_children`
+            // 改归属到目标分集了（`UPDATE episode_id`，不是插副本 —— 全表 UNIQUE 只允许
+            // 搬家）。这里剩下的是**搬不动**的：目标侧已占着同一 `item_id`，或该行指向
+            // 的分集本就没进循环（理论上不存在）。它们随源分集一起清掉，不留孤儿。
             //
             // 必须在同一 `BEGIN IMMEDIATE` 内、且在删 `media_episode` **之前**执行：
             // 分集行一旦删除就再也无法反查它挂过哪些备用源；失败则随既有 ROLLBACK 一起回滚。
             self.conn
                 .execute(
                     "DELETE FROM media_episode_source
+                      WHERE episode_id IN (SELECT id FROM media_episode WHERE series_id = ?1)",
+                    params![source_id],
+                )
+                .await?;
+            // 挂图同源：没搬走的随分集一起清（`media_episode_image` 主键是
+            // `(episode_id, item_id)`，没有全表 UNIQUE，搬家用 `UPDATE OR IGNORE`）。
+            self.conn
+                .execute(
+                    "DELETE FROM media_episode_image
                       WHERE episode_id IN (SELECT id FROM media_episode WHERE series_id = ?1)",
                     params![source_id],
                 )
@@ -4428,6 +4765,100 @@ impl Store {
 
         // 调用方持有事务边界：成功交给上层 `COMMIT`，失败由上层 `ROLLBACK`。
         outcome.map(|()| report)
+    }
+
+    /// **在调用方事务内**把 `item_id` 归并到已存在的分集 `episode_id` 上（BUG-407 / BUG-408）。
+    ///
+    /// 合并遇到「两边是同一集」时，源条目**不得占新集号**，而要降为该集的多源之一：
+    ///
+    /// - **视频** → `media_episode_source`（播放来源，`attach_episode_source` 同一张表）；
+    /// - **图片** → `media_episode_image`（浏览位挂图）—— 该表只认 video，图片没有
+    ///   「播放来源」的概念，同集的第二张图天然属于该集的图集（BUG-168 结构）。
+    ///
+    /// 返回 [`SameEpisodeAttach`]，让调用方把「真并了 / 本来就有 / 并不了」如实计入报告。
+    async fn merge_attach_same_episode(
+        &self,
+        episode_id: i64,
+        item_id: i64,
+        kind: Option<&str>,
+    ) -> libsql::Result<SameEpisodeAttach> {
+        if kind == Some("video") {
+            // `item_id` 全表 UNIQUE：先查它是否已属别的集，避免直接撞约束把整个事务打回。
+            if let Some(r) = self
+                .row_opt(
+                    "SELECT episode_id FROM media_episode_source WHERE item_id = ?1",
+                    params![item_id],
+                )
+                .await?
+            {
+                let existing: i64 = r.get(0)?;
+                return Ok(if existing == episode_id {
+                    SameEpisodeAttach::Already
+                } else {
+                    SameEpisodeAttach::Conflict
+                });
+            }
+            self.conn
+                .execute(
+                    "INSERT INTO media_episode_source (episode_id, item_id, created_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![episode_id, item_id, now_secs()],
+                )
+                .await?;
+            return Ok(SameEpisodeAttach::Video);
+        }
+        // 图片（含未知 kind）：挂进该集的图集。`add_episode_image` 自带
+        // `INSERT OR IGNORE`（主键 `(episode_id, item_id)`），幂等。
+        let added = self.add_episode_image(episode_id, item_id).await?;
+        Ok(if added {
+            SameEpisodeAttach::Image
+        } else {
+            SameEpisodeAttach::Already
+        })
+    }
+
+    /// **在调用方事务内**把源分集 `from_ep` 挂的备用源 / 挂图改归属到 `to_ep`（BUG-103 正修）。
+    ///
+    /// 为什么是 `UPDATE episode_id` 而不是「插副本再删旧行」：`media_episode_source.item_id`
+    /// 是**全表 UNIQUE**，同一 `item_id` 在表里只允许存在一行 —— 插副本必然撞约束。
+    /// 改归属既保住「同一内容只属一集」的不变量，又让内容真的跟着分集走（止血期是直接清掉，
+    /// 用户视角里那些备用源凭空消失）。
+    ///
+    /// 搬不动的（目标集已有同一 `item_id`、或撞挂图主键）用 `OR IGNORE` 留下旧行，
+    /// 随后随源分集一起被删 —— 不静默，也不破坏约束。
+    async fn merge_carry_children(
+        &self,
+        from_ep: i64,
+        to_ep: i64,
+        videos: &HashMap<i64, Vec<i64>>,
+        images: &HashMap<i64, Vec<i64>>,
+    ) -> libsql::Result<()> {
+        if from_ep == to_ep {
+            return Ok(());
+        }
+        if let Some(items) = videos.get(&from_ep) {
+            for item_id in items {
+                self.conn
+                    .execute(
+                        "UPDATE OR IGNORE media_episode_source SET episode_id = ?1
+                          WHERE episode_id = ?2 AND item_id = ?3",
+                        params![to_ep, from_ep, *item_id],
+                    )
+                    .await?;
+            }
+        }
+        if let Some(items) = images.get(&from_ep) {
+            for item_id in items {
+                self.conn
+                    .execute(
+                        "UPDATE OR IGNORE media_episode_image SET episode_id = ?1
+                          WHERE episode_id = ?2 AND item_id = ?3",
+                        params![to_ep, from_ep, *item_id],
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// 删除剧集行（分集 + 标签 + 剧集）。**低层结构删除**。
@@ -10255,18 +10686,18 @@ mod tests {
         assert_eq!(again.description, None, "一次性迁移不得在下次启动把清空值填回");
     }
 
-    /// 回归（BUG-103 **止血**）：`merge_series` 必须清掉源分集挂的备用源行，
-    /// 释放被孤儿行占死的 `item_id`。
+    /// 回归（BUG-103 **正修**）：合并必须把源分集挂的备用源**搬进**目标对应分集，
+    /// 且不留孤儿行、不占死 `item_id`。
     ///
-    /// 场景：源剧集 S 第 1 集主条目 A + 备用源 B。合并 S→T 后应看到：
-    ///  1) **无孤儿行**：`media_episode_source` 左连接 `media_episode` 的悬空行数 = 0
-    ///     （止血前该行因无外键级联而永久残留，跨进程重启仍在）；
-    ///  2) **`item_id` 已释放**：把 B 挂到目标分集返回 `Ok(true)`
-    ///     （止血前是 `Err: UNIQUE constraint failed: media_episode_source.item_id`）；
-    ///  3) 如实记录**未修**的部分：备用源 B **仍不会随合并搬进**目标剧集，
-    ///     这是 BUG-103 的正修范围（搬运 or 同槽归并待拍板），本轮不改。
+    /// 场景：源剧集 S 第 1 集主条目 A + 备用源 B；目标 T 第 1 集已有条目 X。
+    /// A 与 X 是**同一个文件**（`content_hash` 相同）⇒ 同一集 ⇒ A 降为 T 第 1 集的
+    /// 备用源，B 跟着搬过去。合并后应看到：
+    ///  1) **A、B 都在目标第 1 集的 `sources` 里**（止血期 B 是凭空消失的）；
+    ///  2) **无孤儿行**：`media_episode_source` 左连接 `media_episode` 的悬空行数 = 0；
+    ///  3) `attach_episode_source(B)` 幂等返回 `Ok(false)`（B 已在，且不再报 UNIQUE）；
+    ///  4) 目标分集数**没有增加**（同一集不续编）。
     #[tokio::test]
-    async fn merge_series_clears_source_rows_and_frees_item_id() {
+    async fn merge_series_carries_alt_sources_without_orphans() {
         // 注意：`tmp_db` 每次调用都会删库，跨重启必须复用同一路径。
         let path = tmp_db("merge_src");
         let s = Store::open(&path).await.unwrap();
@@ -10278,12 +10709,15 @@ mod tests {
             .upsert_media_item("tg", "t:1", "t1", "video", None, None, None, None)
             .await
             .unwrap();
+        set_content_hash(&s, t_item, "hash-same-file").await;
         let t_ep = s.add_episode(target, t_item, 1, 1).await.unwrap();
 
         let a = s
             .upsert_media_item("tg", "s:1", "s1", "video", None, None, None, None)
             .await
             .unwrap();
+        // A 与目标第 1 集是**同一个文件** ⇒ 合并会归并为同一集（判据只有 hash）。
+        set_content_hash(&s, a, "hash-same-file").await;
         let b = s
             .upsert_media_item("tg", "s:2", "s2", "video", None, None, None, None)
             .await
@@ -10300,19 +10734,28 @@ mod tests {
         assert_eq!(before.episodes[0].sources[0].item_id, b);
 
         let report = s.merge_series(target, source).await.unwrap();
-        assert_eq!(report.added, 1, "源分集 A 应被搬进目标");
+        assert_eq!(
+            report.added, 0,
+            "同槽 ⇒ 同一集，A 不占新集号（续编行为已被 D1=A 取代）"
+        );
+        assert_eq!(report.merged_same_episode, 1, "A 归并为目标第 1 集的备用源");
+        assert_eq!(report.sources_attached, 1);
 
         // 源剧集及其分集已删除。
         assert!(s.get_series(source).await.unwrap().is_none(), "源剧集应被删除");
 
-        // ── 合并结果：A 主位进入目标 ──
+        // ── 断言 1：A、B 都在目标第 1 集的备用源里（止血期 B 会消失）──
         let after = s.get_series(target).await.unwrap().unwrap();
-        let main_ids: Vec<i64> = after.episodes.iter().map(|e| e.item_id).collect();
-        assert!(main_ids.contains(&a), "A 作为主条目应进入目标");
-        assert!(!main_ids.contains(&b), "B 不应以主条目进入目标");
-        println!("[止血] 目标分集主条目: {main_ids:?}");
+        assert_eq!(after.episodes.len(), 1, "同一集不续编 —— 目标仍只有 1 条分集");
+        let ep = &after.episodes[0];
+        assert_eq!(ep.id, t_ep, "目标原分集保留");
+        assert_eq!(ep.item_id, t_item, "主条目仍是目标原有的那一条");
+        let carried: Vec<i64> = ep.sources.iter().map(|x| x.item_id).collect();
+        println!("[正修] 目标第 1 集备用源: {carried:?}");
+        assert!(carried.contains(&a), "A 应作为备用源进入目标（BUG-103 判据 1）");
+        assert!(carried.contains(&b), "B 应随合并搬进目标（止血期凭空消失）");
 
-        // ── 断言 1：无孤儿行（悬空的 episode_id 计数 = 0）──
+        // ── 断言 2：无孤儿行（悬空的 episode_id 计数 = 0）──
         let orphans = scalar_i64(
             &s.conn,
             "SELECT COUNT(*) FROM media_episode_source src
@@ -10320,50 +10763,15 @@ mod tests {
              WHERE e.id IS NULL",
         )
         .await;
-        println!("[止血] 悬空备用源行计数: {orphans}");
+        println!("[正修] 悬空备用源行计数: {orphans}");
         assert_eq!(orphans, 0, "合并后不得残留指向已删分集的孤儿备用源行");
 
-        let b_rows = scalar_i64(
-            &s.conn,
-            &format!("SELECT COUNT(*) FROM media_episode_source WHERE item_id = {b}"),
-        )
-        .await;
-        println!("[止血] item_id={b} 的备用源行数: {b_rows}");
-        assert_eq!(b_rows, 0, "B 的备用源行应被清掉，item_id 名额随之释放");
-
-        // ── 断言 2：B 可以重新挂到目标分集（止血前此处报 UNIQUE 错）──
+        // ── 断言 3：B 已挂在目标分集 ⇒ 再挂是幂等 no-op，且不报 UNIQUE ──
         let r = s.attach_episode_source(t_ep, b).await;
-        println!("[止血] attach_episode_source(B→目标分集) = {r:?}");
-        assert_eq!(
-            r.unwrap(),
-            true,
-            "item_id 已释放，B 必须能挂上目标分集（止血前为 Err UNIQUE）"
-        );
-        let now = s.get_series(target).await.unwrap().unwrap();
-        let b_attached = now
-            .episodes
-            .iter()
-            .any(|e| e.id == t_ep && e.sources.iter().any(|x| x.item_id == b));
-        println!("[止血] B 是否真的挂到目标分集: {b_attached}");
-        assert!(b_attached, "B 应出现在目标分集的备用源里");
+        println!("[正修] attach_episode_source(B→目标分集) = {r:?}");
+        assert_eq!(r.unwrap(), false, "B 已在目标分集，重复挂载应为幂等 no-op");
 
-        // ── 断言 3（如实记录未修）：备用源本身仍不随合并搬进目标剧集 ──
-        //
-        // 这是 BUG-103 的**正修**范围：搬运备用源 / 同槽归并，待「同槽归并与否」
-        // 拍板后另做。此处断言当前真实行为，若将来实现搬运，本断言应改为
-        // 「B 出现在目标对应分集的备用源里」。
-        let carried: Vec<i64> = after
-            .episodes
-            .iter()
-            .flat_map(|e| e.sources.iter().map(|x| x.item_id))
-            .collect();
-        println!("[未修] 合并后目标分集自带备用源: {carried:?}");
-        assert!(
-            !carried.contains(&b),
-            "已知的未修行为：备用源不随合并搬进目标（正修范围，本轮不改）"
-        );
-
-        // ── 跨重启：清理是持久化的，不是本连接内存态 ──
+        // ── 跨重启：搬运是持久化的，不是本连接内存态 ──
         drop(s);
         let s2 = Store::open(&path).await.unwrap();
         let still_orphans = scalar_i64(
@@ -10373,8 +10781,278 @@ mod tests {
              WHERE e.id IS NULL",
         )
         .await;
-        println!("[止血] 重启后悬空行计数: {still_orphans}");
+        println!("[正修] 重启后悬空行计数: {still_orphans}");
         assert_eq!(still_orphans, 0, "重启后仍不得有孤儿行");
+        let reopened = s2.get_series(target).await.unwrap().unwrap();
+        let kept: Vec<i64> = reopened.episodes[0].sources.iter().map(|x| x.item_id).collect();
+        assert!(kept.contains(&b), "重启后 B 仍在目标分集备用源里");
+    }
+
+    // ─────────────────── BUG-407 / BUG-408：合并的同集归并 ───────────────────
+
+    /// 测试辅助：直接给条目写 `content_hash`（生产路径由 `set_item_bytes` 在字节落地时写，
+    /// 这里只造判定所需的事实）。
+    async fn set_content_hash(s: &Store, item_id: i64, hash: &str) {
+        s.conn
+            .execute(
+                "UPDATE media_item SET content_hash = ?1 WHERE id = ?2",
+                params![hash, item_id],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// BUG-407 核心（用户原例）：A 含 1,2,3，B 含 2,3,4 ⇒ 合并后 **1,2,2,3,3,4**
+    /// —— 即「同集多源归并、不同集各自保留」，**不是**把 B 整体续编成 4,5,6。
+    ///
+    /// 前提：B 的第 2、3 集与 A 的第 2、3 集是**同一份文件**（`content_hash` 相同）。
+    /// 判据只有 hash 这一条 —— 集号相同不算（见 `merge_series_no_hash_never_merges_bug407`）。
+    ///
+    /// 反向证伪：把同一性判定改成「只按 item_id 去重 + 声明位被占就续编」⇒ B 的第 2、3 集
+    /// 会变成第 4、5 集，`episodes.len()` 变 6 ⇒ 本用例 FAIL。
+    #[tokio::test]
+    async fn merge_series_merges_same_slot_into_multi_source_bug407() {
+        let path = tmp_db("bug407_same_slot");
+        let s = Store::open(&path).await.unwrap();
+        let target = s.create_series("A", None, "series", None, None).await.unwrap();
+        let source = s.create_series("B", None, "series", None, None).await.unwrap();
+
+        // A = 第 1、2、3 集（各有自己的文件）
+        let mut a = Vec::new();
+        for n in 1..=3 {
+            let item = s
+                .upsert_media_item("tg", &format!("a:{n}"), &format!("A 第{n}集"), "video", None, None, None, None)
+                .await
+                .unwrap();
+            set_content_hash(&s, item, &format!("hash-a{n}")).await;
+            let _ = s.add_episode(target, item, 1, n).await.unwrap();
+            a.push(item);
+        }
+        // B = 第 2、3、4 集：第 2、3 集是 A 那两集的**同一个文件**，第 4 集是新的。
+        let mut b = Vec::new();
+        for n in 2..=4 {
+            let item = s
+                .upsert_media_item("tg", &format!("b:{n}"), &format!("B 第{n}集"), "video", None, None, None, None)
+                .await
+                .unwrap();
+            let h = if n <= 3 {
+                format!("hash-a{n}") // 与 A 同集同文件
+            } else {
+                "hash-b4".to_string()
+            };
+            set_content_hash(&s, item, &h).await;
+            let _ = s.add_episode(source, item, 1, n).await.unwrap();
+            b.push(item);
+        }
+
+        let report = s.merge_series(target, source).await.unwrap();
+        assert_eq!(report.added, 1, "只有 B 的第 4 集占新集号");
+        assert_eq!(report.merged_same_episode, 2, "B 的第 2、3 集归并为同集多源");
+        assert_eq!(report.sources_attached, 2);
+        assert!(report.skipped.is_empty(), "不得静默跳过任何条目");
+
+        let after = s.get_series(target).await.unwrap().unwrap();
+        assert_eq!(after.episodes.len(), 4, "合并后 4 集，不是 6 集");
+        let shape: Vec<(i64, i64, Vec<i64>)> = after
+            .episodes
+            .iter()
+            .map(|e| {
+                let mut srcs: Vec<i64> = e.sources.iter().map(|x| x.item_id).collect();
+                srcs.sort();
+                (e.episode_no, e.item_id, srcs)
+            })
+            .collect();
+        println!("[BUG-407] 合并后 (集号, 主条目, 备用源) = {shape:?}");
+        assert_eq!(
+            shape,
+            vec![
+                (1, a[0], vec![]),
+                (2, a[1], vec![b[0]]),
+                (3, a[2], vec![b[1]]),
+                (4, b[2], vec![]),
+            ],
+            "同集多源：第 2、3 集各两个源，第 1、4 集各自独立"
+        );
+
+        // `media_episode_source` 真的有两行（不是只在 view 里拼出来的假象）。
+        let rows = scalar_i64(&s.conn, "SELECT COUNT(*) FROM media_episode_source").await;
+        assert_eq!(rows, 2, "两条备用源必须真的落库");
+    }
+
+    /// **没有 hash 就不能合并**（用户 2026-10-23 裁定）：
+    /// 「文件怎么可能没有 hash，没有 hash 说明没有文件，两边都是空，不存在合并。」
+    ///
+    /// 所以「同季同集号」**不是**同一性依据 —— 两条各含第 1 集、都没有文件的剧集合并后，
+    /// 必须仍是**两个分集**（第 1、2 集），绝不能被归并成「一集两源」。
+    ///
+    /// 反向证伪：把判据改回「同槽且两侧 hash 不冲突 ⇒ 同一集」⇒ 本用例 FAIL
+    /// （`episodes.len()` 变 1、`added` 变 0）。
+    #[tokio::test]
+    async fn merge_series_no_hash_never_merges_bug407() {
+        let path = tmp_db("bug407_no_hash");
+        let s = Store::open(&path).await.unwrap();
+        let target = s.create_series("A", None, "series", None, None).await.unwrap();
+        let source = s.create_series("B", None, "series", None, None).await.unwrap();
+
+        // 两边都只有「第 1 集」，且都**没有文件**（content_hash 为 NULL）。
+        let a1 = s
+            .upsert_media_item("tg", "nh:1", "A 第1集", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let b1 = s
+            .upsert_media_item("tg", "nh:2", "B 第1集", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let _ = s.add_episode(target, a1, 1, 1).await.unwrap();
+        let _ = s.add_episode(source, b1, 1, 1).await.unwrap();
+
+        let report = s.merge_series(target, source).await.unwrap();
+        assert_eq!(
+            report.merged_same_episode, 0,
+            "没有文件就没有「同一份内容」，不得归并"
+        );
+        assert_eq!(report.added, 1, "两边都没文件 ⇒ 各自成集（续编）");
+
+        let after = s.get_series(target).await.unwrap().unwrap();
+        let shape: Vec<(i64, i64, usize)> = after
+            .episodes
+            .iter()
+            .map(|e| (e.episode_no, e.item_id, e.sources.len()))
+            .collect();
+        println!("[BUG-407] 无 hash 合并后 (集号, 主条目, 源数) = {shape:?}");
+        assert_eq!(
+            shape,
+            vec![(1, a1, 0), (2, b1, 0)],
+            "两个分集各自保留，谁也不是谁的备用源"
+        );
+        assert!(
+            scalar_i64(&s.conn, "SELECT COUNT(*) FROM media_episode_source").await == 0,
+            "备用源表必须一行都没有"
+        );
+    }
+
+    /// BUG-408 判据 3 之一：**hash 冲突 ⇒ 不是同一集** ⇒ 各自成集，绝不误并。
+    #[tokio::test]
+    async fn merge_series_hash_conflict_keeps_episodes_apart_bug408() {
+        let path = tmp_db("bug408_hash_conflict");
+        let s = Store::open(&path).await.unwrap();
+        let target = s.create_series("T", None, "series", None, None).await.unwrap();
+        let source = s.create_series("S", None, "series", None, None).await.unwrap();
+
+        let x = s
+            .upsert_media_item("tg", "x:1", "x", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let y = s
+            .upsert_media_item("tg", "y:1", "y", "video", None, None, None, None)
+            .await
+            .unwrap();
+        set_content_hash(&s, x, "hash-aaa").await;
+        set_content_hash(&s, y, "hash-bbb").await;
+
+        let _ = s.add_episode(target, x, 1, 1).await.unwrap();
+        let _ = s.add_episode(source, y, 1, 1).await.unwrap();
+
+        let report = s.merge_series(target, source).await.unwrap();
+        assert_eq!(report.merged_same_episode, 0, "hash 不同 ⇒ 不同集，不得归并");
+        assert_eq!(report.added, 1, "差异视频各自成集");
+
+        let after = s.get_series(target).await.unwrap().unwrap();
+        assert_eq!(after.episodes.len(), 2, "两集各自保留");
+        assert_eq!(after.episodes[0].episode_no, 1);
+        assert_eq!(after.episodes[0].item_id, x);
+        assert!(after.episodes[0].sources.is_empty(), "不得把差异视频塞成备用源");
+        assert_eq!(after.episodes[1].episode_no, 2, "差异视频续编到第 2 集");
+        assert_eq!(after.episodes[1].item_id, y);
+    }
+
+    /// BUG-408 判据 3 之二：**hash 相同 ⇒ 同一个视频 ⇒ 同一集**，与集号无关。
+    #[tokio::test]
+    async fn merge_series_hash_match_merges_across_slots_bug408() {
+        let path = tmp_db("bug408_hash_match");
+        let s = Store::open(&path).await.unwrap();
+        let target = s.create_series("T", None, "series", None, None).await.unwrap();
+        let source = s.create_series("S", None, "series", None, None).await.unwrap();
+
+        let x = s
+            .upsert_media_item("tg", "x:1", "x", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let y = s
+            .upsert_media_item("tg", "y:1", "y", "video", None, None, None, None)
+            .await
+            .unwrap();
+        set_content_hash(&s, x, "same-hash").await;
+        set_content_hash(&s, y, "same-hash").await;
+
+        let _ = s.add_episode(target, x, 1, 1).await.unwrap();
+        // 源把它编在第 3 集 —— hash 证明是同一个视频，仍应归并回第 1 集。
+        let _ = s.add_episode(source, y, 1, 3).await.unwrap();
+
+        let report = s.merge_series(target, source).await.unwrap();
+        assert_eq!(report.added, 0, "同一视频不占新集号");
+        assert_eq!(report.merged_same_episode, 1);
+        assert_eq!(report.sources_attached, 1);
+
+        let after = s.get_series(target).await.unwrap().unwrap();
+        assert_eq!(after.episodes.len(), 1, "同季只剩一集");
+        let ep = &after.episodes[0];
+        assert_eq!(ep.item_id, x, "目标原条目仍是主源");
+        assert_eq!(
+            ep.sources.iter().map(|s| s.item_id).collect::<Vec<_>>(),
+            vec![y],
+            "同一视频的另一个来源降为备用源"
+        );
+    }
+
+    /// BUG-408 判据 1/2：标题与总介绍取**有值侧**（缺失侧不覆盖有值侧）。
+    ///
+    /// 「缺失」在库里有两种落法（NULL 与空串），故两个方向都测：
+    ///  - 目标空串 / 源有值 ⇒ 取源；
+    ///  - 目标有值 / 源空串 ⇒ **保留目标**（用户已设的介绍不被抹掉）。
+    #[tokio::test]
+    async fn merge_series_metadata_takes_non_empty_side_bug408() {
+        let path = tmp_db("bug408_meta");
+        let s = Store::open(&path).await.unwrap();
+        // 目标：介绍是**空串**（不是 NULL）、无封面、无年份。
+        let target = s
+            .create_series("目标剧", Some(""), "series", None, None)
+            .await
+            .unwrap();
+        // 源：有介绍、有年份；封面随后直接写（`create_series` 不收 poster）。
+        let source = s
+            .create_series("源剧", Some("源侧介绍"), "series", Some(2020), None)
+            .await
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE media_series SET poster = '/covers/src.jpg' WHERE id = ?1",
+                params![source],
+            )
+            .await
+            .unwrap();
+
+        s.merge_series(target, source).await.unwrap();
+        let got = s.get_series(target).await.unwrap().unwrap();
+        assert_eq!(got.series.title, "目标剧", "两边都有标题 ⇒ 保留用户选定的目标标题");
+        assert_eq!(got.series.description.as_deref(), Some("源侧介绍"), "空串侧不得挡住有值侧");
+        assert_eq!(got.series.year, Some(2020), "年份缺失侧继承");
+        assert_eq!(got.series.poster.as_deref(), Some("/covers/src.jpg"), "封面缺失侧继承");
+
+        // ── 反方向：目标有介绍 / 源是空串 ⇒ 保留目标 ──
+        let t2 = s
+            .create_series("T2", Some("目标侧介绍"), "series", Some(1999), None)
+            .await
+            .unwrap();
+        let s2 = s.create_series("S2", Some(""), "series", None, None).await.unwrap();
+        s.merge_series(t2, s2).await.unwrap();
+        let got2 = s.get_series(t2).await.unwrap().unwrap();
+        assert_eq!(
+            got2.series.description.as_deref(),
+            Some("目标侧介绍"),
+            "源侧空串绝不能覆盖目标已设的介绍"
+        );
+        assert_eq!(got2.series.year, Some(1999), "目标年份不被缺失侧抹掉");
     }
 
     /// BUG-056 核心：合集区间（`episode_no_end`）合并后必须保留，
@@ -10602,7 +11280,10 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                let _ = s.add_episode(src, item, 1, ei + 1).await.unwrap();
+                // 集号**互不重叠**（S0=2,3 / S1=4,5 / S2=6,7）：本用例守的是
+                // 「批量搬移 + 全部源被删」，同集归并由 BUG-407 的专项用例覆盖。
+                let no = (si as i64) * 2 + (ei as i64) + 2;
+                let _ = s.add_episode(src, item, 1, no).await.unwrap();
             }
             sources.push(src);
         }
@@ -10610,6 +11291,7 @@ mod tests {
         let report = s.merge_series_batch(target, &sources).await.unwrap();
         assert_eq!(report.added, 6, "3 个源 × 2 集 = 6 集应全部搬入目标");
         assert_eq!(report.skipped.len(), 0, "无重复条目，不应有跳过");
+        assert_eq!(report.merged_same_episode, 0, "集号不重叠 ⇒ 无同集归并");
 
         // 目标分集数 = 原有 1 + 6。
         let after = s.get_series(target).await.unwrap().unwrap();
@@ -11202,13 +11884,13 @@ mod tests {
         );
     }
 
-    /// BUG-255 复现：混编组（1 视频 + N 照片）的 `episodeCount` / `photoCount` 必须把
-    /// 挂在视频集上的「集级挂图」（`media_episode_image`）算进去——否则典型的
-    /// 「1 预告片 + N 海报/截图」相册在媒体库卡片上显示「1 集」，与真实媒体数不符。
+    /// BUG-255（经 BUG-411 修订）：混编组的 `photoCount` 必须把挂在视频集上的
+    /// 「集级挂图」（`media_episode_image`）算进去；而 `episodeCount` 只算分集、
+    /// **不含**挂图（BUG-411 用户 2026-10-23 裁定：集数只回答「有多少集」，图由
+    /// `photoCount` 表达，卡片并列展示 `videoCount · photoCount`，故图不会被吞掉）。
     ///
-    /// 复现（当前 bug）：`list_series_filtered` 的 `episode_count` 只数 `media_episode`
-    /// 行，`photo_count` 只数 `media_episode JOIN media_item WHERE kind='photo'`；混编组
-    /// 的照片走 `media_episode_image`（BUG-168 的集级挂图，不是独立集），两者都不计数。
+    /// 复现（历史 bug）：`photo_count` 原先只数 `media_episode JOIN media_item
+    /// WHERE kind='photo'`，混编组的挂图走 `media_episode_image`（BUG-168），漏计。
     #[tokio::test]
     async fn bug255_mixed_group_counts_gallery_photos_as_episodes() {
         let path = tmp_db("bug255_mixed");
@@ -11245,10 +11927,44 @@ mod tests {
         let list = s.list_series_filtered(None).await.unwrap();
         assert_eq!(list.len(), 1, "应只有一部剧集");
         let view = &list[0];
-        // 真实媒体数 = 1 视频 + 3 照片 = 4；当前 bug 只数到 1。
-        assert_eq!(view.episode_count, 4, "混编组必须把集级挂图计入集数");
+        // BUG-411 修订：集数只算分集（1 视频 = 1 集），集级挂图不计入集数、走 photo_count。
+        assert_eq!(view.episode_count, 1, "集数只算分集，集级挂图不计入（BUG-411 修订）");
         assert_eq!(view.video_count, 1, "视频数应为 1");
         assert_eq!(view.photo_count, 3, "照片数必须把集级挂图算进去");
+    }
+
+    /// BUG-411：集数 = 分集按集号区间展开、按 `(season, 集号)` 去重后的集合大小。
+    /// 例：1-3 合集 + 单集 3 + 单集 4 ⇒ {1,2,3} ∪ {3} ∪ {4} = 4 集。
+    #[tokio::test]
+    async fn bug411_episode_count_expands_ranges_and_dedupes() {
+        let path = tmp_db("bug411_ranges");
+        let s = Store::open(&path).await.unwrap();
+        let sid = s
+            .create_series("区间去重", None, "series", None, None)
+            .await
+            .unwrap();
+        let a = s
+            .upsert_media_item("tg", "a:1", "合集1-3", "video", Some("c/a.mp4"), Some(10), Some(60), None)
+            .await
+            .unwrap();
+        let b = s
+            .upsert_media_item("tg", "b:3", "单集3", "video", Some("c/b.mp4"), Some(10), Some(60), None)
+            .await
+            .unwrap();
+        let c = s
+            .upsert_media_item("tg", "c:4", "单集4", "video", Some("c/c.mp4"), Some(10), Some(60), None)
+            .await
+            .unwrap();
+        // 合集占槽 1、区间到 3；单集 3、单集 4 各占一槽（UNIQUE 只约束起始 episode_no）。
+        s.add_episode_ranged(sid, a, 1, 1, Some(3)).await.unwrap();
+        s.add_episode_ranged(sid, b, 1, 3, None).await.unwrap();
+        s.add_episode_ranged(sid, c, 1, 4, None).await.unwrap();
+
+        let list = s.list_series_filtered(None).await.unwrap();
+        let view = list.iter().find(|v| v.id == sid).expect("剧集应存在");
+        // {1,2,3} ∪ {3} ∪ {4} = {1,2,3,4} = 4
+        assert_eq!(view.episode_count, 4, "区间展开 + 重叠去重后应为 4 集");
+        assert_eq!(view.video_count, 3, "视频数仍按分集行计（3 行）");
     }
 
     /// BUG-044 回归修复（2026-10-15）：纯照片组**不成集** —— 每张照片只完成 T0 登记，

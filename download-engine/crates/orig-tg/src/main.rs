@@ -218,6 +218,27 @@ async fn main() {
         orig_tg::store::Store::migrate_library_into_engine_dir(&root);
     }
 
+    // BUG-421：旧库根搬迁的**行级补漏**。上一步只搬目录，行的 `file_path` 由受管根
+    // 迁移改写 —— 实测漏了 72 条（文件已在新根下，行还指着旧根）。漏一条就是一条
+    // 永远播不了的条目，且 BUG-420 的回填会把它判成「文件不存在」而跳过。
+    // 必须排在上面的目录搬迁之后（否则新根还不存在，无从判定目标）。
+    match state.store.repair_old_library_root_rows().await {
+        Ok((fixed, skipped)) if fixed > 0 || skipped > 0 => {
+            let msg = format!(
+                "BUG-421 legacy library-root rows repaired: {fixed} rewritten, {skipped} kept \
+                 (target file missing — those really have no bytes)"
+            );
+            println!("[tg] {msg}");
+            state.push_log(msg);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            let msg = format!("[warn] BUG-421 legacy library-root row repair failed: {e}");
+            eprintln!("{msg}");
+            state.push_log(msg);
+        }
+    }
+
     // BUG-323：存量受管根迁移（引擎写过的旧落点 → 下载路径之内）。
     //
     // 库根改为派生值后不迁移 = 存量字节整片失联：库根相对路径的条目在新根下
@@ -348,6 +369,29 @@ async fn main() {
     }
     // 首份读快照：服务启动即有数据，避免首个 GET 返回空列表。
     state.refresh_cache_tasks().await;
+
+    // BUG-420：存量内容 hash 回填（后台、幂等、不阻断启动）。
+    //
+    // `content_hash` 的唯一生产点是内容寻址落盘（D24-A / BUG-309），2026-10-12 才落地
+    // ⇒ 此前下载的条目没有 hash，而 BUG-407/408 的归并判据「同 hash ⇒ 同一集」对它们
+    // **恒不成立**（实测真实库 video 只有 19/377 有 hash）。这里补一次：读盘算 SHA-256、
+    // 只写 `content_hash` 一列 —— 不搬字节、不碰 `media_blob` 引用计数。
+    //
+    // 位置：必须排在上面几次「迁移改写 file_path」之后，否则 `resolve_item_path` 会按
+    // 旧路径判「文件不存在」而整片跳过。延迟 8 s 只为让监听与首屏先起来。
+    {
+        let bg = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                bg.config.hash_backfill_delay_secs,
+            ))
+            .await;
+            let rep = orig_tg::hash_backfill::backfill_content_hashes(&bg, 0).await;
+            if !rep.is_noop() {
+                println!("[tg] BUG-420 hash backfill: {}", rep.summary());
+            }
+        });
+    }
 
     // 存量文件名撞车对账（BUG-100）：**只报不修**。
     // 新落盘已带 chat/message 唯一后缀，存量不动（改存量命名会让新代码找不到旧文件）。

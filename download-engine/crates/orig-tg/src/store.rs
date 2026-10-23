@@ -2047,6 +2047,79 @@ impl Store {
         }
     }
 
+    /// 旧库根行的**补漏**：`<下载路径>/library` → `<下载路径>/.orighub/library`（BUG-421）。
+    ///
+    /// 磁盘搬迁（[`Self::migrate_library_into_engine_dir`]）只搬目录，行的 `file_path`
+    /// 由受管根迁移改写 —— 实测漏了 72 条（全部指向旧根，且文件在新根下**确实存在**）。
+    /// 漏一条 = 用户看到一条永远播不了的条目，且它永远拿不到 `content_hash`（BUG-420
+    /// 的回填按 `resolve_item_path` 判存在性，路径错了就被算成「文件不存在」）。
+    ///
+    /// 纪律：**只在目标文件确实存在时改写**。目标不在 ⇒ 保持原样并计入 `skipped`
+    /// —— 那些是真的没有字节，改写只会把「文件没了」伪装成「路径对了」。
+    /// 幂等：改写后的路径不再以旧根开头，重跑不动任何行。
+    ///
+    /// 返回 `(改写数, 目标不存在数)`。
+    pub async fn repair_old_library_root_rows(&self) -> libsql::Result<(i64, i64)> {
+        let dl = self.download_root().await;
+        let new_root = self.library_root().await;
+        self.repair_old_library_root_rows_at(&dl, &new_root).await
+    }
+
+    /// [`Self::repair_old_library_root_rows`] 的可注入版本（根由调用方给，便于单测）。
+    pub async fn repair_old_library_root_rows_at(
+        &self,
+        download_root: &Path,
+        new_root: &Path,
+    ) -> libsql::Result<(i64, i64)> {
+        let old_prefix = {
+            let p = download_root.join(Self::LIBRARY_SUBDIR);
+            let s = orig_core::paths::to_wire(&p);
+            // 统一带尾斜杠，避免 `.../library2` 被当成 `.../library` 的子路径。
+            if s.ends_with('/') {
+                s
+            } else {
+                format!("{s}/")
+            }
+        };
+        let old_lower = old_prefix.to_lowercase();
+        if !new_root.is_dir() {
+            return Ok((0, 0));
+        }
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, file_path FROM media_item WHERE file_path IS NOT NULL",
+                (),
+            )
+            .await?;
+        let mut fixed = 0i64;
+        let mut skipped = 0i64;
+        while let Some(r) = rows.next().await? {
+            let id: i64 = r.get(0)?;
+            let fp: String = r.get(1)?;
+            let wire = orig_core::paths::to_wire_str(&fp);
+            if !wire.to_lowercase().starts_with(&old_lower) {
+                continue;
+            }
+            let rest = &wire[old_prefix.len()..];
+            let candidate = new_root.join(rest.replace('/', std::path::MAIN_SEPARATOR_STR));
+            if !candidate.is_file() {
+                skipped += 1;
+                continue;
+            }
+            // 只改位置列：`content_hash` 是**内容身份**，与文件放在哪无关，
+            // 这里既不能 acquire 也不能 release 引用计数（字节不在 `.blobs` 下）。
+            self.conn
+                .execute(
+                    "UPDATE media_item SET file_path = ?2 WHERE id = ?1",
+                    params![id, orig_core::paths::to_wire(&candidate)],
+                )
+                .await?;
+            fixed += 1;
+        }
+        Ok((fixed, skipped))
+    }
+
     /// 完整受管根集合：下载根（locked，primary 取存储值或默认 true）+ 用户根。
     pub async fn managed_roots(&self) -> Vec<ManagedRoot> {
         // 出参形态必须与用户根一致（用户根在 `user_managed_roots` 里已被
@@ -4665,6 +4738,73 @@ mod tests {
             listed[0].new_hits, 0,
             "存量规则升级后不得把已有命中算成「新命中」（否则首屏全是假 +N）"
         );
+    }
+
+    /// BUG-421：旧库根（`<下载根>/library`）的行级补漏。
+    ///
+    /// 判据两条，缺一不可：
+    /// 1. 目标文件在新根下**确实存在** ⇒ 改写路径（这是真漏，不是文件没了）；
+    /// 2. 目标不存在 ⇒ **保持原样**（把「文件没了」改写成「路径对了」是掩盖事实）。
+    /// 反向证伪：去掉第 2 条的守卫，`skipped` 会变成 0、且悬空行会被改成同样悬空的
+    /// 新路径 —— 断言当场 FAIL。
+    #[tokio::test]
+    async fn repairs_old_library_root_rows_only_when_target_exists_bug421() {
+        let s = store("bug421_rows").await;
+        let base = FixtureDir::new("bug421_rows_files");
+        let dl = base.path().join("dl");
+        let new_root = dl.join(".orighub").join("library");
+        let chat = new_root.join("chat--100");
+        std::fs::create_dir_all(&chat).unwrap();
+        std::fs::write(chat.join("7-media.mp4"), b"payload").unwrap();
+
+        let old_prefix = orig_core::paths::to_wire(&dl.join(Store::LIBRARY_SUBDIR));
+        let hit = format!("{old_prefix}/chat--100/7-media.mp4");
+        let miss = format!("{old_prefix}/chat--100/8-media.mp4");
+        s.upsert_media_item("tg", "-100:hit", "hit", "video", Some(&hit), None, None, None)
+            .await
+            .unwrap();
+        s.upsert_media_item("tg", "-100:miss", "miss", "video", Some(&miss), None, None, None)
+            .await
+            .unwrap();
+
+        let (fixed, skipped) = s
+            .repair_old_library_root_rows_at(&dl, &new_root)
+            .await
+            .unwrap();
+        assert_eq!(fixed, 1, "目标存在的必须改写");
+        assert_eq!(skipped, 1, "目标不存在的必须保持原样（不许伪装）");
+
+        let got = |name: &str| {
+            let s = &s;
+            let r = format!("-100:{name}");
+            async move {
+                let stmt = s
+                    .conn
+                    .prepare("SELECT file_path FROM media_item WHERE ref = ?1")
+                    .await
+                    .unwrap();
+                let mut rows = stmt.query(params![r]).await.unwrap();
+                rows.next()
+                    .await
+                    .unwrap()
+                    .map(|row| row.get::<String>(0).unwrap())
+                    .unwrap()
+            }
+        };
+        let hit_after = got("hit").await;
+        assert!(
+            hit_after.contains(".orighub"),
+            "改写后必须落在新库根下，实测 {hit_after}"
+        );
+        assert!(std::path::Path::new(&hit_after).is_file(), "改写后的路径必须真能打开");
+        assert_eq!(got("miss").await, miss, "悬空行一字不动");
+
+        // 幂等：再跑一次，已改写的不再以旧根开头 ⇒ 只剩那条悬空的被跳过。
+        let (fixed2, skipped2) = s
+            .repair_old_library_root_rows_at(&dl, &new_root)
+            .await
+            .unwrap();
+        assert_eq!((fixed2, skipped2), (0, 1), "重跑零改写");
     }
 
     #[tokio::test]

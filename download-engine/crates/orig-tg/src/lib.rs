@@ -19,6 +19,8 @@ pub mod grammers;
 pub mod login;
 pub mod blob;
 pub mod cache;
+/// 存量内容 hash 回填（BUG-420）：`hash_file` 的唯一生产调用点。
+pub mod hash_backfill;
 /// 极简容量+TTL LRU（媒体元数据/缩略图缓存，BUG-028）。
 pub mod lru;
 pub mod media;

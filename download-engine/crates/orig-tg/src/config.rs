@@ -36,6 +36,11 @@ pub struct Config {
     /// 单条目下载**空闲上限**（秒，BUG-257/271）：连续无字节超过即判停滞（治「死」）。
     /// DB `app_setting: download_idle_max_secs` 可运行时覆盖。
     pub download_idle_secs: u64,
+    /// 启动后**多久**跑存量内容 hash 回填（秒，BUG-420）。默认 8s：先让监听与首屏起来。
+    ///
+    /// 设成很大的值等于关掉（隔离验收脚本靠这个把「启动自动回填」与「手动端点」
+    /// 解耦，否则两者抢同一批条目、断言必然抖）。
+    pub hash_backfill_delay_secs: u64,
 }
 
 impl Default for Config {
@@ -55,6 +60,7 @@ impl Default for Config {
             proxy: None,
             download_item_max_secs: 30 * 60,
             download_idle_secs: 90,
+            hash_backfill_delay_secs: 8,
         }
     }
 }
@@ -112,6 +118,12 @@ impl Config {
         if let Ok(v) = std::env::var("ORIG_TG_DOWNLOAD_IDLE_SECS") {
             if let Ok(n) = v.parse() {
                 cfg.download_idle_secs = n;
+            }
+        }
+        // BUG-420：启动回填延迟（秒）。0 = 不延迟，很大的值 ≈ 关闭。
+        if let Ok(v) = std::env::var("ORIG_TG_HASH_BACKFILL_DELAY_SECS") {
+            if let Ok(n) = v.parse() {
+                cfg.hash_backfill_delay_secs = n;
             }
         }
         if let Ok(v) = std::env::var("ORIG_TG_DOWNLOAD_DIR") {

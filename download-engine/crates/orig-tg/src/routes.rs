@@ -271,6 +271,12 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             axum::routing::patch(patch_media_tag).delete(delete_media_tag),
         )
         .route("/api/media/scan", axum::routing::post(scan_media_dir))
+        // BUG-420：内容 hash 覆盖率体检 + 存量回填（`hash_file` 的生产入口）。
+        .route("/api/media/hashes", get(media_hash_coverage))
+        .route(
+            "/api/media/hashes/backfill",
+            axum::routing::post(media_hash_backfill),
+        )
         // M2 缓存模块独立路由组（BUG-051 §0：缓存不再挂在 TG 端）
         .merge(crate::cache::router())
         .with_state(state)
@@ -724,6 +730,7 @@ fn parse_range(value: Option<&HeaderValue>) -> Result<Option<MediaRange>, ApiErr
 
 /// 仅取 `Range` 头的起始字节偏移（B 路径用：判断 `.part` 已落盘足够字节即可 206 服务）。
 /// 解析失败/非 `bytes=` 单位/尾部计数（`bytes=-N`）一律返回 None（交由直播流处理）。
+#[allow(dead_code)]
 fn range_start_only(rstr: &str) -> Option<u64> {
     let text = rstr.trim();
     if !text.starts_with("bytes=") {
@@ -3108,6 +3115,21 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
                                     crate::media::classify_ext(&ext),
                                 )
                                 .await;
+                            // BUG-420：**平铺路径同样要留 hash**。此前只有内容寻址落盘
+                            // 才写 `content_hash`，走这条降级路的条目永远没有 hash ⇒
+                            // 下次启动要再回填一遍，且归并判据对它们恒不成立。
+                            // 字节不在 `.blobs` 下，故走 `set_item_content_hash`
+                            // （只写内容身份，不 acquire blob 引用计数）。
+                            let hp = std::path::PathBuf::from(&housed.absolute_path);
+                            if let Ok(h) =
+                                tokio::task::spawn_blocking(move || crate::blob::hash_file(&hp))
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        Err(std::io::Error::new(std::io::ErrorKind::Other, format!("join: {e}")))
+                                    })
+                            {
+                                let _ = st.store.set_item_content_hash(*item, &h).await;
+                            }
                         }
                     }
                     None => {
@@ -3935,6 +3957,45 @@ async fn media_stats(
     Ok(Json(json!(s)))
 }
 
+/// `GET /api/media/hashes` — 内容 hash 覆盖率体检（BUG-420）。
+///
+/// 三档互斥：`hashed`（有 hash）/ `missing`（有 `file_path` 但无 hash，含路径悬空）/
+/// `noFilePath`（从未下载）。用户看到的「596 条里只有 47 条有 hash」就是这个口径。
+async fn media_hash_coverage(
+    State(st): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (hashed, missing, no_file_path) = st
+        .store
+        .content_hash_coverage()
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    Ok(Json(json!({
+        "hashed": hashed,
+        "missing": missing,
+        "noFilePath": no_file_path,
+        "total": hashed + missing + no_file_path,
+    })))
+}
+
+#[derive(Deserialize)]
+struct HashBackfillQuery {
+    /// 最多处理多少条（缺省/0 = 全量）。
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `POST /api/media/hashes/backfill?limit=N` — 给存量条目补内容 hash（BUG-420）。
+///
+/// **幂等**：扫描集是 `content_hash IS NULL`，补过的自然出集，重复调用只做零事。
+/// 只补 hash 不搬字节、不碰 `media_blob` 引用计数（详见 `hash_backfill` 模块文档）。
+async fn media_hash_backfill(
+    State(st): State<Arc<AppState>>,
+    Query(q): Query<HashBackfillQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let rep = crate::hash_backfill::backfill_content_hashes(&st, q.limit.unwrap_or(0)).await;
+    Ok(Json(json!(rep)))
+}
+
 /// GET /api/media/export/preview?seriesIds=1,2,3 — 导出完备性校验（byte-ownership P5，只读）。
 ///
 /// 逐剧集列出导出阻断项（缺字节/缺简介/缺图/零字节）；`seriesIds` 缺省 = 全库。
@@ -4183,6 +4244,25 @@ async fn import_media_items(
             )
             .await
             .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+        // BUG-420：本地导入的条目**当场**算内容 hash —— 归并判据（BUG-407/408）用它
+        // 认「同一份文件」，而这条路径此前完全不写 hash（只能等下次启动回填，
+        // 期间导入→合并会退化成「各占一集」）。只写内容身份，不碰 blob 引用计数。
+        if source != "tg" {
+            if let Some(p) = path.as_deref() {
+                let pb = std::path::PathBuf::from(p);
+                if let Ok(h) = tokio::task::spawn_blocking(move || crate::blob::hash_file(&pb))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("join: {e}"),
+                        ))
+                    })
+                {
+                    let _ = st.store.set_item_content_hash(id, &h).await;
+                }
+            }
+        }
         ids.push(id);
     }
     st.push_log(&format!("/api/media/items imported {} item(s)", ids.len()));
@@ -5545,10 +5625,17 @@ async fn media_item_stream(
         // 无 pump 认领的孤儿条目（与「路径 A」同源的变体）。现在守卫 `slot` 随
         // `return` 一起 drop ⇒ 出表，不会污染单飞表。
         if registered {
+            // BUG-401：回跳（含浏览器发出的 closed range `bytes=START-END`）必须命中
+            // 已转码落盘的 `.part`，回 206 + ETag + Cache-Control，而非重新起一条直播首转。
+            // 旧实现用 `range_start_only` 只认 open range（`bytes=N-`），closed range 被放过
+            // ⇒ 落到 live 分支重新拉流（现象即 `x-orig-stream: live` 的「回跳重新拉流」）。
+            // 现改为用 `media_parse_range` 解析任意合法 Range，只要起点已落在当前 `.part`
+            // 字节内即从 `.part` 回 206；起点超出（seek 到尚未转码的区段）才交给 live 首转。
             if let Some(rstr) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
-                if let Some(start) = range_start_only(rstr) {
-                    if let Ok(meta) = tokio::fs::metadata(&part_p).await {
-                        if meta.len() > start {
+                if let Ok(meta) = tokio::fs::metadata(&part_p).await {
+                    let part_len = meta.len();
+                    if let Some((start, _, _)) = media_parse_range(Some(rstr), part_len) {
+                        if start < part_len {
                             let mut res = serve_local_file(
                                 part_p.to_string_lossy().as_ref(),
                                 Some("video"),
@@ -5588,12 +5675,11 @@ async fn media_item_stream(
         let mut res = Response::new(body);
         res.headers_mut()
             .insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
-        // 仅可缓存路径（registered）声明可 Range：完成代理与增长中 `.part` 都能 206 服务；
-        // 锚点 live-only 流不落盘、不可 Range。
-        if registered {
-            res.headers_mut()
-                .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-        }
+        // BUG-401：live 首转是 chunked 流式（无总长、不可断点），**不能**真正服务
+        // Range。如实不声明 accept-ranges（旧实现撒谎声明，导致浏览器做出错误 seek
+        // 决策：回跳时另发 Range 请求却拿不到 206，被迫重新拉整条直播流）。已完成
+        // 代理与增长中 `.part` 走 serve_local_file，自带正确的 accept-ranges / ETag /
+        // Cache-Control；closed range 回跳命中 `.part` 的 206 后即不再回源。
         res.headers_mut()
             .insert("x-orig-stream", stream_mode_header(speed_hundredths, "live"));
         Ok(res)
@@ -6606,6 +6692,8 @@ async fn merge_media_series(
     }
     Ok(Json(json!({
         "added": rep.added,
+        "mergedSameEpisode": rep.merged_same_episode,
+        "sourcesAttached": rep.sources_attached,
         "skippedCount": rep.skipped.len(),
         "skipped": rep.skipped,
     })))
@@ -9921,7 +10009,10 @@ mod tests {
                 .upsert_media_item("tg", &format!("s{si}:1"), "x", "video", None, None, None, None)
                 .await
                 .unwrap();
-            let _ = st.store.add_episode(s, item, 1, 1).await.unwrap();
+            // 集号**互不重叠**：本用例只验证「批量搬移 + 删源」，同集归并由
+            // `merge_series_merges_same_slot_into_multi_source_bug407` 单独守
+            // （BUG-407 起同槽会归并为多源，不再续编，两者是不同的断言面）。
+            let _ = st.store.add_episode(s, item, 1, si as i64 + 1).await.unwrap();
             sources.push(s);
         }
 
@@ -9935,6 +10026,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["added"], 3, "3 个源各 1 集 → 搬入 3 集");
         assert_eq!(v["skippedCount"], 0);
+        assert_eq!(v["mergedSameEpisode"], 0, "集号不重叠 ⇒ 无同集归并");
+        assert_eq!(v["sourcesAttached"], 0);
 
         for s in &sources {
             assert!(
