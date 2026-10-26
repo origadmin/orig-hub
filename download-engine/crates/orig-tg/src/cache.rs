@@ -1297,7 +1297,7 @@ pub(crate) fn priority_target(req: &SetPriorityReq) -> Result<PriorityTarget, Ap
 /// 仅当 `priority > 0` 且仍非终态（运行中/排队中被置顶）才允许取消置顶，
 /// 否则按钮还在、点了却 422，那是界面与端点判据分裂（BUG-249）。
 const PRIORITY_REJECT_MSG: &str =
-    "priority only applies to queued tasks (or to unpinning an already pinned one)";
+    "priority only applies to queued tasks (settled ones carry no pin to unpin)";
 
 fn prioritizable(t: &CacheTask) -> bool {
     t.status == "queued" || (t.priority > 0 && t.status != "done" && t.status != "cancelled")
@@ -2538,15 +2538,44 @@ mod tests {
             .await
             .expect_err("终态任务置顶必须 422");
         assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
-        // 但已置顶的任务即使终态也**必须**能取消置顶（否则置顶不可撤销）。
+        // BUG-396 裁定：**终态任务不携带优先状态** —— `finish_cache_task` 离队就把
+        // `priority` 归零。所以「置顶 → 完成 → 取消置顶」这条链走到一半时，那个待撤的
+        // pin 已经被引擎自己撤掉了；再发 unpin 是**无事可做**，与「终态置顶」同口径
+        // 必须 422（不假装成功），这不是 BUG-419 设想的端点缺陷。
         let (s, _) = priority_call(st.clone(), queued, json!({"top": true}))
             .await
             .expect("置顶成功");
         assert_eq!(s, StatusCode::OK);
         st.store.finish_cache_task(queued, "done", None).await.unwrap();
-        let (s, v) = priority_call(st.clone(), queued, json!({"priority": 0}))
+        // 先钉死前提：完成那一刻 priority 已归零 ⇒ 终态不可能残留 pin（否则下一条
+        // 断言就只是在替 BUG-396 打补丁，看不出因果关系）。
+        let after = st
+            .store
+            .get_cache_task(queued)
             .await
-            .expect("已置顶任务的取消置顶必须始终可用");
+            .expect("readable")
+            .expect("task exists");
+        assert_eq!(
+            after.priority, 0,
+            "BUG-396：任务离队即清 priority，终态不该有 pin 可撤"
+        );
+        let (s, _) = priority_call(st.clone(), queued, json!({"priority": 0}))
+            .await
+            .expect_err("终态任务（哪怕此前置顶过）的 unpin 必须 422");
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+
+        // 「取消置顶」唯一还有可观察效果的场景：**在跑**的任务身上还挂着 pin
+        // （排队时置的顶，跑到一半用户想撤）。UI 的「取消优先」按钮也只在这种情形下
+        // 存在（BUG-396 已对终态隐藏），端点必须放行，否则才真成了不可撤销。
+        let running = seeded_task(&st, "m:7:83", "queued").await;
+        let (s, _) = priority_call(st.clone(), running, json!({"top": true}))
+            .await
+            .expect("排队任务必须能置顶");
+        assert_eq!(s, StatusCode::OK);
+        st.store.mark_cache_task_running(running).await.unwrap();
+        let (s, v) = priority_call(st.clone(), running, json!({"priority": 0}))
+            .await
+            .expect("置顶后必须能取消置顶（UI 有按钮 ⇔ 端点必须放行）");
         assert_eq!(s, StatusCode::OK);
         assert_eq!(v["tasks"][0]["priority"], json!(0));
 
