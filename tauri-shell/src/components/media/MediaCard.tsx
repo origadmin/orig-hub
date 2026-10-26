@@ -515,7 +515,12 @@ function MediaCardBase(props: {
 
       {/* 文本区 */}
       <div className="flex min-w-0 flex-1 flex-col gap-1 px-2.5 py-2">
-        <p className="truncate text-sm font-medium text-fg-strong" title={displayName}>
+        {/*
+          BUG-138 验收要钉「卡片显示的是新标题还是旧标题」，而卡片文本区同时渲染
+          剧名（`· seriesTitle`）—— 改条目标题不该顺带改剧集名，整卡文本因此永远
+          含着旧名。给显名行一个 testid，判据才钉得住标题本身。
+        */}
+        <p className="truncate text-sm font-medium text-fg-strong" title={displayName} data-testid="media-card-title">
           {displayName}
         </p>
         <p className="flex items-center gap-1 truncate text-xs text-muted">

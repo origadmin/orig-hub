@@ -30,16 +30,23 @@ export function cached<T>(key: string, loader: () => Promise<T>): Promise<T> {
   if (running) return running as Promise<T>
   const p = loader()
     .then((v) => {
-      resolved.set(key, v)
+      // 失效竞赛（BUG-425）：loader 在途时该键可能已被写操作作废 —— 此时 v 是
+      // **写前**数据。仅当本 promise 仍是该键当前登记在途的那一条才写回；
+      // 已被除名（失效）还硬写，旧数据就会在失效之后落进缓存，甚至覆盖后来
+      // 者装入的新数据 —— 症状即「刚改完又看到旧值」。发起 loader 的消费者
+      // 照旧拿到 v（它问在写前），被禁止的只是把写前数据留给后来的读者。
+      if (inflight.get(key) === p) resolved.set(key, v)
       return v
     })
     .catch((e: unknown) => {
       // 失败不留在缓存里：一次网络抖动不该让这个 key 在此后整个会话都用不了。
-      inflight.delete(key)
+      if (inflight.get(key) === p) inflight.delete(key)
       throw e
     })
     .finally(() => {
-      inflight.delete(key)
+      // 只摘自己那条：失效后同 key 可能已换成新请求 p2，p1 收尾时误摘 p2
+      // 会打断 p2 的在途合并（BUG-425 同一竞态面）。
+      if (inflight.get(key) === p) inflight.delete(key)
     })
   inflight.set(key, p)
   return p
@@ -56,6 +63,11 @@ export function invalidateCache(prefix?: string) {
     return
   }
   for (const k of [...resolved.keys()]) if (k.startsWith(prefix)) resolved.delete(k)
+  // 在途请求一并除名（BUG-425）：否则失效后仍在途的旧读请求返回时会走 `cached()`
+  // 的写回把**写前**数据落进缓存（覆盖这次失效），且后续读还会合并那条本该作废的
+  // 在途 promise（不重发 = 永远喂旧值）。promise 不取消 —— 发起它的消费者照旧拿到
+  // 自己那一份，被禁止的只是它污染后来的读者。
+  for (const k of [...inflight.keys()]) if (k.startsWith(prefix)) inflight.delete(k)
 }
 
 /** 缓存键：集中在这里，避免各处手写字符串拼错导致「缓存了但永远不命中」。 */
