@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { ChevronDown, ChevronRight, ChevronUp, Plus } from 'lucide-react'
+import { ChevronDown, ChevronRight, ChevronUp, Plus, Search } from 'lucide-react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { Switch } from './ui/switch'
@@ -481,6 +481,22 @@ export function TgPanel(
   const [filterDlgOpen, setFilterDlgOpen] = useState(false)
   /** 节内规则检索（常驻；BUG-320：入口可见性不搞「多了才出现」） */
   const [filterQuery, setFilterQuery] = useState('')
+  /**
+   * BUG-439：节内检索框的折叠态。
+   *
+   * 同节里「新建」早已收进 `+` 图标钮（2026-10-20 裁定），检索却还永占一行版面——
+   * 一件事两套形态。这里让它向 `+` 对齐：**收起 = 只剩一个图标钮**。
+   *
+   * 注意这不是 BUG-320 禁止的那种「条件渲染」：按钮恒定可见（不随规则数量
+   * 显现/消失），折的是那行 Input 的版面开销，入口本身没有消失。
+   */
+  const [filterSearchOpen, setFilterSearchOpen] = useState(false)
+  /** 收起即清词：过滤条件不能藏进看不见的输入框里继续生效（隐形过滤 = 用户读到
+   *  「列表变少了」却找不到原因，与 BUG-390「让不可见状态自带解释」同源）。 */
+  const closeFilterSearch = useCallback(() => {
+    setFilterSearchOpen(false)
+    setFilterQuery('')
+  }, [])
   /** 规则超 K 折叠：false = 只渲染前 K 条 */
   const [filterExpanded, setFilterExpanded] = useState(false)
   const [filterAdding, setFilterAdding] = useState(false)
@@ -2033,6 +2049,22 @@ export function TgPanel(
                 {t('tg.filterHeading')}
               </h3>
               {/*
+               * BUG-439：检索入口与新建入口同形态（h-7 secondary 图标钮，BUG-344 token），
+               * 贴在 `+` 左边。点它才展开那行 Input；再点 / Esc 收起并清空检索词。
+               */}
+              <Button
+                variant="secondary"
+                size="icon-sm"
+                className="shrink-0"
+                aria-label={t('tg.filterSearchToggle')}
+                aria-expanded={filterSearchOpen}
+                aria-controls="tg-filter-search-field"
+                data-testid="tg-filter-search-toggle"
+                onClick={() => (filterSearchOpen ? closeFilterSearch() : setFilterSearchOpen(true))}
+              >
+                <Search className="h-3.5 w-3.5" aria-hidden="true" />
+              </Button>
+              {/*
                * 节头动作钮 token（BUG-344）：h-7 + 有边框有底色（secondary）。
                * BUG-327「存在≠可用」与 BUG-344「按钮过大/右边还有文字」的共同解 =
                * **可见性由边框+底色承担，不由尺寸+文字承担**：v3 的 h-9 图标+文字是
@@ -2043,25 +2075,33 @@ export function TgPanel(
                * 一行的方式严重破坏了整体设计」。弹窗内控件沿用 BUG-329 既有 testid
                * （验收 selector 不变）。
                */}
-              <div className="relative shrink-0">
-                <Button
-                  variant="secondary"
-                  size="icon-sm"
-                  className="shrink-0"
-                  aria-label={t('tg.filterNewDlgTitle')}
-                  aria-expanded={filterDlgOpen}
-                  aria-haspopup="dialog"
-                  data-testid="tg-filter-new"
-                  onClick={() => setFilterDlgOpen((v) => !v)}
-                >
-                  <Plus className="h-3.5 w-3.5" aria-hidden="true" />
-                </Button>
+              <Button
+                variant="secondary"
+                size="icon-sm"
+                className="shrink-0"
+                aria-label={t('tg.filterNewDlgTitle')}
+                aria-expanded={filterDlgOpen}
+                aria-haspopup="dialog"
+                data-testid="tg-filter-new"
+                onClick={() => setFilterDlgOpen((v) => !v)}
+              >
+                <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+              </Button>
+            </div>
+            {filterOpen && (
+              <div id="tg-filter-list-body" className="px-1.5 pb-1.5">
+                {/*
+                 * BUG-329/439 收敛：新建筛选输入框收成「点 + 展开 / 再点 + 或 Esc 收起」
+                 * 的行内形态，紧贴 + 所在节头下方，不再浮层遮挡内容。
+                 * 关键：仍包在 `tg-filter-dialog` 容器内 ⇒ 满足验收「输入不得是节内常驻
+                 * 行」（只有 filterDlgOpen 时才存在），且 `tg-filter-input` 仍在弹层内。
+                 */}
                 {filterDlgOpen && (
                   <div
                     role="dialog"
                     aria-label={t('tg.filterNewDlgTitle')}
                     data-testid="tg-filter-dialog"
-                    className="absolute right-0 top-full z-20 mt-1 w-60 rounded-md border border-border-subtle bg-surface p-2 shadow-lg"
+                    className="mb-1.5 rounded-md border border-border-subtle bg-surface p-2 shadow-sm"
                   >
                     <p className="px-1 pb-1.5 text-[12px] font-semibold text-fg-strong">
                       {t('tg.filterNewDlgTitle')}
@@ -2113,22 +2153,25 @@ export function TgPanel(
                     </div>
                   </div>
                 )}
-              </div>
-            </div>
-            {filterOpen && (
-              <div id="tg-filter-list-body" className="px-1.5 pb-1.5">
-                {/* 节内检索框（常驻）：规则量级 ≤ 几百，纯客户端过滤。
-                    BUG-320 纪律：入口可见性不搞「规则多了才出现」。 */}
-                <div className="px-1 pb-1">
+              {/* 节内检索框（BUG-439：折叠）—— 规则量级 ≤ 几百，纯客户端过滤。
+                   BUG-320 纪律说的是「入口不得随数据量显现/消失」：按钮常驻满足它，
+                   这里折的是一行 Input 的版面，不是把入口藏掉。 */}
+              {filterSearchOpen && (
+                <div id="tg-filter-search-field" className="px-1 pb-1">
                   <Input
+                    autoFocus
                     value={filterQuery}
                     onChange={(e) => setFilterQuery(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') closeFilterSearch()
+                    }}
                     placeholder={t('tg.filterSearchPlaceholder')}
                     aria-label={t('tg.filterSearchPlaceholder')}
                     data-testid="tg-filter-search"
                     className="h-7 text-[12px]"
                   />
                 </div>
+              )}
                 {/* BUG-390：命中数作用域可见性 —— count_filter_hits 只统计「监控中」
                     频道的消息（filter_ignores_unmonitored_channels 钉死该语义），
                     监控列表为空时全部关键词恒 0，被读成「数据全没了」。让 0 自带
