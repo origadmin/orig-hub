@@ -613,6 +613,22 @@ export interface ViewerItem {
   /** 降级地址（首选失败时回退一次，如本地缺失回退在线流） */
   fallbackSrc?: string
   /**
+   * 服务端转码流地址（**仅媒体库条目**填）。
+   *
+   * BUG-434（用户 2026-10-26）：「TG 中点击视频……后台视频在加载，界面依然是展示界面，
+   * 没有播放行为却做了播放动作。」
+   *
+   * 根因：`MediaViewer` 原来自己拼这个地址 —— `mediaItemStreamUrl(cur.messageId)`。
+   * 而 `messageId` 在 TG 场景下是 **Telegram 消息号**，不是媒体库条目号，于是拼出
+   * `/api/media/items/<tgMsgId>/stream` 这种**跨域错位**的地址（实测 404），
+   * 播放器还因 `streamFirst` 先起在这条死链上，白等一轮错误才回退到真正能用的源。
+   *
+   * 修法：把「转码流地址」变成**调用方显式声明**的字段 —— 谁有转码流谁填
+   * （目前只有媒体库），TG 一律不填 ⇒ 播放器直接起在 `src` 上。
+   * 不在 `MediaViewer` 里靠 `chatId === 0` 之类的隐式约定判别来源。
+   */
+  streamSrc?: string
+  /**
    * 所属剧集 id（媒体库场景）。有值时播放器展示分集列表，
    * 并支持「自动播下一集」。模块无关：TG 消息流不填即可。
    */

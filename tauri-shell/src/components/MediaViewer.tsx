@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from 'react'
 import { Image as ImageIcon } from 'lucide-react'
 import { Button } from './ui/button'
 import { useTranslation } from '../i18n'
-import { mediaItemStreamUrl } from '../api/media'
 import { setPosterExtractionPaused } from '../lib/poster'
 import { episodeRecacheCandidates, recacheFromSource } from '../lib/mediaSources'
 import { cn } from '../lib/utils'
@@ -248,8 +247,18 @@ export function MediaViewer(props: {
               nextUp={nextUp}
               onPlayNext={() => nextItem && goTo(nextItem)}
               hasVideoTrack={cur.kind === 'video'}
-              // 兼容流（BUG-208）：视频条目解码不支持时自动切服务端实时转码
-              compatSrc={cur.kind === 'video' ? mediaItemStreamUrl(cur.messageId) : undefined}
+              /*
+               * 兼容流（BUG-208）：视频条目解码不支持时自动切服务端实时转码。
+               *
+               * BUG-434：**不再在这里拼地址**。原写法是
+               * `mediaItemStreamUrl(cur.messageId)` —— 但 `messageId` 在 TG 场景下是
+               * Telegram 消息号，拼出来的是 `/api/media/items/<tgMsgId>/stream`
+               * 这条跨域错位的死链（实测 404）；播放器还因 stream-first 先起在它上面，
+               * 白等一轮错误才回退到真正能用的 `/api/tg/file/...`，用户看到的就是
+               * 「后台一直在加载、画面还是展示界面」。
+               * 现在由调用方用 `streamSrc` 显式声明「我这条有转码流」，TG 不填。
+               */
+              compatSrc={cur.kind === 'video' ? cur.streamSrc : undefined}
               // BUG-253：真源总时长（来自 `GET /api/media/items/<id>` 的 duration 字段），
               // 播放器据此显示正确总数，不取 live 转码流的瞬时 `video.duration`。
               duration={cur.duration ?? undefined}

@@ -17,6 +17,7 @@ import {
   listMediaItems,
   listSeries,
   listTags,
+  mediaItemStreamUrl,
   mediaItemUrl,
   mediaListParams,
   patchMediaItem,
@@ -153,6 +154,12 @@ function toViewerItem(i: MediaItem): ViewerItem {
     // 介绍单独下发：返回行显示标题、底部行显示介绍，两处不重复。
     description: i.description ?? null,
     src: mediaItemUrl(i.id),
+    /*
+     * BUG-434：转码流地址由**库这一侧显式声明**，不再让 `MediaViewer` 自己用
+     * `messageId` 去拼 —— TG 场景下 `messageId` 是 Telegram 消息号，拼出来的是
+     * 一条必然 404 的跨域错位地址。只有库内条目有转码流。
+     */
+    streamSrc: i.kind === 'video' ? mediaItemStreamUrl(i.id) : undefined,
     poster: i.poster ?? null,
     // 非 video 一律不挂剧集（与 `useGoLibrary` 同一口径）：图片/音频/文档永远不进
     // 剧集。`series_id` 是历史推导值，须按 kind 压成 null，防止旧照片分集数据把

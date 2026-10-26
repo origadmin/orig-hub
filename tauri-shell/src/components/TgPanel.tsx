@@ -3491,28 +3491,41 @@ const AlbumBubble = memo(function AlbumBubble(props: {
           </div>
         </div>
         {/* BUG-391：展开宫格移出左右框架 —— 气泡**向下**拉伸（底部展开），
-            不再与封面分列左右；首图已作为封面呈现，不入宫格（宫格 =
-            items[1..]，瓦片 testid/preview 下标仍 = items 下标）。 */}
+            不再与封面分列左右。
+
+            BUG-433（用户 2026-10-26）：「如果第一条数据是视频，那么这个数据组的
+            视频将完全无法播放（第一条没有播放功能）。」
+
+            根因：宫格原先 `items.slice(1)` —— 首条被**故意排除**（注释写「首图已
+            作为封面呈现，不入宫格」），而封面那颗按钮的唯一动作是「展开/收起整组」，
+            从不 `onPreview`。两条加起来 ⇒ `items[0]` **在展开态和折叠态都没有任何
+            预览入口**，组内首条成了死内容；首条是视频时表现最刺眼（「整组的视频
+            都无法播放」）。
+
+            修法：宫格改为 `slice(0)`，首条也进格。代价是首条缩略图与封面重复一次
+            （「主图 + 全部缩略图」是通行形态，可接受）；收益是**组内每一条都有
+            独立可点入口**，`tg-album-tile-N` 的下标也重新与 `items` 下标一致
+            （此前是 N = items 下标 - 1 的隐式偏移，容易读错）。 */}
         {open && items.length > 1 ? (
           <div
             data-testid="album-grid"
             className={cn(
               'mt-2 grid gap-1.5',
-              albumGridClass(Math.min(items.length - 1, ALBUM_MAX_TILES)),
+              albumGridClass(Math.min(items.length, ALBUM_MAX_TILES)),
             )}
           >
-            {items.slice(1, ALBUM_MAX_TILES + 1).map((it, i) => {
+            {items.slice(0, ALBUM_MAX_TILES).map((it, i) => {
               const typ = it.type ?? guessMediaType(it.mimeType, it.filePath)
               const dur = fmtDuration(it.duration)
-              const shown = Math.min(items.length - 1, ALBUM_MAX_TILES)
-              const overflow = items.length - 1 - shown
+              const shown = Math.min(items.length, ALBUM_MAX_TILES)
+              const overflow = items.length - shown
               const isLastTile = i === shown - 1 && overflow > 0
               return (
                 <button
                   key={it.key}
                   type="button"
-                  onClick={() => onPreview(i + 1, items)}
-                  data-testid={`tg-album-tile-${i + 1}`}
+                  onClick={() => onPreview(i, items)}
+                  data-testid={`tg-album-tile-${i}`}
                   data-message-id={it.messageId}
                   /* BUG-305：瓦片也带消息 key —— 相册内单条消息同样是定位锚点 */
                   data-message-key={it.key}
@@ -3789,11 +3802,31 @@ function VideoBlock(props: {
     <button
       type="button"
       onClick={() => {
-        // 已缓存→播本地流；缓存中→在线播放（缓存后台继续，不阻塞观看）；未缓存→开始后台缓存
-        if (downloaded) setPlaying('local')
-        else if (downloading) setPlaying('online')
-        else onDownload()
+        /*
+         * BUG-432（用户 2026-10-26）：「后台视频在加载，界面依然是展示界面。
+         * 也就是说，没有播放行为，但是做了播放动作。」
+         *
+         * 旧分支：未缓存 ⇒ 只 `onDownload()`，**不进播放态**。于是点一下视频
+         * 只看到转圈/开始下载，画面永远停在缩略图上 —— 用户做了「播放」这个动作，
+         * 却得不到任何播放行为。而同一条「正在缓存」时反而是能在线播的
+         * （下面那个 `downloading → online` 分支），两条分支语义自相矛盾。
+         *
+         * 统一规则：**点视频 = 立刻播**。未缓存就先播在线流，缓存同时在后台跑；
+         * 已缓存才走本地流（省一次回源）。
+         */
+        if (downloaded) {
+          setPlaying('local')
+        } else {
+          setPlaying('online')
+          if (!downloading) onDownload()
+        }
       }}
+      /* BUG-432 可观测化：`data-video-state` 是「点了到底有没有播」的唯一事实，
+         不靠猜 DOM 里有没有 <video>（旧行为下点击只开始下载，DOM 里什么都不会变）。 */
+      data-testid="tg-video-block"
+      data-video-state={playing}
+      data-downloaded={downloaded ? 'true' : 'false'}
+      data-downloading={downloading ? 'true' : 'false'}
       /* 2026-10-23 二报：compact 下 flex-1 + min-h-32（左列 flex-col 拉伸）；
          海报 img absolute 铺满，不参与高度计算（防固有比例撑高卡片）。 */
       className={cn(
