@@ -236,7 +236,7 @@
   "media.episode.play": "播放",
   "media.episode.recacheNoRoute": "这一集的来源（{source}）没有可重新拉取的地址",
   "media.episode.recacheQueued": "已重新入队缓存，完成后这一集会恢复播放",
-  "media.episode.removeFromSeries": "从剧集中移除（内容保留在资料库）",
+  "media.episode.removeFromSeries": "从剧集移除本集",
   "media.episode.seasonGroup": "第 {n} 季",
   "media.episode.sectionDesc": "本集介绍",
   "media.episode.sectionDescSeries": "剧集介绍",
@@ -905,5 +905,7 @@
   "tg.backfillInvalidDate": "请选择日期",
   "tg.albumExpandHint": "点击展开 {n} 项",
   "tg.albumCollapse": "收起",
-  "media.episode.playFromHere": "从本集开始播放"
+  "media.episode.playFromHere": "从本集开始播放",
+  "media.episode.removeFromSeriesHint": "只把这一集移出剧集；内容条目保留在资料库，不删文件",
+  "media.series.deleteHint": "整部剧集连同分集编排一起删除；内容条目保留在资料库（变为散片）"
 }

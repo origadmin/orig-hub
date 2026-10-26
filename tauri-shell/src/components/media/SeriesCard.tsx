@@ -254,8 +254,8 @@ export function SeriesCard(props: {
         type="button"
         onClick={onDelete}
         className="absolute bottom-1 right-1 flex h-8 w-8 items-center justify-center rounded-md bg-black/60 text-white opacity-0 transition-opacity hover:bg-red-600 group-hover:opacity-100"
-        title={t('media.series.delete')}
-        aria-label={t('media.series.delete')}
+        title={t('media.series.deleteHint')}
+        aria-label={t('media.series.deleteHint')}
         data-testid="series-card-delete"
       >
         <Trash2 className="h-4 w-4" />

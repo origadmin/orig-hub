@@ -31,6 +31,7 @@ import { subscribeEvents } from '../api/daemon'
 import { loadSeriesDetail, isSeriesNotFound } from '../hooks/useSeriesDetail'
 import { cacheKey, cached, invalidateCache } from '../lib/fetchCache'
 import { seriesLabel } from '../lib/displayTitle'
+import { resolveDisplayName } from '../lib/displayName'
 import { revealItemPath } from '../lib/reveal'
 import type {
   LibraryStats,
@@ -145,12 +146,25 @@ function mergeSummary(
  * 与下面组件内的 `toViewerItems` 是同一份映射的两形态（单条 / 列表），不各写一套。
  */
 function toViewerItem(i: MediaItem): ViewerItem {
+  /*
+   * BUG-436：裸 `title` 为空时不再原样透传空串。
+   *
+   * `MediaViewer` 的返回行是 `title || caption || t('player.untitled')` —— 空串一路
+   * 落到底，用户看到的就是「未命名」。而「这条内容叫什么」早就有一个唯一解析函数
+   * （`lib/displayName.ts`，D24-A / BUG-310 的三层优先级：自定义集名 ＞ 剧名+集号 ＞
+   * 来源原文），文件域卡片、剧集详情、分集列表都走它 —— 只有播放器这条路径自己
+   * 透传裸 title，于是同一个视频在卡片上有名字、点开变「未命名」。
+   *
+   * 只在本条**没有**自己的标题时才问解析函数（有标题就照旧用标题），
+   * 不做「统一改用解析名」的扩大改动。
+   */
+  const ownTitle = (i.title ?? '').trim()
   return {
     key: `media-${i.id}`,
     chatId: 0,
     messageId: i.id,
     kind: i.kind,
-    caption: i.title,
+    caption: ownTitle || resolveDisplayName({ item: i }),
     // 介绍单独下发：返回行显示标题、底部行显示介绍，两处不重复。
     description: i.description ?? null,
     src: mediaItemUrl(i.id),
@@ -193,6 +207,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
     setPendingMediaFocus,
     setPendingTgFocus,
     setFilesActions,
+    setFilesCrumb,
   } = useStore()
 
   // ---- 资料库后端探活（**不探 TG**：TG 只是来源之一，挂了不影响库）----
@@ -303,6 +318,18 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   const [tags, setTags] = useState<MediaTag[]>([])
   const [detail, setDetail] = useState<MediaSeriesDetail | null>(null)
   const [loading, setLoading] = useState(false)
+
+  /**
+   * BUG-409：把「当前下钻到哪部剧集」报给标题行（面包屑尾节）。
+   *
+   * `fmode` 只有 `series:<id>`（数字），面包屑要的是剧名 —— 剧名只有本面板知道。
+   * 退出下钻（`detail` 变 null / 面板卸载）必须**立刻置空**，否则离开剧集后标题行
+   * 还挂着上一部剧的名字，那是一条假事实。
+   */
+  useEffect(() => {
+    setFilesCrumb(detail ? detail.title : null)
+  }, [detail, setFilesCrumb])
+  useEffect(() => () => setFilesCrumb(null), [setFilesCrumb])
 
   // ---- 视图状态 ----
   const [tab, setTab] = useState<Tab>('all')
@@ -1636,7 +1663,21 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
                 return null
               }
             }}
-            onExport={() => setExportOpen(true)}
+            /*
+             * BUG-410（用户 2026-10-23）：「内容详情主卡片上的功能（如『导出浏览』）
+             * 当前呈现/作用的是『总的浏览』，但当前上下文是单个视频详情。所有功能
+             * 应针对『当前视频 / 当前剧集』而非全局，作用域错配。」
+             *
+             * 原来这里只 `setExportOpen(true)`，`exportPreselect` 为 null ⇒ 导出预览
+             * 打开时**一部剧都没勾**，看起来就是「总浏览」。现在把当前剧集预勾上：
+             * 候选集仍是全库（`ExportPreviewDialog` 的 `series` 恒为全库，见该处注释），
+             * 只是初值从「全不勾」变成「勾当前这部剧」—— 作用域对齐当前上下文，
+             * 同时不剥夺「顺手多导几部」的能力。
+             */
+            onExport={() => {
+              setExportPreselect([detail.id])
+              setExportOpen(true)
+            }}
             onViewInTg={viewInTg}
             onGotoItem={(itemId) => {
               // BUG-191：按钮文案是「在媒体库中查看该内容」（`media.episode.gotoItem`），

@@ -822,6 +822,7 @@ export function SeriesDetail(props: {
               size="sm"
               className="h-7 px-2 text-[11px] text-destructive"
               onClick={props.onDeleteSeries}
+              title={t('media.series.deleteHint')}
               data-testid="series-delete"
             >
               {t('media.series.delete')}
@@ -1327,7 +1328,7 @@ export function SeriesDetail(props: {
                     size="sm"
                     className="h-7 px-2.5 text-[11px] text-destructive"
                     onClick={() => props.onRemoveEpisode(cur)}
-                    title={t('media.episode.removeFromSeries')}
+                    title={t('media.episode.removeFromSeriesHint')}
                     data-testid="episode-remove"
                   >
                     <Trash2 className="h-3 w-3" />

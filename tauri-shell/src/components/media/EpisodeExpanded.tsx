@@ -275,7 +275,7 @@ export function EpisodeExpanded(props: {
           size="sm"
           className="h-7 px-2.5 text-[11px] text-destructive"
           onClick={props.onRemove}
-          title={t('media.episode.removeFromSeries')}
+          title={t('media.episode.removeFromSeriesHint')}
           data-testid="episode-remove"
         >
           <Trash2 className="h-3 w-3" />

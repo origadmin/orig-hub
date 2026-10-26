@@ -9,6 +9,7 @@ import { TgGlobalSearch } from '../components/TgGlobalSearch'
 import { TgCacheEntry } from '../components/TgCacheEntry'
 import type { IngestOverview } from '../domains/download/ingestGroups'
 import { useTranslation } from '../i18n'
+import { useStore } from '../store/useStore'
 import { cn } from '../lib/utils'
 
 /**
@@ -83,6 +84,16 @@ interface ViewTitleProps {
 export const ViewTitle = memo(function ViewTitle({ nav }: ViewTitleProps) {
   const { t } = useTranslation()
   const { view, fmode, dlFilter } = nav
+  /**
+   * BUG-409：剧集下钻时的面包屑尾节（剧名）。
+   *
+   * 用户 2026-10-23：「进入内容详情页后，标题区域只显示『文件管理』，缺少
+   * 『剧集 → 内容』的层级表达」。实测根因：下钻把 `fmode` 换成 `series:<id>`，
+   * 而本函数只认 `cat:*` 与 `lib-series` ⇒ **副标题整个消失**，比剧集墙上还少一级。
+   *
+   * 尾节由 `MediaLibraryPanel` 写进 store（剧名只有它知道），这里只读。
+   */
+  const crumb = useStore((s) => s.filesCrumb)
 
   // 副标题 = 当前树选择的标签（文件域取分类/合并视频入口；下载域取档位）
   let sub: string | null = null
@@ -93,6 +104,10 @@ export const ViewTitle = memo(function ViewTitle({ nav }: ViewTitleProps) {
     // 2026-10-14 撤回 BUG-306 / D19-⑦ 合并：剧集是独立入口（标签 `files.lib.series`），
     // 副标题与侧栏同源，不许侧栏叫「剧集」、顶栏叫「视频」。
     else if (lib) sub = t('files.lib.series')
+    // BUG-409：下钻到某一部剧集 —— 给「剧集 › 剧名」，缺剧名时至少保留「剧集」这一级。
+    else if (fmode.startsWith('series:')) {
+      sub = crumb ? `${t('files.lib.series')} › ${crumb}` : t('files.lib.series')
+    }
   } else if (view === 'download' && dlFilter !== 'all') {
     sub = t(`download.${dlFilter}`)
   }

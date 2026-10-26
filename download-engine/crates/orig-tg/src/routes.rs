@@ -1385,7 +1385,7 @@ async fn cache_one(
     dir: &str,
 ) -> Result<(DownloadOutcome, Option<i64>), ApiError> {
     let outcome = cache_one_bytes(st, None, chat_id, message_id, dir).await?;
-    let id = import_cached_file(st, chat_id, message_id, &outcome.path).await;
+    let id = import_cached_file(st, chat_id, message_id, &outcome.path, None).await;
     Ok((outcome, id))
 }
 
@@ -1401,6 +1401,10 @@ async fn import_cached_file(
     chat_id: i64,
     message_id: i64,
     path: &str,
+    // BUG-436 补强（用户 2026-10-26「以文字筛选默认为主」）：筛选入库时用户打的
+    // 筛选文字，作为标题**首要**兜底——caption 缺失时优先用它，其次才回落到组内
+    // 共用 caption。非筛选入库路径传 None。
+    title_hint: Option<&str>,
 ) -> Option<i64> {
     let meta = st
         .client
@@ -1417,11 +1421,40 @@ async fn import_cached_file(
     // 此前卡片/列表里显示的是「标题+正文」的一大坨，播放页更是看不出剧名。
     // 正文同时落到 `description`：条目必须和剧集一样有「介绍位」，
     // 否则切出来的正文无处可去，只能又回流进标题。
-    let (caption_title, caption_desc) = meta
+    let (mut caption_title, caption_desc) = meta
         .as_ref()
         .and_then(|m| m.caption.as_deref())
         .map(split_caption)
         .unwrap_or((None, None));
+    // BUG-436（用户 2026-10-26）：「筛选入库时，因为包含多组数据，视频标题应该以
+    // 文字筛选默认为主，当前缺少标题名称，变成了未命名视频。」
+    //
+    // TG 相册通常只在**一条**消息上挂 caption，其余成员 `caption` 恒为空串；
+    // 于是整组入库后只有 1/N 有标题，其余落成空标题 → 界面「未命名」。
+    //
+    // 用户明确要的是「以文字筛选默认为主」—— 即**筛选入库时用户打的那个筛选词**
+    // （`title_hint`），不是组内 caption（那是 TG 消息原文，与筛选词不是一回事）。
+    // 优先级：① 本条自己的 caption；② 筛选词 `title_hint`（首要兜底）；
+    // ③ 组内共用 caption（仅非筛选入库、无筛选词时回落，保留原 BUG-436 行为）；
+    // ④ 全空则落空标题，由展示层如实表达「未命名」（绝不拿文件名/频道名伪装，BUG-154）。
+    // 只补标题，不补介绍（`description` 的归属是另一条决策，不在本次范围）。
+    if caption_title.as_deref().map(|t| t.trim().is_empty()).unwrap_or(true) {
+        if let Some(hint) = title_hint {
+            let hint = hint.trim();
+            if !hint.is_empty() {
+                caption_title = Some(clean_title(hint));
+            }
+        }
+    }
+    // 回落：筛选词为空（非筛选入库 / 没传）且本条无 caption 时，沿用组内共用 caption
+    // （原 BUG-436：相册组通常只一条带 caption，其余 N-1 条空标题）。
+    if caption_title.as_deref().map(|t| t.trim().is_empty()).unwrap_or(true) {
+        if let Some(gid) = meta.as_ref().and_then(|m| m.group_id) {
+            if let Ok(Some(group_cap)) = st.store.group_caption(chat_id, gid).await {
+                caption_title = split_caption(&group_cap).0;
+            }
+        }
+    }
     // BUG-154：无 caption（或首行为空）时**不再把落盘文件名当标题**。
     //
     // 此前是 `caption_title.unwrap_or(file_name)`：TG 落盘名是 `photo--xxx` 之类的
@@ -1497,6 +1530,11 @@ struct EnqueueCacheReq {
     group_id: Option<i64>,
     #[serde(rename = "dir", default)]
     dir: Option<String>,
+    /// BUG-436 补强（用户 2026-10-26「以文字筛选默认为主」）：筛选入库时用户打的
+    /// 筛选/规则文字，作为标题最终兜底。引擎在 caption / 组内共用 caption 都拿不到时
+    /// 用它。可空（非筛选入库路径不传）。
+    #[serde(rename = "titleHint", default)]
+    title_hint: Option<String>,
 }
 
 /// POST /api/tg/cache/tasks — 入队缓存任务（幂等：同 key 已有活跃任务则直接复用）。
@@ -1581,6 +1619,10 @@ async fn enqueue_cache_task(
     // 只有本次真正新建才起 worker；复用活跃任务时 worker 已在跑（重复起会双跑同组）。
     st.refresh_cache_tasks().await;
     if created {
+        // BUG-436 补强：新任务才写标题兜底（筛选文字）。复用既有任务不覆盖其 hint。
+        if let Some(hint) = req.title_hint.as_deref().filter(|h| !h.trim().is_empty()) {
+            let _ = st.store.set_cache_task_title_hint(task.id, hint).await;
+        }
         spawn_cache_task(st.clone(), task.id);
     }
     // BUG-246：入队即登记消息元数据。任务标题的事实源是 `media_message` 表，而该行
@@ -1598,8 +1640,10 @@ async fn enqueue_cache_task(
         let st_bg = st.clone();
         let chat_id = req.chat_id;
         let msg_ids = req.message_ids.clone();
+        // BUG-436 补强：筛选词贯穿到 T0 登记（enqueue 时即落正确标题，不依赖 worker 轮到）。
+        let title_hint = req.title_hint.clone();
         tokio::spawn(async move {
-            register_enqueued_items(&st_bg, chat_id, &msg_ids).await;
+            register_enqueued_items(&st_bg, chat_id, &msg_ids, title_hint.as_deref()).await;
         });
     }
     Ok(Json(json!(task)))
@@ -2255,6 +2299,9 @@ async fn register_media_item_t0(
     msg_id: i64,
     photo_rule: bool,
     group_desc: Option<&str>,
+    // BUG-436 补强：筛选入库时用户打的筛选词，作为无 caption 条目标题的首要兜底
+    // （仅筛选入库传入；非筛选入库路径传 None）。
+    title_hint: Option<&str>,
 ) -> Option<(i64, String)> {
     let ref_key = format!("{}:{}", chat_id, msg_id);
     let row = st.store.get_message(chat_id, msg_id).await.ok().flatten();
@@ -2265,7 +2312,7 @@ async fn register_media_item_t0(
     let id = match st.store.item_id_by_ref("tg", &ref_key).await {
         Ok(Some(id)) => {
             // 已在库：只做补强（同一事实的更完整版本），不再开口重新 upsert。
-            strengthen_registered_item(st, id, &row, kind.as_str(), msg_id, photo_rule, group_desc)
+            strengthen_registered_item(st, id, &row, kind.as_str(), msg_id, photo_rule, group_desc, title_hint)
                 .await;
             id
         }
@@ -2293,12 +2340,19 @@ async fn register_media_item_t0(
             // `channel_title` 的调用处），绝不退回空串（空标题不可辨识）。
             let title = match title {
                 Some(t) => t,
+                // BUG-436 补强：无 caption 且传入了筛选词，优先用筛选词作标题
+                // （用户要的「以文字筛选默认为主」），视频/照片统一。
+                None if title_hint.map(|h| !h.trim().is_empty()).unwrap_or(false) => {
+                    clean_title(title_hint.unwrap().trim())
+                }
                 None if photo_rule => {
                     let base = channel_title(st, chat_id)
                         .await
                         .unwrap_or_else(|| format!("TG {chat_id}"));
                     format!("{base} · 图片 #{msg_id}")
                 }
+                // 既无 caption 也无筛选词：落空标题，由展示层如实表达「未命名」
+                // （绝不拿文件名/频道名伪装，BUG-154）。
                 None => String::new(),
             };
             match st
@@ -2360,6 +2414,8 @@ async fn strengthen_registered_item(
     msg_id: i64,
     photo_rule: bool,
     group_desc: Option<&str>,
+    // BUG-436 补强：筛选入库时用户打的筛选词，作为无 caption 条目标题的首要兜底。
+    title_hint: Option<&str>,
 ) {
     let Some(msg) = row.as_ref() else {
         // 元数据仍未到位：此刻没有任何更强的事实，什么都不写（下一次登记会再来）。
@@ -2376,9 +2432,13 @@ async fn strengthen_registered_item(
         .unwrap_or((None, None));
     let patch_title = match title {
         Some(t) if existing_blank => Some(t),
-        // 没有 caption 的照片：BUG-049 兜底标题同样只在标题仍空时补。
-        // BUG-362：与 `register_media_item_t0` 的新登记同一把尺子 —— 兜底标题带
-        // **频道名**（`{频道} · 图片 #{msg_id}`），不再是无从辨认的 `TG 图片 #{msg_id}`。
+        // BUG-436 补强（最高优先）：无 caption 且标题仍空，用筛选词兜底
+        // （仅筛选入库传入）；视频/照片统一。
+        None if existing_blank && title_hint.as_deref().map(|h| !h.trim().is_empty()).unwrap_or(false) => {
+            Some(clean_title(title_hint.unwrap().trim()))
+        }
+        // 没有 caption、无筛选词、标题仍空的照片：BUG-049/362 兜底标题带**频道名**
+        // （`{频道} · 图片 #{msg_id}`），不再是无从辨认的 `TG 图片 #{msg_id}`。
         None if existing_blank && photo_rule => {
             let base = channel_title(st, msg.channel_id)
                 .await
@@ -2450,11 +2510,17 @@ async fn strengthen_registered_item(
 ///
 /// 容错与 BUG-246 一致（**登记失败不阻断入队**）：登记只影响「先在」，字节搬运由
 /// worker 负责；把一次 DB 故障变成「加入媒体库失败」比不做更糟。
-async fn register_enqueued_items(st: &Arc<AppState>, chat_id: i64, msg_ids: &[i64]) {
+async fn register_enqueued_items(
+    st: &Arc<AppState>,
+    chat_id: i64,
+    msg_ids: &[i64],
+    // BUG-436 补强：筛选入库时用户打的筛选词，贯穿到 T0 登记与补强。
+    title_hint: Option<&str>,
+) {
     // ① T0 事实登记：快路径，不为元数据行等待。此刻 `media_message` 行一般还没落
     // （监控同步 / worker 才会补），组级 caption 取不到 ⇒ 传 None，留给 ③ 补。
     for msg_id in msg_ids {
-        register_media_item_t0(st, chat_id, *msg_id, false, None).await;
+        register_media_item_t0(st, chat_id, *msg_id, false, None, title_hint).await;
     }
     // ② 元数据登记（BUG-246 的唯一真源，幂等、缺黄豆几百毫秒到几十秒都可能）。
     ensure_message_rows(st, chat_id, msg_ids).await;
@@ -2476,7 +2542,7 @@ async fn register_enqueued_items(st: &Arc<AppState>, chat_id: i64, msg_ids: &[i6
             st.store.get_message(chat_id, *msg_id).await,
             Ok(Some(m)) if m.media_type.as_deref() == Some("photo")
         );
-        register_media_item_t0(st, chat_id, *msg_id, photo_rule, group_desc.as_deref()).await;
+        register_media_item_t0(st, chat_id, *msg_id, photo_rule, group_desc.as_deref(), title_hint).await;
     }
 }
 
@@ -2519,6 +2585,8 @@ struct IngestCtx {
     /// BUG-281：组级 caption 的**正文**（`prepare` 时取一次，与 `ensure_series`
     /// 同源）——自己的 caption 没有正文的分集继承它；标题不继承（BUG-154）。
     group_desc: Option<String>,
+    /// BUG-436 补强：筛选入库时用户打的筛选词，T0 登记作标题首要兜底（贯穿 worker 路径）。
+    title_hint: Option<String>,
 }
 
 impl IngestCtx {
@@ -2585,6 +2653,7 @@ impl IngestCtx {
             series_fresh: false,
             series_blocked: false,
             group_desc,
+            title_hint: task.title_hint.clone(),
         }
     }
 
@@ -2607,6 +2676,7 @@ impl IngestCtx {
             msg_id,
             photo_rule,
             self.group_desc.as_deref(),
+            self.title_hint.as_deref(),
         )
         .await
     }
@@ -3134,7 +3204,7 @@ async fn run_one_cache_task(st: &Arc<AppState>, task_id: i64) {
                     }
                     None => {
                         // T0 登记失败（DB 故障）——退回旧「下载即入库」兜底一次。
-                        import_cached_file(st, task.chat_id, msg_id, &outcome.path).await;
+                        import_cached_file(st, task.chat_id, msg_id, &outcome.path, task.title_hint.as_deref()).await;
                     }
                 }
                 done += 1;
@@ -6852,7 +6922,7 @@ async fn recache_series_gap(
             {
                 let st_bg = st.clone();
                 tokio::spawn(async move {
-                    register_enqueued_items(&st_bg, chat_id, &message_ids).await;
+                    register_enqueued_items(&st_bg, chat_id, &message_ids, None).await;
                 });
             }
             spawn_cache_task(st.clone(), task.id);
@@ -6978,7 +7048,7 @@ async fn recache_series_missing(
             {
                 let st_bg = st.clone();
                 tokio::spawn(async move {
-                    register_enqueued_items(&st_bg, chat_id, &message_ids).await;
+                    register_enqueued_items(&st_bg, chat_id, &message_ids, None).await;
                 });
             }
             spawn_cache_task(st.clone(), task.id);
@@ -7316,6 +7386,7 @@ mod tests {
     use super::all_cache_tasks_payload;
     use super::cache_tasks_payload;
     use super::clean_title;
+    use super::import_cached_file;
     use super::create_media_series;
     use super::list_all_cache_tasks;
     use super::list_episode_bindings;
@@ -10936,6 +11007,7 @@ mod tests {
                 message_ids: vec![41],
                 group_id: None,
                 dir: None,
+                title_hint: None,
             },
         )
         .await
@@ -10995,7 +11067,7 @@ mod tests {
             )
             .await
             .unwrap();
-        register_enqueued_items(&st, CACHE_FIXTURE_CHAT, &[41]).await;
+        register_enqueued_items(&st, CACHE_FIXTURE_CHAT, &[41], None).await;
         let kept = st.store.get_media_item(id).await.unwrap().unwrap();
         assert_eq!(kept.title, "用户改过的标题", "补强不许覆盖用户已改的标题");
     }
@@ -11039,6 +11111,7 @@ mod tests {
                 message_ids: vec![11, 12],
                 group_id: None,
                 dir: None,
+                title_hint: None,
             },
         )
         .await
@@ -11124,6 +11197,7 @@ mod tests {
                 message_ids: vec![31],
                 group_id: None,
                 dir: None,
+                title_hint: None,
             },
         )
         .await
@@ -11166,6 +11240,7 @@ mod tests {
                 message_ids: vec![41],
                 group_id: None,
                 dir: None,
+                title_hint: None,
             },
         )
         .await
@@ -11200,6 +11275,7 @@ mod tests {
                 message_ids: vec![21],
                 group_id: None,
                 dir: None,
+                title_hint: None,
             },
         )
         .await
@@ -11217,6 +11293,7 @@ mod tests {
                     message_ids: vec![21],
                     group_id: None,
                     dir: None,
+                    title_hint: None,
                 },
             )
             .await
@@ -11228,7 +11305,7 @@ mod tests {
             );
         }
         // 直接再打一次登记内核（幂等性的最低层 Likewise 由 `item_id_by_ref` 命中保证）。
-        let again_id = register_media_item_t0(&st, CACHE_FIXTURE_CHAT, 21, false, None)
+        let again_id = register_media_item_t0(&st, CACHE_FIXTURE_CHAT, 21, false, None, None)
             .await
             .expect("重复登记必须返回既有条目")
             .0;
@@ -11236,8 +11313,114 @@ mod tests {
         assert_eq!(again_id, item, "重复登记必须回到同一个 item id");
 
         // 入队时刻的批量入口同样幂等（每条消息走一次内核）。
-        register_enqueued_items(&st, CACHE_FIXTURE_CHAT, &[21]).await;
+        register_enqueued_items(&st, CACHE_FIXTURE_CHAT, &[21], None).await;
         assert_eq!(count_rows(&st, &ref_key).await, 1, "条目只能有一行");
+    }
+
+    /// BUG-436 复报（用户「以文字筛选默认为主」）：无 caption 的视频，T0 登记必须用
+    /// 传入的筛选词（`title_hint`）作标题兜底；有 caption 的不被筛选词覆盖；既无
+    /// caption 也无筛选词 ⇒ 落空标题（BUG-154：不编造）。
+    #[tokio::test]
+    async fn register_t0_uses_title_hint_without_caption() {
+        let dir = scratch_dir("bug436_title_hint");
+        let st = cache_fixture_state(&dir, vec![], vec![]).await;
+        let chat = CACHE_FIXTURE_CHAT;
+
+        // 视频、无 caption、无组 caption ⇒ 标题必须回落到筛选词。
+        st.store
+            .upsert_message(
+                chat, 5001, None, Some("video/mp4"), Some(4096), Some("video"),
+                Some(1_700_000_000), Some(12), None, None,
+            )
+            .await
+            .unwrap();
+        let (id, _kind) = register_media_item_t0(&st, chat, 5001, false, None, Some("时停手表"))
+            .await
+            .expect("无 caption 视频也必须登记成功");
+        let item = st.store.get_media_item(id).await.unwrap().unwrap();
+        assert_eq!(
+            item.title,
+            clean_title("时停手表"),
+            "无 caption 的视频必须用筛选词作标题兜底（BUG-436 复报）"
+        );
+
+        // 有 caption 的不被筛选词覆盖。
+        st.store
+            .upsert_message(
+                chat, 5002, Some("真实剧名 EP1\n正文"), Some("video/mp4"), Some(4096), Some("video"),
+                Some(1_700_000_001), Some(12), None, None,
+            )
+            .await
+            .unwrap();
+        let (id2, _) = register_media_item_t0(&st, chat, 5002, false, None, Some("时停手表"))
+            .await
+            .unwrap();
+        let item2 = st.store.get_media_item(id2).await.unwrap().unwrap();
+        assert_eq!(item2.title, "真实剧名 EP1", "有 caption 绝不被筛选词覆盖");
+
+        // 无 caption 且无筛选词 ⇒ 落空标题（如实表达未命名，BUG-154）。
+        st.store
+            .upsert_message(
+                chat, 5003, None, Some("video/mp4"), Some(4096), Some("video"),
+                Some(1_700_000_002), Some(12), None, None,
+            )
+            .await
+            .unwrap();
+        let (id3, _) = register_media_item_t0(&st, chat, 5003, false, None, None)
+            .await
+            .unwrap();
+        let item3 = st.store.get_media_item(id3).await.unwrap().unwrap();
+        assert!(
+            item3.title.trim().is_empty(),
+            "无 caption 无筛选词 ⇒ 空标题（如实表达未命名）"
+        );
+    }
+
+    /// BUG-436 复报：`import_cached_file` 里筛选词（`title_hint`）必须**优先于**组内
+    /// caption；无筛选词时才回落到组内 caption（保留原 BUG-436 行为）。
+    #[tokio::test]
+    async fn import_cached_file_prefers_title_hint_over_group_caption() {
+        let dir = scratch_dir("bug436_import_hint_a");
+        let chat = CACHE_FIXTURE_CHAT;
+        let gid = 7777i64;
+        let target = fixture_msg(6001, "video", "video/mp4", None, Some(gid));
+        let st = cache_fixture_state(&dir, vec![], vec![target]).await;
+        // 同组另一条带 caption（落在 store，供 group_caption 读取）。
+        st.store
+            .upsert_message(
+                chat, 6002, Some("组内共有标题\n正文"), Some("video/mp4"), Some(4096), Some("video"),
+                Some(1), Some(12), Some(gid), None,
+            )
+            .await
+            .unwrap();
+
+        // ① 有筛选词：必须优先于组内 caption。
+        let id = import_cached_file(&*st, chat, 6001, "ignored.mp4", Some("时停手表"))
+            .await
+            .expect("import must succeed");
+        let item = st.store.get_media_item(id).await.unwrap().unwrap();
+        assert_eq!(
+            item.title,
+            clean_title("时停手表"),
+            "筛选词必须优先于组内 caption"
+        );
+
+        // ② 无筛选词：回落到组内 caption（保留原 BUG-436 行为）。
+        let dir2 = scratch_dir("bug436_import_hint_b");
+        let target2 = fixture_msg(6003, "video", "video/mp4", None, Some(gid));
+        let st2 = cache_fixture_state(&dir2, vec![], vec![target2]).await;
+        st2.store
+            .upsert_message(
+                chat, 6004, Some("组内共有标题\n正文"), Some("video/mp4"), Some(4096), Some("video"),
+                Some(1), Some(12), Some(gid), None,
+            )
+            .await
+            .unwrap();
+        let id2 = import_cached_file(&*st2, chat, 6003, "ignored2.mp4", None)
+            .await
+            .expect("import must succeed");
+        let item2 = st2.store.get_media_item(id2).await.unwrap().unwrap();
+        assert_eq!(item2.title, "组内共有标题", "无筛选词时回落组内 caption");
     }
 
     /// BUG-248 判据 3：登记失败**不阻断入队**（与 BUG-246 同一个容错语义）。
@@ -11266,7 +11449,7 @@ mod tests {
 
         // 内核层：故障必须表现为 `None`（无可奉告），不得 panic / 不得谎报成功。
         assert_eq!(
-            register_media_item_t0(&st, CACHE_FIXTURE_CHAT, 31, false, None).await,
+            register_media_item_t0(&st, CACHE_FIXTURE_CHAT, 31, false, None, None).await,
             None,
             "登记失败必须返回 None（调用方据此不阻断）"
         );
@@ -11282,6 +11465,7 @@ mod tests {
                 message_ids: vec![31],
                 group_id: None,
                 dir: None,
+                title_hint: None,
             },
         )
         .await
@@ -11808,7 +11992,7 @@ mod tests {
             ],
         )
         .await;
-        register_enqueued_items(&st, CACHE_FIXTURE_CHAT, &[91, 92, 93]).await;
+        register_enqueued_items(&st, CACHE_FIXTURE_CHAT, &[91, 92, 93], None).await;
 
         let body = "组级介绍：她披着最乖巧温顺的皮。";
         for msg in [91, 92, 93] {
@@ -11889,7 +12073,7 @@ mod tests {
             .await
             .unwrap();
         let row101 = st.store.get_message(CACHE_FIXTURE_CHAT, 101).await.unwrap();
-        strengthen_registered_item(&st, id_empty, &row101, "video", 101, false, Some(group)).await;
+        strengthen_registered_item(&st, id_empty, &row101, "video", 101, false, Some(group), None).await;
         assert_eq!(
             st.store
                 .get_media_item(id_empty)
@@ -11918,7 +12102,7 @@ mod tests {
             .await
             .unwrap();
         let row103 = st.store.get_message(CACHE_FIXTURE_CHAT, 103).await.unwrap();
-        strengthen_registered_item(&st, id_user, &row103, "video", 103, false, Some(group)).await;
+        strengthen_registered_item(&st, id_user, &row103, "video", 103, false, Some(group), None).await;
         assert_eq!(
             st.store
                 .get_media_item(id_user)
@@ -11958,7 +12142,7 @@ mod tests {
             .await
             .unwrap();
         let row102 = st.store.get_message(CACHE_FIXTURE_CHAT, 102).await.unwrap();
-        strengthen_registered_item(&st, id_cleared, &row102, "video", 102, false, Some(group))
+        strengthen_registered_item(&st, id_cleared, &row102, "video", 102, false, Some(group), None)
             .await;
         assert!(
             st.store

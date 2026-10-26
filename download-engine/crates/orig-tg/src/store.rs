@@ -355,9 +355,15 @@ pub struct CacheTask {
     /// 优先级（BUG-277）：越大越先跑；`0` = 未置顶（存量任务一律 0）。
     ///
     /// 语义**不是**抢占：它只决定「单飞 worker 跑完当前任务后**接哪一条**」，
-    /// 正在跑的任务不受影响（BUG-257 不弃单）。置顶值由后端算（`max + 1`），
+    /// 正在跑的任务不受影响（BUG-257 不弃单）。置顶值由 backend 算（`max + 1`），
     /// 前端只表达意图（"top": true），不猜数值。
     pub priority: i64,
+    /// BUG-436 补强（用户 2026-10-26 裁定「以文字筛选默认为主」）：筛选入库时
+    /// 用户打的那个筛选/规则文字，作为**标题最终兜底**传给引擎。链路：
+    /// `EnqueueCacheReq.title_hint` → 本列 → worker → `import_cached_file` 在
+    /// caption / 组内共用 caption 都拿不到时用作标题。可为空（非筛选入库路径不传）。
+    #[serde(rename = "titleHint", skip_serializing_if = "Option::is_none")]
+    pub title_hint: Option<String>,
 }
 
 /// 任务是否处于「活跃」态（活跃态由 `cache_task_active_uniq` 保证同 key 唯一）。
@@ -365,7 +371,7 @@ pub const CACHE_TASK_ACTIVE_STATES: &str = "('queued', 'running')";
 
 /// 按 `list_cache_tasks`/`get_cache_task` 的 SELECT 列顺序映射一行。
 /// 列顺序：id, chat_id, group_id, item_key, items, total, done, status,
-///         current_id, error, created_at, updated_at, priority
+///         current_id, error, created_at, updated_at, priority, title_hint
 fn cache_task_from_row(r: &Row) -> libsql::Result<CacheTask> {
     let items: String = r.get(4)?;
     Ok(CacheTask {
@@ -384,12 +390,14 @@ fn cache_task_from_row(r: &Row) -> libsql::Result<CacheTask> {
         // 老库加列前的行由迁移补成 `DEFAULT 0`；这里再兜一层 `unwrap_or(0)`
         // （列缺失的极端情况不得让「读队列」整条失败）。
         priority: r.get(12).unwrap_or(0),
+        // `title_hint` 是新列（可空）：缺失/空均兜成 None，绝不让读队列失败。
+        title_hint: r.get(13).ok().flatten(),
     })
 }
 
 /// `cache_task` 的 SELECT 列清单（与 `cache_task_from_row` 严格同序）。
 const CACHE_TASK_COLS: &str = "id, chat_id, group_id, item_key, items, total, done, \
-                               status, current_id, error, created_at, updated_at, priority";
+                               status, current_id, error, created_at, updated_at, priority, title_hint";
 
 /// 队列取序（BUG-277）：**置顶优先，同优先级仍是 FIFO**。
 ///
@@ -519,6 +527,26 @@ async fn migrate_cache_task_priority(conn: &Connection) -> libsql::Result<()> {
         (),
     )
     .await?;
+    Ok(())
+}
+
+/// 迁移：为 `cache_task` 补 `title_hint` 列（BUG-436 补强）。
+///
+/// 可空 TEXT，无 NOT NULL 约束 —— 非筛选入库的存量任务一律 NULL，不影响任何既有语义。
+/// 幂等：列已存在则跳过 `ALTER`。
+async fn migrate_cache_task_title_hint(conn: &Connection) -> libsql::Result<()> {
+    let mut rows = conn.query("PRAGMA table_info(cache_task)", ()).await?;
+    let mut have = false;
+    while let Some(r) = rows.next().await? {
+        let name: String = r.get(1)?;
+        if name == "title_hint" {
+            have = true;
+        }
+    }
+    if !have {
+        conn.execute("ALTER TABLE cache_task ADD COLUMN title_hint TEXT", ())
+            .await?;
+    }
     Ok(())
 }
 
@@ -930,6 +958,8 @@ impl Store {
         .await?;
         // 旧库的 cache_task 缺 priority：幂等补列，不删数据（BUG-277）。
         migrate_cache_task_priority(&conn).await?;
+        // 旧库的 cache_task 缺 title_hint：幂等补列（BUG-436 补强，可空）。
+        migrate_cache_task_title_hint(&conn).await?;
         // 旧库的 monitored_channel 缺 last_read_message_id：幂等补列 + 存量视为已读。
         migrate_monitored_channel_last_read(&conn).await?;
         // 旧库的 monitor_filter 缺 last_read_at（BUG-330 / TGM-06）：幂等补列 +
@@ -1005,6 +1035,105 @@ impl Store {
     }
 
     // ---- 监控频道 ----
+
+    /// 同组（TG 相册）的共用 caption —— BUG-436。
+    ///
+    /// Telegram 相册只在**一条**消息上挂 caption，其余成员 `caption` 恒为空串
+    /// （实测「时停手表」频道 1308–1313 那组：1308–1312 全 NULL，只有 1313 带 caption；
+    /// 相邻的 1306–1307 组反过来，caption 挂在 1307）。**挂在哪一条不固定**，
+    /// 所以这里不假设位置，只问「这组里有没有、是哪一段」。
+    /// 于是「整组缓存/入库」时只有 1/N 的条目拿得到标题，剩下的落成空标题，
+    /// 界面显示为「未命名视频」。
+    ///
+    /// 取法：组内**最早**一条非空 caption 作确定性 tiebreak（正常一组只有一条，
+    /// 顺序无关紧要；万一有多条，取最早的与「先写先得」一致）。
+    ///
+    /// 只读、无副作用；`group_id` 为 None 的调用方（单发媒体）不该调本方法。
+    pub async fn group_caption(
+        &self,
+        channel_id: i64,
+        group_id: i64,
+    ) -> libsql::Result<Option<String>> {
+        match self
+            .row_opt(
+                "SELECT caption FROM media_message
+                  WHERE channel_id = ?1 AND group_id = ?2
+                    AND caption IS NOT NULL AND TRIM(caption) <> ''
+                  ORDER BY message_id ASC LIMIT 1",
+                params![channel_id, group_id],
+            )
+            .await?
+        {
+            Some(r) => r.get::<Option<String>>(0),
+            None => Ok(None),
+        }
+    }
+
+    /// 存量空标题条目的**组级补题**（BUG-436，启动时跑一次）。
+    ///
+    /// [`Self::group_caption`] 只解决「以后新入库的」。用户报的「未命名视频」在库里
+    /// 已经躺了 211 条（其中 182 条的同组消息里**确实有** caption 可继承），只修写入
+    /// 路径等于让存量永远错着。
+    ///
+    /// 纪律（与 BUG-421 的 `repair_old_library_root_rows` 同一条）：
+    /// 1. **只填空**：`WHERE TRIM(COALESCE(title,'')) = ''`，用户改过的名字一个字不动；
+    ///    写入语句里也带同一个守卫，并发重跑不会覆盖。
+    /// 2. **拿不到就不编**：组里没有任何 caption ⇒ 跳过，仍留空串 —— 绝不拿落盘文件名
+    ///    或频道名伪装成标题（BUG-154）。
+    /// 3. **幂等**：补过之后标题非空，重跑零改写。
+    ///
+    /// 返回补上的条数。
+    pub async fn backfill_empty_titles_from_group_caption(&self) -> libsql::Result<i64> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT mi.id, mm.channel_id, mm.group_id
+                   FROM media_item mi
+                   JOIN media_message mm
+                     ON mi.ref = CAST(mm.channel_id AS TEXT) || ':' || CAST(mm.message_id AS TEXT)
+                  WHERE mi.source = 'tg'
+                    AND TRIM(COALESCE(mi.title, '')) = ''
+                    AND mm.group_id IS NOT NULL
+                    AND mm.group_id <> 0
+                    AND EXISTS (
+                          SELECT 1 FROM media_message g
+                           WHERE g.channel_id = mm.channel_id
+                             AND g.group_id = mm.group_id
+                             AND TRIM(COALESCE(g.caption, '')) <> ''
+                        )",
+                (),
+            )
+            .await?;
+        let mut fixed = 0i64;
+        while let Some(r) = rows.next().await? {
+            let id: i64 = r.get(0)?;
+            let chat_id: i64 = r.get(1)?;
+            let group_id: i64 = r.get(2)?;
+            let Some(cap) = self.group_caption(chat_id, group_id).await? else {
+                continue;
+            };
+            // 与写入路径同一把尺子：只取 caption 首行，再走 `clean_title` 白名单。
+            let title = crate::media::split_caption(&cap)
+                .0
+                .map(|t| crate::routes::clean_title(&t))
+                .unwrap_or_default();
+            if title.trim().is_empty() {
+                continue;
+            }
+            let n = self
+                .conn
+                .execute(
+                    "UPDATE media_item SET title = ?2
+                      WHERE id = ?1 AND TRIM(COALESCE(title, '')) = ''",
+                    params![id, title],
+                )
+                .await?;
+            if n > 0 {
+                fixed += 1;
+            }
+        }
+        Ok(fixed)
+    }
 
     /// 添加/更新监控频道（同 id 幂等，更新标题/用户名）。
     ///
@@ -2792,6 +2921,20 @@ impl Store {
             // 撞唯一索引 / 插入报错 / 极端并发下既读不到行：回读同 key 的活跃任务复用。
             _ => Ok(self.active_cache_task(item_key).await?.map(|t| (t, false))),
         }
+    }
+
+    /// BUG-436 补强：为**新创建**的缓存任务写标题兜底（筛选入库时用户打的筛选文字）。
+    ///
+    /// 与 `enqueue_cache_task` 拆开：避免改动其签名牵连几十处测试调用点。复用既有活跃
+    /// 任务（created=false）时不写——那条任务已有自己的 hint（或 NULL），不被本次覆盖。
+    pub async fn set_cache_task_title_hint(&self, id: i64, hint: &str) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE cache_task SET title_hint = ?1, updated_at = ?2 WHERE id = ?3",
+                params![hint, now(), id],
+            )
+            .await?;
+        Ok(())
     }
 
     /// **原任务重试**（BUG-078）：把终态记录复位为 `queued`，复用同一 id，由 worker 重跑。
@@ -4805,6 +4948,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((fixed2, skipped2), (0, 1), "重跑零改写");
+    }
+
+    /// BUG-436：存量空标题按**同组共用 caption** 补题。
+    ///
+    /// 三条判据缺一不可：
+    /// 1. 组里有 caption 的空标题条目 ⇒ 补上（这是用户报的「未命名视频」）；
+    /// 2. 组里没有 caption ⇒ **仍留空**（不许拿文件名/频道名伪装，BUG-154）；
+    /// 3. 已有标题 ⇒ 一个字不动（用户改过的名字不得被覆盖）。
+    /// 反向证伪：把 `TRIM(COALESCE(title,''))=''` 守卫去掉，判据 3 当场 FAIL。
+    #[tokio::test]
+    async fn backfills_empty_titles_from_group_caption_bug436() {
+        let s = store("bug436_titles").await;
+        let chat = -100_777i64;
+        // 组 900：只有 2 号带 caption（实测相册就是「一条挂 caption」）。
+        s.upsert_message(chat, 1, None, Some("video/mp4"), None, Some("video"), None, None, Some(900), None)
+            .await
+            .unwrap();
+        s.upsert_message(chat, 2, Some("My Show EP1\nbody text"), Some("video/mp4"), None, Some("video"), None, None, Some(900), None)
+            .await
+            .unwrap();
+        // 组 901：整组没有 caption —— 无可继承。
+        s.upsert_message(chat, 3, None, Some("video/mp4"), None, Some("video"), None, None, Some(901), None)
+            .await
+            .unwrap();
+
+        let ref1 = format!("{chat}:1");
+        let ref2 = format!("{chat}:2");
+        let ref3 = format!("{chat}:3");
+        s.upsert_media_item("tg", &ref1, "", "video", None, None, None, None)
+            .await
+            .unwrap();
+        s.upsert_media_item("tg", &ref2, "用户改的名字", "video", None, None, None, None)
+            .await
+            .unwrap();
+        s.upsert_media_item("tg", &ref3, "", "video", None, None, None, None)
+            .await
+            .unwrap();
+
+        let fixed = s.backfill_empty_titles_from_group_caption().await.unwrap();
+        assert_eq!(fixed, 1, "只有组 900 的那条可补");
+
+        let title_of = |r: String| {
+            let s = &s;
+            async move {
+                let stmt = s
+                    .conn
+                    .prepare("SELECT title FROM media_item WHERE ref = ?1")
+                    .await
+                    .unwrap();
+                let mut rows = stmt.query(params![r]).await.unwrap();
+                rows.next()
+                    .await
+                    .unwrap()
+                    .map(|row| row.get::<String>(0).unwrap())
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            title_of(ref1.clone()).await,
+            "My Show EP1",
+            "必须取组 caption 的**首行**并过 clean_title"
+        );
+        assert_eq!(title_of(ref2).await, "用户改的名字", "已有标题一个字不动");
+        assert_eq!(title_of(ref3).await, "", "组里没 caption 就如实留空");
+
+        // 幂等：补过之后标题非空 ⇒ 重跑零改写。
+        assert_eq!(s.backfill_empty_titles_from_group_caption().await.unwrap(), 0);
     }
 
     #[tokio::test]

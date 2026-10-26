@@ -239,6 +239,28 @@ async fn main() {
         }
     }
 
+    // BUG-436：存量「未命名视频」的组级补题。
+    //
+    // 用户 2026-10-26 报「筛选入库时因为包含多组数据，视频标题应该以文字筛选默认为主，
+    // 当前缺少标题名称，变成了未命名视频」。写入路径已在 `import_cached_file` 补了
+    // 「同组共用 caption」回退，但库里已经躺着的空标题条目不会自己好 —— 实测 211 条
+    // 空标题里 182 条的同组消息确实带 caption。
+    //
+    // 只填空、拿不到就不编（BUG-154）、幂等；失败不阻断启动。
+    match state.store.backfill_empty_titles_from_group_caption().await {
+        Ok(fixed) if fixed > 0 => {
+            let msg = format!("BUG-436 empty titles backfilled from group caption: {fixed}");
+            println!("[tg] {msg}");
+            state.push_log(msg);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            let msg = format!("[warn] BUG-436 empty-title backfill failed: {e}");
+            eprintln!("{msg}");
+            state.push_log(msg);
+        }
+    }
+
     // BUG-323：存量受管根迁移（引擎写过的旧落点 → 下载路径之内）。
     //
     // 库根改为派生值后不迁移 = 存量字节整片失联：库根相对路径的条目在新根下

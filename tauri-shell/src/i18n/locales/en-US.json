@@ -236,7 +236,7 @@
   "media.episode.play": "Play",
   "media.episode.recacheNoRoute": "The source of this episode ({source}) has no address to re-fetch from",
   "media.episode.recacheQueued": "Re-queued for caching; this episode will play again once it completes",
-  "media.episode.removeFromSeries": "Remove from series (the record stays in the library)",
+  "media.episode.removeFromSeries": "Remove this episode from series",
   "media.episode.seasonGroup": "Season {n}",
   "media.episode.sectionDesc": "Episode description",
   "media.episode.sectionDescSeries": "Show intro",
@@ -905,5 +905,7 @@
   "tg.backfillInvalidDate": "Pick a date",
   "tg.albumExpandHint": "Open {n} items",
   "tg.albumCollapse": "Collapse",
-  "media.episode.playFromHere": "Play from this episode"
+  "media.episode.playFromHere": "Play from this episode",
+  "media.episode.removeFromSeriesHint": "Only detaches this episode from the series. The media entry stays in the library; no file is deleted.",
+  "media.series.deleteHint": "Deletes the whole series and its episode list. The media entries stay in the library as unassigned items."
 }

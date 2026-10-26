@@ -277,6 +277,9 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
           chatId: u.channelId,
           messageIds: ids,
           groupId: u.groupId,
+          // BUG-436 补强：筛选入库时把用户打的筛选文字作为标题兜底传下去
+          // （引擎在 caption / 组内共用 caption 都缺时用作标题）。
+          titleHint: filter.keyword || filter.label,
         })
         if (!r?.alreadyIngested) queued += ids.length
       } catch (e) {

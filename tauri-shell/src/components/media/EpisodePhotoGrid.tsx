@@ -67,8 +67,8 @@ export function EpisodePhotoGrid(props: {
           <button
             type="button"
             onClick={() => onRemoveEpisode(ep)}
-            title={t('media.episode.removeFromSeries')}
-            aria-label={t('media.episode.removeFromSeries')}
+            title={t('media.episode.removeFromSeriesHint')}
+            aria-label={t('media.episode.removeFromSeriesHint')}
             data-testid={`episode-photo-remove-${ep.itemId}`}
             className="absolute right-0.5 top-0.5 flex h-5 w-5 items-center justify-center rounded bg-black/60 text-white opacity-0 transition-opacity hover:bg-destructive focus-visible:opacity-100 group-hover:opacity-100"
           >

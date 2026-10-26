@@ -286,6 +286,20 @@ interface DownloadState {
   setFilesActions: (a: FilesActions | null) => void
 
   /**
+   * 文件域**面包屑尾节**（BUG-409）：当前下钻到的剧集名，`null` = 没在下钻。
+   *
+   * 为什么要有它：`fmode` 只到 `series:<id>`（id 是数字，不是名字），而面包屑要的是
+   * 「剧集 › **剧名**」。剧名只有 `MediaLibraryPanel` 知道（`detail.title`），
+   * `ContextBar` 在外壳的另一棵子树里 —— 与 `filesActions` 完全同一个跨子树问题，
+   * 故用同一个通道形态（面板写、标题行读），不新开第三条路。
+   *
+   * 纪律：**面板卸载/退出下钻必须置 null**，否则离开剧集后标题行会继续挂着上一部
+   * 剧的名字（比不显示更糟：它是一条假事实）。
+   */
+  filesCrumb: string | null
+  setFilesCrumb: (t: string | null) => void
+
+  /**
    * TG **服务层**状态（orig-tg 进程）：真源是 daemon `/api/config`（BUG-178）。
    *
    * 「服务在不在」只由 daemon 回答 —— 前端不再自己探测 orig-tg 端口：那是把
@@ -392,6 +406,9 @@ export const useStore = create<DownloadState>((set, get) => ({
   // 标题行右槽的库级按钮整簇不渲染（不可用就不展示）。
   filesActions: null,
   setFilesActions: (a) => set({ filesActions: a }),
+  // 文件域面包屑尾节（BUG-409）：null = 没在下钻剧集详情。
+  filesCrumb: null,
+  setFilesCrumb: (t) => set({ filesCrumb: t }),
   // 入口级门控（`resolveTgFeatureReady`）只由服务层决定：开关开着 **且** daemon 说
   // 进程在服务才显示。daemon 不可达 / 插件关闭 / 拉起失败时入口保持隐藏 ——
   // 不可用就不展示（不呈现死按钮，违反设计）。

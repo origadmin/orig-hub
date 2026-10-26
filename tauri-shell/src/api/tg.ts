@@ -542,6 +542,8 @@ export async function enqueueCacheTask(opts: {
   chatId: number
   messageIds: number[]
   groupId?: string
+  /** BUG-436 补强：筛选入库时用户打的筛选文字，引擎作为标题最终兜底。 */
+  titleHint?: string
 }): Promise<TgCacheTask & { alreadyIngested?: boolean }> {
   return request<TgCacheTask & { alreadyIngested?: boolean }>('/api/tg/cache/tasks', {
     method: 'POST',
@@ -549,6 +551,7 @@ export async function enqueueCacheTask(opts: {
       chatId: opts.chatId,
       messageIds: opts.messageIds,
       groupId: opts.groupId,
+      titleHint: opts.titleHint,
     }),
   })
 }

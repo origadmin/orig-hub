@@ -129,6 +129,7 @@ export function SeriesHero(props: {
             size="sm"
             className="h-7 px-2 text-[11px] text-destructive"
             onClick={props.onDelete}
+            title={t('media.series.deleteHint')}
             data-testid="series-delete"
           >
             {t('media.series.delete')}
