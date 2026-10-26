@@ -183,6 +183,22 @@ const CENTER_MS = 1500
 /** 自动连播倒计时秒数 */
 const COUNTDOWN_SEC = 5
 
+/**
+ * BUG-428：距真源总时长多少秒以内算「播完」。
+ *
+ * 为什么需要这个常量：视频一律走 `/stream`（stream-first，2026-10-09 用户裁定），
+ * 而该端点的响应头是 `x-orig-stream: live` + `transfer-encoding: chunked`
+ * （无 `content-length`、无 `accept-ranges`）。live 流的元素 `duration` 只是
+ * **随下载量上涨的估算值**（实测 9.43 → 26.1 → 36.0 → … → 374.1，恒比
+ * `currentTime` 大 4~8s），因此浏览器**永远不会抛 `ended`**，
+ * 自动连播倒计时也就永远不出现 —— 用户报的「连续播放完全丢失」。
+ *
+ * 兜底判据改用**真源总时长**（`duration` prop，来自 `GET /api/media/items/<id>`；
+ * 实测 item 1574 的库内时长 694.07s 与 `/raw` 元素的 694.07s 逐位相同），
+ * 容差 0.75s 足以覆盖 timeupdate 的 ~4Hz 采样粒度。
+ */
+const END_EPSILON_SEC = 0.75
+
 // ---- 兼容流记忆（BUG-208）已彻底移除（BUG-224 停用 + 2026-10-09 stream-first 翻转）----
 //
 // BUG-224 曾把记忆机制停用（读即清空），前提是「这些源本机解得动」。2026-10-09
@@ -1088,6 +1104,34 @@ export function VideoPlayer({
     onEnded?.()
   }, [nextUp, autoPlayNext, onEnded])
 
+  /**
+   * BUG-428：live 转码流上 `ended` 不可靠，用真源总时长兜底判定「真的播完了」。
+   *
+   * 触发条件（全部满足才认）：
+   *   ① 当前源**不可任意 seek**（`streamSeekableRef === false`）—— 即 live/锚点流；
+   *      完整代理与 `/raw` 的 `ended` 可靠，不兜底（避免库内时长有偏差时提前切集）；
+   *   ② 真源总时长已知且 > 0（`contentDurationRef`，BUG-253）；
+   *   ③ 换算到**源内容时间**后距末尾 ≤ `END_EPSILON_SEC`；
+   *   ④ 未在播放起点（`currentTime > 0`），且本次播放尚未触发过。
+   *
+   * 换算必须走 `currentTime * speed + offset`：FRC 流的媒体时间轴是压缩的
+   * （`speed` 倍），锚点流的 0:00 也不是内容 0:00（`offset`）。
+   */
+  const endGuardRef = useRef(false)
+  const onTimeUpdateEnd = useCallback(() => {
+    const v = videoRef.current
+    if (!v || endGuardRef.current) return
+    if (streamSeekableRef.current) return
+    if (v.paused || v.currentTime <= 0) return
+    const dur = contentDurationRef.current
+    if (dur == null || !(dur > 0)) return
+    const speed = activeContentSpeedRef.current || 1
+    const contentTime = v.currentTime * speed + contentOffsetRef.current
+    if (contentTime < dur - END_EPSILON_SEC) return
+    endGuardRef.current = true
+    onVideoEnded()
+  }, [onVideoEnded])
+
   const cancelCountdown = useCallback(() => {
     setShowCountdown(false)
     setCountdown(COUNTDOWN_SEC)
@@ -1201,6 +1245,8 @@ export function VideoPlayer({
         onPlay={() => {
           setIsPlaying(true)
           setIsBuffering(false)
+          // BUG-428：每次重新开始播放都复位播完兜底闸门，否则「重播」后不再触发连播
+          endGuardRef.current = false
           pokeControls()
         }}
         onPause={() => {
@@ -1211,6 +1257,7 @@ export function VideoPlayer({
         onPlaying={() => setIsBuffering(false)}
         onCanPlay={() => setIsBuffering(false)}
         onEnded={onVideoEnded}
+        onTimeUpdate={onTimeUpdateEnd}
         onError={onError}
         onDoubleClick={() => void toggleFullscreen()}
       />
@@ -1314,9 +1361,14 @@ export function VideoPlayer({
         </p>
       )}
 
-      {/* 自动连播倒计时（YouTube 式） */}
+      {/* 自动连播倒计时（YouTube 式）
+          data-testid：连播是用户反复报「丢失」的能力（BUG-416），
+          必须能被端到端判据观测到「播完真的浮出下一集」，不能只靠读代码。 */}
       {showCountdown && nextUp && (
         <div
+          data-testid="player-autoplay-next"
+          data-next-title={nextUp.title}
+          data-next-episode={nextUp.episodeNo ?? ''}
           className="absolute inset-0 z-40 flex items-end justify-end p-5 md:p-8"
           style={{
             background:
