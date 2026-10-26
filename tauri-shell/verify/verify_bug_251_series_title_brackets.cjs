@@ -45,6 +45,7 @@ const os = require('node:os')
 const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 const { pathToFileURL } = require('node:url')
+const sandbox = require('./lib/sandbox.cjs')
 
 const cdp = require('./lib/cdp.cjs')
 
@@ -112,8 +113,11 @@ async function httpJson(method, url, body) {
 
 async function resolveTgBase() {
   const cfg = await httpJson('GET', `${DAEMON}/api/config`)
-  if (cfg.status !== 200 || !cfg.json || !cfg.json.tg_port) return null
-  return { base: `http://127.0.0.1:${cfg.json.tg_port}`, tgRunning: cfg.json.tg_running === true }
+  // BUG-358 起 `/api/config` 的 `tg_port` 收进 `plugins[]`（id='tg'）—— 旧键直读
+  // 会恒得 undefined（BUG-422 实测假红）。适配器双契约兼容，只此一处。
+  const tgPort = sandbox.tgPortOf(cfg.json)
+  if (cfg.status !== 200 || !cfg.json || !tgPort) return null
+  return { base: `http://127.0.0.1:${tgPort}`, tgRunning: sandbox.tgRunningOf(cfg.json) }
 }
 
 function startDevServices() {
@@ -144,6 +148,9 @@ async function createItem(title, ts, tg) {
     items: [{ path: fakePath, source: 'local', kind: 'video', title }],
   })
   const id = r.json && Array.isArray(r.json.ids) ? r.json.ids[0] : null
+  // BUG-422：导入即被 BUG-304 自动归档进单集剧集；不先撤销归属，后面往自己的
+  // 剧集挂载会撞 media_episode.item_id 唯一约束（HTTP 500）。
+  if (id != null) await sandbox.detachAutoSeries(tg, id)
   return { id, status: r.status }
 }
 
@@ -331,10 +338,6 @@ async function gotoSeriesWall(page) {
     if (el) el.click()
   })
   await delay(1200)
-  await page.evaluate(() => {
-    const el = document.querySelector('[data-testid="media-rail-series-all"]')
-    if (el) el.click()
-  })
 }
 
 // ─────────────────────────── 主流程 ───────────────────────────
@@ -356,14 +359,36 @@ async function main() {
   console.log(`[bug251] orig-tg = ${TG}（取自 daemon tg_port 真源）`)
 
   // ── 前置 P：真实库里含书名号的剧集必须非空 ──
-  const lib = await httpJson('GET', `${TG}/api/media/series`)
-  const allSeries = lib.json && Array.isArray(lib.json.items) ? lib.json.items : []
+  // BUG-422：API 瞬时抖动（items 取空 / 非 200）会让 P 与 A4 假红。重试至多 3 次，
+  // 仍空才判环境未就绪（不把「取不到」当成「库里没有」）。
+  let allSeries = []
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const lib = await httpJson('GET', `${TG}/api/media/series`)
+    allSeries = lib.json && Array.isArray(lib.json.items) ? lib.json.items : []
+    if (allSeries.length > 0) break
+    console.warn(`[bug251] /api/media/series 第 ${attempt} 次取回空（status=${lib.status}），重试`)
+    await delay(1000)
+  }
+  if (allSeries.length === 0) {
+    console.error('[bug251] 环境未就绪：/api/media/series 三次均取回空列表')
+    process.exit(1)
+  }
+  /*
+   * BUG-422：A4 的 realPick 必须从**墙可见集**里取。剧集墙（BUG-304/D18）只渲染
+   * `hasBytes !== false` 的剧集（MediaLibraryPanel.loadSeries 过滤）；从未过滤的
+   * API 列表取「以《开头」剧集，会选中墙上不存在的剧集 ⇒ 下面的墙有界等待恒超时
+   * （实测 105 条里 17 条 hasBytes=false 被隐藏）。产品行为符合 BUG-304 判据，
+   * 是脚本选靶缺陷。
+   */
   const withBracket = allSeries.filter((s) => typeof s.title === 'string' && s.title.includes('《'))
   const leadingBracket = allSeries.filter(
-    (s) => typeof s.title === 'string' && s.title.trim().startsWith('《'),
+    (s) =>
+      typeof s.title === 'string' &&
+      s.title.trim().startsWith('《') &&
+      s.hasBytes !== false,
   )
   const samples = withBracket.slice(0, 3).map((s) => s.title)
-  console.log(`[bug251] 全库剧集=${allSeries.length} 含《=${withBracket.length} 以《开头=${leadingBracket.length}`)
+  console.log(`[bug251] 全库剧集=${allSeries.length} 含《=${withBracket.length} 以《开头(墙可见)=${leadingBracket.length}`)
   console.log(`[bug251] 含《 前 3 样本: ${JSON.stringify(samples)}`)
   check(
     'P: 真实库中 title 含 《 的剧集条数 > 0（前置非空证明）',
@@ -401,13 +426,8 @@ async function main() {
     })
     if (!navOk) throw new Error('nav-child-lib-series 入口不存在')
     await delay(1500)
-    const railOk = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="media-rail-series-all"]')
-      if (!el) return false
-      el.click()
-      return true
-    })
-    if (!railOk) throw new Error('media-rail-series-all 入口不存在')
+  // M0 导航模型（BUG-298）：`media-rail-series-all` 已废止，侧栏入口直达剧集墙；
+  // 墙可达性由下面的 series-card-root 有界等待承担（不再点已删除的 rail）。
 
     const wantIds = [BR.seriesId, PL.seriesId, ...realPick.map((r) => r.id)]
     await page.waitForFunction(

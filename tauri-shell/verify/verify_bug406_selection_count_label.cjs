@@ -124,7 +124,9 @@ async function httpOk(url) {
 
 /** 有界等待：固定 sleep 不等同「等它发生」（vite 首编译慢会集体假红）。 */
 async function waitFor(page, fn, timeoutMs = 20000) {
-  await page.waitForFunction(fn, { timeoutMs })
+  // cdp 的 waitForFunction 只认 `timeout`；写成 `timeoutMs` 会被静默忽略、
+  // 吃默认 30s（本次首跑即踩到：判据没坏，是等待选项没生效）。
+  await page.waitForFunction(fn, { timeout: timeoutMs })
 }
 
 /** 读某域计数节点文本 + 容器在不在 DOM。 */
@@ -199,7 +201,7 @@ async function main() {
         const el = document.querySelector('[data-testid="items-selection-count"]')
         return el && /2/.test(el.textContent || '')
       },
-      { timeoutMs: 10000 },
+      { timeout: 10000 },
     )
     const c2 = await readCount(page, 'items-selection-count')
     check('② items 勾 2 张 ⇒ 计数变「已选 2 项」（随选中数更新）', countTextOk(c2.text, 2), `text="${c2.text}"`)
@@ -210,7 +212,7 @@ async function main() {
     })
     await page.waitForFunction(
       () => document.querySelector('[data-testid="items-selection-bar"]') === null,
-      { timeoutMs: 10000 },
+      { timeout: 10000 },
     )
 
     /* ── ③ series 域 ── */
@@ -238,7 +240,7 @@ async function main() {
     })
     await page.waitForFunction(
       () => document.querySelector('[data-testid="series-selection-bar"]') === null,
-      { timeoutMs: 10000 },
+      { timeout: 10000 },
     )
 
     /* ── ④ 下载域 ── */

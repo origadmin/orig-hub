@@ -43,7 +43,8 @@
  * ## 环境
  *
  *   vite dev + 后端。未就绪时用 `scripts/dev_services.py` 拉起（**不裸跑** orig-tg：
- *   daemon 是唯一启动者）。orig-tg 端口从 daemon `/api/config` 的 `tg_port` 取真源。
+ *   daemon 是唯一启动者）。orig-tg 端口从 daemon `/api/config` 取真源（BUG-358 起
+ *   plugins[] id="tg".port，旧键 tg_port 兜底 —— BUG-423）。
  *
  * 用法： node verify/verify_bug_249_batch_actions.cjs
  * Env:  APP_PORT(5180) / DAEMON_PORT(19786) / ORIG_VERIFY_SHOTS
@@ -110,8 +111,14 @@ async function httpJson(method, url, body) {
 /** 从 daemon 真源取 orig-tg 端口（不硬编码）。 */
 async function resolveTgBase() {
   const cfg = await httpJson('GET', `${DAEMON}/api/config`)
-  if (cfg.status !== 200 || !cfg.json || !cfg.json.tg_port) return null
-  return { base: `http://127.0.0.1:${cfg.json.tg_port}`, tgRunning: cfg.json.tg_running === true }
+  if (cfg.status !== 200 || !cfg.json) return null
+  // BUG-423：BUG-358 起真源是 plugins[] 里 id="tg"（旧键 tg_port/tg_running 兜底）
+  const plug = Array.isArray(cfg.json.plugins) ? cfg.json.plugins.find((x) => x && x.id === 'tg') : null
+  const port =
+    plug && Number(plug.port) > 0 ? Number(plug.port) : Number(cfg.json.tg_port) > 0 ? Number(cfg.json.tg_port) : null
+  if (!port) return null
+  const tgRunning = plug ? plug.running === true : cfg.json.tg_running === true
+  return { base: `http://127.0.0.1:${port}`, tgRunning }
 }
 
 function startDevServices() {

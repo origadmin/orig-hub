@@ -176,19 +176,11 @@ async function main() {
 
     // 必须回布尔：直接返回 DOM 元素会让 CDP returnByValue 序列化抛
     // 「Object reference chain is too long」。
-    await page.waitForFunction(() => !!document.querySelector('[data-testid="media-panel-title"]'), {
-      timeout: 25000,
-      intervalMs: 300,
-    })
-    const onWall = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="media-rail-series-all"]')
-      if (!el) return false
-      el.click()
-      return true
-    })
-    check(onWall, 'series wall reachable ([data-testid="media-rail-series-all"])', `clicked=${onWall}`)
-    if (!onWall) throw new Error('series wall rail button not found — cannot continue')
-
+    // BUG-422：`media-panel-title` 随面板头部整改已废止（恒超时）——删掉该等待，
+    // 可达性由下面的 series-card-root 有界等待承担。
+    // M0 导航模型（BUG-298）：`media-rail-series-all` 已随左栏 rail 一并废止，
+    // 侧栏 `nav-child-lib-series` 直达剧集墙 —— 上一步已点到，这里改为直接
+    // 等墙上的卡片（可达性判据由下面的有界等待承担，不再依赖已删除的入口）。
     await page.waitForFunction(() => document.querySelectorAll('[data-testid="series-card-root"]').length > 0, {
       timeout: 25000,
       intervalMs: 300,
@@ -232,13 +224,23 @@ async function main() {
       }
     }
 
-    const noBytesSeries = allSeries.find((s) => s.coverHasBytes === false)
+    // BUG-422：(a) 的靶子口径随 BUG-304 翻转 —— 见下方判据注释。
+    //   byteLessSeries：hasBytes===false（分集全无字节）——BUG-304 起不得上墙；
+    //   coverLessSeries：coverHasBytes===false 但 hasBytes!==false——**必须**在墙上
+    //     （证明墙的过滤键是分集字节，不是封面字节；封面没缓存只落占位图）。
+    const byteLessSeries = allSeries.find((s) => s.hasBytes === false)
+    const coverLessSeries = allSeries.find((s) => s.coverHasBytes === false && s.hasBytes !== false)
     const normalSeries = allSeries.find((s) => s.coverHasBytes !== false)
 
     check(
-      Boolean(noBytesSeries),
-      'data: a series with coverHasBytes===false exists (else (a) cannot prove anything)',
-      `noBytesSeries=${noBytesSeries ? noBytesSeries.id : 'none'}`,
+      Boolean(byteLessSeries),
+      'data: a series with hasBytes===false exists (else (a) cannot prove anything)',
+      `byteLessSeries=${byteLessSeries ? byteLessSeries.id : 'none'}`,
+    )
+    check(
+      Boolean(coverLessSeries),
+      'data: a series with coverHasBytes===false but hasBytes!==false exists (else (a-bite) cannot prove)',
+      `coverLessSeries=${coverLessSeries ? coverLessSeries.id : 'none'}`,
     )
     check(
       Boolean(normalSeries),
@@ -251,30 +253,57 @@ async function main() {
       `playerSeries=${playerSeries ? playerSeries.id : 'none'}`,
     )
 
-    // ── 2. (a) 剧集墙标记 ─────────────────────────────────
-    if (noBytesSeries && normalSeries) {
-      const wall = await page.evaluate((nbId, nmId) => {
+    // ── 2. (a) 剧集墙可见性 ───────────────────────────────
+    /*
+     * BUG-422 判据翻转（与 B5b 同型，方向被后续设计决策推翻）：
+     *
+     * 原判据：(a) `coverHasBytes===false` 的剧集卡内出现 `series-nobytes` 标记。
+     * 提交 `ca17a6d`（BUG-304「文件域只列有内容的剧集」）把这条判据的**前提**拆了：
+     *   1. `hasBytes===false`（分集全无字节）的剧集**整卡不上墙**（MediaLibraryPanel
+     *      .loadSeries 的 `list.filter(s => s.hasBytes !== false)`）——没有卡，标记
+     *      无处可挂；
+     *   2. `series-nobytes` 标记本身也在同一提交里从 SeriesCard 移除（源码已无此
+     *      testid）——BUG-304 的裁定是「不显示」而不是「显示了再打标」。
+     * 诉求方向没变（无字节内容不得被当成可播放内容呈现），只是落实方式从
+     * 「墙上打标」升级为「墙根上隐藏」。判据随之翻转为：
+     *   (a)      全无字节剧集**不在**剧集墙上（BUG-304 不变量）；
+     *   (a-bite) 封面无字节但分集有字节的剧集**在**墙上（过滤键是分集字节，
+     *            不是封面字节 —— 防的是把过滤条件误扩成 coverHasBytes）。
+     *   (a-bite2) 有字节剧集在墙上且无 `series-nobytes` 标记（标记已废止，
+     *            防止有人把旧标记加回来）。
+     */
+    if (byteLessSeries && normalSeries) {
+      const wall = await page.evaluate((nbId, clId, nmId) => {
         const card = (id) => document.querySelector(`[data-testid="series-card-root"][data-series-id="${id}"]`)
         const has = (c, tid) => (c ? c.querySelector(`[data-testid="${tid}"]`) !== null : null)
         const nb = card(nbId)
+        const cl = card(clId)
         const nm = card(nmId)
         return {
-          nobytesCardPresent: nb !== null,
-          nobytesHasMarker: has(nb, 'series-nobytes'),
+          byteLessCardPresent: nb !== null,
+          coverLessCardPresent: cl !== null,
+          coverLessHasMarker: has(cl, 'series-nobytes'),
           normalCardPresent: nm !== null,
           normalHasMarker: has(nm, 'series-nobytes'),
         }
-      }, noBytesSeries.id, normalSeries.id)
+      }, byteLessSeries.id, coverLessSeries ? coverLessSeries.id : -1, normalSeries.id)
       console.log(`[verify] series wall state: ${JSON.stringify(wall)}`)
 
       check(
-        wall.nobytesCardPresent && wall.nobytesHasMarker,
-        '(a) byte-less series card shows [series-nobytes]',
-        `seriesId=${noBytesSeries.id} card=${wall.nobytesCardPresent} marker=${wall.nobytesHasMarker}`,
+        !wall.byteLessCardPresent,
+        '(a) 全无字节剧集（hasBytes===false）不在剧集墙上（BUG-304：不显示，而非打了标再显示）',
+        `seriesId=${byteLessSeries.id} card=${wall.byteLessCardPresent}`,
       )
+      if (coverLessSeries) {
+        check(
+          wall.coverLessCardPresent && !wall.coverLessHasMarker,
+          '(a-bite) 封面无字节但分集有字节的剧集仍在墙上（过滤键是分集字节，不是封面字节）',
+          `seriesId=${coverLessSeries.id} card=${wall.coverLessCardPresent} marker=${wall.coverLessHasMarker}`,
+        )
+      }
       check(
         wall.normalCardPresent && !wall.normalHasMarker,
-        '(a-bite) byte-having series card shows NO [series-nobytes]',
+        '(a-bite2) 有字节剧集在墙上且无 series-nobytes 标记（旧标记已随 BUG-304 废止）',
         `seriesId=${normalSeries.id} card=${wall.normalCardPresent} marker=${wall.normalHasMarker}`,
       )
       console.log(`[verify] screenshot: ${await page.screenshot(path.join(SHOT_DIR, 'series-wall.png'), { fullPage: true })}`)

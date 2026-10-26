@@ -40,26 +40,42 @@ const PAGE = 120
 /** 占位名形态：`TG <chat_id> · <YYYY-MM-DD>`（与 routes.rs:2314-2315 同源）。 */
 const PLACEHOLDER_RE = /^TG\s+-?\d+\s+·\s+\d{4}-\d{2}-\d{2}$/
 
+/**
+ * orig-tg 权威计数（外部真值）。
+ *
+ * BUG-422：orig-tg 偶发 ~14s stall（实测同一条 GET 时快时慢、PID 不变，非崩溃），
+ * 旧实现 5s 超时一次性读数 ⇒ apiItems 恒 -1，下游「网格按 PAGE 截断」等判据被
+ * 假红（min(120, -1)）。改成最多 4 轮、每轮 20s 的 GET 重试（GET 幂等，可直接重试）。
+ */
 function apiStats(base) {
-  return new Promise((resolve) => {
-    const req = http.get(`${base}/api/media/stats`, { timeout: 5000 }, (res) => {
-      let body = ''
-      res.setEncoding('utf8')
-      res.on('data', (c) => (body += c))
-      res.on('end', () => {
-        try {
-          resolve({ ok: res.statusCode === 200, data: JSON.parse(body) })
-        } catch (_e) {
-          resolve({ ok: false, data: null })
-        }
+  const once = () =>
+    new Promise((resolve) => {
+      const req = http.get(`${base}/api/media/stats`, { timeout: 20000 }, (res) => {
+        let body = ''
+        res.setEncoding('utf8')
+        res.on('data', (c) => (body += c))
+        res.on('end', () => {
+          try {
+            resolve({ ok: res.statusCode === 200, data: JSON.parse(body) })
+          } catch (_e) {
+            resolve({ ok: false, data: null })
+          }
+        })
+      })
+      req.on('error', () => resolve({ ok: false, data: null }))
+      req.on('timeout', () => {
+        req.destroy()
+        resolve({ ok: false, data: null })
       })
     })
-    req.on('error', () => resolve({ ok: false, data: null }))
-    req.on('timeout', () => {
-      req.destroy()
-      resolve({ ok: false, data: null })
-    })
-  })
+  return (async () => {
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      const r = await once()
+      if (r.ok) return r
+      console.log(`[bug283] apiStats attempt#${attempt} failed — retrying (orig-tg stall tolerance)`)
+    }
+    return { ok: false, data: null }
+  })()
 }
 
 async function main() {
@@ -84,7 +100,8 @@ async function main() {
 
     /*
      * 媒体库默认落在**剧集墙**（`series-wall-scroll`），条目网格要显式点左栏
-     * `media-cat-all` 才出现。点击前必须**轮询等待按钮挂载** ——
+     * `nav-child-cat-video` 才出现（M0/BUG-298 后 `media-cat-all` 已废止）。
+     * 点击前必须**轮询等待按钮挂载** ——
      * 固定 sleep 会撞上「按钮还没渲染」而静默点空（首版即栽在这里）。
      */
     /*
@@ -118,11 +135,11 @@ async function main() {
       }
       return false
     }
-    const hasCatAll = await waitFor(() => !!document.querySelector('[data-testid="media-cat-all"]'))
-    check('左栏「全部内容」入口已挂载', hasCatAll, hasCatAll ? 'ok' : '超时未出现 media-cat-all')
-    if (!hasCatAll) throw new Error('media-cat-all 未出现，无法进入条目视图')
+    const hasCatAll = await waitFor(() => !!document.querySelector('[data-testid="nav-child-cat-video"]'))
+    check('左栏「视频」入口已挂载（M0 后 media-cat-all 废止，条目视图入口）', hasCatAll, hasCatAll ? 'ok' : '超时未出现 nav-child-cat-video')
+    if (!hasCatAll) throw new Error('nav-child-cat-video 未出现，无法进入条目视图')
 
-    await page.evaluate(() => document.querySelector('[data-testid="media-cat-all"]').click())
+    await page.evaluate(() => document.querySelector('[data-testid="nav-child-cat-video"]').click())
     const hasGrid = await waitFor(() => !!document.querySelector('[data-testid="media-grid"]'))
     check('切到条目视图后 media-grid 已出现', hasGrid, hasGrid ? 'ok' : '超时未出现 media-grid')
     if (!hasGrid) throw new Error('media-grid 未出现，无法继续')

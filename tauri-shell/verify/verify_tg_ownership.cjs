@@ -14,7 +14,8 @@
  *
  * 本脚本断言的不是「能不能打开页面」，而是四条结构性事实：
  *   1. **端口单一真源**：浏览器用的 daemon / TG 端口必须等于 daemon 下发的
- *      `port` / `tg_port`（前端不再各自硬编码 9876 / 9877）；
+ *      `port` / orig-tg 端口（BUG-358 起在 `plugins[]` id="tg".port，旧键
+ *      `tg_port` 兜底；前端不再各自硬编码 9876 / 9877）；
  *   2. **门控只问服务层**：`nav-tg` 存在 ⇔ daemon 说的 `tg_enabled && tg_running`；
  *   3. **链路层不冒充故障**：未配置凭证时账号页横幅必须是「待办」文案，
  *      页面任何位置都不得出现「Telegram 不可用」；
@@ -93,14 +94,16 @@ async function main() {
     return 2
   }
   const daemonPort = cfg.port
-  const tgPort = cfg.tg_port
-  const tgEnabled = cfg.tg_enabled === true
-  const tgRunning = cfg.tg_running === true
+  // BUG-423：BUG-358 起契约是 plugins[]（id 取插件）；旧键兜底兼容
+  const tgPlug = Array.isArray(cfg.plugins) ? cfg.plugins.find((x) => x && x.id === 'tg') : null
+  const tgPort = tgPlug && Number(tgPlug.port) > 0 ? Number(tgPlug.port) : Number(cfg.tg_port) > 0 ? Number(cfg.tg_port) : null
+  const tgEnabled = tgPlug ? tgPlug.enabled === true : cfg.tg_enabled === true
+  const tgRunning = tgPlug ? tgPlug.running === true : cfg.tg_running === true
   console.log(
     `[verify:tgowner] daemon: port=${daemonPort} tg_enabled=${tgEnabled} tg_running=${tgRunning} tg_port=${tgPort}`,
   )
   if (!daemonPort || !tgPort) {
-    console.error('[verify:tgowner] daemon 未下发 port / tg_port —— 真源缺失（exit 2）')
+    console.error('[verify:tgowner] daemon 未下发 port / orig-tg 端口（plugins[] id=tg 与旧键 tg_port 均无）—— 真源缺失（exit 2）')
     return 2
   }
 
@@ -152,7 +155,7 @@ async function main() {
       `browser=${bases.daemon} daemon=${daemonPort}`,
     )
     check(
-      '浏览器 TG 基址端口 == daemon 下发的 tg_port（前端不再硬编码 9877）',
+      '浏览器 TG 基址端口 == daemon 下发的 orig-tg 端口（plugins[] id=tg.port，BUG-358 新契约；前端不再硬编码 9877）',
       () => bases.tg === `http://127.0.0.1:${tgPort}`,
       `browser=${bases.tg} daemon_tg_port=${tgPort}`,
     )

@@ -4,7 +4,8 @@
  * （服务层进程状态 + Telegram 链路状态），而不是只有下载引擎一项。
  *
  * 驱动：nav-settings → settings-tab-about → 读 about-tg / about-tg-status。
- * 状态真源：daemon `/api/config`（tg_enabled/tg_running/tg_port/tg_last_error），
+ * 状态真源：daemon `/api/config`（BUG-358 起 plugins[] id="tg" 的
+ * enabled/running/port/lastError，旧键 tg_* 兜底 —— BUG-423），
  * 探针据此核对 UI 文案，不内嵌文案字符串判断逻辑之外的期望值。
  */
 const cdp = require('./lib/cdp.cjs')
@@ -41,7 +42,19 @@ async function main() {
     try {
       const r = await fetch(`${D}/api/config`)
       const d = await r.json()
-      return { enabled: d.tg_enabled, running: d.tg_running, port: d.tg_port, err: d.tg_last_error }
+      // BUG-423：BUG-358 起契约是 plugins[]（id 取插件）；旧键兜底兼容
+      const plug = Array.isArray(d.plugins) ? d.plugins.find((x) => x && x.id === 'tg') : null
+      return {
+        enabled: plug ? plug.enabled === true : d.tg_enabled === true,
+        running: plug ? plug.running === true : d.tg_running === true,
+        port:
+          plug && Number(plug.port) > 0
+            ? Number(plug.port)
+            : Number(d.tg_port) > 0
+              ? Number(d.tg_port)
+              : null,
+        err: plug ? (plug.lastError ?? null) : (d.tg_last_error ?? null),
+      }
     } catch (e) {
       return { error: e.message }
     }

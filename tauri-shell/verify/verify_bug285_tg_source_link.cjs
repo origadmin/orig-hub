@@ -217,10 +217,6 @@ async function openSeriesDetail(page, seriesId, title) {
     if (el) el.click()
   })
   await delay(1200)
-  await page.evaluate(() => {
-    const el = document.querySelector('[data-testid="media-rail-series-all"]')
-    if (el) el.click()
-  })
   await delay(1200)
 
   let opened = false

@@ -36,6 +36,7 @@ const crypto = require('node:crypto')
 
 const cdp = require('./lib/cdp.cjs')
 const endpoints = require('./_lib_endpoints.cjs')
+const sandbox = require('./lib/sandbox.cjs')
 
 const OUT = process.env.ORIG_VERIFY_OUT || path.resolve(__dirname, 'evidence', 'BUG-263')
 const EN_US = path.resolve(__dirname, '..', 'src', 'i18n', 'locales', 'en-US.json')
@@ -92,6 +93,9 @@ async function createRealItem(title, tg) {
     items: [{ path: filePath, source: 'local', kind: 'video', title }],
   })
   const id = r.json && Array.isArray(r.json.ids) ? r.json.ids[0] : null
+  // BUG-422：导入即被 BUG-304 自动归档进单集剧集；不先撤销归属，后面往自己的
+  // 剧集挂载会撞 media_episode.item_id 唯一约束（HTTP 500）。
+  if (id != null) await sandbox.detachAutoSeries(tg, id)
   return { id, filePath, status: r.status }
 }
 
@@ -135,7 +139,8 @@ async function openItemEditDialog(page, itemId) {
   })
   await delay(1200)
   await page.evaluate(() => {
-    const el = document.querySelector('[data-testid="media-cat-all"]')
+    // M0（BUG-298）：`media-cat-all` 已废止，items 视图入口是侧栏 `nav-child-cat-video`。
+    const el = document.querySelector('[data-testid="nav-child-cat-video"]')
     if (el) el.click()
   })
   await page.waitForFunction(
@@ -189,7 +194,10 @@ async function readItemEditDialog(page) {
     }
     walkNoTags(root)
     return {
-      title: norm(root.querySelector('h4') ? root.querySelector('h4').innerText : ''),
+      // BUG-422：标题元素从 h4 改成 h2（ItemEditDialog 现为 `<h2 className="text-base
+      // font-semibold">`）——写死 h4 恒得空标题，①b/②a/③d 三条判据全假红。
+      // 改为不限标题层级（h1..h6 取第一个）。
+      title: norm((root.querySelector('h1,h2,h3,h4,h5,h6') || { innerText: '' }).innerText),
       text: root.innerText,
       textNoTags,
       metaRows,

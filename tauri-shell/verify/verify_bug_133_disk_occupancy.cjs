@@ -86,11 +86,31 @@ const PIN_TG_PORT = (port) => {
       if (url && url.indexOf(daemonOrigin) === 0) {
         if (/\/api\/config(\?|$)/.test(url)) {
           // Preserve the real daemon's settings; override only the port.
+          // BUG-423：前端自 BUG-358 起只读 plugins[]（useStore:
+          // `tgServiceFromPlugins(cfg)` → `setTgPort(svc.port)`），旧键 tg_port
+          // 已无人消费 —— 只注入 tg_port 等于没钉，app 会拿 VITE_TG_PORT 初值
+          // （默认 19787）打错端口。故钉 plugins[] 里 id="tg" 的 port（真配置的
+          // 其余字段保留；旧键一并写上，双契约 readers 也能用）。
           return orig
             .call(this, input, init)
             .then((r) => r.json())
             .catch(() => ({}))
-            .then((body) => stub({ ...body, tg_port: Number(port) }))
+            .then((body) => {
+              const plugins = Array.isArray(body.plugins) ? body.plugins.slice() : []
+              const i = plugins.findIndex((x) => x && x.id === 'tg')
+              const pinned = {
+                id: 'tg',
+                label: 'Telegram',
+                enabled: true,
+                running: true,
+                port: Number(port),
+                lastError: null,
+                health: null,
+              }
+              if (i >= 0) plugins[i] = { ...plugins[i], ...pinned }
+              else plugins.push(pinned)
+              return stub({ ...body, plugins, tg_port: Number(port) })
+            })
         }
         // Other daemon calls (events/health/downloads) are not needed to render
         // the library panel, and would be CORS-blocked from this origin.

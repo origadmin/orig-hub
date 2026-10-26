@@ -22,15 +22,18 @@ const OUT = path.join(__dirname, 'evidence', 'BUG-232')
 fs.mkdirSync(OUT, { recursive: true })
 // orig-tg 端口由 daemon 真源下发（不得硬编码：端口可被保留区顺延/迁移，BUG-177/178/228）。
 const DAEMON = 'http://127.0.0.1:19786'
-const CHANNEL_ROW_RE = /^频道\s*-?\d+\s*·/
 
 async function tgBase(page) {
   const p = await page.evaluate(async (D) => {
     const r = await fetch(`${D}/api/config`)
     const d = await r.json()
-    return d.tg_port ? `http://127.0.0.1:${d.tg_port}` : null
+    // BUG-423：BUG-358 起端口真源是 plugins[] 里 id="tg" 的 port（旧键 tg_port 兜底）
+    const plug = Array.isArray(d.plugins) ? d.plugins.find((x) => x && x.id === 'tg') : null
+    const port =
+      plug && Number(plug.port) > 0 ? Number(plug.port) : Number(d.tg_port) > 0 ? Number(d.tg_port) : null
+    return port ? `http://127.0.0.1:${port}` : null
   }, DAEMON)
-  if (!p) throw new Error('daemon 未下发 tg_port（TG 未运行？）')
+  if (!p) throw new Error('daemon 未下发 orig-tg 端口（plugins[] id=tg 与旧键 tg_port 均无；TG 未运行？）')
   return p
 }
 
@@ -71,7 +74,15 @@ async function main() {
   } catch (e) {
     throw new Error(`对账失败（tasks/all）: ${e.message}`)
   }
-  const oracle = { tasks: (data.tasks || []).map((t) => ({ id: t.id, status: t.status, apiTitle: t.title ?? null })) }
+  const oracle = {
+    tasks: (data.tasks || []).map((t) => ({
+      id: t.id,
+      status: t.status,
+      apiTitle: t.title ?? null,
+      // 回落行判据要用：无 title 任务的首消息号（产品回落实体 = `#<首消息号>`）
+      firstMsg: (t.messageIds || [])[0],
+    })),
+  }
 
   const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim()
   const apiTitled = oracle.tasks.filter((t) => t.apiTitle)
@@ -81,8 +92,28 @@ async function main() {
   const problems = []
   const titleHeads = apiTitled.map((t) => norm(t.apiTitle).slice(0, 12))
   const matched = titleHeads.filter((h) => rows.some((r) => norm(r.title).includes(h))).length
-  const bareRows = rows.filter((r) => CHANNEL_ROW_RE.test(norm(r.title)))
-  const titledRows = rows.filter((r) => !CHANNEL_ROW_RE.test(norm(r.title)))
+  /*
+   * 行分类（对齐产品 `CacheManagerDialog.ingestTitleOf` 的真实形态）：
+   *   - 服务端有 title ⇒ 行首就是该 title（BUG-232 修复的本体）；
+   *   - 服务端无 title ⇒ 产品回落 `<频道名|"频道 <chatId>"> #<首个消息号>`，
+   *     行尾再拼 ` · 单条|整组 · N 条` —— 这是**设计行为**，不是标题丢失。
+   * 旧正则 `/^频道\s*-?\d+\s*·/` 盯的是更早的「频道 <id> ·」形态（无 #msgId、
+   * 且频道无标题时才出现「频道」字样）：现行回落带 #msgId、频道有标题时不出现
+   * 「频道」⇒ 合法回落行被错判进 titledRows，断言 2 把它当「凭空造标题」假红。
+   * 回落行身份判据：行首 `#<msgId>` 必须是某个**服务端无 title** 任务的首消息号
+   * （产品只为无 title 任务造回落；锚在行首，标题中部含 "#12 ·" 不会误豁免）。
+   */
+  const untitledFirstMsgs = new Set(apiUntitled.map((t) => t.firstMsg))
+  const fallbackMsgOf = (txt) => {
+    const m = /^(.+?)\s*#(\d+)\s*·\s*(?:单条|整组)\s*·/.exec(txt)
+    return m ? Number(m[2]) : null
+  }
+  const isFallbackRow = (txt) => {
+    const msg = fallbackMsgOf(txt)
+    return msg != null && untitledFirstMsgs.has(msg)
+  }
+  const bareRows = rows.filter((r) => isFallbackRow(norm(r.title)))
+  const titledRows = rows.filter((r) => !isFallbackRow(norm(r.title)))
 
   // 断言 1：反空跑 —— 服务端确实下发了标题，且 UI 至少渲染出一行内容标题
   if (apiTitled.length === 0) problems.push('服务端未对任何任务下发 title（BUG-232 v2 服务端未生效）')
@@ -96,7 +127,7 @@ async function main() {
   // ——旧行为/旧数据源下的失败形态就是大面积退化成裸 ID。
   if (bareRows.length > Math.max(apiUntitled.length, 0))
     problems.push(`裸频道 ID 行 ${bareRows.length} 条 > 服务端无 title 任务 ${apiUntitled.length} 条（标题被丢失）`)
-  console.log(`UI 行=${rows.length} 内容标题行=${titledRows.length} 命中服务端 title=${matched} 裸 ID 行=${bareRows.length}`)
+  console.log(`UI 行=${rows.length} 内容标题行=${titledRows.length} 命中服务端 title=${matched} 回落行（无 title 任务的频道回落）=${bareRows.length}`)
   await page.screenshot(path.join(OUT, '2_ingest_rows_settled.png'))
   console.log('sample:', JSON.stringify(rows.slice(0, 6)))
   console.log(problems.length ? 'FAIL: ' + problems.slice(0, 5).join('; ') : 'PASS: 行标题 = 入库内容 caption（全状态）')

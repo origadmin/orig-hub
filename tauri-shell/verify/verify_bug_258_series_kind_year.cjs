@@ -86,6 +86,7 @@ const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 
 const cdp = require('./lib/cdp.cjs')
+const sandbox = require('./lib/sandbox.cjs')
 
 const APP_PORT = Number(process.env.APP_PORT || 5180)
 const APP_URL = `http://127.0.0.1:${APP_PORT}/`
@@ -141,8 +142,11 @@ async function httpJson(method, url, body) {
 /** 从 daemon 真源取 orig-tg 端口（不硬编码）。 */
 async function resolveTgBase() {
   const cfg = await httpJson('GET', `${DAEMON}/api/config`)
-  if (cfg.status !== 200 || !cfg.json || !cfg.json.tg_port) return null
-  return { base: `http://127.0.0.1:${cfg.json.tg_port}`, tgRunning: cfg.json.tg_running === true }
+  // BUG-358 起 `/api/config` 的 `tg_port` 收进 `plugins[]`（id='tg'）—— 旧键直读
+  // 会恒得 undefined（BUG-422 实测假红）。适配器双契约兼容，只此一处。
+  const tgPort = sandbox.tgPortOf(cfg.json)
+  if (cfg.status !== 200 || !cfg.json || !tgPort) return null
+  return { base: `http://127.0.0.1:${tgPort}`, tgRunning: sandbox.tgRunningOf(cfg.json) }
 }
 
 function startDevServices() {
@@ -186,6 +190,9 @@ async function createItem(title, ts, tg) {
     items: [{ path: fakePath, source: 'local', kind: 'video', title }],
   })
   const id = r.json && Array.isArray(r.json.ids) ? r.json.ids[0] : null
+  // BUG-422：导入即被 BUG-304 自动归档进单集剧集；不先撤销归属，后面往自己的
+  // 剧集挂载会撞 media_episode.item_id 唯一约束（HTTP 500）。
+  if (id != null) await sandbox.detachAutoSeries(tg, id)
   return { id, status: r.status }
 }
 
@@ -234,10 +241,6 @@ async function navToSeriesWall(page) {
   })
   if (!navOk) throw new Error('nav-child-lib-series 入口不存在')
   await delay(1500)
-  await page.evaluate(() => {
-    const el = document.querySelector('[data-testid="media-rail-series-all"]')
-    if (el) el.click()
-  })
   await delay(1200)
 }
 
@@ -247,7 +250,16 @@ async function openSeriesDetail(page, seriesId) {
     const el = document.querySelector(`[data-testid="series-card"][data-series-id="${sid}"]`)
     if (el) el.click()
   }, seriesId)
-  await delay(1200)
+  // BUG-422：固定 `delay(1200)` 不等价于「详情已打开」。A2 段重启 orig-tg 后详情
+  // 首拉是冷请求（B 段重导航），1200ms 内视图还没切 ⇒ openSeriesEditPanel 找不到
+  // `series-desc-edit`，误报「入口不存在（SeriesEditPanel 打不开）」。
+  // 改为有界等待详情视图锚点（`series-title`），超时报出真实原因。
+  const opened = await page.waitForFunction(
+    () => !!document.querySelector('[data-testid="series-title"]'),
+    { timeout: 20000 },
+  ).then(() => true).catch(() => false)
+  if (!opened) throw new Error('剧集详情视图未打开（点击 series-card 后 20s 内无 series-title）')
+  await delay(300)
 }
 
 /** 从剧集详情页打开 `SeriesEditPanel`（`series-desc-edit` 是该面板的唯一入口）。 */
@@ -680,9 +692,8 @@ async function main() {
     // 切到「内容」分类。左栏 testid 是 `media-cat-<tab>`（`MediaLibraryPanel`
     // 的 `media.contentAll` 分组），**不是** `media-rail-items-all`（不存在）。
     const catOk = await page.evaluate(() => {
-      const el =
-        document.querySelector('[data-testid="media-cat-video"]') ||
-        document.querySelector('[data-testid="media-cat-all"]')
+      // M0（BUG-298）：media-cat-* 系列已废止，items 视图入口是侧栏 nav-child-cat-video。
+      const el = document.querySelector('[data-testid="nav-child-cat-video"]')
       if (!el) return false
       el.click()
       return true

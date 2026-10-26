@@ -58,17 +58,22 @@ const APP_URL = process.env.VERIFY_APP_URL || 'http://127.0.0.1:5180/'
 const DAEMON = process.env.VERIFY_DAEMON_BASE || 'http://127.0.0.1:19786'
 /**
  * orig-tg 基址**运行时解析**（BUG-178 纪律，与前端同口径）：端口以 daemon
- * `/api/config` 的 `tg_port` 为真源 —— 19787 绑不上时 orig-tg 会顺延（如 19788），
- * 硬编码的脚本会在顺延后全部打空。`VERIFY_TG_BASE` 仍可显式覆盖。
+ * `/api/config` 为真源 —— BUG-358 起先读 `plugins[]` 里 `id="tg"` 的 `port`，
+ * 旧键 `tg_port` 兜底（BUG-423）。两者皆无**抛错**，不再静默回落 19787：
+ * 顺延后猜错端口会把「打空」演成绿灯。`VERIFY_TG_BASE` 仍可显式覆盖。
  */
 async function resolveTgBase() {
   if (process.env.VERIFY_TG_BASE) return process.env.VERIFY_TG_BASE
-  try {
-    const cfg = await (await fetch(`${DAEMON}/api/config`)).json()
-    return `http://127.0.0.1:${cfg.tg_port || 19787}`
-  } catch {
-    return 'http://127.0.0.1:19787'
+  const cfg = await (await fetch(`${DAEMON}/api/config`)).json()
+  const plug = Array.isArray(cfg.plugins) ? cfg.plugins.find((x) => x && x.id === 'tg') : null
+  const port =
+    plug && Number(plug.port) > 0 ? Number(plug.port) : Number(cfg.tg_port) > 0 ? Number(cfg.tg_port) : null
+  if (!port) {
+    throw new Error(
+      `daemon ${DAEMON}/api/config 未给出 orig-tg 端口（plugins[] id=tg 与旧键 tg_port 均无）——拒绝猜 19787`,
+    )
   }
+  return `http://127.0.0.1:${port}`
 }
 
 /** 分页页大小：与 MediaLibraryPanel 的 PAGE 同源（源码读）。 */

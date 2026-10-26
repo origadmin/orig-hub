@@ -247,18 +247,61 @@ function httpJson(method, url, body, timeoutMs = 8000) {
  * @param {string} [prefix] 标题前缀，默认 `VerifyProbe_`（落在已知残留前缀内，便于兜底扫描）。
  * @returns {Promise<{id:number, title:string}>} 新建剧集的 id 与标题。
  */
-async function createTempSeries(base, prefix = 'VerifyProbe_') {
+async function createTempSeries(base, prefix = 'VerifyProbe_', attempts = 4) {
   installCleanup()
-  const title = `${prefix}${Date.now()}`
-  const { status, json } = await httpJson('POST', `${base}/api/media/series`, { title })
-  if (status !== 200 || !json || typeof json.id !== 'number') {
-    throw new Error(`createTempSeries failed: status=${status} body=${JSON.stringify(json)}`)
+  /*
+   * BUG-422：orig-tg 偶发 **~14s stall**（实测同一条 GET 时快时慢：0.1s vs 13.7s），
+   * httpJson 默认 8s 超时会把一次**本会成功**的 POST 判成 status=0，脚本随即抛
+   * 「createTempSeries failed: status=0」假红。
+   *
+   * 重试策略不是无脑重发：status=0 = 客户端没收到响应，**服务端可能已经建成**。
+   * 故先按标题查证（GET 幂等）——查到了就沿用那一个，绝不重复 POST 造第二条；
+   * 确实没有才重试。每轮换新标题（Date.now 精度内不撞车）。
+   */
+  const settle = (ms) => new Promise((r) => setTimeout(r, ms))
+  let lastErr = 'unknown'
+  for (let i = 0; i < attempts; i++) {
+    const title = `${prefix}${Date.now()}`
+    const { status, json } = await httpJson('POST', `${base}/api/media/series`, { title }, 20000)
+    if (status === 200 && json && typeof json.id === 'number') {
+      const id = json.id
+      trackCleanup(async () => {
+        await httpJson('DELETE', `${base}/api/media/series/${id}`)
+      })
+      return { id, title }
+    }
+    lastErr = `status=${status} body=${JSON.stringify(json)}`
+    if (status === 0) {
+      const list = await httpJson('GET', `${base}/api/media/series`, null, 20000)
+      const hit = list.json && Array.isArray(list.json.items)
+        ? list.json.items.find((x) => x && x.title === title)
+        : null
+      if (hit && typeof hit.id === 'number') {
+        console.warn(`[sandbox] createTempSeries: POST 超时但服务端已建成，沿用 id=${hit.id}`)
+        trackCleanup(async () => {
+          await httpJson('DELETE', `${base}/api/media/series/${hit.id}`)
+        })
+        return { id: hit.id, title }
+      }
+    }
+    await settle(600 * (i + 1))
   }
-  const id = json.id
-  trackCleanup(async () => {
-    await httpJson('DELETE', `${base}/api/media/series/${id}`)
-  })
-  return { id, title }
+  throw new Error(`createTempSeries failed after ${attempts} attempts: ${lastErr}`)
+}
+
+/**
+ * BUG-422：带重试的 GET —— orig-tg 偶发 ~14s stall（见 createTempSeries 注释），
+ * 8s 超时会误判 status=0。读操作幂等，直接重试即可。
+ */
+async function httpJsonGet(url, timeoutMs = 20000, attempts = 4) {
+  const settle = (ms) => new Promise((r) => setTimeout(r, ms))
+  let last = { status: 0, json: null }
+  for (let i = 0; i < attempts; i++) {
+    last = await httpJson('GET', url, null, timeoutMs)
+    if (last.status !== 0) return last
+    await settle(500 * (i + 1))
+  }
+  return last
 }
 
 /**
@@ -271,6 +314,104 @@ async function createTempSeries(base, prefix = 'VerifyProbe_') {
 async function deleteSeries(base, id) {
   const { status } = await httpJson('DELETE', `${base}/api/media/series/${id}`)
   return status
+}
+
+/**
+ * 撤销条目被 BUG-304 自动归档的归属（若有），解放 `media_episode.item_id` 槽位。
+ *
+ * 为什么必须有这一步（BUG-422）：BUG-304/D18「导入即成剧」——
+ * `POST /api/media/items` 内部 `file_items_into_series` 把每条导入条目自动归档进
+ * 单集剧集（写 `media_episode` 行）；而 `media_episode` 有 `UNIQUE(item_id)`
+ * （活库索引 `idx_media_episode_item_unique`，BUG-292/297 上线）。夹具再往自己的
+ * 剧集挂载 ⇒ INSERT 撞唯一约束 ⇒ 500
+ * `UNIQUE constraint failed: media_episode.item_id`。这是**产品既定行为**
+ * （导入即归档是对的），不是缺陷——夹具必须适配：挂载前先撤销自动归档。
+ *
+ * 撤销手法：自动剧集只挂该条目（导入键 `item:{id}` / `tg:msgs:...` 均夹具独有）
+ * ⇒ 直接删整剧（`delete_series_explicit`：删剧且清墓碑）。**不摘单集**——
+ * `remove_episode` 会写带 `source_key` 的墓碑（BUG-126「删了又回来」保护，
+ * 设计上必须活过剪枝），每跑一轮就攒 inert 行；删剧路径零残留。
+ * 兜底：剧集里若还有别的内容（不该发生）⇒ 只摘自己那一集。
+ *
+ * 实现提炼自 `verify_bug285_tg_source_link.cjs` 的 `detachCurrentEpisode`
+ * （BUG-378 批次 `2d4ea90` 入库，当时只修了那一个脚本；BUG-422 收口到共享库，
+ * 免得 13 个脚本各抄一份然后各自腐烂）。
+ *
+ * @param {string} base 后端 base。
+ * @param {number} itemId 条目 id。
+ * @returns {Promise<{detached:boolean, reason:string, seriesId:(number|null)}>}
+ *   撤销结果；条目未被自动归档时 `{detached:false, reason:'not-filed'}`。
+ */
+async function detachAutoSeries(base, itemId) {
+  const item = await httpJson('GET', `${base}/api/media/items/${itemId}`)
+  // MediaItem 是 `rename_all = "camelCase"` —— 归属字段叫 `seriesId`，
+  // 写成 `series_id` 会永远读到 undefined（静默误判「未归档」）。
+  const sid = item.json && typeof item.json.seriesId === 'number' ? item.json.seriesId : null
+  if (!sid) return { detached: false, reason: 'not-filed', seriesId: null }
+  const detail = await httpJson('GET', `${base}/api/media/series/${sid}`)
+  const eps = (detail.json && detail.json.episodes) || []
+  // EpisodeView 同是 camelCase：条目字段叫 `itemId`（不是 `item_id`）。
+  const mine = eps.filter((e) => e && (e.itemId === itemId || e.item_id === itemId))
+  if (mine.length !== 1) {
+    return { detached: false, reason: 'episode-row-missing', seriesId: sid }
+  }
+  if (eps.length === 1) {
+    const del = await httpJson('DELETE', `${base}/api/media/series/${sid}`)
+    return {
+      detached: del.status === 200,
+      reason: del.status === 200 ? 'auto-series-deleted' : `series-delete-${del.status}`,
+      seriesId: sid,
+    }
+  }
+  const del = await httpJson('DELETE', `${base}/api/media/episodes/${mine[0].id}`)
+  return {
+    detached: del.status === 200,
+    reason: del.status === 200 ? 'detached' : `delete-${del.status}`,
+    seriesId: sid,
+  }
+}
+
+// ────────────────────────────── daemon 契约适配（BUG-358 / BUG-422） ──────────────────────────────
+
+/** daemon `/api/config` 里 TG 插件的 id（与前端 `TG_PLUGIN_ID` 同值）。 */
+const TG_PLUGIN_ID = 'tg'
+
+/**
+ * 从 `/api/config` 响应体取 orig-tg **实际端口**（BUG-358 后的唯一真源）。
+ *
+ * 为什么需要这个适配器：BUG-358 把契约里写死插件名的 `tg_port` / `tg_running` /
+ * `tg_enabled` / `tg_last_error` 四个键收成 `plugins: [{id, label, enabled,
+ * running, port, lastError, health}]`（用户原话：「"tg_enabled"这些都是什么？
+ * 毫无共通性…我把TG改成BB，这个还能用吗？」）。验收脚本里 20+ 处仍在读旧键
+ * `cfg.tg_port` ⇒ 全部拿到 undefined ⇒ 「环境未就绪」假红（BUG-422 实测：
+ * verify_bug_214_qa_independent / verify_bug_214_series_bulk_ops 均因此退出）。
+ *
+ * 兼容旧 daemon：`tg_port` 键仍在时照样认（双轨只在这一处，不散到各脚本）。
+ *
+ * @param {object} cfg `/api/config` 的 JSON 响应体。
+ * @returns {number|null} 端口；取不到返回 null。
+ */
+function tgPortOf(cfg) {
+  if (!cfg || typeof cfg !== 'object') return null
+  const plugins = Array.isArray(cfg.plugins) ? cfg.plugins : []
+  const p = plugins.find((x) => x && x.id === TG_PLUGIN_ID)
+  if (p && Number.isFinite(Number(p.port)) && Number(p.port) > 0) return Number(p.port)
+  if (Number.isFinite(Number(cfg.tg_port)) && Number(cfg.tg_port) > 0) return Number(cfg.tg_port)
+  return null
+}
+
+/**
+ * 从 `/api/config` 响应体取 orig-tg **是否在运行**（同上，plugins 优先）。
+ *
+ * @param {object} cfg `/api/config` 的 JSON 响应体。
+ * @returns {boolean} 在运行为 true；取不到按 false（「没证据说它在跑」）。
+ */
+function tgRunningOf(cfg) {
+  if (!cfg || typeof cfg !== 'object') return false
+  const plugins = Array.isArray(cfg.plugins) ? cfg.plugins : []
+  const p = plugins.find((x) => x && x.id === TG_PLUGIN_ID)
+  if (p && typeof p.running === 'boolean') return p.running
+  return cfg.tg_running === true
 }
 
 // ────────────────────────────── 残留识别 / 清理 ──────────────────────────────
@@ -342,8 +483,12 @@ module.exports = {
   finalize,
   guardWrites,
   httpJson,
+  httpJsonGet,
   createTempSeries,
   deleteSeries,
+  detachAutoSeries,
+  tgPortOf,
+  tgRunningOf,
   looksLikeResidue,
   listResidue,
   sweepResidue,

@@ -59,7 +59,18 @@ const PIN_TG_PORT = (port) => {
       const url = typeof input === 'string' ? input : input && input.url
       if (url && url.indexOf(daemonOrigin) === 0) {
         if (/\/api\/config(\?|$)/.test(url)) {
-          return orig.call(this, input, init).then(r => r.json()).catch(() => ({})).then(b => stub({ ...b, tg_port: Number(port) }))
+          // BUG-423：前端自 BUG-358 起只读 plugins[]（useStore:
+          // `tgServiceFromPlugins(cfg)` → `setTgPort(svc.port)`），只注入旧键
+          // tg_port 等于没钉（app 回落 VITE_TG_PORT 初值 19787 ⇒ 打错端口）。
+          // 钉 plugins[] 里 id="tg" 的 port，真配置其余字段保留；旧键一并写上。
+          return orig.call(this, input, init).then(r => r.json()).catch(() => ({})).then(b => {
+            const plugins = Array.isArray(b.plugins) ? b.plugins.slice() : []
+            const i = plugins.findIndex((x) => x && x.id === 'tg')
+            const pinned = { id: 'tg', label: 'Telegram', enabled: true, running: true, port: Number(port), lastError: null, health: null }
+            if (i >= 0) plugins[i] = { ...plugins[i], ...pinned }
+            else plugins.push(pinned)
+            return stub({ ...b, plugins, tg_port: Number(port) })
+          })
         }
         return stub({ ok: true, events: [], items: [] })
       }

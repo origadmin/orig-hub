@@ -437,6 +437,11 @@
 | BUG-408 | 剧集合并保留/删除提示逻辑错误——标题/介绍/视频/图片三种处置混乱 | fixed | engine+shell |
 | BUG-420 | 内容 hash 只覆盖 7.9% 的条目——`hash_file` 是死代码，「存量懒纳入」从未实现 | fixed | engine |
 | BUG-421 | 旧库根搬迁漏改写 72 条 `file_path`——文件已在新根下，条目却永远播不了、也拿不到 hash | fixed | engine |
+| BUG-422 | 14 个已修缺陷的验收脚本被 M0 重构与 BUG-304 双双打烂——夹具 500、导航选择器过期，「fixed」只剩一句话 | open | shell |
+| BUG-423 | 16 个验收脚本仍直读 `/api/config` 旧键 `tg_port`——BUG-358 改插件契约后恒得 undefined，环境探测假红 | open | shell |
+| BUG-424 | 合并剧集弹窗「集号规则」段英文缺空格——`fromafter` / `numberonward` 黏连 | open | shell |
+| BUG-425 | `invalidateCache(prefix)` 不清在途请求——写前数据在失效后落回缓存，「改完又看到旧值」 | open | shell |
+| BUG-426 | 剧集详情头部两颗逐字同文案、功能重叠的「编辑」按钮（介绍块冗余入口 + 动作条入口开同一面板） | fixed | shell |
 
 ## 历史欠账
 

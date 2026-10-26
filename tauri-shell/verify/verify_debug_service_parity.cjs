@@ -87,8 +87,14 @@ async function main() {
     console.error(`[verify:p179] daemon unreachable on ${DAEMON_PORT}: ${err.message}`)
     return 2
   }
-  const tgPort = cfg.tg_port
-  const tgRunning = cfg.tg_running === true
+  // BUG-423：BUG-358 起契约是 plugins[]（id 取插件）；旧键兜底兼容
+  const tgPlug = Array.isArray(cfg.plugins) ? cfg.plugins.find((x) => x && x.id === 'tg') : null
+  const tgPort = tgPlug && Number(tgPlug.port) > 0 ? Number(tgPlug.port) : Number(cfg.tg_port) > 0 ? Number(cfg.tg_port) : null
+  const tgRunning = tgPlug ? tgPlug.running === true : cfg.tg_running === true
+  if (!tgPort) {
+    console.error(`[verify:p179] daemon config 未给出 orig-tg 端口（plugins[] id=tg 与旧键 tg_port 均无）`)
+    return 2
+  }
   console.log(
     `[verify:p179] label=${DATA_LABEL} negative=${NEGATIVE} daemon_port=${cfg.port} tg_port=${tgPort} tg_running=${tgRunning}`,
   )

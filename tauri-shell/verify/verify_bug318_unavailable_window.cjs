@@ -144,16 +144,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 async function main() {
   fs.mkdirSync(OUT, { recursive: true })
 
-  // 端口运行时解析（BUG-178）：顺延后以 daemon /api/config 的 tg_port 为真源
+  // 端口运行时解析（BUG-178）：顺延后以 daemon /api/config 为真源 —— BUG-358 起
+  // 先读 plugins[] 里 id="tg" 的 port，旧键 tg_port 兜底（BUG-423）；两者皆无抛错，
+  // 不静默回落 19787（猜错端口会让窗口断言打空又变绿）。
   if (process.env.VERIFY_TG_PORT) {
     TG_PORT = Number(process.env.VERIFY_TG_PORT)
   } else {
-    try {
-      const cfg = await (await fetch(`${DAEMON}/api/config`)).json()
-      TG_PORT = Number(cfg.tg_port || 19787)
-    } catch {
-      TG_PORT = 19787
+    const cfg = await (await fetch(`${DAEMON}/api/config`)).json()
+    const plug = Array.isArray(cfg.plugins) ? cfg.plugins.find((x) => x && x.id === 'tg') : null
+    const port =
+      plug && Number(plug.port) > 0 ? Number(plug.port) : Number(cfg.tg_port) > 0 ? Number(cfg.tg_port) : null
+    if (!port) {
+      throw new Error(
+        `daemon ${DAEMON}/api/config 未给出 orig-tg 端口（plugins[] id=tg 与旧键 tg_port 均无）——拒绝猜 19787`,
+      )
     }
+    TG_PORT = port
   }
   console.log(`[setup] orig-tg port resolved: ${TG_PORT}`)
 

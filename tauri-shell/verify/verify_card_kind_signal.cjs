@@ -29,8 +29,17 @@
  * 非循环的判据（关键）：
  *   卡片 DOM 不带 `kind` 属性，若用**被测的徽标**去分类卡片，再用徽标断言，
  *   就是自证循环。所以本脚本用**后端 kind 过滤**作为地面真值：
- *   点左栏 `media-cat-photo` 后，网格里的卡片由后端 `?kind=photo` 返回 ——
- *   这个真值与 `MediaCard.tsx` 无关。随后再交叉核对条数（photo 30 / video 85）。
+ *   点左栏 `nav-child-image` 后（M0 后 photo 分类改名 image），网格里的卡片由后端 `?kind=photo` 返回 ——
+ *   这个真值与 `MediaCard.tsx` 无关。随后再交叉核对条数。
+ *   BUG-422：真值查询必须与**面板同款**——`kind=<kind>&hasBytes=true`（BUG-304 起
+ *   面板恒带 hasBytes，只列已落盘条目），期望值再按 `PAGE=120` 截断。
+ *   旧实现数全量 items（photo 70）而网格实为 57（13 条无字节被过滤），
+ *   「等 70 张」永远超时；视频全量 128 也被 PAGE 截断成 120。
+ *
+ * 导航确认（BUG-422）：
+ *   所有侧栏点击走 `clickNavAndAck`：点击后等该条目出现活动态（`bg-accent/15`），
+ *   没认就重点。实测应用 boot 未完成时编程点击会被静默丢弃，视图停在开机默认态
+ *   （cat-all 混合网格），于是「图片分类」读到 120 张混合卡、报一串假 FAIL。
  *
  * 反向证伪（本项目硬要求，三重）：
  *   1. 死端口跑同一脚本 → 必须 UNREACHABLE（exit 2），证明脚本不是恒绿。
@@ -64,13 +73,20 @@ const os = require('node:os')
 const path = require('node:path')
 
 const cdp = require('./lib/cdp.cjs')
+const endpoints = require('./_lib_endpoints.cjs')
 
 /** 被测页面地址（override 用 APP_URL）。 */
 const APP_URL = process.env.APP_URL || 'http://127.0.0.1:5180/'
 
-/** 媒体库数据源（orig-tg 9877）——用作与 DOM 交叉核对的地面真值。 */
-const MEDIA_API =
-  process.env.ORIG_MEDIA_API || 'http://127.0.0.1:9877/api/media/items?limit=200'
+/**
+ * 媒体库数据源（orig-tg）——用作与 DOM 交叉核对的地面真值。
+ *
+ * BUG-422/423：默认值原写死生产端口 9877（`PROD_PORT`），dev 栈下恒不可达 ⇒
+ * 整个脚本 UNREACHABLE、一条断言都跑不到。改为留空、运行时经 `_lib_endpoints`
+ * 从 daemon `/api/config` 解析 tg 端口（BUG-358 插件契约）；`ORIG_MEDIA_API`
+ * 显式覆盖仍然优先。
+ */
+let MEDIA_API = process.env.ORIG_MEDIA_API || ''
 
 /** 产物目录：**必须在仓库外**（AGENTS.md §6 污染防线）。 */
 const OUT_DIR =
@@ -250,6 +266,15 @@ function collectGridInPage() {
       badgePointerEventsNone: /pointer-events-none/.test(badgeClass),
       noBytes: Boolean(card.querySelector('[data-testid="item-nobytes"]')),
       title: titleEl ? titleEl.textContent : null,
+      /*
+       * BUG-422：可播放性分流。`playable = hasMediaBytes(item)`（客户端按
+       * `bytesPresence` 判，与服务端 `hasBytes=true` 过滤是两套口径）⇒ 网格里
+       *  legitimately 混着不可播放卡（无悬浮层、走 item-nobytes 占位 + 重缓存入口，
+       *  BUG-080「不伪装可播」）。图标判据只对**可播放卡**成立；
+       *  不可播放卡另有一条「必须出示占位 + 重缓存入口」的断言，不悄悄豁免。
+       */
+      playable: Boolean(card.querySelector('[data-testid="media-card-cover"]')),
+      hasRecache: Boolean(card.querySelector('[data-testid="item-recache"]')),
     }
   })
   return {
@@ -274,6 +299,42 @@ async function clickTestId(page, testid) {
       return true
     }, testid),
   )
+}
+
+/**
+ * 点侧栏导航并**等到该条目成为活动项**（`bg-accent/15`）才返回；没认就重点。
+ *
+ * BUG-422：旧实现点完即走（fire-and-forget）。实测在应用 boot 未完成的窗口里
+ * 编程点击会被**静默丢弃** —— 视图停在开机默认态（`cat-all` 的混合网格），
+ * 于是「图片分类」里读到 120 张混合卡（90 视频徽标 + 30 图片徽标），
+ * 报出一串与修复无关的假 FAIL（本轮实测 12 条红里 10 条源于此）。
+ * 导航必须有确认（侧栏高亮 = fmode 已落到面板），不能假设点击必然生效。
+ *
+ * @param {object} page CDP page
+ * @param {string} testid 导航条目 testid
+ * @param {number} timeoutMs 总预算（含重点）
+ * @returns {Promise<{clicks:number, acked:boolean}>} 实际点击次数与是否得到高亮确认
+ */
+async function clickNavAndAck(page, testid, timeoutMs = 25000) {
+  const deadline = Date.now() + timeoutMs
+  let clicks = 0
+  for (;;) {
+    clicks += 1
+    await clickTestId(page, testid)
+    const acked = await page
+      .waitForFunction(
+        t => {
+          const el = document.querySelector(`[data-testid="${t}"]`)
+          return !!el && /bg-accent\/15/.test(el.className || '')
+        },
+        { timeout: 2500, intervalMs: 150, args: [testid] },
+      )
+      .then(() => true)
+      .catch(() => false)
+    if (acked) return { clicks, acked }
+    if (Date.now() > deadline) return { clicks, acked } // 由调用方的后续断言如实报告
+    await new Promise(r => setTimeout(r, 300))
+  }
 }
 
 /** 等某个 data-testid 出现。 */
@@ -466,7 +527,7 @@ async function injectPreFixLabelsIntoGrid(page, labels) {
  */
 async function readCategoryLabel(page, key) {
   const value = await page.evaluate(k => {
-    const el = document.querySelector(`[data-testid="media-cat-${k}"]`)
+    const el = document.querySelector(`[data-testid="nav-child-${k}"]`)
     return el && el.firstElementChild ? (el.firstElementChild.textContent || '').trim() : null
   }, key)
   return value === undefined ? null : value
@@ -477,7 +538,7 @@ async function main() {
   fs.mkdirSync(OUT_DIR, { recursive: true })
 
   console.log(`[verify:card-kind] target: ${APP_URL}`)
-  console.log(`[verify:card-kind] media api: ${MEDIA_API}`)
+  console.log(`[verify:card-kind] media api: ${MEDIA_API || '(resolving at runtime)'}`)
   console.log(`[verify:card-kind] artifacts: ${OUT_DIR}`)
 
   // ---- 环境预检：dev server 必须可达（否则 exit 2，不是断言失败）----
@@ -494,13 +555,24 @@ async function main() {
   }
 
   // ---- 地面真值：后端各 kind 的条数（与 MediaCard.tsx 无关）----
-  const api = await httpGetJson(MEDIA_API)
+  if (!MEDIA_API) {
+    // 端口运行时解析（dev 栈的 tg 端口随 daemon /api/config 漂移，见 _lib_endpoints）。
+    const ep = await endpoints.resolve()
+    MEDIA_API = `${ep.tg}/api/media/items?limit=1000`
+    console.log(`[verify:card-kind] orig-tg resolved at runtime: ${ep.tg}`)
+  }
+  // orig-tg 偶发 ~14s stall（实测）：单发 5s 会假 UNREACHABLE。GET 幂等，重试即可。
+  let api = null
+  for (let attempt = 1; attempt <= 4 && !api; attempt += 1) {
+    api = await httpGetJson(MEDIA_API, 20000)
+    if (!api) console.log(`[verify:card-kind] media api attempt#${attempt} failed — retrying (stall tolerance)`)
+  }
   const apiItems = api && Array.isArray(api.items) ? api.items : null
   if (!apiItems) {
     console.error(
       `[verify:card-kind] media api unreachable or malformed: ${MEDIA_API}`,
     )
-    console.error('[verify:card-kind] orig-tg (9877) must be running for a meaningful run')
+    console.error('[verify:card-kind] orig-tg must be running for a meaningful run (dev stack: daemon + orig-tg + vite)')
     dumpResults()
     console.error('[verify:card-kind] RESULT: UNREACHABLE (exit 2)')
     return 2
@@ -509,8 +581,36 @@ async function main() {
     acc[it.kind] = (acc[it.kind] || 0) + 1
     return acc
   }, {})
+
+  /**
+   * 面板**同款查询**的地面真值：`?kind=<kind>&hasBytes=true`。
+   *
+   * BUG-422：旧真值直接数全量 items（photo=70），而面板自 BUG-304 起恒带
+   * `hasBytes: true`（只列已落盘条目）⇒ 图片网格实为 57 张，等 70 永远超时；
+   * 视频全量 128 但网格还有 PAGE=120 截断。真值必须与面板查询同款，
+   * 期望值再按 PAGE 截断 —— 否则判据量的不是同一份数据。
+   */
+  const fetchGridTruth = async kind => {
+    const base = MEDIA_API.split('?')[0]
+    const url = `${base}?kind=${kind}&hasBytes=true&limit=1000`
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      const r = await httpGetJson(url, 20000)
+      if (r && Array.isArray(r.items)) return r.items.length
+      console.log(`[verify:card-kind] grid truth (${kind}) attempt#${attempt} failed — retrying`)
+    }
+    return null
+  }
+  const photoWithBytes = await fetchGridTruth('photo')
+  const videoWithBytes = await fetchGridTruth('video')
+  if (photoWithBytes === null || videoWithBytes === null) {
+    console.error('[verify:card-kind] grid truth fetch failed (kind+hasBytes)')
+    dumpResults()
+    console.error('[verify:card-kind] RESULT: UNREACHABLE (exit 2)')
+    return 2
+  }
   console.log(
-    `[verify:card-kind] backend truth: total=${apiItems.length} kinds=${JSON.stringify(apiByKind)}`,
+    `[verify:card-kind] backend truth: total=${apiItems.length} kinds=${JSON.stringify(apiByKind)} ` +
+      `gridTruth(photo/withBytes=${photoWithBytes}, video/withBytes=${videoWithBytes}, page=${PAGE_LIMIT})`,
   )
 
   const browser = await cdp.launch()
@@ -549,34 +649,38 @@ async function main() {
     }
     check('sidebar [data-testid="nav-child-lib-series"] 存在', true)
 
-    const entered = await clickTestId(page, 'nav-child-lib-series')
-    check('点击 nav-child-lib-series 进入媒体库', entered)
+    const enteredNav = await clickNavAndAck(page, 'nav-child-lib-series')
+    check(
+      '点击 nav-child-lib-series 进入媒体库（侧栏高亮确认，丢了会重点）',
+      enteredNav.acked,
+      `clicks=${enteredNav.clicks}`,
+    )
 
-    // 左栏分类按钮出现（其计数来自后端 stats，0 计数不渲染）
+    // 左栏分类按钮出现（M0 后恒定渲染，不再受计数门控）
     let catAll = false
     try {
-      await waitForTestId(page, 'media-cat-all', 15000)
+      await waitForTestId(page, 'nav-child-cat-video', 15000)
       catAll = true
     } catch (_err) {
       catAll = false
     }
-    check('媒体库左栏分类按钮渲染（media-cat-all）', catAll)
+    check('媒体库左栏分类按钮渲染（nav-child-cat-video）', catAll)
 
     const hasPhotoCat = Boolean(
-      await page.evaluate(() => Boolean(document.querySelector('[data-testid="media-cat-photo"]'))),
+      await page.evaluate(() => Boolean(document.querySelector('[data-testid="nav-child-image"]'))),
     )
     const hasVideoCat = Boolean(
-      await page.evaluate(() => Boolean(document.querySelector('[data-testid="media-cat-video"]'))),
+      await page.evaluate(() => Boolean(document.querySelector('[data-testid="nav-child-cat-video"]'))),
     )
-    check('左栏存在「图片」分类（media-cat-photo）', hasPhotoCat, `backend photo=${apiByKind.photo ?? 0}`)
-    check('左栏存在「视频」分类（media-cat-video）', hasVideoCat, `backend video=${apiByKind.video ?? 0}`)
+    check('左栏存在「图片」分类（nav-child-image）', hasPhotoCat, `backend photo=${apiByKind.photo ?? 0}`)
+    check('左栏存在「视频」分类（nav-child-cat-video）', hasVideoCat, `backend video=${apiByKind.video ?? 0}`)
 
     // ================= 正向：图片分类 =================
     console.log('')
     console.log('--- 正向断言 A：图片分类（后端 ?kind=photo 为地面真值）---')
 
-    const photoExpected = Math.min(apiByKind.photo ?? 0, PAGE_LIMIT)
-    await clickTestId(page, 'media-cat-photo')
+    const photoExpected = Math.min(photoWithBytes, PAGE_LIMIT)
+    await clickNavAndAck(page, 'nav-child-image')
     let photoSynced = true
     try {
       await waitForGridCount(page, photoExpected)
@@ -602,15 +706,17 @@ async function main() {
       const photoGrid = await page.evaluate(collectGridInPage)
       const photoCards = photoGrid.cards
       const photoTotal = photoGrid.total
+      const photoPlayable = photoCards.filter(c => c.playable)
+      const photoNotPlayable = photoCards.filter(c => !c.playable)
       const playInPhoto = photoCards.filter(c => isPlayIcon(c.actionIcon))
-      const zoomInPhoto = photoCards.filter(c => isZoomInIcon(c.actionIcon))
-      const noLayer = photoCards.filter(c => !c.hasHoverLayer)
+      const zoomInPhoto = photoPlayable.filter(c => isZoomInIcon(c.actionIcon))
+      const noLayer = photoPlayable.filter(c => !c.hasHoverLayer)
       const badgeNotPhoto = photoCards.filter(c => c.badge !== '图片')
       const badgeNotPersistent = photoCards.filter(c => !c.badgeAlwaysVisible)
       const badgeNotClickThrough = photoCards.filter(c => !c.badgePointerEventsNone)
 
       console.log(
-        `[verify:card-kind] photo 卡片=${photoTotal} 悬浮层图标样本=` +
+        `[verify:card-kind] photo 卡片=${photoTotal}（可播放=${photoPlayable.length} 不可播放=${photoNotPlayable.length}） 悬浮层图标样本=` +
           JSON.stringify(photoCards.slice(0, 4).map(c => c.actionIcon)),
       )
       console.log(
@@ -620,23 +726,30 @@ async function main() {
 
       check('图片分类卡片数 > 0（避免后续断言空转）', photoTotal > 0, `cards=${photoTotal}`)
 
-      // ★ 核心断言：图片卡片的悬浮层**绝不是**播放三角
+      // ★ 核心断言：图片卡片（含不可播放卡）的悬浮层**绝不是**播放三角
       check(
         '★ 图片卡片悬浮层不含播放三角（lucide-play）',
         photoTotal > 0 && playInPhoto.length === 0,
         `photo=${photoTotal} 含播放三角=${playInPhoto.length}` +
           (playInPhoto.length > 0 ? ` 首个=${JSON.stringify(playInPhoto[0].actionIcon)}` : ''),
       )
-      // 正向对照：确实是看图语义，而不是「什么都没渲染」（后者会让上一条假绿）
+      // 正向对照：可播放卡确实是看图语义，而不是「什么都没渲染」（后者会让上一条假绿）
       check(
-        '图片卡片悬浮层是看图语义（lucide-zoom-in）',
-        photoTotal > 0 && zoomInPhoto.length === photoTotal,
-        `zoom-in=${zoomInPhoto.length}/${photoTotal}`,
+        '图片卡片悬浮层是看图语义（lucide-zoom-in，仅可播放卡）',
+        photoPlayable.length > 0 && zoomInPhoto.length === photoPlayable.length,
+        `zoom-in=${zoomInPhoto.length}/${photoPlayable.length}（可播放；另 ${photoNotPlayable.length} 张不可播放卡走无字节占位）`,
       )
       check(
-        '图片卡片均存在悬浮操作层（上一条非空转）',
-        photoTotal > 0 && noLayer.length === 0,
-        `无悬浮层=${noLayer.length}`,
+        '可播放图片卡均存在悬浮操作层（上一条非空转）',
+        photoPlayable.length > 0 && noLayer.length === 0,
+        `无悬浮层=${noLayer.length}/${photoPlayable.length}`,
+      )
+      // 不可播放卡不得被悄悄豁免：必须走 item-nobytes 占位并出示重缓存入口
+      // （BUG-080：一个点了必然失败的播放入口比没有入口更糟）。
+      check(
+        '不可播放图片卡走无字节占位且给出重缓存入口（不伪装可播）',
+        photoNotPlayable.every(c => c.noBytes && c.hasRecache),
+        `不可播放=${photoNotPlayable.length} 缺占位或入口=${photoNotPlayable.filter(c => !(c.noBytes && c.hasRecache)).length}`,
       )
       check(
         '图片卡片常驻徽标文本为「图片」',
@@ -654,11 +767,11 @@ async function main() {
         photoTotal > 0 && badgeNotClickThrough.length === 0,
         `非穿透=${badgeNotClickThrough.length}`,
       )
-      // 交叉核对：DOM 条数 == 后端 photo 条数
+      // 交叉核对：DOM 条数 == 面板同款查询（kind=photo&hasBytes=true）的条数，按 PAGE 截断
       check(
-        '图片分类卡片数 == 后端 photo 条数',
-        photoTotal === (apiByKind.photo ?? 0),
-        `dom=${photoTotal} backend=${apiByKind.photo ?? 0}`,
+        '图片分类卡片数 == 后端 photo 条数（hasBytes 过滤 + PAGE 截断）',
+        photoTotal === photoExpected,
+        `dom=${photoTotal} expected=${photoExpected} (photoWithBytes=${photoWithBytes} page=${PAGE_LIMIT})`,
       )
     }
 
@@ -666,8 +779,8 @@ async function main() {
     console.log('')
     console.log('--- 正向断言 B：视频分类（证明播放三角只被"移走"而非"全删"）---')
 
-    const videoExpected = Math.min(apiByKind.video ?? 0, PAGE_LIMIT)
-    await clickTestId(page, 'media-cat-video')
+    const videoExpected = Math.min(videoWithBytes, PAGE_LIMIT)
+    await clickNavAndAck(page, 'nav-child-cat-video')
     let videoSynced = true
     try {
       await waitForGridCount(page, videoExpected)
@@ -685,26 +798,33 @@ async function main() {
       const videoGrid = await page.evaluate(collectGridInPage)
       const videoCards = videoGrid.cards
       const videoTotal = videoGrid.total
-      const playInVideo = videoCards.filter(c => isPlayIcon(c.actionIcon))
+      const videoPlayable = videoCards.filter(c => c.playable)
+      const videoNotPlayable = videoCards.filter(c => !c.playable)
+      const playInVideo = videoPlayable.filter(c => isPlayIcon(c.actionIcon))
       const zoomInVideo = videoCards.filter(c => isZoomInIcon(c.actionIcon))
       const badgeNotVideo = videoCards.filter(c => c.badge !== '视频')
 
       console.log(
-        `[verify:card-kind] video 卡片=${videoTotal} 悬浮层图标样本=` +
+        `[verify:card-kind] video 卡片=${videoTotal}（可播放=${videoPlayable.length} 不可播放=${videoNotPlayable.length}） 悬浮层图标样本=` +
           JSON.stringify(videoCards.slice(0, 4).map(c => c.actionIcon)),
       )
 
       check('视频分类卡片数 > 0', videoTotal > 0, `cards=${videoTotal}`)
       // 视频仍然保留播放三角 —— 没有这条，「把图标全删掉」也能过核心断言
       check(
-        '视频卡片悬浮层仍是播放三角（lucide-play）',
-        videoTotal > 0 && playInVideo.length === videoTotal,
-        `play=${playInVideo.length}/${videoTotal}`,
+        '视频卡片悬浮层仍是播放三角（lucide-play，仅可播放卡）',
+        videoPlayable.length > 0 && playInVideo.length === videoPlayable.length,
+        `play=${playInVideo.length}/${videoPlayable.length}（可播放；另 ${videoNotPlayable.length} 张不可播放卡走无字节占位）`,
       )
       check(
         '视频卡片不含看图语义图标（lucide-zoom-in）',
         zoomInVideo.length === 0,
         `zoom-in=${zoomInVideo.length}`,
+      )
+      check(
+        '不可播放视频卡走无字节占位且给出重缓存入口（不伪装可播）',
+        videoNotPlayable.every(c => c.noBytes && c.hasRecache),
+        `不可播放=${videoNotPlayable.length} 缺占位或入口=${videoNotPlayable.filter(c => !(c.noBytes && c.hasRecache)).length}`,
       )
       check(
         '视频卡片常驻徽标文本为「视频」',
@@ -713,9 +833,9 @@ async function main() {
           (badgeNotVideo.length > 0 ? ` 样本=${JSON.stringify(badgeNotVideo.slice(0, 3).map(c => c.badge))}` : ''),
       )
       check(
-        '视频分类卡片数 == 后端 video 条数',
-        videoTotal === (apiByKind.video ?? 0),
-        `dom=${videoTotal} backend=${apiByKind.video ?? 0}`,
+        '视频分类卡片数 == 后端 video 条数（hasBytes 过滤 + PAGE 截断）',
+        videoTotal === videoExpected,
+        `dom=${videoTotal} expected=${videoExpected} (videoWithBytes=${videoWithBytes} page=${PAGE_LIMIT})`,
       )
     }
 
@@ -724,7 +844,7 @@ async function main() {
     console.log('--- 反向证伪 1：把"修复前的统一播放三角"注回图片卡片，检测器必须报出 ---')
 
     // 回到图片分类，在真实 DOM 上做篡改—检测—还原
-    await clickTestId(page, 'media-cat-photo')
+    await clickNavAndAck(page, 'nav-child-image')
     try {
       await waitForGridCount(page, photoExpected)
     } catch (_err) {
@@ -789,7 +909,7 @@ async function main() {
      */
 
     // 基线：切换前同一个分类按钮的文案（zh-CN），作为「切换后必须变」的对照组
-    const catLabelBefore = await readCategoryLabel(page, 'photo')
+    const catLabelBefore = await readCategoryLabel(page, 'image')
     const langBefore = await page.evaluate(() => document.documentElement.getAttribute('lang'))
     check(
       '切换前 <html lang> 为 zh-CN（证明后面的切换是真变化，而非本来如此）',
@@ -809,23 +929,23 @@ async function main() {
     check('切换后 <html lang> 变为 en-US', langAfter === 'en-US', `lang=${langAfter}`)
 
     // 回媒体库，重新进入图片分类（SPA 切视图会重建卡片 DOM）
-    await clickTestId(page, 'nav-child-lib-series')
+    await clickNavAndAck(page, 'nav-child-lib-series')
     try {
-      await waitForTestId(page, 'media-cat-all', 15000)
+      await waitForTestId(page, 'nav-child-cat-video', 15000)
     } catch (_err) {
       /* 由下面的断言如实报告 */
     }
 
-    const catLabelAfter = await readCategoryLabel(page, 'photo')
+    const catLabelAfter = await readCategoryLabel(page, 'image')
     // ★ 这条是「locale 真的生效」的证据，不是重复断言：它证明的是**前提**成立，
     //   后面的徽标断言才有意义。
     check(
-      '★ locale 确已生效：同一分类按钮文案变为「Photos」（非仅徽标变化）',
-      catLabelAfter === 'Photos',
+      '★ locale 确已生效：同一分类按钮文案变为「Images」（非仅徽标变化）',
+      catLabelAfter === 'Images',
       `label=${catLabelAfter}`,
     )
 
-    await clickTestId(page, 'media-cat-photo')
+    await clickNavAndAck(page, 'nav-child-image')
     let enPhotoSynced = true
     try {
       await waitForGridCount(page, photoExpected)
@@ -868,7 +988,7 @@ async function main() {
     }
 
     // 视频分支同样核一遍 —— 只验 photo 会漏掉「只修了一个分支」
-    await clickTestId(page, 'media-cat-video')
+    await clickNavAndAck(page, 'nav-child-cat-video')
     let enVideoSynced = true
     try {
       await waitForGridCount(page, videoExpected)
@@ -906,13 +1026,13 @@ async function main() {
     // ---- 还原 zh-CN：证明切换双向可用，且 BUG-123 的 zh-CN 渲染值一字未变 ----
     const restored = await switchLocaleViaUI(page, '简体中文', 'zh-CN')
     check('走真实 UI 切回 zh-CN', restored)
-    await clickTestId(page, 'nav-child-lib-series')
+    await clickNavAndAck(page, 'nav-child-lib-series')
     try {
-      await waitForTestId(page, 'media-cat-all', 15000)
+      await waitForTestId(page, 'nav-child-cat-video', 15000)
     } catch (_err) {
       /* 由下面的断言如实报告 */
     }
-    await clickTestId(page, 'media-cat-photo')
+    await clickNavAndAck(page, 'nav-child-image')
     try {
       await waitForGridCount(page, photoExpected)
     } catch (_err) {
@@ -954,11 +1074,19 @@ async function main() {
     )
 
     // ---- BUG-128 源码 / 资源级核对：徽标文案必须走 i18n 键，两个词典都得有 ----
+    // BUG-422：kind → i18n 键的映射已从 MediaCard.tsx 搬到 `src/api/media.ts` 的
+    // `kindLabelKey()`（卡片改为 `t(kindLabelKey(item.kind))`，与剧集详情共用一份）。
+    // 源码级判据要跟着映射走，否则读的是没有这张表的文件、恒 false。
+    const cardSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'components', 'media', 'MediaCard.tsx'), 'utf8')
+    const apiSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'api', 'media.ts'), 'utf8')
+    // 映射实态是 `switch`（`case 'video': return 'media.kindVideo'`），正则按 switch 形态写。
+    const keyCase = (kind, key) =>
+      new RegExp(`case\\s+'${kind}'[\\s\\S]{0,40}?return\\s+'${key.replace('.', '\\.')}'`).test(apiSrc)
     const i18nMapping = {
-      'video → media.kindVideo': /video:\s*'media\.kindVideo'/.test(src),
-      'photo → media.kindPhoto': /photo:\s*'media\.kindPhoto'/.test(src),
-      'audio → media.kindAudio': /audio:\s*'media\.kindAudio'/.test(src),
-      'file → media.kindFile': /file:\s*'media\.kindFile'/.test(src),
+      'video → media.kindVideo': keyCase('video', 'media.kindVideo'),
+      'photo → media.kindPhoto': keyCase('photo', 'media.kindPhoto'),
+      'audio → media.kindAudio': keyCase('audio', 'media.kindAudio'),
+      'file → media.kindFile': keyCase('file', 'media.kindFile'),
     }
     console.log(`[verify:card-kind] 徽标 i18n 键映射: ${JSON.stringify(i18nMapping)}`)
     check(
@@ -966,11 +1094,18 @@ async function main() {
       Object.values(i18nMapping).every(Boolean),
       JSON.stringify(i18nMapping),
     )
-    // 硬编码中文的指纹：KIND_LABEL 那张表里若再出现 `video: '视频'` 就说明回退了
+    // 硬编码中文的指纹：两个文件里若再出现 `video: '视频'` 这类字面量就说明回退了
     check(
       'KIND_LABEL 不再把中文字面量当文案（源码级，BUG-128）',
-      !/video:\s*'视频'|photo:\s*'图片'|audio:\s*'音频'|file:\s*'文档'/.test(src),
+      !/video:\s*'视频'|photo:\s*'图片'|audio:\s*'音频'|file:\s*'文档'/.test(apiSrc) &&
+        !/video:\s*'视频'|photo:\s*'图片'|audio:\s*'音频'|file:\s*'文档'/.test(cardSrc),
       '检测到中文字面量直接作为徽标文案',
+    )
+    // 卡片侧：徽标必须经 kindLabelKey 取键，不得在组件里再落一份映射
+    check(
+      'MediaCard 徽标走 kindLabelKey（不在组件内另落映射，源码级）',
+      /kindLabelKey\s*\(/.test(cardSrc),
+      '卡片应 t(kindLabelKey(item.kind))',
     )
 
     const locales = {}

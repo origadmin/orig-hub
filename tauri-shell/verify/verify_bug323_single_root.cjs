@@ -197,7 +197,9 @@ async function main() {
 
   const before = await cfg()
   const originalDir = before.download_dir ?? ''
-  const tgPort = before.tg_port
+  // BUG-423：端口真源 BUG-358 起是 plugins[] id="tg".port（旧键 tg_port 兜底）
+  const tgPlug = Array.isArray(before.plugins) ? before.plugins.find((x) => x && x.id === 'tg') : null
+  const tgPort = tgPlug && Number(tgPlug.port) > 0 ? Number(tgPlug.port) : before.tg_port
   console.log(
     `[fixture] download_dir(前)=${JSON.stringify(originalDir)} tg_port=${tgPort} effective=${before.effective_download_root}`,
   )

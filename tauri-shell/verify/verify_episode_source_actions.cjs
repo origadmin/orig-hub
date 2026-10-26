@@ -385,7 +385,11 @@ async function createItem(kind, title, filePath) {
   if (r.status !== 200 || !r.json || !Array.isArray(r.json.ids) || r.json.ids.length !== 1) {
     throw new Error(`createItem(${kind}) failed: status=${r.status} body=${JSON.stringify(r.json)}`)
   }
-  return Number(r.json.ids[0])
+  const id = Number(r.json.ids[0])
+  // BUG-422：导入即被 BUG-304 自动归档进单集剧集；不先撤销归属，后面往自己的
+  // 剧集挂载会撞 media_episode.item_id 唯一约束（HTTP 500）。
+  await sandbox.detachAutoSeries(MEDIA_API, id)
+  return id
 }
 
 /**

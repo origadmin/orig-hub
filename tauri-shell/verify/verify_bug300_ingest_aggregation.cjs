@@ -71,17 +71,22 @@ const APP_URL = process.env.VERIFY_APP_URL || 'http://127.0.0.1:5180/'
 const DAEMON = process.env.VERIFY_DAEMON_BASE || 'http://127.0.0.1:19786'
 /**
  * orig-tg 基址**运行时解析**（BUG-178 纪律，与前端同口径）：端口以 daemon
- * `/api/config` 的 `tg_port` 为真源 —— 19787 绑不上时 orig-tg 会顺延（如 19788），
- * 硬编码 19787 的脚本会在顺延后全部打空。`VERIFY_TG_BASE` 仍可显式覆盖。
+ * `/api/config` 为真源 —— BUG-358 起先读 `plugins[]` 里 `id="tg"` 的 `port`，
+ * 旧键 `tg_port` 兜底（BUG-423）。两者皆无**抛错**，不再静默回落 19787：
+ * 顺延后猜错端口会把「打空」演成绿灯。`VERIFY_TG_BASE` 仍可显式覆盖。
  */
 async function resolveTgBase() {
   if (process.env.VERIFY_TG_BASE) return process.env.VERIFY_TG_BASE
-  try {
-    const cfg = await (await fetch(`${DAEMON}/api/config`)).json()
-    return `http://127.0.0.1:${cfg.tg_port || 19787}`
-  } catch {
-    return 'http://127.0.0.1:19787'
+  const cfg = await (await fetch(`${DAEMON}/api/config`)).json()
+  const plug = Array.isArray(cfg.plugins) ? cfg.plugins.find((x) => x && x.id === 'tg') : null
+  const port =
+    plug && Number(plug.port) > 0 ? Number(plug.port) : Number(cfg.tg_port) > 0 ? Number(cfg.tg_port) : null
+  if (!port) {
+    throw new Error(
+      `daemon ${DAEMON}/api/config 未给出 orig-tg 端口（plugins[] id=tg 与旧键 tg_port 均无）——拒绝猜 19787`,
+    )
   }
+  return `http://127.0.0.1:${port}`
 }
 
 const SRC = {
@@ -327,11 +332,13 @@ async function main() {
     /getCacheTaskItems\(/.test(SRC.sheet)
   check(`源码：IngestGroupRow 挂 ${T.row} 且明细 Sheet 拉组清单（getCacheTaskItems 在 Sheet 内懒加载）`, rowOk)
 
+  // BUG-366 撤除了面板内的来源切片与概览区（dl-source-filter / dl-overview-* 已
+  // 不在 DOM）—— 挂载锚改用仍存在的契约元素（见下方运行段的三选一回落）。
+  // 旧门控仍钉已删的两个 testid ⇒ 恒红 FATAL，运行时断言全部作废（腐烂）。
   const panelOk =
     /ingest: UseIngestGroupsResult/.test(SRC.panel) &&
-    new RegExp(`data-testid="${T.sourceFilter}"`).test(SRC.panel) &&
-    new RegExp(`data-testid="${T.overviewTotal}"`).test(SRC.panel)
-  check('源码：DownloadPanel 收 ingest、渲染来源切片与概览', panelOk)
+    new RegExp(`data-testid="${T.dlEmpty}"`).test(SRC.panel)
+  check('源码：DownloadPanel 收 ingest 状态并渲染自身挂载锚（BUG-366 后来源切片/概览已撤，锚走 dl-empty）', panelOk)
 
   // 单一轮询点：壳体拉、面板收。两处各拉一份 = 轮询两次 + 两个时刻的状态
   // ⇒ 「徽标数 ≠ 点进去的条数」（BUG-082 三处同源纪律）。
@@ -381,25 +388,31 @@ async function main() {
   )
   // 撤档不撤记录：可见性改由既有标准化机制承担 —— 「全部」档保留 cancelled 行，
   // 概览「已取消」计数保留（两处缺一即「记录不可见/不可数」复现）。
+  // 锚点随实现搬迁重钉（原钉 DownloadPanel 内联过滤，现由共享 groupInBucket 承担；
+  // 概览读数消费方在 MainLayout）—— 语义不变：all 档无条件收、cancelled 真被数。
   const retentionOk =
-    /d\.status === 'cancelled'/.test(SRC.panel) &&
-    /overview\.cancelled/.test(SRC.panel) &&
+    /groups\.filter\(\(g\) => groupInBucket\(g\.latest\.status, dlFilter\)\)/.test(SRC.panel) &&
+    /case 'all':\s*\n\s*default:\s*\n\s*return true/.test(SRC.groups) &&
+    /overview\.cancelled/.test(SRC.layout) &&
     /o\.cancelled \+= 1/.test(SRC.groups)
   check(
     '源码（BUG-314）：取消记录由「全部」档承载 + 概览「已取消」计数保留',
     retentionOk,
   )
-  // BUG-318 锚点（下载域数据丢失）：**取不到 ≠ 没有**。hook 必须读 `/api/activity`
-  // 的 `sources`——orig-tg 不可用时端点恒 200 但 cache 零条，只读 tasks 就会把
-  // 「取不到」渲染成「暂无传输任务」（无 banner、行全消、停轮后不自动回血）。
+  // BUG-318 锚点（下载域数据丢失）：**取不到 ≠ 没有**。hook 必须读来源可用性
+  // —— orig-tg 不可用时端点恒 200 但 cache 零条，只读 tasks 就会把「取不到」
+  // 渲染成「暂无传输任务」（无 banner、行全消、停轮后不自动回血）。
+  // BUG-395 起健康改从独立 `/api/sources` 取（与 58KB 任务列表解耦），故真源
+  // 锚点是 `fetchSources()` + `health.sources`（旧 `data?.sources` 已随解耦搬迁）。
   // 聚合层代表任务必须「有活跃取最新活跃」——终态行被「取消优先」bump
   // updated_at 后，更早的活跃任务会被掩蔽进 history（下载中档看不到、无取消按钮）。
   const sourcesOk =
-    /data\?\.sources/.test(SRC.hook) &&
+    /fetchSources\(\)/.test(SRC.hook) &&
+    /health\.sources/.test(SRC.hook) &&
     /s\.kind === 'cache'/.test(SRC.hook) &&
     /available === false/.test(SRC.hook) &&
     /sourceUnknown/.test(SRC.hook) &&
-    /\|\| sourceUnknown\.current/.test(SRC.hook) &&
+    /!hasWork\.current && !sourceUnknown\.current/.test(SRC.hook) &&
     /const active = sorted\.filter/.test(SRC.groups) &&
     /active\[0\] : sorted\[0\]/.test(SRC.groups)
   check(
@@ -683,15 +696,40 @@ async function main() {
     )
     const firstKey = topRows[0]?.key
     const firstTask = byKey.get(firstKey)
-    const clickedRow = await page.evaluate(
-      (sel) => window.__click(sel),
-      `[data-testid="${T.header}"]`,
-    )
-    if (clickedRow !== true) throw new Error('点不到入库行折叠头')
-    await page.waitForFunction((sel) => window.__exists(sel), {
-      args: [`[data-testid="${T.sheet}"]`],
-      timeout: 10000,
-    })
+    if (!firstKey) throw new Error('累积集里没有入库行，明细断言前提不成立（数据已变）')
+    // 窗口化 + 重渲染双坑：① 点「首个 DOM 折叠头」点到的可能不是 topRows[0]
+    // （滚动语境漂移）；② boot/重渲染窗口内的点击会被静默丢失（点击返回 true
+    // 但 Sheet 不开）。故钉 data-key：reveal 进视口 → 点**该行自己的**折叠头 →
+    // 有界等 Sheet，不成重试两轮；末败带现场快照抛错（ stall/丢失 vs 真故障可分）。
+    let sheetUp = false
+    for (let attempt = 1; attempt <= 3 && !sheetUp; attempt += 1) {
+      const revealed = await page.evaluate((k) => window.__revealKey(k), firstKey)
+      if (revealed !== true) throw new Error(`首行滚不进视口（revealKey 失败, key=${firstKey}）`)
+      const clickedHeader = await page.evaluate((k) => {
+        const row = document.querySelector(`[data-testid="ingest-group-row"][data-key="${k}"]`)
+        const header = row && row.querySelector('[data-testid="ingest-group-header"]')
+        if (!header) return false
+        header.click()
+        return true
+      }, firstKey)
+      if (!clickedHeader) throw new Error('首行折叠头不在 DOM（data-key 钉点失败）')
+      sheetUp = await page
+        .waitForFunction((sel) => window.__exists(sel), {
+          args: [`[data-testid="${T.sheet}"]`],
+          timeout: 10000,
+        })
+        .then(() => true)
+        .catch(() => false)
+      if (!sheetUp && attempt < 3) console.log(`[bug300] sheet attempt#${attempt} 未开，重试`)
+    }
+    if (!sheetUp) {
+      const snap = await page.evaluate(() => ({
+        sheet: !!document.querySelector('[data-testid="ingest-detail-sheet"]'),
+        rows: document.querySelectorAll('[data-testid="ingest-group-row"]').length,
+        headers: document.querySelectorAll('[data-testid="ingest-group-header"]').length,
+      }))
+      throw new Error(`首行 Sheet 3 次点击均未打开：${JSON.stringify(snap)}`)
+    }
     await page.waitForFunction((sel) => window.__exists(sel), {
       args: [`[data-testid="${T.entries}"]`],
       timeout: 10000,
@@ -837,7 +875,7 @@ async function main() {
     check(
       `UI（BUG-314）：侧栏无「已取消」树档；取消行在「全部」档可见且可数（实列 ${visibleCancelled}；概览已按 BUG-366 撤除）`,
       bucketGone === true && Number.isFinite(cancelledN) && visibleCancelled === cancelledN,
-      `bucketGone=${bucketGone} overview=${cancelledText} visible=${visibleCancelled}`,
+      `bucketGone=${bucketGone} visible=${visibleCancelled}（概览读数已按 BUG-366 撤除，可数性由累积集自身承担）`,
     )
     await page.screenshot(path.join(OUT, '04-ingest-cancelled-bucket.png'))
 

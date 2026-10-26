@@ -12,8 +12,11 @@
  * 故本脚本的核心断言由「nav-tg 存在 ⇔ 服务可达」改为「nav-tg **恒存在**」。
  *
  * 本脚本**不接受**「页面能打开」或「字符串存在」当证据。真值来自两处且必须在浏览器内对齐：
- *   1. daemon `GET /api/config` 的 `tg_enabled` / `tg_running` / `tg_last_error`；
- *   2. 浏览器**自己**那个 TG base（动态 import `/src/api/tg.ts` 取 `TG_BASE`，
+ *   1. daemon `GET /api/config` 的 TG 插件态（BUG-358 起 `plugins[]` id="tg" 的
+ *      `enabled` / `running` / `lastError`，旧键 `tg_*` 兜底 —— BUG-423）；
+ *   2. 浏览器**自己**那个 TG base（动态 import `/src/api/tg.ts` 取 `tgBase()`，
+ *      BUG-423 修正：旧读法 `TG_BASE` 常量已不存在，且 /health 须答 JSON ok ——
+ *      vite SPA 兜底会把打错端口的相对 URL 也答成 200，不能当可达证据）；
  *      与 App 同源，不硬编码端口）的 `/health` 可达性。
  * 断言（新口径）：
  *   a. `nav-tg` 在「后端活 / 后端死」两种状态下**都存在**（入口常驻）；
@@ -85,11 +88,14 @@ async function main() {
     console.error('[verify:tggating] RESULT: UNREACHABLE (exit 2)')
     return 2
   }
-  const tgEnabled = daemon.tg_enabled === true
-  const tgRunning = daemon.tg_running === true
-  const tgLastError = daemon.tg_last_error ?? null
+  // BUG-423：BUG-358 起契约是 plugins[]（id 取插件）；旧键兜底兼容
+  const tgPlug = Array.isArray(daemon.plugins) ? daemon.plugins.find((x) => x && x.id === 'tg') : null
+  const tgEnabled = tgPlug ? tgPlug.enabled === true : daemon.tg_enabled === true
+  const tgRunning = tgPlug ? tgPlug.running === true : daemon.tg_running === true
+  const tgLastError = tgPlug ? (tgPlug.lastError ?? null) : (daemon.tg_last_error ?? null)
+  const tgPort = tgPlug && Number(tgPlug.port) > 0 ? Number(tgPlug.port) : daemon.tg_port
   console.log(
-    `[verify:tggating] daemon: tg_enabled=${tgEnabled} tg_running=${tgRunning} tg_port=${daemon.tg_port}`,
+    `[verify:tggating] daemon: tg_enabled=${tgEnabled} tg_running=${tgRunning} tg_port=${tgPort}`,
   )
   if (tgLastError) console.log(`[verify:tggating] daemon tg_last_error = ${JSON.stringify(tgLastError)}`)
 
@@ -113,24 +119,37 @@ async function main() {
 
     // ---- 2. 浏览器**自己**的 TG base（与 App 同源，不猜端口）----
     const tgProbe = await page.evaluate(async () => {
+      // BUG-423 同族腐烂：模块早把 `TG_BASE` 常量改成 `tgBase()` 函数（端口运行期
+      // 可变），旧读法恒得 undefined；`fetch("undefined/health")` 是相对 URL，
+      // 被 vite dev server 的 SPA 兜底答 200 ⇒ reachable=true 是**假绿**。
+      // 故：取 `tgBase()`，且 /health 必须答 application/json {"status":"ok"}
+      // （orig-tg 文档响应），SPA 兜底的 text/html 过不了这关。
       const mod = await import('/src/api/tg.ts')
-      const base = mod.TG_BASE
+      const base = typeof mod.tgBase === 'function' ? mod.tgBase() : mod.TG_BASE
       let reachable = false
+      let why = 'not attempted'
       try {
         const r = await fetch(`${base}/health`)
-        reachable = r.ok
-      } catch (_e) {
-        reachable = false
+        const ct = r.headers.get('content-type') || ''
+        if (!r.ok) why = `HTTP ${r.status}`
+        else if (!/application\/json/i.test(ct)) why = `content-type=${ct}`
+        else {
+          const j = await r.json()
+          if (j && j.status === 'ok') reachable = true
+          else why = `body=${JSON.stringify(j)}`
+        }
+      } catch (e) {
+        why = String((e && e.message) || e)
       }
-      return { base, reachable }
+      return { base, reachable, why }
     })
     console.log(
-      `[verify:tggating] browser TG_BASE=${tgProbe.base} reachable=${tgProbe.reachable}`,
+      `[verify:tggating] browser tgBase()=${tgProbe.base} reachable=${tgProbe.reachable}${tgProbe.reachable ? '' : ` (${tgProbe.why})`}`,
     )
 
     // 新口径（2026-10-13）：入口常驻 —— 两种后端状态下 nav-tg 都必须存在。
     const expectedVisible = true
-    console.log(`[verify:tggating] daemon tg_enabled=${tgEnabled} browser TG_BASE reachable=${tgProbe.reachable}`)
+    console.log(`[verify:tggating] daemon tg_enabled=${tgEnabled} browser tgBase() reachable=${tgProbe.reachable}`)
     console.log('[verify:tggating] expected nav-tg visible = true（入口常驻，与就绪态无关）')
     console.log('')
     console.log('--- assertions ---')

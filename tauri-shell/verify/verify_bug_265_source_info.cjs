@@ -38,6 +38,9 @@
  *   C. **1 备用源夹具**（临时挂一个再验，验完删；注入走产品 API，不直改库）：
  *      C1 判据6：两个既有 testid 在 DOM 中存在（各 1 个）；
  *      C2 判据4：点「切为主版本」→ 读模型主条目变为备用源条目（切换真实生效）；
+ *      C2b 判据4 的 UI 侧前提：切换后**页面重渲染**出「主条目 = 备用源行」
+ *                （服务端先生效、UI 后渲染，不等这步就点摘除会点到旧行 =
+ *                 闭包里旧 itemId 的 no-op，实测假红过）；
  *      C3 判据4：点「摘除」→ `media_episode_source` 行消失、控件从 DOM 消失，
  *                信息段**仍然可见**（BUG-210 合理部分未被回退）。
  *
@@ -91,23 +94,29 @@ const OUT_DIR = process.env.ORIG_VERIFY_OUT || path.resolve(__dirname, 'evidence
 const SERIES_DETAIL_SRC = path.resolve(__dirname, '..', 'src', 'components', 'media', 'SeriesDetail.tsx')
 
 // ── 反向证伪锚点（都是源文件里唯一的字符串；与修复态逐字节对应） ──────────────
+// BUG-422：锚点随源码漂移两次 —— ①className 的 border-t/…/pt-2.5 已被样式调整移除；
+// ②块尾「单集结构性操作」注释被 BUG-350 改写。锚点只认**当前**活实现，
+// 每次改动 SeriesDetail.tsx 信息段周边结构都必须回来同步，否则注入会拒改。
 const ANCHOR_OPEN = [
   '              <div',
-  '                className="flex flex-col gap-1.5 border-t border-border-subtle/60 pt-2.5"',
+  '                className="flex flex-col gap-1.5"',
   '                data-testid="episode-source-info"',
   '              >',
 ].join('\n')
 const ANCHOR_OPEN_INJECTED = '              {(cur.sources ?? []).length > 0 ? (\n' + ANCHOR_OPEN
+// 块尾：内层 ul 门控收尾 + 信息段 </div> + 紧随的 BUG-350 注释首行（唯一定位）。
 const ANCHOR_CLOSE = [
+  '                ) : null}',
   '              </div>',
   '',
-  '              {/* 单集结构性操作：上移 / 下移 / 移除（编辑入口已上移到标题行，见右栏头） */}',
+  '              {/* BUG-350：上移/下移/移除与「操作」组（挂图/前往条目/重缓存）已并入',
 ].join('\n')
 const ANCHOR_CLOSE_INJECTED = [
+  '                ) : null}',
   '              </div>',
   '              ) : null}',
   '',
-  '              {/* 单集结构性操作：上移 / 下移 / 移除（编辑入口已上移到标题行，见右栏头） */}',
+  '              {/* BUG-350：上移/下移/移除与「操作」组（挂图/前往条目/重缓存）已并入',
 ].join('\n')
 
 // ── 文案候选集（浏览器语言未知：zh / en 两套都收） ──────────────────────────
@@ -244,6 +253,28 @@ async function waitCountEq(page, testid, want, timeout = 9000) {
   for (;;) {
     const n = await countTestid(page, testid)
     if (n === want) return true
+    if (Date.now() > deadline) return false
+    await delay(250)
+  }
+}
+
+/**
+ * 等右栏「备用源行」（含 episode-source-detach 的那个 li）渲染出期望文本。
+ * BUG-422：切换动作**服务端先生效、UI 后重渲染**——API 轮询看到 primary 已换，
+ * 页面可能还停在切换前。此刻点「摘除」点到的是旧行，其 onClick 闭包里的
+ * s.itemId 还是切换前的备用源（切换后它已是主版本）⇒ 摘除 no-op，
+ * api/db 恒 1、判据 4 假红。点摘除前必须等这步。
+ * @returns {Promise<boolean>}
+ */
+async function waitBackupRowText(page, want, timeout = 10000) {
+  const deadline = Date.now() + timeout
+  for (;;) {
+    const txt = await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid="episode-source-detach"]')
+      const li = btn && btn.closest('li')
+      return li ? (li.innerText || '') : ''
+    })
+    if (txt.includes(want)) return true
     if (Date.now() > deadline) return false
     await delay(250)
   }
@@ -389,6 +420,9 @@ async function createItem(kind, title, filePath) {
     throw new Error(`createItem(${kind}) failed: status=${r.status} body=${JSON.stringify(r.json)}`)
   }
   const id = Number(r.json.ids[0])
+  // BUG-422：导入即被 BUG-304 自动归档进单集剧集；不先撤销归属，后面往自己的
+  // 剧集挂载会撞 media_episode.item_id 唯一约束（HTTP 500）。
+  await sandbox.detachAutoSeries(MEDIA_API, id)
   sandbox.trackCleanup(async () => {
     await sandbox.httpJson('DELETE', `${MEDIA_API}/api/media/items/${id}`)
   })
@@ -412,7 +446,8 @@ async function buildFixture(withSource) {
     MEDIA_API,
     'VerifyProbe_',
   )
-  const mainItem = await createItem('video', 'QA-BUG265 主视频', mk(withSource ? 'main2.mp4' : 'main.mp4'))
+  const mainTitle = 'QA-BUG265 主视频'
+  const mainItem = await createItem('video', mainTitle, mk(withSource ? 'main2.mp4' : 'main.mp4'))
 
   const epRes = await sandbox.httpJson(
     'POST',
@@ -441,7 +476,7 @@ async function buildFixture(withSource) {
     `[bug265] fixture: series=${seriesId} "${seriesTitle}" episode=${episodeId} ` +
       `main=${mainItem}${withSource ? ` alt(source)=${altItem}` : ' (no backup source)'}`,
   )
-  return { seriesId, episodeId, mainItem, altItem, seriesTitle }
+  return { seriesId, episodeId, mainItem, altItem, seriesTitle, mainTitle }
 }
 
 // ────────────────────────────── 反向证伪：注入 + 还原 ──────────────────────────────
@@ -532,8 +567,11 @@ async function main() {
       throw new Error(`series list unavailable: status=${list.status}`)
     }
     // 找一个「首集无备用源」的真实剧集（生产库备用源 0 行 ⇒ 第一个即满足；找不到才扫全表）。
+    // BUG-422：候选必须**墙可见**（hasBytes !== false）——BUG-304 起无字节剧集整卡
+    // 不上墙，选中了也点不开卡（实测 543 就是这样：API 列表第一条，墙上没有）。
     let realSeries = null
     for (const s of list.json.items) {
+      if (s.hasBytes === false) continue
       const { status, series } = await apiSeries(s.id)
       if (status !== 200 || !series || !(series.episodes || []).length) continue
       const v = episodeView(series, series.episodes[0].id)
@@ -639,6 +677,15 @@ async function main() {
     await assertInfoVisible(page, 'C/fixture-after-switch')
 
     // ── 摘除：点「摘除」→ 备用源行消失、控件缺席、信息段仍在 ──
+    // BUG-422：先等 UI 重渲染出「主条目 = 备用源行」再点摘除。
+    // 不等就点会点到切换前的旧行（闭包里 s.itemId 还是旧备用源，而它切换后
+    // 已是主版本 ⇒ 摘除 no-op，api/db 恒 1，判据 4 假红——实测踩过）。
+    const rowReady = await waitBackupRowText(page, fx2.mainTitle)
+    check(
+      'C/fixture: 切换后 UI 重渲染 —— 备用源行显示主条目（判据4 的 UI 侧前提）',
+      rowReady,
+      `backup row should contain "${fx2.mainTitle}" after switch`,
+    )
     await clickTestid(page, 'episode-source-detach')
     console.log('[bug265] clicked [data-testid="episode-source-detach"]')
     const dtGone = await waitCountEq(page, 'episode-source-detach', 0, 9000)

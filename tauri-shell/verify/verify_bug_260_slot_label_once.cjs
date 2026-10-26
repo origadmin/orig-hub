@@ -41,8 +41,11 @@
  *
  * ## 只读铁律
  *
- * - API 只 GET；UI 只导航 / 截图；不点任何编辑 / 保存 / 删除；零数据写入。
+ * - 真实库数据**只 GET**；UI 只导航 / 截图；不点任何编辑 / 保存 / 删除。
  * - 唯一写盘是反向证伪对 `src/lib/episodePresentation.ts` 的**临时注入 + 字节级还原**。
+ * - BUG-422 追加的唯一写入：库内**没有 photo 分集**时自建 photo 夹具（先挂视频分集、
+ *   再把条目 kind 改成 photo —— API 422 与 DB 触发器都只守「分集写入」，不守条目
+ *   kind 变更，这是 photo 分集行唯一可达路径），跑完即删，库恢复原状。
  *
  * ## 用法
  *
@@ -57,6 +60,7 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 
 const cdp = require('./lib/cdp.cjs')
+const sandbox = require('./lib/sandbox.cjs')
 
 const APP_PORT = Number(process.env.APP_PORT || 5180)
 const APP_URL = `http://127.0.0.1:${APP_PORT}/`
@@ -101,8 +105,11 @@ async function httpJson(method, url, body) {
 
 async function resolveTg() {
   const cfg = await httpJson('GET', `${DAEMON}/api/config`)
-  if (cfg.status !== 200 || !cfg.json || !cfg.json.tg_port) return null
-  return `http://127.0.0.1:${cfg.json.tg_port}`
+  // BUG-358 起 `/api/config` 的 `tg_port` 收进 `plugins[]`（id='tg'）—— 旧键直读
+  // 会恒得 undefined（BUG-422 实测假红）。适配器双契约兼容，只此一处。
+  const tgPort = sandbox.tgPortOf(cfg.json)
+  if (cfg.status !== 200 || !cfg.json || !tgPort) return null
+  return `http://127.0.0.1:${tgPort}`
 }
 
 async function shot(page, name) {
@@ -150,17 +157,8 @@ async function gotoWall(page) {
     return true
   })
   if (!navOk) throw new Error('nav-child-lib-series 入口不存在')
-  await page.waitForFunction(() => !!document.querySelector('[data-testid="media-panel-title"]'), {
-    timeout: 25000,
-    intervalMs: 300,
-  })
-  const railOk = await page.evaluate(() => {
-    const el = document.querySelector('[data-testid="media-rail-series-all"]')
-    if (!el) return false
-    el.click()
-    return true
-  })
-  if (!railOk) throw new Error('media-rail-series-all 入口不存在')
+  // BUG-422：原判据等 `media-panel-title`——该 testid 已从 MediaLibraryPanel 消失
+  // （面板头部重构），恒超时。墙可达性的真锚点是下面的 series-card-root。
   await page.waitForFunction(
     () => document.querySelectorAll('[data-testid="series-card-root"]').length > 0,
     { timeout: 25000, intervalMs: 300 },
@@ -301,9 +299,57 @@ const fmtRow = (r) =>
   `labelCount=${r.actual}(exp ${r.expected}) middle=${JSON.stringify(r.middle)} glyph=${r.glyphCount}`
 
 /**
+ * BUG-422：库内没有 photo 分集时自建夹具（判据 2 的防回归面否则永远空转）。
+ *
+ * photo 分集行**唯一可达路径**（实测）：
+ *   1. `POST /api/media/items` 建 **video** 条目（分集写入时触发器才放行）；
+ *   2. 撤销 BUG-304 自动归档（`detachAutoSeries`），否则挂载撞 UNIQUE(item_id)；
+ *   3. 建剧集 + `POST /api/media/series/:id/episodes` 挂载（此刻是合规 video 分集）；
+ *   4. `PATCH /api/media/items/:id` `{kind:'photo'}` —— API 422 与
+ *      `trg_media_episode_video_only_ins/_upd` 都只守 media_episode 的写入，
+ *      不守 media_item.kind 变更，分集行由此读出 kind=photo。
+ * 真实标题保留（判据 2.4 的 gate=true 面），剧集标题与条目标题刻意不同。
+ */
+async function makePhotoFixture(page, TG) {
+  const ts = Date.now()
+  const itemTitle = `ZZ-BUG260-PHOTO-${ts}`
+  const seriesTitle = `ZZ-BUG260-PS-${ts}`
+  const fakePath = path.join(require('node:os').tmpdir(), `orighub-bug260-${ts}-0.mp4`)
+  const it = await httpJson('POST', `${TG}/api/media/items`, {
+    items: [{ path: fakePath, source: 'local', kind: 'video', title: itemTitle }],
+  })
+  const itemId = it.json && Array.isArray(it.json.ids) ? it.json.ids[0] : null
+  if (itemId == null) throw new Error(`photo 夹具条目创建失败 (status=${it.status})`)
+  await sandbox.detachAutoSeries(TG, itemId)
+  const ser = await httpJson('POST', `${TG}/api/media/series`, { title: seriesTitle, kind: 'series' })
+  const seriesId = ser.json && ser.json.id
+  if (seriesId == null) throw new Error(`photo 夹具剧集创建失败 (status=${ser.status})`)
+  const ep = await httpJson('POST', `${TG}/api/media/series/${seriesId}/episodes`, {
+    itemId, season: 1, episodeNo: 1,
+  })
+  if (ep.status !== 200) throw new Error(`photo 夹具分集挂载失败 (status=${ep.status})`)
+  const flip = await httpJson('PATCH', `${TG}/api/media/items/${itemId}`, { kind: 'photo' })
+  if (flip.status !== 200) throw new Error(`photo 夹具 kind 改写失败 (status=${flip.status})`)
+  const d = await xhrJson(page, `${TG}/api/media/series/${seriesId}`)
+  console.log(`[bug260] 自建 photo 夹具: series=${seriesId} item=${itemId} title=${JSON.stringify(seriesTitle)}`)
+  return {
+    fixture: { seriesId, itemId },
+    target: {
+      id: d.id,
+      title: d.title,
+      episodeCount: d.episodes.length,
+      emptyCount: d.episodes.filter((e) => titleTrim(e).length === 0).length,
+      realCount: d.episodes.filter((e) => titleGate(e, d)).length,
+      photoCount: d.episodes.filter(isPhotoEp).length,
+      detail: d,
+    },
+  }
+}
+
+/**
  * 运行时发现靶子（不硬编码 series id）：
  *   targetEmpty = 空标题集数最多、且带真标题集的剧（核心咬合面）；
- *   targetPhoto = photo 分集最多的剧（防回归面）。
+ *   targetPhoto = photo 分集最多的剧（防回归面）；库内没有则自建夹具。
  */
 async function discoverFixtures(page, TG) {
   const list = await xhrJson(page, `${TG}/api/media/series?limit=1000`)
@@ -329,10 +375,18 @@ async function discoverFixtures(page, TG) {
   const targetEmpty = withEmpty.find((x) => x.realCount > 0) || withEmpty[0] || null
   const withPhoto = seen.filter((x) => x.photoCount > 0)
   withPhoto.sort((a, b) => b.photoCount - a.photoCount || a.id - b.id)
-  const targetPhoto = withPhoto[0] || null
+  let targetPhoto = withPhoto[0] || null
+  let photoFixture = null
+  if (!targetPhoto) {
+    // BUG-422：库内无 photo 分集（BUG-044 起分集只能挂视频，历史 photo 分集已清空）
+    // —— 自建夹具，否则判据 2 永远「靶子不足」退出，防回归面名存实亡。
+    const made = await makePhotoFixture(page, TG)
+    photoFixture = made.fixture
+    targetPhoto = made.target
+  }
   console.log(`[bug260] 候选（空标题）: ${JSON.stringify(withEmpty.slice(0, 5).map((x) => ({ id: x.id, empty: x.emptyCount, real: x.realCount, eps: x.episodeCount })))}`)
   console.log(`[bug260] 候选（photo）: ${JSON.stringify(withPhoto.slice(0, 5).map((x) => ({ id: x.id, photo: x.photoCount, eps: x.episodeCount })))}`)
-  return { targetEmpty, targetPhoto, scanned: seen.length }
+  return { targetEmpty, targetPhoto, photoFixture, scanned: seen.length }
 }
 
 async function main() {
@@ -347,6 +401,7 @@ async function main() {
   console.log(`[bug260] tg=${TG}`)
 
   let browser = null
+  let photoFixture = null
   try {
     browser = await cdp.launch()
     const page = await browser.newPage()
@@ -359,7 +414,8 @@ async function main() {
 
     // ── 0. 数据前置：靶子运行时发现 ──────────────────────────────────
     console.log('\n[bug260] === 判据 0：数据前置（运行时发现靶子，不硬编码 series id） ===')
-    const { targetEmpty, targetPhoto, scanned } = await discoverFixtures(page, TG)
+    const { targetEmpty, targetPhoto, photoFixture: madeFixture, scanned } = await discoverFixtures(page, TG)
+    photoFixture = madeFixture
     check('0.1', '发现「≥1 集标题为空串」的剧集（核心咬合面）',
       Boolean(targetEmpty),
       '全库扫描后至少 1 部剧含空标题分集',
@@ -559,6 +615,15 @@ async function main() {
     if (failed.length) console.log('[bug260] FAILED:', failed.map((c) => `${c.id}:${c.label}`).join(' | '))
     process.exitCode = failed.length ? 2 : 0
   } finally {
+    // BUG-422：自建 photo 夹具的清理（删剧集即解挂；条目随剧集删除后的 prune 收尾）
+    if (photoFixture) {
+      try {
+        const del = await httpJson('DELETE', `${TG}/api/media/series/${photoFixture.seriesId}`)
+        console.log(`[bug260] photo 夹具已清理: series=${photoFixture.seriesId} item=${photoFixture.itemId} status=${del.status}`)
+      } catch (e) {
+        console.error(`[bug260] photo 夹具清理失败: ${e && e.message}`)
+      }
+    }
     if (browser) await browser.close()
   }
 }

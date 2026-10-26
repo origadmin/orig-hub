@@ -54,6 +54,7 @@ const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 
 const cdp = require('./lib/cdp.cjs')
+const sandbox = require('./lib/sandbox.cjs')
 
 const APP_PORT = Number(process.env.APP_PORT || 5180)
 const APP_URL = `http://127.0.0.1:${APP_PORT}/`
@@ -117,8 +118,11 @@ async function httpJson(method, url, body, timeoutMs = 10000) {
 
 async function resolveTgBase() {
   const cfg = await httpJson('GET', `${DAEMON}/api/config`)
-  if (cfg.status !== 200 || !cfg.json || !cfg.json.tg_port) return null
-  return { base: `http://127.0.0.1:${cfg.json.tg_port}`, tgRunning: cfg.json.tg_running === true }
+  // BUG-358 起 `/api/config` 的 `tg_port` 收进 `plugins[]`（id='tg'）—— 旧键直读
+  // 会恒得 undefined（BUG-422 实测假红）。适配器双契约兼容，只此一处。
+  const tgPort = sandbox.tgPortOf(cfg.json)
+  if (cfg.status !== 200 || !cfg.json || !tgPort) return null
+  return { base: `http://127.0.0.1:${tgPort}`, tgRunning: sandbox.tgRunningOf(cfg.json) }
 }
 
 function startDevServices() {
@@ -397,13 +401,18 @@ async function main() {
     })
     if (!navOk) throw new Error('nav-child-lib-series 入口不存在')
     await delay(1800)
+    // M0（BUG-298）：`media-cat-all` 已废止，items 视图入口是侧栏 `nav-child-cat-video`。
+    // BUG-422：旧代码点了废止的 media-cat-all 就抛错，从没试过新入口（半截适配）——
+    // 改成新入口优先、旧入口回落，两者都没有才报错。
     const catOk = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="media-cat-all"]')
+      const el =
+        document.querySelector('[data-testid="nav-child-cat-video"]') ||
+        document.querySelector('[data-testid="media-cat-all"]')
       if (!el) return false
       el.click()
       return true
     })
-    if (!catOk) throw new Error('media-cat-all 入口不存在')
+    if (!catOk) throw new Error('items 视图入口不存在（nav-child-cat-video 与 media-cat-all 均未挂载）')
     await page.waitForFunction(
       () => document.querySelectorAll('[data-testid="media-card"]').length >= 60,
       { timeout: 25000 },

@@ -25,7 +25,9 @@
  *      B1 E2 行 `episode-nobytes` / `episode-nobytes-cache` 存在；
  *      B2 点标记 → toast 反馈 + 行聚焦**未**切换（focus title 仍是 E1）；
  *      B3 任务列表出现该 ref 的消息（真实入队）。
- *   C. **判据 2（剧集级补缺）**：夹具 2 集 tg 无字节：
+ *   C. **判据 2（剧集级补缺）**：夹具 1 集本地有字节 + 2 集 tg 无字节
+ *      （全缺字节的剧集按 BUG-304 不上墙、UI 无入口，必须垫一条有字节分集才能经墙打开；
+ *      N 只数无字节分集 ⇒ 仍是 2）：
  *      C1 按钮 `series-recache-missing` 文案含 N=2 且未禁用；
  *      C2 点击 → 发出 `POST /api/media/series/:id/recache-missing`（fetch 捕获）；
  *      C3 端点入队断言在**隔离 mock 实例**（ORIG_BUG261_MOCK_TG，见下）执行：
@@ -223,21 +225,38 @@ async function openSeriesById(page, id) {
     { timeout: 20000 },
   )
   await delay(600)
-  const clicked = await page.evaluate((sid) => {
-    const card = document.querySelector(`[data-testid="series-card"][data-series-id="${sid}"]`)
-    if (!card) return false
-    card.scrollIntoView({ block: 'center' })
-    card.click()
-    return true
-  }, id)
-  if (!clicked) throw new Error(`series-card with data-series-id=${id} not found on the series wall`)
-  const detailUp = await page
-    .waitForFunction(() => !!document.querySelector('[data-testid="episode-focus-title"]'), {
-      timeout: 20000,
-    })
-    .then(() => true)
-    .catch(() => false)
-  if (!detailUp) throw new Error('series detail never rendered (episode-focus-title missing)')
+  const clickCard = () =>
+    page.evaluate((sid) => {
+      const card = document.querySelector(`[data-testid="series-card"][data-series-id="${sid}"]`)
+      if (!card) return false
+      card.scrollIntoView({ block: 'center' })
+      card.click()
+      return true
+    }, id)
+  const waitDetail = (timeout) =>
+    page
+      .waitForFunction(() => !!document.querySelector('[data-testid="episode-focus-title"]'), {
+        timeout,
+        intervalMs: 300,
+      })
+      .then(() => true)
+      .catch(() => false)
+  if (!(await clickCard())) {
+    throw new Error(`series-card with data-series-id=${id} not found on the series wall`)
+  }
+  let detailUp = await waitDetail(45000)
+  if (!detailUp) {
+    // orig-tg 偶发 ~14s 长尾：openSeries 先 await loadSeriesDetail 才切视图，
+    // 慢/失败时界面停在墙上。首轮不上来就回墙重点一轮，别把长尾误报成「详情不渲染」。
+    const reclicked = await clickCard()
+    detailUp = reclicked ? await waitDetail(45000) : false
+  }
+  if (!detailUp) {
+    const bodyTail = await page.evaluate(() => (document.body.innerText || '').slice(-300))
+    throw new Error(
+      `series detail never rendered (episode-focus-title missing); page tail=${JSON.stringify(bodyTail)}`,
+    )
+  }
   await delay(600)
 }
 
@@ -253,6 +272,9 @@ async function createItem(entry) {
     throw new Error(`createItem failed: status=${r.status} body=${JSON.stringify(r.json)}`)
   }
   const id = Number(r.json.ids[0])
+  // BUG-422：导入即被 BUG-304 自动归档进单集剧集；不先撤销归属，后面往自己的
+  // 剧集挂载会撞 media_episode.item_id 唯一约束（HTTP 500）。
+  await sandbox.detachAutoSeries(MEDIA_API, id)
   sandbox.trackCleanup(async () => {
     await sandbox.httpJson('DELETE', `${MEDIA_API}/api/media/items/${id}`)
   })
@@ -497,6 +519,8 @@ async function createItemOn(base, entry) {
     throw new Error(`mock createItem failed: status=${r.status} body=${JSON.stringify(r.json)}`)
   }
   const id = Number(r.json.ids[0])
+  // BUG-422：同上——mock 实例与真实例同一条自动归档代码路径。
+  await sandbox.detachAutoSeries(base, id)
   sandbox.trackCleanup(async () => {
     await sandbox.httpJson('DELETE', `${base}/api/media/items/${id}`)
   })
@@ -705,6 +729,20 @@ async function main() {
     // ══ C. 判据 2：剧集级补缺（N 随夹具变化 + 点击发出原子端点请求） ═══════
     const fxMissing = await buildFixture('C(补缺)')
     {
+      /*
+       * 必须先给一条**有字节**的分集（E1，本地真实文件）再挂两集缺字节 tg：
+       * 剧集墙按 BUG-304 / D18 只列 `hasBytes !== false` 的剧集（客户端
+       * `loadSeries` 过滤，服务端同源）—— 全部分集都缺字节的剧集**故意**不上墙，
+       * UI 没有任何入口能打开它（无深链、检索只走条目域）。实测：两集全 tg 缺字节
+       * ⇒ series.hasBytes=false ⇒ `openSeriesById` 找不到卡片（确定性失败，非 flaky）。
+       * 补 E1 后剧集有内容 ⇒ 可经墙打开；`missingCount` 仍只数无字节分集 ⇒ N=2 不变，
+       * 端点也只入队缺失集（C2b 的批次任务断言不受影响）。
+       */
+      const e1 = await createItem({
+        path: mkBytesFile('bug261-c1.mp4'),
+        title: 'QA261-C1',
+        kind: 'video',
+      })
       const m1 = await createItem({
         source: 'tg',
         ref: `${FIXTURE_CHAT}:${MSG_MISSING_1}`,
@@ -717,8 +755,9 @@ async function main() {
         title: 'QA261-M2',
         kind: 'video',
       })
-      await addEpisode(fxMissing.seriesId, m1, 1)
-      await addEpisode(fxMissing.seriesId, m2, 2)
+      await addEpisode(fxMissing.seriesId, e1, 1)
+      await addEpisode(fxMissing.seriesId, m1, 2)
+      await addEpisode(fxMissing.seriesId, m2, 3)
     }
     await openSeriesById(page, fxMissing.seriesId)
     await delay(500)

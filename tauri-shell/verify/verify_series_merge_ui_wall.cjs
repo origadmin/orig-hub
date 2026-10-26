@@ -39,6 +39,7 @@ const os = require('node:os')
 const path = require('node:path')
 
 const cdp = require('./lib/cdp.cjs')
+const sandbox = require('./lib/sandbox.cjs')
 
 const APP_URL = process.env.APP_URL || 'http://127.0.0.1:5180/'
 const TG_API = (process.env.TG_API || process.env.ORIG_TG_API || 'http://127.0.0.1:19787').replace(
@@ -162,6 +163,9 @@ async function createItem(title) {
     items: [{ path: fakePath, source: 'local', kind: 'video', title }],
   })
   const id = r.json && Array.isArray(r.json.ids) ? r.json.ids[0] : null
+  // BUG-422：导入即被 BUG-304 自动归档进单集剧集；不先撤销归属，后面往自己的
+  // 剧集挂载会撞 media_episode.item_id 唯一约束（HTTP 500）。
+  if (id != null) await sandbox.detachAutoSeries(TG_API, id)
   return { id, status: r.status }
 }
 
@@ -318,9 +322,10 @@ async function main() {
     )
     await delay(1000)
 
-    // 进入剧集墙（确保 view === 'series'）。
+    // 进入剧集墙（确保 view === 'series'）。M0（BUG-298）后 rail 入口废止，
+    // 改点侧栏剧集入口（`media-rail-series-all` 已不存在）。
     await page.evaluate(() => {
-      const b = document.querySelector('[data-testid="media-rail-series-all"]')
+      const b = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (b) b.click()
     })
     await delay(800)
@@ -365,9 +370,15 @@ async function main() {
     await clickSelect(B) // 取消 B，剩 1 条
     await delay(300)
     const bar1 = await page.evaluate(SCAN_BAR_FN)
+    // 判据翻转（BUG-422）：本断言原写「剩 1 条 → 动作条消失」，那是 2026-09-29
+    // （BUG-186 当时）的旧设计 —— 动作条只在 ≥2 时出现。BUG-214（2026-10-13）已把
+    // 设计改成「选中 ≥1 即出现」（见 verify_bug_214_qa_independent 判据 1.1
+    // 「选中 1 条：动作条存在」）。旧判据方向与现设计相反，留着等于要求产品退回旧
+    // 形态（BUG-320 同型：判据与诉求反向＝白改）。现判据验的是本来要验的点：
+    // 取消 1 条后动作条**仍在**、计数实时降为 1。
     check(
-      'B5b: 取消 1 条（剩 1 条）→ 动作条消失',
-      !bar1.hasBar,
+      'B5b: 取消 1 条（剩 1 条）→ 动作条仍在、计数降为 1（BUG-214 后 ≥1 即显示）',
+      bar1.hasBar && /已选\s*1\s*条/.test(bar1.countText || ''),
       `hasBar=${bar1.hasBar} countText=${JSON.stringify(bar1.countText)}`,
     )
 
@@ -376,13 +387,15 @@ async function main() {
     await clickSelect(A)
     await clickSelect(B)
     await delay(300)
+    // M0 导航模型（BUG-298）：`media-cat-all` 已废止，内容视图入口是侧栏
+    // `nav-child-cat-video`（原 media-cat-* 系列一并改名）。
     await page.evaluate(() => {
-      const b = document.querySelector('[data-testid="media-cat-all"]')
+      const b = document.querySelector('[data-testid="nav-child-cat-video"]')
       if (b) b.click()
     })
     await delay(700)
     await page.evaluate(() => {
-      const b = document.querySelector('[data-testid="media-rail-series-all"]')
+      const b = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (b) b.click()
     })
     await delay(900)

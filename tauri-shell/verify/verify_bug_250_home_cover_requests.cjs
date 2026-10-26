@@ -17,7 +17,7 @@
  *
  * 1. 先解析出 `kind=video && bytesPresence=missing` 的 id 集合 —— 没有这个集合，
  *    「没有对无字节视频发请求」这句话无法被证伪（任何干净页面都恒过）。
- * 2. 打开媒体库 → 切到 items 视图（`media-cat-all`）→ **滚动到底**
+ * 2. 打开媒体库 → 切到 items 视图（`nav-child-cat-video`，M0 后 media-cat-all 废止）→ **滚动到底**
  *    （封面是 IntersectionObserver 懒触发的，只测首屏等于没测），
  *    用 CDP `Network.responseReceived` 收集每一条 `/api/media/items/:id/raw`。
  * 3. A：items 视图对 `video+missing` 的 raw 请求数必须为 **0**（修复前 > 0 且 404）；
@@ -128,13 +128,18 @@ async function main() {
     )
     await sleep(4000)
     phase = 'items-view'
+    // M0（BUG-298）：`media-cat-all` 已废止，入口改名 `nav-child-cat-video`。
+    // BUG-422：旧代码点的还是废止的 media-cat-all（恒 clicked=false）——
+    // 新入口优先、旧入口回落。
     const switched = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="media-cat-all"]')
+      const el =
+        document.querySelector('[data-testid="nav-child-cat-video"]') ||
+        document.querySelector('[data-testid="media-cat-all"]')
       if (!el) return false
       el.click()
       return true
     })
-    check(switched, 'items view reachable ([data-testid="media-cat-all"])', `clicked=${switched}`)
+    check(switched, 'items view reachable ([data-testid="nav-child-cat-video"])', `clicked=${switched}`)
 
     await page.waitForFunction(
       () => document.querySelectorAll('[data-testid="media-card"]').length > 0,

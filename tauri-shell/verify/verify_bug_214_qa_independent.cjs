@@ -20,7 +20,8 @@
  *
  *   1 边界：选中 1 条 → count 含「1」、`series-merge-wall` disabled 且有 title、
  *     `series-bulk-remove` 可用；点清空 → 动作条**从 DOM 消失**；选 3 条 → merge 可点。
- *   2 批量导出不得退化成全库：勾选数 === 2 且总行数 ≠ 2；CDP 抓到的真实请求 URL 必须是
+ *   2 批量导出不得退化成全库：勾选数 === 2 且总行数 ≠ 2；总行数基线 = 剧集墙可见集大小
+ *     （BUG-304 hasBytes 过滤后，见选靶口径）；CDP 抓到的真实请求 URL 必须是
  *     `.../export/preview?seriesIds=<恰好那 2 个 id>`。
  *   3 批量打标 scope 文案：弹窗标题必须是**剧集**口径，不得是 items 口径（两语言都比对）。
  *   4 删除确认链：清单行数 === 选中数、每行含剧名与集数、`series-confirm-keep-items` 非空；
@@ -40,6 +41,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const cdp = require('./lib/cdp.cjs')
+const sandbox = require('./lib/sandbox.cjs')
 
 const APP_PORT = Number(process.env.APP_PORT || 5180)
 const APP_URL = `http://127.0.0.1:${APP_PORT}/`
@@ -83,8 +85,11 @@ async function httpJson(method, url, body) {
 
 async function resolveTg() {
   const cfg = await httpJson('GET', `${DAEMON}/api/config`)
-  if (cfg.status !== 200 || !cfg.json || !cfg.json.tg_port) return null
-  return `http://127.0.0.1:${cfg.json.tg_port}`
+  // BUG-358 起 `/api/config` 的 `tg_port` 收进 `plugins[]`（id='tg'）—— 旧键直读
+  // 会恒得 undefined（BUG-422 实测假红）。适配器双契约兼容，只此一处。
+  const tgPort = sandbox.tgPortOf(cfg.json)
+  if (cfg.status !== 200 || !cfg.json || !tgPort) return null
+  return `http://127.0.0.1:${tgPort}`
 }
 
 async function shot(page, name) {
@@ -162,7 +167,28 @@ async function main() {
     console.error(`[bug214-qa] 库中剧集不足 3 条（${beforeItems.length}），无法完成边界判据`)
     process.exit(1)
   }
-  const target = beforeItems.slice(0, 3).map((s) => ({ id: s.id, title: s.title, episodeCount: s.episodeCount }))
+  /*
+   * BUG-422 修正靶子选取口径：剧集墙（与导出弹窗候选）只渲染 **hasBytes !== false**
+   * 的剧集——BUG-304/D18「文件域只列有内容的剧集」过滤（MediaLibraryPanel.loadSeries
+   * 的 `list.filter(s => s.hasBytes !== false)`，后端按「至少一个分集条目已落盘」下发
+   * hasBytes）。实测 105 条库里 17 条 hasBytes=false 被隐藏，墙上只有 88 张。
+   *
+   * 原脚本用**未过滤的 API 列表**前 3 条当靶子 ⇒ 可能选中墙上不存在的剧集
+   * （本次实测靶子 543 正是 hasBytes=false），后续 selectSeries 直接抛
+   * 「series-card-select for 543 not found」。这是**脚本选靶缺陷**，不是产品缺陷：
+   * 墙上没有的剧集本就选不到，产品行为符合 BUG-304 判据。
+   *
+   * 修法：靶子从**墙可见集**里取；判据 2.2/2.3 的「候选全量」基线同步改为可见集大小
+   * （导出弹窗候选 = 同一个 `series` state，见 MediaLibraryPanel 的 `series={series}`）。
+   * 判据 4.7（无幽灵删除）仍以**原始 API 全集**为基线——它验的是存储层没被误删。
+   */
+  const wallItems = beforeItems.filter((s) => s.hasBytes !== false)
+  console.log(`[bug214-qa] 墙可见剧集（hasBytes!==false）= ${wallItems.length} / 全集 ${beforeItems.length}`)
+  if (wallItems.length < 3) {
+    console.error(`[bug214-qa] 墙可见剧集不足 3 条（${wallItems.length}），无法完成边界判据`)
+    process.exit(1)
+  }
+  const target = wallItems.slice(0, 3).map((s) => ({ id: s.id, title: s.title, episodeCount: s.episodeCount }))
   console.log(`[bug214-qa] 选择目标: ${JSON.stringify(target)}`)
 
   let browser = null
@@ -246,13 +272,11 @@ async function main() {
     if (!navOk) throw new Error('nav-child-lib-series 入口不存在')
     await delay(3000) // items 视图渲染窗口（供 /raw 归因）
 
-    const railOk = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="media-rail-series-all"]')
-      if (!el) return false
-      el.click()
-      return true
-    })
-    if (!railOk) throw new Error('media-rail-series-all 入口不存在')
+  // M0 导航模型（BUG-298）：`media-rail-series-all` 已废止，侧栏入口直达剧集墙。
+  // BUG-422 更正：此前此处加了「懒加载滚动」补丁，前提是「靶子卡在屏外、滚动可刷出」。
+  // 实测证伪：墙把可见集**一次性全量渲染**（88 张全在 DOM，含屏外位），滚到到底卡片数
+  // 不变；105→88 的差是 BUG-304 的 hasBytes 过滤，不是懒加载。故滚动循环已删除，
+  // 靶子选取改为墙可见集（见上方选靶口径），下面只保留原有的有界等待。
     await page.waitForFunction(
       (ids) => ids.every((id) => !!document.querySelector(`[data-testid="series-card-root"][data-series-id="${id}"]`)),
       { timeout: 25000, args: [target.map((t) => t.id)] },
@@ -346,10 +370,11 @@ async function main() {
 
     check('2.1', '对话框已勾选数 === 选中的 2 条', dlg.checkedRows === 2,
       'checked=2', `checked=${dlg.checkedRows} / totalRows=${dlg.totalRows}`)
-    check('2.2', '对话框总行数 ≠ 2（候选是全库，不是子集）', dlg.totalRows !== 2,
-      `totalRows ≠ 2 且 = 库中剧集总数 ${beforeItems.length}`, `totalRows=${dlg.totalRows}`)
-    check('2.3', '总行数 === 库中剧集总数（候选未被收窄）', dlg.totalRows === beforeItems.length,
-      `totalRows === ${beforeItems.length}`, `totalRows=${dlg.totalRows}`)
+    check('2.2', '对话框总行数 ≠ 2（候选是全量，不是子集）', dlg.totalRows !== 2,
+      `totalRows ≠ 2 且 = 剧集墙可见剧集数 ${wallItems.length}（BUG-304 hasBytes 过滤后的全量候选）`,
+      `totalRows=${dlg.totalRows}`)
+    check('2.3', '总行数 === 墙可见剧集数（候选未被收窄）', dlg.totalRows === wallItems.length,
+      `totalRows === ${wallItems.length}`, `totalRows=${dlg.totalRows}`)
 
     // 只点「校验」（GET，只读），绝不点 export-run
     const runClicked = await page.evaluate(() => {
@@ -405,20 +430,27 @@ async function main() {
       return true
     })
     if (!openTag) throw new Error('series-bulk-tag 不存在')
+    // BUG-422：弹窗标题元素从 h4 改成了 h2（TagManagerDialog.BulkTagDialog 现为
+    // `<h2 className="text-base font-semibold">`）——写死 h4 会永远等不到。
+    // 改为不限标题层级的匹配（h1..h6 任一层，文本口径不变）。
+    // 注意：作为参数传给页面内 `new RegExp(rx)`，**不能带正则字面量的斜杠**。
+    const TAG_TITLE_RX = '设置标签|Set tags'
     await page.waitForFunction(
-      () => [...document.querySelectorAll('h4')].some((h) => /设置标签|Set tags/.test(h.textContent || '')),
-      { timeout: 10000 },
+      (rx) => [...document.querySelectorAll('h1,h2,h3,h4,h5,h6')]
+        .some((h) => new RegExp(rx).test(h.textContent || '')),
+      { timeout: 10000, args: [TAG_TITLE_RX] },
     )
-    const tagText = await page.evaluate(() => {
-      const h4 = [...document.querySelectorAll('h4')].find((h) => /设置标签|Set tags/.test(h.textContent || ''))
-      if (!h4) return null
-      const box = h4.parentElement
+    const tagText = await page.evaluate((rx) => {
+      const h = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6')]
+        .find((el) => new RegExp(rx).test(el.textContent || ''))
+      if (!h) return null
+      const box = h.parentElement
       const p = box.querySelector('p')
       return {
-        title: String(h4.textContent || '').trim(),
+        title: String(h.textContent || '').trim(),
         hint: p ? String(p.textContent || '').trim() : null,
       }
-    })
+    }, TAG_TITLE_RX)
     await shot(page, '05-tag-dialog-scope.png')
 
     const seriesTitleZh = tpl(ZH['media.seriesBulkTagTitle'], { n: 2 })
@@ -439,15 +471,16 @@ async function main() {
       '标题含 "2"', `actualTitle=${JSON.stringify(tagText && tagText.title)}`)
 
     // 取消（找「取消」按钮，绝不点「应用」）
-    const tagCancelled = await page.evaluate(() => {
-      const h4 = [...document.querySelectorAll('h4')].find((h) => /设置标签|Set tags/.test(h.textContent || ''))
-      if (!h4) return false
-      const box = h4.parentElement
+    const tagCancelled = await page.evaluate((rx) => {
+      const h = [...document.querySelectorAll('h1,h2,h3,h4,h5,h6')]
+        .find((el) => new RegExp(rx).test(el.textContent || ''))
+      if (!h) return false
+      const box = h.parentElement
       const btn = [...box.querySelectorAll('button')].find((b) => /取消|Cancel/.test(b.textContent || ''))
       if (!btn) return false
       btn.click()
       return true
-    })
+    }, TAG_TITLE_RX)
     if (!tagCancelled) console.warn('[bug214-qa] 未找到打标取消按钮（对话框未关闭）')
     await delay(500)
 

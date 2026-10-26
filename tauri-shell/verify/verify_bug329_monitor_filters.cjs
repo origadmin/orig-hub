@@ -300,10 +300,17 @@ async function main() {
       /selected\.has\(u\.key\)/.test(filterSrc),
   )
 
-  // ---- 解析 orig-tg 端口（真源：daemon /api/config 的 tg_port）----
+  // ---- 解析 orig-tg 端口（真源：daemon /api/config）----
+  // BUG-423：BUG-358 起先读 plugins[] 里 id="tg" 的 port，旧键 tg_port 兜底；
+  // 两者皆无才抛错（旧实现只读 tg_port，新契约下恒抛，环境探测假红）。
   const cfg = await httpJson(`${DAEMON}/api/config`)
-  const tgPort = cfg.body && cfg.body.tg_port
-  if (!tgPort) throw new Error(`daemon /api/config 里读不到 tg_port：${JSON.stringify(cfg.body)}`)
+  const tgPlug =
+    cfg.body && Array.isArray(cfg.body.plugins)
+      ? cfg.body.plugins.find((x) => x && x.id === 'tg')
+      : null
+  const tgPort =
+    tgPlug && Number(tgPlug.port) > 0 ? Number(tgPlug.port) : cfg.body && Number(cfg.body.tg_port) > 0 ? Number(cfg.body.tg_port) : null
+  if (!tgPort) throw new Error(`daemon /api/config 里读不到 orig-tg 端口（plugins[] id=tg 与旧键 tg_port 均无）：${JSON.stringify(cfg.body)}`)
   TG = `http://127.0.0.1:${tgPort}`
   console.log(`# orig-tg = ${TG}`)
 

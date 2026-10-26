@@ -148,9 +148,10 @@ async function engineSupportsPriority(tg) {
  * daemon，于是要么入口整个不出现（无法做真实 UI 验收），要么端口被真 daemon
  * 改写回生产实例（那就会去动真实队列 —— 绝不允许）。
  *
- * 因此这里起一个只回答 `/api/config`（`tg_port` 指向本次的隔离引擎）与空列表的
- * 桩：它**不替代任何产品行为**，只是让壳走完它本来就有的那条「按 config 定位
- * 服务」的路径。生产/开发栈（有真 daemon）**不会**起它。
+ * 因此这里起一个只回答 `/api/config`（`plugins[]` 的 id="tg".port 指向本次的
+ * 隔离引擎，BUG-423 新契约；旧键 tg_port 一并答上）与空列表的桩：它**不替代
+ * 任何产品行为**，只是让壳走完它本来就有的那条「按 config 定位服务」的路径。
+ * 生产/开发栈（有真 daemon）**不会**起它。
  */
 function startStubDaemon(port, tgPort) {
   const server = http.createServer((req, res) => {
@@ -184,6 +185,21 @@ function startStubDaemon(port, tgPort) {
     if (url.startsWith('/api/config')) {
       body = JSON.stringify({
         port,
+        // BUG-423：前端自 BUG-358 起只认 plugins[]（useStore 的
+        // `tgServiceFromPlugins(cfg)` 按 id 取；没有 tg 插件 ⇒ tgService=null
+        // ⇒ 侧栏 TG 入口与入库按钮整个不出现，真实 UI 验收直接做不了）。
+        // 桩必须答新契约；旧键一并保留（双契约 readers 可用，成本为零）。
+        plugins: [
+          {
+            id: 'tg',
+            label: 'Telegram',
+            enabled: true,
+            running: true,
+            port: tgPort,
+            lastError: null,
+            health: null,
+          },
+        ],
         tg_enabled: true,
         tg_running: true,
         tg_port: tgPort,

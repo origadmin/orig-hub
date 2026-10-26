@@ -47,6 +47,7 @@
  */
 
 const path = require('node:path')
+const sandbox = require('./lib/sandbox.cjs')
 
 const TG_API = (process.env.TG_API || process.env.ORIG_TG_API || 'http://127.0.0.1:19787').replace(
   /\/$/,
@@ -133,6 +134,9 @@ async function createItem(title) {
     items: [{ path: fakePath, source: 'local', kind: 'video', title }],
   })
   const id = r.json && Array.isArray(r.json.ids) ? r.json.ids[0] : null
+  // BUG-422：导入即被 BUG-304 自动归档进单集剧集；不先撤销归属，后面往自己的
+  // 剧集挂载会撞 media_episode.item_id 唯一约束（HTTP 500）。
+  if (id != null) await sandbox.detachAutoSeries(TG_API, id)
   return { id, status: r.status }
 }
 

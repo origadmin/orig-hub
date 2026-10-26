@@ -49,6 +49,7 @@ const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 
 const cdp = require('./lib/cdp.cjs')
+const sandbox = require('./lib/sandbox.cjs')
 
 const APP_PORT = Number(process.env.APP_PORT || 5180)
 const APP_URL = `http://127.0.0.1:${APP_PORT}/`
@@ -112,8 +113,11 @@ async function httpJson(method, url, body) {
 /** 从 daemon 真源取 orig-tg 端口（不硬编码；端口可被保留区顺延/迁移）。 */
 async function resolveTgBase() {
   const cfg = await httpJson('GET', `${DAEMON}/api/config`)
-  if (cfg.status !== 200 || !cfg.json || !cfg.json.tg_port) return null
-  return { base: `http://127.0.0.1:${cfg.json.tg_port}`, tgRunning: cfg.json.tg_running === true }
+  // BUG-358 起 `/api/config` 的 `tg_port` 收进 `plugins[]`（id='tg'）—— 旧键直读
+  // 会恒得 undefined（BUG-422 实测假红）。适配器双契约兼容，只此一处。
+  const tgPort = sandbox.tgPortOf(cfg.json)
+  if (cfg.status !== 200 || !cfg.json || !tgPort) return null
+  return { base: `http://127.0.0.1:${tgPort}`, tgRunning: sandbox.tgRunningOf(cfg.json) }
 }
 
 /** 环境未就绪时按仓库约定拉起（daemon 是唯一启动者）。 */
@@ -145,6 +149,9 @@ async function createItem(title, ts, tg) {
     items: [{ path: fakePath, source: 'local', kind: 'video', title }],
   })
   const id = r.json && Array.isArray(r.json.ids) ? r.json.ids[0] : null
+  // BUG-422：导入即被 BUG-304 自动归档进单集剧集；不先撤销归属，后面往自己的
+  // 剧集挂载会撞 media_episode.item_id 唯一约束（HTTP 500）。
+  if (id != null) await sandbox.detachAutoSeries(tg, id)
   return { id, status: r.status }
 }
 
@@ -266,19 +273,25 @@ async function judgeA1(page) {
 
 /** A2：动作条几何位置（相对**内容区**，不是视口）。 */
 async function judgeA2(page, tag) {
+  // 判据翻转（BUG-422，与 B5b 同型）：原判据要求动作条 `position: absolute`
+  // 且相对**滚动容器**居中/贴底。BUG-393（2026-10-23，用户裁定「样式就应该统一」）
+  // 把三域选择条收口为**全仓标准形态**：`fixed bottom-4 left-1/2 -translate-x-1/2`
+  // —— 视口相对。理由有实测：两域包含块不同（剧集墙的条挂在带内边距的面板里，
+  // absolute 落点比下载域右偏 96px、上移 32px），写同一串 absolute 类名也得不到
+  // 同一个落点（见 selection-bar.tsx 注释与 docs/standards/style.md §选择条）。
+  // 旧判据方向与现标准相反，留着等于要求产品退回 BUG-393 已修掉的不一致。
+  // 现判据验的是同一个意图（浮在底部、水平居中），基准从「内容区」换成「视口」。
   const geo = await page.evaluate((expectGap) => {
     const bar = document.querySelector('[data-testid="series-selection-bar"]')
-    const scroller = document.querySelector('[data-testid="series-wall-scroll"]')
-    if (!bar || !scroller) return { hasBar: !!bar, hasScroller: !!scroller }
+    if (!bar) return { hasBar: false }
     const b = bar.getBoundingClientRect()
-    const s = scroller.getBoundingClientRect()
     return {
       hasBar: true,
-      hasScroller: true,
       bar: { left: b.left, right: b.right, top: b.top, bottom: b.bottom, w: b.width, h: b.height },
-      scroller: { left: s.left, right: s.right, top: s.top, bottom: s.bottom, w: s.width, h: s.height },
-      centerDelta: (b.left + b.right) / 2 - (s.left + s.right) / 2,
-      bottomGap: s.bottom - b.bottom,
+      // 视口居中（left-1/2 -translate-x-1/2 的必然结果）
+      centerDelta: (b.left + b.right) / 2 - window.innerWidth / 2,
+      // 距视口底边（bottom-4 = 16px）
+      bottomGap: window.innerHeight - b.bottom,
       expectGap,
       innerWidth: window.innerWidth,
       innerHeight: window.innerHeight,
@@ -286,26 +299,25 @@ async function judgeA2(page, tag) {
     }
   }, EXPECT_BOTTOM_GAP)
 
-  if (!geo.hasBar || !geo.hasScroller) {
-    return { ok: false, geo, reason: '动作条或内容区缺失，几何无从判定', detail: JSON.stringify(geo) }
+  if (!geo.hasBar) {
+    return { ok: false, geo, reason: '动作条缺失，几何无从判定', detail: JSON.stringify(geo) }
   }
   const centerOk = Math.abs(geo.centerDelta) <= CENTER_TOL
   const gapOk = Math.abs(geo.bottomGap - EXPECT_BOTTOM_GAP) <= BOTTOM_GAP_TOL
-  const absOk = geo.pos === 'absolute'
+  const fixedOk = geo.pos === 'fixed'
   const detail =
     `centerDelta=${geo.centerDelta.toFixed(2)}px (tol ${CENTER_TOL}) ` +
     `bottomGap=${geo.bottomGap.toFixed(2)}px (expect ${EXPECT_BOTTOM_GAP}±${BOTTOM_GAP_TOL}) ` +
     `position=${geo.pos} ` +
     `viewport=${geo.innerWidth}x${geo.innerHeight} ` +
-    `bar=[${geo.bar.left.toFixed(1)},${geo.bar.top.toFixed(1)}..${geo.bar.right.toFixed(1)},${geo.bar.bottom.toFixed(1)}] ` +
-    `scroller=[${geo.scroller.left.toFixed(1)},${geo.scroller.top.toFixed(1)}..${geo.scroller.right.toFixed(1)},${geo.scroller.bottom.toFixed(1)}]`
+    `bar=[${geo.bar.left.toFixed(1)},${geo.bar.top.toFixed(1)}..${geo.bar.right.toFixed(1)},${geo.bar.bottom.toFixed(1)}]`
   return {
-    ok: centerOk && gapOk && absOk,
+    ok: centerOk && gapOk && fixedOk,
     geo,
     reason:
-      !absOk ? '动作条不是 absolute 定位' :
-      !centerOk ? `水平中心偏差 ${geo.centerDelta.toFixed(2)}px 超过 ${CENTER_TOL}px` :
-      !gapOk ? `距内容区底边 ${geo.bottomGap.toFixed(2)}px，偏离 ${EXPECT_BOTTOM_GAP}±${BOTTOM_GAP_TOL}` : '',
+      !fixedOk ? '动作条不是 fixed 定位（BUG-393 标准形态：fixed bottom-4 left-1/2）' :
+      !centerOk ? `视口水平中心偏差 ${geo.centerDelta.toFixed(2)}px 超过 ${CENTER_TOL}px` :
+      !gapOk ? `距视口底边 ${geo.bottomGap.toFixed(2)}px，偏离 ${EXPECT_BOTTOM_GAP}±${BOTTOM_GAP_TOL}` : '',
     detail,
     shot: tag,
   }
@@ -461,13 +473,8 @@ async function main() {
     })
     if (!navOk) throw new Error('nav-child-lib-series 入口不存在')
     await delay(1500)
-    const railOk = await page.evaluate(() => {
-      const el = document.querySelector('[data-testid="media-rail-series-all"]')
-      if (!el) return false
-      el.click()
-      return true
-    })
-    if (!railOk) throw new Error('media-rail-series-all 入口不存在')
+  // M0 导航模型（BUG-298）：`media-rail-series-all` 已废止，侧栏入口直达剧集墙；
+  // 墙可达性由下面的 series-card-root 有界等待承担（不再点已删除的 rail）。
 
     // 有界等待：两条夹具的卡片都要出现在墙上。
     await page.waitForFunction(

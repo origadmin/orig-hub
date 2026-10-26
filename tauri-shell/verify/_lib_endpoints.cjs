@@ -180,22 +180,35 @@ async function resolve() {
   // Reachability self-check: a wrong (or deliberately forced) port must fail
   // LOUDLY here rather than silently yielding a "0 requests" capture.
   if (process.env.ORIG_ENDPOINTS_NO_PING !== '1') {
-    let why
-    try {
-      why = await tgHealthFailure(4000)
-    } catch (e) {
-      fatal(
-        `orig-tg endpoint ${tg} is not reachable (${e.message}). ` +
-          (overrideTg ? 'TG_URL override is wrong. ' : '') +
-          `Resolved from ${configUrl} (tg port=${tgPort}). ` +
-          `Refusing to run a probe that would report 0 requests.`,
-      )
+    // BUG-422：orig-tg 的 /health 实测要 ~3.6s（内部做链路探测），旧实现单发 4s
+    // 会把「慢但活着」打成「不可达」——同机 /api/media/stats 只要 4ms，端口是对的。
+    // 严格性一点不放宽（仍要 200 + application/json + {"status":"ok"}，错端口
+    // 的 SPA 兜底/拒连照旧 FATAL），只把慢响应与真故障区分开：3 轮 × 15s。
+    let why = 'not attempted'
+    let threw = null
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        why = await tgHealthFailure(15000)
+        threw = null
+        if (!why) break
+      } catch (e) {
+        why = e.message
+        threw = e
+      }
+      if (attempt < 3) {
+        console.log(`[endpoints] tg ${tg}/health attempt#${attempt} failed (${why}) — retrying`)
+      }
     }
     if (why) {
       fatal(
-        `orig-tg endpoint ${tg}/health did not answer as orig-tg (${why}). ` +
-          (overrideTg ? 'TG_URL override is wrong. ' : '') +
-          `Resolved from ${configUrl} (tg port=${tgPort}).`,
+        threw
+          ? `orig-tg endpoint ${tg} is not reachable (${why}) after 3 attempts. ` +
+              (overrideTg ? 'TG_URL override is wrong. ' : '') +
+              `Resolved from ${configUrl} (tg port=${tgPort}). ` +
+              `Refusing to run a probe that would report 0 requests.`
+          : `orig-tg endpoint ${tg}/health did not answer as orig-tg (${why}) after 3 attempts. ` +
+              (overrideTg ? 'TG_URL override is wrong. ' : '') +
+              `Resolved from ${configUrl} (tg port=${tgPort}).`,
       )
     }
   }
