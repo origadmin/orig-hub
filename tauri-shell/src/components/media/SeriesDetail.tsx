@@ -1374,8 +1374,16 @@ export function SeriesDetail(props: {
                       frames={focusFrames}
                       w={focusPortrait ? 170 : 300}
                       h={focusPortrait ? 302 : 169}
-                      maxW={420}
-                      peek={26}
+                      /* BUG-429（用户 2026-10-26：「本集图组 平铺需要再展开一点，
+                         后面的图片不容易点击」）：原 420/26/6 让后卡只露 26px
+                         （竖版 170px 卡宽的 15%），实测父容器有 830px 富余，
+                         且 9 帧时后 3 帧完全叠在同一槽位（露边 0）。
+                         放宽到 580/56/10 ⇒ 露边下限 44px 由 Deck 保证，
+                         槽位数按宽度预算自适应（9 帧实测排满 9 个，各露 51px）；
+                         窄窗口由 Deck 内部的「可用宽取小」兜住，不溢出。 */
+                      maxW={580}
+                      peek={56}
+                      maxSlots={10}
                       onOpenFrame={(i) => openFocusLightbox(cur, i)}
                     />
                   </div>

@@ -58,7 +58,7 @@ function check(name, pass, detail) {
 
 async function openSeriesById(page, seriesId) {
   for (let attempt = 0; attempt < 3; attempt++) {
-    await page.goto(APP_URL, { waitForRoot: true, settleMs: 1800 })
+    await page.goto(APP_URL, { waitForRoot: true, settleMs: 1800, timeout: 90000 })
     const ok = await page.evaluate(() => {
       const el = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (!el) return false

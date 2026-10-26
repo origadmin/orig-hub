@@ -35,7 +35,7 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms))
 async function openSeriesDetail(page) {
   // 剧集墙首屏可能因 daemon 忙而慢（实测偶发 >25s）：整体重试 3 轮
   for (let attempt = 0; attempt < 3; attempt++) {
-    await page.goto(APP_URL, { waitForRoot: true, settleMs: 1800 })
+    await page.goto(APP_URL, { waitForRoot: true, settleMs: 1800, timeout: 90000 })
     const ok = await page.evaluate(() => {
       const el = document.querySelector('[data-testid="nav-child-lib-series"]')
       if (!el) return false

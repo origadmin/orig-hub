@@ -206,11 +206,14 @@ export function EpisodeEditPanel(props: {
         <div className="flex flex-wrap gap-2" data-testid="episode-edit-images">
           {(ep.images ?? []).map((img) => (
             <span key={img.itemId} className="group relative inline-block">
+              {/* BUG-429（用户 2026-10-26：「编辑中的图片展示也需要稍微放大点，
+                  这是图片不是ICON」）：原 `h-14 w-20` = 56×80，接近图标尺寸，
+                  认不出画面内容。放大到 80×112（+43%），比例不变。 */}
               <img
                 src={img.poster ?? mediaItemUrl(img.itemId)}
                 alt=""
                 loading="lazy"
-                className="h-14 w-20 rounded border border-border-subtle object-cover"
+                className="h-20 w-28 rounded border border-border-subtle object-cover"
               />
               {/* M0-T04 / BUG-040 / BUG-112：× **常驻半透明**，禁纯 hover 显露
                   （原型 `.sd-remove` 口径：22×22 圆钮、rgba(0,0,0,.65)、opacity .65；

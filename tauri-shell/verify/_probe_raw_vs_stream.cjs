@@ -37,7 +37,7 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms))
   const page = await browser.newPage()
   const report = { itemId: ITEM_ID }
   try {
-    await page.goto(APP_URL, { waitForRoot: true, settleMs: 1500 })
+    await page.goto(APP_URL, { waitForRoot: true, settleMs: 1500, timeout: 90000 })
     const res = await page.evaluate(async (id) => {
       const base = `http://127.0.0.1:19787/api/media/items/${id}`
       const probe = (url) =>

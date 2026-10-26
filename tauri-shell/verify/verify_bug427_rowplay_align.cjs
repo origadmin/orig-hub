@@ -57,7 +57,7 @@ function check(name, pass, detail) {
 async function openSeriesDetail(page) {
   for (let i = 0; i < 3; i++) {
     try {
-      await page.goto(APP_URL, { waitForRoot: true, settleMs: 1800 })
+      await page.goto(APP_URL, { waitForRoot: true, settleMs: 1800, timeout: 90000 })
       break
     } catch (e) {
       console.log(`[bug427] goto#${i + 1} failed: ${e.message}`)
