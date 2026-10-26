@@ -2556,6 +2556,15 @@ impl Store {
     /// `media_type`/mime；落盘后扩展名分类（`classify_ext`）是旧实现入库的同一判据，
     /// 借回填顺手对齐（如 octet-stream 的 .mp4 文档 T0 登记为 `file`，回填校正为
     /// `video`）。None = 不碰 kind（扩展名分类不出时保持登记值）。
+    /// 字节回填：写 `file_path`，并在**仅有占位 kind** 时用 `kind` 补强。
+    ///
+    /// BUG-418（重跑不幂等）：kind 一律只做**占位升级**（`file` → 真 kind），绝不
+    /// 允许扩展名覆盖权威 kind —— 与 `strengthen_registered_item` 同一把尺子。
+    /// 此前这里是 `kind = COALESCE(?3, kind)`：**无条件**把「按扩展名推出来的 kind」
+    /// 写进条目，而扩展名根本不是权威事实（BUG-122：27.6% MPEG-TS 被命名成 .mp4；
+    /// 本仓缓存夹具也一律落 `.mp4`）。后果是一条照片条目落盘后 kind 被静默翻成
+    /// `video`，重跑走已缓存分支时 `register_item` 读回的就是 `video`，
+    /// `register_slot` 据此把它当分集追加 ⇒ 剧集里凭空多出一集，幂等破裂。
     pub async fn backfill_item_bytes(
         &self,
         id: i64,
@@ -2565,7 +2574,10 @@ impl Store {
         let n = self
             .conn
             .execute(
-                "UPDATE media_item SET file_path = ?2, kind = COALESCE(?3, kind) WHERE id = ?1",
+                "UPDATE media_item SET file_path = ?2, \
+                 kind = CASE WHEN COALESCE(kind, 'file') = 'file' \
+                             THEN COALESCE(?3, kind) ELSE kind END \
+                 WHERE id = ?1",
                 params![id, file_path, kind],
             )
             .await?;
@@ -2588,10 +2600,14 @@ impl Store {
         // 先走引用计数（release 旧 / acquire 新），再写路径与 kind。
         self.set_item_file_path_with_blob(id, Some(file_path), Some(hash), size)
             .await?;
+        // 同上（BUG-418）：kind 只做占位升级，不让扩展名覆盖权威 kind。
         let n = self
             .conn
             .execute(
-                "UPDATE media_item SET kind = COALESCE(?2, kind) WHERE id = ?1",
+                "UPDATE media_item SET \
+                 kind = CASE WHEN COALESCE(kind, 'file') = 'file' \
+                             THEN COALESCE(?2, kind) ELSE kind END \
+                 WHERE id = ?1",
                 params![id, kind],
             )
             .await?;
