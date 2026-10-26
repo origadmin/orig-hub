@@ -534,6 +534,19 @@ export function SeriesDetail(props: {
   const cover = resolveSeriesCover(detail)
   const showSeasons = showSeasonHeaders(detail)
 
+  /**
+   * BUG-427：选集器行尾「时长格」统一宽度（字符数 = 本剧最长时长长度）。
+   *
+   * 行尾是 `[▶][时长]` 且该列右对齐 ⇒ `▶.x` 随时长文本宽度漂移
+   * （实测 "11:34" 与 "5:12" 差 5.78px，整列图标对不齐）。
+   * `font-mono` 下 `1ch` 恒等于一个字符宽，故按最长时长预留即可让 ▶ 对齐。
+   * 照片集没有时长（`fmtDuration` 返回空串），不参与计算。
+   */
+  const durCellCh = detail.episodes.reduce((m, ep) => {
+    if (isPhotoEpisode(ep) || ep.duration == null) return m
+    return Math.max(m, fmtDuration(ep.duration).length)
+  }, 0)
+
   /** 当前聚焦集的本集图组帧：集图（poster）为底 + 挂图（images）依次入列 */
   const focusFrames: DeckFrame[] = cur
     ? [
@@ -874,6 +887,18 @@ export function SeriesDetail(props: {
               </button>
             </div>
           ) : null}
+          {/*
+            BUG-427（用户第六次报「播放按钮位置拍板错乱」）：行尾是
+            `[▶][时长]`，而该列是 `auto` 宽 + 整行右对齐 ⇒
+            `▶.x = 列右缘 − 时长文本宽 − gap − 24`。
+            时长一变宽（"11:34" 5 字符 vs "5:12" 4 字符）图标就整体左移，
+            实测极差 **5.78px**（选中集 468.13 / 其余 473.91）——
+            整列 ▶ 对不齐，这就是「错乱」的物理来源。
+            修法：时长格宽度按**本剧最长时长**统一（`font-mono` ⇒ `1ch` 恒等于
+            一个字符宽），所有行同宽 ⇒ ▶ 落在同一条竖线上。
+            不采用「把 ▶ 挪到行末」：那会再动一次用户已经在看的位置，
+            属 BUG-369 教训里的「判据与诉求方向相反」。最小 diff 优先。
+          */}
           <div className="flex min-h-0 flex-col gap-px overflow-y-auto" data-testid="episode-picker">
             {!pickerCollapsed &&
               detail.episodes.map((ep, i) => {
@@ -980,7 +1005,13 @@ export function SeriesDetail(props: {
                       )
                     })()}
                     {withBytes ? (
-                      <span className="font-mono text-[10.5px] text-muted">
+                      /* BUG-427：`text-right` + 统一 `minWidth` ⇒ 时长右缘固定、
+                         时长格左缘固定 ⇒ 其左侧的 ▶ 也固定，整列对齐。 */
+                      <span
+                        className="text-right font-mono text-[10.5px] text-muted"
+                        style={durCellCh > 0 ? { minWidth: `${durCellCh}ch` } : undefined}
+                        data-testid="episode-duration"
+                      >
                         {!photo && ep.duration != null ? fmtDuration(ep.duration) : ''}
                       </span>
                     ) : (

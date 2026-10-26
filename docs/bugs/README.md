@@ -442,6 +442,7 @@
 | BUG-424 | 合并剧集弹窗「集号规则」段英文缺空格——`fromafter` / `numberonward` 黏连 | open | shell |
 | BUG-425 | `invalidateCache(prefix)` 不清在途请求——写前数据在失效后落回缓存，「改完又看到旧值」 | open | shell |
 | BUG-426 | 剧集详情头部两颗逐字同文案、功能重叠的「编辑」按钮（介绍块冗余入口 + 动作条入口开同一面板） | fixed | shell |
+| BUG-427 | 左栏选集器「▶ 播放入口」整列不齐——行尾右对齐使图标 x 随右侧时长文本宽度漂移 5.78px | fixed | shell |
 
 ## 历史欠账
 
