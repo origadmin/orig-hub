@@ -7,6 +7,7 @@ import { useTranslation } from '../i18n'
 import { describeTgFailure } from '../lib/tgReason'
 import { deriveEntryState } from '../lib/entryState'
 import { useGoLibrary } from '../hooks/useGoLibrary'
+import { hasPriorityPin } from '../domains/download/ingestGroups'
 import { useEvent } from '../hooks/useEvent'
 import {
   cancelCacheTask,
@@ -89,17 +90,15 @@ const RETRYABLE = new Set<TgCacheTask['status']>(['failed', 'cancelled', 'interr
  *
  * 与后端 `cache::prioritizable` 逐字同源（端点对不可优先下载的 id 回 422）。
  */
-// BUG-396：终态（done/cancelled）任务不携带优先状态，不允许取消优先。
+// BUG-396：终态任务离队即无优先状态 —— 「是否挂了优先」由 `hasPriorityPin`
+// 单一判据回答（`domains/download/ingestGroups`），本组件不得再自己算一遍。
 function prioritizable(task: TgCacheTask): boolean {
-  return (
-    task.status === 'queued' ||
-    ((task.priority ?? 0) > 0 && task.status !== 'done' && task.status !== 'cancelled')
-  )
+  return task.status === 'queued' || hasPriorityPin(task.status, task.priority ?? 0)
 }
 
-/** 是否已优先下载（后端 `priority` > 0）。 */
+/** 是否已优先下载 —— 与后端 `cache::prioritizable`、启动迁移终态口径同源。 */
 function isPrioritized(task: TgCacheTask): boolean {
-  return (task.priority ?? 0) > 0
+  return hasPriorityPin(task.status, task.priority ?? 0)
 }
 
 /**

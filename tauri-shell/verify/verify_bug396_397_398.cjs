@@ -5,8 +5,13 @@
  *
  * P396 入库「优先」不得作用于终态任务：
  *   a. wire：`/api/downloads?scope=all` 里 status∈{done,cancelled} 的任务 priority==0；
- *   b. DOM：ingest 行 data-status=终态 ⇒ 无 prefer/unprefer 动作钮、无「优先」徽标；
- *   牙：向终态行注入徽标+unprefer 钮 ⇒ b 必红。
+ *   b. DOM：下载域 ingest 行 data-status=终态 ⇒ 无 prefer/unprefer 钮、无「优先」徽标；
+ *   牙：向终态行注入徽标 ⇒ b 必红。
+ *   c. DOM（BUG-396 收口）：入库流水线面板（`CacheManagerDialog`）同一条判据 ——
+ *      `cache-task-row` 终态行无 prioritized 徽标 / prefer / cancel-prefer 钮；
+ *      牙：向终态行注入徽标+unprefer 钮 ⇒ c 必红。
+ *   d. wire 行为：对每条终态记录发「取消置顶」请求，端点一律 422
+ *      （判据与后端 `cache::prioritizable` 同源，不静默成功）。
  *
  * P397 频道内容图不得裁切（object-contain）：
  *   DOM：TG 消息区全部内容 img 的 computed objectFit == 'contain'；
@@ -98,7 +103,89 @@ async function main() {
     check('P396_teeth_injected_badge_trips', p396teeth.bad > 0, 'mutation did NOT trip P396b (恒绿!)')
     await page.goto(APP_URL, { waitForRoot: true, settleMs: 1200 })
 
+    // ───────── P396c：入库流水线面板（`CacheManagerDialog`）同一条判据 ─────────
+    // 这一面此前完全没有被 P396 覆盖，而它的 `isPrioritized` 只读 `priority>0`
+    // （不看状态）⇒ 终态行一旦残留 pin，「完成后仍是优先」就会在这里复活。
+    await page.evaluate(() => {
+      const el = document.querySelector('[data-testid="nav-tg"]')
+      if (el) el.click()
+    })
+    await delay(1200)
+    await page.evaluate(() => {
+      const el = document.querySelector('[data-testid="tg-cache-manager-entry"]')
+      if (el) el.click()
+    })
+    await page
+      .waitForFunction(() => document.querySelectorAll('[data-testid="cache-task-row"]').length > 0, {
+        timeout: 20000,
+      })
+      .catch(() => {})
+    await delay(400)
+
+    const evalManagerRows = () =>
+      page.evaluate(() => {
+        const SETTLED = ['done', 'cancelled', 'failed', 'interrupted']
+        const rows = Array.from(document.querySelectorAll('[data-testid="cache-task-row"]'))
+        const settled = rows.filter((r) => SETTLED.includes(r.dataset.status))
+        const bad = settled.filter(
+          (r) =>
+            r.querySelector(
+              '[data-testid="cache-task-prioritized"], [data-testid="cache-task-prefer-download"], [data-testid="cache-task-cancel-prefer"]',
+            ),
+        )
+        return { rows: rows.length, settled: settled.length, bad: bad.length }
+      })
+    const p396c0 = await evalManagerRows()
+    check(
+      'P396c_manager_settled_no_prefer_ui',
+      p396c0.settled > 0 && p396c0.bad === 0,
+      JSON.stringify(p396c0),
+    )
+
+    // 牙：给终态行注入徽标 + 取消优先钮 ⇒ 判据必红；注入后还原 DOM 再继续。
+    await page.evaluate(() => {
+      const SETTLED = ['done', 'cancelled', 'failed', 'interrupted']
+      const row = Array.from(document.querySelectorAll('[data-testid="cache-task-row"]')).find((r) =>
+        SETTLED.includes(r.dataset.status),
+      )
+      if (!row) return
+      const span = document.createElement('span')
+      span.dataset.testid = 'cache-task-prioritized'
+      span.textContent = '优先'
+      const btn = document.createElement('button')
+      btn.dataset.testid = 'cache-task-cancel-prefer'
+      btn.textContent = '取消优先'
+      row.appendChild(span)
+      row.appendChild(btn)
+    })
+    const p396cTeeth = await evalManagerRows()
+    check('P396c_teeth_injected_badge_trips', p396cTeeth.bad > 0, 'mutation did NOT trip P396c (恒绿!)')
+    await page.goto(APP_URL, { waitForRoot: true, settleMs: 1200 })
+
+    // ───────── P396d：wire 行为判据 ─────────
+    const p396d = await (async () => {
+      const d = await fetchJson(`http://127.0.0.1:${DAEMON}/api/downloads?scope=all`)
+      if (d.status !== 200 || !d.json || !Array.isArray(d.json.tasks)) {
+        return { ok: false, detail: `status=${d.status}` }
+      }
+      const SETTLED = new Set(['done', 'cancelled', 'failed', 'interrupted'])
+      const settled = d.json.tasks.filter((t) => SETTLED.has(t.status))
+      if (settled.length === 0) return { ok: false, detail: 'no settled task to probe' }
+      const wrong = []
+      for (const t of settled.slice(0, 5)) {
+        const res = await fetch(`http://127.0.0.1:19787/api/tg/cache/tasks/priority`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ ids: [t.id], priority: 0 }),
+        }).catch((e) => ({ status: -1, note: e.message }))
+        if (res.status !== 422) wrong.push(`id=${t.id} status=${t.status} -> ${res.status}`)
+      }
+      return { ok: wrong.length === 0, detail: `probed=${Math.min(settled.length, 5)}; ${wrong.join(' | ')}` }
+    })()
+    check('P396d_wire_unpin_settled_rejected_422', p396d.ok, p396d.detail)
+
     // ───────── P397 / P398：TG 域 ─────────
+    await page.goto(APP_URL, { waitForRoot: true, settleMs: 1200 })
     await page.evaluate(() => {
       const el = document.querySelector('[data-testid="nav-tg"]')
       if (el) el.click()

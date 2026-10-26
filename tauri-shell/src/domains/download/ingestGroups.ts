@@ -54,6 +54,23 @@ export function isCacheSettled(status: string): boolean {
 }
 
 /**
+ * 「已优先」是否成立 —— **前端唯一判据**（BUG-396 收口）。
+ *
+ * 用户裁定：任务一旦离开队列（终态：done/cancelled/failed/interrupted），它就
+ * **没有优先状态** —— 排序只对还排得上队的东西有意义，跑完的行挂个「优先」是
+ * 界面在撒谎。此前三个呈现面各自写 `priority > 0`（有的加 `isCacheSettled`
+ * 门控、有的没加），同一份数据两种读法 ⇒ 修一处漏一处。现在只有这一处判：
+ *
+ *   `priority > 0` **且**任务仍在队列里（`queued`/`running`）。
+ *
+ * 与后端 `cache::prioritizable`、启动迁移 `migrate_cache_task_priority` 的终态
+ * 口径一致：三者对同一行的回答必须相同。
+ */
+export function hasPriorityPin(status: string, priority = 0): boolean {
+  return priority > 0 && isCacheActive(status)
+}
+
+/**
  * 已停止 = **非在传、非完成**（BUG-377，2026-10-22 用户裁定）。
  *
  * 用户原话：「全部下载 -> 已暂停没有看到暂停内容（失败、取消、错误），
@@ -189,10 +206,10 @@ export function ingestActionsFor(status: string, priority = 0): IngestAction[] {
   const acts: IngestAction[] = []
   if (isCacheActive(status)) acts.push('cancel')
   if (isCacheStalled(status) || status === 'cancelled') acts.push('retry')
-  // BUG-396：完成后（done/cancelled）不再有「优先」状态 —— 终态任务即使残留
-  // priority>0 也不许取消优先（priority 已由引擎在离队时归零；此处是前/后端
-  // 判据对齐的最后一环，避免陈旧值在前端再冒出「已优先」徽标/按钮）。
-  if (priority > 0 && !isCacheSettled(status)) acts.push('unprefer')
+  // BUG-396：pin 是否成立走唯一判据 `hasPriorityPin`（离开队列即无优先状态）。
+  // 终态任务即使残留 priority>0，也不给「取消优先」钮 —— 优先是队列里的排序
+  // 状态，任务都已经跑完了，「取消」没有任何可观察效果。
+  if (hasPriorityPin(status, priority)) acts.push('unprefer')
   else if (status === 'queued') acts.push('prefer')
   return acts
 }

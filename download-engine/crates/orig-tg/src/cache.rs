@@ -1300,7 +1300,9 @@ const PRIORITY_REJECT_MSG: &str =
     "priority only applies to queued tasks (settled ones carry no pin to unpin)";
 
 fn prioritizable(t: &CacheTask) -> bool {
-    t.status == "queued" || (t.priority > 0 && t.status != "done" && t.status != "cancelled")
+    // 与前端 `hasPriorityPin`、`store::migrate_cache_task_priority` 的终态口径同源：
+    // 优先只对**仍在队列里**的任务成立（queued 可置顶；running 且已置顶的可撤销）。
+    t.status == "queued" || (t.priority > 0 && t.status == "running")
 }
 
 /// 单条**置顶 / 取消置顶**的状态迁移内核（唯一真源）。
@@ -2584,5 +2586,49 @@ mod tests {
             .await
             .expect_err("未知 id 必须 404");
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    /// BUG-396 收口：**所有终态**都不携带优先状态，不只是 done/cancelled。
+    ///
+    /// 此前 `prioritizable` 只排除 `done`/`cancelled`，一条「failed 且残留 priority>0」
+    /// 的脏行会被端点放行（unpin 200），而前端同期判据（`hasPriorityPin` 要求任务仍在
+    /// 队列里）判它终态无 pin ⇒ 界面没按钮、端点却认，两端读同一行给出两种答案
+    /// （BUG-249 同型的判据分裂）。
+    #[tokio::test]
+    async fn priority_rejects_pin_on_every_settled_state_bug396() {
+        let st = state().await;
+        assert!(st.claim_cache_worker());
+        for (tag, status) in [
+            ("d", "done"),
+            ("c", "cancelled"),
+            ("f", "failed"),
+            ("i", "interrupted"),
+        ] {
+            let id = seeded_task(&st, &format!("m:7:5{tag}"), "queued").await;
+            let (s, _) = priority_call(st.clone(), id, json!({"top": true}))
+                .await
+                .expect("排队任务必须能置顶");
+            assert_eq!(s, StatusCode::OK);
+            // 绕过 `finish_cache_task` / `cancel_cache_task`（它们会顺手清零）直接把行写成
+            // 「终态 + priority 残留」的脏数据：启动迁移只会归一一次，运行期内这种行的
+            // **第一道防线必须是端点判据**。
+            st.store
+                .conn
+                .execute(&format!("UPDATE cache_task SET status='{status}' WHERE id={id}"), ())
+                .await
+                .expect("raw settle");
+            let before = st
+                .store
+                .get_cache_task(id)
+                .await
+                .expect("readable")
+                .expect("task exists");
+            assert_eq!(before.status, status);
+            assert!(before.priority > 0, "前提：这是一条残留 pin 的终态脏行");
+            let (s, _) = priority_call(st.clone(), id, json!({"priority": 0}))
+                .await
+                .expect_err("终态任务 unpin 必须 422");
+            assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "status={status}");
+        }
     }
 }
