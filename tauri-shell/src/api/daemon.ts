@@ -486,12 +486,26 @@ export interface ActivitySourceHealth {
   kind: ActivityKind
   available: boolean
   error: string | null
-  count: number
+}
+
+/** BUG-395 第二步：各来源纳入条数（已从 `ActivitySourceHealth.count` 上移，依赖 scope）。 */
+export interface SourceCounts {
+  download: number
+  cache: number
+}
+
+/** BUG-395 第一步：来源健康独立端点 `GET /api/sources` 的响应。 */
+export interface SourcesSnapshot {
+  sources: ActivitySourceHealth[]
+  counts: SourceCounts
+  generated_at: number
 }
 
 export interface ActivitySnapshot {
   tasks: ActivityTask[]
   sources: ActivitySourceHealth[]
+  /** BUG-395 第二步：顶层计数（替代旧 `sources[].count`）。 */
+  counts: SourceCounts
   generated_at: number
 }
 
@@ -506,6 +520,16 @@ export interface ActivitySnapshot {
  */
 export function fetchDownloads(scope: 'active' | 'all' = 'active'): Promise<ActivitySnapshot> {
   return request<ActivitySnapshot>(`/api/downloads?scope=${scope}`)
+}
+
+/**
+ * BUG-395 第一步：来源健康独立端点 `GET /api/sources`。
+ *
+ * 把「横幅要不要显示」这个全局判据从 58KB 任务列表里摘出来：本端点只有约 200B，
+ * 与 `fetchDownloads` 的任务列表解耦。健康口径与 `ActivitySnapshot.sources` 逐字一致。
+ */
+export function fetchSources(): Promise<SourcesSnapshot> {
+  return request<SourcesSnapshot>(`/api/sources`)
 }
 
 /**

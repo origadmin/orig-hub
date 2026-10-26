@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 use orig_core::engine::Task;
 use orig_core::protocol::{DownloadConfig, Metadata, ParsedUrl, Protocol, SseEvent};
-use crate::activity::{self, ActivityQuery, ActivitySnapshot};
+use crate::activity::{self, ActivityQuery, ActivitySnapshot, SourcesSnapshot};
 use crate::config::{resolve_output, resolve_output_classified};
 use crate::fsbrowse;
 use crate::files;
@@ -747,6 +747,15 @@ async fn activity(
     Query(q): Query<ActivityQuery>,
 ) -> axum::Json<ActivitySnapshot> {
     axum::Json(activity::collect(&st, q.scope()).await)
+}
+
+/// BUG-395 第一步：`GET /api/sources` —— 来源健康独立端点。
+///
+/// 把「横幅要不要显示」这个全局问题从 58KB 任务列表里摘出来：本端点只有约 200B，
+/// 可独立于 `/api/activity`/`/api/downloads` 低频轮询。`sources` 口径与
+/// `ActivitySnapshot.sources` 逐字一致；`/api/downloads` 的 `sources` 保留为兼容字段。
+async fn sources(State(st): State<Arc<AppState>>) -> axum::Json<SourcesSnapshot> {
+    axum::Json(activity::source_health(&st).await)
 }
 
 /// BUG-392：**统一列表端点** —— 全来源（插件/TG 入库 + 原生引擎 + BT）一个列表。
@@ -1511,6 +1520,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/api/downloads/:id/retry", axum::routing::post(retry_one))
         .route("/api/events", get(events))
         .route("/api/activity", get(activity))
+        .route("/api/sources", get(sources))
         // BUG-299 M2-T00a：受管下载根成品事实（文件域「全部文件」的 downloads 一侧）。
         // GET 枚举 / DELETE 删除（受管根边界守卫，见 files.rs）。
         .route("/api/files", get(files::list_files).delete(files::delete_file))

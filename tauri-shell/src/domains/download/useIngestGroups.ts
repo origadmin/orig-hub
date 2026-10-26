@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { fetchDownloads, downloadControl, removeDownload, type ActivityTask } from '../../api/daemon'
+import { fetchDownloads, fetchSources, downloadControl, removeDownload, type ActivityTask } from '../../api/daemon'
 import type { TgCacheTask } from '../../types'
 import {
   groupIngestTasks,
@@ -191,17 +191,22 @@ export function useIngestGroups(
       if (guarded && inFlight.current) return
       inFlight.current = true
       try {
-        const data = await fetchDownloads('all')
+        // BUG-395 第一步：健康从独立的 `/api/sources`（~200B）取，与 58KB 任务列表解耦；
+        // 任务列表仍走 `/api/downloads?scope=all`。两者并行，健康判据与任务保持同步。
+        const [data, health] = await Promise.all([
+          fetchDownloads('all'),
+          fetchSources(),
+        ])
         // BUG-318：先问「这一侧取到了吗」，再决定 tasks 能不能当「没有」读。
         // orig-tg 不可用（监督重启实测约每 10-15 分钟一次）时端点恒 200 但
         // cache 零条 —— 只读 tasks 就会把「取不到」渲染成「暂无传输任务」。
-        const cacheSrc = (data?.sources ?? []).find((s) => s.kind === 'cache')
+        const cacheSrc = (health.sources ?? []).find((s) => s.kind === 'cache')
         const srcUnavailable = cacheSrc != null && cacheSrc.available === false
         if (cancelled) return
         sourceUnknown.current = srcUnavailable
         // BUG-355：下载源可用性也纳入横幅判据（不再只盯 cache）。全 outage 时两侧都
         // 不可用，横幅须如实报「TG 与普通下载均不可用」，而非写死「普通下载不受影响」。
-        const dlSrc = (data?.sources ?? []).find((s) => s.kind === 'download')
+        const dlSrc = (health.sources ?? []).find((s) => s.kind === 'download')
         const dlDown = dlSrc != null && dlSrc.available === false
         setDownloadUnavailable(dlDown ? (dlSrc?.error ?? '普通下载不可用') : null)
         if (srcUnavailable) {

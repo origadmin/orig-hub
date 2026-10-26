@@ -220,6 +220,10 @@ pub struct TaskView {
 }
 
 /// 单个来源的健康状况：聚合是跨进程的，必须让调用方看得见「哪一侧没取到」。
+///
+/// BUG-395 第二步：`count` 已从本结构移除——它是「本次响应过滤后的任务投影」，
+/// 不是来源的属性，放在健康里会误导读的人把它当成「全局有几个」。计数改到
+/// `ActivitySnapshot.counts` / `SourcesSnapshot.counts` 顶层（见 `SourceCounts`）。
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceHealth {
     pub kind: TaskKind,
@@ -228,8 +232,17 @@ pub struct SourceHealth {
     /// 不可用原因（可直出给用户看）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// 该来源最终纳入的条数（过滤后）。
-    pub count: usize,
+}
+
+/// 本次响应范围内各来源纳入的条数（BUG-395 第二步：从 `SourceHealth.count` 上移而来）。
+///
+/// 语义仍是「本次响应过滤后各来源的条数」，但放在顶层明确它依赖 `scope`/查询参数，
+/// 不是来源自身的固有属性。判据：`scope=active` 与 `scope=all` 的 `counts` 必须分别
+/// 等于各自响应里 `tasks` 中对应 kind 的实际条数。
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceCounts {
+    pub download: usize,
+    pub cache: usize,
 }
 
 /// `GET /api/activity` 的响应。
@@ -238,6 +251,21 @@ pub struct ActivitySnapshot {
     pub tasks: Vec<TaskView>,
     /// 恒含 download / cache 两条，顺序固定。
     pub sources: Vec<SourceHealth>,
+    /// BUG-395 第二步：顶层计数（替代旧 `sources[].count`）。
+    pub counts: SourceCounts,
+    pub generated_at: i64,
+}
+
+/// `GET /api/sources` 的响应（BUG-395 第一步：来源健康独立端点）。
+///
+/// 与 `ActivitySnapshot.sources` 口径逐字一致，但不含任务列表、不受 `scope` 投影影响。
+/// `counts` 在此端点恒为 `{download:0, cache:0}`（健康端点不枚举任务；计数移出 `sources`
+/// 是 BUG-395 第二步，顶层 `counts` 留作形态兼容）。
+#[derive(Debug, Clone, Serialize)]
+pub struct SourcesSnapshot {
+    pub sources: Vec<SourceHealth>,
+    /// BUG-395 第二步：顶层计数（健康端点无任务 ⇒ 恒 {0,0}）。
+    pub counts: SourceCounts,
     pub generated_at: i64,
 }
 
@@ -340,6 +368,56 @@ pub async fn collect(st: &AppState, scope: Scope) -> ActivitySnapshot {
     snap
 }
 
+/// 仅计算来源健康，不含任务列表、不随 `scope` 变（BUG-395 第一步）。
+///
+/// 与 `collect` 对 `sources.available` 的计算逐字一致：
+/// - cache 源：`fetch_cache_views` 成功 ⇒ available=true，否则 available=false + error；
+/// - download 源：`available` 反映真实下载根健康度（BUG-355），非法/不可写 ⇒ false + error。
+/// 这样 `/api/sources` 可以脱离 58KB 任务列表独立轮询，横幅判据不再被绑定在下载列表上。
+pub async fn source_health(st: &AppState) -> SourcesSnapshot {
+    let tg_enabled = st.config.read().map(|c| c.tg_enabled).unwrap_or(false);
+    let cache = if tg_enabled {
+        fetch_cache_views(st).await
+    } else {
+        Err("tg plugin disabled".to_string())
+    };
+
+    let mut sources = vec![
+        SourceHealth {
+            kind: TaskKind::Download,
+            available: true,
+            error: None,
+        },
+        SourceHealth {
+            kind: TaskKind::Cache,
+            available: false,
+            error: None,
+        },
+    ];
+
+    match cache {
+        Ok(_) => sources[1].available = true,
+        Err(e) => sources[1].error = Some(e),
+    }
+
+    // BUG-355：下载源可用性反映真实下载根健康度（与 collect 同款逻辑）。
+    if let Ok(cfg) = st.config.read() {
+        let dl_root = crate::config::effective_download_root(&cfg);
+        let dl_ok = orig_core::paths::is_valid_content_root(&dl_root);
+        sources[0].available = dl_ok;
+        if !dl_ok {
+            sources[0].error =
+                Some("下载根目录无效或不可写（检查设置中的下载目录）".to_string());
+        }
+    }
+
+    SourcesSnapshot {
+        sources,
+        counts: SourceCounts { download: 0, cache: 0 },
+        generated_at: now_secs(),
+    }
+}
+
 /// 纯合并逻辑（与网络/状态解耦，便于单测覆盖降级路径）。
 fn merge(
     downloads: Vec<TaskView>,
@@ -351,13 +429,11 @@ fn merge(
             kind: TaskKind::Download,
             available: true,
             error: None,
-            count: 0,
         },
         SourceHealth {
             kind: TaskKind::Cache,
             available: false,
             error: None,
-            count: 0,
         },
     ];
 
@@ -391,16 +467,18 @@ fn merge(
         a.id.cmp(&b.id)
     });
 
+    let mut counts = SourceCounts { download: 0, cache: 0 };
     for t in &tasks {
         match t.kind {
-            TaskKind::Download => sources[0].count += 1,
-            TaskKind::Cache => sources[1].count += 1,
+            TaskKind::Download => counts.download += 1,
+            TaskKind::Cache => counts.cache += 1,
         }
     }
 
     ActivitySnapshot {
         tasks,
         sources,
+        counts,
         generated_at: now_secs(),
     }
 }
@@ -638,7 +716,7 @@ mod tests {
             .find(|s| s.kind == TaskKind::Cache)
             .expect("cache source must always be reported");
         assert!(!cache.available, "cache source must be flagged unavailable");
-        assert_eq!(cache.count, 0);
+        assert_eq!(snap.counts.cache, 0);
         assert!(cache.error.as_deref().unwrap_or("").contains("connection refused"));
 
         let dl = snap
@@ -647,7 +725,7 @@ mod tests {
             .find(|s| s.kind == TaskKind::Download)
             .expect("download source must always be reported");
         assert!(dl.available);
-        assert_eq!(dl.count, 1);
+        assert_eq!(snap.counts.download, 1);
     }
 
     #[test]
