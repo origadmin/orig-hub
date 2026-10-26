@@ -5752,10 +5752,19 @@ impl Store {
             // 组内消息全集（算组级剧名用）——Arc 共享，避免每条消息各克隆一份。
             let msgs = std::sync::Arc::new(list.clone());
             for m in list {
+                let new_prio = (filing.0.is_some(), group.is_some());
                 match map.get(&(chat, m)) {
-                    Some((Some(_), _, _, _)) => {}
-                    Some((None, _, _, _)) if group.is_none() => {}
-                    _ => {
+                    Some((ex_g, _, _, ex_f)) => {
+                        // 优先级：归档轴（series_key）权重最高，其次 group；同优先级保留先创建的。
+                        // BUG-441：旧逻辑只认 group、完全忽略 series_key ⇒ 一条「先到的无键任务」
+                        // 会遮蔽「后到的筛选归档轴」，同相册被裂成占位剧集 + 筛选剧集两部。
+                        let ex_prio = (ex_f.0.is_some(), ex_g.is_some());
+                        if ex_prio.0 >= new_prio.0 && ex_prio.1 >= new_prio.1 {
+                            continue;
+                        }
+                        map.insert((chat, m), (group, first, msgs.clone(), filing.clone()));
+                    }
+                    None => {
                         map.insert((chat, m), (group, first, msgs.clone(), filing.clone()));
                     }
                 }
@@ -12856,6 +12865,89 @@ mod tests {
             Some("相册甲"),
             "归档轴不得渗透条目标题（BUG-154：显示名保持原样）"
         );
+    }
+
+    /// BUG-441：`cache_task_msg_index` 去重**完全忽略 `series_key`**（BUG-438 修复的回归）。
+    /// 一条「先到的无归档轴任务」会遮蔽「后到的筛选归档轴」，同相册被裂成占位剧集 + 筛选剧集两部。
+    /// 修复：去重优先级 `(series_key, group)` —— 带归档轴的永远优先于无归档轴的。
+    ///
+    /// 验牙：本测试在「去重忽略 series_key」的旧逻辑下必 FAIL（101/102 被无键任务 A 认领、
+    /// 按 group 建占位剧；103 带键建筛选剧 ⇒ 两部剧）；修复后三条全归 `tg:filter:7` ⇒ 一部剧。
+    #[tokio::test]
+    async fn cache_task_msg_index_prefers_series_key_over_unkeyed_task_bug441() {
+        let s = Store::open(tmp_db("bug441_series_key_priority")).await.unwrap();
+        let now = now_secs();
+        // 任务 A：组下载，无归档轴（series_key = NULL），先创建（id 更小）——「先下载」。
+        s.conn
+            .execute(
+                "INSERT INTO cache_task (chat_id, group_id, item_key, items, total, done, status, \
+                 created_at, updated_at, series_key, series_hint) \
+                 VALUES (?1, ?2, ?3, ?4, 2, 0, 'queued', ?5, ?5, NULL, NULL)",
+                params![
+                    600i64,
+                    11i64,
+                    "g:600:11",
+                    serde_json::to_string(&vec![101i64, 102i64]).unwrap(),
+                    now
+                ],
+            )
+            .await
+            .unwrap();
+        // 任务 B：筛选入库，带归档轴，后创建（id 更大），且**包含 A 的全部消息**——「后筛选」。
+        s.conn
+            .execute(
+                "INSERT INTO cache_task (chat_id, group_id, item_key, items, total, done, status, \
+                 created_at, updated_at, series_key, series_hint) \
+                 VALUES (?1, ?2, ?3, ?4, 3, 0, 'queued', ?5, ?5, 'tg:filter:7', '我的筛选')",
+                params![
+                    600i64,
+                    11i64,
+                    "g:600:11-b",
+                    serde_json::to_string(&vec![101i64, 102i64, 103i64]).unwrap(),
+                    now + 1
+                ],
+            )
+            .await
+            .unwrap();
+        for (m, cap) in [(101i64, "相册甲"), (102i64, ""), (103i64, "相册丙")] {
+            let c: Option<&str> = if cap.is_empty() { None } else { Some(cap) };
+            s.conn
+                .execute(
+                    "INSERT INTO media_message (channel_id, message_id, caption, media_type, mime_type, created_at) \
+                     VALUES (?1, ?2, ?3, 'video', 'video/mp4', ?4)",
+                    params![600i64, m, c, now],
+                )
+                .await
+                .unwrap();
+        }
+        let mut ids = Vec::new();
+        for m in [101i64, 102, 103] {
+            ids.push(
+                s.upsert_media_item(
+                    "tg",
+                    &format!("600:{m}"),
+                    if m == 101 { "相册甲" } else { "" },
+                    "video",
+                    None,
+                    Some(10),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        // 修复前：101/102 被无键任务 A 认领 ⇒ 按 group 建占位剧；103 带键 ⇒ 筛选剧 ⇒ 两部剧。
+        // 修复后：series_key 优先 ⇒ 三条全归 tg:filter:7 ⇒ 一部剧。
+        let (created, attached) = s.file_items_into_series(&ids).await.unwrap();
+        assert_eq!(created, 1, "共享消息必须被筛选归档轴认领，整批落一部剧");
+        assert_eq!(attached, 3);
+        assert!(
+            s.find_series_by_source_key("tg:filter:7").await.unwrap().is_some(),
+            "筛选剧集必须存在"
+        );
+        let total: i64 = s.count_one("SELECT COUNT(*) FROM media_series", ()).await.unwrap();
+        assert_eq!(total, 1, "库内只应有一部剧（筛选归档轴那部）");
     }
 
     /// BUG-304 判据 1（引擎半）：「零认领」的判定必须看**三张**认领表 ——
