@@ -102,6 +102,7 @@
 | verify_album_cover.cjs | tg | S2 |
 | verify_album_photo_import.cjs | tg | S2 |
 | verify_bug396_397_398.cjs | download+tg | S2 |
+| verify_bug404_405_415_416_417_live.cjs | files+playback | S2 |
 | verify_bug437_monitor_sync_in_filter.cjs | tg | S2 |
 | verify_bug101_monitor_collapse.cjs | tg | S2 |
 | verify_bug138_media_list_cache.cjs | files | S2 |
