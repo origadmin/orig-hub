@@ -2369,43 +2369,99 @@ export function TgPanel(
                        * 只会以为按钮没生效（BUG-327「存在≠可用」的同一个坑）。
                        */}
                       {backfillRunning ? (
-                        <div
-                          data-testid="tg-monitor-backfill-progress"
-                          data-until={ch.backfillUntil}
-                          className="mb-1 flex items-center gap-2 rounded-md bg-surface-2/60 px-2 py-1.5"
-                        >
-                          <span className="min-w-0 flex-1 text-[12px] text-fg-mid">
-                            <span className="block truncate">
-                              {t('tg.backfillRunning', { date: fmtDateOnly(ch.backfillUntil ?? 0) })}
-                            </span>
-                            {/* BUG-382：双边界 —— 「已回溯至 #{游标}」+「最新 #{同步游标}」。
-                                旧形态只有目标日期：说得出「要到哪」、说不出「已到哪」，
-                                用户无法确认回溯进度，回溯结束后行上又毫无痕迹。 */}
-                            <span
-                              className="block truncate text-[11px] text-muted"
-                              data-testid="tg-monitor-backfill-bounds"
-                              data-before={ch.backfillBeforeId ?? 0}
-                              data-latest={ch.lastMessageId ?? 0}
+                        (() => {
+                          /*
+                           * BUG-431（用户 2026-10-26 原话：「数据回溯展示问题：文字有严重
+                           * 问题，进度也不可见。」）三处硬伤，都在这一块：
+                           *
+                           * 1. **原始键直出**：`tg.backfillCancel` 只在 `en-US.json` 里定义，
+                           *    `zh-CN.json` 漏了 ⇒ 中文界面直接渲染出 `tg.backfillCancel`
+                           *    这串键名。缺键不报错、只裸奔，所以一直没被发现。
+                           * 2. **自相矛盾**：标题说「回溯中（至 2026-01-01…）」，副行说
+                           *    「回溯尚未开始」。`backfillBeforeId === 0` 的真实含义是
+                           *    「第一页还没翻完，游标未建立」，不是「没开始」。
+                           * 3. **进度不可见**：原来只有「#9719 / #…」这种消息号 —— 用户既
+                           *    不知道回溯到哪一天，也不知道还剩多少。
+                           *
+                           * 改法：标题只留「回溯中」（短，窄栏不截断）；日期与进度改由
+                           * `flex-wrap` 的多段并排（宁可换行也不截断数字）；进度用
+                           * **日期轴**表达 —— `oldestMessageDate` 是库内最老已入库日期，
+                           * 回溯每翻一页它就往旧走，所以「已回溯至 X · 还差 N 天」是
+                           * 单调、可核对的真进度。
+                           *
+                           * 刻意**不做百分比**：分母是「本次回溯起点」，后端没有存
+                           * （`sync_cursor` 只有目标日期与游标），拿 now 或最新消息日
+                           * 去凑分母会在点击瞬间就报出 50%，比不显示更误导。条状指示
+                           * 只表示「还在跑」，不谎报比例。
+                           */
+                          const untilTs = ch.backfillUntil ?? 0
+                          const oldestTs = ch.oldestMessageDate ?? 0
+                          const started = (ch.backfillBeforeId ?? 0) > 0
+                          const daysLeft =
+                            started && oldestTs > 0 && untilTs > 0
+                              ? Math.max(0, Math.ceil((oldestTs - untilTs) / 86400))
+                              : null
+                          return (
+                            <div
+                              data-testid="tg-monitor-backfill-progress"
+                              data-until={untilTs}
+                              data-oldest={oldestTs}
+                              data-days-left={daysLeft ?? -1}
+                              className="mb-1 rounded-md bg-surface-2/60 px-2 py-1.5"
                             >
-                              {(ch.backfillBeforeId ?? 0) > 0
-                                ? t('tg.backfillReached', { id: ch.backfillBeforeId ?? 0 })
-                                : t('tg.backfillNotStarted')}
-                              {' · '}
-                              {t('tg.backfillLatest', { id: ch.lastMessageId ?? 0 })}
-                            </span>
-                          </span>
-                          <Button
-                            variant="ghost"
-                            size="xs"
-                            data-testid="tg-monitor-backfill-cancel"
-                            title={t('tg.backfillCancelHint')}
-                            disabled={backfillBusy}
-                            onClick={() => void doCancelBackfill(ch.id)}
-                            className="h-9 shrink-0 px-2 text-[12px]"
-                          >
-                            {t('tg.backfillCancel')}
-                          </Button>
-                        </div>
+                              <div className="flex items-center gap-2">
+                                <span className="min-w-0 flex-1 text-[12px] font-medium text-fg-mid">
+                                  {t('tg.backfillRunningTitle')}
+                                </span>
+                                <Button
+                                  variant="ghost"
+                                  size="xs"
+                                  data-testid="tg-monitor-backfill-cancel"
+                                  title={t('tg.backfillCancelHint')}
+                                  disabled={backfillBusy}
+                                  onClick={() => void doCancelBackfill(ch.id)}
+                                  className="h-7 shrink-0 px-2 text-[12px]"
+                                >
+                                  {t('tg.backfillCancel')}
+                                </Button>
+                              </div>
+                              {/* 日期轴：目标 / 已到 / 剩余。`flex-wrap` 而非 `truncate`
+                                  —— 窄栏里宁可折行，也不许把日期截成「2026-01-01…」。 */}
+                              <div
+                                className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[11px] text-muted"
+                                data-testid="tg-monitor-backfill-bounds"
+                                data-before={ch.backfillBeforeId ?? 0}
+                                data-latest={ch.lastMessageId ?? 0}
+                              >
+                                <span data-testid="tg-monitor-backfill-target">
+                                  {t('tg.backfillTarget', { date: fmtDateOnly(untilTs) })}
+                                </span>
+                                <span data-testid="tg-monitor-backfill-reached">
+                                  {started && oldestTs > 0
+                                    ? t('tg.backfillReachedDate', { date: fmtDateOnly(oldestTs) })
+                                    : t('tg.backfillLocating')}
+                                </span>
+                                {daysLeft != null ? (
+                                  <span data-testid="tg-monitor-backfill-remaining">
+                                    {t('tg.backfillRemaining', { n: daysLeft })}
+                                  </span>
+                                ) : null}
+                                {/* BUG-382 的「最新边界」保留（同步游标是回溯的终点边界），
+                                    但降为最次一级：消息号对用户没有日历意义。 */}
+                                <span className="text-muted/70" data-testid="tg-monitor-backfill-latest">
+                                  {t('tg.backfillLatest', { id: ch.lastMessageId ?? 0 })}
+                                </span>
+                              </div>
+                              {/* 「还在跑」的指示：满宽脉冲条，不表达比例。 */}
+                              <div
+                                className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-surface-3"
+                                data-testid="tg-monitor-backfill-bar"
+                              >
+                                <div className="h-full w-full animate-pulse rounded-full bg-emerald-500/70" />
+                              </div>
+                            </div>
+                          )
+                        })()
                       ) : lastBackfill.has(ch.id) ? (
                         /* BUG-382：回溯完成/取消后的痕迹 —— 服务端 clear_backfill 后
                            `backfillUntil` 归零、进度条消失，没有这行用户就不知道
