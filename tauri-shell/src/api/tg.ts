@@ -544,6 +544,14 @@ export async function enqueueCacheTask(opts: {
   groupId?: string
   /** BUG-436 补强：筛选入库时用户打的筛选文字，引擎作为标题最终兜底。 */
   titleHint?: string
+  /**
+   * BUG-438：**归档轴**的稳定幂等键。只有文字筛选入库传（`tg:filter:{id}`）。
+   * 用例烟：改名不影响后续入库 —— 键是一次入库钉死的身份，剧名只是新建那次写的展示文案。
+   * 其余入库路径不传 ⇒ 走既定口径（组内 caption / 条目标题）。
+   */
+  seriesKey?: string
+  /** BUG-438：键首次命中时才用的剧名（筛选规则的自名）。 */
+  seriesHint?: string
 }): Promise<TgCacheTask & { alreadyIngested?: boolean }> {
   return request<TgCacheTask & { alreadyIngested?: boolean }>('/api/tg/cache/tasks', {
     method: 'POST',
@@ -552,6 +560,8 @@ export async function enqueueCacheTask(opts: {
       messageIds: opts.messageIds,
       groupId: opts.groupId,
       titleHint: opts.titleHint,
+      seriesKey: opts.seriesKey,
+      seriesHint: opts.seriesHint,
     }),
   })
 }

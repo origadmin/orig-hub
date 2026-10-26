@@ -1249,8 +1249,13 @@ export function TgPanel(
   // 停留在面板里永远看不到新内容（BUG-038）。这里补上「内容即监控点」的主动轮：
   // 进入监控频道立即触发一轮全局增量同步，停留期间每 60s 一轮；
   // 同步到新条目不粗暴重载（会拽走滚动位置），累计进「有新内容」提示条。
+  // 范围的更动（BUG-437）：`selectedId` 只在 `channel:<id>` 模式下有值，而看筛选规则时
+  // `tgMode='filter:<id>'` ⇒ `selectedId` 恒为 null ⇒ 原守卫直接 return ⇒ **停在规则
+  // 视图里一轮同步都不跑**，规则命中数与命中列表双双冻结（只能退出重进）。
+  // 现在「选中了监控频道」**或**「正在看某条筛选规则」都跑这轮同步。
   useEffect(() => {
-    if (selectedId === null || !monitoredSet.has(selectedId)) return
+    if (selectedId === null && tgFilterId === null) return
+    if (selectedId !== null && !monitoredSet.has(selectedId)) return
     let cancelled = false
     const run = async () => {
       try {
@@ -1282,7 +1287,8 @@ export function TgPanel(
       cancelled = true
       clearInterval(h)
     }
-  }, [selectedId, monitoredSet])
+    // BUG-437：计入规则视图 —— 切进/切出规则都要重挂（节拍恒定，不留陈旧闭包）。
+  }, [selectedId, monitoredSet, tgFilterId])
 
   // 滚到底 / prepend 锚定（在 DOM 更新后同步执行，避免闪烁）。
   useLayoutEffect(() => {

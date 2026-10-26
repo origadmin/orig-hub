@@ -1535,6 +1535,14 @@ struct EnqueueCacheReq {
     /// 用它。可空（非筛选入库路径不传）。
     #[serde(rename = "titleHint", default)]
     title_hint: Option<String>,
+    /// BUG-438：**归档轴**的稳定幂等键。只有「文字筛选」入库会填
+    /// （`tg:filter:{filter_id}`）；其余入库路径一律不传 ⇒ 键沿既定口径算
+    /// （组内 caption / 条目标题，BUG-292 / BUG-378）。
+    #[serde(rename = "seriesKey", default)]
+    series_key: Option<String>,
+    /// BUG-438：命中新建时才用的**剧名**（键已命中既有剧集时不写，故用户改名不被回滚）。
+    #[serde(rename = "seriesHint", default)]
+    series_hint: Option<String>,
 }
 
 /// POST /api/tg/cache/tasks — 入队缓存任务（幂等：同 key 已有活跃任务则直接复用）。
@@ -1622,6 +1630,15 @@ async fn enqueue_cache_task(
         // BUG-436 补强：新任务才写标题兜底（筛选文字）。复用既有任务不覆盖其 hint。
         if let Some(hint) = req.title_hint.as_deref().filter(|h| !h.trim().is_empty()) {
             let _ = st.store.set_cache_task_title_hint(task.id, hint).await;
+        }
+        // BUG-438：新任务才钉归档轴。同为「只有新建才写」：复用活跃任务时这批消息
+        // 并入的是**原来那条任务**的家，不该被第二个筛选词抢走（否则同一部内容会被
+        // 两个 key 拉扯，正是 BUG-292 裂剧的形态）。
+        if let (Some(key), Some(hint)) = (
+            req.series_key.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+            req.series_hint.as_deref(),
+        ) {
+            let _ = st.store.set_cache_task_series_filing(task.id, key, hint.trim()).await;
         }
         spawn_cache_task(st.clone(), task.id);
     }
@@ -11008,6 +11025,8 @@ mod tests {
                 group_id: None,
                 dir: None,
                 title_hint: None,
+                series_key: None,
+                series_hint: None,
             },
         )
         .await
@@ -11112,6 +11131,8 @@ mod tests {
                 group_id: None,
                 dir: None,
                 title_hint: None,
+                series_key: None,
+                series_hint: None,
             },
         )
         .await
@@ -11198,6 +11219,8 @@ mod tests {
                 group_id: None,
                 dir: None,
                 title_hint: None,
+                series_key: None,
+                series_hint: None,
             },
         )
         .await
@@ -11241,6 +11264,8 @@ mod tests {
                 group_id: None,
                 dir: None,
                 title_hint: None,
+                series_key: None,
+                series_hint: None,
             },
         )
         .await
@@ -11276,6 +11301,8 @@ mod tests {
                 group_id: None,
                 dir: None,
                 title_hint: None,
+                series_key: None,
+                series_hint: None,
             },
         )
         .await
@@ -11294,6 +11321,8 @@ mod tests {
                     group_id: None,
                     dir: None,
                     title_hint: None,
+                    series_key: None,
+                    series_hint: None,
                 },
             )
             .await
@@ -11466,6 +11495,8 @@ mod tests {
                 group_id: None,
                 dir: None,
                 title_hint: None,
+                series_key: None,
+                series_hint: None,
             },
         )
         .await

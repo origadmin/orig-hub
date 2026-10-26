@@ -5526,10 +5526,35 @@ impl Store {
             // D22-A①（BUG-292）：与 `IngestCtx::ensure_series` **同一把**键 —— 规范化剧名
             // 优先，`group_id` / 首条消息号只作退化兜底。两处规则若分叉，同一条内容会在
             // 自动路径重建时裂成两个剧集（BUG-292 形态）。
-            let key = if source == "tg" {
-                match crate::routes::parse_tg_ref(&ref_key) {
-                    Some((chat, msg)) => match index.get(&(chat, msg)) {
-                        Some((task_group, first, msgs)) => {
+            let tg_ref = if source == "tg" {
+                crate::routes::parse_tg_ref(&ref_key)
+            } else {
+                None
+            };
+            // BUG-438：**显式归档轴**（只有筛选入库会填）。返回 `(幂等键, 首次建剧用的剧名)`。
+            //
+            // 为什么必须与最终的**剧名**分开：键是入库那一刻钉死的身份，剧名是用户可以改的
+            // 展示文案。键由入队那一刻一次写入，`source_key` 命中既有剧集后就不再用到剧名
+            // ⇒ 用户改名既不拆剧（后续入库照样投进同一部），也不被回滚（`create_series`
+            // 只在 miss 时调用）。两者若共用一份字符串，改名就会变成「新建一部同内容的旧名剧」。
+            let explicit_filing: Option<(String, Option<String>)> = match tg_ref {
+                Some((chat, msg)) => index.get(&(chat, msg)).and_then(|(_, _, _, filing)| {
+                    let k = filing.0.as_deref()?.trim();
+                    if k.is_empty() {
+                        None
+                    } else {
+                        Some((k.to_string(), filing.1.clone()))
+                    }
+                }),
+                None => None,
+            };
+            let key = match (&explicit_filing, tg_ref) {
+                // BUG-438：显式归档轴就是这批内容的「家」，优先于组内 caption —— 否则
+                // 同一次筛选会按各相册自己的 caption 裂成 N 部剧，用户在库里找不到
+                // 「我刚才入库的那一批」。
+                (Some((k, _)), _) => k.clone(),
+                (None, Some((chat, msg))) => match index.get(&(chat, msg)) {
+                        Some((task_group, first, msgs, _filing)) => {
                             // BUG-378：组归属与组级剧名以 `media_message` 为权威。
                             // 任务行 `(group_id, items)` 是入队快照：items 只是当时
                             // 入队的消息（单条任务不含组内有 caption 的那条）、
@@ -5575,15 +5600,20 @@ impl Store {
                             crate::routes::episodic_group_key(chat, &name, None, msg)
                         }
                     },
-                    None => format!("item:{item_id}"),
-                }
-            } else {
-                format!("item:{item_id}")
+                (None, None) => format!("item:{item_id}"),
             };
             let (sid, fresh) = match self.find_series_by_source_key(&key).await? {
                 Some(sid) => (sid, false),
                 None => {
-                    let name = fallback_series_title(&title, &kind, item_id);
+                    // BUG-438：有显式归档轴 ⇒ 用它给的剧名建剧；没有 ⇒ 沿用既定口径
+                    // （条目自己的标题，空则「未命名X #id」，BUG-304 / D18）。
+                    let name = explicit_filing
+                        .as_ref()
+                        .and_then(|(_, hint)| {
+                            hint.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                        })
+                        .map(str::to_string)
+                        .unwrap_or_else(|| fallback_series_title(&title, &kind, item_id));
                     match self.create_series(&name, None, "series", None, Some(&key)).await {
                         Ok(sid) => {
                             created += 1;
@@ -5664,7 +5694,11 @@ impl Store {
         Ok((found, created, attached, skipped))
     }
 
-    /// `(chat_id, message_id) -> (group_id, 该任务的首条 message_id, 该任务的全部 message_id)`。
+    /// `(chat_id, message_id) -> (group_id, 该任务的首条 message_id, 该任务的全部
+    /// message_id, 该任务的归档轴)`。
+    ///
+    /// BUG-438：第四项是 `(series_key, series_hint)` —— 只有**筛选入库**会填
+    /// （键 `tg:filter:{id}`），其余路径恒 `(None, None)`，键的算走既定口径。
     ///
     /// 用来给孤儿 `tg` 条目找回「它属于哪个相册」以及**该组的剧名**（取自组内首条非空
     /// caption），从而与 [`crate::routes`] 里 `ensure_series` 用**同一把幂等键**。
@@ -5676,12 +5710,28 @@ impl Store {
     async fn cache_task_msg_index(
         &self,
     ) -> libsql::Result<
-        std::collections::HashMap<(i64, i64), (Option<i64>, i64, std::sync::Arc<Vec<i64>>)>,
+        std::collections::HashMap<
+            (i64, i64),
+            (
+                Option<i64>,
+                i64,
+                std::sync::Arc<Vec<i64>>,
+                std::sync::Arc<(Option<String>, Option<String>)>,
+            ),
+        >,
     > {
-        type Entry = (Option<i64>, i64, std::sync::Arc<Vec<i64>>);
+        type Entry = (
+            Option<i64>,
+            i64,
+            std::sync::Arc<Vec<i64>>,
+            std::sync::Arc<(Option<String>, Option<String>)>,
+        );
         let stmt = self
             .conn
-            .prepare("SELECT id, chat_id, group_id, items FROM cache_task ORDER BY id ASC")
+            .prepare(
+                "SELECT id, chat_id, group_id, items, series_key, series_hint \
+                   FROM cache_task ORDER BY id ASC",
+            )
             .await?;
         let mut rows = stmt.query(()).await?;
         let mut map: std::collections::HashMap<(i64, i64), Entry> =
@@ -5690,6 +5740,8 @@ impl Store {
             let chat: i64 = r.get(1)?;
             let group: Option<i64> = r.get(2)?;
             let items: Option<String> = r.get(3)?;
+            // BUG-438：归档轴按任务共享（每条消息各克隆一份字符串没有意义）。
+            let filing = std::sync::Arc::new((r.get(4).ok().flatten(), r.get(5).ok().flatten()));
             let Some(raw) = items else { continue };
             let Ok(list) = serde_json::from_str::<Vec<i64>>(&raw) else {
                 continue;
@@ -5701,10 +5753,10 @@ impl Store {
             let msgs = std::sync::Arc::new(list.clone());
             for m in list {
                 match map.get(&(chat, m)) {
-                    Some((Some(_), _, _)) => {}
-                    Some((None, _, _)) if group.is_none() => {}
+                    Some((Some(_), _, _, _)) => {}
+                    Some((None, _, _, _)) if group.is_none() => {}
                     _ => {
-                        map.insert((chat, m), (group, first, msgs.clone()));
+                        map.insert((chat, m), (group, first, msgs.clone(), filing.clone()));
                     }
                 }
             }
@@ -12660,6 +12712,150 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(eps, 6, "六个条目全部编入同一部剧");
+    }
+
+    /// BUG-438 判据：筛选入库必须落在**筛选规则自己那部剧**里，且改名不影响后续入库。
+    ///
+    /// 三条断言（缺一不可）：
+    ///   ① 两条不同相册的任务（各自 caption 不同）带同一个 `series_key` ⇒ 建**一部**剧，
+    ///      剧名取 `series_hint`（不是任一相册的 caption）；
+    ///   ② 用户**改名**这部剧后，同一 key 的新条目仍投进同一部剧（`created == 0`），
+    ///      且不新建「旧名剧」——这正是「标题可改、不该影响后续入库」的机制前提；
+    ///   ③ 显示名没有被渗透：条目自身的标题仍是它自己的 caption（不是筛选词）。
+    ///
+    /// **反向证伪**：把 `explicit_filing` 的优先级拿掉（回落到组内 caption 那条支路）
+    /// ⇒ ① 的 `created` 必为 2（两个相册两部剧）⇒ FAIL。
+    #[tokio::test]
+    async fn filter_ingest_files_into_its_own_series_and_survives_rename_bug438() {
+        let s = Store::open(tmp_db("bug438_series_filing")).await.unwrap();
+        let now = now_secs();
+        // 两个相册：组 11（101/102）、组 12（201/202）。caption 各异（真实相册就是这样，
+        // 没有归档轴时它们必然各起一部剧 —— 这正是 BUG-438 的现象）。
+        for (group, msgs, caption) in [
+            (11i64, vec![101i64, 102], "相册甲"),
+            (12i64, vec![201i64, 202], "相册乙"),
+        ] {
+            s.conn
+                .execute(
+                    "INSERT INTO cache_task (chat_id, group_id, item_key, items, total, done, status, \
+                     created_at, updated_at, series_key, series_hint) \
+                     VALUES (?1, ?2, ?3, ?4, 2, 0, 'queued', ?5, ?5, 'tg:filter:7', '我的筛选')",
+                    params![
+                        600i64,
+                        group,
+                        format!("g:600:{group}"),
+                        serde_json::to_string(&msgs).unwrap(),
+                        now
+                    ],
+                )
+                .await
+                .unwrap();
+            for m in &msgs {
+                let cap: Option<&str> = if *m == msgs[0] { Some(caption) } else { None };
+                s.conn
+                    .execute(
+                        "INSERT INTO media_message (channel_id, message_id, caption, media_type, mime_type, created_at) \
+                         VALUES (?1, ?2, ?3, 'video', 'video/mp4', ?4)",
+                        params![600i64, *m, cap, now],
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        let mut ids = Vec::new();
+        for (m, cap) in [(101i64, "相册甲"), (102i64, ""), (201i64, "相册乙"), (202i64, "")] {
+            ids.push(
+                s.upsert_media_item(
+                    "tg",
+                    &format!("600:{m}"),
+                    cap,
+                    "video",
+                    None,
+                    Some(10),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        // ① 两个相册 ⇒ 一部剧，且是筛选标题那部。
+        let (created, attached) = s.file_items_into_series(&ids).await.unwrap();
+        assert_eq!(created, 1, "两个相册必须落同一部剧（BUG-438：归档轴优先于组内 caption）");
+        assert_eq!(attached, 4, "四个条目全部编入该剧");
+        let sid = s
+            .find_series_by_source_key("tg:filter:7")
+            .await
+            .unwrap()
+            .expect("键必须是 tg:filter:{id}");
+        assert!(
+            s.find_series_by_source_key("tg:named:600:相册甲")
+                .await
+                .unwrap()
+                .is_none(),
+            "不得再按相册 caption 建出第二部剧"
+        );
+        let title: Option<String> = s
+            .row_opt(
+                "SELECT title FROM media_series WHERE id = ?1",
+                params![sid],
+            )
+            .await
+            .unwrap()
+            .map(|r| r.get(0).unwrap());
+        assert_eq!(title.as_deref(), Some("我的筛选"), "新建剧集的剧名必须是筛选规则的标题");
+
+        // ② 用户改名 ⇒ 后续入库照样投进同一部，且不冒出新剧。
+        let _ = s // 改名：直接 UPDATE series.title（用户在剧集详情改名的最终落点）
+            .conn
+            .execute("UPDATE media_series SET title = '我改过的名字' WHERE id = ?1", params![sid])
+            .await
+            .unwrap();
+        let extra = s
+            .upsert_media_item("tg", "600:203", "后来入库的一条", "video", None, Some(10), None, None)
+            .await
+            .unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO cache_task (chat_id, group_id, item_key, items, total, done, status, \
+                 created_at, updated_at, series_key, series_hint) \
+                 VALUES (600, 13, 'g:600:13', ?1, 1, 0, 'queued', ?2, ?2, 'tg:filter:7', '我的筛选')",
+                params![serde_json::to_string(&vec![203i64]).unwrap(), now],
+            )
+            .await
+            .unwrap();
+        let (created2, attached2) = s.file_items_into_series(&[extra]).await.unwrap();
+        assert_eq!(
+            (created2, attached2),
+            (0, 1),
+            "改名不得拆剧：新条目必须投进同一部剧（created == 0）"
+        );
+        let total: i64 = s
+            .count_one("SELECT COUNT(*) FROM media_series", ())
+            .await
+            .unwrap();
+        assert_eq!(total, 1, "改名不得冒出第二部剧（库内仍只有一部）");
+        let kept: Option<String> = s
+            .row_opt("SELECT title FROM media_series WHERE id = ?1", params![sid])
+            .await
+            .unwrap()
+            .map(|r| r.get(0).unwrap());
+        assert_eq!(kept.as_deref(), Some("我改过的名字"), "用户改的名字不得被回滚");
+
+        // ③ 条目自己的标题仍是它的 caption（归档轴不改显示名）。
+        let item_title: Option<String> = s
+            .row_opt(
+                "SELECT title FROM media_item WHERE id = ?1",
+                params![ids[0]],
+            )
+            .await
+            .unwrap()
+            .map(|r| r.get(0).unwrap());
+        assert_eq!(
+            item_title.as_deref(),
+            Some("相册甲"),
+            "归档轴不得渗透条目标题（BUG-154：显示名保持原样）"
+        );
     }
 
     /// BUG-304 判据 1（引擎半）：「零认领」的判定必须看**三张**认领表 ——

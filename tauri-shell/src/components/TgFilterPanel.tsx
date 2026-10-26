@@ -40,6 +40,10 @@ interface Props {
   onIngested?: (queued: number) => void
 }
 
+/** 命中行所属的**单元键**（与 `groupHits` 同一套规则）—— newcomers 判定用它对齐。 */
+const unitKeyOf = (h: TgMonitorFilterHit) =>
+  h.groupId != null ? `g:${h.channelId}:${h.groupId}` : `m:${h.channelId}:${h.messageId}`
+
 /** 消息键：`<chatId>:<messageId>`（跨频道，故不能只用 messageId） */
 const keyOf = (h: TgMonitorFilterHit) => `${h.channelId}:${h.messageId}`
 
@@ -123,6 +127,81 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
   const touchedRef = useRef<Set<string>>(new Set())
 
   const units = useMemo(() => groupHits(hits), [hits])
+  /**
+   * BUG-437：命中列表必须跟着监控内容走 —— 「显示总的全部数据」。
+   *
+   * 两个原本都断掉的连接现已接上：
+   *   ① `TgPanel` 的增量同步 effect 之前把「在看筛选规则」排除在外（守卫只看
+   *      `selectedId`），规则视图里一轮都不跑；现在它也会跑 ⇒ 本面板拿到的
+   *      `filter.hits` 会跟着长；
+   *   ② 本面板原来只在挂载/换规则时取一次首屏。现在监听单元总数：`hits` 比上次
+   *      取数时的基线**增长** ⇒ 判定有新增命中 ⇒ 拉一次首屏并**就地并入**。
+   *
+   * 为什么只在数字增长时才拉：常态轮询 50 个单元（每个都带缩略图请求）是纯浪费；
+   * 计数是服务端现算的便宜数字（`count_filter_hits`），用它当闸门，一次新增只付
+   * 一次列表钱。
+   *
+   * 为什么不自动重选：勾选是工作台态（默认全选、用户做减法，BUG-327/341）。
+   * 并入时沿用 `loadMore` 的同一套增量规则 —— 只补**没被用户碰过**的单元，
+   * 用户显式取消过的绝不静默勾回。
+   */
+  const hitsRef = useRef<TgMonitorFilterHit[]>([])
+  useEffect(() => {
+    hitsRef.current = hits
+  }, [hits])
+  /** 上一次取数时看到的单元总数（服务端口径，`count_filter_hits`）——增长 = 有新命中。 */
+  const hitsBaselineRef = useRef<number | null>(null)
+  const headBusyRef = useRef(false)
+  /** 事后新来的单元（同一次会话内用于视觉区分：勾选框描边强调色）。 */
+  const [newUnitKeys, setNewUnitKeys] = useState<Set<string>>(new Set())
+
+  const pullNewHead = useCallback(async () => {
+    if (headBusyRef.current) return
+    headBusyRef.current = true
+    try {
+      // 无游标 = 最新一页；新命中永远在头部（列表按 新→旧）。
+      const items = await listTgMonitorFilterMessages(filter.id, PAGE_SIZE)
+      const known = new Set(groupHits(hitsRef.current).map((u) => u.key))
+      const incoming = groupHits(items)
+      const fresh = incoming.filter((u) => !known.has(u.key))
+      if (fresh.length === 0) return
+      const freshKeys = new Set(fresh.map((u) => u.key))
+      // 只把**新单元自己的行**前置；已在列表里的行保持原对象引用 ⇒ 不触发它们重渲染。
+      const rows = items.filter((h) => freshKeys.has(unitKeyOf(h)))
+      setHits((prev) => [...rows, ...prev])
+      setNewUnitKeys((prev) => {
+        const next = new Set(prev)
+        for (const k of freshKeys) next.add(k)
+        return next
+      })
+      // 与 loadMore 同一把尺子：缺字节 = 要下载的 ⇒ 默认入选，用户碰过的不还原。
+      setSelected((prev) => {
+        const next = new Set(prev)
+        for (const u of fresh) {
+          if (touchedRef.current.has(u.key)) continue
+          if (u.members.some((m) => !m.downloaded)) next.add(u.key)
+        }
+        return next
+      })
+    } catch {
+      // BUG-167 纪律：后台并入失败不打脸现有列表（列表本身仍是自洽的旧数据）。
+    } finally {
+      headBusyRef.current = false
+    }
+  }, [filter.id])
+
+  /**
+   * BUG-437：监控推来的新命中**就地并入**，不再让用户「退出重进」才看得到。
+   * 只在总数比基线增长时触发（闸门用的是服务端那个便宜计数，不是整列表）。
+   */
+  useEffect(() => {
+    const base = hitsBaselineRef.current
+    if (base === null || loading) return
+    if (filter.hits > base) {
+      hitsBaselineRef.current = filter.hits
+      void pullNewHead()
+    }
+  }, [filter.hits, loading, pullNewHead])
 
   useEffect(() => {
     let cancelled = false
@@ -132,9 +211,12 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
     setExpanded(new Set())
     setHits([])
     setHasMore(false)
-    // 换规则 = 新工作台：默认全选态复位，等首屏到位后重来（见下方 didInitSelect）。
+    setNewUnitKeys(new Set())
+    // 换规则 = 新工作台：默认全选态复位，「新来的」标记也要清零（否则上一规则的
+    // 视觉强调会随新列表延续下来），等首屏到位后重来（见下方 didInitSelect）。
     didInitSelect.current = false
     touchedRef.current = new Set()
+    hitsBaselineRef.current = null
     void (async () => {
       try {
         const items = await listTgMonitorFilterMessages(filter.id, PAGE_SIZE)
@@ -142,6 +224,10 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
           setHits(items)
           // hasMore 按**单元**数判（满页单元 ⇒ 可能有下一页）。
           setHasMore(groupHits(items).length === PAGE_SIZE)
+          // BUG-437：首屏到位即钉基线；此后 `filter.hits` 高于它 ⇒ 有新命中进来。
+          // 用**服务端总数**而不是已渲染数做基线：Pagination 时 `hits` 恒大于已加载，
+          // 拿后者比较会变成「每次都以为有新内容」的轮询。
+          hitsBaselineRef.current = filter.hits
         }
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e))
@@ -280,6 +366,15 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
           // BUG-436 补强：筛选入库时把用户打的筛选文字作为标题兜底传下去
           // （引擎在 caption / 组内共用 caption 都缺时用作标题）。
           titleHint: filter.keyword || filter.label,
+          // BUG-438：**归档轴**——这批内容归到「筛选规则自己那部剧」里，而不是每个
+          // 相册各按自己的 caption 起一部。
+          //   - `seriesKey` 是一次入库钉死的身份 ⇒ 用户之后把这部剧改名，后续入库
+          //     照样投进同一部（不会被拆、名字也不会被回滚）；
+          //   - `seriesHint` 是**新建**那部剧时才用的名字，命中既有剧集时不生效；
+          //   - 两者与 `titleHint`（条目自己的显示名）互不干扰：筛选词当剧名，
+          //     条目还叫它本来的名字。
+          seriesKey: `tg:filter:${filter.id}`,
+          seriesHint: filter.label || filter.keyword,
         })
         if (!r?.alreadyIngested) queued += ids.length
       } catch (e) {
@@ -339,6 +434,7 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
             const isAlbum = u.groupId != null
             // 可勾 = 组内还有缺字节成员（整组已入库的不可勾）。
             const pickable = u.members.some((m) => !m.downloaded)
+            const isNew = newUnitKeys.has(k)
             const newest = u.members.reduce<TgMonitorFilterHit | null>(
               (acc, m) => (acc == null || (m.date ?? 0) > (acc.date ?? 0) ? m : acc),
               null,
@@ -348,9 +444,13 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
               <div
                 key={k}
                 data-testid={isAlbum ? 'tg-filter-group' : 'tg-filter-hit'}
+                // BUG-437：会话内新到的命中标出来（用户要「新数据用其他颜色标识」）。
+                // 只是标记、不改变可用性 —— 它照样能勾、能入库，与老命中的差别只在眼睛。
+                data-new-hit={isNew ? '1' : undefined}
                 className={cn(
                   'rounded-md transition-colors',
                   checked ? 'bg-accent/5' : 'hover:bg-surface-2/60',
+                  isNew && 'ring-1 ring-accent/50',
                 )}
               >
                 <div className="flex items-start gap-2 px-2 py-2">

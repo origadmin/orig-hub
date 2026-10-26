@@ -364,6 +364,17 @@ pub struct CacheTask {
     /// caption / 组内共用 caption 都拿不到时用作标题。可为空（非筛选入库路径不传）。
     #[serde(rename = "titleHint", skip_serializing_if = "Option::is_none")]
     pub title_hint: Option<String>,
+    /// BUG-438：**归档轴**的稳定幂等键（筛选入库传 `tg:filter:{id}`，其余路径恒 None）。
+    ///
+    /// 为什么必须与「剧名」分开存：剧名是**可被用户改**的展示文案，键是一次入库时
+    /// 钉死的身份。两者若共用同一份字符串，用户改名后后续入库就会
+    /// 「找不到旧剧 ⇒ 新建一部同内容的旧名剧」，改名等于拆剧。
+    #[serde(rename = "seriesKey", skip_serializing_if = "Option::is_none")]
+    pub series_key: Option<String>,
+    /// BUG-438：新建剧集时用的**剧名**（`series_key` 命中既有剧集时不用），即
+    /// 筛选规则的自名。只在 `create_series` 那一刻写一次，之后用户改名不被回滚。
+    #[serde(rename = "seriesHint", skip_serializing_if = "Option::is_none")]
+    pub series_hint: Option<String>,
 }
 
 /// 任务是否处于「活跃」态（活跃态由 `cache_task_active_uniq` 保证同 key 唯一）。
@@ -371,7 +382,8 @@ pub const CACHE_TASK_ACTIVE_STATES: &str = "('queued', 'running')";
 
 /// 按 `list_cache_tasks`/`get_cache_task` 的 SELECT 列顺序映射一行。
 /// 列顺序：id, chat_id, group_id, item_key, items, total, done, status,
-///         current_id, error, created_at, updated_at, priority, title_hint
+///         current_id, error, created_at, updated_at, priority, title_hint,
+///         series_key, series_hint
 fn cache_task_from_row(r: &Row) -> libsql::Result<CacheTask> {
     let items: String = r.get(4)?;
     Ok(CacheTask {
@@ -392,12 +404,16 @@ fn cache_task_from_row(r: &Row) -> libsql::Result<CacheTask> {
         priority: r.get(12).unwrap_or(0),
         // `title_hint` 是新列（可空）：缺失/空均兜成 None，绝不让读队列失败。
         title_hint: r.get(13).ok().flatten(),
+        // BUG-438：`series_key` / `series_hint` 同为新增可空列，同上一行的兜底口径。
+        series_key: r.get(14).ok().flatten(),
+        series_hint: r.get(15).ok().flatten(),
     })
 }
 
 /// `cache_task` 的 SELECT 列清单（与 `cache_task_from_row` 严格同序）。
 const CACHE_TASK_COLS: &str = "id, chat_id, group_id, item_key, items, total, done, \
-                               status, current_id, error, created_at, updated_at, priority, title_hint";
+                               status, current_id, error, created_at, updated_at, priority, title_hint, \
+                               series_key, series_hint";
 
 /// 队列取序（BUG-277）：**置顶优先，同优先级仍是 FIFO**。
 ///
@@ -546,6 +562,28 @@ async fn migrate_cache_task_title_hint(conn: &Connection) -> libsql::Result<()> 
     if !have {
         conn.execute("ALTER TABLE cache_task ADD COLUMN title_hint TEXT", ())
             .await?;
+    }
+    Ok(())
+}
+
+/// 迁移：为 `cache_task` 补 `series_key` / `series_hint` 两列（BUG-438）。
+///
+/// 可空 TEXT，无 NOT NULL 约束 —— 非筛选入库的存量任务一律 NULL，键的算走既有
+/// 口径（`episodic_group_key`），行为与迁移前逐字一致。幂等：列已存在则跳过 `ALTER`。
+async fn migrate_cache_task_series_filing(conn: &Connection) -> libsql::Result<()> {
+    for col in ["series_key", "series_hint"] {
+        let mut rows = conn.query("PRAGMA table_info(cache_task)", ()).await?;
+        let mut have = false;
+        while let Some(r) = rows.next().await? {
+            let name: String = r.get(1)?;
+            if name == col {
+                have = true;
+            }
+        }
+        if !have {
+            conn.execute(&format!("ALTER TABLE cache_task ADD COLUMN {col} TEXT"), ())
+                .await?;
+        }
     }
     Ok(())
 }
@@ -960,6 +998,8 @@ impl Store {
         migrate_cache_task_priority(&conn).await?;
         // 旧库的 cache_task 缺 title_hint：幂等补列（BUG-436 补强，可空）。
         migrate_cache_task_title_hint(&conn).await?;
+        // 旧库的 cache_task 缺归档轴两列：幂等补列（BUG-438，可空）。
+        migrate_cache_task_series_filing(&conn).await?;
         // 旧库的 monitored_channel 缺 last_read_message_id：幂等补列 + 存量视为已读。
         migrate_monitored_channel_last_read(&conn).await?;
         // 旧库的 monitor_filter 缺 last_read_at（BUG-330 / TGM-06）：幂等补列 +
@@ -2932,6 +2972,30 @@ impl Store {
             .execute(
                 "UPDATE cache_task SET title_hint = ?1, updated_at = ?2 WHERE id = ?3",
                 params![hint, now(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// BUG-438：写下本次入队的**归档轴**（稳定键 + 首次建剧用的剧名）。
+    ///
+    /// 与 `set_cache_task_title_hint` 同样的拆法：不动 `enqueue_cache_task` 的
+    /// 签名（那会牵连几十处测试调用点）。只写**新建**任务，复用活跃任务时不覆盖 ——
+    /// 那条任务已有自己的归档轴，本次入队只是把消息并进它，语义不该被第二个筛选词抢走。
+    ///
+    /// `key` 非空才写：`file_items_into_series` 里「有 key ⇒ 用它」的判据必须与使用
+    /// 方严格一致，避免写空串却被当成显式归档轴。
+    pub async fn set_cache_task_series_filing(
+        &self,
+        id: i64,
+        key: &str,
+        hint: &str,
+    ) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE cache_task SET series_key = ?1, series_hint = ?2, updated_at = ?3 \
+                 WHERE id = ?4",
+                params![key, hint, now(), id],
             )
             .await?;
         Ok(())
