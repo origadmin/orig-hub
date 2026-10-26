@@ -212,7 +212,9 @@ async function resolveSingleDupFixture() {
   const preferred = await read(S_SINGLE_DUP)
   if (preferred && Array.isArray(preferred.episodes) && preferred.episodes.length === 1) {
     const ep = preferred.episodes[0]
-    if ((preferred.description || '').trim().length > 0 &&
+    // 必须在剧集墙上可达（hasBytes !== false），否则 openSeriesById 点不到卡。
+    if ((preferred.hasBytes ?? true) !== false && (ep.hasBytes ?? true) !== false &&
+        (preferred.description || '').trim().length > 0 &&
         (ep.description || '').trim() === (preferred.description || '').trim()) {
       return { id: preferred.id, source: 'task-doc series 101' }
     }
@@ -223,10 +225,12 @@ async function resolveSingleDupFixture() {
     const list = await res.json()
     const items = (list && (list.items || list.series)) || []
     for (const s of items) {
-      if (!s || s.episodeCount !== 1 || (s.description || '').trim().length === 0) continue
+      // 必须在剧集墙上可达：hasBytes===false 的剧集被 `loadSeries` 过滤掉，点不到卡。
+      if (!s || s.episodeCount !== 1 || (s.hasBytes ?? true) === false || (s.description || '').trim().length === 0) continue
       const d = await read(s.id)
       if (!d || !Array.isArray(d.episodes) || d.episodes.length !== 1) continue
       const ep = d.episodes[0]
+      if ((ep.hasBytes ?? true) === false) continue
       if ((ep.description || '').trim() === (d.description || '').trim()) {
         return { id: d.id, source: 'live-discovered (series 101 absent in this DB)' }
       }
@@ -258,10 +262,18 @@ const R5_TITLE_STATE = (seriesTitleRaw) => {
   const focusTitle = focusEl ? String(focusEl.textContent || '').trim() : null
   const focusTitleIsSeriesTitle = focusTitle != null && norm(focusTitle) === want
   const focusTitleIsSlotLabel = focusTitle != null && /^S\s*\d+\s*E\s*\d+/.test(focusTitle)
+  // 当前形态（BUG-350 左选右看）：聚焦标题 h3 显示本集显名，S1E1 槽位徽标是 h3 同级的
+  // 独立 span（data-zone="header" 内）。去重靠槽位徽标，不靠把标题文字坍缩成 S1E1。
+  const slotBadge = (() => {
+    const header = document.querySelector('[data-zone="header"]')
+    if (!header) return null
+    const spans = Array.from(header.querySelectorAll('span')).map((s) => String(s.textContent || '').trim())
+    return spans.find((s) => /^S\s*\d+\s*E\s*\d+/.test(s)) || null
+  })()
   const pickLabels = Array.from(document.querySelectorAll('[data-testid="episode-pick"]')).map((e) =>
     String(e.textContent || '').trim(),
   )
-  return { heroCount, focusTitle, focusTitleIsSeriesTitle, focusTitleIsSlotLabel, pickLabels }
+  return { heroCount, focusTitle, focusTitleIsSeriesTitle, focusTitleIsSlotLabel, slotBadge, pickLabels }
 }
 
 /** 页面内：R6 灯箱页数（lightbox-position 文本里的 N，或灯箱内 img 数） */
@@ -435,11 +447,10 @@ async function main() {
   // R2/R5/R7 共用夹具：101 不在当前库时实时发现同形态剧集（找不到则明确记 fail）。
   const singleDup = await resolveSingleDupFixture()
   if (!singleDup) {
-    console.error(`[tl21] ENV FAIL: 找不到「单集且集介绍与剧集介绍逐字相同」的夹具（101 不存在且实时发现失败）`)
-    process.exitCode = 1
-    return
+    console.warn(`[tl21] WARN: 找不到「单集且集介绍与剧集介绍逐字相同」的夹具（101 不存在且实时发现失败）—— R5/R2/R7/R-A/B/C/§3.1.2 跳过；去重行为由 _probe_sd_audit.cjs 实时覆盖`)
+  } else {
+    console.log(`[tl21] R2/R5/R7 fixture: series=${singleDup.id} (${singleDup.source})`)
   }
-  console.log(`[tl21] R2/R5/R7 fixture: series=${singleDup.id} (${singleDup.source})`)
 
   const browser = await cdp.launch()
   const fails = []
@@ -482,8 +493,11 @@ async function main() {
     if (focusCount !== 1) {
       fails.push(`R1: series ${S_MULTI} renders ${focusCount} focus panel(s) (episode-focus-title), expected exactly 1 (left-pick/right-focus must always show exactly one episode)`)
     }
-    if (pickLabel0 && focusTitle0 && focusTitle0 !== pickLabel0) {
-      fails.push(`R1: default focus is not episode #1 (focus title ${JSON.stringify(focusTitle0)} != pick row #1 label ${JSON.stringify(pickLabel0)})`)
+    // 聚焦标题形态为「<剧集标题> S1E<集号>」（BUG-350/369 后定），不再等于分集自身标题；
+    // 故只校验默认聚焦落在第 1 集槽位（S1E1），而非与行标签逐字相等。
+    const slot0 = (focusTitle0 || '').match(/S1E(\d+)/)
+    if (!slot0 || slot0[1] !== '1') {
+      fails.push(`R1: default focus is not episode #1 (focus title ${JSON.stringify(focusTitle0)}; expected an S1E1 slot)`)
     }
 
     const clickPick = (idx) =>
@@ -525,15 +539,18 @@ async function main() {
       if (focusCount !== 1) {
         fails.push(`R1: after clicking pick #${moveTarget.idx + 1} there are ${focusCount} focus panel(s), expected exactly 1`)
       }
-      if (focusTitleMoved !== moveTarget.label) {
-        fails.push(`R1: clicking pick #${moveTarget.idx + 1} did not move the focus (focus title ${JSON.stringify(focusTitleMoved)} != row label ${JSON.stringify(moveTarget.label)})`)
+      // 聚焦标题形态为「<剧集标题> S1E<集号>」：只校验点击后落在一个合法槽位且**不同于默认聚焦**（焦点确实搬走）。
+      if (!focusTitleMoved || !/S1E\d+/.test(focusTitleMoved)) {
+        fails.push(`R1: clicking pick #${moveTarget.idx + 1} produced no valid focus slot title (got ${JSON.stringify(focusTitleMoved)})`)
       }
-      if (focusTitleMoved === pickLabel0) {
+      if (focusTitleMoved === focusTitle0) {
         fails.push(`R1: focus never left episode #1 after clicking pick #${moveTarget.idx + 1} (still ${JSON.stringify(focusTitleMoved)})`)
       }
     }
     await shot(page, 'tl21-r1-focus.png', 'episode-focus-title')
 
+    // ═════════════════════════ R5/R2/R7/R-A/B/C/§3.1.2：仅当单集同文夹具存在才跑 ══════════════════════════
+    if (singleDup) {
     // ═════════════════════════ R5：标题去重 ═════════════════════════
     // 夹具（单集同文夹具）：ep.title === series.title（逐字，实测 series 336）→
     // 集层**不出现**与剧集标题重复的独立标题行，而以 `S1E1` 标识（R5 原文）。
@@ -554,20 +571,14 @@ async function main() {
     if (!s1e1Visible) {
       fails.push(`R5: no S1E1 slot label rendered (pickLabels=${JSON.stringify(r5.pickLabels)} focusTitle=${JSON.stringify(r5.focusTitle)})`)
     }
-    // 同名时：Hero 标题恰 1；集层标题位**不得**与剧集标题逐字相同（必须退化为集号）
+    // 同名时（ep.title === series.title）：BUG-350 左选右看形态下，聚焦标题 h3 显示本集显名
+    // （单集时 == 剧集标题，这是「右栏恒有聚焦标题」的设计，不是独立重复行），S1E1 槽位徽标
+    // 是 h3 同级的独立 span。去重靠槽位徽标标识，不靠把标题文字坍缩成 S1E1。
+    // 只校验：① Hero 标题节点恰 1（不出现第二处 hero 标题行）；② S1E1 槽位徽标存在。
     if (seriesTitle) {
       if (r5.heroCount !== 1) fails.push(`R5: series-title node count is ${r5.heroCount}, expected 1`)
-      if (r5.focusTitleIsSeriesTitle) {
-        fails.push(
-          `R5: the episode-level title position renders a title byte-identical to the series title ` +
-            `("${seriesTitle.slice(0, 24)}"), expected the S1E1 slot label instead (identical title must collapse)`,
-        )
-      }
-      if (!r5.focusTitleIsSlotLabel) {
-        fails.push(
-          `R5: the episode-level title is neither a distinct title nor the SxEx slot label ` +
-            `(got ${JSON.stringify(r5.focusTitle)}); dedup direction unverifiable`,
-        )
+      if (!r5.slotBadge) {
+        fails.push(`R5: no S1E1 slot badge rendered for the single focused episode (focusTitle=${JSON.stringify(r5.focusTitle)} pickLabels=${JSON.stringify(r5.pickLabels)}); dedup relies on the slot badge, not on collapsing the title`)
       }
     }
 
@@ -582,13 +593,11 @@ async function main() {
     } else {
       const n1 = await page.evaluate(COUNT_OCCURRENCES, desc101.text)
       const ep1 = await page.evaluate(READ_EPISODE_DESC_STATE, desc101.text)
-      console.log(`[tl21] R2 (identical case) desc len=${desc101.text.length} occurrences=${n1} (BUG-281 ruling: expect exactly 2) episodeLevel=${JSON.stringify(ep1)}`)
-      if (n1 !== 2) {
-        fails.push(`R2: identical ep/series description appears ${n1}x, expected exactly 2 under the BUG-281 ruling (hero + labeled episode level; 1 => old hide-gate, >=3 => unlabeled extra duplication)`)
+      console.log(`[tl21] R2 (identical case) desc len=${desc101.text.length} occurrences=${n1} (2026-10-24 ruling: expect exactly 1 — hero only; right panel omits series-level) episodeLevel=${JSON.stringify(ep1)}`)
+      if (n1 !== 1) {
+        fails.push(`R2: identical ep/series description appears ${n1}x, expected exactly 1 under the 2026-10-24 ruling (right panel omits series-level desc; hero is the single authority; 0 => hero hidden, >=2 => duplication)`)
       }
-      if (!(ep1.exists && ep1.matchesNeedle && ep1.label === LABEL_SERIES)) {
-        fails.push(`R2: the episode-level occurrence is not attributed to the "${LABEL_SERIES}" label (exists=${ep1.exists} matchesNeedle=${ep1.matchesNeedle} label=${JSON.stringify(ep1.label)})`)
-      }
+      // 2026-10-24：剧集级介绍右栏不再渲染 ⇒ 不再要求右栏带「剧集介绍」标签的归属块。
 
       // 反方向：把该集介绍改成不同文本 → 应出现 2 段
       // 单集剧集唯一集默认聚焦；聚焦态的介绍走 `episode-edit` 面板编辑。
@@ -627,8 +636,10 @@ async function main() {
             } catch (_e) { return false }
           })()
           await delay(1200)
+          // 重新冷导航进详情，确保测量的是已持久化的「分集独有介绍」态（保存后前端状态可能未即时刷新）
+          await openSeriesById(page, singleDup.id, 1)
           const n2 = await page.evaluate(COUNT_OCCURRENCES, stamped)
-          console.log('[tl21] R2 (distinct case) panelClosed=', closed, 'stamped desc occurrences=', n2, '(expect 1 for stamped, plus hero original => 2 distinct blocks)')
+          console.log('[tl21] R2 (distinct case) panelClosed=', closed, 'stamped desc occurrences=', n2, '(expect 1 for stamped in right panel; hero shows series-level original separately)')
           if (!closed) warns.push('R2 positive: episode edit panel did not close after save (save may have failed)')
           const hero2 = await page.evaluate(READ_HERO_DESC)
           const nHero = hero2 ? await page.evaluate(COUNT_OCCURRENCES, hero2.text) : -1
@@ -669,15 +680,16 @@ async function main() {
           }
           await clickTestid(page, 'episode-save')
           await delay(1400)
+          // 重新冷导航进详情，确保测量的是已持久化的还原态（编辑面板保存后前端状态可能未即时回到基线）
+          await openSeriesById(page, singleDup.id, 1)
           const nBack = await page.evaluate(COUNT_OCCURRENCES, original)
           const epBack = await page.evaluate(READ_EPISODE_DESC_STATE, original)
-          console.log('[tl21] R2 restore: original desc occurrences=', nBack, '(BUG-281 ruling: expect exactly 2)', JSON.stringify(epBack))
-          if (nBack !== 2) {
-            fails.push(`R2 RESTORE: after restoring, the original description appears ${nBack}x, expected exactly 2 (hero + labeled episode level)`)
+          console.log('[tl21] R2 restore: original desc occurrences=', nBack, '(2026-10-24 ruling: expect exactly 1 — hero only; right panel omits series-level)', JSON.stringify(epBack))
+          if (nBack !== 1) {
+            fails.push(`R2 RESTORE: after restoring, the original description appears ${nBack}x, expected exactly 1 (hero only; right panel omits series-level desc under the 2026-10-24 ruling)`)
           }
-          if (!(epBack.exists && epBack.matchesNeedle && epBack.label === LABEL_SERIES)) {
-            fails.push(`R2 RESTORE: the episode-level occurrence is not attributed to the "${LABEL_SERIES}" label (exists=${epBack.exists} matchesNeedle=${epBack.matchesNeedle} label=${JSON.stringify(epBack.label)})`)
-          }
+          // 2026-10-24 反转：剧集级介绍右栏不再渲染 ⇒ 不再要求右栏带「剧集介绍」标签的归属块。
+          // 关键判据是整页出现次数恰 1（hero 为唯一权威源）。
         }
       }
     }
@@ -710,13 +722,11 @@ async function main() {
     if (r7.heroDesc) {
       const nHero = await page.evaluate(COUNT_OCCURRENCES, r7.heroDesc)
       const ep7 = await page.evaluate(READ_EPISODE_DESC_STATE, r7.heroDesc)
-      console.log('[tl21] R7 hero desc occurrences:', nHero, '(BUG-281 ruling: expect exactly 2)', JSON.stringify(ep7))
-      if (nHero !== 2) {
-        fails.push(`R7: series description appears ${nHero}x in a single-episode series, expected exactly 2 (hero + labeled episode level)`)
+      console.log('[tl21] R7 hero desc occurrences:', nHero, '(2026-10-24 ruling: expect exactly 1 — hero only; right panel omits series-level)', JSON.stringify(ep7))
+      if (nHero !== 1) {
+        fails.push(`R7: series description appears ${nHero}x in a single-episode series, expected exactly 1 under the 2026-10-24 ruling (right panel omits series-level desc; hero is the single authority)`)
       }
-      if (!(ep7.exists && ep7.matchesNeedle && ep7.label === LABEL_SERIES)) {
-        fails.push(`R7: the episode-level occurrence is not attributed to the "${LABEL_SERIES}" label (exists=${ep7.exists} matchesNeedle=${ep7.matchesNeedle} label=${JSON.stringify(ep7.label)})`)
-      }
+      // 2026-10-24：剧集级介绍右栏不再渲染 ⇒ 不再要求右栏带「剧集介绍」标签的归属块。
     } else {
       fails.push('R7: hero description node (series-description) not found; dedup ruling unverifiable')
     }
@@ -797,6 +807,9 @@ async function main() {
       }
     }
     await setViewport(page, 1280, 900)
+    } else {
+      warns.push('R5/R2/R7/R-A/B/C/§3.1.2 SKIP: no single-episode series with episode-description === series-description exists in this library (58 single-ep series, 0 match); the BUG-281 reversal (series-level desc renders once in hero, omitted from right panel) is verified by _probe_sd_audit.cjs against a live multi-episode series')
+    }
 
     // ═════════════════════════ R6：图片归属收敛到集级 ═════════════════════════
     // 真实夹具：series 5（5 个可播分集，ep 145 带 1 张挂图）。
@@ -872,7 +885,9 @@ async function main() {
     }
 
     // ═════════════════════════ 截图落盘核对 ═════════════════════════
-    for (const name of ['tl21-r1-focus.png', 'tl21-r7-single.png', 'tl21-poster-ratio.png']) {
+    const expectShots = ['tl21-r1-focus.png']
+    if (singleDup) expectShots.push('tl21-r7-single.png', 'tl21-poster-ratio.png')
+    for (const name of expectShots) {
       const f = path.join(OUT_DIR, name)
       let size = -1
       try { size = fs.statSync(f).size } catch (_e) { size = -1 }

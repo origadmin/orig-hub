@@ -2,7 +2,12 @@
 'use strict'
 
 /**
- * BUG-281 **媒体库侧（shell）**验收：分集介绍「按来源贴标签」取代「逐字相同即隐藏」。
+ * BUG-281 **媒体库侧（shell）**验收：分集介绍渲染裁定。
+ *
+ * **2026-10-24 裁定反转**（详见 `docs/bugs/BUG-281.md` 同名小节）：2026-10-12 的
+ * 「按来源贴标签、剧集级也渲染」已被推翻——左栏总览（series-description）已恒常驻展示
+ * 剧集介绍，右栏聚焦面**只在「分集独有介绍」时渲染**（标签恒「本集介绍」），剧集级介绍
+ * 右栏不再重复。本脚本判据 1 / 4.2 已同步：剧集级 ⇒ 右栏 episode-focus-desc 不应存在。
  *
  * ## 被验对象（产品裁定，2026-10-12 用户定）
  *
@@ -53,6 +58,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const cdp = require('./lib/cdp.cjs')
+const sandbox = require('./lib/sandbox.cjs')
 
 const APP_PORT = Number(process.env.APP_PORT || 5180)
 const APP_URL = `http://127.0.0.1:${APP_PORT}/`
@@ -102,8 +108,11 @@ async function httpJson(method, url, body) {
 
 async function resolveTg() {
   const cfg = await httpJson('GET', `${DAEMON}/api/config`)
-  if (cfg.status !== 200 || !cfg.json || !cfg.json.tg_port) return null
-  return `http://127.0.0.1:${cfg.json.tg_port}`
+  // BUG-358 起 `/api/config` 的 `tg_port` 收进 `plugins[]`（id='tg'）—— 旧键直读
+  // 会恒得 undefined（BUG-422 实测假红）。适配器双契约兼容，只此一处。
+  const tgPort = sandbox.tgPortOf(cfg.json)
+  if (cfg.status !== 200 || !cfg.json || !tgPort) return null
+  return `http://127.0.0.1:${tgPort}`
 }
 
 async function shot(page, name) {
@@ -246,17 +255,9 @@ async function gotoWall(page) {
     return true
   })
   if (!navOk) throw new Error('nav-child-lib-series 入口不存在')
-  await page.waitForFunction(() => !!document.querySelector('[data-testid="media-panel-title"]'), {
-    timeout: 25000,
-    intervalMs: 300,
-  })
-  const railOk = await page.evaluate(() => {
-    const el = document.querySelector('[data-testid="media-rail-series-all"]')
-    if (!el) return false
-    el.click()
-    return true
-  })
-  if (!railOk) throw new Error('media-rail-series-all 入口不存在')
+  // BUG-422：`media-panel-title` 随面板头部整改已废止（恒超时）——删掉该等待，
+  // 墙可达性由下面的 series-card-root 有界等待承担。
+  // M0 导航模型（BUG-298）：`media-rail-series-all` 已废止，侧栏入口直达剧集墙。
   await page.waitForFunction(
     () => document.querySelectorAll('[data-testid="series-card-root"]').length > 0,
     { timeout: 25000, intervalMs: 300 },
@@ -329,6 +330,7 @@ async function main() {
   console.log(`[bug281] tg=${TG}`)
 
   let browser = null
+  let emptyFixture = null
   try {
     browser = await cdp.launch()
     const page = await browser.newPage()
@@ -362,7 +364,35 @@ async function main() {
         String(e.description || '').trim() !== seriesDescB.trim(),
     ) || null
     // 空态靶子：介绍为空的某一集（如 EP1）
-    const epEmpty = epsA.find((e) => String(e.description || '').trim().length === 0) || null
+    let epEmpty = epsA.find((e) => String(e.description || '').trim().length === 0) || null
+    /*
+     * BUG-422：series A 曾被 BUG-420 的 hash 回填补满介绍（引擎回填前实测 1 条空介绍，
+     * 现在 0 条）⇒ 空态咬合面在真实库里取不到靶子。自建夹具剧集（条目**不给
+     * description** ⇒ 分集介绍为空，与真实空态同构），靶子口径不变。
+     */
+    let emptySeriesId = SERIES_A
+    if (!epEmpty) {
+      const ts = Date.now()
+      const itemTitle = `ZZ-BUG281-EMPTY-${ts}`
+      const fakePath = path.join(require('node:os').tmpdir(), `orighub-bug281-${ts}-0.mp4`)
+      const it = await httpJson('POST', `${TG}/api/media/items`, {
+        items: [{ path: fakePath, source: 'local', kind: 'video', title: itemTitle }],
+      })
+      const itemId = it.json && Array.isArray(it.json.ids) ? it.json.ids[0] : null
+      if (itemId == null) throw new Error(`空态夹具条目创建失败 (status=${it.status})`)
+      await sandbox.detachAutoSeries(TG, itemId)
+      const ser = await httpJson('POST', `${TG}/api/media/series`, { title: `ZZ-BUG281-ES-${ts}`, kind: 'series' })
+      const seriesId = ser.json && ser.json.id
+      if (seriesId == null) throw new Error(`空态夹具剧集创建失败 (status=${ser.status})`)
+      const ep = await httpJson('POST', `${TG}/api/media/series/${seriesId}/episodes`, { itemId, season: 1, episodeNo: 1 })
+      if (ep.status !== 200) throw new Error(`空态夹具分集挂载失败 (status=${ep.status})`)
+      const d = await httpJson('GET', `${TG}/api/media/series/${seriesId}`)
+      epEmpty = (d.json && d.json.episodes && d.json.episodes[0]) || null
+      if (!epEmpty) throw new Error('空态夹具分集读数失败')
+      emptyFixture = { seriesId, itemId }
+      emptySeriesId = seriesId
+      console.log(`[bug281] 自建空态夹具: series=${seriesId} item=${itemId} epId=${epEmpty.id}`)
+    }
 
     check('0.1', '剧集级靶子存在：series A 有「介绍非空且逐字等于剧集介绍」的分集',
       Boolean(epA),
@@ -410,44 +440,55 @@ async function main() {
       `present=${heroA.present} visible=${heroA.visible} textLen=${heroA.text ? heroA.text.length : -1} identical=${heroA.text === seriesDescA}`)
 
     // ── 判据 1：剧集级分集（A 的 caption 归属集） ─────────────────────
-    console.log(`\n[bug281] === 判据 1：剧集级分集（series ${SERIES_A} EP${epA.episodeNo}，旧代码必红） ===`)
+    // 2026-10-24 裁定反转：剧集级介绍（与剧集介绍逐字相同）已在左栏总览
+    // （series-description）常驻展示，右栏聚焦面**不再重复渲染** ⇒ 右栏
+    // episode-focus-desc 不应存在；介绍只在左栏出现一次（消除「同一段简介
+    // 出现两次」）。旧代码（贴「剧集介绍」标签仍渲染）下 1.1/1.2 必 FAIL。
+    console.log(`\n[bug281] === 判据 1：剧集级分集（series ${SERIES_A} EP${epA.episodeNo}，新裁定：右栏不重复） ===`)
     await selectEpisode(page, epA.id)
     const blockA = await readDescBlock(page)
     await shot(page, `01-series${SERIES_A}-ep${epA.episodeNo}-serieslevel-desc.png`)
 
-    check('1.1', `series ${SERIES_A} EP${epA.episodeNo}：episode-focus-desc 在 DOM 中`,
-      blockA.hasDesc === true,
-      'querySelector([data-testid="episode-focus-desc"]) 非空',
-      `hasDesc=${blockA.hasDesc} label=${JSON.stringify(blockA.label)} emptyText=${JSON.stringify(blockA.emptyText)}`)
-    check('1.2', `series ${SERIES_A} EP${epA.episodeNo}：episode-focus-desc 可见（非 display:none / 零尺寸）`,
-      blockA.hasDesc === true && blockA.descVisible === true,
-      'hasDesc=true 且 descVisible=true（getClientRects + computed style 判定）',
-      `hasDesc=${blockA.hasDesc} descVisible=${blockA.descVisible}`)
-    check('1.3', `series ${SERIES_A} EP${epA.episodeNo}：正文非空且 === 该集介绍（trim 后逐字相等）`,
-      blockA.descText != null && blockA.descText.trim() === String(epA.description || '').trim(),
-      `text.trim() === API 下发的该集 description（len=${String(epA.description || '').length}）`,
-      `textLen=${blockA.descText == null ? -1 : blockA.descText.length} identical=${blockA.descText != null && blockA.descText.trim() === String(epA.description || '').trim()}`)
-    check('1.4', `series ${SERIES_A} EP${epA.episodeNo}：区块标签 === 「${LABEL_SERIES}」（剧集级来源）`,
-      blockA.label === LABEL_SERIES,
-      `label === "${LABEL_SERIES}"（zh: media.episode.sectionDescSeries）`,
-      `label=${JSON.stringify(blockA.label)} hasLabelTestid=${blockA.hasLabelTestid}`)
-    check('1.5', `series ${SERIES_A} EP${epA.episodeNo}：不出现空态文案「${EMPTY_TEXT}」`,
+    check('1.1', `series ${SERIES_A} EP${epA.episodeNo}：右栏不再重复渲染剧集级介绍 —— episode-focus-desc 不应存在`,
+      blockA.hasDesc === false,
+      'querySelector([data-testid="episode-focus-desc"]) 为空',
+      `hasDesc=${blockA.hasDesc} label=${JSON.stringify(blockA.label)}`)
+    check('1.2', `series ${SERIES_A} EP${epA.episodeNo}：剧集级介绍只在左栏总览出现一次（series-description 可见且 === 剧集介绍）`,
+      heroA.present && heroA.visible && heroA.text === seriesDescA,
+      'series-description 可见，text === 剧集介绍（与判据 3.1 同旨，此处确认不重复）',
+      `present=${heroA.present} visible=${heroA.visible} identical=${heroA.text === seriesDescA}`)
+    check('1.3', `series ${SERIES_A} EP${epA.episodeNo}：右栏不出现空态文案「${EMPTY_TEXT}」`,
       blockA.emptyText !== EMPTY_TEXT,
-      `空态 <p> 文本 !== "${EMPTY_TEXT}"`,
+      `emptyText !== "${EMPTY_TEXT}"（剧集级不进右栏，自然也无空态）`,
       `emptyText=${JSON.stringify(blockA.emptyText)}`)
 
     // ── 判据 4（A 页）：空态仍保留 + 非空分集全渲染 ───────────────────
-    console.log(`\n[bug281] === 判据 4：空态咬合 + 非空分集不漏（series ${SERIES_A}） ===`)
+    console.log(`\n[bug281] === 判据 4：空态咬合 + 非空分集不漏（series ${emptySeriesId}） ===`)
+    if (emptySeriesId !== SERIES_A) {
+      // 空态靶子来自夹具剧集：重新走墙打开它（与判据 2 导航 series B 同机制）
+      await gotoWall(page)
+      await openSeries(page, emptySeriesId)
+    }
     await selectEpisode(page, epEmpty.id)
     const blockEmpty = await readDescBlock(page)
-    await shot(page, `02-series${SERIES_A}-ep${epEmpty.episodeNo}-empty-state.png`)
-    check('4.1', `series ${SERIES_A} EP${epEmpty.episodeNo}（介绍为空）：仍走空态，无 episode-focus-desc`,
+    await shot(page, `02-series${emptySeriesId}-ep${epEmpty.episodeNo}-empty-state.png`)
+    check('4.1', `series ${emptySeriesId} EP${epEmpty.episodeNo}（介绍为空）：仍走空态，无 episode-focus-desc`,
       blockEmpty.hasDesc === false && blockEmpty.emptyText === EMPTY_TEXT,
       `hasDesc=false 且空态文案 === "${EMPTY_TEXT}"`,
       `hasDesc=${blockEmpty.hasDesc} emptyText=${JSON.stringify(blockEmpty.emptyText)}`)
 
-    const nonEmptyEps = epsA.filter((e) => String(e.description || '').trim().length > 0)
-    console.log(`[bug281] series ${SERIES_A} 非空介绍分集数=${nonEmptyEps.length}（引擎回填前实测 1；回填后应为 8）`)
+    if (emptySeriesId !== SERIES_A) {
+      // 4.1 在夹具剧集上做；4.2 要遍历 series A 的全部分集 ⇒ 先回 series A
+      await gotoWall(page)
+      await openSeries(page, SERIES_A)
+    }
+    const nonEmptyEps = epsA.filter((e) => {
+      // 2026-10-24 裁定：剧集级介绍（逐字等于剧集介绍）已收口到左栏总览，右栏不再渲染；
+      // 4.2 只核对「分集独有」非空介绍分集是否在右栏渲染出正文。
+      const d = String(e.description || '').trim()
+      return d.length > 0 && d !== seriesDescA.trim()
+    })
+    console.log(`[bug281] series ${SERIES_A} 分集独有非空介绍分集数=${nonEmptyEps.length}（剧集级介绍不计入右栏渲染）`)
     let allNonEmptyRendered = true
     const renderedLens = []
     for (const e of nonEmptyEps) {
@@ -507,6 +548,15 @@ async function main() {
     if (failed.length) console.log('[bug281] FAILED:', failed.map((c) => `${c.id}:${c.label}`).join(' | '))
     process.exitCode = failed.length ? 2 : 0
   } finally {
+    // BUG-422：空态夹具清理（删剧集即解挂）
+    if (emptyFixture) {
+      try {
+        const del = await httpJson('DELETE', `${TG}/api/media/series/${emptyFixture.seriesId}`)
+        console.log(`[bug281] 空态夹具已清理: series=${emptyFixture.seriesId} item=${emptyFixture.itemId} status=${del.status}`)
+      } catch (e) {
+        console.error(`[bug281] 空态夹具清理失败: ${e && e.message}`)
+      }
+    }
     if (browser) await browser.close()
   }
 }

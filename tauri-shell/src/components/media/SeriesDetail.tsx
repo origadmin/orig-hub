@@ -676,28 +676,20 @@ export function SeriesDetail(props: {
                 >
                   {detail.description}
                 </p>
-                <div className="flex shrink-0 flex-col items-start gap-1">
-                  {descOverflowing ? (
-                    <button
-                      type="button"
-                      onClick={() => setDescExpanded((v) => !v)}
-                      className="rounded px-1.5 py-0.5 text-[10.5px] text-accent hover:bg-accent/10"
-                      data-testid="series-desc-toggle"
-                    >
-                      {descExpanded ? t('media.series.descShowLess') : t('media.series.descShowMore')}
-                    </button>
-                  ) : null}
-                  {/* 编辑入口进 `SeriesEditPanel`（介绍与标题/类型/年份/标签一次提交） */}
+                {/* 编辑入口统一收口到右栏动作条的 `series-edit`（同一个
+                    `SeriesEditPanel`，含介绍/标题/类型/年份/标签），此处不再放第二颗
+                    「编辑」—— 否则与动作条那颗逐字同文案、功能完全重叠（用户
+                    2026-10-24 报「两个编辑按钮」）。长文仍可展开。 */}
+                {descOverflowing ? (
                   <button
                     type="button"
-                    onClick={() => setEditingSeries(true)}
-                    className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] text-muted hover:bg-surface-2 hover:text-fg-mid"
-                    title={t('media.editSeriesDesc')}
-                    data-testid="series-desc-edit"
+                    onClick={() => setDescExpanded((v) => !v)}
+                    className="shrink-0 rounded px-1.5 py-0.5 text-[10.5px] text-accent hover:bg-accent/10"
+                    data-testid="series-desc-toggle"
                   >
-                    <Pencil className="h-3 w-3" /> {t('media.series.editMeta')}
+                    {descExpanded ? t('media.series.descShowLess') : t('media.series.descShowMore')}
                   </button>
-                </div>
+                ) : null}
               </div>
             ) : (
               /* 介绍空态：可编辑空位（R4 判据）—— 不出现首集介绍文本 */
@@ -1359,22 +1351,22 @@ export function SeriesDetail(props: {
                 </div>
               ) : null}
 
-              {/* 本集介绍（BUG-281 产品裁定：**按来源贴标签，不再按文本隐藏**）。
-                  非空即渲染：与剧集介绍逐字相同 ⇒ 贴「剧集介绍」标签（TG 相册组
-                  共拥一条组级 caption，重复是显式的、有说明的）；不同 ⇒ 「本集介绍」。
-                  旧门控「逐字相同即隐藏」把 36/44 条有介绍的分集藏成了空态，
-                  即 BUG-281 报障的「大部分集是没有内容的」。
-                  BUG-203：编辑态隐藏 —— 介绍正在编辑面板的 textarea 里，正文再渲染一份
-                  就是第二处重复（与标题的 2 行重叠同根因）。 */}
-              {!editingEpisode ? (
+              {/* 本集介绍（2026-10-24 裁定）：剧集级介绍（与剧集介绍 trim 后逐字相同）
+                  已在左栏总览常驻展示（`series-description`），右栏**不再重复渲染**，
+                  消除「同一段简介出现两次」（BUG-171 复报 / 用户 2026-10-24 报障）。
+                  只有分集独有介绍才在右栏渲染（标签恒为「本集介绍」）；空态显示
+                  「本集暂无介绍」。
+                  演进：BUG-281（2026-10-12）曾改「非空即渲染 + 贴『剧集介绍』标签」，
+                  但可见的重复仍是重复 ⇒ 本次改为右栏仅在「分集独有」时渲染。
+                  BUG-203：编辑态隐藏 —— 介绍在编辑面板 textarea 里，正文再渲染一份是
+                  第二处重复。 */}
+              {!editingEpisode && !episodeDescriptionIsSeriesLevel(cur, detail) ? (
                 <div className="flex flex-col gap-1.5">
                   <span
                     className="text-[11px] font-medium text-fg-strong"
                     data-testid="episode-focus-desc-label"
                   >
-                    {episodeDescriptionIsSeriesLevel(cur, detail)
-                      ? t('media.episode.sectionDescSeries')
-                      : t('media.episode.sectionDesc')}
+                    {t('media.episode.sectionDesc')}
                   </span>
                   {shouldRenderEpisodeDescription(cur, detail) ? (
                     <p
@@ -1386,8 +1378,6 @@ export function SeriesDetail(props: {
                   ) : (
                     <p className="text-[11px] text-muted/70">{t('media.descEmptyEp')}</p>
                   )}
-                  {/* BUG-201：此处**不再**放第二个编辑按钮 —— 介绍与标题/槽位在同一个
-                      `episode-edit` 面板里，两个入口打开的是同一个面板。 */}
                 </div>
               ) : null}
 

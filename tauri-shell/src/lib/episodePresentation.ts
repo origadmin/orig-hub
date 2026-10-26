@@ -71,33 +71,37 @@ export function episodeRowTitle(ep: MediaEpisode, series: MediaSeriesDetail): st
 }
 
 /**
- * 单集介绍是否需要在单集层渲染。
+ * 单集介绍是否需要在单集层（右栏聚焦面）渲染。
  *
- * BUG-281 产品裁定（2026-10-12，用户定）：**按来源贴标签，不再按文本隐藏**。
+ * 2026-10-24 裁定（用户复报「简介出现两次」）：**剧集级介绍不在右栏重复渲染**。
  *
- * 旧规则（BUG-171 / series 101 实测）是「与剧集介绍逐字相同 ⇒ 隐藏」，理由是
- * 「同一段文案在剧集层与单集层各显示一遍」。但 TG 相册组只带**一条**组级
- * caption：实测全库 44 条有介绍的分集里 **36 条逐字等于剧集介绍**（series 315
- * EP6 即 232 字全等）⇒ 旧门控把唯一的内容入口也隐藏了，用户在几乎每一集上
- * 读到空态「本集暂无介绍」—— 这正是 BUG-281 的报障原话「大部分集是没有内容的」。
+ * 演进：
+ *  - 旧规则（BUG-171）：与剧集介绍逐字相同 ⇒ 隐藏。缺陷：TG 相册组只有一条组级
+ *    caption，36/44 条分集逐字等于剧集介绍 ⇒ 右栏几乎每集都空态「本集暂无介绍」
+ *    （BUG-281 报障「大部分集是没有内容的」）。
+ *  - BUG-281 裁定（2026-10-12）：改为「非空即渲染 + 贴『剧集介绍』标签」，让重复
+ *    可见、有说明。
+ *  - 2026-10-24 复报：可见的重复仍是重复 —— 用户判定「没修」。此时左栏总览已**恒常驻**
+ *    展示剧集介绍（BUG-183 补回的 `series-description`），剧集级文案在左栏有一份权威
+ *    展示位，右栏再贴一份就是纯冗余。
  *
- * 新规则：单集介绍 **trim 后非空即渲染**。与剧集介绍逐字相同的那部分不再消失，
- * 而是由渲染层按 `episodeDescriptionIsSeriesLevel` 贴上「剧集介绍」标签 ——
- * 与剧集头那段重复现在是**可见的、有说明的**，而不是被藏掉。只有连文本都没有时
- * 才走空态 `media.descEmptyEp`。
+ * 现行规则（与左栏总览分工，内容只出现一次）：
+ *  - 空 ⇒ 右栏走空态 `media.descEmptyEp`（此时左栏也没有，确实没有）；
+ *  - 与剧集介绍 trim 后逐字相同（剧集级）⇒ **右栏不渲染**（已在左栏总览展示）；
+ *  - 其余（分集独有介绍）⇒ 右栏渲染，标签恒为「本集介绍」。
  *
- * 设计约束（文件头）不变：编辑入口从不问这些函数；这是**渲染期规则**；
- * 绝不为了去重去改数据（P5 单一真源）。
- *
- * `_series` 保留在签名里（下划线 = 不再参与判定）：两层展示判定的 (ep, series)
- * 参数对是模块的既有契约，调用点（`SeriesDetail` / `EpisodeExpanded`）不因本次
- * 裁定而改形；来源判定已移交给 `episodeDescriptionIsSeriesLevel`。
+ * 编辑入口从不问这些函数（设计约束，文件头）；这是渲染期规则，绝不为了去重去改
+ * 数据（P5 单一真源）。`series` 现在参与判定（剧集级去重的依据）。
  */
 export function shouldRenderEpisodeDescription(
   ep: MediaEpisode,
-  _series: MediaSeriesDetail,
+  series: MediaSeriesDetail,
 ): boolean {
-  return (ep.description ?? '').trim().length > 0
+  const epDesc = (ep.description ?? '').trim()
+  if (epDesc.length === 0) return false
+  // 剧集级介绍：左栏总览已常驻展示，右栏不再重复（消除「同一段简介出现两次」）。
+  if (epDesc === (series.description ?? '').trim()) return false
+  return true
 }
 
 /**
