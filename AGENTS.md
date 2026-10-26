@@ -30,7 +30,8 @@
 要求：
 
 - 二进制（sidecar `*.exe`、`target/`、`dist/`、`node_modules/`、`/bin`、`/data`）**绝不入库**（已由根 `.gitignore` 覆盖）。
-- 提交前确保 `cargo build`（engine）与 `npm run build`（shell 前端）通过。
+- **提交要快（2026-10-26 用户裁定）**：提交期只跑毫秒级目录污染检查，**不在提交时跑 `check-bugs` / `check-decisions`，也不跑构建**。登记/决策门禁与构建属「编码完成、推送/交付前」的闸门，由 `pre-push` 与 CI 执行；本地提交不应被内容门禁或构建拖慢。
+- 交付/推送前确保 `cargo build`（engine）与 `npm run build`（shell 前端）通过。
 - 不 `--no-verify` 跳过钩子，除非显式授权。
 
 ## 3. 缺陷追踪
@@ -127,15 +128,16 @@
 
 | 门禁 | 脚本（单一真源） | 覆盖 | 本地钩子 | CI |
 |---|---|---|---|---|
-| 缺陷登记一致性 | `python scripts/check-bugs.py` | 编号连续 / 索引↔文件双向一致 / 字段枚举 / `fixed` 须有可核证据 / 登记档位（`standard`｜`light`） | pre-commit（必需） | `registry` |
+| 缺陷登记一致性 | `python scripts/check-bugs.py` | 编号连续 / 索引↔文件双向一致 / 字段枚举 / `fixed` 须有可核证据 / 登记档位（`standard`｜`light`） | pre-push（必需） | `registry` |
 | 登记档位规则 | `python scripts/verify_light_tier.py` | 反向证伪：轻量档缺证据、轻量档写根因、档位值非法、未知字段名**各自必须 FAIL**；合法轻量档**必须零报错** | — | `registry` |
-| 决策项可拍板性 | `python scripts/check-decisions.py` | 每条 `### D<n>.` 必须有：`请求:` / `设计锚点:`（指向真实 `docs/*.md`）/ **≥2 个实质选项** / **「不做」选项（按 `涉及:` 实质判定，非标签）** / 每选项 `涉及:`+`量化:`+`回归风险:`+`后果:`（空字段=不存在） | pre-commit（必需） | `registry` |
+| 决策项可拍板性 | `python scripts/check-decisions.py` | 每条 `### D<n>.` 必须有：`请求:` / `设计锚点:`（指向真实 `docs/*.md`）/ **≥2 个实质选项** / **「不做」选项（按 `涉及:` 实质判定，非标签）** / 每选项 `涉及:`+`量化:`+`回归风险:`+`后果:`（空字段=不存在） | pre-push（必需） | `registry` |
 | 决策规范证伪 | `python scripts/verify_decision_spec.py` | 反向证伪：无「不做」、只剩 1 选项、缺/空字段、锚点不存在、标签伪装的「不做」**各自必须 FAIL**；合法全角冒号写法**必须零报错** | — | `registry` |
 | 提交信息 | `python scripts/check-commit-msgs.py` | 全英文（扫 `%B` 全文，只看 `%s` 会假阴性）；`fix` 必须引用 `BUG-<编号>`；**CRLF 检测**：扫 `%B` 全文，出现 `CR` 即失败（必须 LF，`%B` 按字节取，`text=True` 会吃掉 `\r` 致假阴性）；历史欠账（生效点 `3e85681` 及其祖先）只告警不阻断 | commit-msg（必需） | `registry` |
 | 目录污染 | `sh scripts/check-pollution.sh` | 根 4 文件白名单（I1）/ 未跟踪的产物与 AI 目录（I2）/ 未忽略残留（I3） | pre-commit（必需） | `registry` |
 | sidecar 一致性 | `sh scripts/sync-sidecars.sh --check` | release 产物不旧于源码 + 四处副本逐字节一致 | — | `engine` |
 
 - 钩子权威副本在 `scripts/hooks/`（**钩子本身不入库**）：新克隆必须 `bash scripts/install-hooks.sh`。
+  钩子分工（2026-10-26 用户裁定）：`pre-commit` = 目录污染（毫秒级，提交要快）；`pre-push` = 缺陷登记 + 决策项（编码完成、交付前）；`commit-msg` = 英文 + LF。
 - 任一必需依赖缺失即**失败**，不顺延、不静默跳过。历史教训：pre-commit 曾无条件 `exec` 一个从未入库的
   脚本 → 恒 exit 127 把所有提交锁死；随后改成「缺了就跳过」，污染门禁又长期空转（根目录因此积了残留）。
 - CI 与本地钩子调用同一批脚本，CI 是最后一道闸（本地可被 `--no-verify` 绕过）。

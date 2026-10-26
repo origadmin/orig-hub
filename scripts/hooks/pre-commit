@@ -1,69 +1,20 @@
 #!/usr/bin/env sh
 # orig-hub pre-commit hook (tracked copy; install via scripts/install-hooks.sh)
 #
-# 门禁清单（与 AGENTS.md §7 门禁表逐条对应）：
-#  1) 缺陷登记完整性 —— `scripts/check-bugs.py`（编号连续 / 索引双向一致 / 字段枚举 /
-#     fixed 必须有可核证据）。
-#  2) 决策项可拍板性 —— `scripts/check-decisions.py`（每条 `### D<n>.` 必须有 请求 /
-#     设计锚点 / ≥2 个实质选项 /「不做」选项 / 每选项的 涉及+量化+回归风险+后果）。
-#  3) 目录污染 —— `scripts/check-pollution.sh`（AGENTS.md §6：根 4 文件白名单 /
-#     未跟踪产物 / AI 工具目录）。
+# 2026-10-26 用户裁定：**提交要快**，提交期不跑任何 check-bugs / check-decisions，
+# 也不跑构建。缺陷登记与决策项门禁属「编码完成、推送/交付前」的闸门，已移到
+# pre-push（scripts/hooks/pre-push）与 CI 的 `registry` job。
 #
-# 三个依赖**都已入库**，任一缺失即失败（不静默跳过）。
-# 历史教训：本钩子曾无条件 `exec sh scripts/check-pollution.sh`，而该脚本从未入库，
-# 钩子恒 exit 127 → **所有提交被锁死**且报错只指向不存在的文件；随后修成「缺了就跳过」，
-# 结果污染门禁长期空转（根目录因此积了两处残留）。缺依赖必须说真话，不能装没看见。
+# 提交期只保留**目录污染**这一道毫秒级卫生检查（扫暂存集，见 AGENTS.md §6/§7）。
 #
-# BUG-187：本钩子一度只跑第 3 条 —— 缺陷登记门禁在本地静默不执行。安装器曾用内联
-# heredoc 重写本文件，内容停在旧版本，权威副本的修订没跟过来。现在安装器只 `cp` 本文件，
-# 且装完必须 diff 回读校验，二者恒等；少一条门禁即视为安装失败。
+# 历史（BUG-187）：本钩子曾把 check-bugs.py + check-decisions.py 串在提交里；
+#   check-bugs 全量一度要 231s、后续提速到约 3s 仍属「内容门禁」，与「小步快提交」
+#   直接冲突（本地提交被拖慢、多会话还会撞 index.lock）。2026-10-26 起一律挪到 pre-push。
 ROOT="$(git rev-parse --show-toplevel)"
-rc=0
-
-# --- pick the interpreter once; every python gate below needs it ---
-PY=""
-if command -v python >/dev/null 2>&1; then
-  PY=python
-elif command -v python3 >/dev/null 2>&1; then
-  PY=python3
-else
-  echo "pre-commit: FAIL - python not found, cannot run the bug/decision gates" >&2
+GATE="$ROOT/scripts/check-pollution.sh"
+if [ ! -f "$GATE" ]; then
+  echo "pre-commit: FAIL - scripts/check-pollution.sh missing (pollution gate is required)" >&2
   exit 1
 fi
-
-# --- run one required python gate; never silently skipped ---
-# usage: run_python_gate <script> <label> [args...]
-run_python_gate() {
-  _script="$1"
-  _label="$2"
-  shift 2
-  _path="$ROOT/scripts/$_script"
-  if [ ! -f "$_path" ]; then
-    echo "pre-commit: FAIL - scripts/$_script missing ($_label gate is required)" >&2
-    rc=1
-    return 0
-  fi
-  # `--quiet`（仅 check-bugs.py 支持）：历史告警有上百条，全量输出会把真正的 ERROR
-  # 埋掉；总数仍在结论行里。check-decisions.py 无此开关，故不传。
-  "$PY" "$_path" "$@" || rc=1
-}
-
-# --- run one required shell gate ---
-# usage: run_sh_gate <script> <label>
-run_sh_gate() {
-  _script="$1"
-  _label="$2"
-  _path="$ROOT/scripts/$_script"
-  if [ ! -f "$_path" ]; then
-    echo "pre-commit: FAIL - scripts/$_script missing ($_label gate is required)" >&2
-    rc=1
-    return 0
-  fi
-  sh "$_path" || rc=1
-}
-
-run_python_gate check-bugs.py "bug registry" --quiet
-run_python_gate check-decisions.py "decision decidability"
-run_sh_gate check-pollution.sh "pollution"
-
-exit $rc
+sh "$GATE"
+exit $?

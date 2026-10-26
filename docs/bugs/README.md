@@ -38,7 +38,7 @@
 | BUG-173 | 共享 `store.db` 拆分的前置阻塞——5 处跨域耦合不先改造，拆库即制造数据损伤 | open | engine |
 | BUG-174 | 无 BitTorrent 支持——协议抽象层已预留（`SourceKind::Bittorrent` / `DHT` / `PINNING` 全部未实现），但入口与任务模型未就绪… | open | engine |
 | BUG-176 | 媒体库整页依赖 TG 服务进程 —— TG 不可达时库「整页失明」，且界面无法区分「没有内容」与「取不到内容」 | open | shell |
-| BUG-187 | BUG-187 本地 pre-commit 只跑污染门禁：安装路径写死旧内容，缺陷登记门禁在本地静默不执行 | open | build |
+| BUG-187 | BUG-187 本地 pre-commit 只跑污染门禁：安装路径写死旧内容，缺陷登记门禁在本地静默不执行 | fixed | build |
 | BUG-190 | `media_item.kind` 可被三条生产路径改写，而挂载表不变量只在 INSERT 侧守护 | open | engine |
 | BUG-192 | BUG-192 Telegram 置顶（pinned）频道在应用频道列表里既排不到前面、也认不出来 | open | engine+shell |
 | BUG-194 | BUG-194 会话缓存里 156 条 title 为空串：列表渲染成认不出的空白行 | open | engine+shell |

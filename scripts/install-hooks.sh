@@ -3,9 +3,10 @@
 # Install repo git hooks (hooks are NOT version-controlled).
 #   sh scripts/install-hooks.sh
 #
-# Installs both hooks from their single tracked source under scripts/hooks/:
-#   pre-commit -> scripts/hooks/pre-commit  (bug-registry + pollution gates, AGENTS.md §7)
+# Installs the hooks from their single tracked source under scripts/hooks/:
+#   pre-commit -> scripts/hooks/pre-commit  (pollution gate only -- commits stay fast, AGENTS.md §7)
 #   commit-msg -> scripts/hooks/commit-msg  (English-only commit messages, AGENTS.md §2)
+#   pre-push   -> scripts/hooks/pre-push    (bug-registry + decision gates at delivery, AGENTS.md §7)
 #
 # Two defects fixed here (BUG-187). Both are "the installer and the tracked copy
 # drifted apart", which is the same failure the tracked pre-commit's own header warns about:
@@ -49,13 +50,14 @@ install_hook() {
 
 install_hook pre-commit
 install_hook commit-msg
+install_hook pre-push
 
 echo "installed hooks into $HOOKS:"
 ls -1 "$HOOKS" | grep -v '\.sample$' || true
 
 # Prove the installed hooks really are the tracked revisions.
 rc=0
-for name in pre-commit commit-msg; do
+for name in pre-commit commit-msg pre-push; do
   if diff -q "$ROOT/scripts/hooks/$name" "$HOOKS/$name" >/dev/null 2>&1; then
     echo "  $name: IDENTICAL to scripts/hooks/$name"
   else
