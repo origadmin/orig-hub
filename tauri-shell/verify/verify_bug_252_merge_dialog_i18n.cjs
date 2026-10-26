@@ -34,6 +34,7 @@ const os = require('node:os')
 const crypto = require('node:crypto')
 
 const cdp = require('./lib/cdp.cjs')
+const sandbox = require('./lib/sandbox.cjs')
 const endpoints = require('./_lib_endpoints.cjs')
 
 const OUT = process.env.ORIG_VERIFY_OUT || path.resolve(__dirname, 'evidence', 'BUG-252')
@@ -86,6 +87,9 @@ async function createItem(title, tg) {
     items: [{ path: fakePath, source: 'local', kind: 'video', title }],
   })
   const id = r.json && Array.isArray(r.json.ids) ? r.json.ids[0] : null
+  // BUG-422：导入即被 BUG-304 自动归档进单集剧集；不先撤销归属，后面往自己的
+  // 剧集挂载会撞 media_episode.item_id 唯一约束（HTTP 500）。
+  if (id != null) await sandbox.detachAutoSeries(tg, id)
   return { id, status: r.status }
 }
 
@@ -131,10 +135,6 @@ async function openMergeDialog(page, targetId, sourceTitle) {
     if (el) el.click()
   })
   await delay(1200)
-  await page.evaluate(() => {
-    const el = document.querySelector('[data-testid="media-rail-series-all"]')
-    if (el) el.click()
-  })
   await page.waitForFunction(
     (sid) => !!document.querySelector(`[data-testid="series-card-root"][data-series-id="${sid}"]`),
     { timeout: 25000, args: [targetId] },
@@ -166,7 +166,12 @@ async function readMergeDialog(page, sourceTitle) {
     const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim()
     return {
       title: norm(node.querySelector('h4') ? node.querySelector('h4').innerText : ''),
-      text: node.innerText,
+      // BUG-422：`text` 必须与 `options`（白名单来源）走**同一套归一化**。option 文本
+      // 经 `norm()` 后 `\u00a0`（不断行空格）等被折叠成普通空格，而原始 `innerText`
+      // 保留原样 ⇒ 含 NBSP 的剧名（实测库内 `🌟🔥🔥《洞洞杂货铺》EP6\xa0 原档 …`）
+      // 在白名单里拆不干净，CJK 残留恒 16，③d 假红。数据（剧名）不是文案，
+      // 归一化后按数据白名单移除，判据仍只盯着真正的界面文案。
+      text: norm(node.innerText),
       paragraphs: [...node.querySelectorAll('p')].map((p) => norm(p.innerText)),
       options: [...node.querySelectorAll('option')].map((o) => norm(o.innerText)),
       buttons: [...node.querySelectorAll('button')].map((b) => norm(b.innerText)),
@@ -272,11 +277,23 @@ async function main() {
       `got=${JSON.stringify(dlg.paragraphs[0])} exp=${JSON.stringify(expDescEn)}`)
     check('①d 候选项 = "' + SRC + ' (1 eps)"（media.seriesMergeOption）',
       dlg.options.includes(`${SRC} (1 eps)`), JSON.stringify(dlg.options.slice(0, 3)))
-    check('①e 合并说明段含 "merging makes no judgement about content"',
-      dlg.paragraphs.some((p) => p.includes('merging makes no judgement about content')),
+    // BUG-422：期望短语曾是 "merging makes no judgement about content"——那是
+    // BUG-252 修复时（a690aa5）的旧文案。提交 9b057a0（BUG-407/408 改合并语义）
+    // 有意把整句重写为「全自动、没有保留/删除可选」，判据字面量没跟着更新，
+    // 从那天起恒红。诉求方向没变（该段必须说明「合并全自动、无需逐项取舍」），
+    // 只把字面量更新到现行文案的特征短语。
+    check('①e 合并说明段含 "there is no keep/delete choice to make"（合并全自动、无需逐项取舍）',
+      dlg.paragraphs.some((p) => p.includes('there is no keep/delete choice to make')),
       JSON.stringify(dlg.paragraphs.slice(1, 3)))
     check('①f 集号规则段含 "Episode numbering" 与 "the current highest episode number"',
       dlg.paragraphs.some((p) => p.includes('Episode numbering') && p.includes('the current highest episode number')),
+      JSON.stringify(dlg.paragraphs.slice(1, 3)))
+    // BUG-424：三键拼接处必须有空格。原判据只断言片段存在，漏掉 JSX 折行吃掉
+    // 空格造成的 `fromafter` / `numberonward` 黏连（实测病句，见 BUG-424）。
+    check('①k 集号规则段三片段被空格正确分隔（无 fromafter / numberonward 黏连）',
+      dlg.paragraphs.some((p) =>
+        p.includes('from after the current highest episode number onward') &&
+        !p.includes('fromafter') && !p.includes('numberonward')),
       JSON.stringify(dlg.paragraphs.slice(1, 3)))
     check('①g 第一步按钮 = ["Cancel", "Next"]',
       dlg.buttons.length === 2 && dlg.buttons[0] === 'Cancel' && dlg.buttons[1] === 'Next',
@@ -320,6 +337,11 @@ async function main() {
     check('②d zh-CN 确认提示 = 预期中文',
       zh.paragraphs.some((p) => p === expConfirmZh),
       `got=${JSON.stringify(zh.paragraphs.find((p) => p.includes('分集并入')))}`)
+    // BUG-424：中文侧同样要有牙齿——空格只加在 en 的键值里，zh 三段必须
+    // 零空格紧拼（防的是后来者给 JSx 无条件加 `{' '}`，把中文句子插出空格）。
+    check('②e zh-CN 集号规则段紧拼无空格（从现有最大集号之后续编）',
+      zh.paragraphs.some((p) => p.includes('从现有最大集号之后续编') && !p.includes('从 现有')),
+      JSON.stringify(zh.paragraphs.slice(1, 3)))
 
     // ③ 反向证伪：键值临时改回硬编码中文 ⇒ 判据①必须红 ──
     console.log(`[bug252] --- 证伪：${TAMPER_KEY} 的 en-US 值临时改回中文 ---`)
