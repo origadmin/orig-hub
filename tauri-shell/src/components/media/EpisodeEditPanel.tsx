@@ -191,17 +191,10 @@ export function EpisodeEditPanel(props: {
         <span className="text-[10px] text-muted/80">{t('media.episode.endHintRow')}</span>
       </div>
 
-      <textarea
-        value={desc}
-        onChange={(e) => setDesc(e.target.value)}
-        placeholder={t('media.descEmptyEp')}
-        aria-label={t('media.descEmptyEp')}
-        rows={2}
-        className="w-full resize-none rounded-md border border-border-subtle bg-surface px-2 py-1 text-[11px] text-fg-strong"
-      />
-
       {/* BUG-204：图片纳入统一编辑 —— 「编辑所有内容」名实相符。
-          增/替换 = 挂图选择器（replace-all 语义，勾选即新全集）；删 = 每张缩略图 ×。 */}
+          增/替换 = 挂图选择器（replace-all 语义，勾选即新全集）；删 = 每张缩略图 ×。
+          BUG-412：图片区块放在介绍**之前**，与显示态（本集图组 → 本集介绍）保持
+          同一顺序，消除「一进编辑态图文位置完全相反」。 */}
       <span className="text-[11px] font-medium text-fg-strong">
         {t('media.episode.sectionImages')}
       </span>
@@ -252,6 +245,20 @@ export function EpisodeEditPanel(props: {
           {t('media.episode.editImages')}
         </Button>
       </div>
+
+      {/* BUG-412：介绍在图片**之后** —— 与显示态同一顺序，消除「图文相反」。 */}
+      <span className="text-[11px] font-medium text-fg-strong">
+        {t('media.episode.sectionDesc')}
+      </span>
+      <textarea
+        value={desc}
+        onChange={(e) => setDesc(e.target.value)}
+        placeholder={t('media.descEmptyEp')}
+        aria-label={t('media.episode.sectionDesc')}
+        data-testid="episode-desc-input"
+        rows={2}
+        className="w-full resize-none rounded-md border border-border-subtle bg-surface px-2 py-1 text-[11px] text-fg-strong"
+      />
 
       <div className="flex gap-2">
         <Button
