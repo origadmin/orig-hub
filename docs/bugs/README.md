@@ -32,7 +32,7 @@
 | BUG-133 | 媒体库「占用空间」展示登记值——清缓存后数字不变，答不出磁盘真值 | open | engine+shell |
 | BUG-139 | 「打开已下载」= 系统默认播放器、「预览」= 内置播放器——同一「打开」动词两种行为 | open | shell |
 | BUG-141 | i18n 硬编码中文文案 253 行分布 25 文件——en-US 界面混中文（BUG-128 同病新实例） | open | shell |
-| BUG-142 | i18n 孤儿 key 42 个——历史收敛的文案残骸误导维护 | open | shell |
+| BUG-142 | i18n 孤儿 key 42 个——历史收敛的文案残骸误导维护 | fixed | shell |
 | BUG-158 | 所有 git 钩子在本仓**恒不生效** —— 外层 `core.hooksPath=NUL` 把钩子目录指向不存在的路径，且 `install-hooks.sh` 与 BUG-157 同因装错仓 | open | build |
 | BUG-172 | 媒体库被错误部署在 TG 进程内——一个来源插件的生死决定了一等公民功能的可用性 | open | engine |
 | BUG-173 | 共享 `store.db` 拆分的前置阻塞——5 处跨域耦合不先改造，拆库即制造数据损伤 | open | engine |
@@ -127,6 +127,9 @@
 | BUG-418 | 缓存任务重跑不幂等——重跑后多出重复条目与分集（单测红灯） | fixed | engine |
 | BUG-419 | 「终态任务取消置顶 422」并非缺陷——单测期望与 BUG-396 裁定冲突，改的是期望与错误文案 | fixed | engine |
 | BUG-439 | 筛选节两套输入框形态打架——检索框常驻占位，新建却在「+」里 | fixed | shell |
+| BUG-442 | 清/删条目不回收平铺布局存量字节——清缓存后文件残留磁盘 | open | engine |
+| BUG-443 | serve_local_file 的 ETag/Last-Modified 全由 mtime 派生——LRU 触摸即失效、跨盘迁移击穿缓存 | open | engine |
+| BUG-444 | 「播放全部」起点取可播子集但播放序列是全量集序列——自动连播遍历非可播集 | open | shell |
 
 ## 已完成
 
@@ -438,9 +441,9 @@
 | BUG-408 | 剧集合并保留/删除提示逻辑错误——标题/介绍/视频/图片三种处置混乱 | fixed | engine+shell |
 | BUG-420 | 内容 hash 只覆盖 7.9% 的条目——`hash_file` 是死代码，「存量懒纳入」从未实现 | fixed | engine |
 | BUG-421 | 旧库根搬迁漏改写 72 条 `file_path`——文件已在新根下，条目却永远播不了、也拿不到 hash | fixed | engine |
-| BUG-422 | 14 个已修缺陷的验收脚本被 M0 重构与 BUG-304 双双打烂——夹具 500、导航选择器过期，「fixed」只剩一句话 | open | shell |
-| BUG-423 | 16 个验收脚本仍直读 `/api/config` 旧键 `tg_port`——BUG-358 改插件契约后恒得 undefined，环境探测假红 | open | shell |
-| BUG-424 | 合并剧集弹窗「集号规则」段英文缺空格——`fromafter` / `numberonward` 黏连 | open | shell |
+| BUG-422 | 14 个已修缺陷的验收脚本被 M0 重构与 BUG-304 双双打烂——夹具 500、导航选择器过期，「fixed」只剩一句话 | fixed | shell |
+| BUG-423 | 16 个验收脚本仍直读 `/api/config` 旧键 `tg_port`——BUG-358 改插件契约后恒得 undefined，环境探测假红 | fixed | shell |
+| BUG-424 | 合并剧集弹窗「集号规则」段英文缺空格——`fromafter` / `numberonward` 黏连 | fixed | shell |
 | BUG-425 | `invalidateCache(prefix)` 不清在途请求——写前数据在失效后落回缓存，「改完又看到旧值」 | open | shell |
 | BUG-426 | 剧集详情头部两颗逐字同文案、功能重叠的「编辑」按钮（介绍块冗余入口 + 动作条入口开同一面板） | fixed | shell |
 | BUG-427 | 左栏选集器「▶ 播放入口」整列不齐——行尾右对齐使图标 x 随右侧时长文本宽度漂移 5.78px | fixed | shell |
