@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useStore } from '../../store/useStore'
 import {
   AlertTriangle,
   ChevronDown,
@@ -47,6 +48,7 @@ function useImagePortrait(src: string | undefined) {
 
 import {
   mediaItemUrl,
+  mediaThumbUrl,
   switchEpisodeSource,
   detachEpisodeImage,
   detachEpisodeSource,
@@ -149,6 +151,11 @@ export function SeriesDetail(props: {
   onViewInTg?: (coords: { chatId: number; messageId: number }) => void
   /** 就地新建标签（与 `TagPicker.onCreate` 同契约） */
   onCreateTag: (name: string) => Promise<number | null>
+  /**
+   * BUG-415 拆分对话框逐源预览：点「预览」打开该来源条目（应用内播放器）。
+   * 多源错误合并拆回前，必须先看清「哪个源是真正的第 2 集」才能正确勾选。
+   */
+  onPreviewSource?: (itemId: number) => void
 }) {
   const { t } = useTranslation()
   const { detail, tags, onError, onChanged } = props
@@ -292,6 +299,8 @@ export function SeriesDetail(props: {
     setEditingEpisode(false)
     setEditNonce(0)
     setAttachingEpisodeId(null)
+    // BUG-404：离开/切换剧集时，面包屑回落到「剧名」（集级信息由聚焦时写入）。
+    useStore.getState().setFilesCrumb(detail.title)
     setEditingTags(false)
     setSelectedTagIds(detail.tags.map((x) => x.id))
     setLightbox(null)
@@ -921,6 +930,11 @@ export function SeriesDetail(props: {
                     onClick={() => {
                       setFocusedEpisodeId(ep.id)
                       setEditNonce(0)
+                      // BUG-404：聚焦某集时把集级信息并入标题栏面包屑
+                      // （「剧名 › S1E3 单集标题」），ContextBar 再前缀「剧集 ›」。
+                      useStore.getState().setFilesCrumb(
+                        `${detail.title} › ${episodeSlotLabel(ep)} ${episodeRowTitle(ep, detail)}`,
+                      )
                     }}
                     className={`grid w-full grid-cols-[auto_1fr_auto] items-center gap-2 rounded-md px-2 py-1.5 text-left ${
                       on ? 'bg-accent/10' : 'hover:bg-surface-2'
@@ -1673,14 +1687,22 @@ export function SeriesDetail(props: {
             <div className="mb-3 flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto">
               {detail.episodes.map((ep) => {
                 const checked = splitSelected.includes(ep.itemId)
+                const epSources = ep.sources ?? []
                 return (
-                  <label
+                  <div
                     key={ep.id}
-                    className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-left text-[12px] hover:bg-surface-2"
+                    className="flex items-start gap-2 rounded px-2 py-1.5 text-left text-[12px] hover:bg-surface-2"
                     data-testid="series-split-option"
                   >
-                    {/* BUG-393：剧集行选择框同样并入标准组件（原 h-3.5 与下载行
-                        h-4 不同源，两处视觉尺寸不一致）。 */}
+                    {/* BUG-415：封面缩略图，帮助在拆回前辨认内容 */}
+                    <img
+                      src={mediaThumbUrl(ep.itemId, 64)}
+                      alt=""
+                      className="mt-0.5 h-10 w-10 shrink-0 rounded border border-border-subtle/70 object-cover"
+                      onError={(e) => {
+                        ;(e.currentTarget as HTMLImageElement).style.visibility = 'hidden'
+                      }}
+                    />
                     <RowCheckbox
                       checked={checked}
                       disabled={splitting}
@@ -1688,11 +1710,51 @@ export function SeriesDetail(props: {
                       testId="series-split-select"
                       ariaLabel="选中此集"
                     />
-                    <span className="shrink-0 font-mono text-[10.5px] text-muted">
-                      {episodeSlotLabel(ep)}
-                    </span>
-                    <span className="min-w-0 truncate text-fg-mid">{episodeRowTitle(ep, detail)}</span>
-                  </label>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="shrink-0 font-mono text-[10.5px] text-muted">
+                          {episodeSlotLabel(ep)}
+                        </span>
+                        <span className="min-w-0 truncate text-fg-mid">{episodeRowTitle(ep, detail)}</span>
+                      </div>
+                      {/* BUG-415：多源剧集展开逐源预览，先看清「哪个源是真正的第 2 集」再拆 */}
+                      {epSources.length > 1 && (
+                        <div className="mt-1.5 flex flex-col gap-1 border-l border-border-subtle/60 pl-2">
+                          <span className="text-[10px] text-muted">
+                            {t('media.series.splitMultiSource', { n: epSources.length })}
+                          </span>
+                          {epSources.map((s) => (
+                            <div
+                              key={s.itemId}
+                              className="flex items-center gap-1.5 rounded border border-border-subtle/70 px-1.5 py-1"
+                              data-testid="series-split-source"
+                            >
+                              <img
+                                src={mediaThumbUrl(s.itemId, 48)}
+                                alt=""
+                                className="h-7 w-7 shrink-0 rounded object-cover"
+                                onError={(e) => {
+                                  ;(e.currentTarget as HTMLImageElement).style.visibility = 'hidden'
+                                }}
+                              />
+                              <span className="min-w-0 flex-1 truncate text-[10.5px] text-fg-mid">
+                                {s.title || `#${s.itemId}`}
+                              </span>
+                              <button
+                                type="button"
+                                disabled={splitting}
+                                onClick={() => props.onPreviewSource?.(s.itemId)}
+                                className="shrink-0 rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-accent hover:bg-surface-2"
+                                data-testid="series-split-source-preview"
+                              >
+                                {t('media.series.splitPreview')}
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 )
               })}
             </div>

@@ -9,6 +9,7 @@ import {
   PictureInPicture,
   Play,
   Rewind,
+  Scissors,
   Volume2,
   VolumeX,
   X,
@@ -97,6 +98,14 @@ export interface VideoPlayerProps {
   hasBytes?: boolean | null
   /** 无字节时「重新缓存」入口（BUG-254）；缺省 = 不展示重缓存按钮。 */
   onRecache?: () => void
+  /**
+   * BUG-417 分段播放（前/后跳过只播主段）：内容窗口起点 / 终点（秒）。
+   * 仅作为**显示窗口**与**真实元素的钳制边界**使用，不写入 rate-switch 的
+   * `contentOffsetRef`/`contentDurationRef`（避免与转码锚点逻辑冲突）。
+   * `skipStartSec` 缺省 0；`skipEndSec` 缺省 null（不截断结尾）。
+   */
+  skipStartSec?: number
+  skipEndSec?: number | null
 }
 
 /** 可选倍速档位（与 EE 一致；3x/4x 为 BUG-209 新增——用户要求高倍速审看，
@@ -581,6 +590,8 @@ export function VideoPlayer({
   duration,
   hasBytes,
   onRecache,
+  skipStartSec: skipStartProp = 0,
+  skipEndSec: skipEndProp = null,
 }: VideoPlayerProps) {
   const { t } = useTranslation()
   /**
@@ -697,6 +708,51 @@ export function VideoPlayer({
   const streamSeekableRef = useRef(!activeSrcAtMountRef.current.includes('/stream'))
   /** 已停载（退无可退）：渲染 BUG-207 的诚实失败遮罩 */
   const [halted, setHalted] = useState(false)
+
+  /**
+   * BUG-417 分段播放（前/后跳过只播主段）：内容窗口起点 / 终点（秒），由播放器内
+   * 弹层设置，初始来自 props（外部可预设，缺省 0 / null）。仅用于显示窗口与真实
+   * 元素的钳制边界，不写入 rate-switch 的 ref（避开转码锚点逻辑）。
+   */
+  const [skipStartSec, setSkipStartSec] = useState(skipStartProp)
+  const [skipEndSec, setSkipEndSec] = useState(skipEndProp)
+  const [skipOpen, setSkipOpen] = useState(false)
+  const segOffset = skipStartSec > 0 ? skipStartSec : 0
+  const segDuration = skipEndSec != null && skipEndSec > segOffset ? skipEndSec - segOffset : null
+
+  /**
+   * BUG-417 钳制（真实 `<video>` 元素，按绝对秒）：播放越过窗口起点 → 拉回起点；
+   * 到达窗口终点 → 暂停并当作「播完」处理（续播走 `onPlayNext`，与 416 合并播放衔接）。
+   * 独立于 rate-switch 的 `contentOffsetRef`/`contentDurationRef`，只服务于分段播放，
+   * 不干扰转码锚点逻辑。本地文件（timeScale=1）下绝对秒即内容秒，钳制精确。
+   */
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return
+    const onTime = () => {
+      if (segOffset > 0 && v.currentTime < segOffset - 0.15) {
+        v.currentTime = segOffset
+      } else if (segDuration != null && v.currentTime >= segOffset + segDuration - 0.1) {
+        v.pause()
+        if (onPlayNext) onPlayNext()
+      }
+    }
+    v.addEventListener('timeupdate', onTime)
+    return () => v.removeEventListener('timeupdate', onTime)
+  }, [segOffset, segDuration, onPlayNext])
+
+  /** BUG-417：元数据就绪后若设了起点，直接落到起点（不播片头）。 */
+  useEffect(() => {
+    if (segOffset <= 0) return
+    const v = videoRef.current
+    if (!v) return
+    const seekToStart = () => {
+      if (Math.abs(v.currentTime - segOffset) > 0.25) v.currentTime = segOffset
+    }
+    if (v.readyState >= 1) seekToStart()
+    v.addEventListener('loadedmetadata', seekToStart)
+    return () => v.removeEventListener('loadedmetadata', seekToStart)
+  }, [segOffset, activeSrc])
 
   /** 视频轨解不出来 / 解码吃力 —— 两类 onError 抓不到的静默失败（BUG-034）。
    *  换源或改倍速都重设基线：倍速变化会改变所需解码吞吐，旧账不能算到新状态上（BUG-053）。 */
@@ -1485,8 +1541,8 @@ export function VideoPlayer({
               barHover={barHover}
               onBarHoverChange={setBarHover}
               timeScale={activeContentSpeedRef.current}
-              contentOffset={contentOffsetRef.current}
-              contentDuration={contentDurationRef.current}
+              contentOffset={segOffset}
+              contentDuration={segDuration}
               onContentSeek={contentSeek}
             />
           )}
@@ -1588,6 +1644,64 @@ export function VideoPlayer({
             </div>
 
             <div className="flex items-center gap-1 md:gap-2">
+              {/* BUG-417 跳过片头/片尾（分段播放）：弹层设前跳/后跳秒，应用后只播主段 */}
+              <div className="relative">
+                <button
+                  type="button"
+                  aria-label={t('player.skipSegment')}
+                  aria-expanded={skipOpen}
+                  aria-haspopup="dialog"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setSkipOpen((v) => !v)
+                    pokeControls()
+                  }}
+                  className={cn(
+                    'flex h-10 w-10 items-center justify-center rounded-full text-white transition-colors hover:bg-white/15',
+                    (segOffset > 0 || segDuration != null) && 'bg-accent/30',
+                    skipOpen && 'bg-white/15',
+                  )}
+                  data-testid="player-skip-segment"
+                >
+                  <Scissors className="h-5 w-5" />
+                </button>
+                {skipOpen && (
+                  <div
+                    role="dialog"
+                    aria-label={t('player.skipSegment')}
+                    className="absolute bottom-full right-0 mb-2 w-56 rounded-lg border border-white/10 bg-black/90 p-3 shadow-xl backdrop-blur-md"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <p className="mb-2 text-[11px] font-medium text-white/80">{t('player.skipSegmentHint')}</p>
+                    <label className="mb-2 block">
+                      <span className="mb-1 block text-[10px] text-white/60">{t('player.skipStart')}</span>
+                      <input
+                        type="number"
+                        min={0}
+                        step={1}
+                        value={Math.round(skipStartSec)}
+                        onChange={(e) => setSkipStartSec(Math.max(0, Number(e.target.value) || 0))}
+                        className="w-full rounded border border-white/15 bg-white/10 px-2 py-1 text-sm text-white outline-none"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="mb-1 block text-[10px] text-white/60">{t('player.skipEnd')}</span>
+                      <input
+                        type="number"
+                        min={0}
+                        step={1}
+                        value={skipEndSec ?? ''}
+                        placeholder="∞"
+                        onChange={(e) =>
+                          setSkipEndSec(e.target.value === '' ? null : Math.max(0, Number(e.target.value) || 0))
+                        }
+                        className="w-full rounded border border-white/15 bg-white/10 px-2 py-1 text-sm text-white outline-none"
+                      />
+                    </label>
+                  </div>
+                )}
+              </div>
+
               {/* 倍速 */}
               <div className="relative">
                 <button

@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from './ui/button'
 import { SelectAllButtons, SelectionBar } from './ui/selection-bar'
-import { Input } from './ui/input'
 import { useTranslation } from '../i18n'
 import { useStore } from '../store/useStore'
 import { useFilesSearch } from '../store/filesSearch'
@@ -53,6 +52,7 @@ import { AddToSeriesDialog, CreateSeriesDialog, MergeSeriesDialog, MergeSeriesMu
 import { ExportPreviewDialog } from './media/ExportPreviewDialog'
 import { OrganizeWizard } from './media/OrganizeWizard'
 import { ItemEditDialog } from './media/ItemEditDialog'
+import { Tag } from 'lucide-react'
 import { ItemDetailDialog } from './media/ItemDetailDialog'
 import {
   isRawFileName,
@@ -902,6 +902,21 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
     void playItems(episodesToItems(detail), Math.max(0, index), detail.title)
   }
 
+  /** BUG-415：拆分对话框逐源预览入口 —— 按来源 itemId 直接打开应用内查看器。 */
+  const previewSourceItem = useCallback(
+    (itemId: number) => {
+      void (async () => {
+        try {
+          const item = await getMediaItem(itemId)
+          openViewer({ items: [toViewerItem(item)], index: 0, title: item.title })
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e))
+        }
+      })()
+    },
+    [openViewer, setError, t],
+  )
+
   /**
    * 重新缓存（BUG-080）：条目被清掉字节后**原路取回**。
    *
@@ -1455,21 +1470,32 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
         {view === "series" && (
           <>
                     <div className="flex items-center gap-2 px-2 pt-3">
-                      {/* 标签筛选样式（2026-10-14 修正）：「标签」标签与筛选输入框**同一套式样**
-                          —— 同字号（11px）、同字重（medium）、同前景色（text-fg-soft），
-                          不再用「极小 uppercase muted 小标签 + 撑满大输入框」两套视觉。 */}
-                      <span className="shrink-0 text-[11px] font-medium text-fg-soft">
-                        {t('media.tags')}
-                      </span>
-                      {/* BUG-304 / D18：常态可见，不再等 `tagExpanded`；且必须在 chip 列表
-                          **之前** —— 筛选框与它筛选的对象必须同屏。 */}
-                      <Input
-                        data-testid="media-tag-filter"
-                        value={tagFilter}
-                        onChange={(e) => setTagFilter(e.target.value)}
-                        placeholder={t('media.tag.filterPlaceholder')}
-                        className="h-7 flex-1 text-[11px]"
-                      />
+                      {/* BUG-405 修正：原设计「标签」文字 + 撑满长输入框是**两个组件**，且输入框
+                          flex-1 过长。改为单一紧凑 pill（与标题栏搜索框同一视觉语言：圆角描边 + 图标
+                          前缀），标签用 Tag 图标作前缀、输入限宽 w-56 不再撑满、自带一键清空。 */}
+                      <div
+                        className="flex h-7 w-56 items-center gap-1.5 rounded-md border border-border-subtle bg-surface-2/40 px-2"
+                        data-testid="media-tag-filter-wrap"
+                      >
+                        <Tag className="h-3.5 w-3.5 shrink-0 text-muted" />
+                        <input
+                          data-testid="media-tag-filter"
+                          value={tagFilter}
+                          onChange={(e) => setTagFilter(e.target.value)}
+                          placeholder={t('media.tag.filterPlaceholder')}
+                          className="h-full min-w-0 flex-1 bg-transparent text-[11px] text-fg-strong outline-none placeholder:text-muted"
+                        />
+                        {tagFilter ? (
+                          <button
+                            type="button"
+                            onClick={() => setTagFilter('')}
+                            aria-label={t('media.clearFilter')}
+                            className="shrink-0 rounded px-1 text-[11px] text-muted hover:bg-surface-2 hover:text-fg-strong"
+                          >
+                            x
+                          </button>
+                        ) : null}
+                      </div>
                     </div>
                     <div className="mt-1 flex flex-wrap gap-1 px-1" data-testid="media-tag-list">
                       {(() => {
@@ -1679,6 +1705,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
               setExportOpen(true)
             }}
             onViewInTg={viewInTg}
+            onPreviewSource={previewSourceItem}
             onGotoItem={(itemId) => {
               // BUG-191：按钮文案是「在媒体库中查看该内容」（`media.episode.gotoItem`），
               // 行为就必须是**查看** —— 原实现 `setEditing(...)` 打开的是 `ItemEditDialog`

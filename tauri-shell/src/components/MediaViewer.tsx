@@ -207,6 +207,25 @@ export function MediaViewer(props: {
 
       {/* 主体：媒体区 + 分集侧栏 */}
       <div className="flex min-h-0 flex-1">
+        {/*
+          BUG-416 合并播放（连播不断档）：切到下一集前先**预载字节**。
+          这个隐藏 video 以 `nextItem.src` 为 key，跨集切换时 MediaViewer 不卸载，
+          故预载不被打断；下一集 `<VideoPlayer>` 挂载时字节已在 HTTP 缓存中，
+          切换如同单视频续播，不再「重新加载」。
+        */}
+        {nextItem?.src ? (
+          <video
+            key={nextItem.src}
+            src={nextItem.src}
+            preload="auto"
+            muted
+            playsInline
+            aria-hidden="true"
+            style={{ display: 'none' }}
+            data-testid="next-episode-preload"
+          />
+        ) : null}
+
         {/* 媒体区：黑底居中；‹ › 组内切换收在面板两侧，不再出框 */}
         <div className="relative flex min-h-0 min-w-0 flex-1 items-center justify-center bg-black">
           {many && prevItem && (

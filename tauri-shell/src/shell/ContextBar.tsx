@@ -112,20 +112,37 @@ export const ViewTitle = memo(function ViewTitle({ nav }: ViewTitleProps) {
     sub = t(`download.${dlFilter}`)
   }
 
+  // BUG-404：面包屑逐级呈现（不是一整串扁平文本）。根级 = 当前视图标题（强）；
+  // 下钻链（剧集 › 剧名 [› 季·集号徽标 › 单集标题]）逐段 muted、用 `›` 分隔，
+  // 末级略强调 —— 层级一眼可见，不靠字号/颜色硬挤在一行。
+  const crumbParts = sub ? sub.split(' › ').map((s) => s.trim()).filter(Boolean) : []
   return (
-    <span className="flex min-w-0 items-baseline gap-2">
+    <span className="flex min-w-0 items-baseline gap-1.5">
       <span
-        className="min-w-0 truncate text-sm font-semibold text-fg-strong"
+        className="shrink-0 truncate text-sm font-semibold text-fg-strong"
         title={t(TITLE_KEY[view])}
         data-testid="page-title"
       >
         {t(TITLE_KEY[view])}
       </span>
-      {sub && (
-        <span className="min-w-0 truncate text-[13px] text-muted" data-testid="context-bar-sub">
-          {sub}
-        </span>
-      )}
+      {crumbParts.map((part, i) => {
+        const last = i === crumbParts.length - 1
+        return (
+          <span key={i} className="flex min-w-0 items-baseline gap-1.5">
+            <span className="shrink-0 text-[13px] text-muted">›</span>
+            <span
+              className={
+                last
+                  ? 'min-w-0 truncate text-[13px] font-medium text-fg-mid'
+                  : 'min-w-0 truncate text-[13px] text-muted'
+              }
+              data-testid="context-bar-sub"
+            >
+              {part}
+            </span>
+          </span>
+        )
+      })}
     </span>
   )
 })
