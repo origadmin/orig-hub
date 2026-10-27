@@ -29,6 +29,11 @@ const EN = path.join(REPO, 'tauri-shell', 'src', 'i18n', 'locales', 'en-US.json'
 const GATE = path.join(REPO, 'scripts', 'check-i18n-keys.py')
 const BASE = process.env.BASE_URL || 'http://127.0.0.1:5180'
 
+/** locale 的顶层命名空间 = 「这串点分文本是不是 i18n key」的唯一可靠判据。 */
+const NAMESPACES = new Set(
+  Object.keys(JSON.parse(fs.readFileSync(ZH, 'utf8'))).map((k) => k.split('.')[0]),
+)
+
 let failed = 0
 function check(name, ok, detail = '') {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? `  — ${detail}` : ''}`)
@@ -92,8 +97,43 @@ async function scanPages() {
         continue
       }
       await page.evaluate(() => new Promise((r) => setTimeout(r, 1200)))
-      const found = await page.evaluate(() => {
-        // i18n key 形状：小写字母开头的点分段标识符，至少两段，且不在 <script>/<style> 内
+      // 前置：页面必须**真的有内容**。空页面（「媒体服务未运行」）上扫不到 raw key
+      // 是无意义的恒绿 —— 第一次跑这条断言时正是这种假通过。
+      const rowCount = await page.evaluate(
+        () =>
+          document.querySelectorAll(
+            '[data-testid="file-list-row"], [data-testid="media-card"], [data-testid="series-card"], [data-testid="download-item"], [data-testid="nav-child-lib-series"]',
+          ).length,
+      )
+      if ((label === 'files' || label === 'download') && rowCount === 0) {
+        leaks.push({ page: label, leak: 'EMPTY_PAGE:no rows to scan' })
+        continue
+      }
+      // 声纳自检（禁恒绿）：先往页面塞一段 key 形状的文本，扫描器必须命中它。
+      // 不做这一步，「扫描 0 命中」既可能是真干净，也可能是扫描器根本不工作。
+      let sonar = null
+      if (label === 'files') {
+        await page.evaluate(() => {
+          const el = document.createElement('span')
+          el.id = '__i18n_sonar'
+          el.textContent = 'media.card.delete'
+          document.body.appendChild(el)
+        })
+        sonar = await page.evaluate((namespaces) => {
+          const ns = new Set(namespaces)
+          const re = /\b[a-z][a-zA-Z0-9]*(?:\.[a-zA-Z0-9]+){1,3}\b/g
+          const el = document.getElementById('__i18n_sonar')
+          const hits = [...(el?.textContent || '').matchAll(re)].map((m) => m[0]).filter((s) => ns.has(s.split('.')[0]))
+          el?.remove()
+          return hits
+        }, [...NAMESPACES])
+      }
+
+      const found = await page.evaluate((namespaces) => {
+        // i18n key 形状：小写字母开头的点分段标识符，至少两段，且**首段是已知命名空间**。
+        // 只按「点分」判会误报文件名（实测 `bug322ui.bin` / `d.zip` / `c.zip` 全被抓），
+        // 而文件名与 key 的字符形状完全一样 —— 唯一可靠判据是首段 ∈ locale 顶层命名空间。
+        const ns = new Set(namespaces)
         const re = /\b[a-z][a-zA-Z0-9]*(?:\.[a-zA-Z0-9]+){1,3}\b/g
         const skip = /\.(png|jpe?g|svg|css|js|tsx?|json|mp4|html|exe|dll|log)$/i
         const out = []
@@ -109,11 +149,15 @@ async function scanPages() {
           for (const m of t.matchAll(re)) {
             const s = m[0]
             if (skip.test(s)) continue
+            if (!ns.has(s.split('.')[0])) continue
             out.push(s)
           }
         }
         return [...new Set(out)]
-      })
+      }, [...NAMESPACES])
+      if (sonar) {
+        check('C0 扫描器声纳自检（注入 key 形状文本必须命中）', sonar.includes('media.card.delete'), `hits=${JSON.stringify(sonar)}`)
+      }
       for (const l of found) leaks.push({ page: label, leak: l })
       await page.screenshot(path.join(REPO, 'tauri-shell', 'verify', 'evidence', 'BUG-447', `${label}.png`))
     }

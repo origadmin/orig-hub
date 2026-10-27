@@ -389,10 +389,26 @@ def ensure_vite() -> tuple[bool, str]:
     if not VITE_DIR.is_dir():
         return False, f"目录不存在 {VITE_DIR}"
     log_handle = VITE_LOG.open("a", encoding="utf-8", errors="replace", buffering=1)
+    # 端口必须随世界一起下发，否则 vite 里的前端仍按**默认** 19786/19787 去连，
+    # 而 dev 世界跑在 29786/29787 ⇒ 界面显示「媒体服务未运行」，一条命令起来的栈
+    # 实际不可用（这是「dev 环境无法保证」的第二个成因）。
+    # 真源 = daemon 的 `/api/config.tg_port`（orig-tg 端口可能被顺延，不能写死）。
+    env = os.environ.copy()
+    env["VITE_DAEMON_PORT"] = str(DAEMON_PORT)
+    cfg = None
+    try:
+        cfg = ds.probe(DAEMON_PORT)
+    except Exception:  # noqa: BLE001 - daemon 未起时只退化为默认端口
+        cfg = None
+    # `tg_port` 在 daemon 尚未接管 orig-tg 时是 None（实测 dev start 后一段时间内如此），
+    # 此时必须退回本世界的规范端口 —— 否则前端保留默认 19787，而 orig-tg 跑在 29787，
+    # 界面就是「媒体服务未运行」。
+    env["VITE_TG_PORT"] = str((cfg or {}).get("tg_port") or TG_PORT)
     try:
         proc = subprocess.Popen(
             ["cmd", "/c", "npm", "run", "dev"],
             cwd=str(VITE_DIR),
+            env=env,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             creationflags=ds.DETACHED | ds.NEW_GROUP,
