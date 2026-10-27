@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Debug-mode service bootstrap (BUG-179 / 测试增强 2026-10-16).
 
-设计边界（用户裁定）：本脚本**不是**自治监督者。它只做两件事——
-一次性把 daemon 拉起来（DETACHED，不挂在控制台），以及让 agent 经文件信号
-请求 daemon 重启它的 orig-tg 子进程（用于更新）。**绝不**自己杀进程、绝不自治
-自愈、绝不碰 vite（vite 是用户自己的 UI 工具，归用户）。
+设计边界（用户裁定）：本脚本**不是**自治监督者。它只做三件事——
+一次性把 daemon 拉起来（DETACHED，不挂在控制台）、让 agent 经文件信号
+请求 daemon 重启它的 orig-tg 子进程（用于更新）、以及把 vite 拉起/停下（DETACHED）。
+**绝不**自己杀第三方进程、绝不自治自愈。
+
+vite 归属（用户 2026-10-28 裁定，推翻旧的「vite 归用户」边界）：**用户只负责验收，
+永不运行 `npm run dev` 等开发工具命令（禁止）**。dev 工具链（daemon/orig-tg/vite）
+全生命周期归脚本/AI；用户侧唯一动作 = 浏览器打开 http://localhost:5180 验收。
 
 daemon 才是常驻进程，它自己负责：
   - 拉起并**自愈 orig-tg 子进程**（子进程挂了 5s 内拉回，BUG-321/177）；
@@ -21,6 +25,8 @@ daemon 才是常驻进程，它自己负责：
 
     # 第一次（用户，建议提权，规避 Windows 端口排除区间）：
     python scripts/dev_services.py --start          # 拉起 daemon（DETACHED），然后退出
+    python scripts/dev_services.py --vite           # 拉起 vite(:5180)（DETACHED，幂等），然后退出
+    python scripts/dev_services.py --vite-stop      # 停 vite
 
 排他契约（BUG-481）：规范端口 19786/19787 是 dev 栈与 release 壳栈的**排他资源**
 （两者共享数据根，双栈并跑会互相覆盖端点文件、争 SQLite 写锁、TG 同 session 双连接）。
@@ -74,6 +80,12 @@ REDEPLOY_BUILT = Path(os.environ.get("TEMP", str(REPO))) / "orighub-redeploy-bui
 REDEPLOY_DONE = Path(os.environ.get("TEMP", str(REPO))) / "orighub-redeploy-done"
 REDEPLOY_TIMEOUT_S = 120.0
 HEALTH_TIMEOUT_S = 20.0
+# vite（BUG-481 追记，用户 2026-10-28 裁定：用户只验收，dev 工具链归脚本/AI）。
+VITE_DIR = REPO / "tauri-shell"
+VITE_PORT = 5180
+VITE_PID_FILE = Path(os.environ.get("TEMP", str(REPO))) / "orighub-dev-vite.pid"
+VITE_LOG_FILE = Path(os.environ.get("TEMP", str(REPO))) / "orighub-dev-vite.log"
+VITE_TIMEOUT_S = 90.0  # 冷启动首次整页可 >30s（见 AGENTS：vite 变更后慢加载），给足余量
 DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0x8)
 NEW_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
 
@@ -222,12 +234,70 @@ def start_daemon(
         f"[dev-services] started orig-daemon pid={proc.pid} (DETACHED, not tied to this console)\n"
         f"  - it self-heals orig-tg: if orig-tg exits, daemon restarts it within ~15s\n"
         f"  - lifecycle log: {LOG_FILE}  (daemon is a windows-subsystem app, no console)\n"
-        f"  - to STOP:       python scripts/dev-services.py --stop\n"
+        f"  - to STOP:       python scripts/dev_services.py --stop\n"
         f"  - to UPDATE orig-tg (no daemon restart):  --redeploy-request … build … --redeploy-done\n"
         f"  - to UPDATE daemon itself:                --stop … rebuild … --start\n"
-        f"  - vite is YOUR tool: start it yourself (e.g. cd tauri-shell && npm run dev)"
+        f"  - to START vite (UI, :5180):              python scripts/dev_services.py --vite"
     )
     return proc
+
+
+def vite_up() -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{VITE_PORT}/", timeout=2) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def start_vite() -> int:
+    """拉起 vite（DETACHED，幂等）：已在应答就复用；否则启动并等到 HTTP 200。
+
+    归属裁定（用户 2026-10-28）：用户只验收、永不跑 npm 命令，vite 生命周期归本脚本。
+    """
+    if vite_up():
+        print(f"[dev-services] vite already serving on :{VITE_PORT}")
+        return 0
+    if not (VITE_DIR / "package.json").exists():
+        print(f"[dev-services] vite project missing: {VITE_DIR}", file=sys.stderr)
+        return 11
+    log_handle = VITE_LOG_FILE.open("a", encoding="utf-8", errors="replace", buffering=1)
+    try:
+        proc = subprocess.Popen(
+            ["cmd.exe", "/c", "npm", "run", "dev"],
+            cwd=str(VITE_DIR),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            creationflags=DETACHED | NEW_GROUP,
+        )
+    finally:
+        log_handle.close()
+    VITE_PID_FILE.write_text(str(proc.pid), encoding="ascii")
+    deadline = time.monotonic() + VITE_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if vite_up():
+            print(
+                f"[dev-services] vite serving on http://localhost:{VITE_PORT}/ "
+                f"(launcher pid={proc.pid}, DETACHED; log: {VITE_LOG_FILE})"
+            )
+            return 0
+        time.sleep(1.0)
+    print(
+        f"[dev-services] vite did not become ready within {VITE_TIMEOUT_S:.0f}s; see {VITE_LOG_FILE}",
+        file=sys.stderr,
+    )
+    return 12
+
+
+def stop_vite() -> None:
+    if VITE_PID_FILE.exists():
+        pid = VITE_PID_FILE.read_text(encoding="ascii", errors="ignore").strip()
+        if pid.isdigit():
+            subprocess.run(["taskkill", "/PID", pid, "/T", "/F"], capture_output=True)
+            print(f"[dev-services] stopped vite launcher pid {pid} (and its node child)")
+        VITE_PID_FILE.unlink(missing_ok=True)
+    else:
+        print("[dev-services] no vite pid file; was it started via --vite?")
 
 
 def pid_alive(pid: int) -> bool:
@@ -330,6 +400,12 @@ def main() -> int:
     ap.add_argument("--status", action="store_true", help="probe only, do not start (exit 0 = ready)")
     ap.add_argument("--stop", action="store_true", help="stop the daemon (and its orig-tg child)")
     ap.add_argument(
+        "--vite",
+        action="store_true",
+        help="start vite on :5180 (DETACHED, idempotent; user only does acceptance in browser)",
+    )
+    ap.add_argument("--vite-stop", action="store_true", help="stop vite started via --vite")
+    ap.add_argument(
         "--redeploy-request",
         action="store_true",
         help="request redeploy: daemon stops orig-tg and writes stopped (safe to build)",
@@ -382,6 +458,13 @@ def main() -> int:
     if args.stop:
         stop_daemon()
         return 0
+
+    if args.vite_stop:
+        stop_vite()
+        return 0
+
+    if args.vite:
+        return start_vite()
 
     if args.status:
         return emit_status(args.port, probe(args.port))
