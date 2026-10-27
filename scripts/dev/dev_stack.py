@@ -129,8 +129,8 @@ def dev_runtime_env(data_dir: Path) -> dict[str, str]:
     - `ORIG_DAEMON_ENDPOINT_FILE`：端点文件是壳的端口真源，同名会互相覆盖 ⇒ 连错实例。
     - `ORIG_ENGINE_TASKS_DB`：任务列表是运行态，共用会让 dev 的测试任务出现在
       release 列表里，进度也会互相覆盖。
-    - `ORIG_TG_SESSION`：会话文件没有文件锁，两个 orig-tg 同时写会损坏；即便不损坏，
-      同一 auth key 双连接会被 Telegram 互踢。dev 需独立登录一次（一次性成本）。
+    - `ORIG_TG_SESSION`：dev 与 release **共用真实会话** `tg/session.session`（同一份登录
+      凭证），不做分离。避免 dev 永远停在 Anonymous、"TG 未绑定" 的假死态。
     - `ORIG_LOG_DIR`：日志同目录会交错追加，排障时分不清某行是谁写的。
     """
     return {
@@ -138,7 +138,7 @@ def dev_runtime_env(data_dir: Path) -> dict[str, str]:
         "ORIG_TG_PORT": str(TG_PORT),
         "ORIG_DAEMON_ENDPOINT_FILE": str(data_dir / "daemon.dev.endpoint"),
         "ORIG_ENGINE_TASKS_DB": str(data_dir / "engine_tasks.dev.db"),
-        "ORIG_TG_SESSION": str(data_dir / "tg" / "session.dev.session"),
+        "ORIG_TG_SESSION": str(data_dir / "tg" / "session.session"),
         "ORIG_LOG_DIR": str(data_dir / "logs" / "dev"),
     }
 
@@ -233,6 +233,36 @@ def kill_tree(pid: int, label: str) -> bool:
 
 
 # ── 诊断 ──────────────────────────────────────────────────────────────────
+
+
+def daemon_binary_is_stale() -> tuple[bool, str]:
+    """dev 守护进程二进制是否比 orig-daemon 源码旧（与 collect() 同口径）。
+
+    跑一份比源码旧的守护进程二进制意味着其中已修过的逻辑并未生效，可能复现
+    已知且已修掉的引擎缺陷。因此 dev 栈不应起/复用一份比 orig-daemon 源码旧的
+    守护进程——应先 build 再起。
+    """
+    deps = ["orig-daemon", "orig-core", "orig-net", "orig-protocol-http", "orig-protocol-virtual"]
+    bin_path = REPO / "download-engine/target/release/orig-daemon.exe"
+    if not bin_path.is_file():
+        return True, "没有 release 产物（先 build）"
+    bm = bin_path.stat().st_mtime
+    newest = None
+    for c in deps:
+        d = REPO / "download-engine/crates" / c
+        if not d.is_dir():
+            continue
+        for p in list(d.rglob("*.rs")) + list(d.rglob("Cargo.toml")):
+            try:
+                m = p.stat().st_mtime
+            except OSError:
+                continue
+            if m > bm and (newest is None or m > newest[1]):
+                newest = (p, m)
+    if newest:
+        rel = newest[0].relative_to(REPO)
+        return True, f"产物比源码旧（{rel} 更新）⇒ 需要 build"
+    return False, ""
 
 
 def collect() -> dict:
@@ -424,6 +454,16 @@ def ensure_vite() -> tuple[bool, str]:
 
 
 def do_start(force: bool, with_vite: bool) -> int:
+    # ★ 最高规则护栏（会话隔离，BUG-474 衍生）：dev 守护进程二进制比 orig-daemon 源码旧时，
+    # 跑旧二进制 = 其中已修的逻辑没生效，可能复现已知缺陷。
+    # 注意：只判 orig-daemon（守护进程本体）；前端/纯 orig-tg 改动不会触发本护栏。
+    stale, why = daemon_binary_is_stale()
+    if stale:
+        print("⚠ 护栏：dev 守护进程二进制比源码旧，其中已修的逻辑不会生效。")
+        print(f"   {why}")
+        print("   请先运行：")
+        print("     python scripts/dev/dev_stack.py build")
+        return 1
     # BUG-453：dev 跑在 cargo 输出目录之外的副本目录，构建不再锁住运行中的 dev 进程。
     ds.DAEMON_EXE = DEV_BIN_DIR / "orig-daemon.exe"
     # 一条命令必须自足：副本目录缺二进制时（干净检出/首次运行/目录被清）先构建，

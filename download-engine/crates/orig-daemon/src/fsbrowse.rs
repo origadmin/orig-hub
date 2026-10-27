@@ -275,7 +275,13 @@ mod tests {
         // 文件不参与；目录按小写字典序
         assert_eq!(names, vec!["Alpha", "beta"]);
         // 上级 = 临时目录（`temp_dir()` 带尾分隔符、`Path::parent()` 不带 ⇒ 归一后比）
-        let norm = |s: &str| s.trim_end_matches(['\\', '/']).to_lowercase();
+        // 测试侧归一化必须**同时**折分隔符：响应里的路径走 `to_wire`（统一 `/`），
+        // 而 `temp_dir()` 在 Windows 上是 `\` —— 只折大小写会让同一个目录判成不同串。
+        let norm = |s: &str| {
+            s.replace('\\', "/")
+                .trim_end_matches('/')
+                .to_lowercase()
+        };
         let parent = r.parent.clone().unwrap();
         assert_eq!(
             norm(&parent),

@@ -435,13 +435,52 @@ impl AppState {
         if port_bindable(cur).await {
             return cur;
         }
+        // BUG-228：端口不可绑定但**有监听者**时不要立刻迁 —— 先问占用者「你是不是
+        // 一个健康的 orig-tg」。外部实例（上一轮 daemon 遗留 / 手动启动）在正常服务时
+        // 也占着端口，旧实现把它当成「本机端口不可用」而迁移，与巡检叠加成端口漂移
+        // 风暴（P1→P2→P3 每 60s 一次，前端播放 URL 指到死端口）。
+        // 健康 ⇒ 复用（对齐 BUG-091「别的发起方拉起也算在服务」的语义）；
+        // 不响应/非本服务 ⇒ 才迁移。
+        if tg_port_has_listener(cur).await {
+            if self.tg_health_ok_on(cur).await {
+                daemon_log(&format!(
+                    "orig-tg port {cur} is served by a healthy instance; keeping it instead of migrating (BUG-228)"
+                ));
+                return cur;
+            }
+            daemon_log(&format!(
+                "orig-tg port {cur} has a listener that does not answer /health; treating it as unusable (BUG-228)"
+            ));
+        }
         match select_bindable_port(tg_port()).await {
             Some(next) => {
+                daemon_log(&format!(
+                    "orig-tg port {cur} is not bindable (reserved/in use, no listener); migrating to {next} (BUG-228)"
+                ));
                 *self.tg_port.write().unwrap() = next;
                 next
             }
             // 一个都绑不上：如实留下起点，让 `tg_start_on` 去报真实错误。
             None => cur,
+        }
+    }
+
+    /// 指定端口上的 orig-tg 是否**健康**（`GET /health` 2xx）。
+    ///
+    /// BUG-228：`tg_reselect_port` 迁移前的判据。只看「有没有监听者」会把
+    /// 「别人在正常服务」和「端口被一个僵尸连接占着」混为一谈 —— 前者必须复用，
+    /// 后者必须迁移。本函数把两者分开。超时短（800ms）：这是启动/巡检路径上的探测，
+    /// 不能因为一个沉默的监听者把重启拖住。
+    async fn tg_health_ok_on(&self, port: u16) -> bool {
+        match self
+            .http
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .timeout(Duration::from_millis(800))
+            .send()
+            .await
+        {
+            Ok(r) => r.status().is_success(),
+            Err(_) => false,
         }
     }
 
@@ -658,8 +697,19 @@ impl AppState {
 
     /// 拉起 orig-tg 子进程（端口在拉起前重新选定，见 [`Self::tg_reselect_port`]）。
     pub async fn tg_start(&self) -> std::io::Result<bool> {
+        // BUG-228：迁移后的端口只有 spawn **成功**才算数。原实现先改 `tg_port` 再
+        // spawn，失败也不回滚 ⇒ `/api/config` 指向一个从未监听过的端口（前端把播放
+        // URL 指过去就是死链），下一轮巡检又从这里重新选，形成漂移。
+        let prev = self.tg_port_state();
         let port = self.tg_reselect_port().await;
-        self.tg_start_on(port).await
+        let res = self.tg_start_on(port).await;
+        if res.is_err() && port != prev {
+            *self.tg_port.write().unwrap() = prev;
+            daemon_log(&format!(
+                "orig-tg failed to listen on migrated port {port}; rolled tg_port back to {prev} (BUG-228)"
+            ));
+        }
+        res
     }
 
     /// 重启 orig-tg（**唯一执行者语义**：凭证变更 / 链路恢复都走这里）。
@@ -1028,7 +1078,10 @@ pub fn resolve_tg_env(cfg: &Config, data_dir: &Path) -> TgLaunchEnv {
 pub fn tg_data_dir() -> PathBuf {
     if let Ok(d) = std::env::var("ORIG_TG_DATA") {
         if !d.is_empty() {
-            return PathBuf::from(d);
+            // BUG-336：原样 `PathBuf::from(d)` 会把用户给的 `D:/Verify/TG` 带进来，
+            // 之后 `log_dir().join("logs")` 就拼出 `D:/Verify/TG\logs`（同一串里两种
+            // 分隔符）。在**唯一入口**归一，全进程下游都只有一种形态。
+            return orig_core::paths::normalize_dir_path(Path::new(d.trim()));
         }
     }
     if cfg!(windows) {
@@ -1082,7 +1135,9 @@ pub fn log_dir() -> PathBuf {
     if let Ok(p) = std::env::var("ORIG_LOG_DIR") {
         let p = p.trim();
         if !p.is_empty() {
-            return PathBuf::from(p);
+            // BUG-336：同上，覆盖值也必须归一（否则 `ORIG_LOG_DIR=D:/x` 会把混用
+            // 分隔符一路带到「关于」页的日志路径串）。
+            return orig_core::paths::normalize_dir_path(Path::new(p));
         }
     }
     tg_data_dir().join("logs")

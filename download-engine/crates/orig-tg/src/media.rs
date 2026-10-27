@@ -762,6 +762,38 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
         (),
     )
     .await?;
+    // 旧库兼容：media_item 补 album_group 列（BUG-297）。
+    //
+    // 条目的「定位」有三段：来源坐标（`ref`，必填）、相册组、剧集槽位。组信息一直
+    // 只存在流水表 `media_message.group_id` 里，条目侧**没有位置可写** ⇒ 一旦挂靠
+    // 没发生，条目就永远说不出自己属于哪个相册（实测 tg 条目零挂靠 96/438）。
+    // 这里补上列并做一次**只填空值**的回填（幂等），新数据由登记路径写入。
+    let probe = conn
+        .prepare("SELECT 1 FROM pragma_table_info('media_item') WHERE name = 'album_group'")
+        .await?;
+    let exists = probe.query(()).await?.next().await?.is_some();
+    if !exists {
+        conn.execute("ALTER TABLE media_item ADD COLUMN album_group INTEGER", ())
+            .await?;
+    }
+    // 回填：只写 `album_group IS NULL` 的行（幂等；不覆盖已写入的值）。
+    conn.execute(
+        "UPDATE media_item AS i SET album_group = (
+             SELECT m.group_id FROM media_message m
+              WHERE m.channel_id || ':' || m.message_id = i.ref AND m.group_id IS NOT NULL
+              LIMIT 1)
+          WHERE i.source = 'tg' AND i.album_group IS NULL
+            AND EXISTS (SELECT 1 FROM media_message m
+                         WHERE m.channel_id || ':' || m.message_id = i.ref
+                           AND m.group_id IS NOT NULL)",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_media_item_album_group ON media_item(album_group)",
+        (),
+    )
+    .await?;
     // 旧库兼容：media_item 补 source_title 列（D24-A / BUG-310）。
     //
     // `source_title` 是**只读的来源事实字段**：记录这条内容**第一次**被写下的名字
@@ -817,6 +849,21 @@ pub async fn migrate(conn: &Connection) -> libsql::Result<()> {
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_series_source_key
              ON media_series(source_key) WHERE source_key IS NOT NULL",
+        (),
+    )
+    .await?;
+    // BUG-475：剧集级删除封禁（用户显式删剧后，禁止自动路径按 source_key 重建）。
+    // 与 `media_episode_removed`（分集摘除墓碑）同一哲学：**用户显式删除 > 系统自动重建**。
+    // 没有这条，用户删掉一个 TG 自动成剧后，monitor 重启（立即 tick）重跑缓存任务 /
+    // `reconcile_unfiled_items` 会按 `source_key` 把剧集重新建回来 —— 即「删了又回来，像病毒」。
+    // 表只存 key + 删除时刻；带来源键的剧集被删即记一行，自动成剧路径（见 `ensure_series` /
+    // `file_items_into_series`）查到即放弃重建。手工剧集（source_key = NULL）本就无重建路径，
+    // 不需要也不写这条。
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS media_series_removed (
+             source_key TEXT PRIMARY KEY,
+             removed_at  INTEGER NOT NULL
+         )",
         (),
     )
     .await?;
@@ -1568,6 +1615,42 @@ pub struct SeriesDetail {
     pub episodes: Vec<EpisodeView>,
 }
 
+/// BUG-283：标题是否仍是「… · YYYY-MM-DD」占位形态（入库时拿不到 caption 的兜底名）。
+///
+/// 形态判定（而非「等于某频道名」）：频道名可能变、也可能缺失（退化成
+/// `TG <chat_id>`），但**兜底名的形状**恒定 —— `{base} · {ymd}`（见
+/// `routes::ymd_str`）。重算/回填只碰这种标题，真实剧名（含用户手改的）一律不匹配。
+pub(crate) fn is_placeholder_series_title(title: &str) -> bool {
+    let Some((_base, tail)) = title.trim().rsplit_once(" · ") else {
+        return false;
+    };
+    let b = tail.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[..4].iter().all(|c| c.is_ascii_digit())
+        && b[5..7].iter().all(|c| c.is_ascii_digit())
+        && b[8..].iter().all(|c| c.is_ascii_digit())
+}
+
+/// BUG-294：逐条缓存态（派生，非状态机值）。见 [`ManifestEntry::cache_state`]。
+fn entry_cache_state(
+    has_bytes: bool,
+    media_type: Option<&str>,
+    started_at: Option<i64>,
+) -> &'static str {
+    if has_bytes {
+        "on_disk"
+    } else if media_type == Some("photo") {
+        // BUG-049 裁定：图片不落盘。把它算成「缺口」会让每一次补档都试图重下图片。
+        "photo_no_bytes"
+    } else if started_at.is_some() {
+        "in_flight"
+    } else {
+        "never_attempted"
+    }
+}
+
 /// 组清单里单条消息的状态（D22-A② / BUG-296，**只读派生**）。
 ///
 /// 三值互斥，覆盖 BUG-296 的五态口径：
@@ -1586,6 +1669,16 @@ pub struct ManifestEntry {
     pub message_id: i64,
     /// `slotted` | `registered_unslotted` | `missing`。
     pub state: &'static str,
+    /// BUG-294：**条目级缓存态**（与 `state` 正交：`state` 说「编到哪儿」，
+    /// 本字段说「字节/尝试到哪一步」）：
+    /// `on_disk`（字节在盘）/ `photo_no_bytes`（图片按 BUG-049 规则不落盘）/
+    /// `in_flight`（本任务为它落了尝试起点 `cache_task_item_wall.started_at`）/
+    /// `never_attempted`（零记录 —— 用户说的「丢失状态」）。
+    ///
+    /// 全部**派生**自既有真源（字节 stat + `cache_task_item_wall`），不新建表、
+    /// 不新增状态机值；`done` 计数不再需要被反推成「哪几条成了」。
+    #[serde(rename = "cacheState")]
+    pub cache_state: &'static str,
     /// 字节是否真的在盘（`probe_cached_bytes`，与分集/条目视图同一套真值，BUG-132）。
     #[serde(rename = "hasBytes")]
     pub has_bytes: bool,
@@ -2445,8 +2538,34 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// 待补 hash 的条目（`content_hash` 为空且有 `file_path`）—— BUG-420 回填的扫描集。
+    /// BUG-297：把相册组 id 写进条目自己（`media_item.album_group`）。
     ///
+    /// `None` 是 **no-op**，不是「清空」：登记发生在 T0（元数据行可能还没到），
+    /// 取不到组只能用 NULL 表示「还不知道」，绝不能用它覆盖后来写入的真值。
+    pub async fn set_item_album_group(&self, id: i64, group: Option<i64>) -> libsql::Result<()> {
+        let Some(g) = group else { return Ok(()) };
+        self.conn
+            .execute(
+                "UPDATE media_item SET album_group = ?2 WHERE id = ?1",
+                params![id, g],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// BUG-443：单条目的内容身份（ETag 用）。主键单行读，不走列表投影
+    /// （`MediaItem` 故意不携带 hash：它是归并判据，不应进入对外 DTO）。
+    pub async fn item_content_hash(&self, id: i64) -> libsql::Result<Option<String>> {
+        let row = self
+            .row_opt(
+                "SELECT content_hash FROM media_item WHERE id = ?1",
+                params![id],
+            )
+            .await?;
+        Ok(row.and_then(|r| r.get::<Option<String>>(0).ok().flatten()))
+    }
+
+    /// 待补 hash 的条目（`content_hash` 为空且有 `file_path`）—— BUG-420 回填的扫描集。
     /// 只按「有没有 hash」筛，**不**在这里判文件是否存在：存在性要触盘，属调用方
     /// （`hash_backfill`）的事。`limit` 为 0 = 不限。
     pub async fn list_items_missing_hash(&self, limit: usize) -> libsql::Result<Vec<(i64, String)>> {
@@ -3450,6 +3569,8 @@ impl Store {
                 out.push(ManifestEntry {
                     message_id: m,
                     state: "missing",
+                    // BUG-294：没有条目行 ⇒ 只可能是「尝试过（有墙钟起点）」或「从未尝试」。
+                    cache_state: if started_at.is_some() { "in_flight" } else { "never_attempted" },
                     has_bytes: false,
                     episode_id: None,
                     season: None,
@@ -3485,6 +3606,7 @@ impl Store {
                 Some(e) => out.push(ManifestEntry {
                     message_id: m,
                     state: "slotted",
+                    cache_state: entry_cache_state(has_bytes, media_type.as_deref(), started_at),
                     has_bytes,
                     episode_id: Some(e.get(0)?),
                     season: Some(e.get(1)?),
@@ -3501,6 +3623,7 @@ impl Store {
                 None => out.push(ManifestEntry {
                     message_id: m,
                     state: "registered_unslotted",
+                    cache_state: entry_cache_state(has_bytes, media_type.as_deref(), started_at),
                     has_bytes,
                     episode_id: None,
                     season: None,
@@ -4041,6 +4164,74 @@ impl Store {
             Some(r) => r.get(0),
             None => Ok(0),
         }
+    }
+
+    /// BUG-283：存量占位名重算 —— 把「频道名 · 日期」这类**占位标题**按组内 caption
+    /// 重算成真剧名。
+    ///
+    /// 只动**占位形态**的标题（[`is_placeholder_series_title`]）：真实剧名（含用户手工
+    /// 改过的）一律不匹配 ⇒ 天然满足「不得覆盖用户编辑」。算不出真名就原样保留
+    /// （不臆造标题，BUG-154）。返回被改名的条数。
+    ///
+    /// 为什么需要它（BUG-283 根因）：标题在创建时若拿不到 caption 就落占位名，而追加
+    /// 路径刻意不写 title（BUG-152）⇒ 占位名被永久钉死。这里补上「按 source_key 重算」
+    /// 这条缺失的通道；缓存消息入库后也会再触发一次（`routes` 侧增量回填）。
+    pub async fn repair_placeholder_series_titles(&self, limit: usize) -> libsql::Result<usize> {
+        let stmt = self
+            .conn
+            .prepare(
+                "SELECT id, title FROM media_series \
+                 WHERE title LIKE '% · ____-__-__' ORDER BY id LIMIT ?1",
+            )
+            .await?;
+        let mut rows = stmt.query(params![limit.max(1) as i64]).await?;
+        let mut candidates: Vec<(i64, String)> = Vec::new();
+        while let Some(r) = rows.next().await? {
+            let id: i64 = r.get(0)?;
+            let title: String = r.get(1)?;
+            if is_placeholder_series_title(&title) {
+                candidates.push((id, title));
+            }
+        }
+        let mut changed = 0usize;
+        for (sid, old_title) in candidates {
+            // 该剧集的任一 TG 条目 → (chat, msg) → 组内 caption。
+            let Some(r) = self
+                .row_opt(
+                    "SELECT i.ref FROM media_episode e JOIN media_item i ON i.id = e.item_id \
+                     WHERE e.series_id = ?1 AND i.source = 'tg' LIMIT 1",
+                    params![sid],
+                )
+                .await?
+            else {
+                continue;
+            };
+            let ref_key: String = r.get(0)?;
+            let Some((chat_id, msg_id)) = crate::routes::parse_tg_ref(&ref_key) else {
+                continue;
+            };
+            let Ok((_group, Some(cap))) = self.tg_group_facts(chat_id, msg_id).await else {
+                continue;
+            };
+            let (title_line, _desc) = split_caption(&cap);
+            let name = title_line
+                .as_deref()
+                .map(crate::routes::normalized_series_name)
+                .unwrap_or_default();
+            if name.trim().is_empty() || is_placeholder_series_title(&name) {
+                continue;
+            }
+            // 带旧标题做守卫：期间若被用户改名（不再是占位名）则不改。
+            let n = self
+                .conn
+                .execute(
+                    "UPDATE media_series SET title = ?2, updated_at = ?3 WHERE id = ?1 AND title = ?4",
+                    params![sid, name, now_secs(), old_title],
+                )
+                .await?;
+            changed += n as usize;
+        }
+        Ok(changed)
     }
 
     /// 更新剧集元数据。
@@ -4916,6 +5107,11 @@ impl Store {
             )
             .await?;
         if let Some(k) = key {
+            // BUG-475：先写**剧集级**删除封禁（借 `&k`，不移动），压住自动路径按此键重建
+            //（「删了又回来，像病毒」的根因）。剧集级封禁与分集墓碑分属两表，必须**留下**
+            // 才压得住 monitor 重启后的自动重建。下面清掉的是分集墓碑（用户删的是整部剧，
+            // 负向记录完成使命）。
+            self.mark_series_removed(&k).await?;
             self.conn
                 .execute(
                     "DELETE FROM media_episode_removed
@@ -5605,6 +5801,17 @@ impl Store {
             let (sid, fresh) = match self.find_series_by_source_key(&key).await? {
                 Some(sid) => (sid, false),
                 None => {
+                    // BUG-475：用户显式删过这部剧（按 source_key 封禁）⇒ 绝不重建。
+                    // 否则 `reconcile_unfiled_items` 会把孤儿条目按同一键重新归集出剧集
+                    //（「删了又回来，像病毒」）。命中封禁则本条不建剧、不挂集，
+                    // 保持未归档态（用户删剧语义优先）。
+                    if self.is_series_removed(&key).await.unwrap_or(false) {
+                        tracing::debug!(
+                            "BUG-475 series {key} explicitly removed by user; \
+                             skip auto-rebuild for item {item_id}"
+                        );
+                        continue;
+                    }
                     // BUG-438：有显式归档轴 ⇒ 用它给的剧名建剧；没有 ⇒ 沿用既定口径
                     // （条目自己的标题，空则「未命名X #id」，BUG-304 / D18）。
                     let name = explicit_filing
@@ -5883,6 +6090,42 @@ impl Store {
             Some(r) => Ok(r.get::<Option<String>>(0)?),
             None => Ok(None),
         }
+    }
+
+    /// BUG-475：剧集级删除封禁。用户**显式**删掉一部带 `source_key` 的剧集后，
+    /// 写一行 `(source_key, removed_at)`，阻止自动成剧路径（`ensure_series` /
+    /// `file_items_into_series`）按同一键把剧集重建回来 —— 即用户报告的
+    /// 「删了又回来，像病毒」。
+    ///
+    /// 与 `media_episode_removed`（分集摘除墓碑，BUG-126）同一哲学：**用户显式删除
+    /// 高于系统自动重建**。分集级早已存在墓碑；剧集级此前缺失，正是 BUG-475 的根因缺口。
+    ///
+    /// `INSERT OR IGNORE`：用户可多次点删除，重复写同一 key 不报错。手工剧集
+    /// （`source_key = NULL`）无重建路径，调用方**不应**传 NULL（无意义，主键约束也会拒绝）。
+    pub async fn mark_series_removed(&self, source_key: &str) -> libsql::Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO media_series_removed (source_key, removed_at)
+                      VALUES (?1, cast(strftime('%s','now') as integer))",
+                params![source_key],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// BUG-475：查询某 `source_key` 是否已被用户**显式**删剧封禁。命中返回 `true`。
+    ///
+    /// 自动成剧的两个入口（`IngestCtx::ensure_series`、`Store::file_items_into_series`）
+    /// 在 `find_series_by_source_key` miss 之后、调 `create_series` 之前必须查这一条 ——
+    /// 命中即放弃重建，让底层 `media_item` 保持未归档态（用户删剧的语义优先）。
+    pub async fn is_series_removed(&self, source_key: &str) -> libsql::Result<bool> {
+        let row = self
+            .row_opt(
+                "SELECT 1 FROM media_series_removed WHERE source_key = ?1 LIMIT 1",
+                params![source_key],
+            )
+            .await?;
+        Ok(row.is_some())
     }
 
     /// 清除指定内容的「已摘除」墓碑（BUG-126：**用户显式操作**高于系统惯例）。
@@ -6505,6 +6748,25 @@ impl Store {
         }
         let caption = self.first_caption(chat_id, &ids).await?;
         Ok((group, caption))
+    }
+
+    /// BUG-297：单条消息的**相册组 id**（一列读，不含 caption）。
+    ///
+    /// 与 [`Self::tg_group_facts`] 的分工：那条要「整组 caption」，会展开组内消息并逐条
+    /// 取 caption（O(N) 次查询），只适合每任务/每剧集调用一次；登记路径是**逐条消息**
+    /// 调用，用一列读才不会退化成 O(N²)。
+    pub async fn message_group_id(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> libsql::Result<Option<i64>> {
+        let row = self
+            .row_opt(
+                "SELECT group_id FROM media_message WHERE channel_id = ?1 AND message_id = ?2",
+                params![chat_id, message_id],
+            )
+            .await?;
+        Ok(row.and_then(|r| r.get::<Option<i64>>(0).ok().flatten()))
     }
 
     /// 把一批**标签名**并集式归档到剧集（不存在的标签自动创建）。
@@ -8348,6 +8610,79 @@ mod tests {
             tombstone_count(&s).await,
             0,
             "用户显式删剧应清掉带键墓碑（负向记录已完成使命）"
+        );
+    }
+
+    /// 回归（BUG-475）：用户**显式**删掉一部带 `source_key` 的剧集后，必须写「剧集级删除封禁」
+    ///（落到 `media_series_removed`），否则自动成剧路径（monitor 重启重跑缓存任务 /
+    /// `reconcile_unfiled_items`）会按 `source_key` 把剧集**重建回来** —— 即用户报告的
+    /// 「删了又回来，像病毒」。分集级墓碑（BUG-126）早已存在；剧集级此前缺失，是本 bug 的根因。
+    #[tokio::test]
+    async fn delete_series_explicit_writes_series_removal_ban() {
+        let s = Store::open(tmp_db("series_ban_write")).await.unwrap();
+        let a = s
+            .upsert_media_item("tg", "sb:1", "a", "video", None, None, None, None)
+            .await
+            .unwrap();
+        let sid = s
+            .create_series("S", None, "series", None, Some("tg:named:1:Show"))
+            .await
+            .unwrap();
+        s.add_episode(sid, a, 1, 1).await.unwrap();
+
+        // 前置：删之前无封禁。
+        assert!(
+            !s.is_series_removed("tg:named:1:Show").await.unwrap(),
+            "前置条件：删剧前不应有封禁"
+        );
+
+        // 用户显式删剧。
+        s.delete_series_explicit(sid).await.unwrap();
+
+        assert!(!series_exists(&s, sid).await, "剧集应已被删");
+        assert_eq!(
+            tombstone_count(&s).await,
+            0,
+            "用户显式删剧应清掉分集墓碑（负向记录完成使命）"
+        );
+        assert!(
+            s.is_series_removed("tg:named:1:Show").await.unwrap(),
+            "BUG-475：删剧必须写剧集级封禁，否则会自动重建"
+        );
+    }
+
+    /// 回归（BUG-475）：封禁写好后，自动归集路径 `file_items_into_series`（`reconcile_unfiled_items`
+    /// 的底层）遇到被封禁的 `source_key` 必须**放弃重建**，让底层 `media_item` 保持未归档态。
+    ///
+    /// 用「本地条目」走 `(None,None)` 退化键 `item:{id}`（与 TG 条目走 `tg:named:` / `tg:group:`
+    /// 同一把守卫逻辑），确定性地复现「删剧 → 重启 reconcile → 不该复活」。
+    #[tokio::test]
+    async fn reconcile_does_not_resurrect_explicitly_removed_series() {
+        let s = Store::open(tmp_db("series_ban_guard")).await.unwrap();
+        // 非 tg 来源（ref 无法解析为 chat:msg）的条目，file_items_into_series 退化键 = `item:{id}`。
+        let id = s
+            .upsert_media_item("local", "D:/x/a.mp4", "a", "video", Some("D:/x/a.mp4"), None, None, None)
+            .await
+            .unwrap();
+        let key = format!("item:{id}");
+
+        // 模拟「此前用户显式删过这部剧」：先建带键剧集、挂一集、再显式删（写封禁）。
+        let sid = s
+            .create_series("S", None, "series", None, Some(&key))
+            .await
+            .unwrap();
+        s.add_episode(sid, id, 1, 1).await.unwrap();
+        s.delete_series_explicit(sid).await.unwrap();
+        assert!(s.is_series_removed(&key).await.unwrap(), "前置：封禁已写");
+
+        // 重启后 reconcile 孤儿条目：必须不重建被封禁的剧集。
+        let (created, attached) = s.file_items_into_series(&[id]).await.unwrap();
+        assert_eq!(created, 0, "BUG-475：被封禁的剧集不得被自动重建");
+        assert_eq!(attached, 0, "BUG-475：孤儿条目保持未归档态");
+        assert_eq!(
+            s.find_series_by_source_key(&key).await.unwrap(),
+            None,
+            "BUG-475：封禁后反查仍应为空（剧集未复活）"
         );
     }
 

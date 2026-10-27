@@ -278,6 +278,15 @@ pub struct Store {
     /// 字节所有权 P2：库根的解析链需要它——config.json 与默认库根都取
     /// `<TG 数据目录>/<...>`，而 TG 数据目录 = 数据库文件的父目录。
     pub(crate) db_path: PathBuf,
+    /// `app_setting.download_dir` 的进程内快照（BUG-274）。
+    ///
+    /// 播放三个端点（`/raw`、`/tg/local`、`/stream`）**每请求**都要走
+    /// `library_root() → download_root() → get_setting("download_dir")` 一次 SELECT，
+    /// 而这条读与缓存 worker 的记账**共用同一条 libsql 连接** ⇒ 写入突发时播放读
+    /// 只能排队。设置写点唯一（`set_setting`）⇒ 在这里缓存并在写点失效，读路径零 SQL。
+    ///
+    /// `None` = 还没读过；`Some(None)` = 库里没有该键；`Some(Some(v))` = 原值。
+    download_dir_cache: std::sync::RwLock<Option<Option<String>>>,
 }
 
 /// 批量清除任务记录的**范围**——动词只有一个（清除），可变的是范围。
@@ -882,6 +891,16 @@ impl Store {
     pub async fn open(path: impl AsRef<Path>) -> libsql::Result<Self> {
         let db_path = path.as_ref().to_path_buf();
         let conn = libsql::Builder::new_local(path).build().await?.connect()?;
+        // BUG-274：库默认是 **rollback journal** 模式 —— 每次写事务都要建/删 `-journal`
+        // 文件并两次 fsync（库在 `%APPDATA%`，还会被安全软件实时扫描），而缓存 worker
+        // 每条目要写十几次 ⇒ 播放侧的读请求落在这个窗口里就等。WAL 让读不再被写阻塞，
+        // 并把每提交的独占/fsync 语义降为「追加日志」。`busy_timeout` 兜住残余的写-写
+        // 竞争（libsql 单连接下仍有并发调用），避免直接返回 SQLITE_BUSY。
+        // 幂等：WAL 是库文件的持久属性，重复设置在已 WAL 的库上是空操作。
+        // 失败不阻断启动（内存库 `:memory:` 不支持 WAL，测试夹具会走到这里）。
+        if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;").await {
+            tracing::warn!(target: "orig_tg::store", "WAL pragma failed (continuing in default journal mode): {e}");
+        }
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS monitored_channel (
@@ -1023,7 +1042,22 @@ impl Store {
         }
         // 媒体资料库（内容/剧集/标签）：与 TG 流水同库、职责分离。
         crate::media::migrate(&conn).await?;
-        let store = Self { conn, db_path };
+        let store = Self {
+            conn,
+            db_path,
+            download_dir_cache: std::sync::RwLock::new(None),
+        };
+        // BUG-283：存量「频道名 · 日期」占位剧集名按组内 caption 重算。
+        // 只动占位形态的标题（用户/真实剧名不匹配），幂等；失败不阻断启动。
+        match store.repair_placeholder_series_titles(200).await {
+            Ok(n) if n > 0 => {
+                eprintln!("[store] BUG-283: recomputed {n} placeholder series title(s) from group captions");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("[store] BUG-283: placeholder title repair failed (non-fatal): {e}");
+            }
+        }
         // BUG-304 / D18（用户 2026-10-14 拍板：视频=剧集，永远不存在未归档）：
         // 启动自愈 —— 把「零认领」条目补进剧集。三条入库路径里只有
         // `IngestCtx::ensure_series` 建剧（`register_media_item_t0` 与
@@ -2052,6 +2086,10 @@ impl Store {
                 params![key, value],
             )
             .await?;
+        // BUG-274：设置写点唯一 ⇒ 在这里让读路径缓存失效（见字段注释）。
+        if key == "download_dir" {
+            *self.download_dir_cache.write().unwrap() = Some(Some(value.to_string()));
+        }
         Ok(())
     }
 
@@ -2109,10 +2147,23 @@ impl Store {
         };
         let raw = match raw {
             Some(v) => v,
-            None => match self.get_setting("download_dir").await {
-                Ok(Some(v)) if !v.trim().is_empty() => v,
-                _ => return self.default_content_root(),
-            },
+            None => {
+                // BUG-274：读路径不碰库（见字段注释）。缓存只存**设置原值**，
+                // env `ORIG_TG_DOWNLOAD_DIR` 仍在上面每次实时解析。
+                let cached = self.download_dir_cache.read().unwrap().clone();
+                let setting = match cached {
+                    Some(v) => v,
+                    None => {
+                        let v = self.get_setting("download_dir").await.ok().flatten();
+                        *self.download_dir_cache.write().unwrap() = Some(v.clone());
+                        v
+                    }
+                };
+                match setting {
+                    Some(v) if !v.trim().is_empty() => v,
+                    _ => return self.default_content_root(),
+                }
+            }
         };
         let norm = norm_root(&orig_core::paths::expand_tilde(raw.trim()));
         if orig_core::paths::is_forbidden_content_drive(&norm) {
@@ -3681,8 +3732,24 @@ impl Store {
         };
         let path: Option<String> = row.get(0).ok();
         if let Some(p) = path {
-            // 文件已被手动移动/删除时静默忽略：目标仍是复位状态
-            let _ = std::fs::remove_file(&p);
+            // BUG-442：存量平铺条目的 `file_path` 是**库根相对**路径（`chat--<id>/…`），
+            // 按 CWD 直接 `remove_file` 必然失败、又被 `let _` 吞掉 ⇒ 库里已置空、
+            // 占用统计下降，字节却留在库根目录里（且再没有任何行知道它们属于谁）。
+            // 与投递/删条目同一口径：先按库根解析成绝对路径，且只在**确实是文件**时才动手
+            // （BUG-421 的教训：目标不存在就什么都不做，别把「文件没了」伪装成「路径对了」）。
+            let absolute = crate::cache::resolve_item_path(&self.library_root().await, &p);
+            if absolute.is_file() {
+                if let Err(e) = std::fs::remove_file(&absolute) {
+                    // 删不掉就不置空 `file_path`：否则「DB 已清、字节还在」且无通道可回收。
+                    // 如实按「没有清掉」返回，调用方据此保留条目状态。
+                    eprintln!(
+                        "[store] clear_downloaded({channel_id},{message_id}): remove_file {} \
+                         failed: {e}; keeping the row as downloaded (BUG-442)",
+                        absolute.display()
+                    );
+                    return Ok(false);
+                }
+            }
         }
         self.conn
             .execute(

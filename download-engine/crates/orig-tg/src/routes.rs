@@ -594,12 +594,52 @@ const PHOTO_PROXY_CACHE_CONTROL: &str = "private, max-age=86400";
 /// 在线流（`GET /api/tg/file/...`）与 BUG-117 的全尺寸原图代理**共用此实现**，
 /// 使 Range / 206 / `Content-Range` 契约只定义一次。`range` 必须是**同一个**
 /// 传给 `Client::media` 的值：206 分支据此决定是否回 `Content-Range`。
+/// BUG-114：把远程（grammers 直透）字节流按**与本地投递同一套**速率策略节流。
+///
+/// 原实现 `Body::from_stream(stream.body)` 是零背压直透：服务端以链路极限灌数据，
+/// 解码器只按「码率 × 倍速」消费，Chromium 读满 buffer 即 abort 再重取同一区域
+/// （BUG-033 实测 2x 下 137 请求 / 63x 冗余）。本地路径早已有节流（`serve_local_file`），
+/// 在线路径漏了 —— 这里补上，速率口径完全复用 `delivery_bps`（含 BUG-199 的环回豁免
+/// 与 `ORIG_TG_DELIVERY_BPS` 覆盖），不另立一套阈值。
+///
+/// 上游的有界预读由 `grammers::media` 的定长 channel 提供（容量 4/2），慢消费者
+/// 会把反压传回 MTProto 读取循环。
+fn throttle_remote_body(
+    body: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>, std::io::Error>> + Send>>,
+    total: Option<u64>,
+) -> axum::body::Body {
+    use futures::StreamExt as _;
+    let bps = delivery_bps(total.unwrap_or(0), None);
+    if bps <= 0.0 {
+        return axum::body::Body::from_stream(body);
+    }
+    let burst_secs = std::env::var("ORIG_TG_DELIVERY_BURST_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(DELIVERY_BURST_SECS);
+    let started = std::time::Instant::now();
+    let throttled = futures::stream::unfold((body, 0u64), move |(mut src, sent)| async move {
+        let chunk = src.next().await?;
+        let mut sent = sent;
+        if let Ok(bytes) = &chunk {
+            sent += bytes.len() as u64;
+            let lag = delivery_due_secs(sent, bps, burst_secs) - started.elapsed().as_secs_f64();
+            if lag > 0.0 {
+                tokio::time::sleep(std::time::Duration::from_secs_f64(lag)).await;
+            }
+        }
+        Some((chunk, (src, sent)))
+    });
+    axum::body::Body::from_stream(throttled)
+}
+
 fn media_stream_response(
     stream: crate::login::MediaStream,
     range: Option<MediaRange>,
     cache_control: &'static str,
 ) -> Response {
-    let mut res = Response::new(axum::body::Body::from_stream(stream.body));
+    // BUG-114：远程流必须与本地投递同速（不再零背压直透）。
+    let mut res = Response::new(throttle_remote_body(stream.body, stream.total_size));
     let ct = HeaderValue::from_str(&stream.content_type)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     res.headers_mut().insert(header::CONTENT_TYPE, ct);
@@ -913,7 +953,7 @@ async fn local_file(
     if !std::path::Path::new(&path).exists() {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "cached file missing"));
     }
-    serve_local_file(&path, msg.media_type.as_deref(), msg.duration, &headers).await
+    serve_local_file(&path, msg.media_type.as_deref(), msg.duration, &headers, None).await
 }
 
 /// 下载目录当前生效值（= 受管根 / 权限边界，BUG-323）。
@@ -2401,6 +2441,17 @@ async fn register_media_item_t0(
         .ok()
         .and_then(|m| m.get(&id).cloned())
         .unwrap_or(kind);
+    // BUG-297：定位写进**条目自己**（`media_item.album_group`）。组 id 在入库路径上一直
+    // 齐全（入队请求、任务上下文、剧集键都用了），却从不落到条目 —— 于是条目只能说
+    // 「我是 <chat>:<msg>」，说不出「我属于哪个相册」。取消息侧的权威组（BUG-378）：
+    // T0 时元数据行可能还没到 ⇒ 取不到就**不覆盖**（`set_item_album_group` 对 None 是
+    // no-op），步骤 ③ 的补强会再写一次。
+    //
+    // 只读 `group_id` 一列（不是 `tg_group_facts`）：后者会带出整组 caption，
+    // 而本函数在入队路径上**逐条**调用，用它会变成 O(N²) 次查询。
+    if let Ok(Some(group)) = st.store.message_group_id(chat_id, msg_id).await {
+        let _ = st.store.set_item_album_group(id, Some(group)).await;
+    }
     Some((id, kind))
 }
 
@@ -2910,7 +2961,28 @@ impl IngestCtx {
             Ok(Some(sid)) => {
                 // BUG-152：追加批次**不静默覆盖**已有标题；留痕便于诊断候选与现状差异。
                 if let Ok(Some(cur)) = st.store.get_series(sid).await {
-                    if cur.series.title != title {
+                    // BUG-283（增量回填）：只有当**现有标题仍是占位形态**且本次能算出真名时
+                    // 才回填 —— 真实剧名（含用户手改）不是占位形态，天然不被覆盖。
+                    if crate::media::is_placeholder_series_title(&cur.series.title)
+                        && !norm.trim().is_empty()
+                        && !crate::media::is_placeholder_series_title(&norm)
+                    {
+                        let patch = crate::media::SeriesPatch {
+                            title: Some(norm.clone()),
+                            ..Default::default()
+                        };
+                        match st.store.update_series(sid, &patch).await {
+                            Ok(true) => st.push_log(&format!(
+                                "cache task {}: series {sid} title recomputed from placeholder to {norm:?} (BUG-283)",
+                                self.task_id
+                            )),
+                            Ok(false) => {}
+                            Err(e) => st.push_log(&format!(
+                                "cache task {}: series {sid} placeholder title repair failed: {e}",
+                                self.task_id
+                            )),
+                        }
+                    } else if cur.series.title != title {
                         tracing::debug!(
                             "BUG-152 series {sid} title kept as {:?}; batch candidate {:?} ignored \
                              (source_key={key})",
@@ -2924,6 +2996,24 @@ impl IngestCtx {
                 Some(sid)
             }
             Ok(None) => {
+                // BUG-475：用户显式删过这部剧（按 source_key 封禁）⇒ 绝不重建。
+                // 否则 monitor 重启（立即 tick）重跑缓存任务会把刚删的剧集重新建回来
+                //（「删了又回来，像病毒」）。底层 media_item 保留未归档态，用户想恢复
+                // 可手动重新归档。
+                if st
+                    .store
+                    .is_series_removed(&key)
+                    .await
+                    .unwrap_or(false)
+                {
+                    st.push_log(&format!(
+                        "cache task {}: series {key} was explicitly removed by user; \
+                         skip auto-rebuild (BUG-475)",
+                        self.task_id
+                    ));
+                    self.series_blocked = true;
+                    return None;
+                }
                 // kind 恒为 `series`：剧集是任意内容的编排容器（含图片浏览位）。
                 match st
                     .store
@@ -3820,7 +3910,28 @@ async fn clear_stored(
             .item_id_by_ref("tg", &format!("{channel_id}:{message_id}"))
             .await
         {
-            let _ = st.store.set_item_file_path(item_id, None).await;
+            // BUG-442：清缓存必须回收**条目自己的**那份字节。存量条目的
+            // `media_item.file_path` 与 `media_message.file_path` 可能指向**不同落点**
+            // （BUG-421 只改写了条目侧），只按消息侧删 ⇒ 条目侧文件残留、DB 却已置空，
+            // 且再没有任何行指向它。与 `delete_media_item` 同一纪律：先按库根解析成
+            // 绝对路径、确认 `is_file()` 才动手，refcount 归零才回收（共享留给别人）。
+            let item = st.store.get_media_item(item_id).await.ok().flatten();
+            let orphan = st.store.clear_item_bytes(item_id).await.ok().flatten();
+            if let Some(p) = item.and_then(|i| i.file_path) {
+                let lib_root = st.store.library_root().await;
+                let absolute = crate::cache::resolve_item_path(&lib_root, &p);
+                if absolute.is_file() && orphan.unwrap_or(true) {
+                    if let Err(e) = std::fs::remove_file(&absolute) {
+                        let msg = format!(
+                            "clear_stored({channel_id},{message_id}): remove_file {} failed: {e}; \
+                             entry bytes left behind (BUG-442)",
+                            absolute.display()
+                        );
+                        tracing::warn!("{msg}");
+                        st.push_log(&format!("WARN {msg}"));
+                    }
+                }
+            }
         }
     }
     st.push_log(&format!("/api/tg/stored/{channel_id}/{message_id} cleared={removed}"));
@@ -5048,7 +5159,17 @@ async fn media_item_raw(
                 })?
                 .to_string_lossy()
                 .into_owned();
-            serve_local_file(&p, Some(item.kind.as_str()), item.duration, &headers).await
+            // BUG-443：ETag 的内容身份取条目 hash（主键单行读）；无 hash 时
+            // `serve_local_file` 退回「大小 + 创建时间」，两者都与 mtime 解耦。
+            let content_hash = st.store.item_content_hash(item.id).await.ok().flatten();
+            serve_local_file(
+                &p,
+                Some(item.kind.as_str()),
+                item.duration,
+                &headers,
+                content_hash.as_deref(),
+            )
+            .await
         }
         // 未落盘 → 路由层调传输域代理**原图**（不是缩略图）。
         RawLocator::TelegramPhoto {
@@ -5628,6 +5749,7 @@ async fn media_item_stream(
             Some("video"),
             stream_duration,
             &headers,
+            None,
         )
         .await?;
         res.headers_mut()
@@ -5675,6 +5797,7 @@ async fn media_item_stream(
                     Some("video"),
                     stream_duration,
                     &headers,
+                    None,
                 )
                 .await?;
                 res.headers_mut()
@@ -5728,6 +5851,7 @@ async fn media_item_stream(
                                 Some("video"),
                                 None,
                                 &headers,
+                                None,
                             )
                             .await?;
                             res.headers_mut().insert(
@@ -5785,6 +5909,35 @@ async fn media_item_stream(
 ///
 /// BUG-288：`slot` 是单飞表的**出表守卫**，所有权随本 future 一起 move：
 /// panic / 任务被 drop 时 `Drop` 也会出表，不再依赖「必须走到 `finish()`」。
+/// BUG-290：FRC（断开后继续补完）转码的并发闸门。
+///
+/// 「断开后继续转码」是 BUG-230 秒开体验的一部分，不取消；但原先**没有任何上限**：
+/// 用户在转码窗口内依次点几个倍速 = 同时起 N 路 ffmpeg（实测峰值 5–6 路、聚合 >10 核），
+/// 把正在播的那一路也拖慢。这里给**补完型**转码加一个有界队列 —— 超限不是拒绝，
+/// 而是排队（拿到许可才 spawn ffmpeg，最终仍会转完落盘）。
+///
+/// 前台锚点流（`start_secs` 带值、`persist = false`）**不**过闸门：那是用户正在等的
+/// 那一路，让它在后台补完的任务后面排队正是本条要避免的观感。
+///
+/// 上限默认「可用核数 / 2」并夹在 1..=4；`ORIG_TG_TRANSCODE_CONCURRENCY` 可覆盖。
+fn transcode_concurrency_limit() -> usize {
+    if let Some(v) = std::env::var("ORIG_TG_TRANSCODE_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return v.max(1);
+    }
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(1, 4))
+        .unwrap_or(1)
+}
+
+static TRANSCODE_SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+
+fn transcode_slots() -> &'static tokio::sync::Semaphore {
+    TRANSCODE_SLOTS.get_or_init(|| tokio::sync::Semaphore::new(transcode_concurrency_limit()))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn transcode_pump(
     ffmpeg: PathBuf,
@@ -5801,6 +5954,13 @@ async fn transcode_pump(
 ) {
     let id = key.item_id;
     let persist = start_secs.is_none();
+    // BUG-290：补完型转码先排队取槽（permit 活到函数结束，任何 return/drop 都归还）。
+    // 放在 create_dir_all / spawn 之前 —— 排队期间不起进程、不占 CPU。
+    let _transcode_permit = if persist {
+        transcode_slots().acquire().await.ok()
+    } else {
+        None
+    };
     let mut finish = |completed: bool| {
         // BUG-288：出表交给守卫（`disarm` = 显式出表，之后 `Drop` 不再重复 remove）。
         // 守卫为 `None` ⇒ 锚点流没占过坑，绝不能把（可能属于别人的）同键条目顶掉。
@@ -6196,6 +6356,9 @@ async fn serve_local_file(
     kind: Option<&str>,
     duration_secs: Option<i64>,
     headers: &HeaderMap,
+    // BUG-443：内容身份（`media_item.content_hash`）。ETag 必须由它派生，
+    // 不能由 mtime 派生 —— 见下面 etag 处的注释。
+    content_identity: Option<&str>,
 ) -> Result<Response, ApiError> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -6297,7 +6460,22 @@ async fn serve_local_file(
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let etag = format!("\"{:x}-{:x}\"", total, mtime_secs);
+    // BUG-443：ETag **不得**由 mtime 派生。命中代理/LRU 的投递路径会主动
+    // `set_modified(now)` 刷新 mtime（上面两处 `set_modified`），mtime 一变 ETag 就变，
+    // Chromium 的媒体字节缓存随之整体作废 ⇒ 已取 Range 全部重下（播放卡顿 + 出网放大）；
+    // 库根跨盘迁移同理。改为：内容 hash 优先；无 hash 退回「大小 + 创建时间」——
+    // 创建时间不随 `set_modified` / `rename` 改变，能穿过 LRU 触摸与迁移，
+    // 而大小变化仍能反映内容变化。
+    let created_secs = meta
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let etag = match content_identity.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(hash) => format!("\"{:x}-{}\"", total, hash),
+        None => format!("\"{:x}-{:x}\"", total, created_secs),
+    };
 
     let mut res = axum::response::Response::builder()
         .status(status)
@@ -8420,7 +8598,7 @@ mod tests {
 
         // 从发起到取回第一块 = 完整 time-to-first-byte。
         let t0 = std::time::Instant::now();
-        let resp = match serve_local_file(&path, Some("video"), Some(500), &headers).await {
+        let resp = match serve_local_file(&path, Some("video"), Some(500), &headers, None).await {
             Ok(r) => r,
             Err(e) => panic!("serve must succeed, got {}: {}", e.status, e.message()),
         };
@@ -8454,7 +8632,7 @@ mod tests {
         headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
 
         let t0 = std::time::Instant::now();
-        let resp = match serve_local_file(&path, Some("video"), Some(500), &headers).await {
+        let resp = match serve_local_file(&path, Some("video"), Some(500), &headers, None).await {
             Ok(r) => r,
             Err(e) => panic!("serve must succeed, got {}: {}", e.status, e.message()),
         };
@@ -8495,7 +8673,7 @@ mod tests {
         headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
 
         let t0 = std::time::Instant::now();
-        let resp = match serve_local_file(&path, Some("video"), Some(500), &headers).await {
+        let resp = match serve_local_file(&path, Some("video"), Some(500), &headers, None).await {
             Ok(r) => r,
             Err(e) => panic!("serve must succeed, got {}: {}", e.status, e.message()),
         };
