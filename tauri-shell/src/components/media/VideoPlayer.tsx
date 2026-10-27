@@ -322,6 +322,16 @@ interface PlayerProgressBarProps {
   /** BUG-226：源内容总时长（秒）——探针先于元素元数据已知时用它画全局比例。 */
   contentDuration?: number | null
   /**
+   * BUG-450：真源时长的**活引用**。必须传 ref，不能只传值。
+   *
+   * 真源时长是**挂载之后**才学到的（换档探针 / `durationchange` 兜底），写的是父组件的
+   * `contentDurationRef.current`；而本组件刻意不随 `timeupdate` 重渲染（BUG-216，时间推进
+   * 走 `write()` 直写 DOM）⇒ 作为**值**传进来的 `contentDuration` 会永久停在挂载那一刻
+   * （通常是 `null`），`displayDur()` 于是回退到元素 `duration`——在 live 转码流上那只是
+   * 「已经转码到哪」，10:30 的视频播到 1:14 就会算出 97% 的满条。
+   */
+  contentDurationRef?: React.RefObject<number | null>
+  /**
    * BUG-226：live 流上的拖拽落点超出已转码覆盖范围时由父组件换 src 重锚。
    * 返回 true = 父组件已处理（本地不再写 currentTime）；false = 本地 seek。
    */
@@ -348,6 +358,7 @@ function PlayerProgressBar({
   timeScale = 1,
   contentOffset = 0,
   contentDuration = null,
+  contentDurationRef,
   onContentSeek,
 }: PlayerProgressBarProps) {
   const { t } = useTranslation()
@@ -365,9 +376,23 @@ function PlayerProgressBar({
    *  `force=true` 用于离散事件（seek / 拖拽 / 元数据）即时刷新，不受节流限制。
    *  BUG-225/226：所有比例都定义在**源内容时间轴**上（contentOffset 修正 +
    *  timeScale 换算），进度条在锚点流与完整代理上呈现同一全局比例。 */
-  const displayDur = () => {
-    const v = videoRef.current
+  /**
+   * BUG-450：真源时长的读取必须**ref 优先**。
+   *
+   * 本组件不随播放推进重渲染（BUG-216），所以 `contentDuration` 这个 **prop** 会停在
+   * 挂载那一刻的值；真源时长是之后才学到的，只体现在 ref 上。读 prop 会拿到 null ⇒
+   * 回退到元素 `duration` ⇒ live 转码流上分母只是「已转码到哪」⇒ 条面提前满。
+   */
+  const resolvedContentDuration = () => {
+    const live = contentDurationRef?.current
+    if (live != null && live > 0) return live
     if (contentDuration != null && contentDuration > 0) return contentDuration
+    return null
+  }
+  const displayDur = () => {
+    const cd = resolvedContentDuration()
+    if (cd != null) return cd
+    const v = videoRef.current
     if (!v) return 0
     return (Number.isFinite(v.duration) ? v.duration : 0) * timeScale + contentOffset
   }
@@ -417,7 +442,7 @@ function PlayerProgressBar({
     },
     // `displayDur` 读的是 props 与元素属性，无自身状态；依赖与旧实现一致
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [videoRef, timeScale, contentOffset, contentDuration],
+    [videoRef, timeScale, contentOffset, contentDuration, contentDurationRef],
   )
 
   useEffect(() => {
@@ -458,9 +483,7 @@ function PlayerProgressBar({
     (ratio: number) => {
       const v = videoRef.current
       if (!v) return
-      const dur = contentDuration != null && contentDuration > 0
-        ? contentDuration
-        : (Number.isFinite(v.duration) ? v.duration : 0) * timeScale + contentOffset
+      const dur = resolvedContentDuration() ?? ((Number.isFinite(v.duration) ? v.duration : 0) * timeScale + contentOffset)
       if (!dur) return
       const contentSec = ratio * dur
       // live 流上目标超出已转码覆盖范围 → 父组件换 src 重锚（BUG-226）
@@ -471,7 +494,7 @@ function PlayerProgressBar({
       v.currentTime = Math.max(0, (contentSec - contentOffset) / (timeScale || 1))
       write(true)
     },
-    [videoRef, write, timeScale, contentOffset, contentDuration, onContentSeek],
+    [videoRef, write, timeScale, contentOffset, contentDuration, contentDurationRef, onContentSeek],
   )
 
   const onPointerDown = useCallback(
@@ -1517,6 +1540,7 @@ export function VideoPlayer({
           timeScale={activeContentSpeedRef.current}
           contentOffset={contentOffsetRef.current}
           contentDuration={contentDurationRef.current}
+          contentDurationRef={contentDurationRef}
           onContentSeek={contentSeek}
         />
       )}
@@ -1541,8 +1565,14 @@ export function VideoPlayer({
               barHover={barHover}
               onBarHoverChange={setBarHover}
               timeScale={activeContentSpeedRef.current}
-              contentOffset={segOffset}
-              contentDuration={segDuration}
+              /* BUG-450：条面必须与左侧时间文本同一分母（**内容轴**）。
+                 旧实现传的是 `segOffset`/`segDuration`（跳过片头/片尾之后的**分段轴**），
+                 而它俩默认是 `0`/`null` ⇒ `displayDur()` 回退到元素 `duration`，
+                 在 live 转码流上那只是「已转码到哪」⇒ 10:30 的片子播到 1:14 条面就满了。
+                 片头/片尾该画成条面上的区间标记，不该改分母。 */
+              contentOffset={contentOffsetRef.current}
+              contentDuration={contentDurationRef.current}
+              contentDurationRef={contentDurationRef}
               onContentSeek={contentSeek}
             />
           )}

@@ -599,7 +599,7 @@ export async function deleteCacheTasksByIds(
   ids: number[],
 ): Promise<{ ok: boolean; removed: number; selected: number }> {
   if (ids.length === 0) {
-    throw new Error('没有勾选任何记录')
+    throw new Error(t('api.tg.noRecordsSelected'))
   }
   return request(`/api/cache/tasks?ids=${encodeURIComponent(ids.join(','))}`, { method: 'DELETE' })
 }
@@ -619,7 +619,7 @@ export async function deleteCacheTasksByIds(
 export async function retryCacheTasks(
   ids: number[],
 ): Promise<{ ok: boolean; ids: number[] }> {
-  if (ids.length === 0) throw new Error('没有可重试的记录')
+  if (ids.length === 0) throw new Error(t('api.tg.noRetryable'))
   return request(`/api/cache/tasks/retry?ids=${encodeURIComponent(ids.join(','))}`, {
     method: 'POST',
   })
@@ -634,7 +634,7 @@ export async function retryCacheTasks(
 export async function cancelCacheTasks(
   ids: number[],
 ): Promise<{ ok: boolean; ids: number[] }> {
-  if (ids.length === 0) throw new Error('没有可取消的记录')
+  if (ids.length === 0) throw new Error(t('api.tg.noCancellable'))
   return request(`/api/cache/tasks/cancel?ids=${encodeURIComponent(ids.join(','))}`, {
     method: 'POST',
   })
@@ -691,7 +691,7 @@ export async function setCacheTasksPriority(
   ids: number[],
   opts: { priority?: number; top?: boolean },
 ): Promise<CacheTaskPriorityResult> {
-  if (ids.length === 0) throw new Error('没有勾选任何记录')
+  if (ids.length === 0) throw new Error(t('api.tg.noRecordsSelected'))
   return request('/api/tg/cache/tasks/priority', {
     method: 'POST',
     body: JSON.stringify({ ids, ...opts }),

@@ -533,7 +533,7 @@ function MediaCardBase(props: {
            * 故这里只做**口径标注**、不编造数字 —— 未落盘/已清字节的内容照样显示登记值，
            * 但读的人知道那不是磁盘事实。
            */}
-          <span title="内容在源头的大小（登记值），非本地磁盘占用；未落盘或字节已清时仍显示此值">
+          <span title={t('media.card.sizeTitle')}>
             {fmtSize(item.size)}
           </span>
           {/* 来源徽标（S2）：一眼分清这条内容是从哪来的 */}
@@ -589,12 +589,12 @@ function MediaCardBase(props: {
               type="button"
               onClick={() => onDelete(item)}
               className="flex items-center gap-1 rounded px-2 py-1 text-[11px] text-fg-mid transition-colors hover:bg-destructive hover:text-white"
-              title="从资料库删除这条内容（只删记录，磁盘上的文件不受影响）"
-              aria-label="删除"
+              title={t('media.card.deleteTitle')}
+              aria-label={t('media.card.deleteAria')}
               data-testid="item-delete"
             >
               <Trash2 className="h-3 w-3" />
-              删除
+              {t('media.card.delete')}
             </button>
           ) : null}
           {onEdit ? (
@@ -602,12 +602,12 @@ function MediaCardBase(props: {
               type="button"
               onClick={() => onEdit(item)}
               className="flex items-center gap-1 rounded px-2 py-1 text-[11px] text-fg-mid transition-colors hover:bg-surface-2 hover:text-fg-strong"
-              title="编辑标题 / 介绍 / 标签"
-              aria-label="编辑"
+              title={t('media.card.editTitle')}
+              aria-label={t('media.card.editAria')}
               data-testid="item-edit"
             >
               <Pencil className="h-3 w-3" />
-              编辑
+              {t('media.card.edit')}
             </button>
           ) : null}
         </div>

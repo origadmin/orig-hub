@@ -17,6 +17,13 @@ Checks, per locale:
   2. placeholder drift-> same key, different `{placeholder}` set (BLOCKING;
                          a renamed placeholder renders `{date}` literally)
   3. empty value      -> value is empty/whitespace (BLOCKING)
+  4. dangling reference (BUG-447) -> source code passes a key to `t()` (or holds
+                         it in a key-literal map that `t()` consumes) that NO
+                         locale defines. `t()` returns the raw key on a miss, so
+                         the UI renders `media.card.delete` to the user. Checks
+                         1-3 cannot catch this: they only compare locale files
+                         with each other, so "perfectly aligned" and "referencing
+                         keys that exist nowhere" are both green at once.
 
 Usage:
     python scripts/check-i18n-keys.py [--quiet]
@@ -45,7 +52,31 @@ PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 LITERAL_BRACE_KEYS = {
     # organize.rs:173-197 — `剧名|series`, `季|season`, `集|episode`, ...
     "media.organize.varsHint",
+    # The template itself is the string the user edits; `{season:02}` is template
+    # syntax shown verbatim, and each locale documents its own variable spelling.
+    "media.organize.templateDefault",
 }
+
+SRC_DIR = Path(__file__).resolve().parent.parent / "tauri-shell" / "src"
+SRC_SUFFIXES = {".ts", ".tsx"}
+
+# `t('a.b.c')` / t("a.b.c") / t(`a.b.c`) — static literal only. A template with
+# `${}` is dynamic and cannot be verified statically; those are reported as WARN.
+T_CALL_RE = re.compile(r"\bt\(\s*['\"`]([A-Za-z0-9_.\-]+)['\"`]")
+# Any dotted string literal (key maps, helper tables, props) — narrowed below to
+# literals whose first segment is a known i18n namespace, so CSS/URL-ish strings
+# such as "bg.surface.2" or "com.origadmin.orighub" cannot produce false alarms.
+DOTTED_LITERAL_RE = re.compile(r"['\"`]([A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z0-9]+){1,})['\"`]")
+DYNAMIC_T_RE = re.compile(r"\bt\(\s*`[^`]*\$\{")
+
+# Files that legitimately talk about keys as data (the gate itself, the i18n
+# runtime, dictionaries) — their literals are not UI references.
+SCAN_EXCLUDE_PARTS = ("__tests__", "verify", "locales")
+
+# A literal that ends with a dot is a *prefix* later concatenated with a runtime
+# value (`t('category.' + c.category)`); it is a dynamic key by construction and
+# cannot be resolved statically. Same for anything shaped like a file name.
+FILE_EXT_RE = re.compile(r"\.(tsx?|jsx?|rs|json|md|cjs|mjs|py|html|css|toml|yaml|yml|sh)$")
 
 
 def load(path: Path) -> dict[str, str]:
@@ -62,6 +93,54 @@ def load(path: Path) -> dict[str, str]:
 
 def placeholders(value: str) -> set[str]:
     return set(PLACEHOLDER_RE.findall(value))
+
+
+def scan_references(namespaces: set[str]) -> tuple[dict[str, list[str]], list[str]]:
+    """Return ({key: [file:line, ...]}, [dynamic-call warnings]).
+
+    Only literals whose first segment is an i18n namespace are considered, which
+    is what keeps this check from flagging every dotted string in the codebase.
+    """
+    found: dict[str, list[str]] = {}
+    dynamic: list[str] = []
+    if not SRC_DIR.is_dir():
+        return found, [f"src dir not found: {SRC_DIR}"]
+
+    for path in sorted(SRC_DIR.rglob("*")):
+        if path.suffix not in SRC_SUFFIXES or not path.is_file():
+            continue
+        rel = path.relative_to(SRC_DIR).as_posix()
+        if any(part in SCAN_EXCLUDE_PARTS for part in rel.split("/")):
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        for lineno, line in enumerate(lines, 1):
+            # Comment lines mention keys such as `media.rs` or `nav.fmode` as
+            # documentation; they are never passed to t(). Skipping lines whose
+            # first non-space characters start a comment keeps those out without
+            # needing a full JS parser.
+            stripped = line.strip()
+            if stripped.startswith(("//", "/*", "*")):
+                continue
+            for m in T_CALL_RE.finditer(line):
+                key = m.group(1)
+                # `t('category.' + c.category)` — a prefix concatenated with a
+                # runtime value; dynamic by construction, not a dangling key.
+                if key.endswith("."):
+                    continue
+                if key.split(".")[0] in namespaces or "." in key:
+                    found.setdefault(key, []).append(f"{rel}:{lineno}")
+            for m in DOTTED_LITERAL_RE.finditer(line):
+                key = m.group(1)
+                if key.endswith(".") or FILE_EXT_RE.search(key):
+                    continue
+                if key.split(".")[0] in namespaces:
+                    entry = f"{rel}:{lineno}"
+                    if entry not in found.setdefault(key, []):
+                        found[key].append(entry)
+            for m in DYNAMIC_T_RE.finditer(line):
+                dynamic.append(f"{rel}:{lineno}: {line.strip()[:90]}")
+    return found, dynamic
 
 
 def main() -> int:
@@ -112,6 +191,21 @@ def main() -> int:
                     f"{name}: placeholder drift on `{key}` — "
                     f"{REFERENCE}{sorted(want)} vs {name}{sorted(got)}"
                 )
+
+    # ---- check 4 (BUG-447): every key the code hands to t() must exist ----
+    namespaces = {k.split(".")[0] for k in union}
+    refs, dynamic = scan_references(namespaces)
+    dangling = {k: sites for k, sites in refs.items() if k not in union}
+    for key in sorted(dangling):
+        sites = ", ".join(dangling[key][:3])
+        more = "" if len(dangling[key]) <= 3 else f" (+{len(dangling[key]) - 3} more)"
+        violations.append(
+            f"dangling i18n reference `{key}` — no locale defines it, "
+            f"so t() renders the raw key. referenced at {sites}{more}"
+        )
+    if dynamic and not args.quiet:
+        print(f"warn  {len(dynamic)} dynamic t(`...${{...}}`) call(s) — "
+              f"not statically verifiable (first: {dynamic[0]})")
 
     if not args.quiet:
         for v in violations:

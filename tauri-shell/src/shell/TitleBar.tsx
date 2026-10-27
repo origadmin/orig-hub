@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useTranslation } from '../i18n'
 
 interface Props {
   /** 左侧标题文本 */
@@ -11,6 +12,7 @@ function detectTauri(): boolean {
 }
 
 export function TitleBar({ title }: Props) {
+  const { t } = useTranslation()
   const [maximized, setMaximized] = useState(false)
   const [tauri, setTauri] = useState(false)
 
@@ -76,14 +78,14 @@ export function TitleBar({ title }: Props) {
         {title}
       </span>
       <div className="ml-auto flex h-full">
-        <button className="titlebar-btn" title="最小化" onClick={handleMinimize}>
+        <button className="titlebar-btn" title={t('ui.titleBar.minimize')} onClick={handleMinimize}>
           <svg width="11" height="11" viewBox="0 0 12 12" fill="currentColor">
             <rect x="0" y="5.2" width="12" height="1.6" rx="0.8" />
           </svg>
         </button>
         <button
           className="titlebar-btn"
-          title={maximized ? '还原' : '最大化'}
+          title={maximized ? t('ui.titleBar.restore') : t('ui.titleBar.maximize')}
           onClick={handleToggleMax}
         >
           {maximized ? (
@@ -113,7 +115,7 @@ export function TitleBar({ title }: Props) {
         </button>
         <button
           className="titlebar-btn titlebar-btn-close"
-          title="关闭"
+          title={t('ui.titleBar.close')}
           onClick={handleClose}
         >
           <svg

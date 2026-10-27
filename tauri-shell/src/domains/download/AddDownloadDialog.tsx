@@ -11,6 +11,7 @@ import { Switch } from '../../components/ui/switch'
 import { useStore } from '../../store/useStore'
 import { getConfig } from '../../api/daemon'
 import { filenameFromUrl, cn } from '../../lib/utils'
+import { useTranslation } from '../../i18n'
 
 interface Props {
   open: boolean
@@ -18,6 +19,7 @@ interface Props {
 }
 
 export function AddDownloadDialog({ open, onClose }: Props) {
+  const { t } = useTranslation()
   const { addDownload, setError, settings } = useStore()
   const [url, setUrl] = useState('')
   const [filename, setFilename] = useState('')
@@ -64,7 +66,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
   const handleSubmit = async () => {
     setFormError(null)
     if (!url.trim()) {
-      setFormError('请输入下载 URL')
+      setFormError(t('download.addDialog.urlRequired'))
       return
     }
     // 组装 interfaces：主网卡权重 2 份，附属各 1 份（公式 N+1，主 2 份）
@@ -134,7 +136,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
         className="w-full max-w-md animate-spring rounded-xl border border-border-subtle bg-surface p-4 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 className="text-base font-semibold text-fg-strong">新建下载</h2>
+        <h2 className="text-base font-semibold text-fg-strong">{t('download.addDialog.title')}</h2>
 
         {formError && (
           <div className="mt-3 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-xs leading-relaxed text-danger">
@@ -153,24 +155,24 @@ export function AddDownloadDialog({ open, onClose }: Props) {
             />
           </div>
           <div>
-            <label className="mb-1 block text-xs text-muted">文件名（可选）</label>
+            <label className="mb-1 block text-xs text-muted">{t('download.addDialog.filenameLabel')}</label>
             <Input
-              placeholder="留空自动从 URL 推断"
+              placeholder={t('download.addDialog.filenamePlaceholder')}
               value={filename}
               onChange={(e) => setFilename(e.target.value)}
             />
           </div>
           <div>
-            <label className="mb-1 block text-xs text-muted">保存目录（可选）</label>
+            <label className="mb-1 block text-xs text-muted">{t('download.addDialog.saveDirLabel')}</label>
             <DirectoryPicker
               value={outputPath}
               onChange={setOutputPath}
-              placeholder={outputPath || defaultDir || '留空使用默认下载目录'}
+              placeholder={outputPath || defaultDir || t('download.addDialog.defaultDirPlaceholder')}
               onError={setError}
             />
           </div>
           <div>
-            <label className="mb-1 block text-xs text-muted">最大连接数</label>
+            <label className="mb-1 block text-xs text-muted">{t('download.addDialog.maxConnLabel')}</label>
             <Stepper
               value={maxConnections}
               onChange={setMaxConnections}
@@ -193,7 +195,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
               >
                 ▶
               </span>
-              多网卡分流
+              {t('download.addDialog.multiNic')}
             </button>
             {showAdvanced && (
               <div className="mt-2 space-y-1.5 rounded-md border border-border-subtle bg-surface-2/40 p-2.5">
@@ -202,12 +204,13 @@ export function AddDownloadDialog({ open, onClose }: Props) {
                     <p className="break-all text-fg-mid">
                       {ifaces.primary && (
                         <span className="font-medium text-accent">
-                          {ifaces.primary}（主） +{' '}
+                          {ifaces.primary}
+                          {t('download.addDialog.primaryBadge')} +{' '}
                         </span>
                       )}
                       {ifaces.enabledNames.join('、')}
                       {!ifaces.primary && ifaces.enabledNames.length === 0 && (
-                        <span className="text-muted">仅主网卡参与（自动识别）</span>
+                        <span className="text-muted">{t('download.addDialog.primaryOnly')}</span>
                       )}
                     </p>
                   </div>
@@ -216,11 +219,11 @@ export function AddDownloadDialog({ open, onClose }: Props) {
                     size="sm"
                     onClick={() => setPickerOpen(true)}
                   >
-                    选择网卡
+                    {t('download.addDialog.selectNic')}
                   </Button>
                 </div>
                 <p className="pt-1 text-[10px] leading-relaxed text-muted">
-                  勾选参与网卡；权重按公式自动分配（主 2 份 / 附属 1 份）。
+                  {t('download.addDialog.nicHint')}
                 </p>
               </div>
             )}
@@ -229,17 +232,17 @@ export function AddDownloadDialog({ open, onClose }: Props) {
           {/* 代理：本次下载覆盖全局配置 */}
           <div className="flex items-center justify-between gap-3 rounded-md border border-border-subtle bg-surface-2/40 p-2.5">
             <div className="min-w-0 flex-1">
-              <p className="text-xs font-medium text-fg-mid">代理</p>
+              <p className="text-xs font-medium text-fg-mid">{t('download.addDialog.proxy')}</p>
               <p className="mt-0.5 text-[10px] leading-relaxed text-muted">
                 {proxyMode === 'global'
-                  ? '使用设置页中的代理配置'
-                  : '本次下载走指定代理'}
+                  ? t('download.addDialog.proxyGlobal')
+                  : t('download.addDialog.proxyCustom')}
               </p>
               {proxyMode === 'custom' && (
                 <Input
                   value={proxyUrl}
                   onChange={(e) => setProxyUrl(e.target.value)}
-                  placeholder="http://127.0.0.1:7897 或 socks5://..."
+                  placeholder={t('download.addDialog.proxyPlaceholder')}
                   className="mt-1.5 font-mono"
                 />
               )}
@@ -255,7 +258,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
                     : 'text-muted hover:text-fg-mid',
                 )}
               >
-                跟随全局
+                {t('download.addDialog.proxyFollowGlobal')}
               </button>
               <button
                 type="button"
@@ -267,7 +270,7 @@ export function AddDownloadDialog({ open, onClose }: Props) {
                     : 'text-muted hover:text-fg-mid',
                 )}
               >
-                指定代理
+                {t('download.addDialog.proxySpecify')}
               </button>
             </div>
           </div>
@@ -275,8 +278,8 @@ export function AddDownloadDialog({ open, onClose }: Props) {
           {/* 自动分类（R3） */}
           <div className="flex items-center justify-between gap-3 rounded-md border border-border-subtle bg-surface-2/40 p-2.5">
             <div className="min-w-0">
-              <p className="text-xs font-medium text-fg-mid">自动分类</p>
-              <p className="mt-0.5 text-[10px] leading-relaxed text-muted">按扩展名归档到子目录（视频/音频/图片/文档/压缩包）</p>
+              <p className="text-xs font-medium text-fg-mid">{t('download.addDialog.autoClassify')}</p>
+              <p className="mt-0.5 text-[10px] leading-relaxed text-muted">{t('download.addDialog.autoClassifyHint')}</p>
             </div>
             <Switch checked={classify} onChange={setClassify} />
           </div>
@@ -284,8 +287,8 @@ export function AddDownloadDialog({ open, onClose }: Props) {
           {/* 覆盖下载 */}
           <div className="flex items-center justify-between gap-3 rounded-md border border-border-subtle bg-surface-2/40 p-2.5">
             <div className="min-w-0">
-              <p className="text-xs font-medium text-fg-mid">覆盖下载</p>
-              <p className="mt-0.5 text-[10px] leading-relaxed text-muted">目标文件已存在时删除旧文件重新下载</p>
+              <p className="text-xs font-medium text-fg-mid">{t('download.addDialog.overwrite')}</p>
+              <p className="mt-0.5 text-[10px] leading-relaxed text-muted">{t('download.addDialog.overwriteHint')}</p>
             </div>
             <Switch checked={overwrite} onChange={setOverwrite} />
           </div>
@@ -293,10 +296,10 @@ export function AddDownloadDialog({ open, onClose }: Props) {
 
         <div className="mt-6 flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose}>
-            取消
+            {t('download.addDialog.cancel')}
           </Button>
           <Button onClick={handleSubmit} disabled={submitting}>
-            {submitting ? '添加中…' : '开始下载'}
+            {submitting ? t('download.addDialog.submitting') : t('download.addDialog.start')}
           </Button>
         </div>
 

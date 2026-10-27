@@ -15,6 +15,7 @@ import {
   type IngestGroup,
 } from './ingestGroups'
 import { IngestDetailSheet } from './IngestDetailSheet'
+import { useTranslation } from '../../i18n'
 
 /**
  * TG 入库对象行（BT 类比里的「种子」）。
@@ -65,25 +66,25 @@ import { IngestDetailSheet } from './IngestDetailSheet'
  * 不如直说「停止请用整行的取消」。这是「让错误状态不可表达」，不是功能缺失。
  */
 
-/** 入库各状态词 → 中文标签 + 徽标色调（`status` 是 orig-tg **原生**词，不做跨侧归一化）。 */
+/** 入库各状态词 → i18n key + 徽标色调（`status` 是 orig-tg **原生**词，不做跨侧归一化）。 */
 const cacheStatusMeta: Record<
   string,
-  { label: string; variant: 'success' | 'warning' | 'danger' | 'default' | 'secondary' }
+  { key: string; variant: 'success' | 'warning' | 'danger' | 'default' | 'secondary' }
 > = {
-  queued: { label: '排队中', variant: 'secondary' },
-  running: { label: '入库中', variant: 'default' },
-  done: { label: '已完成', variant: 'success' },
-  cancelled: { label: '已取消', variant: 'secondary' },
-  failed: { label: '失败', variant: 'danger' },
-  interrupted: { label: '已中断', variant: 'warning' },
+  queued: { key: 'download.ingest.status.queued', variant: 'secondary' },
+  running: { key: 'download.ingest.status.running', variant: 'default' },
+  done: { key: 'download.ingest.status.done', variant: 'success' },
+  cancelled: { key: 'download.ingest.status.cancelled', variant: 'secondary' },
+  failed: { key: 'download.ingest.status.failed', variant: 'danger' },
+  interrupted: { key: 'download.ingest.status.interrupted', variant: 'warning' },
 }
 
-const actionMeta: Record<IngestAction, { label: string; hint: string }> = {
-  cancel: { label: '取消', hint: '取消这次入库（记录保留，可重试）' },
-  retry: { label: '重试', hint: '按原记录重新入队（TG 无真续传，只能整任务重跑）' },
+const actionMeta: Record<IngestAction, { key: string; hintKey: string }> = {
+  cancel: { key: 'download.ingest.action.cancel', hintKey: 'download.ingest.action.cancelHint' },
+  retry: { key: 'download.ingest.action.retry', hintKey: 'download.ingest.action.retryHint' },
   // 优先下载（BUG-277）：语义写在 hint 里 —— 不抢占，只决定「当前任务跑完后接哪一条」。
-  prefer: { label: '优先下载', hint: '当前任务跑完后下一个跑它，不抢占正在跑的任务' },
-  unprefer: { label: '取消优先', hint: '回到默认排队顺序（FIFO）' },
+  prefer: { key: 'download.ingest.action.prefer', hintKey: 'download.ingest.action.preferHint' },
+  unprefer: { key: 'download.ingest.action.unprefer', hintKey: 'download.ingest.action.unpreferHint' },
 }
 
 function stamp(sec: number): string {
@@ -126,12 +127,13 @@ export function IngestGroupRow({
   selected = false,
   onToggleSelect,
 }: Props) {
+  const { t } = useTranslation()
   const { latest, runs } = group
   /** 明细 Sheet 开关（DLU-T01：底部弹出，替代原行内展开区）。 */
   const [sheetOpen, setSheetOpen] = useState(false)
 
   const meta = cacheStatusMeta[latest.status] ?? {
-    label: latest.status,
+    key: latest.status,
     variant: 'secondary' as const,
   }
   const isActive = isCacheActive(latest.status)
@@ -165,7 +167,7 @@ export function IngestGroupRow({
       <div
         className="group cursor-pointer p-4"
         onClick={() => setSheetOpen(true)}
-        title="查看条目明细 / 历史批次"
+        title={t('download.ingest.headerTitle')}
         data-testid="ingest-group-header"
       >
         <div className="flex items-start justify-between gap-3">
@@ -174,19 +176,19 @@ export function IngestGroupRow({
           <label
             className="mt-0.5 flex shrink-0 cursor-pointer items-center"
             onClick={(e) => e.stopPropagation()}
-            title="选中此入库对象（用于批量取消）"
+            title={t('download.ingest.selectTitle')}
           >
             {/* BUG-393：行选择框走全仓标准组件。 */}
             <RowCheckbox
               checked={!!selected}
               onChange={() => onToggleSelect?.(group.key)}
               testId="ingest-group-select"
-              ariaLabel="选中此入库对象"
+              ariaLabel={t('download.ingest.selectAria')}
             />
           </label>
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <Badge variant="secondary">TG 入库</Badge>
+              <Badge variant="secondary">{t('download.ingest.tgBadge')}</Badge>
               <p
                 className="truncate text-sm font-medium text-fg-strong"
                 title={latest.title || latest.itemKey}
@@ -194,26 +196,26 @@ export function IngestGroupRow({
               >
                 {ingestDisplayName(latest)}
               </p>
-              <Badge variant={meta.variant}>{meta.label}</Badge>
+              <Badge variant={meta.variant}>{t(meta.key)}</Badge>
               {/* 优先下载徽标（BUG-277）：「已优先下载」是这一行的**排序状态**，必须看得见
                   —— 否则用户点了优先下载，除了列表顺序以外没有任何反馈可核对。 */}
               {/* BUG-396：徽标判据走唯一源 `hasPriorityPin` —— 终态任务没有优先状态。 */}
               {hasPriorityPin(latest.status, latest.priority ?? 0) && (
                 <span
                   className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-medium text-accent"
-                  title="已优先下载：当前任务跑完后下一个跑它（不抢占）"
+                  title={t('download.ingest.prioritizedTitle')}
                   data-testid="ingest-group-prioritized"
                 >
-                  优先
+                  {t('download.ingest.prioritized')}
                 </span>
               )}
               {runs > 1 && (
                 <span
                   className="shrink-0 text-[10px] text-muted"
-                  title="同一批内容的历次入库记录已合并显示"
+                  title={t('download.ingest.runsTitle')}
                   data-testid="ingest-group-runs"
                 >
-                  共 {runs} 次
+                  {t('download.ingest.runs', { n: runs })}
                 </span>
               )}
             </div>
@@ -245,10 +247,10 @@ export function IngestGroupRow({
                   size="sm"
                   variant="ghost"
                   onClick={() => onAction(latest, a)}
-                  title={actionMeta[a]?.hint ?? actionMeta[a]?.label ?? a}
+                  title={t(actionMeta[a]?.hintKey ?? actionMeta[a]?.key ?? a)}
                   data-testid={`ingest-group-action-${a}`}
                 >
-                  {actionMeta[a]?.label ?? a}
+                  {t(actionMeta[a]?.key ?? a)}
                 </Button>
               ))}
               {/*
@@ -261,20 +263,20 @@ export function IngestGroupRow({
                   size="sm"
                   variant="ghost"
                   onClick={() => onGoLibrary(latest)}
-                  title="在媒体库中查看这批内容的成品"
+                  title={t('download.ingest.goLibraryTitle')}
                   data-testid="ingest-group-golibrary"
                 >
-                  去媒体库查看
+                  {t('download.ingest.goLibrary')}
                 </Button>
               )}
               <Button
                 size="sm"
                 variant="ghost"
                 onClick={() => onRemove(latest)}
-                title="删除记录"
+                title={t('download.ingest.removeTitle')}
                 data-testid="ingest-group-remove"
               >
-                删除
+                {t('download.ingest.remove')}
               </Button>
             </div>
           </div>
@@ -287,7 +289,8 @@ export function IngestGroupRow({
 
         <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted">
           <span className="font-mono text-fg-mid" data-testid="ingest-group-progress">
-            {latest.done} / {latest.total} 条
+            {latest.done} / {latest.total}
+            {t('download.ingest.entriesUnit')}
           </span>
           {byteProgress != null && (
             <span className="font-mono text-accent" data-testid="ingest-group-bytes">
@@ -296,7 +299,7 @@ export function IngestGroupRow({
           )}
           {latest.itemBytes != null && byteProgress == null && (
             <span className="font-mono text-accent" data-testid="ingest-group-bytes">
-              已收 {formatBytes(latest.itemBytes)}
+              {t('download.ingest.bytesReceived', { size: formatBytes(latest.itemBytes!) })}
             </span>
           )}
           <span className="font-mono">{stamp(latest.updatedAt)}</span>

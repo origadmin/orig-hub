@@ -481,12 +481,12 @@
 | BUG-441 | `cache_task_msg_index` 去重忽略 `series_key`，无归档轴任务遮蔽筛选归档轴，同相册裂成两部剧（BUG-438 回归） | fixed | engine |
 | BUG-445 | 缺陷登记册无排期/延期机制——93 条 open 单向棘轮积压，46 条 high/critical 无计划 | fixed | build |
 | BUG-446 | release 壳打开即无响应（Application Hang），WebView2 进程从未创建 | open | shell |
-| BUG-447 | i18n 引用不存在的 key，界面显示原始 key；门禁只校验双语对齐 | open | shell |
+| BUG-447 | i18n 引用不存在的 key，界面显示原始 key；门禁只校验双语对齐 | fixed | shell |
 | BUG-448 | 启动时 daemon 就绪被 TG 插件阻塞（10.4s→0.36s）、壳 5s 误判超时、超时不杀子进程留孤儿、`ensure_daemon` 同步命令冻结 UI 5 秒 | fixed | engine+shell |
 | BUG-449 | 点播放弹出一串后端控制台黑窗——硬解探测 4 条子进程缺 `CREATE_NO_WINDOW` | fixed | engine |
 | BUG-450 | 进度条走「分段轴」、时间文本走「内容轴」——10:30 的视频播到 1:14 条面就满（真源时长只写 ref 不重渲染，prop 永久停在 null） | fixed | shell |
 | BUG-451 | 文件域上下文栏「搜索输入框 × 库级动作组（导入目录/新建剧集/导出/标签管理）」重叠——`gridCls` 窄窗修复只给了 `view==='tg'`，文件域右槽 4 按钮≈358px 溢出压住 `w-80` 搜索框（1200/1100/1000/900px 重叠 30/80/130/180px） | fixed | shell |
-| BUG-452 | 关闭 APP 后右下角托盘（Daemon 图标）消失、下载随之停止——`lib.rs` 缺 `CloseRequested` 处理，点 X 即 `app.exit`、托盘销毁、daemon 变孤儿（下载工具常理：关窗应最小化到托盘、下载继续） | fixed | shell |
+| BUG-452 | 关闭 APP 后右下角托盘（Daemon 图标）消失、下载随之停止——`lib.rs` 缺 `CloseRequested` 处理，点 X 即 `app.exit`、托盘销毁、daemon 变孤儿（下载工具常理：关窗应最小化到托盘、下载继续）；代码已落盘，**行为级验收阻塞于 BUG-446**（release 壳打不开） | partial | shell |
 
 ## 历史欠账
 

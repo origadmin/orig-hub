@@ -1,6 +1,7 @@
 import { memo } from 'react'
 import { fmtSize } from '../lib/mediaSources'
 import { useLibraryReadout } from '../store/libraryReadout'
+import { useTranslation } from '../i18n'
 
 /**
  * 全局状态栏的文件域读数叶子（BUG-400：占用/登记「应该在底栏显示状态」）。
@@ -18,6 +19,7 @@ import { useLibraryReadout } from '../store/libraryReadout'
  * `stats === null`（文件域数据从未加载）⇒ 不渲染 —— 不可用就不展示，不呈现死读数。
  */
 export const LibraryReadout = memo(function LibraryReadout() {
+  const { t } = useTranslation()
   const stats = useLibraryReadout((s) => s.stats)
   const note = useLibraryReadout((s) => s.note)
 
@@ -34,11 +36,12 @@ export const LibraryReadout = memo(function LibraryReadout() {
         className="shrink-0 text-[11px] text-muted"
         data-testid="page-secondary-info"
         title={`${hasDiskBasis
-          ? '占用空间 = 文件管理在本机实际占用的磁盘字节（清缓存后会下降）'
-          : '占用空间 = 文件管理登记的内容大小（后端未提供磁盘占用读数；清缓存后此值不变）'}\n登记值 = 内容在源头的大小之和（未落盘/字节已清的内容仍计入），不是本地磁盘占用`}
+          ? t('media.readout.diskBasisTitle')
+          : t('media.readout.registeredTitle')}${t('media.readout.registeredNote')}`}
       >
-        占用 {occupancy}
-        {stats.truncated ? '（已截断）' : ''} · 登记 {registered}
+        {t('media.readout.occupancy', { occupancy })}
+        {stats.truncated ? t('media.readout.truncated') : ''}
+        {t('media.readout.registeredMid', { registered })}
       </span>
       {note ? <span className="min-w-0 truncate">{note}</span> : null}
     </span>

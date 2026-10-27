@@ -241,9 +241,11 @@ export function EpisodeList({
                     {(ep.originSeriesTitle || ep.originEpisodeNo != null) && (
                       <span className="block text-[10px] text-accent/75">
                         {ep.originSeriesTitle
-                          ? `合并自${seriesLabel(ep.originSeriesTitle)}`
-                          : '合并自其他剧集'}
-                        {ep.originEpisodeNo != null ? ` 原 E${ep.originEpisodeNo}` : ''}
+                          ? t('media.episodeList.mergedFrom', { series: seriesLabel(ep.originSeriesTitle) })
+                          : t('media.episodeList.mergedFromOther')}
+                        {ep.originEpisodeNo != null
+                          ? t('media.episodeList.originEpisode', { ep: ep.originEpisodeNo })
+                          : ''}
                       </span>
                     )}
                   </span>

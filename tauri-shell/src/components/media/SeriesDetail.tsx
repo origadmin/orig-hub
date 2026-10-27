@@ -1708,7 +1708,7 @@ export function SeriesDetail(props: {
                       disabled={splitting}
                       onChange={() => toggleSplitSelect(ep.itemId)}
                       testId="series-split-select"
-                      ariaLabel="选中此集"
+                      ariaLabel={t('media.seriesDetail.selectThisEpisode')}
                     />
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">

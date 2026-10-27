@@ -59,7 +59,13 @@ function hitTitle(h: TgMonitorFilterHit): string {
 }
 
 function typeLabel(type?: string): string {
-  return type === 'photo' ? '图片' : type === 'video' ? '视频' : type === 'audio' ? '音频' : '文件'
+  return type === 'photo'
+    ? t('media.kindPhoto')
+    : type === 'video'
+      ? t('media.kindVideo')
+      : type === 'audio'
+        ? t('media.kindAudio')
+        : t('tg.kindFile')
 }
 
 /** 每页**单元**数（BUG-341：limit 数相册/单条，不数消息——组永不被页边界切开）。

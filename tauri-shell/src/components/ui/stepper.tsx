@@ -1,4 +1,5 @@
 import { cn } from '../../lib/utils'
+import { useTranslation } from '../../i18n'
 
 interface StepperProps {
   value: number
@@ -23,6 +24,7 @@ export function Stepper({
   disabled,
   className,
 }: StepperProps) {
+  const { t } = useTranslation()
   const clamp = (v: number) => Math.min(max, Math.max(min, Math.round(v)))
 
   const stepTo = (dir: 1 | -1) => onChange(clamp(value + dir * step))
@@ -40,7 +42,7 @@ export function Stepper({
         onClick={() => stepTo(-1)}
         disabled={disabled || value <= min}
         className="flex h-full w-8 items-center justify-center text-muted transition-colors hover:bg-surface-2 hover:text-fg-strong disabled:cursor-not-allowed disabled:opacity-40"
-        aria-label="减少"
+        aria-label={t('ui.stepper.decrease')}
       >
         −
       </button>
@@ -75,7 +77,7 @@ export function Stepper({
         onClick={() => stepTo(1)}
         disabled={disabled || value >= max}
         className="flex h-full w-8 items-center justify-center text-muted transition-colors hover:bg-surface-2 hover:text-fg-strong disabled:cursor-not-allowed disabled:opacity-40"
-        aria-label="增加"
+        aria-label={t('ui.stepper.increase')}
       >
         +
       </button>

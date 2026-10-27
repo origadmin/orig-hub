@@ -46,7 +46,7 @@ export function OrganizeWizard(props: {
   const { itemIds, onClose, onError } = props
   const { t } = useTranslation()
   const [presets, setPresets] = useState<OrganizePreset[]>([])
-  const [template, setTemplate] = useState('{剧名}/S{season:02}E{episode:02} - {集名}.{ext}')
+  const [template, setTemplate] = useState(t('media.organize.templateDefault'))
   const [targetDir, setTargetDir] = useState('')
   const [preview, setPreview] = useState<OrganizeReport | null>(null)
   const [busy, setBusy] = useState(false)

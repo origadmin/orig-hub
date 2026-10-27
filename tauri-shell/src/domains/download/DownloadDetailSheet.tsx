@@ -3,23 +3,24 @@ import { Badge } from '../../components/ui/badge'
 import { useStore } from '../../store/useStore'
 import { cn, formatBytes, formatSpeed, formatEta } from '../../lib/utils'
 import type { DownloadStatus } from '../../types'
+import { useTranslation } from '../../i18n'
 
-/** 状态词 → 中文（统一语言，避免英文/中文混搭） */
-const STATUS_LABEL: Record<string, string> = {
-  idle: '空闲',
-  queued: '排队中',
-  downloading: '下载中',
-  paused: '已暂停',
-  completed: '已完成',
-  error: '错误',
-  cancelled: '已取消',
+/** 状态词 → i18n key（统一语言，避免英文/中文混搭） */
+const STATUS_KEY: Record<string, string> = {
+  idle: 'download.detail.status.idle',
+  queued: 'download.detail.status.queued',
+  downloading: 'download.detail.status.downloading',
+  paused: 'download.detail.status.paused',
+  completed: 'download.detail.status.completed',
+  error: 'download.detail.status.error',
+  cancelled: 'download.detail.status.cancelled',
 }
 
-/** 连接（源）状态词 → 中文 */
-const CONN_STATE_LABEL: Record<string, string> = {
-  idle: '空闲',
-  downloading: '下载中',
-  error: '错误',
+/** 连接（源）状态词 → i18n key */
+const CONN_STATE_KEY: Record<string, string> = {
+  idle: 'download.detail.connState.idle',
+  downloading: 'download.detail.connState.downloading',
+  error: 'download.detail.connState.error',
 }
 
 /** 网卡配色（按出现顺序分配；超过调色板长度则循环） */
@@ -52,8 +53,9 @@ export function DownloadDetailSheet({
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
 
+  const { t } = useTranslation()
   const { downloads } = useStore()
-  const statusLabel = STATUS_LABEL[item.status] ?? STATUS_LABEL.idle
+  const statusLabel = t(STATUS_KEY[item.status] ?? STATUS_KEY.idle)
 
   // 源下标 → 网卡名 → 颜色
   const srcToIface = new Map<number, string>()
@@ -93,13 +95,13 @@ export function DownloadDetailSheet({
         */}
         <div className="flex items-center gap-2 px-4 py-3">
           <p className="min-w-0 flex-1 truncate text-sm font-semibold text-fg-strong">
-            {item.filename || '未知文件'}
+            {item.filename || t('download.detail.unknownFile')}
           </p>
           <Badge>{statusLabel}</Badge>
           <button
             onClick={onClose}
             className="ml-1 rounded-md px-2 py-1 text-muted hover:bg-border-subtle"
-            title="关闭"
+            title={t('download.detail.close')}
           >
             ✕
           </button>
@@ -115,11 +117,12 @@ export function DownloadDetailSheet({
             {item.status === 'downloading' ? formatSpeed(item.speed) : '—'}
           </span>
           {item.status === 'downloading' && item.eta > 0 && (
-            <span className="font-mono">剩余 {formatEta(item.eta)}</span>
+            <span className="font-mono">{t('download.detail.remaining', { eta: formatEta(item.eta) })}</span>
           )}
           <span className="font-mono">
-            {item.blocks_total ?? 0} 块
-            {item.blocks_total ? ` · 每块约 ${formatBytes(Math.ceil((item.total_size || 0) / (item.blocks_total || 1)))}` : ''}
+            {item.blocks_total ?? 0}
+            {t('download.detail.blocksUnit')}
+            {item.blocks_total ? t('download.detail.perBlock', { size: formatBytes(Math.ceil((item.total_size || 0) / (item.blocks_total || 1))) }) : ''}
           </span>
         </div>
 
@@ -138,15 +141,15 @@ export function DownloadDetailSheet({
           {/* 左：块完成位图（颜色 = 负责网卡）；sm 下固定宽度，避免挤压右栏 */}
           <div className="w-full shrink-0 border-b border-border-subtle p-4 sm:w-[70%] sm:shrink-0 sm:border-b-0 sm:border-r">
             <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted">
-              块完成位图（颜色 = 负责网卡）
-            </div>
-            {showGrid ? (
-              <>
-                {hasArray ? (
-                  <div
-                    className="flex max-h-56 flex-wrap gap-0.5 overflow-auto"
-                    title={`${item.blocks_done ?? 0}/${item.blocks_total} 块完成 · ${item.blocks_pending ?? 0} 待下载`}
-                  >
+            {t('download.detail.blockBitmap')}
+          </div>
+          {showGrid ? (
+            <>
+              {hasArray ? (
+                <div
+                  className="flex max-h-56 flex-wrap gap-0.5 overflow-auto"
+                  title={`${item.blocks_done ?? 0}/${item.blocks_total}${t('download.detail.blocksDone')} · ${item.blocks_pending ?? 0}${t('download.detail.blocksPending')}`}
+                >
                     {blocks.map((st, i) => {
                       const src = item.block_source?.[i] ?? UNASSIGNED
                       const iface = src !== UNASSIGNED ? srcToIface.get(src) : undefined
@@ -156,7 +159,7 @@ export function DownloadDetailSheet({
                           <span
                             key={i}
                             className="h-2.5 w-2.5 rounded-[1px] bg-border-subtle"
-                            title="未分配"
+                            title={t('download.detail.unassigned')}
                           />
                         )
                       }
@@ -173,15 +176,16 @@ export function DownloadDetailSheet({
                           key={i}
                           className={cn('h-2.5 w-2.5 rounded-[1px]', cls)}
                           style={{ backgroundColor: color }}
-                          title={`${iface} · ${st === 2 ? '完成' : st === 1 ? '下载中' : st === 3 ? '失败' : '待下载'}`}
+                          title={`${iface} · ${st === 2 ? t('download.detail.blockState.done') : st === 1 ? t('download.detail.blockState.downloading') : st === 3 ? t('download.detail.blockState.failed') : t('download.detail.blockState.pending')}`}
                         />
                       )
                     })}
                   </div>
                 ) : (
                   <div className="font-mono text-xs text-muted">
-                    {item.blocks_done ?? 0}/{item.blocks_total} 块完成
-                    {item.blocks_pending ? ` · ${item.blocks_pending} 待下载` : ''}
+                    {item.blocks_done ?? 0}/{item.blocks_total}
+                    {t('download.detail.blocksDone')}
+                    {item.blocks_pending ? ` · ${item.blocks_pending}${t('download.detail.blocksPending')}` : ''}
                   </div>
                 )}
 
@@ -198,21 +202,21 @@ export function DownloadDetailSheet({
                   ))}
                   <span className="flex items-center gap-1">
                     <span className="inline-block h-3 w-3 rounded-[1px] bg-border-subtle" />
-                    未分配
+                    {t('download.detail.unassigned')}
                   </span>
                 </div>
                 <div className="mt-1 flex flex-wrap gap-3 text-xs text-muted">
-                  <span>■ 实色 = 完成</span>
-                  <span>▢ 半透明 = 下载中</span>
-                  <span>⛒ 红框 = 失败</span>
+                  <span>{t('download.detail.legendSolid')}</span>
+                  <span>{t('download.detail.legendTranslucent')}</span>
+                  <span>{t('download.detail.legendFailed')}</span>
                 </div>
                 <div className="mt-2 text-[11px] text-muted">
-                  完成 / 失败 / 待下载颜色统一为网卡色，仅用填充样式区分；未分配统一为灰色。
+                  {t('download.detail.legendNote')}
                 </div>
               </>
             ) : (
               <div className="rounded-lg bg-border-subtle/60 px-3 py-2 text-xs text-muted">
-                单流模式（无分块）：以字节进度为准，不展示块网格。
+                {t('download.detail.singleStream')}
               </div>
             )}
           </div>
@@ -220,30 +224,30 @@ export function DownloadDetailSheet({
           {/* 右：源 / 网卡表 + 全局一行小字 */}
           <div className="min-w-0 flex-1 p-4">
             <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted">
-              源 / 网卡
-            </div>
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="text-muted">
-                  <th className="px-2 py-1 text-left font-semibold">源#</th>
-                  <th className="px-2 py-1 text-left font-semibold">网卡</th>
-                  <th className="px-2 py-1 text-left font-semibold">状态</th>
-                  <th className="px-2 py-1 text-right font-semibold">速度</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(item.connections_detail ?? []).map((c) => (
-                  <tr key={c.id} className="border-t border-border-subtle">
-                    <td className="px-2 py-1 font-mono text-fg-mid">{c.source_index}</td>
-                    <td className="px-2 py-1 font-mono text-fg-mid">{c.iface}</td>
-                    <td
-                      className={cn(
-                        'px-2 py-1 font-medium',
-                        c.state === 'error' ? 'text-danger' : 'text-success',
-                      )}
-                    >
-                      {CONN_STATE_LABEL[c.state] ?? c.state}
-                    </td>
+            {t('download.detail.sourceNic')}
+          </div>
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-muted">
+                <th className="px-2 py-1 text-left font-semibold">{t('download.detail.colSource')}</th>
+                <th className="px-2 py-1 text-left font-semibold">{t('download.detail.colNic')}</th>
+                <th className="px-2 py-1 text-left font-semibold">{t('download.detail.colStatus')}</th>
+                <th className="px-2 py-1 text-right font-semibold">{t('download.detail.colSpeed')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(item.connections_detail ?? []).map((c) => (
+                <tr key={c.id} className="border-t border-border-subtle">
+                  <td className="px-2 py-1 font-mono text-fg-mid">{c.source_index}</td>
+                  <td className="px-2 py-1 font-mono text-fg-mid">{c.iface}</td>
+                  <td
+                    className={cn(
+                      'px-2 py-1 font-medium',
+                      c.state === 'error' ? 'text-danger' : 'text-success',
+                    )}
+                  >
+                    {t(CONN_STATE_KEY[c.state] ?? c.state)}
+                  </td>
                     <td className="px-2 py-1 text-right font-mono text-fg-mid">
                       {formatSpeed(c.speed)}
                     </td>
@@ -251,17 +255,20 @@ export function DownloadDetailSheet({
                 ))}
                 {(item.connections_detail ?? []).length === 0 && (
                   <tr>
-                    <td colSpan={4} className="px-2 py-2 text-muted">
-                      无源信息
-                    </td>
+                  <td colSpan={4} className="px-2 py-2 text-muted">
+                    {t('download.detail.noSource')}
+                  </td>
                   </tr>
                 )}
               </tbody>
             </table>
 
             <div className="mt-3 rounded-lg bg-border-subtle/60 px-3 py-2 text-[11px] text-muted">
-              全局 · 总速度 <span className="font-mono text-accent">{formatSpeed(globalSpeed)}</span>
-              {' · '}任务数 <span className="font-mono text-fg-mid">{downloads.length}</span>
+              {t('download.detail.globalSpeed')}
+              <span className="font-mono text-accent">{formatSpeed(globalSpeed)}</span>
+              {' · '}
+              {t('download.detail.taskCount')}
+              <span className="font-mono text-fg-mid">{downloads.length}</span>
             </div>
           </div>
         </div>

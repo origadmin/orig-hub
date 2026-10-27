@@ -7,25 +7,24 @@ import type { GroupManifest, ManifestState } from '../../types'
 import { ingestDisplayName, isCacheActive } from './ingestGroups'
 import type { IngestGroup } from './ingestGroups'
 
-/** 入库各状态词 → 中文标签 + 徽标色调（`status` 是 orig-tg **原生**词，不做跨侧归一化）。 */
+/** 入库各状态词 → i18n key + 徽标色调（`status` 是 orig-tg **原生**词，不做跨侧归一化）。 */
 const cacheStatusMeta: Record<
   string,
-  { label: string; variant: 'success' | 'warning' | 'danger' | 'default' | 'secondary' }
+  { key: string; variant: 'success' | 'warning' | 'danger' | 'default' | 'secondary' }
 > = {
-  queued: { label: '排队中', variant: 'secondary' },
-  running: { label: '入库中', variant: 'default' },
-  done: { label: '已完成', variant: 'success' },
-  cancelled: { label: '已取消', variant: 'secondary' },
-  failed: { label: '失败', variant: 'danger' },
-  interrupted: { label: '已中断', variant: 'warning' },
+  queued: { key: 'download.ingest.status.queued', variant: 'secondary' },
+  running: { key: 'download.ingest.status.running', variant: 'default' },
+  done: { key: 'download.ingest.status.done', variant: 'success' },
+  cancelled: { key: 'download.ingest.status.cancelled', variant: 'secondary' },
+  failed: { key: 'download.ingest.status.failed', variant: 'danger' },
+  interrupted: { key: 'download.ingest.status.interrupted', variant: 'warning' },
 }
 
-/** 组清单每条状态的中文标签（BUG-296）。措辞统一到「入库」口径：2026-10-17 用户
- *  裁定「不应该有编入」—— 「编入」是内部术语，界面一律说「入库」。 */
-const entryMeta: Record<ManifestState, { label: string; tone: string }> = {
-  slotted: { label: '已入库', tone: 'text-success' },
-  registered_unslotted: { label: '已登记未入库', tone: 'text-warning' },
-  missing: { label: '无条目', tone: 'text-muted' },
+/** 组清单每条状态的 i18n key（BUG-296）。措辞统一到「入库」口径。 */
+const entryMeta: Record<ManifestState, { key: string; tone: string }> = {
+  slotted: { key: 'download.ingest.entry.slotted', tone: 'text-success' },
+  registered_unslotted: { key: 'download.ingest.entry.registeredUnslotted', tone: 'text-warning' },
+  missing: { key: 'download.ingest.entry.missing', tone: 'text-muted' },
 }
 
 /**
@@ -150,7 +149,7 @@ export function IngestDetailSheet({
   }, [latest.id])
 
   const meta = cacheStatusMeta[latest.status] ?? {
-    label: latest.status,
+    key: latest.status,
     variant: 'secondary' as const,
   }
   const isActive = isCacheActive(latest.status)
@@ -223,13 +222,13 @@ export function IngestDetailSheet({
           >
             {ingestDisplayName(latest)}
           </p>
-          <Badge variant={meta.variant} className="text-[12px]">{meta.label}</Badge>
+          <Badge variant={meta.variant} className="text-[12px]">{t(meta.key)}</Badge>
           <button
             onClick={onClose}
             /* 关闭是唯一出口，命中区必须够大（原 px-2 py-1 ≈ 24×24px，13px 的 ✕ 太难点） */
             className="ml-1 rounded-md px-2.5 py-1.5 text-base leading-none text-muted hover:bg-border-subtle hover:text-fg-strong"
-            title="关闭"
-            aria-label="关闭明细"
+            title={t('download.detail.close')}
+            aria-label={t('download.ingest.closeAria')}
             data-testid="ingest-detail-sheet-close"
           >
             ✕
@@ -239,7 +238,8 @@ export function IngestDetailSheet({
         {/* 元信息行 */}
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 pb-2 text-xs text-muted">
           <span className="font-mono text-fg-mid">
-            {latest.done} / {latest.total} 条
+            {latest.done} / {latest.total}
+            {t('download.ingest.entriesUnit')}
           </span>
           {latest.itemBytes != null && latest.itemBytesTotal != null && (
             <span className="font-mono text-accent">
@@ -271,14 +271,14 @@ export function IngestDetailSheet({
               className="mb-2.5 text-[12px] leading-relaxed text-muted"
               data-testid="ingest-group-entry-note"
             >
-              {isActive
-                ? '整批入库中：条目级停止不存在（传输以整批任务为最小单位），要停请用列表行的「取消」'
-                : '未入库的条目已经全部选中；取消勾选你不想下的，只有选中的才会下载'}
+            {isActive
+              ? t('download.ingest.activeNote')
+              : t('download.ingest.idleNote')}
             </p>
-            {loading && <p className="text-[12px] text-muted">加载中…</p>}
+            {loading && <p className="text-[12px] text-muted">{t('download.list.loading')}</p>}
             {err && <p className="text-[12px] text-danger">{err}</p>}
             {!loading && !err && !manifest && (
-              <p className="text-[12px] text-muted">无明细</p>
+              <p className="text-[12px] text-muted">{t('download.ingest.noDetail')}</p>
             )}
             {manifest && (() => {
               return (
@@ -294,7 +294,7 @@ export function IngestDetailSheet({
                 {selectableIds.length > 0 ? (
                   <label
                     className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[13px] text-fg-mid select-none"
-                    title={isActive ? '整批入库中：不可选择' : '全选 / 取消全选缺字节条目'}
+                    title={isActive ? t('download.ingest.selectAllDisabled') : t('download.ingest.selectAllToggle')}
                     data-testid="ingest-sheet-select-all"
                   >
                     <input
@@ -306,17 +306,19 @@ export function IngestDetailSheet({
                       onChange={toggleAll}
                       data-testid="ingest-sheet-select-all-box"
                     />
-                    全选
+                    {t('download.ingest.selectAll')}
                   </label>
                 ) : (
                   <span className="w-4 shrink-0" aria-hidden="true" />
                 )}
                 <p className="min-w-0 flex-1 text-[13px] font-medium text-fg-strong">
-                  条目明细
+                  {t('download.ingest.entryDetail')}
                   {latest.manifest && (
                     <span className="ml-2 font-normal text-muted">
-                      （已入库 {latest.manifest.slotted} / 未入库{' '}
-                      {latest.manifest.registeredUnslotted} / 无条目 {latest.manifest.missing}）
+                      （{t('download.ingest.entry.slotted')} {latest.manifest.slotted} /{' '}
+                      {t('download.ingest.entry.registeredUnslotted')}{' '}
+                      {latest.manifest.registeredUnslotted} / {t('download.ingest.entry.missing')}{' '}
+                      {latest.manifest.missing}）
                     </span>
                   )}
                 </p>
@@ -328,9 +330,9 @@ export function IngestDetailSheet({
                   const label = isEpisode
                     ? `S${e.season}E${e.episodeNo}`
                     : e.mediaType === 'photo'
-                      ? '图片'
+                      ? t('media.kindPhoto')
                       : e.mediaType === 'video'
-                        ? '视频'
+                        ? t('media.kindVideo')
                         : `#${e.messageId}`
                   const title = e.caption ?? e.fileName ?? undefined
                   const sizeText =
@@ -352,7 +354,7 @@ export function IngestDetailSheet({
                    * 它是唯一可操作态（可勾选下载），且正是「我不要/我要这条」的判据面。
                    */
                   const byteBadge = !e.hasBytes
-                    ? { label: '缺字节', tone: 'text-warning' as const }
+                    ? { key: 'download.ingest.byteBadgeMissing', tone: 'text-warning' as const }
                     : em
                   // BUG-368：照片「有字节但未入库」也可勾选（历史落盘图未入媒体库），
                   // 判据统一定义在 isSelectableEntry。
@@ -383,8 +385,8 @@ export function IngestDetailSheet({
                       title={
                         downloadable && !isActive
                           ? isSelected
-                            ? '点击取消这条（取消后不下载）'
-                            : '点击选中这条（选中的才会下载）'
+                            ? t('download.ingest.clickToDeselect')
+                            : t('download.ingest.clickToSelect')
                           : undefined
                       }
                       data-testid="ingest-sheet-entry"
@@ -407,12 +409,12 @@ export function IngestDetailSheet({
                           onChange={() => toggleOne(e.messageId)}
                           title={
                             isActive
-                              ? '整批正在入库：请先用列表行的「取消」停止，再勾选下载'
-                              : '勾选后随底部「下载选中」一并下载'
+                              ? t('download.ingest.bulkActiveHint')
+                              : t('download.ingest.checkboxHint')
                           }
                           data-testid="ingest-sheet-entry-checkbox"
                           data-message-id={e.messageId}
-                          aria-label={`选择 ${label}`}
+                          aria-label={t('download.ingest.selectEntry', { label })}
                         />
                       )}
                       <span className="w-14 shrink-0 font-mono text-muted">
@@ -431,7 +433,7 @@ export function IngestDetailSheet({
                       <span className="ml-auto flex shrink-0 items-center gap-2 text-[12px]">
                         <span className="font-mono text-fg-mid">{sizeText}</span>
                         <span className="font-mono text-muted">{dateText}</span>
-                        <span className={byteBadge.tone}>{byteBadge.label}</span>
+                        <span className={byteBadge.tone}>{t(byteBadge.key)}</span>
                         {inFlight ? (
                           <Badge variant="default" className="shrink-0 text-[12px]">
                             {t('tg.manifestInFlight')}
@@ -454,7 +456,7 @@ export function IngestDetailSheet({
           {history.length > 0 && (
             <div>
               <p className="mb-1.5 text-[13px] font-medium text-fg-strong">
-                历史批次（{history.length}）
+                {t('download.ingest.historyBatches', { n: history.length })}
               </p>
               <ul className="space-y-1" data-testid="ingest-sheet-history">
                 {history.map((h) => (
@@ -465,7 +467,7 @@ export function IngestDetailSheet({
                     data-status={h.status}
                   >
                     <span className="w-16 shrink-0 font-mono">#{h.id}</span>
-                    <span>{cacheStatusMeta[h.status]?.label ?? h.status}</span>
+                    <span>{t(cacheStatusMeta[h.status]?.key ?? h.status)}</span>
                     <span className="font-mono">{stamp(h.updatedAt)}</span>
                     {h.error && (
                       <span className="truncate text-danger" title={h.error}>
@@ -497,14 +499,13 @@ export function IngestDetailSheet({
             <span className="min-w-0 flex-1 text-[13px] text-muted">
               {selected.size > 0 ? (
                 <>
-                  已选{' '}
                   <span className="font-mono font-semibold text-fg-strong">
                     {selected.size}
-                  </span>{' '}
-                  项 / 可下载 {selectableIds.length} 项
+                  </span>
+                  {t('download.ingest.selectedSuffix', { total: selectableIds.length })}
                 </>
               ) : (
-                '尚未选择条目'
+                t('download.ingest.noneSelected')
               )}
             </span>
             <button
@@ -513,10 +514,10 @@ export function IngestDetailSheet({
               disabled={isActive || selected.size === 0}
               title={
                 isActive
-                  ? '整批正在入库：请先用列表行的「取消」停止，再勾选下载'
+                  ? t('download.ingest.bulkActiveHint')
                   : selected.size === 0
-                    ? '先选条目：点行或勾选复选框'
-                    : `下载选中的 ${selected.size} 项`
+                    ? t('download.ingest.selectFirstHint')
+                    : t('download.ingest.downloadSelectedN', { n: selected.size })
               }
               data-testid="ingest-sheet-download-selected"
               onClick={() => {
@@ -525,7 +526,7 @@ export function IngestDetailSheet({
                 setSelected(new Set())
               }}
             >
-              {selected.size > 0 ? `下载选中 ${selected.size} 项` : '下载选中'}
+              {selected.size > 0 ? t('download.ingest.downloadSelectedN', { n: selected.size }) : t('download.ingest.downloadSelected')}
             </button>
           </div>
         )}

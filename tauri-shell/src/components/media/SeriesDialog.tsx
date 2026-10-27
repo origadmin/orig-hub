@@ -20,6 +20,7 @@ export function CreateSeriesDialog(props: {
   onError: (msg: string) => void
 }) {
   const { onClose, onCreated, onError } = props
+  const { t } = useTranslation()
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [year, setYear] = useState('')
@@ -56,12 +57,12 @@ export function CreateSeriesDialog(props: {
         onClick={(e) => e.stopPropagation()}
         data-testid="series-create-dialog"
       >
-        <h2 className="text-base font-semibold text-fg-strong">新建剧集</h2>
+        <h2 className="text-base font-semibold text-fg-strong">{t('media.series.createTitle')}</h2>
         <div className="mt-3 space-y-2">
           <Input
             value={title}
             onChange={(e) => setTitle(e.target.value)}
-            placeholder="名称，例如「Big Buck Bunny · 码率阶梯」"
+            placeholder={t('media.series.createNamePlaceholder')}
             className="h-8 text-xs"
             autoFocus
           />
@@ -69,21 +70,21 @@ export function CreateSeriesDialog(props: {
           <textarea
             value={description}
             onChange={(e) => setDescription(e.target.value)}
-            placeholder="简介（可选，支持换行）"
+            placeholder={t('media.series.createDescPlaceholder')}
             rows={2}
             className="w-full resize-none rounded-md border border-border-subtle bg-surface px-2.5 py-1.5 text-xs text-fg-strong placeholder:text-muted"
           />
           <Input
             value={year}
             onChange={(e) => setYear(e.target.value)}
-            placeholder="年份（可选）"
+            placeholder={t('media.series.createYearPlaceholder')}
             className="h-8 text-xs"
             inputMode="numeric"
           />
         </div>
         <div className="mt-4 flex justify-end gap-2">
           <Button variant="outline" size="sm" className="h-8 px-3 text-xs" onClick={onClose}>
-            取消
+            {t('media.cancel')}
           </Button>
           <Button
             size="sm"
@@ -91,7 +92,7 @@ export function CreateSeriesDialog(props: {
             disabled={busy || !title.trim()}
             onClick={() => void submit()}
           >
-            {busy ? '创建中…' : '创建'}
+            {busy ? t('media.series.creating') : t('media.series.create')}
           </Button>
         </div>
       </div>
@@ -108,6 +109,7 @@ export function AddToSeriesDialog(props: {
   onError: (msg: string) => void
 }) {
   const { itemIds, series, onClose, onDone, onError } = props
+  const { t } = useTranslation()
   const [target, setTarget] = useState<number | null>(series[0]?.id ?? null)
   const [season, setSeason] = useState('1')
   const [busy, setBusy] = useState(false)
@@ -138,11 +140,11 @@ export function AddToSeriesDialog(props: {
         onClick={(e) => e.stopPropagation()}
       >
         <h4 className="text-[13px] font-semibold text-fg-strong">
-          将 {itemIds.length} 项加入剧集
+          {t('media.series.addNToSeries', { n: itemIds.length })}
         </h4>
         {series.length === 0 ? (
           <p className="py-6 text-center text-xs text-muted">
-            还没有剧集，请先点「新建剧集」创建一个
+            {t('media.series.noSeriesCreateHint')}
           </p>
         ) : (
           <div className="mt-3 space-y-2">
@@ -153,25 +155,26 @@ export function AddToSeriesDialog(props: {
             >
               {series.map((s) => (
                 <option key={s.id} value={s.id}>
-                  {s.title}（{s.episodeCount} 集）
+                  {s.title}
+                  {t('media.series.episodeCountParen', { n: s.episodeCount })}
                 </option>
               ))}
             </select>
             <Input
               value={season}
               onChange={(e) => setSeason(e.target.value)}
-              placeholder="季号（默认 1）"
+              placeholder={t('media.series.seasonPlaceholder')}
               className="h-8 text-xs"
               inputMode="numeric"
             />
             <p className="text-[10px] text-muted">
-              按当前选择顺序追加为连续集号（接在该季已有集数之后）。
+              {t('media.series.appendHint')}
             </p>
           </div>
         )}
         <div className="mt-4 flex justify-end gap-2">
           <Button variant="outline" size="sm" className="h-8 px-3 text-xs" onClick={onClose}>
-            取消
+            {t('media.cancel')}
           </Button>
           <Button
             size="sm"
@@ -179,7 +182,7 @@ export function AddToSeriesDialog(props: {
             disabled={busy || target === null || itemIds.length === 0}
             onClick={() => void submit()}
           >
-            {busy ? '添加中…' : '加入'}
+            {busy ? t('media.series.adding') : t('media.series.add')}
           </Button>
         </div>
       </div>

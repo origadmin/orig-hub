@@ -5,6 +5,7 @@ import { Input } from './ui/input'
 import { DirectoryBrowserDialog } from './DirectoryBrowserDialog'
 import { getRecentDirs, addRecentDir, removeRecentDir } from '../lib/recentDirs'
 import { isTauri } from '../lib/env'
+import { useTranslation } from '../i18n'
 
 interface Props {
   value: string
@@ -34,6 +35,7 @@ export function DirectoryPicker({
   initialPath,
   onError,
 }: Props) {
+  const { t } = useTranslation()
   const [recent, setRecent] = useState<string[]>([])
   const [openList, setOpenList] = useState(false)
   const [localErr, setLocalErr] = useState<string | null>(null)
@@ -98,8 +100,8 @@ export function DirectoryPicker({
       // 原生通道失败（权限/插件未注册）也不留死路：降级到应用内浏览器。
       // 同时上报全局提示（BUG-167：用户主动操作的失败不可静默）。
       const msg = e instanceof Error ? e.message : String(e)
-      setLocalErr(`系统目录对话框不可用（${msg}），已切换为应用内选择`)
-      onError?.(`系统目录对话框不可用，已切换为应用内选择：${msg}`)
+      setLocalErr(t('dir.nativeUnavailable', { msg }))
+      onError?.(t('dir.nativeUnavailableToast', { msg }))
       setBrowserOpen(true)
     }
   }
@@ -129,7 +131,7 @@ export function DirectoryPicker({
             type="button"
             onClick={() => setOpenList((v) => !v)}
             disabled={disabled}
-            title="历史目录"
+            title={t('dir.historyTitle')}
             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border-subtle bg-surface-2 text-muted transition-colors hover:bg-surface-2/80 hover:text-fg-strong disabled:opacity-50"
           >
             <svg
@@ -152,10 +154,10 @@ export function DirectoryPicker({
           onClick={pick}
           disabled={disabled}
           data-testid="dir-picker-browse"
-          title={inTauri ? undefined : '网页调试模式：使用应用内目录浏览器（系统原生对话框仅桌面客户端可用）'}
+          title={inTauri ? undefined : t('dir.webDebugHint')}
           className="shrink-0"
         >
-          浏览…
+          {t('dir.browse')}
         </Button>
       </div>
 
@@ -179,7 +181,7 @@ export function DirectoryPicker({
       {showHistory && openList && recent.length > 0 && (
         <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-56 overflow-y-auto rounded-md border border-border-subtle bg-surface shadow-xl">
           <p className="px-3 pt-2 text-[10px] uppercase tracking-wide text-muted">
-            最近使用
+            {t('dir.recent')}
           </p>
           {recent.map((d) => (
             <div
@@ -192,7 +194,7 @@ export function DirectoryPicker({
               <button
                 className="shrink-0 text-muted opacity-0 transition-opacity hover:text-danger group-hover:opacity-100"
                 onClick={(e) => removeOne(e, d)}
-                title="从历史移除"
+                title={t('dir.removeHistory')}
               >
                 ✕
               </button>

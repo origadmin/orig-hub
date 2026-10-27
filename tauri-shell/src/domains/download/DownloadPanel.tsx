@@ -165,13 +165,13 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
   const tgUnavailable = daemonDown || unavailable != null || downloadUnavailable != null
   const tgReason = unavailable ?? downloadUnavailable ?? error
   const tgScopeText = daemonDown
-    ? '服务未连接，TG 入库与普通下载均不可用'
+    ? t('download.panel.scopeDaemonDown')
     : unavailable != null && dlDown
-      ? 'TG 入库与普通下载均不可用'
+      ? t('download.panel.scopeBothDown')
       : unavailable != null
-        ? 'TG 入库任务暂时无法读取'
+        ? t('download.panel.scopeTgUnavailable')
         : dlDown
-          ? '普通下载不可用'
+          ? t('download.panel.scopeDlUnavailable')
           : ''
 
   const fail = (e: unknown) => setError(e instanceof Error ? e.message : String(e))
@@ -199,7 +199,7 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
         if (res?.alreadyIngested) skipped += 1
       }
       if (skipped > 0) {
-        setError(`${skipped} 项已入库，未重复下载`)
+        setError(t('download.panel.skippedIngest', { n: skipped }))
       }
       refresh()
     } catch (e) {
@@ -258,14 +258,14 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
       }
     }
     if (ops.length === 0) {
-      if (skipped > 0) setError('选中的内容无可取消的操作')
+      if (skipped > 0) setError(t('download.panel.cancelNothing'))
       return
     }
     try {
       await Promise.all(ops.map((o) => o()))
       setSelected(new Set())
       refresh()
-      if (skipped > 0) setError(`${skipped} 项已无取消操作，已跳过`)
+      if (skipped > 0) setError(t('download.panel.cancelSkipped', { n: skipped }))
     } catch (e) {
       fail(e)
     }
@@ -287,7 +287,7 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
     return (
       <div className="flex flex-col items-center justify-center py-24 text-muted">
         <div className="h-8 w-8 animate-spin rounded-full border-2 border-surface-2 border-t-accent" />
-        <p className="mt-4 text-sm">加载中…</p>
+        <p className="mt-4 text-sm">{t('download.list.loading')}</p>
       </div>
     )
   }
@@ -300,12 +300,12 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
     return (
       <div className="flex flex-col items-center justify-center py-24" data-testid="dl-error">
       <p className="text-sm text-danger">{tgReason}</p>
-      <button
-        onClick={refresh}
-        className="mt-3 text-xs text-accent hover:underline"
-      >
-          重试
-      </button>
+          <button
+            onClick={refresh}
+            className="mt-3 text-xs text-accent hover:underline"
+          >
+            {t('download.list.retry')}
+          </button>
       </div>
     )
   }
@@ -334,8 +334,8 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
         <SelectAllButtons
           onSelectAll={selectAllVisible}
           onSelectNone={clearSelection}
-          allLabel="全选本页"
-          noneLabel="全不选"
+          allLabel={t('download.panel.selectAllPage')}
+          noneLabel={t('download.panel.selectNone')}
           allTestId="dl-select-all"
           noneTestId="dl-select-none"
         />
@@ -345,9 +345,9 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
           className="h-7 px-2 text-[11px]"
           onClick={clearSelection}
           data-testid="dl-batch-clear"
-          title="清空选择"
+          title={t('download.panel.clearSelection')}
         >
-          清空
+          {t('download.panel.clear')}
         </Button>
         <Button
           size="sm"
@@ -355,9 +355,9 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
           className="h-7 px-2 text-[11px]"
           onClick={() => void cancelSelected()}
           data-testid="dl-batch-cancel"
-          title="取消选中的下载"
+          title={t('download.panel.cancelSelectedTitle')}
         >
-          取消选中
+          {t('download.panel.cancelSelectedLabel')}
         </Button>
       </SelectionBar>
 
@@ -369,7 +369,7 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
           {tgScopeText}：{tgReason}
           {/* 仅当「只有 TG 取不到」且仍有快照行时，才提示「断开前的最后快照」；
               两侧都挂时不适用（BUG-355） */}
-          {unavailable != null && !dlDown && ingestRows.length > 0 && '（下列入库行为断开前的最后快照，恢复后自动刷新）'}
+          {unavailable != null && !dlDown && ingestRows.length > 0 && t('download.panel.snapshotNote')}
         </div>
       )}
 
@@ -383,13 +383,13 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
               <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
             </svg>
           </div>
-          <h3 className="mt-4 text-sm font-medium text-fg-mid">暂无传输任务</h3>
+          <h3 className="mt-4 text-sm font-medium text-fg-mid">{t('download.panel.emptyTitle')}</h3>
           <p className="mt-1 text-xs text-muted">
             {tgUnavailable
               ? (dlDown
-                  ? '恢复服务后，任务会出现在这里'
-                  : '连上 TG 后，入库任务会出现在这里')
-              : '点击右上角「新建下载」添加任务，或在 TG 面板入库'}
+                  ? t('download.panel.emptyRecover')
+                  : t('download.panel.emptyTg'))
+              : t('download.panel.emptyHint')}
           </p>
         </div>
       ) : (

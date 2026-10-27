@@ -151,6 +151,9 @@
 | verify_bug393_selection_standard.cjs | misc | S2 |
 | verify_bug394_backfill_default_date.cjs | tg | S2 |
 | verify_bug399_column_alignment.cjs | misc | S2 |
+| verify_bug447_i18n_keys.cjs | misc(i18n) | S2 |
+| verify_bug454_avatar_initial.cjs | tg | S2 |
+| verify_bug456_category_counts.cjs | files | S2 |
 | verify_bug400_files_ia.cjs | files | S2 |
 | verify_bug_121_action_labels.cjs | misc | S2 |
 | verify_bug_133_disk_occupancy.cjs | misc | S2 |

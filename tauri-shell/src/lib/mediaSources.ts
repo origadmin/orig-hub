@@ -13,6 +13,7 @@
  * 不得再碰 `lib/tgmedia`（即使只是通用格式化工具，也已在本文件 re-export，统一从这里取）。
  */
 import { clearCacheItem, enqueueCacheTask, tgDiag } from '../api/tg'
+import { t } from '../i18n'
 import type { TgCacheTask } from '../types'
 import { ensureDaemon } from '../api/tauri'
 import { TG_PLUGIN_ID, restartPlugin } from '../api/daemon'
@@ -56,7 +57,7 @@ const tgAdapter: SourceAdapter = {
   canRecache: true,
   async recache(ref: string) {
     const tg = parseTgRef(ref)
-    if (!tg) throw new Error('这条内容的来源标识不是 chat:msg，无法重新缓存')
+    if (!tg) throw new Error(t('source.notChatMsg'))
     await enqueueCacheTask({ chatId: tg.chatId, messageIds: [tg.messageId] })
   },
   /**
@@ -209,9 +210,9 @@ export async function recacheFromSource(
 ): Promise<void> {
   const adapter = getSourceAdapter(source)
   if (!adapter || !adapter.canRecache) {
-    throw new Error('这条内容的来源不支持原路重新缓存')
+    throw new Error(t('source.noOriginalPath'))
   }
-  if (!ref) throw new Error('这条内容没有来源定位符，无法重新缓存')
+  if (!ref) throw new Error(t('source.noRef'))
   await adapter.recache(ref)
 }
 
@@ -256,7 +257,7 @@ export async function probeSourceBackend(source?: string | null): Promise<boolea
 /** 确保来源后端可用（TG 即确保已登录/已拉起） */
 export async function ensureSourceBackend(source?: string | null): Promise<void> {
   const adapter = getSourceAdapter(source)
-  if (!adapter) throw new Error('未知来源，无法连接')
+  if (!adapter) throw new Error(t('source.unknown'))
   await adapter.ensureAvailable()
 }
 

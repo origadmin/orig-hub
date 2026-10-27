@@ -5,12 +5,13 @@ import { importMediaItems, scanDirectory } from '../../api/media'
 import type { ScannedFile } from '../../api/media'
 import { fmtSize } from '../../lib/mediaSources'
 import { getRecentDirs } from '../../lib/recentDirs'
+import { useTranslation } from '../../i18n'
 
-const KIND_LABEL: Record<string, string> = {
-  video: '视频',
-  photo: '图片',
-  audio: '音频',
-  file: '文件',
+const KIND_KEY: Record<string, string> = {
+  video: 'media.kindVideo',
+  photo: 'media.kindPhoto',
+  audio: 'media.kindAudio',
+  file: 'media.kindFile',
 }
 
 /**
@@ -24,6 +25,7 @@ export function ImportDialog(props: {
   onError: (msg: string) => void
 }) {
   const { onClose, onImported, onError } = props
+  const { t } = useTranslation()
   // BUG-143：原先硬编码 `D:\test_videos`（开发期调试残留，会带到用户机器上）。
   // 改为「上次用过的目录，没有就留空」—— 复用现成的 recentDirs，不新造一套持久化。
   const [dir, setDir] = useState(() => getRecentDirs()[0] ?? '')
@@ -97,9 +99,9 @@ export function ImportDialog(props: {
         onClick={(e) => e.stopPropagation()}
       >
         <header className="shrink-0 border-b border-border-subtle/60 px-4 py-3">
-          <h2 className="text-base font-semibold text-fg-strong">导入本地目录</h2>
+          <h2 className="text-base font-semibold text-fg-strong">{t('media.import.title')}</h2>
           <p className="mt-0.5 text-[11px] text-muted">
-            扫描目录中的视频/图片/音频并登记到资料库，原文件保留在原位不会被移动。
+            {t('media.import.desc')}
           </p>
         </header>
 
@@ -109,7 +111,7 @@ export function ImportDialog(props: {
               <Input
                 value={dir}
                 onChange={(e) => setDir(e.target.value)}
-                placeholder="选择要导入的目录"
+                placeholder={t('media.import.dirPlaceholder')}
                 className="h-8 text-xs"
                 spellCheck={false}
               />
@@ -120,14 +122,16 @@ export function ImportDialog(props: {
               disabled={scanning || !dir.trim()}
               onClick={() => void runScan()}
             >
-              {scanning ? '扫描中…' : '扫描'}
+              {scanning ? t('media.import.scanning') : t('media.import.scan')}
             </Button>
           </div>
           {found ? (
             <p className="mt-2 text-[11px] text-muted">
-              共 {found.length} 个媒体文件
-              {Object.entries(counts).map(([k, v]) => ` · ${KIND_LABEL[k] ?? k} ${v}`).join('')}
-              {' · 已选 '}
+              {t('media.import.foundCount', { n: found.length })}
+              {Object.entries(counts)
+                .map(([k, v]) => ` · ${t(KIND_KEY[k] ?? k)} ${v}`)
+                .join('')}
+              {t('media.import.selectedPrefix')}
               <span className="font-medium text-fg-strong">{selected.length}</span>
             </p>
           ) : null}
@@ -135,9 +139,9 @@ export function ImportDialog(props: {
 
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
           {found === null ? (
-            <p className="py-8 text-center text-xs text-muted">输入目录后点击「扫描」</p>
+            <p className="py-8 text-center text-xs text-muted">{t('media.import.hintEmpty')}</p>
           ) : found.length === 0 ? (
-            <p className="py-8 text-center text-xs text-muted">该目录下没有可识别的媒体文件</p>
+            <p className="py-8 text-center text-xs text-muted">{t('media.import.hintNone')}</p>
           ) : (
             <ul className="space-y-0.5">
               {found.map((f) => {
@@ -155,7 +159,7 @@ export function ImportDialog(props: {
                         {f.dir ? `${f.dir}/` : ''}
                         {f.name}
                       </span>
-                      <span className="shrink-0 text-[10px] text-muted">{KIND_LABEL[f.kind]}</span>
+                      <span className="shrink-0 text-[10px] text-muted">{t(KIND_KEY[f.kind] ?? f.kind)}</span>
                       <span className="w-16 shrink-0 text-right text-[10px] text-muted">
                         {fmtSize(f.size)}
                       </span>
@@ -177,7 +181,7 @@ export function ImportDialog(props: {
               else setExcluded(new Set())
             }}
           >
-            全不选
+            {t('media.import.selectNone')}
           </Button>
           <Button
             variant="outline"
@@ -185,10 +189,10 @@ export function ImportDialog(props: {
             className="h-8 px-3 text-xs"
             onClick={() => setExcluded(new Set())}
           >
-            全选
+            {t('media.import.selectAll')}
           </Button>
           <Button variant="outline" size="sm" className="h-8 px-3 text-xs" onClick={onClose}>
-            取消
+            {t('media.import.cancel')}
           </Button>
           <Button
             size="sm"
@@ -196,7 +200,7 @@ export function ImportDialog(props: {
             disabled={importing || selected.length === 0}
             onClick={() => void runImport()}
           >
-            {importing ? '导入中…' : `导入 ${selected.length} 项`}
+            {importing ? t('media.import.importing') : t('media.import.importN', { n: selected.length })}
           </Button>
         </footer>
       </div>

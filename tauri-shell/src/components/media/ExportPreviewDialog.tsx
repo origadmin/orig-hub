@@ -83,8 +83,8 @@ export function ExportPreviewDialog(props: {
       const copied = await copyToClipboard(dir)
       onError(
         copied
-          ? '网页调试模式不支持打开系统文件夹，已复制导出目录路径'
-          : `网页调试模式不支持打开系统文件夹，导出目录：${dir}`,
+          ? t('media.export.openFolderWebCopied')
+          : t('media.export.openFolderWebDir', { dir }),
       )
       return
     }

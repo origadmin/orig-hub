@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Button } from './ui/button'
 import { Badge } from './ui/badge'
 import { listInterfaces } from '../api/daemon'
+import { useTranslation } from '../i18n'
 import type { NetworkInterface } from '../types'
 
 export interface InterfaceSelection {
@@ -26,6 +27,7 @@ interface Props {
  * - 未连接 / 虚拟网卡禁用并标注；名称单行省略不换行
  */
 export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Props) {
+  const { t } = useTranslation()
   const [ifaces, setIfaces] = useState<NetworkInterface[]>([])
   const [primary, setPrimary] = useState<string | undefined>(selected.primary)
   const [checked, setChecked] = useState<Record<string, boolean>>({})
@@ -82,16 +84,16 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between">
-          <h2 className="text-base font-semibold text-fg-strong">选择网卡</h2>
-          <Badge variant="secondary">参与加速</Badge>
+          <h2 className="text-base font-semibold text-fg-strong">{t('nic.pickTitle')}</h2>
+          <Badge variant="secondary">{t('nic.participateBadge')}</Badge>
         </div>
 
         {/* 主网卡选择 */}
         <div className="mt-4 rounded-md bg-surface-2/60 px-3 py-2.5">
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2">
-              <span className="text-xs font-medium text-fg-mid">主网卡</span>
-              <Badge variant="default" className="text-[9px]">默认</Badge>
+              <span className="text-xs font-medium text-fg-mid">{t('nic.primary')}</span>
+              <Badge variant="default" className="text-[9px]">{t('nic.default')}</Badge>
             </div>
             <select
               value={primary ?? ''}
@@ -102,23 +104,23 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
               }}
               className="max-w-[60%] flex-1 truncate rounded-md border border-border-subtle bg-surface px-2 py-1.5 text-xs text-fg-strong focus:outline-none focus:ring-2 focus:ring-accent/50"
             >
-              <option value="">自动识别（默认路由网卡）</option>
+              <option value="">{t('nic.autoDetect')}</option>
               {connIfaces.map((nic) => (
                 <option key={nic.name} value={nic.name}>
-                  {nic.name} {nic.is_default ? '（默认）' : ''}
+                  {nic.name} {nic.is_default ? t('nic.defaultParen') : ''}
                 </option>
               ))}
             </select>
           </div>
           <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
-            主网卡始终参与分流，可在下方列表中切换指定。
+            {t('nic.hintPrimary')}
           </p>
         </div>
 
         {/* 网卡列表（多选） */}
         <div className="mt-3 max-h-64 space-y-1.5 overflow-y-auto pr-1">
           {ifaces.length === 0 && (
-            <p className="text-xs text-muted">daemon 未连接，无法枚举网卡</p>
+            <p className="text-xs text-muted">{t('nic.daemonDown')}</p>
           )}
           {ifaces.map((nic) => {
             const u = usable(nic)
@@ -149,13 +151,13 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
                     {nic.ip ?? '—'}
                   </span>
                   {isPrimary && (
-                    <Badge variant="default" className="shrink-0 text-[9px]">主</Badge>
+                    <Badge variant="default" className="shrink-0 text-[9px]">{t('nic.primaryBadge')}</Badge>
                   )}
                   {nic.is_virtual && (
-                    <Badge variant="outline" className="shrink-0 text-[9px]">虚拟</Badge>
+                    <Badge variant="outline" className="shrink-0 text-[9px]">{t('nic.virtual')}</Badge>
                   )}
                   {!nic.connected && (
-                    <Badge variant="outline" className="shrink-0 text-[9px] text-danger">未连接</Badge>
+                    <Badge variant="outline" className="shrink-0 text-[9px] text-danger">{t('nic.disconnected')}</Badge>
                   )}
                 </div>
               </div>
@@ -164,12 +166,12 @@ export function InterfacePickerDialog({ open, onClose, selected, onConfirm }: Pr
         </div>
 
         <p className="mt-2 text-[11px] leading-relaxed text-muted">
-          勾选已连接的网卡参与分流（可多选）；主网卡固定参与。权重在设置页「多网卡」中按比例自动分配。
+          {t('nic.hintMulti')}
         </p>
 
         <div className="mt-4 flex justify-end gap-2">
-          <Button variant="ghost" onClick={onClose}>取消</Button>
-          <Button onClick={handleConfirm}>确定</Button>
+          <Button variant="ghost" onClick={onClose}>{t('media.cancel')}</Button>
+          <Button onClick={handleConfirm}>{t('nic.confirm')}</Button>
         </div>
       </div>
     </div>

@@ -3,6 +3,7 @@ import { Folder } from 'lucide-react'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 import { listDirs } from '../api/daemon'
+import { useTranslation } from '../i18n'
 import type { FsDirListing } from '../api/daemon'
 
 interface Props {
@@ -13,12 +14,12 @@ interface Props {
   onPick: (dir: string) => void
 }
 
-/** 快捷锚点语义键 → 展示文案（label 归前端，daemon 只给 key）。 */
-const ROOT_LABEL: Record<string, string> = {
-  default_download: '系统下载目录',
-  home: '主目录',
-  current: '当前下载目录',
-  library: '媒体库根',
+/** 快捷锚点语义键 → i18n key（label 归前端，daemon 只给 key）。 */
+const ROOT_KEY: Record<string, string> = {
+  default_download: 'dir.rootDefaultDownload',
+  home: 'dir.rootHome',
+  current: 'dir.rootCurrent',
+  library: 'dir.rootLibrary',
 }
 
 /**
@@ -33,6 +34,7 @@ const ROOT_LABEL: Record<string, string> = {
  * 正是 BUG-176 / BUG-318 那类「数据丢失幻觉」的成因。
  */
 export function DirectoryBrowserDialog({ open, initialPath, onClose, onPick }: Props) {
+  const { t } = useTranslation()
   const [listing, setListing] = useState<FsDirListing | null>(null)
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState<string | null>(null)
@@ -96,11 +98,11 @@ export function DirectoryBrowserDialog({ open, initialPath, onClose, onPick }: P
       <div
         role="dialog"
         aria-modal="true"
-        aria-label="选择目录"
+        aria-label={t('dir.browserTitle')}
         className="w-full max-w-xl animate-spring rounded-xl border border-border-subtle bg-surface p-4 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 className="text-base font-semibold text-fg-strong">选择目录</h2>
+        <h2 className="text-base font-semibold text-fg-strong">{t('dir.browserTitle')}</h2>
 
         {/* 快捷锚点 */}
         {listing && listing.roots.length > 0 && (
@@ -114,7 +116,7 @@ export function DirectoryBrowserDialog({ open, initialPath, onClose, onPick }: P
                 data-testid={`dir-browser-root-${r.key}`}
                 className="max-w-[16rem] truncate rounded-md border border-border-subtle bg-surface-2 px-2 py-1 text-[11px] text-fg-mid transition-colors hover:bg-surface-2/70"
               >
-                {ROOT_LABEL[r.key] ?? r.key}
+                {t(ROOT_KEY[r.key] ?? r.key)}
               </button>
             ))}
           </div>
@@ -131,14 +133,14 @@ export function DirectoryBrowserDialog({ open, initialPath, onClose, onPick }: P
             onClick={() => listing?.parent && void go(listing.parent)}
             data-testid="dir-browser-up"
           >
-            上一级
+            {t('dir.up')}
           </Button>
           <span
             className="min-w-0 flex-1 truncate font-mono text-[11px] text-fg-mid"
             title={listing?.path ?? undefined}
             data-testid="dir-browser-path"
           >
-            {listing?.path ?? '此电脑'}
+            {listing?.path ?? t('dir.thisComputer')}
           </span>
         </div>
 
@@ -149,7 +151,7 @@ export function DirectoryBrowserDialog({ open, initialPath, onClose, onPick }: P
             onKeyDown={(e) => {
               if (e.key === 'Enter') void go(jump)
             }}
-            placeholder="直接输入绝对路径后回车"
+            placeholder={t('dir.pathPlaceholder')}
             data-testid="dir-browser-input"
           />
           <Button
@@ -159,7 +161,7 @@ export function DirectoryBrowserDialog({ open, initialPath, onClose, onPick }: P
             onClick={() => void go(jump)}
             data-testid="dir-browser-go"
           >
-            前往
+            {t('dir.go')}
           </Button>
         </div>
 
@@ -167,13 +169,13 @@ export function DirectoryBrowserDialog({ open, initialPath, onClose, onPick }: P
         <div className="mt-3 h-64 overflow-y-auto rounded-md border border-border-subtle bg-surface-2/40">
           {err && (
             <p className="border-b border-border-subtle px-3 py-2 text-xs text-danger" data-testid="dir-browser-error">
-              无法读取该目录：{err}
+              {t('dir.readFailed', { err })}
             </p>
           )}
-          {loading && <p className="px-3 py-2 text-xs text-muted">读取中…</p>}
+          {loading && <p className="px-3 py-2 text-xs text-muted">{t('dir.reading')}</p>}
           {!loading && !err && listing?.entries.length === 0 && (
             <p className="px-3 py-2 text-xs text-muted" data-testid="dir-browser-empty">
-              该目录下没有子目录
+              {t('dir.empty')}
             </p>
           )}
           {!loading &&
@@ -194,13 +196,13 @@ export function DirectoryBrowserDialog({ open, initialPath, onClose, onPick }: P
 
         {listing?.truncated && (
           <p className="mt-1.5 text-[11px] text-muted">
-            子目录过多，仅显示前 1000 个（可直接在上方输入完整路径跳转）
+            {t('dir.truncated')}
           </p>
         )}
 
         <div className="mt-4 flex justify-end gap-2">
           <Button variant="ghost" onClick={onClose} data-testid="dir-browser-close">
-            取消
+            {t('media.cancel')}
           </Button>
           <Button
             disabled={!listing?.path || loading}
@@ -209,7 +211,7 @@ export function DirectoryBrowserDialog({ open, initialPath, onClose, onPick }: P
             }}
             data-testid="dir-browser-pick"
           >
-            选择此目录
+            {t('dir.pickThis')}
           </Button>
         </div>
       </div>
