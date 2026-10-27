@@ -154,6 +154,8 @@
 | BUG-474 | TG 服务挂了却显示「未绑定」引导卡——daemon 不可达时 tgService 留 stale running=true，废掉 BUG-094「unreachable 才隐藏」规则，dead 服务被渲染成 unbound | open | engine+shell |
 | BUG-479 | 导出流程重设计——「导出预览 + 完备性校验」对话框作用不明、范围不明（导出什么/导到哪/缺什么三问皆答不出）；完备性校验须改为流程内呈现（BUG-478 内容级移交） | open | shell |
 | BUG-480 | 剧集标签选择器重设计——弹出标签堆无组织逻辑（无分组/无搜索/已选态弱）；对齐 BUG-259/068/405 三条既有标签规则（BUG-478 内容级移交） | open | shell |
+| BUG-481 | dev_services 在 release 栈共存时静默漂移（29786）、free_port 静默杀用户壳后端、status 把 release daemon 误报成 dev 就绪（tg 全 null）——整条 dev 流程跑不通；改为排他+拒绝(exit 3)+启动后自证(exit 6)+状态归属(owner/exit 7) | fixed | build |
+| BUG-482 | release 壳栈退化出双 daemon+双 tg（单壳跑出 19786/19787 双 daemon、tg 漂 19789），占死双规范端口；壳侧 spawn 监督逻辑待查 | open | shell |
 
 ## 已完成
 

@@ -22,6 +22,16 @@ daemon 才是常驻进程，它自己负责：
     # 第一次（用户，建议提权，规避 Windows 端口排除区间）：
     python scripts/dev_services.py --start          # 拉起 daemon（DETACHED），然后退出
 
+排他契约（BUG-481）：规范端口 19786/19787 是 dev 栈与 release 壳栈的**排他资源**
+（两者共享数据根，双栈并跑会互相覆盖端点文件、争 SQLite 写锁、TG 同 session 双连接）。
+因此：
+  - 19786 被非 dev 栈占用时 --start **拒绝启动**（exit 3）并打印占用者身份，绝不漂移、
+    绝不代杀第三方进程；
+  - dev daemon 启动后必须应答在规范端口上，否则 kill 自己刚拉起的子进程并报错
+    （exit 6）—— 漂移状态不可存在；
+  - --status 区分应答者归属（owner=dev/release-shell/…），非 dev 应答视为未就绪
+    （exit 7），不再输出全 null 的假就绪。
+
     # 之后每次代码更新：
     #   a) 只改了 orig-tg（最常见）：
     python scripts/dev_services.py --redeploy-request   # 写信号→daemon 停 orig-tg、回 stopped
@@ -98,10 +108,21 @@ def probe(port: int):
 
 
 def free_port(port: int) -> None:
-    """清理占着 daemon/orig-tg 规范端口的僵尸，避免新实例漂移到随机端口。
+    """清理占着规范端口的 **dev 栈自身僵尸**（与 DAEMON_EXE 同路径的监听者）。
 
-    只在本进程**启动 daemon 之前**用一次，不是自治杀进程。
+    第三方监听者（release 壳的 daemon、任何其他进程）**绝不碰** —— 它们的存在由
+    --start 主流程显式拒绝并报告（BUG-481：此前的静默 taskkill 会误杀用户的
+    release 壳后端，引发端口战争）。只在本进程**启动 daemon 之前**用一次。
     """
+    pid = listener_pid(port)
+    if not pid:
+        return
+    if is_dev_daemon_exe(exe_of(pid)):
+        subprocess.run(["taskkill", "/PID", pid, "/T", "/F"], capture_output=True)
+
+
+def listener_pid(port: int) -> str | None:
+    """返回正在 LISTEN 该端口的 pid；无监听者返回 None。"""
     try:
         out = subprocess.run(
             ["netstat", "-ano", "-p", "TCP"],
@@ -115,9 +136,51 @@ def free_port(port: int) -> None:
                 continue
             local, state, pid = cols[1], cols[3], cols[4]
             if f":{port}" in local and state == "LISTENING" and pid.isdigit():
-                subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True)
+                return pid
     except Exception:
         pass
+    return None
+
+
+def exe_of(pid: str) -> str:
+    """解析 pid 的可执行文件路径（失败返回空串 —— 调用方按 fail-closed 处理）。"""
+    try:
+        out = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').ExecutablePath",
+            ],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+        ).stdout.strip()
+        return out
+    except Exception:
+        return ""
+
+
+def is_dev_daemon_exe(exe: str) -> bool:
+    if not exe:
+        return False
+    try:
+        return Path(exe).resolve() == DAEMON_EXE.resolve()
+    except Exception:
+        return False
+
+
+def classify_owner(exe: str) -> str:
+    """按可执行路径归属监听者。fail-closed：认不出 = unknown（视同非 dev）。"""
+    e = exe.replace("/", "\\").lower()
+    if is_dev_daemon_exe(exe):
+        return "dev"
+    if "src-tauri" in e and e.endswith("orig-daemon.exe"):
+        return "release-shell"
+    if e.endswith("orig-daemon.exe"):
+        return "other-daemon"
+    return "unknown"
 
 
 def start_daemon(
@@ -208,10 +271,16 @@ def emit_status(port: int, cfg: dict | None) -> int:
     if cfg is None:
         print(json.dumps({"ready": False, "port": port}, ensure_ascii=False))
         return 1
+    pid = listener_pid(port)
+    exe = exe_of(pid) if pid else ""
+    owner = classify_owner(exe)
     print(
         json.dumps(
             {
-                "ready": True,
+                "ready": owner == "dev" and bool(cfg.get("tg_running")),
+                "owner": owner,
+                "holder_pid": pid,
+                "holder_exe": exe,
                 "port": cfg.get("port"),
                 "tg_port": cfg.get("tg_port"),
                 "tg_enabled": cfg.get("tg_enabled"),
@@ -223,6 +292,14 @@ def emit_status(port: int, cfg: dict | None) -> int:
             indent=2,
         )
     )
+    if owner != "dev":
+        print(
+            f"[dev-services] WARN: port {port} is served by a NON-dev stack "
+            f"(owner={owner}, pid={pid}, {exe or 'unknown path'}); "
+            "this is NOT your dev engine. Close the release shell app, then --start.",
+            file=sys.stderr,
+        )
+        return 7
     if not cfg.get("tg_running"):
         print("[dev-services] WARN: orig-tg not running; check logs/orig-daemon.log", file=sys.stderr)
         return 5
@@ -295,22 +372,66 @@ def main() -> int:
 
     # 默认 / --start：起或复用 daemon（一次性，然后退出——本脚本不常驻）。
     cfg = probe(args.port)
+    if cfg is not None:
+        # 19786 上已有人在应答：先回答「是谁」（BUG-481）。dev 自身 → 复用；
+        # 其他栈 → 拒绝并报告，绝不漂移、绝不代杀。
+        pid = listener_pid(args.port)
+        exe = exe_of(pid) if pid else ""
+        owner = classify_owner(exe)
+        if owner == "dev":
+            print("[dev-services] reusing healthy dev daemon")
+            return emit_status(args.port, cfg)
+        print(
+            json.dumps(
+                {
+                    "ready": False,
+                    "refused": True,
+                    "reason": f"canonical port {args.port} is held by a non-dev stack",
+                    "holder": {"pid": pid, "exe": exe, "owner": owner},
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        print(
+            f"[dev-services] REFUSED: port {args.port} is held by pid {pid} "
+            f"({exe or 'unknown path'}, owner={owner}).\n"
+            "  This is usually the release-shell stack auto-started by the OrigHub app;\n"
+            "  dev and release stacks are mutually exclusive on the canonical ports.\n"
+            "  → close the OrigHub shell app, wait a few seconds, then run --start again;\n"
+            "  → or explicitly approve cleanup of the release stack. This script will NOT kill it.",
+            file=sys.stderr,
+        )
+        return 3
+    data_dir = resolve_data_dir(args.data_dir)
+    print(f"[dev-services] starting orig-daemon (ORIG_TG_DATA={data_dir})")
+    proc = start_daemon(data_dir, args.port)
+    if proc is None:
+        return 2
+    cfg = wait_healthy(args.port, HEALTH_TIMEOUT_S)
     if cfg is None:
-        data_dir = resolve_data_dir(args.data_dir)
-        print(f"[dev-services] starting orig-daemon (ORIG_TG_DATA={data_dir})")
-        proc = start_daemon(data_dir, args.port)
-        if proc is None:
-            return 2
-        cfg = wait_healthy(args.port, HEALTH_TIMEOUT_S)
-        if cfg is None:
-            print(
-                f"[dev-services] daemon did not become healthy within {HEALTH_TIMEOUT_S}s; "
-                "see LOG_FILE",
-                file=sys.stderr,
-            )
-            return 4
-    else:
-        print("[dev-services] reusing healthy daemon")
+        print(
+            f"[dev-services] daemon did not become healthy within {HEALTH_TIMEOUT_S}s; "
+            "see LOG_FILE",
+            file=sys.stderr,
+        )
+        return 4
+    # 防漂移自证（BUG-481）：daemon 必须应答在规范端口上；漂移即 kill 自己刚拉起的
+    # 子进程（不是第三方进程）并显式报错 —— 漂移状态不可存在。
+    if cfg.get("port") != args.port:
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
+        print(
+            json.dumps(
+                {
+                    "ready": False,
+                    "reason": f"dev daemon drifted to port {cfg.get('port')} instead of {args.port}; killed our own child",
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 6
     return emit_status(args.port, cfg)
 
 
