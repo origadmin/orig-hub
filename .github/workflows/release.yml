@@ -1,0 +1,135 @@
+name: Release App
+
+# APP 发布：打 `v*` tag 即打包 Windows 安装器并发布 GitHub Release。
+#
+# 职责边界：门禁（engine 单测/构建 + shell 类型检查/构建 + 登记册一致性 +
+# 提交信息 + 目录污染）全在 `ci.yml`，本文件**只做产物打包与发布**，不重复门禁。
+# 推送/打 tag 由人执行；本工作流由仓库事件触发。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. v0.1.0'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build Tauri app (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            download-engine
+            tauri-shell/src-tauri
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: tauri-shell/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: tauri-shell
+        run: npm ci
+
+      # 版本真源门禁：tag 必须与 tauri.conf.json 的 version 一致。
+      # 两边各写一个版本号 = 产物自称的版本与仓库 tag 对不上，事后无法追溯。
+      - name: 'Gate: tag matches tauri.conf.json version'
+        shell: bash
+        run: |
+          set -eu
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VER="${TAG#v}"
+          CFG="$(node -p "require('./tauri-shell/src-tauri/tauri.conf.json').version")"
+          echo "tag=$TAG (ver=$VER) vs tauri.conf.json=$CFG"
+          if [ "$VER" != "$CFG" ]; then
+            echo "::error::版本不一致：tag 版本 $VER 与 tauri.conf.json 的 $CFG 不符；请先改配置再打 tag。"
+            exit 1
+          fi
+
+      # sidecar 必须**先于** tauri build 产出：externalBin 指向
+      # `download-engine/target/release/orig-daemon|orig-tg`，缺文件则 tauri build
+      # 直接失败；陈旧则把旧引擎打进包（BUG-055/061「产物比源码旧」在此必须响）。
+      - name: Build engine sidecars
+        working-directory: download-engine
+        run: cargo build --release -p orig-daemon -p orig-tg
+
+      - name: Sync sidecars + freshness gate
+        shell: bash
+        run: |
+          sh scripts/sync-sidecars.sh
+          # --check 不写盘：断言 release 产物不旧于 crate 源码，且 externalBin 源与
+          # cargo 产物逐字节一致。产物与源码脱节时这里必须红。
+          sh scripts/sync-sidecars.sh --check
+
+      - name: Tauri build (installer bundle)
+        working-directory: tauri-shell
+        run: npm run tauri:build
+        env:
+          # 更新器签名。仓库 secrets 未配置时为空 ⇒ 跳过签名，不阻断打包
+          # （未签名产物仅供本地/内部分发，不可走自动更新通道）。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Collect bundle artifacts
+        shell: bash
+        run: |
+          set -eu
+          BUNDLE_DIR="tauri-shell/src-tauri/target/release/bundle"
+          mkdir -p dist_release
+          if [ ! -d "$BUNDLE_DIR" ]; then
+            echo "::error::未找到产物目录 $BUNDLE_DIR（tauri build 未产出 bundle）"
+            exit 1
+          fi
+          shopt -s nullglob
+          found=0
+          for f in "$BUNDLE_DIR"/msi/*.msi "$BUNDLE_DIR"/nsis/*.exe "$BUNDLE_DIR"/nsis/*.sig; do
+            [ -f "$f" ] || continue
+            cp "$f" "dist_release/"
+            found=1
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::bundle 目录里没有找到 MSI/NSIS 安装器"
+            exit 1
+          fi
+          ls -la dist_release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orig-hub-windows
+          path: dist_release/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: orig-hub-windows
+          path: dist_release
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "publishing $TAG"
+          gh release create "$TAG" dist_release/* --title "$TAG" --generate-notes

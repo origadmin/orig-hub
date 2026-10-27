@@ -1,6 +1,7 @@
 import type {
   AddDownloadRequest,
   DownloadStatus,
+  DownloadStatusValue,
   NetworkInterface,
 } from '../types'
 
@@ -50,16 +51,38 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
-/** GET /api/downloads */
 /**
- * GET /api/downloads/native — **引擎原生明细**（BUG-392）。
+ * GET /api/downloads?scope=all — **统一列表**（全来源快照 `{tasks, sources}`，BUG-392）。
  *
- * `/api/downloads` 现在是**统一列表**（全来源快照 `{tasks, sources}`），不是数组；
- * 引擎面（分块/连接/速度等原生字段）改由 `/native` 投影承担。store 的
- * `downloads` 是引擎面派生（速度/进行中计数），必须取这一支。
+ * BUG-466：主列表此前误走 `/api/downloads/native`（引擎单源）——那个 native 端点
+ * 是统一改造时自己造出来的分裂端点，既违反「下载只有一个列表接口」的裁定，又让
+ * 引擎行与入库行分裂成两个来源。native 端点已删除；统一 `/api/downloads` 的
+ * download 行现已携带引擎原生细节（`destPath`/`url`/`connections`…），这里只过滤
+ * `kind === 'download'` 并映射回 `DownloadStatus`，**单一端点即完整真源**。
  */
 export function listDownloads(): Promise<DownloadStatus[]> {
-  return request('/api/downloads/native')
+  return fetchDownloads('all').then((snap) =>
+    snap.tasks
+      .filter((t) => t.kind === 'download')
+      .map((t): DownloadStatus => ({
+        // 统一视图 id 形如 `dl:<uuid>`；引擎动作端点吃的是原生 id，故剥掉前缀。
+        id: t.id.startsWith('dl:') ? t.id.slice(3) : t.id,
+        url: t.url ?? '',
+        filename: t.name,
+        dest_path: t.destPath,
+        total_size: t.totalSize ?? t.total,
+        downloaded: t.downloaded ?? t.done,
+        progress: t.progress,
+        speed: t.speed ?? 0,
+        status: t.status as DownloadStatusValue,
+        error: t.error ?? undefined,
+        eta: t.eta ?? 0,
+        connections: t.connections ?? 0,
+        added_at: t.addedAt ?? t.updated_at,
+        time_taken: t.timeTaken ?? 0,
+        avg_speed: t.avgSpeed ?? t.speed ?? 0,
+      })),
+  )
 }
 
 /** GET /api/downloads/:id */
@@ -480,6 +503,19 @@ export interface ActivityTask {
   control: ActivityControl
   updated_at: number
   error: string | null
+  /**
+   * BUG-466：引擎原生细节已并入统一列表（native 端点删除后无处可取）。
+   * 仅 `kind === 'download'` 的行填充；TG 缓存侧无对应概念 ⇒ 缺省值。
+   */
+  url?: string
+  destPath?: string
+  totalSize?: number
+  downloaded?: number
+  connections?: number
+  eta?: number
+  avgSpeed?: number
+  addedAt?: number
+  timeTaken?: number
 }
 
 export interface ActivitySourceHealth {

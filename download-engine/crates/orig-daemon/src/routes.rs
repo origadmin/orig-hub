@@ -123,26 +123,6 @@ async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({"status": "ok"}))
 }
 
-/// `GET /api/downloads` — 引擎侧全量。
-///
-/// 与 `/api/activity` 的 download 行共用 `engine_rows` 同一真源（内存 ∪ 库）。
-/// 之前本端点**只读内存**，导致栈重启后聚合面看得到行、下载页却空白 —— 同一个
-/// 事实两个答案。两个面必须同一份合并结果，否则「数据丢失」的观感永远修不完。
-async fn list(State(st): State<Arc<AppState>>) -> impl IntoResponse {
-    let rows = crate::activity::engine_rows(&st).await;
-    let now = now_secs();
-    let mut out = Vec::with_capacity(rows.len());
-    for r in &rows {
-        // 只有内存活体才有实时明细可采；纯记录行只陈事实（不产分块/连接）。
-        let detail = match &r.live {
-            Some(t) => Some(t.progress().await),
-            None => None,
-        };
-        out.push(DownloadStatus::from_row(r, detail.as_ref(), now));
-    }
-    axum::Json(out)
-}
-
 /// 同名文件自动重命名的候选：`name (1).ext` / `name (2).ext` … 直到磁盘上不存在。
 ///
 /// 只在「原路径**已存在**」时调用（见 [`add`] 的完整度检测分支）；语义是「给冲突文件
@@ -763,7 +743,9 @@ async fn sources(State(st): State<Arc<AppState>>) -> axum::Json<SourcesSnapshot>
 /// 此前 `/api/downloads` 只回引擎原生面（于是它长期只挂着 1 条 mock 夹具，被读成
 /// 「数据只有一条」），统一聚合面却是另一个端点 `/api/activity`；UI 只认后者，
 /// 两个 endpoint 各说一半。用户共识：下载只有**一个列表接口**。
-/// 原引擎原生列表退居 `/api/downloads/native`（调试/详情投影，非 UI 列表路径）。
+/// 原引擎原生列表端点 `/api/downloads/native` 已于 **BUG-466 删除**（它是统一改造时
+/// 自造的分裂端点）；引擎原生细节字段（`destPath`/`url`/`connections`…）改为**并入
+/// 本统一列表**的 download 行 —— 单一端点即完整真源，UI 不再有第二个列表端点可调。
 async fn list_unified(
     State(st): State<Arc<AppState>>,
     Query(q): Query<ActivityQuery>,
@@ -1509,8 +1491,6 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/health", get(health))
         // BUG-392：GET 是**统一列表**（全来源）；POST（新增任务）语义不变。
         .route("/api/downloads", get(list_unified).post(add))
-        // 引擎原生明细投影（分块/连接数等），调试与详情用；UI 列表不走这里。
-        .route("/api/downloads/native", get(list))
         .route(
             "/api/downloads/:id",
             get(get_one).post(action).delete(delete_one),

@@ -410,6 +410,14 @@ def ensure_vite() -> tuple[bool, str]:
 def do_start(force: bool, with_vite: bool) -> int:
     # BUG-453：dev 跑在 cargo 输出目录之外的副本目录，构建不再锁住运行中的 dev 进程。
     ds.DAEMON_EXE = DEV_BIN_DIR / "orig-daemon.exe"
+    # 一条命令必须自足：副本目录缺二进制时（干净检出/首次运行/目录被清）先构建，
+    # 否则 `start` 只会打印「二进制缺失，先跑 build」而退出 —— 这正是「dev 环境
+    # 无法保证」的成因之一：命令本身不能把环境带到可用态。
+    if not all((DEV_BIN_DIR / n).is_file() for n in ("orig-daemon.exe", "orig-tg.exe")):
+        print("dev 副本缺二进制 ⇒ 先构建，保证一条命令即可起栈")
+        rc = do_build(False)
+        if rc != 0:
+            return rc
     ensure_dev_bins()
     pid = pid_on_port(DAEMON_PORT)
     cfg = ds.probe(DAEMON_PORT)

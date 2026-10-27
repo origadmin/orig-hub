@@ -135,15 +135,19 @@
 | BUG-455 | 下载域「全部下载」页文案丢失：DownloadPanel 引用的 download.panel.*/list.* key 在 zh-CN/en-US 均缺失（已补 key，待 GUI 复验） | in_progress | shell |
 | BUG-456 | 文件管理侧栏分类子项无状态数字：counts 无 per-category 计数源 | open | shell |
 | BUG-457 | 频道回溯无进度、未按天分配、读取进度不可见（状态栏监控下拉按天显示 doneDays/totalDays + reading 态） | open | engine+shell |
-| BUG-458 | 文件管理主操作「导入目录」语义错——应为「添加目录」，目录下媒体直接进文件管理（现状只登记勾选的文件，目录不被记住） | open | shell |
-| BUG-459 | 播放态不切换呈现模式——左栏 340px 列表常驻占位，缺「列表 / 播放（介绍）」TAB 切换 | open | shell |
-| BUG-466 | 下载主列表误用 /api/downloads/native（引擎单源）而非统一 /api/downloads（全来源），BUG-392 回归 | open | engine+shell |
+| BUG-458 | 文件管理主操作「导入目录」语义错——应为「目录管理」（受管根集合登记/移除/设主目录/手动对账），目录下媒体直接进文件管理（现状只登记勾选的文件，目录不被记住） | open | shell |
+| BUG-459 | 播放界面右侧恒为 300px 分集列表、介绍被压在底部 96px 窄条——播放态应可切到「介绍」（初版误写为剧集详情左栏，已更正） | open | shell |
+| BUG-466 | 下载主列表误用 /api/downloads/native（引擎单源，系统一改造时自造的分裂端点）而非统一 /api/downloads；已删端点并合并引擎字段 | in_progress | engine+shell |
 | BUG-460 | 季号 / 集号 / 多集编辑不人性化——三个裸数字框 + 逐集单点保存，无序列视角与批量应用 | open | shell |
 | BUG-461 | 常驻占位说明应改为带圈功能按钮——点击后短时高亮，不常驻（优先级低） | open | shell |
 | BUG-462 | 本集介绍输入框只有 2 行（应 ≥3 行），本集标题保持 2 行 | open | shell |
 | BUG-463 | 详情态工具条整行只放一个「← 返回」，与上下文栏面包屑重复且白占一行 | open | shell |
 | BUG-464 | 本集图组瓦片尺寸硬编码（88×120 / 编辑态 80×112），宽容器右侧留大片空白 | open | shell |
 | BUG-465 | 文件管理按钮入口混乱——库级与剧集级动作同屏混排、同义入口重复（标签/导出各 2 个）、播放类落位缺失 | open | shell |
+| BUG-467 | 文件管理与正式内容之间有一条空白条（剧集墙态 header 零控件仍渲染）；过滤标签在无内容可筛时仍占位 | open | shell |
+| BUG-468 | 文件位置变更是否需要与库关联——下载 / 管理路径 / 库存储 / 位置移动整链路评估 | open | engine+shell |
+| BUG-469 | 缺「剧集文件整理」——以剧集为单位把内容（文字）/ 视频（多集）/ 图片按需求归位（现只有条目级 OrganizeWizard） | open | engine+shell |
+| BUG-470 | 入库即「加入筛选」——筛选名 = 标题 = 剧集名（三者同一）；当前 TG 面板入库（`downloadAlbum`/`doDownload`）既无筛选入口也无命名入口，命名只存在于筛选面板链路 | open | engine+shell |
 
 ## 已完成
 

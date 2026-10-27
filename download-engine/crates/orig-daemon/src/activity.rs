@@ -215,6 +215,27 @@ pub struct TaskView {
     pub control: ControlRef,
     /// 最近更新时间戳（Unix 秒；下载侧取入队时间 —— 内存任务无更新时点）。
     pub updated_at: i64,
+    /// 引擎原生细节（仅 `kind == download` 填充；TG 缓存侧无对应概念 ⇒ 缺省值）。
+    /// BUG-466：统一列表此前另走 `/api/downloads/native` 取这些字段，现合并进统一的
+    /// `ActivityTask`，使单一端点即完整真源（native 端点已于 BUG-466 删除）。
+    #[serde(rename = "url")]
+    pub url: String,
+    #[serde(rename = "destPath")]
+    pub dest_path: String,
+    #[serde(rename = "totalSize")]
+    pub total_size: u64,
+    #[serde(rename = "downloaded")]
+    pub downloaded: u64,
+    #[serde(rename = "connections")]
+    pub connections: u32,
+    #[serde(rename = "eta")]
+    pub eta: i64,
+    #[serde(rename = "avgSpeed")]
+    pub avg_speed: f64,
+    #[serde(rename = "addedAt")]
+    pub added_at: i64,
+    #[serde(rename = "timeTaken")]
+    pub time_taken: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -519,6 +540,15 @@ async fn download_views(st: &AppState) -> Vec<TaskView> {
                     native_id: r.id,
                 },
                 updated_at: r.updated_at,
+                url: r.url,
+                dest_path: r.output,
+                total_size: r.total,
+                downloaded: r.done,
+                connections: r.max_concurrency,
+                eta: 0,
+                avg_speed: if r.status == "downloading" { r.speed } else { 0.0 },
+                added_at: r.added_at,
+                time_taken: 0,
                 error: r.error,
                 status: r.status,
             }
@@ -600,6 +630,16 @@ fn cache_view(t: &TgCacheTask) -> TaskView {
             native_id: t.id.to_string(),
         },
         updated_at: t.updated_at,
+        // 引擎原生细节：TG 缓存侧无对应概念 ⇒ 诚实缺省（空串/0），与 struct 注释一致。
+        url: String::new(),
+        dest_path: String::new(),
+        total_size: total,
+        downloaded: done,
+        connections: 0,
+        eta: 0,
+        avg_speed: 0.0,
+        added_at: t.updated_at,
+        time_taken: 0,
         error: t.error.clone(),
         status: t.status.clone(),
     }
@@ -688,6 +728,16 @@ mod tests {
             speed: None,
             progress: 10.0,
             status: status.to_string(),
+            // 引擎原生细节缺省（测试夹具不涉及这些字段）。
+            url: String::new(),
+            dest_path: String::new(),
+            total_size: 10,
+            downloaded: 1,
+            connections: 0,
+            eta: 0,
+            avg_speed: 0.0,
+            added_at: 0,
+            time_taken: 0,
             actions: actions_for(kind, status),
             control: ControlRef {
                 side: match kind {

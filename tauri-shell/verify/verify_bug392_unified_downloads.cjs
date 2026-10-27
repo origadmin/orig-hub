@@ -8,8 +8,9 @@
  * `/api/activity`，状态变更还要前端直连 orig-tg。
  *
  * 修法：
- *   ① `/api/downloads?scope=` = 统一列表（全来源 + sources 健康度）；
- *      `/api/downloads/native` = 引擎原生明细投影（调试，非 UI 列表路径）。
+ *   ① `/api/downloads?scope=` = 统一列表（全来源 + sources 健康度），其 download 行
+ *      自带引擎原生细节（destPath/url/connections…）；**BUG-466 已删除**统一改造时
+ *      自造的分裂端点 `/api/downloads/native`（UI 主列表曾误调它）。
  *   ② `/api/downloads/:id`（POST action / DELETE）= 统一状态变更，按行 id
  *      前缀 `tg:`/`dl:` **服务端分流**。
  *   ③ 清理 `mock://bug322ui.bin` 遗留夹具。
@@ -17,13 +18,14 @@
  * 判据：
  *   U1 统一列表：`/api/downloads?scope=all` 是快照对象（tasks+sources），
  *      同时含 cache（插件入库）与 download（原生/BT）两源声明，且无 mock:// 残留。
- *   U2 引擎原生投影与统一列表**不同面**：native 每行都带引擎字段（dest_path），
- *      行数 ≤ 统一列表行数。
+ *   U2 统一列表即**完整真源**：download 行自带引擎字段 destPath；分裂端点
+ *      `/api/downloads/native` 已删除（404，不再是「调试投影」）。
  *   U3 状态变更按前缀分流：`tg:` 行 pause/resume → 422（不造假，非 404）；
  *      `tg:` 行 cancel 打不存在的 id → 502（确实去了 orig-tg，不是落到引擎）；
  *      `dl:` 行 pause 打不存在的 uuid → 404（确实落在引擎侧）。
  *   U4 UI 走统一端点：下载域渲染出行（engine+ingest 合计 > 0），无页面异常。
- *   验牙：装回旧路由（`/api/downloads` = 引擎原生数组）U1/U2 必红，还原复绿。
+ *   验牙：装回旧路由（`/api/downloads` = 引擎原生数组）U1/U2 必红；把 native 端点
+ *      挂回则 U2b 必红，还原复绿。
  *
  * 只读：不取消/重试任何真实任务（U3 全部用不存在的 id 或不支持的动作）。
  */
@@ -67,13 +69,24 @@ async function main() {
   check('U1c BUG-322 遗留 mock 夹具已清空（残留=0）', mockRows.length === 0, `mockRows=${mockRows.length}`)
   console.log(`[info] unified tasks=${snap.tasks.length} kinds=${[...new Set(snap.tasks.map((t) => t.kind))].join(',')}`)
 
-  // ---- U2：原生投影不是统一列表 ----
-  const nat = await (await fetch(`${d}/api/downloads/native`)).json()
-  const nativeAllEngine = Array.isArray(nat) && nat.every((r) => 'dest_path' in r)
+  // ---- U2：统一列表即完整真源（BUG-466：native 分裂端点已删除） ----
+  // 断言打在**全行**而非「download 行 > 0」：无下载任务时后者恒红（假红），
+  // 而全行断言仍以实际行数证伪「字段没贯通」。
+  const withDest = snap.tasks.filter((t) => t.destPath !== undefined)
+  const dlRows = snap.tasks.filter((t) => t.kind === 'download')
+  const dlWithDest = dlRows.filter((t) => t.destPath !== undefined)
   check(
-    'U2 /api/downloads/native 仍是引擎原生投影（每行带 dest_path）',
-    nativeAllEngine && nat.length <= snap.tasks.length,
-    `native=${nat.length} unified=${snap.tasks.length}`,
+    'U2 统一列表自带引擎细节 destPath（无需另取 native）',
+    snap.tasks.length > 0 &&
+      withDest.length === snap.tasks.length &&
+      dlWithDest.length === dlRows.length,
+    `全行=${snap.tasks.length} 带 destPath=${withDest.length}；download 行=${dlRows.length} 带=${dlWithDest.length}`,
+  )
+  const natRes = await fetch(`${d}/api/downloads/native`)
+  check(
+    'U2b /api/downloads/native 已删除（404，不再是可用端点）',
+    natRes.status === 404,
+    `HTTP ${natRes.status}`,
   )
 
   // ---- U3：统一状态变更按前缀分流 ----
