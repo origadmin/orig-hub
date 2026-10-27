@@ -47,6 +47,8 @@
 | _probe_bug353_download_selection.cjs | download | S2 |
 | _probe_bug354_onboarding_mode.cjs | misc | S2 |
 | _probe_bug355_download_scope.cjs | download | S2 |
+| _probe_bug483_stale_failure.cjs | tg | S2 |
+| _probe_episode_actions.cjs | files | S2 |
 | _probe_cache_dialog_geom.cjs | misc | S2 |
 | _probe_cache_panel.cjs | misc | S2 |
 | _probe_codec.cjs | misc | S2 |

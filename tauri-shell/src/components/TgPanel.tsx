@@ -1187,9 +1187,16 @@ export function TgPanel(
     }
   }, [cacheTask])
 
-  /** 任务失败必须显式告知（此前失败只留在前端 catch 里，刷新后连痕迹都没有）。 */
+  /** 任务失败必须显式告知（此前失败只留在前端 catch 里，刷新后连痕迹都没有）。
+   *  BUG-483：横幅是**事件**，任务快照是**状态**。挂载恢复的快照里会带着早已终态的
+   *  历史 failed 任务，旧实现把它重放成新鲜事件 ⇒ 每次进 TG 插件都弹一次旧失败横幅
+   *  （reportedFailuresRef 每次挂载都是新 Set，跨挂载零去重能力）。判据 = 事件新鲜度：
+   *  只有失败发生在本面板实例挂载之后（updatedAt 晚于挂载时刻）才打断用户；历史失败
+   *  由任务行/缓存管理面板持久呈现（状态呈现），信息不丢、不再重放。 */
+  const panelMountedAtRef = useRef<number>(Math.floor(Date.now() / 1000))
   useEffect(() => {
     if (!cacheTask || cacheTask.status !== 'failed') return
+    if (cacheTask.updatedAt <= panelMountedAtRef.current) return
     if (reportedFailuresRef.current.has(cacheTask.id)) return
     reportedFailuresRef.current.add(cacheTask.id)
     const raw = cacheTask.error ?? ''

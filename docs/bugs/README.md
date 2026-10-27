@@ -156,6 +156,7 @@
 | BUG-480 | 剧集标签选择器重设计——弹出标签堆无组织逻辑（无分组/无搜索/已选态弱）；对齐 BUG-259/068/405 三条既有标签规则（BUG-478 内容级移交） | open | shell |
 | BUG-481 | dev_services 在 release 栈共存时静默漂移（29786）、free_port 静默杀用户壳后端、status 把 release daemon 误报成 dev 就绪（tg 全 null）——整条 dev 流程跑不通；改为排他+拒绝(exit 3)+启动后自证(exit 6)+状态归属(owner/exit 7) | fixed | build |
 | BUG-482 | release 壳栈退化出双 daemon+双 tg（单壳跑出 19786/19787 双 daemon、tg 漂 19789），占死双规范端口；壳侧 spawn 监督逻辑待查 | open | shell |
+| BUG-483 | 挂载把历史 failed 缓存任务重放成全局 toast——库里 10 条历史 failed 恒在「最近一条已结束」候选，每次进 TG 插件都弹「下载过慢」旧失败；修复=失败告知加事件新鲜度判据（updatedAt vs 挂载时刻），新鲜失败照常提示（反向变异验证） | fixed | shell |
 
 ## 已完成
 
