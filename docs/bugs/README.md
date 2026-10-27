@@ -460,6 +460,7 @@
 | BUG-438 | 入库不随筛选标题归馆——同一批筛选内容散落成「每个相册一部剧」 | fixed | engine+shell |
 | BUG-440 | 新建筛选关键字输入框应「收缩到 + 边上 展开收起」——浮层改行内卡片 | fixed | shell |
 | BUG-441 | `cache_task_msg_index` 去重忽略 `series_key`，无归档轴任务遮蔽筛选归档轴，同相册裂成两部剧（BUG-438 回归） | fixed | engine |
+| BUG-445 | 缺陷登记册无排期/延期机制——93 条 open 单向棘轮积压，46 条 high/critical 无计划 | fixed | build |
 
 ## 历史欠账
 

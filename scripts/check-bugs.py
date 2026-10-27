@@ -19,6 +19,9 @@
   8. 终态（fixed/closed）必须带至少一条**跨机器可核验**的引用（入库路径或真实提交 hash）——
      只有 `verify_shots/` 引用时，换台机器（CI / 同事）根本无从复核，等于没有证据。
      RULE_FROM 起强制，历史只告警。
+  9. 非终态（open/in_progress/partial）必须带 `- 排期: YYYY-MM-DD` 或
+     `- 延期至: YYYY-MM-DD（理由）`；排期已过且无未过期延期即 ERROR ——
+     把「除非显式延期，否则不该有旧 BUG」机械化，杜绝「只进不出」的单向棘轮积压。
 
 历史期的旧登记不追加强制章节（RULE_FROM 之前只告警），因为事后补写的「证据」
 本身就是伪造 —— 规则从升级点起生效，历史如实标注。
@@ -31,6 +34,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import os
 import re
 import subprocess
@@ -66,6 +70,9 @@ NOW_FIELD_NAMES = {
     # 加白只代表「门禁认得这行是元数据」，不改变任何规则口径。
     "登记", "报告", "日期", "修复日期", "修复提交", "优先级",
     "发现方式", "修复者", "Owner", "影响面", "严重度",
+    # 2026-10-27 排期机制：非终态缺陷必须有计划完成日或显式延期。
+    # `类型: epic` 只是分类标签（设计级工程），不改变任何强制口径。
+    "排期", "延期至", "类型",
 }
 # 正则**从集合生成**，不再手抄一份：上面那段注释骂的就是「硬编码字段名 ⇒
 # 新字段被静默忽略 ⇒ 规则假绿」，而正则里原本又抄了一遍同样的名单。
@@ -400,6 +407,44 @@ def main() -> int:
             head = re.split(r"\s*/\s*", sev_val)[0].strip()
             if head not in SEVERITIES:
                 err(f"{rel}: 严重程度 `{sev_val}` 不在枚举 {sorted(SEVERITIES)}")
+
+        # 9. 排期 / 延期机制（2026-10-27 新增）。
+        #    为什么：登记廉价且强制（先登记后修复 + commit-msg 要编号），关闭昂贵
+        #    （证据 + 4 分钟门禁 + 跨机器引用）⇒ **单向棘轮**，只进不出，实测积到 93 条 open、
+        #    46 条 high/critical、最久 38 天无人管。用户裁定：「除非显式延期，否则不该有旧 BUG」。
+        #    故非终态必须有 `- 排期: YYYY-MM-DD`（计划完成）或 `- 延期至: YYYY-MM-DD（理由）`
+        #    （显式延期）；两者都没有、或排期已过且无未过期延期 ⇒ ERROR。
+        if status in ("open", "in_progress", "partial"):
+            sched = field.get("排期", "").strip()
+            defer = field.get("延期至", "").strip()
+
+            def _parse_date(s: str):
+                m = re.match(r"(\d{4}-\d{2}-\d{2})", s)
+                if not m:
+                    return None
+                try:
+                    return datetime.date.fromisoformat(m.group(1))
+                except ValueError:
+                    return None
+
+            d_sched = _parse_date(sched) if sched else None
+            d_defer = _parse_date(defer) if defer else None
+            today = datetime.date.today()
+            if not sched and not defer:
+                err(f"{rel}: 非终态 {status} 缺 `- 排期: YYYY-MM-DD` 或 "
+                    f"`- 延期至: YYYY-MM-DD（理由）`（排期机制：必须有计划完成日或显式延期）")
+            else:
+                if sched and d_sched is None:
+                    err(f"{rel}: 排期 `{sched}` 不是 YYYY-MM-DD")
+                if defer and d_defer is None:
+                    err(f"{rel}: 延期至 `{defer}` 不是 YYYY-MM-DD")
+                if d_defer is not None:
+                    if d_defer < today:
+                        err(f"{rel}: 延期至 {d_defer} 已过期（今天 {today}）—— "
+                            f"请重新排期或再次延期并写明理由")
+                elif d_sched is not None and d_sched < today:
+                    err(f"{rel}: 排期 {d_sched} 已过期且无有效延期（今天 {today}）—— "
+                        f"请改排期或加 `- 延期至: YYYY-MM-DD（理由）`")
 
         if status not in ("fixed", "closed"):
             continue
