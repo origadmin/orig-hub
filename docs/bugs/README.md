@@ -94,13 +94,13 @@
 | BUG-312 | 下载页「清空历史」将误删 TG 入库记录（前瞻风险：M3 来源合并后逐条 DELETE 不区分来源） | open | shell |
 | BUG-316 | 所有页面访问卡顿——前端侧卡顿，根因未定（请求设计/渲染逻辑/dev 未打包三嫌疑并列） | open | shell |
 | BUG-317 | 页面设计无统一标准——下载页为标准样式（顶部标题/主按钮/次级信息/三级筛选），大部分页面违反，需重新制定与全站收敛 | open | shell |
-| BUG-331 | 验收跑范围外 bug——「只验收当前 BUG」无对照表、无工具裁剪，范围外回归混入本回合结论 | open | docs |
-| BUG-332 | 路径显示用正斜杠——Windows 下应显示 `\`，存储妥协（BUG-234 写正斜杠）原样漏给用户 | open | shell |
+| BUG-331 | 验收跑范围外 bug——「只验收当前 BUG」无对照表、无工具裁剪，范围外回归混入本回合结论 | in_progress | docs |
+| BUG-332 | 路径显示用正斜杠——Windows 下应显示 `\`，存储妥协（BUG-234 写正斜杠）原样漏给用户 | fixed | shell |
 | BUG-333 | 下载设置三概念主次不明——受管目录/库根目录/默认下载目录平铺并列，用户分不清该改哪个 | open | shell |
 | BUG-334 | 文件管理内容混乱——内部库条目流出到成品列表、非受管/无字节条目被显示 | fixed | shell |
 | BUG-335 | 设置保存模式不清楚——同一页两套提交语义（即时 vs 显式保存）并存且无标识，底部保存键管什么不可见 | open | shell |
 | BUG-336 | 调试日志路径分隔符混用——同一条路径里 `/` 与 `\` 并存（ORIG_TG_DATA 原样入 PathBuf，join 后混用，原样下发原样展示） | open | engine+shell |
-| BUG-337 | 设置「通用」区块命名两套文案、默认优先级倒挂——点进去是「常规设置」，且「通用」高居「下载」之上 | open | shell |
+| BUG-337 | 设置「通用」区块命名两套文案、默认优先级倒挂——点进去是「常规设置」，且「通用」高居「下载」之上 | fixed | shell |
 | BUG-339 | 时序用例 `wall_clock_accumulates_across_restarts_instead_of_resetting` 全量并行必然假红（测试基础设施） | open | engine |
 | BUG-363 | TG 面板 101 个文字节点 < 12px（70 个 10px、25 个 9px、6 个 11px），低于项目自订可读性阈值 | open | shell |
 | BUG-367 | 文件列表同一列里五种命名方式并排，且 `未命名视频 #1574` 在四行上重复 | open | shell |
@@ -132,12 +132,12 @@
 | BUG-444 | 「播放全部」起点取可播子集但播放序列是全量集序列——自动连播遍历非可播集 | open | shell |
 | BUG-453 | dev 与 release 互相干扰、无统一控制脚本，dev 进程每次构建都被杀（dev-stack 副本隔离 + 统一 hub.py） | fixed | shell |
 | BUG-454 | TG 频道行 ICON 未取真实头像，fallback 成标题首字母（types.ts 无 photo 字段） | in_progress | shell |
-| BUG-455 | 下载域「全部下载」页文案丢失：DownloadPanel 引用的 download.panel.*/list.* key 在 zh-CN/en-US 均缺失（已补 key，待 GUI 复验） | in_progress | shell |
-| BUG-456 | 文件管理侧栏分类子项无状态数字：counts 无 per-category 计数源 | in_progress | shell |
+| BUG-455 | 下载域「全部下载」页文案丢失：DownloadPanel 引用的 download.panel.*/list.* key 在 zh-CN/en-US 均缺失（已补 key，待 GUI 复验） | fixed | shell |
+| BUG-456 | 文件管理侧栏分类子项无状态数字：counts 无 per-category 计数源 | fixed | shell |
 | BUG-457 | 频道回溯无进度、未按天分配、读取进度不可见（状态栏监控下拉按天显示 doneDays/totalDays + reading 态） | open | engine+shell |
 | BUG-458 | 文件管理主操作「导入目录」语义错——应为「目录管理」（受管根集合登记/移除/设主目录/手动对账），目录下媒体直接进文件管理（现状只登记勾选的文件，目录不被记住） | open | shell |
 | BUG-459 | 播放界面右侧恒为 300px 分集列表、介绍被压在底部 96px 窄条——播放态应可切到「介绍」（初版误写为剧集详情左栏，已更正） | open | shell |
-| BUG-466 | 下载主列表误用 /api/downloads/native（引擎单源，系统一改造时自造的分裂端点）而非统一 /api/downloads；已删端点并合并引擎字段 | in_progress | engine+shell |
+| BUG-466 | 下载主列表误用 /api/downloads/native（引擎单源，系统一改造时自造的分裂端点）而非统一 /api/downloads；已删端点并合并引擎字段 | fixed | engine+shell |
 | BUG-460 | 季号 / 集号 / 多集编辑不人性化——三个裸数字框 + 逐集单点保存，无序列视角与批量应用 | open | shell |
 | BUG-461 | 常驻占位说明应改为带圈功能按钮——点击后短时高亮，不常驻（优先级低） | open | shell |
 | BUG-462 | 本集介绍输入框只有 2 行（应 ≥3 行），本集标题保持 2 行 | open | shell |
@@ -464,7 +464,7 @@
 | BUG-422 | 14 个已修缺陷的验收脚本被 M0 重构与 BUG-304 双双打烂——夹具 500、导航选择器过期，「fixed」只剩一句话 | fixed | shell |
 | BUG-423 | 16 个验收脚本仍直读 `/api/config` 旧键 `tg_port`——BUG-358 改插件契约后恒得 undefined，环境探测假红 | fixed | shell |
 | BUG-424 | 合并剧集弹窗「集号规则」段英文缺空格——`fromafter` / `numberonward` 黏连 | fixed | shell |
-| BUG-425 | `invalidateCache(prefix)` 不清在途请求——写前数据在失效后落回缓存，「改完又看到旧值」 | open | shell |
+| BUG-425 | `invalidateCache(prefix)` 不清在途请求——写前数据在失效后落回缓存，「改完又看到旧值」 | fixed | shell |
 | BUG-426 | 剧集详情头部两颗逐字同文案、功能重叠的「编辑」按钮（介绍块冗余入口 + 动作条入口开同一面板） | fixed | shell |
 | BUG-427 | 左栏选集器「▶ 播放入口」整列不齐——行尾右对齐使图标 x 随右侧时长文本宽度漂移 5.78px | fixed | shell |
 | BUG-428 | 自动连播依赖浏览器 `ended`，而播放一律走 live 转码流 ⇒ 播完浮不出「下一集」 | fixed | shell |

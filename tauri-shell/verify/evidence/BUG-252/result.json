@@ -1,6 +1,6 @@
 {
-  "passed": 21,
-  "total": 21,
+  "passed": 23,
+  "total": 23,
   "all_passed": true,
   "checks": [
     {
@@ -21,22 +21,27 @@
     {
       "name": "①c 说明段 = 预期英文（前缀 + 弯引号剧名 + 集数后缀）",
       "ok": true,
-      "detail": "got=\"Merge another series into“ZZ-BUG252-TGT-1791814731501” (1 eps); the source series is then deleted.\" exp=\"Merge another series into“ZZ-BUG252-TGT-1791814731501” (1 eps); the source series is then deleted.\""
+      "detail": "got=\"Merge another series into“ZZ-BUG252-TGT-1792786143283” (1 eps); the source series is then deleted.\" exp=\"Merge another series into“ZZ-BUG252-TGT-1792786143283” (1 eps); the source series is then deleted.\""
     },
     {
-      "name": "①d 候选项 = \"ZZ-BUG252-SRC-1791814731501 (1 eps)\"（media.seriesMergeOption）",
+      "name": "①d 候选项 = \"ZZ-BUG252-SRC-1792786143283 (1 eps)\"（media.seriesMergeOption）",
       "ok": true,
-      "detail": "[\"ZZ-BUG252-SRC-1791814731501 (1 eps)\",\"🌟⚡️🔥《时停手表》 (2 eps)\",\"🌟🔥🔥🔥《妈妈陪儿子高考》 (10 eps)\"]"
+      "detail": "[\"ZZ-BUG252-SRC-1792786143283 (1 eps)\",\"未命名视频 #1574 (7 eps)\",\"📱【时停手表】 (6 eps)\"]"
     },
     {
-      "name": "①e 合并说明段含 \"merging makes no judgement about content\"",
+      "name": "①e 合并说明段含 \"there is no keep/delete choice to make\"（合并全自动、无需逐项取舍）",
       "ok": true,
-      "detail": "[\"Episodes are appended in their original order to the end of each season in the target and renumbered; entries already in the target are not added again. Items with the same file name but different content, and different sources of the same item, are all kept as-is — merging makes no judgement about content.\",\"Episode numbering: each season of the target continues fromthe current highest episode numberonward (existing numbers are never overwritten). Each merged episode keeps a \\\"Merged from <source series> · was E<n>\\\" provenance note, and can be renumbered or moved later in the detail view. Tags from both series are merged and deduplicated — nothing is lost, nothing duplicated.\"]"
+      "detail": "[\"Merging is fully automatic — there is no keep/delete choice to make: if both sides hold the same file (identical content hash) they are the SAME episode and get merged into one episode with multiple sources, using no new episode number; different content, or a side with no file at all, is kept separately with a new number. Title / description / cover / year take whichever side has a value — an empty value never overwrites what you already filled in.\",\"Episode numbering: each season of the target continues from after the current highest episode number onward (existing numbers are never overwritten; items merged as extra sources use no new number). Each merged episode keeps a \\\"Merged from <source series> · was E<n>\\\" provenance note, and can be renumbered or moved later in the detail view. Tags from both series are merged and deduplicated — nothing is lost, nothing duplicated.\"]"
     },
     {
       "name": "①f 集号规则段含 \"Episode numbering\" 与 \"the current highest episode number\"",
       "ok": true,
-      "detail": "[\"Episodes are appended in their original order to the end of each season in the target and renumbered; entries already in the target are not added again. Items with the same file name but different content, and different sources of the same item, are all kept as-is — merging makes no judgement about content.\",\"Episode numbering: each season of the target continues fromthe current highest episode numberonward (existing numbers are never overwritten). Each merged episode keeps a \\\"Merged from <source series> · was E<n>\\\" provenance note, and can be renumbered or moved later in the detail view. Tags from both series are merged and deduplicated — nothing is lost, nothing duplicated.\"]"
+      "detail": "[\"Merging is fully automatic — there is no keep/delete choice to make: if both sides hold the same file (identical content hash) they are the SAME episode and get merged into one episode with multiple sources, using no new episode number; different content, or a side with no file at all, is kept separately with a new number. Title / description / cover / year take whichever side has a value — an empty value never overwrites what you already filled in.\",\"Episode numbering: each season of the target continues from after the current highest episode number onward (existing numbers are never overwritten; items merged as extra sources use no new number). Each merged episode keeps a \\\"Merged from <source series> · was E<n>\\\" provenance note, and can be renumbered or moved later in the detail view. Tags from both series are merged and deduplicated — nothing is lost, nothing duplicated.\"]"
+    },
+    {
+      "name": "①k 集号规则段三片段被空格正确分隔（无 fromafter / numberonward 黏连）",
+      "ok": true,
+      "detail": "[\"Merging is fully automatic — there is no keep/delete choice to make: if both sides hold the same file (identical content hash) they are the SAME episode and get merged into one episode with multiple sources, using no new episode number; different content, or a side with no file at all, is kept separately with a new number. Title / description / cover / year take whichever side has a value — an empty value never overwrites what you already filled in.\",\"Episode numbering: each season of the target continues from after the current highest episode number onward (existing numbers are never overwritten; items merged as extra sources use no new number). Each merged episode keeps a \\\"Merged from <source series> · was E<n>\\\" provenance note, and can be renumbered or moved later in the detail view. Tags from both series are merged and deduplicated — nothing is lost, nothing duplicated.\"]"
     },
     {
       "name": "①g 第一步按钮 = [\"Cancel\", \"Next\"]",
@@ -46,7 +51,7 @@
     {
       "name": "①h 确认提示 = 预期英文（media.seriesMergeConfirmBodySingle）",
       "ok": true,
-      "detail": "got=\"The 1 episodes of “ZZ-BUG252-SRC-1791814731501” will be merged into “ZZ-BUG252-TGT-1791814731501”. The source series will be deleted, and this cannot be undone.\" exp=\"The 1 episodes of “ZZ-BUG252-SRC-1791814731501” will be merged into “ZZ-BUG252-TGT-1791814731501”. The source series will be deleted, and this cannot be undone.\""
+      "detail": "got=\"The 1 episodes of “ZZ-BUG252-SRC-1792786143283” will be merged into “ZZ-BUG252-TGT-1792786143283”. The source series will be deleted, and this cannot be undone.\" exp=\"The 1 episodes of “ZZ-BUG252-SRC-1792786143283” will be merged into “ZZ-BUG252-TGT-1792786143283”. The source series will be deleted, and this cannot be undone.\""
     },
     {
       "name": "①i 确认态 CJK 残留 = 0（扣除剧集名数据后）",
@@ -66,17 +71,22 @@
     {
       "name": "②b zh-CN 说明段 = 预期中文（前缀 + 书名号剧名 + 集数后缀）",
       "ok": true,
-      "detail": "\"把另一个剧集的内容并入《ZZ-BUG252-TGT-1791814731501》（1 集），源剧集随后被删除。\""
+      "detail": "\"把另一个剧集的内容并入《ZZ-BUG252-TGT-1792786143283》（1 集），源剧集随后被删除。\""
     },
     {
       "name": "②c zh-CN 弹窗正常渲染中文（残留 > 0，证明键存在而非回退 key 名）",
       "ok": true,
-      "detail": "residue=184"
+      "detail": "residue=215"
     },
     {
       "name": "②d zh-CN 确认提示 = 预期中文",
       "ok": true,
-      "detail": "got=\"将把《ZZ-BUG252-SRC-1791814731501》的 1 个分集并入《ZZ-BUG252-TGT-1791814731501》，源剧集会被删除，此操作无法撤销。\""
+      "detail": "got=\"将把《ZZ-BUG252-SRC-1792786143283》的 1 个分集并入《ZZ-BUG252-TGT-1792786143283》，源剧集会被删除，此操作无法撤销。\""
+    },
+    {
+      "name": "②e zh-CN 集号规则段紧拼无空格（从现有最大集号之后续编）",
+      "ok": true,
+      "detail": "[\"合并处置全自动，没有「保留 / 删除」要你选：两侧视频是同一份文件（内容 hash 相同）⇒ 判为同一集，归并成「一集多源」不新增集号；内容不同、或一侧没有文件 ⇒ 各自保留、续编新集号。标题 / 介绍 / 封面 / 年份取有值的一侧，不会用空值覆盖你已填的内容。\",\"集号规则：目标各季从现有最大集号之后续编（不会覆盖已有编号；归并为多源的内容不占新号）；并入的每一集保留「合并自《源剧集》· 原 E<n>」溯源标注，之后可在详情里改号或上下移动。两个剧集的标签会合并去重，不会丢也不会重复。\"]"
     },
     {
       "name": "③P 证伪锚点存在（en-US.json 含目标行）",
@@ -96,7 +106,7 @@
     {
       "name": "③c 字节级还原：sha256 与改前一致",
       "ok": true,
-      "detail": "before=cc3d1c6d0fb9 after=cc3d1c6d0fb9"
+      "detail": "before=c4af6af50525 after=c4af6af50525"
     },
     {
       "name": "③d 还原后复跑：标题 = \"Merge series\" 且 CJK 残留 = 0",

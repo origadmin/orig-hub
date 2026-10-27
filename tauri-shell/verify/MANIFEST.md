@@ -240,3 +240,17 @@
 | verify_tg_viewer_sequence.cjs | tg | S2 |
 | verify_ui_render.cjs | misc | S2 |
 | verify_unsupported_halt.cjs | engine | S2 |
+| _probe_252_residue.cjs | misc | S2 |
+| _probe_cat_switch.cjs | misc | S2 |
+| _probe_cat_switch2.cjs | misc | S2 |
+| _probe_cat_switch3.cjs | misc | S2 |
+| _probe_inflight_race.cjs | misc | S2 |
+| _probe_sd_audit.cjs | misc | S2 |
+| _probe_series_detail.cjs | misc | S2 |
+| _probe_series_ia.cjs | misc | S2 |
+| _probe_tag_dialog.cjs | misc | S2 |
+| _probe_untitled_where.cjs | misc | S2 |
+| _probe_wall_scroll.cjs | misc | S2 |
+| _shot_bug413_card.cjs | misc | S2 |
+| _shot_pages_eval.cjs | misc | S2 |
+| verify_bug396_status.cjs | misc | S2 |

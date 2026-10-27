@@ -36,12 +36,12 @@
     {
       "name": "①f 路径行以 \"Path: \" 开头（media.item.path）",
       "ok": true,
-      "detail": "\"Path: C:\\\\Users\\\\godcong\\\\AppData\\\\Local\\\\Temp\\\\orighub-bug263-1791822140152-ZZ-BUG263-ITEM-1791822140151.mp4\""
+      "detail": "\"Path: C:/Users/godcong/AppData/Local/Temp/orighub-bug263-1792786957198-ZZ-BUG263-ITEM-1792786957198.mp4\""
     },
     {
-      "name": "①g 归属行 = \"Series: ZZ-BUG263-SER-1791822140151\"（media.item.series）",
+      "name": "①g 归属行 = \"Series: ZZ-BUG263-SER-1792786957198\"（media.item.series）",
       "ok": true,
-      "detail": "\"Series: ZZ-BUG263-SER-1791822140151\""
+      "detail": "\"Series: ZZ-BUG263-SER-1792786957198\""
     },
     {
       "name": "①h 字段标签含 \"Title\" / \"Tags\"（media.item.title / media.tags）",
@@ -79,9 +79,9 @@
       "detail": "lang=zh-CN title=\"编辑内容\""
     },
     {
-      "name": "②b zh-CN 元信息四行 = 来源：本地 / 大小：… / 路径：… / 归属：ZZ-BUG263-SER-1791822140151",
+      "name": "②b zh-CN 元信息四行 = 来源：本地 / 大小：… / 路径：… / 归属：ZZ-BUG263-SER-1792786957198",
       "ok": true,
-      "detail": "[\"来源：本地\",\"大小：2.0 KB\",\"路径：C:\\\\Users\\\\godcong\\\\AppData\\\\Local\\\\Temp\\\\orighub-bug263-1791822140152-ZZ-BUG263-ITEM-1791822140151.mp4\",\"归属：ZZ-BUG263-SER-1791822140151\"]"
+      "detail": "[\"来源：本地\",\"大小：2.0 KB\",\"路径：C:/Users/godcong/AppData/Local/Temp/orighub-bug263-1792786957198-ZZ-BUG263-ITEM-1792786957198.mp4\",\"归属：ZZ-BUG263-SER-1792786957198\"]"
     },
     {
       "name": "②c zh-CN 弹窗正常渲染中文（残留 > 0，证明键存在而非回退 key 名）",
@@ -111,7 +111,7 @@
     {
       "name": "③c 字节级还原：sha256 与改前一致",
       "ok": true,
-      "detail": "before=cc3d1c6d0fb9 after=cc3d1c6d0fb9"
+      "detail": "before=c4af6af50525 after=c4af6af50525"
     },
     {
       "name": "③d 还原后复跑：标题 = \"Edit content\" 且 CJK 残留 = 0",

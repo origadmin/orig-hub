@@ -12,7 +12,11 @@
     "ok": true
   },
   {
-    "name": "U2 /api/downloads/native 仍是引擎原生投影（每行带 dest_path）",
+    "name": "U2 统一列表自带引擎细节 destPath（无需另取 native）",
+    "ok": true
+  },
+  {
+    "name": "U2b /api/downloads/native 已删除（404，不再是可用端点）",
     "ok": true
   },
   {
@@ -29,6 +33,6 @@
   },
   {
     "name": "U4 下载域经统一端点渲染出行（>0）",
-    "ok": true
+    "ok": false
   }
 ]
