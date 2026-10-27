@@ -224,20 +224,47 @@ export async function recacheFromSource(
  * 媒体库变成空面板——那是把「一个下载源不可用」误报成「整个库不可用」。
  */
 export async function probeLibraryBackend(): Promise<boolean> {
+  return (await probeLibraryBackendDetail()).ok
+}
+
+/**
+ * 资料库后端探活的**带原因**版本（BUG-176）。
+ *
+ * 布尔探活只能回答「可不可用」，回答不了用户那句「是没有数据，还是根本没取到」——
+ * 界面于是只能画一个看起来很空的页面。失败原因在这里如实带回，供 banner 直出；
+ * 判据仍是同一次 stats 请求（不额外发探活包）。
+ */
+export async function probeLibraryBackendDetail(): Promise<{ ok: boolean; reason: string | null }> {
   try {
     // 与 `loadMeta` 共用同一份 stats 缓存（BUG-239 根因 2）：探活与首屏徽标读的是
     // **同一份数据**，不该各发一次。失败不入缓存（`cached` 的错误路径），
     // 故「后端挂了 → 重试」仍会真发请求。
     await cached(cacheKey.libraryStats(), () => getLibraryStats())
-    return true
-  } catch {
-    return false
+    return { ok: true, reason: null }
+  } catch (e) {
+    return { ok: false, reason: e instanceof Error ? e.message : String(e) }
   }
 }
 
-/** 确保资料库后端可用（Tauri 模式下拉起 daemon；非 Tauri 无托管手段，抛错由调用方降级） */
-export async function ensureLibraryBackend(): Promise<void> {
+/**
+ * 确保资料库后端可用（Tauri 模式下拉起 daemon；非 Tauri 无托管手段，抛错由调用方降级）。
+ *
+ * BUG-176 次生缺陷：资料库 `/api/media/*` 今天仍托管在 `orig-tg` 进程里，
+ * 只拉 daemon **永远拉不起资料库**（原实现在这台机器上「重试连接」点了没反应）。
+ * 故 daemon 就绪后，`startHost` 为真时再请它重启资料库宿主进程；宿主未登记时由
+ * 随后的复探如实回报，不在这里假装成功。
+ *
+ * `startHost` 默认 false：**重启宿主会打断它正在跑的缓存任务**，所以只在用户
+ * 显式点「重试连接」时传 true —— 面板挂载 / 自动续轮只拉起 daemon，不动宿主。
+ */
+export async function ensureLibraryBackend(startHost = false): Promise<void> {
   await ensureDaemon()
+  if (!startHost) return
+  try {
+    await restartPlugin(TG_PLUGIN_ID)
+  } catch {
+    // 宿主进程未安装/未配置：交给调用方的复探判据，不吞掉「仍不可用」的事实。
+  }
 }
 
 /**

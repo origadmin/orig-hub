@@ -1,5 +1,6 @@
 import type { TgCacheTask } from '../../types'
 import type { DlFilter } from '../../nav'
+import { t } from '../../i18n'
 
 /**
  * TG 入库任务的**聚合层**（BUG-300 / M3 修正）。
@@ -146,15 +147,24 @@ export function describeItemKey(key: string): string {
   const m = /^([gmb]):(-?\d+):(.+)$/.exec(key)
   if (!m) return key
   const [, prefix, chat, tail] = m
-  const kind = prefix === 'g' ? '相册组' : prefix === 'b' ? '批量组' : '消息'
-  return `${kind} ${tail} · 频道 ${chat}`
+  // BUG-141：展示文案走 i18n —— 此前是中文字面量，切 en-US 时这一行仍显示中文，
+  // 与周围英文混排（调用方 IngestGroupRow / IngestDetailSheet 均用 useTranslation
+  // 订阅语言，切换后会重渲染，所以这里用裸 t() 是安全的）。
+  const kind =
+    prefix === 'g'
+      ? t('download.ingest.kindAlbum')
+      : prefix === 'b'
+        ? t('download.ingest.kindBatch')
+        : t('download.ingest.kindMessage')
+  return t('download.ingest.itemKeyLine', { kind, tail, chat })
 }
 
 /** 入库对象标题：优先入库内容标题，缺失才把定位键翻成人话。 */
 export function ingestDisplayName(task: TgCacheTask): string {
   const title = (task.title ?? '').trim()
   if (title) return title
-  return describeItemKey(task.itemKey ?? '') || '未知内容'
+  // BUG-141：兜底文案同样走 i18n（原「未知内容」是硬编码中文）。
+  return describeItemKey(task.itemKey ?? '') || t('download.ingest.unknownContent')
 }
 
 /** 概览口径（「笼统的数据」）：一批内容算**一个对象**，不是 N 条记录。 */

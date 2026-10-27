@@ -85,12 +85,39 @@ export function MainLayout() {
           .then(() => setDaemonAlive(true))
           .catch(() => setDaemonAlive(false))
       })
-    // 定期刷新兜底：仅在 SSE 断线（connected=false）时真正拉取，避免健康连接下每 5s 空轮询
-    const timer = setInterval(() => {
-      if (useStore.getState().connected) return
-      refresh().catch(() => {})
-    }, 5000)
-    return () => clearInterval(timer)
+    /*
+     * 兜底刷新：仅在 SSE 断线（connected=false）时真正拉取。
+     *
+     * BUG-282：原来是无条件 `setInterval(5s)` + `.catch(()=>{})` —— daemon 未启动时
+     * `connected` 恒 false，于是每 5s 发一次必败请求、**永不休止**（实测 12 次/分钟），
+     * `.catch` 还把「连不上」这件事吞掉了。现在改成一次性定时器 + 失败退避：
+     * 成功回 5s，连续失败 5→10→20→40→60s 封顶，成功一次立刻复位。
+     * 退避只降低重试频率，不放弃恢复能力（最长 60s 仍会再试）。
+     */
+    let failures = 0
+    let timer: number | undefined
+    const tick = () => {
+      const st = useStore.getState()
+      if (st.connected) {
+        failures = 0
+        schedule()
+        return
+      }
+      // `refresh()` 自己吞掉异常并写进 `error`（它要维持「一次失败不炸界面」的语义），
+      // 所以退避的判据不是 promise 是否 reject，而是 store 里是否留下了 error。
+      void refresh().finally(() => {
+        failures = useStore.getState().error ? failures + 1 : 0
+        schedule()
+      })
+    }
+    const schedule = () => {
+      const delay = Math.min(5000 * 2 ** Math.min(failures, 4), 60000)
+      timer = window.setTimeout(tick, delay)
+    }
+    schedule()
+    return () => {
+      if (timer) window.clearTimeout(timer)
+    }
   }, [init, refresh, setDaemon, setDaemonAlive])
 
   /*

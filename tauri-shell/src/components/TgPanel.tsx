@@ -57,6 +57,10 @@ import { useTgSearch } from '../store/tgSearch'
 import { classifyTgReason, describeTgFailure, logTgReason } from '../lib/tgReason'
 import { deriveEntryState } from '../lib/entryState'
 import type { EntryState } from '../lib/entryState'
+// BUG-095：开关/入口的四态由单一 resolver 派生（不在本文件再拼一份 enabled/running）
+import { resolveTgSwitch } from '../lib/tgState'
+// BUG-457：回溯进度按天切片（复用既有 backfillUntil / oldestMessageDate，不新增端点）
+import { backfillDays } from '../lib/tgBackfill'
 import {
   ALBUM_MAX_TILES,
   albumGridClass,
@@ -66,6 +70,13 @@ import {
   guessMediaType,
   type MediaType,
 } from '../lib/tgmedia'
+
+/**
+ * BUG-363：本面板**不得有 <12px 的可读文字**（BUG-327 已进门禁的阈值：正文 ≥13px、
+ * 次级 ≥12px）。此前 101 个节点落在 9/10/11px（消息气泡元信息行、相册角标、
+ * 搜索命中行等），实机近乎不可读。这里统一抬到 **12px 次级档**，只改字号、
+ * 不动布局结构（行高随字号自然增长，不再另调 padding）。
+ */
 
 /**
  * unix 秒 → `YYYY-MM-DD`（**UTC**，与 `monitor::parse_date_utc` 同一口径）。
@@ -199,7 +210,7 @@ function Chip({
   return (
     <span
       className={cn(
-        'inline-flex h-6 shrink-0 items-center rounded-md border px-2 text-[10px] leading-none',
+        'inline-flex h-6 shrink-0 items-center rounded-md border px-2 text-[12px] leading-none',
         toneCls,
         className,
       )}
@@ -346,8 +357,9 @@ export function TgPanel(
     onOpenMedia?: () => void
   },
 ) {
-  const { t } = useTranslation()
-  const { setError, setToast, openViewer, tgService, tgLink, accounts, refreshTgState } = useStore()
+  const { t, language } = useTranslation()
+  const { setError, setToast, openViewer, tgService, tgLink, accounts, refreshTgState, restartTg } =
+    useStore()
   /**
    * BUG-305：媒体库 → TG 面板的跳转焦点（`pendingMediaFocus` 的正向对应）。
    *
@@ -389,6 +401,50 @@ export function TgPanel(
    */
   const tgDisabled = tgService.known && !tgService.enabled
   const tgReady = resolveTgFeatureReady(tgService)
+  /**
+   * BUG-095：四态（不可用 / 关 / 开·正常 / 开·异常）由 `lib/tgState.ts` 单点派生，
+   * 本文件不再自己拼 `known/enabled/running/link`。`data-tg-state` 把结果落成
+   * DOM 事实，验收断属性不断译后中文（BUG-095 验收硬约束第 4 条）。
+   */
+  const tgSwitch = resolveTgSwitch({ tgService, tgLinkState: tgLink.state })
+  /**
+   * BUG-389：不可达**不是**启动中。三态分流只看可核原因：
+   *   `!known`（daemon 都够不到）→ daemonDown；`enabled && !running` → pluginDown；
+   *   其余（进程在跑、会话探针未通）才允许写「正在启动」。
+   */
+  const tgOnboardMode: 'daemonDown' | 'pluginDown' | 'starting' = !tgService.known
+    ? 'daemonDown'
+    : tgService.enabled && !tgService.running
+      ? 'pluginDown'
+      : 'starting'
+  /** BUG-389：降级态的可复制诊断串（只陈述事实，不替用户下结论）。 */
+  const tgDiag = [
+    `time: ${new Date().toISOString()}`,
+    `state: ${tgSwitch.state}`,
+    `plugin: known=${tgService.known} enabled=${tgService.enabled} running=${tgService.running} port=${tgService.port ?? '-'}`,
+    `link: ${tgLink.state}`,
+    `lastError: ${tgService.lastError ?? '-'}`,
+  ].join('\n')
+  /**
+   * BUG-095：「开·异常」态的**常驻重试出口**。
+   *
+   * 走 daemon 的 restart（`restartTg` → `POST /api/tg/restart`），**不是**壳侧
+   * `ensure_tg`：进程所有权仍只有一个主人（BUG-178 反对的是「两个主人互相 kill」，
+   * 不是「用户不能重试」）。代理改完不重启不生效，而此前用户唯一出路是重启整个应用。
+   * 反馈三段式：进行中（按钮禁用 + 文案）→ 成功（状态回 on_ok）→ 仍失败（保留异常态，
+   * 不反复弹窗）。
+   */
+  const [tgRetrying, setTgRetrying] = useState(false)
+  const onRetryTg = async () => {
+    if (tgRetrying) return
+    setTgRetrying(true)
+    try {
+      await restartTg()
+      await refreshTgState()
+    } finally {
+      setTgRetrying(false)
+    }
+  }
   /** 后端原文（仅用于日志与分类），绝不直接渲染 */
   const rawReason = tgBroken ? tgLink.reason : null
   const showReason = Boolean(rawReason && rawReason.trim())
@@ -473,6 +529,15 @@ export function TgPanel(
    * 渲染成多个条目，不是单频道内的复合条件。
    */
   const [filters, setFilters] = useState<TgMonitorFilter[]>([])
+  /**
+   * BUG-470：「加入筛选并缓存」的目标（null = 未打开）。
+   *
+   * 定稿语义：筛选名 = 入库后这批内容的标题 = 剧集名，三者同一字符串。
+   * 单条与整组共用同一个面板，只是提交时 `messageIds` 不同 —— 不存在「给条目还是给剧」的分支。
+   */
+  const [filterCache, setFilterCache] = useState<
+    { kind: 'item'; item: FeedItem } | { kind: 'album'; items: FeedItem[] } | null
+  >(null)
   const [filterOpen, setFilterOpen] = useState(true)
   /** 新建筛选的输入（弹窗内；旧版是节内常驻一行 Input+按钮，用户「严重破坏整体设计」） */
   const [filterDraft, setFilterDraft] = useState('')
@@ -1866,6 +1931,54 @@ export function TgPanel(
     }
   }
 
+  /**
+   * BUG-470：**加入筛选 + 缓存入库**合并为一次提交（单条与整组共用）。
+   *
+   * 定稿：筛选名 = 入库后这批内容的标题 = 归属剧集名 ⇒ 同一个字符串同时下发
+   * `titleHint`（条目显示名）与 `seriesHint`（剧名），`seriesKey = tg:filter:{id}`
+   * 作幂等轴（BUG-438）。引擎零改动：仍是既有 `POST /api/tg/cache/tasks`。
+   * 「新建筛选」也只是把名字登记成一条筛选（`addTgMonitorFilter`，keyword 与 label
+   * 同值 —— 谓词只是「以后自动投进这个筛选」的来源，不参与本次显式归入）。
+   */
+  const submitFilterCache = async (name: string, filterId: number | null) => {
+    if (!filterCache) return
+    const picked = filterId != null ? filters.find((f) => f.id === filterId) : undefined
+    // 选了已有筛选 ⇒ 名字以筛选为准（改名不影响已入库的键，但本次归属必须同源）
+    const label = (picked?.label || picked?.keyword || name).trim()
+    if (!label) return
+    try {
+      let id = filterId
+      if (id == null) {
+        const created = await addTgMonitorFilter({ keyword: label, label })
+        id = created.id
+        setFilters(await listTgMonitorFilters())
+      }
+      const target =
+        filterCache.kind === 'item'
+          ? { chatId: filterCache.item.chatId, messageIds: [filterCache.item.messageId] }
+          : {
+              chatId: filterCache.items[0].chatId,
+              messageIds: filterCache.items.map((it) => it.messageId),
+              groupId: filterCache.items[0].groupId,
+            }
+      const res = await enqueueCacheTask({
+        ...target,
+        titleHint: label,
+        seriesHint: label,
+        seriesKey: `tg:filter:${id}`,
+      })
+      setFilterCache(null)
+      // 已入库 ⇒ 后端拦下（BUG-308）：归属已在更早的入库里钉死，这里如实说明而非假成功
+      if (res.alreadyIngested) {
+        setToast(t('tg.alreadyIngested'))
+        return
+      }
+      await refreshCacheTasks()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
   /** 取消整组缓存：取消服务端任务（worker 在下一条目间隙退出；排队任务直接出队）。 */
   const cancelAlbum = async (key: string) => {
     // 单飞模型：当前任务或任一排队任务覆盖该组时都可取消（BUG-181：排队前也可撤）。
@@ -1907,6 +2020,13 @@ export function TgPanel(
   const onBubbleOpen = useEvent((item: FeedItem) => void openDownloaded(item))
   const onBubblePreview = useEvent((item: FeedItem) => openPlayable(item, [item], 0))
   const onAlbumDownload = useEvent((items: FeedItem[]) => void downloadAlbum(items))
+  /* BUG-470：单条 / 整组「加入筛选并缓存」的入口回调（恒定引用，保住子气泡的 memo） */
+  const onBubbleAddToFilter = useEvent((item: FeedItem) =>
+    setFilterCache({ kind: 'item', item }),
+  )
+  const onAlbumAddToFilter = useEvent((items: FeedItem[]) => {
+    if (items.length > 0) setFilterCache({ kind: 'album', items })
+  })
   const onAlbumCancel = useEvent((items: FeedItem[]) =>
     void cancelAlbum(`a-${items[0].chatId}-${items[0].groupId}`),
   )
@@ -1925,6 +2045,8 @@ export function TgPanel(
     <div
       className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
       data-testid="tg-panel-root"
+      /* BUG-095：四态是面板的 DOM 事实（不靠翻译文案判态） */
+      data-tg-state={tgSwitch.state}
     >
       {/*
         原先这里的顶部工具条只为「缓存管理」一个按钮而存在：1248x41 的容器里只有
@@ -1959,15 +2081,34 @@ export function TgPanel(
             <h3 className="text-[14px] font-semibold text-danger" data-testid="tg-panel-broken-title">
               {t('tg.linkDown')}
             </h3>
-            <p className="mt-1 text-[11px] leading-relaxed text-danger/90">
+            <p className="mt-1 text-[12px] leading-relaxed text-danger/90">
               {/* 面板内不自带「连接诊断」，故用面板专属文案（不指向账号页才有的区块） */}
               {t('tg.linkDownHint')}
             </p>
             {/* 原文不进 DOM（BUG-088）：只渲染分类降级后的中文文案 */}
             {showReason && (
-              <p className="mt-3 rounded-md bg-surface/60 px-2 py-1.5 text-[10px] leading-relaxed text-danger">
+              <p className="mt-3 rounded-md bg-surface/60 px-2 py-1.5 text-[12px] leading-relaxed text-danger">
                 {t(reasonKey)}
               </p>
+            )}
+            {/* BUG-095：重试入口常驻（不是只在故障面板里出现一次就消失） */}
+            {tgSwitch.showRetry && (
+              <div className="mt-4 flex items-center gap-2">
+                <Button
+                  size="sm"
+                  className="h-8 text-xs"
+                  data-testid="tg-retry"
+                  disabled={tgRetrying}
+                  onClick={() => void onRetryTg()}
+                >
+                  {tgRetrying ? t('tg.retrying') : t('tg.retry')}
+                </Button>
+                <span className="text-[12px] text-danger/80" data-testid="tg-retry-hint">
+                  {language === 'en-US'
+                    ? 'Network/proxy changed? Restart the TG plugin to apply it.'
+                    : '刚恢复网络或改过代理？重试会重启 TG 插件使配置生效。'}
+                </span>
+              </div>
             )}
           </div>
         </div>
@@ -1983,12 +2124,12 @@ export function TgPanel(
         <div className="flex flex-1 items-center justify-center p-6">
           <div className="w-full max-w-md rounded-lg border border-border-subtle bg-surface p-5">
             <h3 className="text-[14px] font-semibold text-fg-strong">ⓘ {t('tg.setup')}</h3>
-            <p className="mt-1 text-[11px] leading-relaxed text-muted">{t('tg.setupTip')}</p>
-            <label className="mt-4 block text-[11px] text-muted">{t('tg.setupApiId')}</label>
+            <p className="mt-1 text-[12px] leading-relaxed text-muted">{t('tg.setupTip')}</p>
+            <label className="mt-4 block text-[12px] text-muted">{t('tg.setupApiId')}</label>
             <Input value={cfgId} onChange={(e) => setCfgId(e.target.value)} className="mt-1 h-8 text-xs" spellCheck={false} />
-            <label className="mt-3 block text-[11px] text-muted">{t('tg.setupApiHash')}</label>
+            <label className="mt-3 block text-[12px] text-muted">{t('tg.setupApiHash')}</label>
             <Input value={cfgHash} onChange={(e) => setCfgHash(e.target.value)} className="mt-1 h-8 text-xs" spellCheck={false} />
-            <label className="mt-3 block text-[11px] text-muted">{t('tg.setupProxy')}</label>
+            <label className="mt-3 block text-[12px] text-muted">{t('tg.setupProxy')}</label>
             <Input value={cfgProxy} onChange={(e) => setCfgProxy(e.target.value)} className="mt-1 h-8 text-xs" spellCheck={false} />
             <Button
               size="sm"
@@ -2002,11 +2143,17 @@ export function TgPanel(
         </div>
       ) : !tgReady ? (
         /*
-         * 开着但还没起来（M0-T05）：daemon 正在拉起 orig-tg（`probeTg` 有界重试）。
-         * **刻意无按钮** —— 手动重试入口曾让 TG 进程有两个主人互相 kill（BUG-178）。
-         * 这一态以前会直接落到下面那个空的两栏面板，看起来像「没有内容」。
+         * BUG-389：此前无论「daemon 不可达」「插件没起」「真在启动」都写
+         * 「Telegram 正在启动」—— 服务全灭时用户被这句话骗着干等，进而读成
+         * 「数据全没了」。现在按可核原因分流（见 `tgOnboardMode`），三态各自
+         * 带可复制诊断串；「正在启动」只在进程确实在跑、会话未就绪时出现。
+         * 仍**刻意无按钮** —— 手动重试曾让 TG 进程有两个主人互相 kill（BUG-178）。
          */
-        <TgOnboarding mode="starting" />
+        <TgOnboarding
+          mode={tgOnboardMode}
+          diag={tgDiag}
+          lastError={tgService.lastError}
+        />
       ) : (
         <>
       <aside className="flex w-72 shrink-0 flex-col border-r border-border-subtle bg-surface/30">
@@ -2336,6 +2483,8 @@ export function TgPanel(
                 size="xs"
                 onClick={doSync}
                 disabled={syncing || monitoredList.length === 0}
+                /* BUG-363：`xs` token 自带 11px，面板内一律抬到 12px 次级档 */
+                className="text-[12px]"
               >
                 {syncing ? t('tg.syncing') : t('tg.sync')}
               </Button>
@@ -2450,12 +2599,25 @@ export function TgPanel(
                             started && oldestTs > 0 && untilTs > 0
                               ? Math.max(0, Math.ceil((oldestTs - untilTs) / 86400))
                               : null
+                          /*
+                           * BUG-457：按天分配进度 —— 「已读 X / 共 Y 天 + 读取中」。
+                           * 分母不再是猜的：目标日 → 今天的总天数由服务端既有
+                           * `backfillUntil` 直接给出；已读天数取库内最老已入库日期
+                           * （回溯向旧翻，它单调往旧走）。引擎零改动、不新增端点。
+                           */
+                          const bf = backfillDays({
+                            backfillUntil: untilTs,
+                            oldestMessageDate: oldestTs,
+                          })
                           return (
                             <div
                               data-testid="tg-monitor-backfill-progress"
                               data-until={untilTs}
                               data-oldest={oldestTs}
                               data-days-left={daysLeft ?? -1}
+                              data-done-days={bf.doneDays}
+                              data-total-days={bf.totalDays}
+                              data-reading={bf.reading ? 'true' : 'false'}
                               className="mb-1 rounded-md bg-surface-2/60 px-2 py-1.5"
                             >
                               <div className="flex items-center gap-2">
@@ -2477,7 +2639,7 @@ export function TgPanel(
                               {/* 日期轴：目标 / 已到 / 剩余。`flex-wrap` 而非 `truncate`
                                   —— 窄栏里宁可折行，也不许把日期截成「2026-01-01…」。 */}
                               <div
-                                className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[11px] text-muted"
+                                className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[12px] text-muted"
                                 data-testid="tg-monitor-backfill-bounds"
                                 data-before={ch.backfillBeforeId ?? 0}
                                 data-latest={ch.lastMessageId ?? 0}
@@ -2495,18 +2657,57 @@ export function TgPanel(
                                     {t('tg.backfillRemaining', { n: daysLeft })}
                                   </span>
                                 ) : null}
+                                {/* BUG-457：天粒度进度（用户原话「应该按天分配；读取进度也没有」）。
+                                    `totalDays` 由目标日与今天算出，`doneDays` 由库内最老已入库
+                                    日期算出 —— 两个都是既有字段，不新增引擎端点。 */}
+                                <span
+                                  data-testid="tg-monitor-backfill-days"
+                                  className="tabular-nums"
+                                >
+                                  {language === 'en-US'
+                                    ? `${bf.doneDays}/${bf.totalDays} days read`
+                                    : `已读 ${bf.doneDays}/${bf.totalDays} 天`}
+                                </span>
+                                {bf.reading ? (
+                                  <span
+                                    data-testid="tg-monitor-backfill-reading"
+                                    className="text-accent"
+                                  >
+                                    {language === 'en-US' ? 'Reading…' : '读取中…'}
+                                  </span>
+                                ) : bf.done ? (
+                                  <span
+                                    data-testid="tg-monitor-backfill-done"
+                                    className="text-success"
+                                  >
+                                    {language === 'en-US' ? 'Backfill complete' : '回溯完成'}
+                                  </span>
+                                ) : null}
                                 {/* BUG-382 的「最新边界」保留（同步游标是回溯的终点边界），
                                     但降为最次一级：消息号对用户没有日历意义。 */}
                                 <span className="text-muted/70" data-testid="tg-monitor-backfill-latest">
                                   {t('tg.backfillLatest', { id: ch.lastMessageId ?? 0 })}
                                 </span>
                               </div>
-                              {/* 「还在跑」的指示：满宽脉冲条，不表达比例。 */}
+                              {/* BUG-457：分母已由天粒度给出 ⇒ 进度条可以如实表达比例
+                                  （旧版「满宽脉冲条」只表示还在跑，是因为当时没有分母）。 */}
                               <div
                                 className="mt-1.5 h-1 w-full overflow-hidden rounded-full bg-surface-3"
                                 data-testid="tg-monitor-backfill-bar"
                               >
-                                <div className="h-full w-full animate-pulse rounded-full bg-emerald-500/70" />
+                                <div
+                                  className={cn(
+                                    'h-full rounded-full bg-emerald-500/70 transition-[width]',
+                                    bf.reading && 'animate-pulse',
+                                  )}
+                                  style={{
+                                    width: `${
+                                      bf.totalDays > 0
+                                        ? Math.round((bf.doneDays / bf.totalDays) * 100)
+                                        : 0
+                                    }%`,
+                                  }}
+                                />
                               </div>
                             </div>
                           )
@@ -2518,7 +2719,7 @@ export function TgPanel(
                         <div
                           data-testid="tg-monitor-backfill-last"
                           data-cancelled={lastBackfill.get(ch.id)!.cancelled ? 'true' : 'false'}
-                          className="mb-1 truncate rounded-md bg-surface-2/40 px-2 py-1 text-[11px] text-muted"
+                          className="mb-1 truncate rounded-md bg-surface-2/40 px-2 py-1 text-[12px] text-muted"
                         >
                           {lastBackfill.get(ch.id)!.cancelled
                             ? t('tg.backfillLastCancelled', { date: lastBackfill.get(ch.id)!.date })
@@ -2630,6 +2831,7 @@ export function TgPanel(
                   )
                 }
                 disabled={!alive}
+                className="text-[12px]"
               >
                 {t('tg.refresh')}
               </Button>
@@ -2653,7 +2855,7 @@ export function TgPanel(
                       )}
                     >
                       <span className="min-w-0 flex-1 truncate">{sec.title}</span>
-                      <span className="shrink-0 text-[10px] text-muted">{sec.count}</span>
+                      <span className="shrink-0 text-[12px] text-muted">{sec.count}</span>
                     </button>
                   )
                 })}
@@ -2684,13 +2886,13 @@ export function TgPanel(
               {/* 原此处常驻「仅搜索已同步到本地的监控消息」（03bf4d4 引入）。
                   同 TgGlobalSearch：能力限制说明不做常驻元素，改在空态按需解释。 */}
               <span className="min-w-0 flex-1" />
-              <span className="shrink-0 text-[11px] tabular-nums text-muted">
+              <span className="shrink-0 text-[12px] tabular-nums text-muted">
                 {globalHits.length}
               </span>
               <Button
                 variant="ghost"
                 size="xs"
-                className="shrink-0"
+                className="shrink-0 text-[12px]"
                 onClick={() => {
                   clearGlobalSearch()
                   // TGM-03：清除 = 退出瞬态 'search' 模式，回到进来之前的那一屏
@@ -2707,12 +2909,12 @@ export function TgPanel(
               ) : globalGroups.length === 0 ? (
                 <div className="px-4 py-6 text-center">
                   <p className="text-xs text-muted">{t('tg.searchNoMatch')}</p>
-                  <p className="mt-1 text-[10px] text-muted/80">{t('tg.globalSearchScope')}</p>
+                  <p className="mt-1 text-[12px] text-muted/80">{t('tg.globalSearchScope')}</p>
                 </div>
               ) : (
                 globalGroups.map(([title, hits]) => (
                   <div key={title} className="mb-2">
-                    <p className="sticky top-0 z-10 truncate bg-surface/95 px-2 py-1 text-[10px] font-semibold text-muted backdrop-blur-sm">
+                    <p className="sticky top-0 z-10 truncate bg-surface/95 px-2 py-1 text-[12px] font-semibold text-muted backdrop-blur-sm">
                       {title} · {hits.length}
                     </p>
                     {hits.map((hit) => {
@@ -2736,21 +2938,21 @@ export function TgPanel(
                               open && 'bg-surface-2/70',
                             )}
                           >
-                            <span className="w-6 shrink-0 text-center text-[9px] text-muted">
+                            <span className="w-6 shrink-0 text-center text-[12px] text-muted">
                               {open ? '▾' : '▸'}
                             </span>
-                            <span className="w-10 shrink-0 text-center text-[9px] text-muted">
+                            <span className="w-10 shrink-0 text-center text-[12px] text-muted">
                               {typ === 'photo' ? '图片' : typ === 'video' ? '视频' : typ === 'audio' ? '音频' : '文件'}
                             </span>
                             <span className="min-w-0 flex-1 truncate text-[12px] text-fg-mid">
                               {hit.caption}
                             </span>
                             {hit.downloaded && (
-                              <span className="shrink-0 text-[9px] text-success">
+                              <span className="shrink-0 text-[12px] text-success">
                                 {t('tg.downloaded')}
                               </span>
                             )}
-                            <span className="shrink-0 text-[9px] tabular-nums text-muted">
+                            <span className="shrink-0 text-[12px] tabular-nums text-muted">
                               {fmtTime(hit.date ?? hit.createdAt)}
                             </span>
                           </button>
@@ -2765,6 +2967,7 @@ export function TgPanel(
                                 state={entryStateFor(item)}
                                 downloadedPath={downloadedPaths.get(item.key)}
                                 onDownload={onBubbleDownload}
+                                onAddToFilter={onBubbleAddToFilter}
                                 onOpenDownloaded={onBubbleOpen}
                                 onPreview={onBubblePreview}
                               />
@@ -2773,7 +2976,7 @@ export function TgPanel(
                                   <Button
                                     variant="secondary"
                                     size="sm"
-                                    className="h-6 px-2 text-[10px]"
+                                    className="h-6 px-2 text-[12px]"
                                     onClick={() => onGlobalHitPreview(hit)}
                                     data-testid="tg-hit-play"
                                   >
@@ -2802,7 +3005,7 @@ export function TgPanel(
             </header>
             <div className="border-b border-border-subtle/60 px-3 pb-2 pt-2">
               <span
-                className="mb-1 block text-[10px] text-muted"
+                className="mb-1 block text-[12px] text-muted"
                 data-testid="tg-group-search-scope"
               >
                 {t('tg.channelSearchScope')}
@@ -2820,7 +3023,7 @@ export function TgPanel(
                     onClick={() => setSearch('')}
                     aria-label={t('tg.globalSearchClear')}
                     data-testid="tg-group-search-clear"
-                    className="absolute right-1 top-1/2 -translate-y-1/2 rounded px-1 text-[11px] text-muted hover:bg-surface-2 hover:text-fg-strong"
+                    className="absolute right-1 top-1/2 -translate-y-1/2 rounded px-1 text-[12px] text-muted hover:bg-surface-2 hover:text-fg-strong"
                   >
                     x
                   </button>
@@ -2856,14 +3059,22 @@ export function TgPanel(
                             {ch.title}
                           </p>
                           {ch.username && (
-                            <p className="truncate text-[10px] text-muted">@{ch.username}</p>
+                            <p className="truncate text-[12px] text-muted">@{ch.username}</p>
                           )}
                         </div>
                       </button>
-                      <Switch
-                        checked={isMon}
-                        onChange={(v) => (v ? void addMonitor(ch) : void removeMonitor(ch.id))}
-                      />
+                      {/* BUG-301：监控开关与「打开会话」点击区**视觉分离** ——
+                          分隔线 + 独立留白，误触点不再落在相邻整行热区上
+                          （此前 Switch 紧贴频道名按钮，点开关变成进会话）。 */}
+                      <div
+                        className="ml-1 flex shrink-0 items-center border-l border-border-subtle/70 pl-3"
+                        title={t('tg.monitoring')}
+                      >
+                        <Switch
+                          checked={isMon}
+                          onChange={(v) => (v ? void addMonitor(ch) : void removeMonitor(ch.id))}
+                        />
+                      </div>
                     </div>
                   )
                 })
@@ -2884,7 +3095,7 @@ export function TgPanel(
                 <Button
                   variant="ghost"
                   size="xs"
-                  className="shrink-0"
+                  className="shrink-0 text-[12px]"
                   onClick={() => {
                     // 回到进来之前的分组列表（TGM-03：瞬态前模式同款语义）
                     const back = cameFromListRef.current ?? 'channels'
@@ -2901,7 +3112,7 @@ export function TgPanel(
                   {selectedChannel.title}
                 </p>
                 {selectedChannel.username && (
-                  <p className="truncate text-[10px] text-muted">
+                  <p className="truncate text-[12px] text-muted">
                     @{selectedChannel.username}
                   </p>
                 )}
@@ -2917,7 +3128,7 @@ export function TgPanel(
                   <Button
                     variant="ghost"
                     size="xs"
-                    className="shrink-0 text-muted hover:text-danger"
+                    className="shrink-0 text-[12px] text-muted hover:text-danger"
                     onClick={() => {
                       if (selectedId !== null) void removeMonitor(selectedId)
                     }}
@@ -2931,6 +3142,7 @@ export function TgPanel(
                 <Button
                   variant="secondary"
                   size="xs"
+                  className="text-[12px]"
                   onClick={() => void addMonitor(selectedChannel)}
                 >
                   {t('tg.addMonitor')}
@@ -2951,13 +3163,13 @@ export function TgPanel(
                 {/* 顶部：历史加载状态 / 定位中（BUG-364） */}
                 <div className="flex h-6 items-center justify-center">
                   {locateReq ? (
-                    <span className="text-[11px] text-accent" data-testid="tg-locating">
+                    <span className="text-[12px] text-accent" data-testid="tg-locating">
                       {t('tg.locating')}
                     </span>
                   ) : loadingOlder ? (
-                    <span className="text-[11px] text-muted">{t('tg.historyOlder')}</span>
+                    <span className="text-[12px] text-muted">{t('tg.historyOlder')}</span>
                   ) : feed.length > 0 && !hasMore ? (
-                    <span className="text-[11px] text-muted">{t('tg.historyNoMore')}</span>
+                    <span className="text-[12px] text-muted">{t('tg.historyNoMore')}</span>
                   ) : null}
                 </div>
 
@@ -2979,6 +3191,7 @@ export function TgPanel(
                         progress={singleProgress.get(unit[0].messageId)}
                         highlighted={highlightKey === unit[0].key}
                         onDownload={onBubbleDownload}
+                        onAddToFilter={onBubbleAddToFilter}
                         onOpenDownloaded={onBubbleOpen}
                         onPreview={onBubblePreview}
                       />
@@ -3012,6 +3225,7 @@ export function TgPanel(
                           return live ?? (stillCaching ? held : undefined)
                         })()}
                         onDownload={onAlbumDownload}
+                        onAddToFilter={onAlbumAddToFilter}
                         onCancel={onAlbumCancel}
                         onPreview={onAlbumPreview}
                       />
@@ -3030,7 +3244,7 @@ export function TgPanel(
                     setPendingNew(0)
                     setFeedReloadTick((v) => v + 1)
                   }}
-                  className="pointer-events-auto rounded-full bg-accent px-3 py-1 text-[11px] font-medium text-white shadow-md transition-transform hover:scale-[1.03]"
+                  className="pointer-events-auto rounded-full bg-accent px-3 py-1 text-[12px] font-medium text-white shadow-md transition-transform hover:scale-[1.03]"
                 >
                   {t('tg.newContent').replace('{n}', String(pendingNew))}
                 </button>
@@ -3057,6 +3271,20 @@ export function TgPanel(
           channels={channels}
           onClose={() => setCacheManagerOpen(false)}
           onOpenMedia={onOpenMedia}
+        />
+      ) : null}
+      {/* BUG-470：单条 / 整组共用同一个「加入筛选并缓存」面板（预填 caption 兜底名） */}
+      {filterCache ? (
+        <FilterCacheDialog
+          filters={filters}
+          defaultName={
+            filterCache.kind === 'item'
+              ? (filterCache.item.caption ?? '')
+              : (filterCache.items.find((x) => x.caption?.trim())?.caption ?? '')
+          }
+          count={filterCache.kind === 'item' ? 1 : filterCache.items.length}
+          onCancel={() => setFilterCache(null)}
+          onSubmit={(name, id) => void submitFilterCache(name, id)}
         />
       ) : null}
     </div>
@@ -3097,6 +3325,8 @@ const MessageBubble = memo(function MessageBubble(props: {
    */
   highlighted?: boolean
   onDownload: (item: FeedItem) => void
+  /** BUG-470：加入筛选并缓存（缺省不渲染 —— 不给点不动的入口） */
+  onAddToFilter?: (item: FeedItem) => void
   onOpenDownloaded: (item: FeedItem) => void
   onPreview: (item: FeedItem) => void
 }) {
@@ -3107,10 +3337,13 @@ const MessageBubble = memo(function MessageBubble(props: {
     progress,
     highlighted = false,
     onDownload,
+    onAddToFilter,
     onOpenDownloaded,
     onPreview,
   } = props
-  const { t } = useTranslation()
+  const { t, language } = useTranslation()
+  /** BUG-470：入口文案按当前语言取（本轮不新增 i18n 键，需主控补 `tg.addToFilterCache`） */
+  const zh = language !== 'en-US'
   const cached = state === 'cached'
   const caching = state === 'caching'
   const queued = state === 'queued'
@@ -3130,11 +3363,11 @@ const MessageBubble = memo(function MessageBubble(props: {
   /** 元信息 + 操作行（左右/上下两种布局共用一份，不各写一套）。 */
   const bubbleMeta = () => (
     <div className="mt-1.5 flex flex-wrap items-center gap-2">
-      <span className="font-mono text-[9px] text-muted">#{m.messageId}</span>
-      {m.size ? <span className="text-[10px] text-muted">{fmtSize(m.size)}</span> : null}
+      <span className="font-mono text-[12px] text-muted">#{m.messageId}</span>
+      {m.size ? <span className="text-[12px] text-muted">{fmtSize(m.size)}</span> : null}
       {/* 条目内字节（BUG-181）：下载中时 `已传/总量` 是唯一活着的证据 */}
       {caching && progress?.itemBytesTotal ? (
-        <span className="text-[10px] text-accent" data-testid="bubble-item-bytes">
+        <span className="text-[12px] text-accent" data-testid="bubble-item-bytes">
           {fmtSize(progress.itemBytes ?? 0)}/{fmtSize(progress.itemBytesTotal)}
         </span>
       ) : null}
@@ -3142,22 +3375,62 @@ const MessageBubble = memo(function MessageBubble(props: {
       {cached && <Chip tone="success">{t('tg.downloaded')}</Chip>}
       {state === 'bytesMissing' && <Chip tone="warn">{t('tg.bytesMissing')}</Chip>}
       {state === 'failed' && <Chip tone="warn">{t('tg.statusFailed')}</Chip>}
-      <span className="ml-auto text-[10px] text-muted">{fmtTime(m.date)}</span>
+      <span className="ml-auto text-[12px] text-muted">{fmtTime(m.date)}</span>
       {/* 缓存/播放按钮：视频与图片同构（BUG-046）——此前视频只靠海报上的 ⬇ 图标，
           图片却有显式「缓存」按钮，逻辑倒置。海报点击行为不变（已缓存=播放，
           缓存中=在线播放，未缓存=开始缓存），按钮是明确的兜底入口。 */}
       {/* 操作按钮（BUG-352：图片与视频同一把尺子）——已落盘=播放；否则=缓存/排队中/
           重试缓存。BUG-049 的「图片=加入图片库/已入库」分支已删除：图片同样是内容，
           同样落盘（不成「剧集」这一点不变，那是 BUG-044 的规则）。 */}
+      {/*
+        BUG-139：「打开」这个动词在本面板必须只有**一种**含义 —— 主入口统一走内置
+        播放器（`onPreview` → openViewer，带解码健康提示 BUG-034、倍速与连播 BUG-137）。
+        系统播放器**不删除**，但降为显式命名的次要动作（文案写明「用系统播放器打开」），
+        且不再是同权重按钮（无边框文字链），用户不点开也知道会走外部程序。
+        `file` 类型没有内置呈现（MediaViewer 对 file 返回 none）⇒ 系统打开是它的唯一
+        动作，所以仍是按钮，但同样显式命名，不留「播放一个 zip」的歧义。
+      */}
       {downloadedPath || m.downloaded ? (
-        <Button variant="secondary" size="sm" className="h-6 px-2 text-[10px]" onClick={() => onOpenDownloaded(m)}>
-          {t('tg.play')}
-        </Button>
+        m.type === 'file' ? (
+          <Button
+            variant="secondary"
+            size="sm"
+            className="h-6 px-2 text-[12px]"
+            data-testid="bubble-open-system"
+            onClick={() => onOpenDownloaded(m)}
+          >
+            {zh ? '用系统播放器打开' : 'Open with system player'}
+          </Button>
+        ) : (
+          <>
+            <Button
+              variant="secondary"
+              size="sm"
+              className="h-6 px-2 text-[12px]"
+              data-testid="bubble-open"
+              onClick={() => onPreview(m)}
+            >
+              {t('tg.play')}
+            </Button>
+            {/* 次要动作只在**真有本地路径**时给（`m.downloaded` 为真但路径未回填时
+                opener 拿不到目标，给了就是点不动的死按钮 —— BUG-324 纪律）。 */}
+            {downloadedPath ? (
+              <button
+                type="button"
+                data-testid="bubble-open-system"
+                onClick={() => onOpenDownloaded(m)}
+                className="text-[12px] text-muted underline-offset-2 hover:text-fg-mid hover:underline"
+              >
+                {zh ? '用系统播放器打开' : 'Open with system player'}
+              </button>
+            ) : null}
+          </>
+        )
       ) : (
         <Button
           variant="secondary"
           size="sm"
-          className="h-6 px-2 text-[10px]"
+          className="h-6 px-2 text-[12px]"
           disabled={caching || queued}
           onClick={() => onDownload(m)}
         >
@@ -3172,6 +3445,22 @@ const MessageBubble = memo(function MessageBubble(props: {
                 : t('tg.download')}
         </Button>
       )}
+      {/* BUG-470：与「缓存」并列的合并入口 —— 一次提交同时完成「加入筛选」与「入队」。
+          只在未落盘时出现：已入库的条目后端会拦成 alreadyIngested，那颗按钮点了
+          只会提示「已入库」，等于给一个承诺不了的出口。 */}
+      {!(downloadedPath || m.downloaded) && onAddToFilter ? (
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-6 px-2 text-[12px] text-accent"
+          disabled={caching || queued}
+          onClick={() => onAddToFilter(m)}
+          title={zh ? '筛选名 = 这批内容的标题 = 剧集名' : 'Filter name = title = series name'}
+          data-testid="bubble-add-to-filter"
+        >
+          {zh ? '加入筛选并缓存' : 'Add to filter & cache'}
+        </Button>
+      ) : null}
     </div>
   )
   return (
@@ -3260,6 +3549,153 @@ const MessageBubble = memo(function MessageBubble(props: {
   )
 })
 
+/**
+ * BUG-470：单条 / 整组共用的「加入筛选并缓存」轻量面板。
+ *
+ * 只做一件事：定一个筛选名（= 入库后这批内容的标题 = 归属剧集名），然后提交。
+ * 名字可预填 caption 兜底、现场可改；**留空不提交**并显式说明原因 ——
+ * 「没有名字的内容在库里认不出来」正是现状产生无名批次的原因。
+ * 「选已有筛选」只是复用其 id 作 `seriesKey`，不新增任何筛选模型字段。
+ */
+function FilterCacheDialog(props: {
+  filters: TgMonitorFilter[]
+  /** 预填名（caption 兜底，可为空 ⇒ 用户必须自己起名） */
+  defaultName: string
+  /** 本次涉及的条目数（1 = 单条） */
+  count: number
+  onCancel: () => void
+  onSubmit: (name: string, filterId: number | null) => void
+}) {
+  const { t, language } = useTranslation()
+  const zh = language !== 'en-US'
+  const { filters, defaultName, count } = props
+  const [mode, setMode] = useState<'new' | 'existing'>(filters.length > 0 ? 'existing' : 'new')
+  const [name, setName] = useState(defaultName)
+  const [pickedId, setPickedId] = useState<number | null>(filters[0]?.id ?? null)
+  const [err, setErr] = useState<string | null>(null)
+
+  const submit = () => {
+    if (mode === 'existing') {
+      if (pickedId == null) {
+        setErr(zh ? '请选择一条筛选' : 'Pick a filter')
+        return
+      }
+      props.onSubmit('', pickedId)
+      return
+    }
+    if (!name.trim()) {
+      setErr(
+        zh
+          ? '筛选名必填：没有名字的内容在库里认不出来'
+          : 'Name required — unnamed content cannot be recognized in the library',
+      )
+      return
+    }
+    props.onSubmit(name.trim(), null)
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6"
+      onClick={props.onCancel}
+    >
+      <div
+        className="w-full max-w-md rounded-lg border border-border-subtle bg-surface p-4 shadow-lg"
+        onClick={(e) => e.stopPropagation()}
+        data-testid="tg-filter-cache-dialog"
+      >
+        <h2 className="text-sm font-semibold text-fg-strong">
+          {zh ? '加入筛选并缓存' : 'Add to filter & cache'}
+        </h2>
+        <p className="mt-1 text-[12px] leading-relaxed text-muted">
+          {zh
+            ? `筛选名 = 这批${count} 条内容的标题 = 剧集名；一次提交同时完成归类与入库。`
+            : `Filter name = title of these ${count} item(s) = series name; one submit does both.`}
+        </p>
+
+        <div className="mt-3 flex items-center gap-3 text-[12px] text-fg-mid">
+          <label className="flex items-center gap-1.5">
+            <input
+              type="radio"
+              checked={mode === 'new'}
+              onChange={() => setMode('new')}
+              data-testid="tg-filter-cache-new"
+            />
+            {zh ? '新建筛选' : 'New filter'}
+          </label>
+          <label className="flex items-center gap-1.5">
+            <input
+              type="radio"
+              checked={mode === 'existing'}
+              onChange={() => setMode('existing')}
+              disabled={filters.length === 0}
+              data-testid="tg-filter-cache-existing"
+            />
+            {zh ? '选已有筛选' : 'Existing filter'}
+          </label>
+        </div>
+
+        {mode === 'new' ? (
+          <Input
+            value={name}
+            onChange={(e) => {
+              setName(e.target.value)
+              setErr(null)
+            }}
+            placeholder={zh ? '筛选名（必填）' : 'Filter name (required)'}
+            className="mt-2 h-8 text-xs"
+            spellCheck={false}
+            autoFocus
+            data-testid="tg-filter-cache-name"
+          />
+        ) : (
+          <select
+            value={pickedId ?? ''}
+            onChange={(e) => {
+              setPickedId(Number(e.target.value))
+              setErr(null)
+            }}
+            className="mt-2 h-8 w-full rounded-md border border-border-subtle bg-surface px-2 text-xs text-fg-strong"
+            data-testid="tg-filter-cache-select"
+          >
+            {filters.map((f) => (
+              <option key={f.id} value={f.id}>
+                {f.label || f.keyword}
+              </option>
+            ))}
+          </select>
+        )}
+
+        {err ? (
+          <p className="mt-2 text-[12px] text-danger" data-testid="tg-filter-cache-error">
+            {err}
+          </p>
+        ) : null}
+
+        <div className="mt-3 flex items-center justify-end gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 px-3 text-[12px]"
+            onClick={props.onCancel}
+            data-testid="tg-filter-cache-cancel"
+          >
+            {t('tg.cancel')}
+          </Button>
+          <Button
+            size="sm"
+            className="h-7 px-3 text-[12px]"
+            onClick={submit}
+            data-testid="tg-filter-cache-submit"
+          >
+            {zh ? '加入并缓存' : 'Add & cache'}
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /** 可选播放速率（倍速菜单项） */
 const PLAYBACK_SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2]
 
@@ -3282,12 +3718,12 @@ function PlaybackSpeed(props: { rate: number; onRate: (r: number) => void }) {
         type="button"
         aria-label={`playback speed ${rate}x`}
         onClick={() => setOpen((v) => !v)}
-        className="flex h-8 min-w-[2.5rem] items-center justify-center rounded-md bg-black/70 px-2 text-[11px] font-semibold text-white ring-1 ring-white/30 backdrop-blur-sm hover:bg-black/85"
+        className="flex h-8 min-w-[2.5rem] items-center justify-center rounded-md bg-black/70 px-2 text-[12px] font-semibold text-white ring-1 ring-white/30 backdrop-blur-sm hover:bg-black/85"
       >
         {rate === 1 ? t('tg.speed') : `${rate}x`}
       </button>
       {open && (
-        <div className="mt-1 flex flex-col overflow-hidden rounded-md border border-white/20 bg-black/80 text-[11px] text-white shadow-lg backdrop-blur-sm">
+        <div className="mt-1 flex flex-col overflow-hidden rounded-md border border-white/20 bg-black/80 text-[12px] text-white shadow-lg backdrop-blur-sm">
           {PLAYBACK_SPEEDS.map((s) => (
             <button
               key={s}
@@ -3333,6 +3769,8 @@ const AlbumBubble = memo(function AlbumBubble(props: {
    */
   highlighted?: boolean
   onDownload: (items: FeedItem[]) => void
+  /** BUG-470：加入筛选并缓存（缺省不渲染 —— 不呈现点不动的入口） */
+  onAddToFilter?: (items: FeedItem[]) => void
   /** 取消整组缓存（进行中时操作行显示「取消」） */
   onCancel?: (items: FeedItem[]) => void
   onPreview: (index: number, items: FeedItem[]) => void
@@ -3360,12 +3798,15 @@ const AlbumBubble = memo(function AlbumBubble(props: {
     progress,
     highlighted = false,
     onDownload,
+    onAddToFilter,
     onCancel,
     onPreview,
     expanded = false,
     onToggleExpand,
   } = props
-  const { t } = useTranslation()
+  const { t, language } = useTranslation()
+  /** BUG-470：入口文案按当前语言取（本轮不新增 i18n 键，需主控补 `tg.addToFilterCache`） */
+  const zh = language !== 'en-US'
   /* BUG-352：完成判据只有一条 —— **全部条目都有字节**。此前按组构成分叉
      （纯图组改判「图片是否已入库」），那是因为图片当时不落盘；现在图片与视频同样
      落盘，分叉就成了两套互斥的「完成」定义（同一组可以按一个口径算完成、按另一个
@@ -3402,7 +3843,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
         )}
       >
         {/* 状态行：相册计数 + 缓存进度（纯文本弱化，文字归文字、按钮归按钮） */}
-        <div className="mb-1.5 flex items-center gap-2 text-[10px]">
+        <div className="mb-1.5 flex items-center gap-2 text-[12px]">
           <span className="font-medium text-accent">{t('tg.albumN', { n: items.length })}</span>
           {allDone ? (
             <span className="text-success">{t('tg.downloaded')}</span>
@@ -3422,7 +3863,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
               type="button"
               onClick={onToggleExpand}
               data-testid="album-collapse"
-              className="ml-auto rounded px-1.5 py-0.5 text-[11px] text-fg-mid transition-colors hover:bg-surface-2 hover:text-fg-strong"
+              className="ml-auto rounded px-1.5 py-0.5 text-[12px] text-fg-mid transition-colors hover:bg-surface-2 hover:text-fg-strong"
             >
               ⌃ {t('tg.albumCollapse')}
             </button>
@@ -3485,12 +3926,12 @@ const AlbumBubble = memo(function AlbumBubble(props: {
                 {/* 数量角标：让用户在**展开之前**就知道这是一组，而不是一张 */}
                 <span
                   data-testid="album-cover-count"
-                  className="absolute right-1.5 top-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white"
+                  className="absolute right-1.5 top-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[12px] font-medium text-white"
                 >
                   {items.length}
                 </span>
                 {/* 通栏底条：折叠=展开语义、展开=收起语义（显著化，替代旧左下角小条） */}
-                <span className="absolute inset-x-0 bottom-0 bg-black/60 px-1.5 py-0.5 text-center text-[11px] text-white/90">
+                <span className="absolute inset-x-0 bottom-0 bg-black/60 px-1.5 py-0.5 text-center text-[12px] text-white/90">
                   {open ? t('tg.albumCollapse') : t('tg.albumExpandHint', { n: items.length })}
                 </span>
               </button>
@@ -3520,7 +3961,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
                 )}
                 <span
                   data-testid="album-cover-count"
-                  className="absolute right-1.5 top-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white"
+                  className="absolute right-1.5 top-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[12px] font-medium text-white"
                 >
                   {items.length}
                 </span>
@@ -3592,7 +4033,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
                     </span>
                   )}
                   {typ === 'video' && dur && (
-                    <span className="absolute bottom-1 right-1 rounded bg-black/70 px-1 py-0.5 text-[9px] font-medium text-white">
+                    <span className="absolute bottom-1 right-1 rounded bg-black/70 px-1 py-0.5 text-[12px] font-medium text-white">
                       {dur}
                     </span>
                   )}
@@ -3616,17 +4057,17 @@ const AlbumBubble = memo(function AlbumBubble(props: {
 
         {/* 操作行：整组缓存 / 进度 / 首条消息号 + 总大小（按钮与缓存库同构：outline h-6） */}
         <div className="mt-1.5 flex items-center gap-2">
-          <span className="font-mono text-[9px] text-muted">#{items[0].messageId}</span>
-          <span className="text-[10px] text-muted">{fmtSize(totalSize)}</span>
+          <span className="font-mono text-[12px] text-muted">#{items[0].messageId}</span>
+          <span className="text-[12px] text-muted">{fmtSize(totalSize)}</span>
           {progress ? (
             <>
               {progress.queued ? (
                 /* BUG-181：排队组——本轮还没轮到它，如实呈现「排队中」而非假装在缓存 */
-                <span className="ml-auto text-[10px] text-muted" data-testid="album-queued">
+                <span className="ml-auto text-[12px] text-muted" data-testid="album-queued">
                   {t('tg.queued')}
                 </span>
               ) : (
-                <span className="ml-auto text-[10px] text-muted" data-testid="album-progress">
+                <span className="ml-auto text-[12px] text-muted" data-testid="album-progress">
                   {t('tg.cachingProgress', { n: progress.done, total: progress.total })}
                   {/* 条目内字节（BUG-181）：长条目下载期间 done 冻结，字节是唯一活着的证据 */}
                   {progress.itemBytesTotal
@@ -3638,7 +4079,7 @@ const AlbumBubble = memo(function AlbumBubble(props: {
                 <Button
                   variant="outline"
                   size="sm"
-                  className="h-6 px-2 text-[10px]"
+                  className="h-6 px-2 text-[12px]"
                   onClick={() => onCancel(items)}
                 >
                   {t('tg.cancel')}
@@ -3648,29 +4089,46 @@ const AlbumBubble = memo(function AlbumBubble(props: {
           ) : !allDone ? (
             /* BUG-352：按钮语义不再按组构成分叉 —— 整组一个出口 `onDownload`
                （worker 落盘，图片与视频同等）。部分已下时给「继续 n/N」，
-               分子分母同源（都按字节真值派生），没有任务时不会出现「继续 1/6」。 */
+               分子分母同源（都按字节真值派生），没有任务时不会出现「继续 1/6」。
+               BUG-470：并列加一颗「加入筛选并缓存」—— 一次提交同时完成归属与入队；
+               只在**尚未全部落盘**时给（已入库的组后端会直接拦下，那颗按钮点了只会
+               提示「已入库」，属于承诺不了的入口）。 */
+            <div className="ml-auto flex flex-wrap items-center gap-2">
+              {onAddToFilter ? (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="h-6 px-2 text-[12px]"
+                  onClick={() => onAddToFilter(items)}
+                  title={zh ? '筛选名 = 这批内容的标题 = 剧集名' : 'Filter name = title = series name'}
+                  data-testid="album-add-to-filter"
+                >
+                  {zh ? '加入筛选并缓存' : 'Add to filter & cache'}
+                </Button>
+              ) : null}
             <Button
               variant="outline"
               size="sm"
-              className="ml-auto h-6 px-2 text-[10px]"
+              className="h-6 px-2 text-[12px]"
               onClick={() => onDownload(items)}
             >
               {cachedTargets > 0
                 ? `${t('tg.continue')} ${cachedTargets}/${cacheTargets}`
                 : t('tg.download')}
             </Button>
+            </div>
           ) : (
             /* BUG-185：完成态**不得落 null** —— 此前整行消失，用户无法区分
                「已完成」与「这个页面不支持缓存」。给明确标识 + 可点击出口，
                与单条完成后的「播放」按钮对称。 */
             <div className="ml-auto flex items-center gap-2">
-              <span className="text-[10px] text-success" data-testid="album-done">
+              <span className="text-[12px] text-success" data-testid="album-done">
                 {t('tg.downloaded')}
               </span>
               <Button
                 variant="outline"
                 size="sm"
-                className="h-6 px-2 text-[10px]"
+                className="h-6 px-2 text-[12px]"
                 onClick={() => onPreview(0, items)}
                 data-testid="album-open"
               >
@@ -3734,7 +4192,7 @@ function PhotoBlock(props: {
         type="button"
         onClick={onPreview}
         className={cn(
-          'flex w-full items-center justify-center rounded-lg bg-surface-2 text-[11px] text-muted',
+          'flex w-full items-center justify-center rounded-lg bg-surface-2 text-[12px] text-muted',
           // 2026-10-23 二报：flex-1 + min-h-32 —— 左列 flex-col 下的等高拉伸
           compact ? 'min-h-32 flex-1' : 'h-28',
         )}
@@ -3882,7 +4340,7 @@ function VideoBlock(props: {
       {posterErr ? (
         <span
           className={cn(
-            'flex w-full items-center justify-center text-[11px] text-white/50',
+            'flex w-full items-center justify-center text-[12px] text-white/50',
             compact ? 'absolute inset-0' : 'aspect-video',
           )}
         >
@@ -3902,7 +4360,7 @@ function VideoBlock(props: {
         />
       )}
       {dur && (
-        <span className="absolute bottom-1.5 right-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[10px] font-medium text-white">
+        <span className="absolute bottom-1.5 right-1.5 rounded bg-black/70 px-1.5 py-0.5 text-[12px] font-medium text-white">
           {dur}
         </span>
       )}
@@ -3910,7 +4368,7 @@ function VideoBlock(props: {
         {downloading ? (
           <span className="flex flex-col items-center gap-1.5">
             <span className="h-8 w-8 animate-spin rounded-full border-2 border-white/80 border-t-transparent" />
-            <span className="text-[10px] text-white/90">{t('tg.caching')}</span>
+            <span className="text-[12px] text-white/90">{t('tg.caching')}</span>
           </span>
         ) : (
           <span className="flex h-12 w-12 items-center justify-center rounded-full bg-black/55 pl-0.5 text-lg text-white backdrop-blur-sm transition-transform hover:scale-105">
@@ -3932,7 +4390,7 @@ function VideoBlock(props: {
               setPlaying('online')
             }
           }}
-          className="absolute left-1.5 top-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white/90 hover:bg-black/80"
+          className="absolute left-1.5 top-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[12px] text-white/90 hover:bg-black/80"
         >
           {t('tg.online')}
         </span>

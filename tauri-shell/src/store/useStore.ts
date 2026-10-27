@@ -29,6 +29,9 @@ import {
 import { getTgSession, setTgPort } from '../api/tg'
 import type { DaemonPlugin } from '../api/daemon'
 import { logTgReason } from '../lib/tgReason'
+// BUG-312：清空历史的来源判据（单一真源在域内，见 domains/download/clearSources.ts）。
+import { splitClearHistoryRows } from '../domains/download/clearSources'
+import { t } from '../i18n'
 import type { AddDownloadRequest, ViewerItem } from '../types'
 
 const SETTINGS_KEY = 'orig-hub:settings'
@@ -616,9 +619,13 @@ export const useStore = create<DownloadState>((set, get) => ({
     const completed = get().downloads.filter(
       (d) => d.status === 'completed' || d.status === 'error' || d.status === 'cancelled',
     )
+    // BUG-312（D21=A④）：「清空历史」只删**引擎来源**的行。TG 入库任务（cache_task）
+    // 同时承担「TG 全部下载索引」，它唯一的删除入口是 设置→Telegram→缓存管理；
+    // 此前这里对终态行逐条 DELETE、不看来源，M3 合并列表后会把那份索引一起抹掉。
+    const { clearable, kept } = splitClearHistoryRows(completed)
     let failed = 0
     let firstErr: unknown = null
-    for (const d of completed) {
+    for (const d of clearable) {
       try {
         await apiRemoveDownload(d.id)
       } catch (e) {
@@ -629,7 +636,11 @@ export const useStore = create<DownloadState>((set, get) => ({
     await get().refresh()
     if (failed > 0) {
       const reason = firstErr instanceof Error ? firstErr.message : String(firstErr)
-      set({ toast: `${failed}/${completed.length} 条记录清除失败：${reason}` })
+      set({ toast: `${failed}/${clearable.length} 条记录清除失败：${reason}` })
+    } else if (kept.length > 0) {
+      // 只在真的保留了行时提示（kept=0 时一句「已保留 0 条」纯属噪音）；
+      // 静默保留也不行 —— 用户会以为「清空」这个按钮坏了。
+      set({ toast: t('download.panel.clearKeptIngest', { n: kept.length }) })
     }
   },
 

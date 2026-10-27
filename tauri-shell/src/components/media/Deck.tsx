@@ -33,6 +33,17 @@ export interface DeckFrame {
  */
 const MIN_PEEK_PX = 44
 
+/**
+ * BUG-270：平铺态相邻两帧的间距（px）。
+ */
+const FLAT_GAP_PX = 8
+/**
+ * BUG-270：堆叠态**自动跑马**的节拍（ms）。用户 2026-10-10 裁定 D1「跑马 = 自动」：
+ * 堆叠态必须在**无任何用户输入**时自行位移；原先只有「点左半/右半翻一张」，
+ * 「跑马灯」只是名字（现象 4）。
+ */
+const MARQUEE_MS = 2600
+
 export function Deck(props: {
   frames: DeckFrame[]
   /** 单卡宽（px） */
@@ -84,11 +95,20 @@ export function Deck(props: {
     return () => ro.disconnect()
   }, [])
 
-  const { p, total, visible } = useMemo(() => {
-    if (n === 0) return { p: 0, total: 0, visible: 0 }
+  const { mode, p, total, visible } = useMemo(() => {
+    if (n === 0) return { mode: 'stack' as const, p: 0, total: 0, visible: 0 }
     // 可用宽尚未量到（首帧）时按声明上限走，避免闪一帧 0 宽
     const declared = maxW > 0 ? maxW : w
     const cap = avail > 0 ? Math.min(declared, Math.max(w, avail)) : declared
+    /*
+     * BUG-270：用户原裁定 D2/D4「**够宽就一行平铺、放不下才堆叠**」——判定必须由
+     * **容器可用宽**驱动（不是帧数阈值、也不是视口断点）。平铺所需宽 = n 张单卡 +
+     * (n-1) 个间距；装得下就平铺（不重叠），装不下才进堆叠态。
+     * 单帧（D5）单独成态：不参与层叠，整图居中、不裁剪。
+     */
+    if (n === 1) return { mode: 'single' as const, p: 0, total: w, visible: 1 }
+    const flatW = n * w + (n - 1) * FLAT_GAP_PX
+    if (cap >= flatW) return { mode: 'flat' as const, p: w + FLAT_GAP_PX, total: flatW, visible: n }
     const room = Math.max(0, cap - w)
     /*
      * BUG-429：槽位数不再写死 6 —— 实测 9 帧的图组里后 3 帧**完全叠在同一槽位**
@@ -101,10 +121,26 @@ export function Deck(props: {
     const vis = Math.max(1, Math.min(n, maxSlots, maxByStep))
     const step =
       n > 1 ? Math.max(8, Math.min(peek, Math.round(room / Math.max(1, vis - 1)))) : 0
-    return { p: step, total: w + Math.max(0, vis - 1) * step, visible: vis }
+    return { mode: 'stack' as const, p: step, total: w + Math.max(0, vis - 1) * step, visible: vis }
   }, [n, w, maxW, peek, maxSlots, avail])
 
+  /**
+   * BUG-270：堆叠态的**自动跑马**（裁定 D1）。指针悬停时暂停（可选增强，
+   * 不影响「无输入时自行位移」的判据）；离开恢复。
+   */
+  const hoverPausedRef = useRef(false)
+  useEffect(() => {
+    if (mode !== 'stack' || n <= 1) return
+    const id = window.setInterval(() => {
+      if (!hoverPausedRef.current) setHead((v) => (v + 1) % n)
+    }, MARQUEE_MS)
+    return () => window.clearInterval(id)
+  }, [mode, n])
+
   if (n === 0) return null
+
+  /** 帧序号的归一化 head（帧集合变化后 head 可能越界，取模防止负槽位）。 */
+  const headAt = n > 0 ? head % n : 0
 
   const next = () => setHead((v) => (v + 1) % n)
   const prev = () => setHead((v) => (v - 1 + n) % n)
@@ -116,6 +152,83 @@ export function Deck(props: {
     else next()
   }
 
+  /*
+   * BUG-270：平铺态（裁定 D2「一行平铺 + 溢出横向滚动」）。装得下时全部帧同一行、
+   * 不重叠；点任意一张直接开灯箱（不再有「翻页」语义 —— 全都看得见）。
+   */
+  if (mode === 'flat') {
+    return (
+      <div ref={boxRef} className="w-full min-w-0">
+        <div
+          className="flex flex-nowrap items-start gap-2 overflow-x-auto pb-1"
+          data-testid={testId ?? 'episode-deck'}
+          data-deck-mode="flat"
+          data-deck-count={`${n}`}
+        >
+          {frames.map((f, i) => (
+            <button
+              key={`${f.src}-${i}`}
+              type="button"
+              onClick={() => onOpenFrame?.(i)}
+              disabled={!onOpenFrame}
+              className="relative overflow-hidden rounded-lg bg-surface-3 shadow-[0_2px_6px_rgba(16,24,40,.16),0_1px_2px_rgba(16,24,40,.1)] disabled:cursor-default"
+              style={{ width: w, height: h }}
+              data-testid="episode-deck-flat-tile"
+              title={f.label}
+            >
+              <DeckImage src={f.src} alt="" />
+              {f.label ? (
+                <span className="absolute inset-x-0 bottom-0 truncate bg-gradient-to-t from-black/60 to-transparent px-1.5 pb-1 pt-3 font-mono text-[10.5px] text-white">
+                  {f.label}
+                </span>
+              ) : null}
+            </button>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  /*
+   * BUG-270：单帧（裁定 D5）—— 不裁剪（整图按原始宽高比缩放）、容器内居中、
+   * 不出现 `1 / 1` 层叠计数。开灯箱能力保留（点图 / ⤢ 均可）。
+   */
+  if (mode === 'single') {
+    const f = frames[0]
+    return (
+      <div ref={boxRef} className="w-full min-w-0">
+        <div
+          className="relative flex justify-center"
+          data-testid={testId ?? 'episode-deck'}
+          data-deck-mode="single"
+        >
+          <img
+            src={f.src}
+            alt=""
+            loading="lazy"
+            draggable={false}
+            onClick={() => onOpenFrame?.(0)}
+            className={onOpenFrame ? 'max-w-full cursor-zoom-in rounded-lg' : 'max-w-full rounded-lg'}
+            style={{ width: w, height: 'auto' }}
+          />
+          {onOpenFrame ? (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation()
+                onOpenFrame(0)
+              }}
+              className="absolute bottom-1.5 right-1.5 rounded bg-black/55 px-1.5 py-0.5 text-[10px] text-white hover:bg-black/75"
+              data-testid="episode-deck-open"
+            >
+              ⤢
+            </button>
+          ) : null}
+        </div>
+      </div>
+    )
+  }
+
   return (
     /* BUG-429：量的是**外层可用宽**（`w-full`，与父容器同宽）。
        绝不能把 ref 挂到下面那个 width=total 的盒子上 —— 那会自己量自己，
@@ -125,12 +238,19 @@ export function Deck(props: {
         className="relative cursor-pointer select-none"
         style={{ width: total, height: h, perspective: 900 }}
         onClick={onClick}
+        onMouseEnter={() => {
+          hoverPausedRef.current = true
+        }}
+        onMouseLeave={() => {
+          hoverPausedRef.current = false
+        }}
         data-testid={testId ?? 'episode-deck'}
-        data-deck-count={`${head + 1} / ${n}`}
+        data-deck-mode="stack"
+        data-deck-count={`${headAt + 1} / ${n}`}
       >
       {frames.map((f, i) => {
         // 相对 head 的偏移：0 = 最前；超过可见槽数的卡全部压在队尾那条边下
-        const rel = (i - head + n) % n
+        const rel = (i - headAt + n) % n
         const slot = Math.min(rel, visible - 1)
         return (
           <div
@@ -158,14 +278,14 @@ export function Deck(props: {
         className="absolute right-1.5 top-1.5 z-[99] rounded bg-black/60 px-1.5 py-px font-mono text-[9.5px] text-white"
         data-testid="episode-deck-count"
       >
-        {head + 1} / {n}
+        {headAt + 1} / {n}
       </span>
       {onOpenFrame ? (
         <button
           type="button"
           onClick={(e) => {
             e.stopPropagation()
-            onOpenFrame(head)
+            onOpenFrame(headAt)
           }}
           className="absolute bottom-1.5 right-1.5 z-[99] rounded bg-black/55 px-1.5 py-0.5 text-[10px] text-white hover:bg-black/75"
           data-testid="episode-deck-open"

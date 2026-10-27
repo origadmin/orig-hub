@@ -113,13 +113,16 @@ export function SeriesHero(props: {
             <GitMerge className="h-3.5 w-3.5" />
             {t('media.series.merge')}
           </Button>
-          {/* ④ 导出预览（能力 #21 的迁移落位） */}
+          {/* ④ 导出预览（能力 #21 的迁移落位）
+              BUG-465：本组件**未挂载**（全仓 0 处 `<SeriesHero`），却与线上库级主操作
+              `ContextBarFilesActions` 抢同一个 `media-export-preview` 契约 —— 验收脚本按
+              testid 点击会指向错误元素。这里改名，保持全局唯一。 */}
           <Button
             variant="outline"
             size="sm"
             className="h-7 px-2 text-[11px]"
             onClick={props.onExport}
-            data-testid="media-export-preview"
+            data-testid="series-hero-export"
           >
             {t('media.exportPreview')}
           </Button>

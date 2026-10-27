@@ -29,7 +29,9 @@ export const ContextBarFilesActions = memo(function ContextBarFilesActions() {
 
   return (
     <>
-      {/* 主操作：导入目录（primary） */}
+      {/* 主操作（BUG-458）：由「导入目录」改为「目录管理」—— 点击打开的是受管根
+          集合的登记/移除/设主/对账，而不是一次性的「扫描 → 勾选 → 写库」。
+          文案走 i18n（`media.dirManage`）。 */}
       <Button size="sm" onClick={filesActions.import} data-testid="page-primary-action">
         <svg
           className="mr-1 h-3.5 w-3.5"
@@ -40,7 +42,7 @@ export const ContextBarFilesActions = memo(function ContextBarFilesActions() {
         >
           <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
         </svg>
-        {t('media.importDir')}
+        {t('media.dirManage')}
       </Button>
       {/* 次级：新建剧集（testid 沿用既有契约，验收脚本直接点） */}
       <Button

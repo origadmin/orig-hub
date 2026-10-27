@@ -14,6 +14,7 @@ import {
   sourceLabelKey,
 } from '../../lib/mediaSources'
 import { useTranslation } from '../../i18n'
+import { cleanTitle } from '../../lib/titleClean'
 
 /**
  * 单条内容编辑：**标题 + 介绍 + 标签**（封面由卡片自动抽帧生成，也可在此预览）。
@@ -41,6 +42,8 @@ export function ItemEditDialog(props: {
   const { item, tags, onClose, onSaved, onError, onCreateTag } = props
   const { t } = useTranslation()
   const [title, setTitle] = useState(item.title)
+  /** BUG-264 D1-a：清理剥空时提示「这条需要手工命名」 */
+  const [cleanFellBack, setCleanFellBack] = useState(false)
   const [desc, setDesc] = useState(item.description ?? '')
   const [selected, setSelected] = useState<number[]>(item.tags.map((t) => t.id))
   const [busy, setBusy] = useState(false)
@@ -207,6 +210,28 @@ export function ItemEditDialog(props: {
             autoFocus
             data-testid="item-edit-title"
           />
+          {/* BUG-264 D1-a：与剧集面板同一条规则、同一个函数（单点） */}
+          <span className="flex items-center gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-6 px-2 text-[11px]"
+              onClick={() => {
+                const r = cleanTitle(title)
+                setTitle(r.text)
+                setCleanFellBack(r.fellBack)
+              }}
+              data-testid="item-title-clean"
+            >
+              {t('media.title.clean')}
+            </Button>
+            {cleanFellBack && (
+              <span className="text-[11px] text-warning" data-testid="item-title-clean-empty">
+                {t('media.title.cleanEmpty')}
+              </span>
+            )}
+          </span>
           <label className="block text-[11px] text-muted" htmlFor="item-edit-desc">
             {t('media.item.desc')}
             <span className="ml-1 text-[10px] text-muted/70">

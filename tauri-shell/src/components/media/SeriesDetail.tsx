@@ -84,7 +84,7 @@ import { Lightbox, type LightboxItem } from './Lightbox'
 import { TagPicker } from './TagManagerDialog'
 import { TagToken } from './TagToken'
 import { CoverImage } from './CoverImage'
-import { Button } from '../ui/button'
+import { Button, TONE_VARIANT } from '../ui/button'
 import { RowCheckbox } from '../ui/selection-bar'
 import { useTranslation } from '../../i18n'
 import { seriesLabel } from '../../lib/displayTitle'
@@ -594,7 +594,7 @@ export function SeriesDetail(props: {
               {t('media.save')}
             </Button>
             <Button
-              variant="outline"
+              variant={TONE_VARIANT.secondary}
               size="sm"
               className="h-7 px-3 text-[11px]"
               onClick={() => setEditingTags(false)}
@@ -706,7 +706,11 @@ export function SeriesDetail(props: {
                   <button
                     type="button"
                     onClick={() => setDescExpanded((v) => !v)}
-                    className="shrink-0 rounded px-1.5 py-0.5 text-[10.5px] text-accent hover:bg-accent/10"
+                    /* BUG-269（2026-10-13 复报）：同一页面里两个「展开/收起」控件
+                       （本按钮 vs 选集器头部 `episode-picker-collapse`）此前一绿一灰、
+                       一 accent 一 muted，用户「展开按钮点击下部展开和视频右边显示稍微
+                       不一样」。统一为同一套 disclosure 外观（下方那个为准）。 */
+                    className="shrink-0 rounded px-1.5 py-0.5 text-[10.5px] font-normal text-muted hover:bg-surface-2 hover:text-fg-mid"
                     data-testid="series-desc-toggle"
                   >
                     {descExpanded ? t('media.series.descShowLess') : t('media.series.descShowMore')}
@@ -744,7 +748,29 @@ export function SeriesDetail(props: {
             - 与右栏 `episode-play` 的区分：右栏文案改「从本集开始播放」（BUG-262
               追加解读 ①：两者文案必须可区分，否则同一命令两个同文案主按钮）。
           */}
-          <div className="flex flex-wrap gap-1.5">
+          {/*
+            BUG-465：7 颗动作原先共用一个 `flex flex-wrap gap-1.5`，靠换行决定位置，
+            主次不可辨。现按性质分组（播放 / 编辑与标签 / 结构 / 导出与危险），组间用
+            细分隔线断开，破坏类独占末位。**既有 testid 一个不删**（验收脚本依赖）。
+            BUG-463：返回（页面导航）也并进这一行 —— 详情态不再为它单占一整条工具条，
+            `series-back` testid 随迁，行为与容器传入的 `onBack` 逐字等价。
+          */}
+          <div className="flex flex-wrap items-center gap-1.5" data-testid="series-actions">
+            <Button
+              /* BUG-269：映射表「取消 / 返回 → secondary（outline）」——
+                 原为 ghost，与同一行的其余次要动作两种外观。 */
+              variant={TONE_VARIANT.secondary}
+              size="sm"
+              className="h-7 shrink-0 px-2 text-[11px]"
+              onClick={props.onBack}
+              data-testid="series-back"
+            >
+              ← {t('media.series.back')}
+            </Button>
+            <span aria-hidden="true" className="h-4 w-px bg-border-subtle/70" />
+
+            {/* ① 播放类（唯一播放入口在本卡，起点 = 首个可播集；见 BUG-262 注释） */}
+            <div className="flex flex-wrap items-center gap-1.5" data-testid="series-action-play">
             <Button
               size="sm"
               className="h-7 px-2.5 text-[11px]"
@@ -764,6 +790,11 @@ export function SeriesDetail(props: {
               <Play className="h-3.5 w-3.5" />
               {t('media.series.playAll')}
             </Button>
+            </div>
+            <span aria-hidden="true" className="h-4 w-px bg-border-subtle/70" />
+
+            {/* ② 编辑与标签 */}
+            <div className="flex flex-wrap items-center gap-1.5" data-testid="series-action-edit">
             <Button
               size="sm"
               className="h-7 px-2.5 text-[11px]"
@@ -774,7 +805,7 @@ export function SeriesDetail(props: {
               {t('media.series.editMeta')}
             </Button>
             <Button
-              variant="outline"
+              variant={TONE_VARIANT.secondary}
               size="sm"
               className="h-7 px-2.5 text-[11px]"
               onClick={() => {
@@ -784,10 +815,16 @@ export function SeriesDetail(props: {
               data-testid="series-tag-edit"
             >
               <Tag className="h-3.5 w-3.5" />
-              {t('media.series.editTags')}
+              {/* BUG-465：库级是「标签管理」，剧集级必须能区分作用域（原为同义的「标签」） */}
+              {t('media.series.tagsOwn')}
             </Button>
+            </div>
+            <span aria-hidden="true" className="h-4 w-px bg-border-subtle/70" />
+
+            {/* ③ 结构类（合并 / 拆分 —— 改变剧集构成，互为逆操作） */}
+            <div className="flex flex-wrap items-center gap-1.5" data-testid="series-action-structure">
             <Button
-              variant="outline"
+              variant={TONE_VARIANT.secondary}
               size="sm"
               className="h-7 px-2 text-[11px]"
               onClick={props.onMerge}
@@ -800,7 +837,7 @@ export function SeriesDetail(props: {
             {/* D22-A⑥（BUG-292）：人工**拆剧** —— 合并的逆操作，误并的唯一出口。
                 组键统一后「同频道同名幂等同一部」，不做自动冲突弹窗，只在此显式进入。 */}
             <Button
-              variant="outline"
+              variant={TONE_VARIANT.secondary}
               size="sm"
               className="h-7 px-2 text-[11px]"
               onClick={() => {
@@ -814,8 +851,13 @@ export function SeriesDetail(props: {
               <Scissors className="h-3.5 w-3.5" />
               {t('media.series.split')}
             </Button>
+            </div>
+            <span aria-hidden="true" className="h-4 w-px bg-border-subtle/70" />
+
+            {/* ④ 导出与危险（破坏类独立末位，视觉权重最低） */}
+            <div className="flex flex-wrap items-center gap-1.5" data-testid="series-action-export">
             <Button
-              variant="outline"
+              variant={TONE_VARIANT.secondary}
               size="sm"
               className="h-7 px-2 text-[11px]"
               onClick={() => {
@@ -824,10 +866,11 @@ export function SeriesDetail(props: {
               }}
               data-testid="series-export"
             >
-              {t('media.exportPreview')}
+              {/* BUG-465：库级是「导出」，剧集级改为显式作用于本剧（原为与库级近义的「导出预览」） */}
+              {t('media.series.exportPreviewOwn')}
             </Button>
             <Button
-              variant="outline"
+              variant={TONE_VARIANT.secondary}
               size="sm"
               className="h-7 px-2 text-[11px] text-destructive"
               onClick={props.onDeleteSeries}
@@ -836,6 +879,7 @@ export function SeriesDetail(props: {
             >
               {t('media.series.delete')}
             </Button>
+            </div>
           </div>
 
           {/* 选集器：全部分集（含 photo 集，标注「图」；图片集不进播放序列 P6）。
@@ -1220,7 +1264,7 @@ export function SeriesDetail(props: {
                 <div className="flex flex-wrap items-center gap-1.5">
                   {isPhotoEpisode(cur) ? (
                     <Button
-                      variant="outline"
+                      variant={TONE_VARIANT.secondary}
                       size="sm"
                       className="h-7 px-2.5 text-[11px]"
                       disabled={!hasMediaBytes(cur)}
@@ -1238,7 +1282,7 @@ export function SeriesDetail(props: {
                   ) : null}
                   {/* 单一编辑入口（原标题行按钮下移，BUG-197/202 同一开关） */}
                   <Button
-                    variant="outline"
+                    variant={TONE_VARIANT.secondary}
                     size="sm"
                     className="h-7 px-2.5 text-[11px]"
                     onClick={editingEpisode ? closeEdit : openEdit}
@@ -1251,7 +1295,7 @@ export function SeriesDetail(props: {
                       编辑态不再渲染第二个图片入口。 */}
                   {!editingEpisode ? (
                     <Button
-                      variant="outline"
+                      variant={TONE_VARIANT.secondary}
                       size="sm"
                       className="h-7 px-2.5 text-[11px]"
                       onClick={() => setAttachingEpisodeId(cur.id)}
@@ -1262,7 +1306,7 @@ export function SeriesDetail(props: {
                     </Button>
                   ) : null}
                   <Button
-                    variant="outline"
+                    variant={TONE_VARIANT.secondary}
                     size="sm"
                     className="h-7 px-2.5 text-[11px]"
                     onClick={() => gotoItem(cur)}
@@ -1277,7 +1321,7 @@ export function SeriesDetail(props: {
                         const cand = episodeRecacheCandidates(cur)[0]
                         return (
                           <Button
-                            variant="outline"
+                            variant={TONE_VARIANT.secondary}
                             size="sm"
                             className="h-7 px-2.5 text-[11px]"
                             disabled={!cand}
@@ -1297,10 +1341,17 @@ export function SeriesDetail(props: {
                         )
                       })()
                     : null}
+                  {/* BUG-430：这两颗是**排序**（与本季上一集/下一集换位），不是
+                      「切上一集/下一集」—— 纯图标 + 只有 tooltip 让用户读成了「切换」。
+                      修法（方向 A 的最小形态）：①补**可见短文案**「上移/下移」；
+                      ②与右侧破坏性动作（从剧集删除）之间加分隔线，避免误点。
+                      文案暂用 `t()` 的 fallback 参数（本区域不新增 i18n key）——
+                      **需主控补 `media.episode.moveUpShort` / `moveDownShort`**
+                      （en：Move up / Move down），补上后此处无需再改。 */}
                   <Button
-                    variant="outline"
+                    variant={TONE_VARIANT.secondary}
                     size="sm"
-                    className="h-7 px-2 text-[11px]"
+                    className="h-7 gap-1 px-2 text-[11px]"
                     onClick={() => {
                       void (async () => {
                         try {
@@ -1312,15 +1363,17 @@ export function SeriesDetail(props: {
                         }
                       })()
                     }}
+                    aria-label={t('media.episode.moveUp')}
                     title={t('media.episode.moveUp')}
                     data-testid="episode-move-up"
                   >
                     <ChevronUp className="h-3.5 w-3.5" />
+                    {t('media.episode.moveUpShort', undefined, '上移')}
                   </Button>
                   <Button
-                    variant="outline"
+                    variant={TONE_VARIANT.secondary}
                     size="sm"
-                    className="h-7 px-2 text-[11px]"
+                    className="h-7 gap-1 px-2 text-[11px]"
                     onClick={() => {
                       void (async () => {
                         try {
@@ -1332,13 +1385,17 @@ export function SeriesDetail(props: {
                         }
                       })()
                     }}
+                    aria-label={t('media.episode.moveDown')}
                     title={t('media.episode.moveDown')}
                     data-testid="episode-move-down"
                   >
                     <ChevronDown className="h-3.5 w-3.5" />
+                    {t('media.episode.moveDownShort', undefined, '下移')}
                   </Button>
+                  {/* BUG-430：结构编辑（排序）与破坏性动作（从剧集删除）之间显式分层 */}
+                  <span aria-hidden className="mx-0.5 h-4 w-px shrink-0 bg-border-subtle" />
                   <Button
-                    variant="outline"
+                    variant={TONE_VARIANT.secondary}
                     size="sm"
                     className="h-7 px-2.5 text-[11px] text-destructive"
                     onClick={() => props.onRemoveEpisode(cur)}
@@ -1659,7 +1716,8 @@ export function SeriesDetail(props: {
               ))}
             </div>
             <div className="mt-3 flex justify-end">
-              <Button variant="ghost" size="sm" onClick={() => setSourcePick(null)}>
+              {/* BUG-269：取消 = 次要动作 → secondary（与对话框底部同一形态） */}
+              <Button variant={TONE_VARIANT.secondary} size="sm" onClick={() => setSourcePick(null)}>
                 {t('media.cancel')}
               </Button>
             </div>
@@ -1772,8 +1830,9 @@ export function SeriesDetail(props: {
                 {t('media.series.splitSelected', { n: splitSelected.length })}
               </span>
               <div className="flex gap-2">
+                {/* BUG-269：取消 = 次要动作 → secondary（与右侧确认同一形态，不再一 ghost 一 outline） */}
                 <Button
-                  variant="ghost"
+                  variant={TONE_VARIANT.secondary}
                   size="sm"
                   disabled={splitting}
                   onClick={() => setSplitOpen(false)}
@@ -1781,7 +1840,7 @@ export function SeriesDetail(props: {
                   {t('media.cancel')}
                 </Button>
                 <Button
-                  variant="outline"
+                  variant={TONE_VARIANT.secondary}
                   size="sm"
                   disabled={splitting || splitSelected.length === 0}
                   onClick={submitSplit}

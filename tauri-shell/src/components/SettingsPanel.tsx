@@ -28,7 +28,8 @@ import {
 import { isTauri, copyToClipboard } from '../lib/env'
 import { CacheManagerDialog } from './CacheManagerDialog'
 import { useStore } from '../store/useStore'
-import { useTranslation } from '../i18n'
+import { useTranslation, t } from '../i18n'
+import { displayPath } from '../lib/pathDisplay'
 import { fmtSize } from '../lib/tgmedia'
 import { cn } from '../lib/utils'
 import type { SettingsSection } from '../nav'
@@ -49,8 +50,10 @@ import type { SettingsSection } from '../nav'
  *     下载目录，二者不可能再分家。
  */
 const SECTIONS: { id: SettingsSection; labelKey: string; descKey: string }[] = [
-  { id: 'general', labelKey: 'sec.general', descKey: 'sec.general.desc' },
+  // BUG-337：下载与存储是最高频决策面（目录、分类都在这里），置首位并作为默认
+  // 落地页；「通用」收外观与行为，频次低，排在其后。
   { id: 'downloads', labelKey: 'sec.downloads', descKey: 'sec.downloads.desc' },
+  { id: 'general', labelKey: 'sec.general', descKey: 'sec.general.desc' },
   { id: 'network', labelKey: 'sec.network', descKey: 'sec.network.desc' },
   { id: 'engine', labelKey: 'sec.engine', descKey: 'sec.engine.desc' },
   { id: 'telegram', labelKey: 'sec.telegram', descKey: 'sec.telegram.desc' },
@@ -95,6 +98,20 @@ function sharePct(isPrimary: boolean, cardCount: number): number {
   const total = cardCount + 1 // N+1
   const parts = isPrimary ? 2 : 1
   return Math.round((parts / total) * 100)
+}
+
+/**
+ * BUG-335：「即时生效」标记。
+ *
+ * 这些控件直接写本地 store（主题 / 语言 / 开机自启 / 通知），**不受**底部保存键
+ * 管辖；不加标记时用户只能靠试（改完切走再回来）推断哪套语义生效。
+ */
+function InstantBadge() {
+  return (
+    <Badge variant="secondary" className="ml-2 align-middle text-[10px]">
+      {t('settings.instant')}
+    </Badge>
+  )
 }
 
 interface CategoryRow {
@@ -148,7 +165,7 @@ export function SettingsPanel({
   /** 近期重启窗口：15 分钟内重启过 ⇒ 状态点转琥珀色（它是「莫名挂了」的直接来源） */
   const tgRecentlyRestarted =
     !!tgHealth?.last_restart_at && Date.now() / 1000 - tgHealth.last_restart_at < 900
-  const [activeTab, setActiveTab] = useState<SettingsSection>(section ?? 'general')
+  const [activeTab, setActiveTab] = useState<SettingsSection>(section ?? 'downloads')
   /**
    * 分区锚点受控同步（M0-T07）：外部（`navigate('settings',{section})`）改分区时
    * 面板跟着走。用 `!==` 比较而非无条件 setState —— 无条件 set 每次渲染都写一次，
@@ -449,9 +466,10 @@ export function SettingsPanel({
       // （BUG-167 约定），否则「界面改了、引擎没跟上」又得用户自己去猜。
       if (!r.tg_synced) {
         setError(
+          // BUG-141：文案走 i18n（此前字面量中文，切 en-US 时此处混排中文）。
           r.tg_error
-            ? `下载路径已保存，但 Telegram 服务未同步：${r.tg_error}`
-            : '下载路径已保存，但 Telegram 服务未同步（orig-tg 不可达）',
+            ? t('downloads.dirSavedTgUnsynced', { reason: r.tg_error })
+            : t('downloads.dirSavedTgUnreachable'),
         )
       }
     } catch (e) {
@@ -527,9 +545,10 @@ export function SettingsPanel({
   const degradeToCopyPath = async (target: string) => {
     const copied = await copyToClipboard(target)
     setNativeHint(
+      // BUG-141：文案走 i18n，不再直接拼中文字面量。
       copied
-        ? `网页调试模式不支持打开系统文件夹，路径已复制：${target}`
-        : `网页调试模式不支持打开系统文件夹，路径：${target}`,
+        ? t('settings.openPathWebCopied', { path: target })
+        : t('settings.openPathWebOnly', { path: target }),
     )
   }
 
@@ -679,12 +698,24 @@ export function SettingsPanel({
                 <SectionDesc>{t('downloads.sub')}</SectionDesc>
               </div>
 
+              {/*
+                BUG-333（用户裁定方案 A · 主次分层）：本区**唯一**需要用户决策的是
+                「下载路径」；库根 = 它的派生值、管理范围 = 它的注脚。此前三个目录名词
+                同字号同权重平铺成三张平级卡，用户只能靠猜决定改哪个。
+              */}
               <SectionCard>
-                {/* 默认下载目录：标题在上，路径框全宽（重新排版） */}
                 <div>
-                  <div className="flex items-center justify-between">
-                    <p className="text-[13px] font-medium text-fg-strong">{t('downloads.dir')}</p>
-                    <p className="text-[11px] text-muted">{t('downloads.dirHint')}</p>
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-[13px] font-medium text-fg-strong">
+                        {t('downloads.dirCardTitle')}
+                        {/* BUG-335：显式标注本卡属于「显式保存」语义（与即时生效的开关区分）。 */}
+                        <Badge variant="outline" className="ml-2 align-middle text-[10px]">
+                          {t('settings.needsSave')}
+                        </Badge>
+                      </p>
+                      <p className="mt-0.5 text-[11px] text-muted">{t('downloads.dirCardHint')}</p>
+                    </div>
                   </div>
                   <div className="mt-2" data-testid="download-dir-picker">
                     <DirectoryPicker
@@ -700,7 +731,7 @@ export function SettingsPanel({
                   <p className="mt-1.5 text-[11px] leading-relaxed text-muted" data-testid="download-dir-effective">
                     {t('downloads.dirEffective')}
                     <span className="ml-1 font-mono text-fg-mid">
-                      {effectiveRoot || dir || manualRoot || defaultDir || '—'}
+                      {displayPath(effectiveRoot || dir || manualRoot || defaultDir) || '—'}
                     </span>
                   </p>
                   <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
@@ -710,21 +741,20 @@ export function SettingsPanel({
 
                 <div className="h-px bg-border-subtle/60" />
 
-                {/* 库根（BUG-323）：`<下载路径>/library` 的**派生值** —— 只读展示。
+                {/* 库根（BUG-323 + BUG-333）：`<下载路径>/library` 的**派生值**，
+                    降级为主卡内的一行只读注脚 —— 它的来源关系直接写在行首，
+                    不再是一张与「下载路径」平级的卡（并列会让用户以为它能单独改）。
                     刻意没有编辑入口：库根脱离下载路径在结构上就不可表达（用户裁定
                     「库根跟下载走，所有文件不允许脱离下载路径」）。想换库根 = 换下载目录。 */}
                 <div>
-                  <div className="flex items-center justify-between">
-                    <p className="text-[13px] font-medium text-fg-strong">{t('downloads.libDir')}</p>
-                    <p className="text-[11px] text-muted">{t('downloads.libDirHint')}</p>
-                  </div>
-                  <div className="mt-2 flex items-start gap-2">
+                  <p className="text-[12px] text-fg-mid">{t('downloads.libDerived')}</p>
+                  <div className="mt-1.5 flex items-start gap-2">
                     <div
                       className="min-w-0 flex-1 truncate rounded-md border border-border-subtle bg-surface-2/40 px-3 py-2 font-mono text-xs text-fg-mid"
                       data-testid="lib-root-readonly"
-                      title={libRoot}
+                      title={displayPath(libRoot)}
                     >
-                      {libRoot || '—'}
+                      {displayPath(libRoot) || '—'}
                     </div>
                     <Button
                       variant="outline"
@@ -745,20 +775,23 @@ export function SettingsPanel({
                       {nativeHint}
                     </p>
                   )}
-                  <p className="mt-1.5 text-[11px] leading-relaxed text-muted">
-                    {t('downloads.libDirNote')}
-                  </p>
                 </div>
+              </SectionCard>
 
-                <div className="h-px bg-border-subtle/60" />
-
-                {/* 受管目录（BUG-323 Stage 2，2026-10-19 补齐）：下载单根 /
-                    管理多根。下载根 locked 只读；用户根可增删、可设主。
-                    主根 = 管理视图默认选中，**不**决定下载落点、不重定向写入（R3′）。 */}
-                <div data-testid="managed-roots">
-                  <div className="flex items-center justify-between">
-                    <p className="text-[13px] font-medium text-fg-strong">
+              {/*
+                受管目录（BUG-323 Stage 2，2026-10-19 补齐）：下载单根 / 管理多根。
+                下载根 locked 只读；用户根可增删、可设主。
+                主根 = 管理视图默认选中，**不**决定下载落点、不重定向写入（R3′）。
+                BUG-333：降级为**次级卡**（标题小一级 + 只读引导文案）—— 它是下载路径
+                派生出的管理范围，不是第二个可改的「下载目录」。
+              */}
+              <SectionCard data-testid="managed-roots">
+                <div>
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[12px] font-medium text-fg-mid">
                       {t('downloads.managedTitle')}
+                      {/* BUG-335：受管根的增删/设主调端点即刻生效，与底部保存键无关。 */}
+                      <InstantBadge />
                     </p>
                     <p className="text-[11px] text-muted">{t('downloads.managedHint')}</p>
                   </div>
@@ -781,9 +814,9 @@ export function SettingsPanel({
                       >
                         <span
                           className="min-w-0 flex-1 truncate rounded-md border border-border-subtle bg-surface-2/40 px-3 py-1.5 font-mono text-xs text-fg-mid"
-                          title={r.path}
+                          title={displayPath(r.path)}
                         >
-                          {r.path}
+                          {displayPath(r.path)}
                         </span>
                         {r.primary && (
                           <Badge variant="secondary" className="shrink-0">
@@ -856,13 +889,20 @@ export function SettingsPanel({
                     {t('downloads.managedNote')}
                   </p>
                 </div>
+              </SectionCard>
 
-                <div className="h-px bg-border-subtle/60" />
-
+              {/* BUG-333：并发与分类与「目录」是两件事，独立成卡 —— 免得它们被读成
+                  第三个「下载目录」概念（此前同卡相邻，正是名词混淆的来源之一）。 */}
+              <SectionCard>
                 {/* 最大连接数 */}
                 <div className="flex items-center justify-between gap-4">
                   <div className="min-w-0">
-                    <p className="text-[13px] font-medium text-fg-strong">{t('downloads.conn')}</p>
+                    <p className="text-[13px] font-medium text-fg-strong">
+                      {t('downloads.conn')}
+                      <Badge variant="outline" className="ml-2 align-middle text-[10px]">
+                        {t('settings.needsSave')}
+                      </Badge>
+                    </p>
                     <p className="mt-0.5 text-[11px] text-muted">{t('downloads.connHint')}</p>
                   </div>
                   <Stepper value={maxConnections} onChange={setMaxConnections} min={1} max={64} />
@@ -874,7 +914,12 @@ export function SettingsPanel({
                 <div>
                   <div className="flex items-center justify-between gap-4">
                     <div className="min-w-0">
-                      <p className="text-[13px] font-medium text-fg-strong">{t('downloads.classify')}</p>
+                      <p className="text-[13px] font-medium text-fg-strong">
+                        {t('downloads.classify')}
+                        <Badge variant="outline" className="ml-2 align-middle text-[10px]">
+                          {t('settings.needsSave')}
+                        </Badge>
+                      </p>
                       <p className="mt-0.5 text-[11px] text-muted">
                         {t('downloads.classifyHint')}
                       </p>
@@ -1012,7 +1057,11 @@ export function SettingsPanel({
                   <div>
                     <div className="flex items-center justify-between gap-4">
                       <div className="min-w-0">
-                        <p className="text-[13px] font-medium text-fg-strong">{t('tg.toggle')}</p>
+                        <p className="text-[13px] font-medium text-fg-strong">
+                          {t('tg.toggle')}
+                          {/* BUG-335：插件启停直接拉起/终止服务，即时生效。 */}
+                          <InstantBadge />
+                        </p>
                         <p className="mt-0.5 text-[11px] text-muted">{t('tg.toggleHint')}</p>
                       </div>
                       <div className="flex shrink-0 items-center gap-2">
@@ -1122,7 +1171,12 @@ export function SettingsPanel({
               <SectionCard>
                 <div className="flex items-center justify-between gap-4">
                   <div className="min-w-0">
-                    <p className="text-[13px] font-medium text-fg-strong">{t('network.nics')}</p>
+                    <p className="text-[13px] font-medium text-fg-strong">
+                      {t('network.nics')}
+                      <Badge variant="outline" className="ml-2 align-middle text-[10px]">
+                        {t('settings.needsSave')}
+                      </Badge>
+                    </p>
                     <p className="mt-0.5 text-[11px] text-muted">
                       {t('network.nicsHint')}
                     </p>
@@ -1194,7 +1248,13 @@ export function SettingsPanel({
           {activeTab === 'network' && (
             <div className="mx-auto max-w-2xl space-y-6" data-sec="network-proxy">
               <SectionCard>
-                <SectionTitle>{t('proxy.heading')}</SectionTitle>
+                <SectionTitle>
+                  {t('proxy.heading')}
+                  {/* BUG-335：代理属「显式保存」语义（底部保存键 / 本卡「保存并生效」）。 */}
+                  <Badge variant="outline" className="ml-2 align-middle text-[10px]">
+                    {t('settings.needsSave')}
+                  </Badge>
+                </SectionTitle>
                 <SectionDesc>{t('proxy.sub')}</SectionDesc>
                 {/* 模式选择 */}
                 <div>
@@ -1249,7 +1309,7 @@ export function SettingsPanel({
                   <Input
                     value={proxyUrl}
                     onChange={(e) => setProxyUrl(e.target.value)}
-                    placeholder="http://127.0.0.1:7897 或 socks5://127.0.0.1:1080"
+                    placeholder={t('proxy.addrPlaceholder')}
                     disabled={proxyMode !== 'custom'}
                     className={cn('mt-2 w-full font-mono', proxyMode !== 'custom' && 'opacity-50')}
                   />
@@ -1317,7 +1377,10 @@ export function SettingsPanel({
               <SectionCard>
                 {/* 主题：卡片式选择，即时生效 */}
                 <div>
-                  <p className="text-[13px] font-medium text-fg-strong">{t('general.theme')}</p>
+                  <p className="text-[13px] font-medium text-fg-strong">
+                    {t('general.theme')}
+                    <InstantBadge />
+                  </p>
                   <p className="mt-0.5 text-[11px] text-muted">{t('general.themeHint')}</p>
                   <div className="mt-3 grid grid-cols-3 gap-2">
                     {themeOptions.map((opt) => (
@@ -1363,7 +1426,10 @@ export function SettingsPanel({
 
                 {/* 语言：卡片式选择，即时生效 */}
                 <div>
-                  <p className="text-[13px] font-medium text-fg-strong">{t('general.language')}</p>
+                  <p className="text-[13px] font-medium text-fg-strong">
+                    {t('general.language')}
+                    <InstantBadge />
+                  </p>
                   <p className="mt-0.5 text-[11px] text-muted">{t('general.languageHint')}</p>
                   <div className="mt-3 grid grid-cols-2 gap-2">
                     {supported.map((opt) => (
@@ -1388,7 +1454,10 @@ export function SettingsPanel({
                 {/* 启动行为 */}
                 <div className="flex items-center justify-between gap-4">
                   <div className="min-w-0">
-                    <p className="text-[13px] font-medium text-fg-strong">{t('general.autoStart')}</p>
+                    <p className="text-[13px] font-medium text-fg-strong">
+                      {t('general.autoStart')}
+                      <InstantBadge />
+                    </p>
                     <p className="mt-0.5 text-[11px] text-muted">{t('general.autoStartHint')}</p>
                   </div>
                   <Switch
@@ -1399,7 +1468,10 @@ export function SettingsPanel({
                 <div className="h-px bg-border-subtle/60" />
                 <div className="flex items-center justify-between gap-4">
                   <div className="min-w-0">
-                    <p className="text-[13px] font-medium text-fg-strong">{t('general.notify')}</p>
+                    <p className="text-[13px] font-medium text-fg-strong">
+                      {t('general.notify')}
+                      <InstantBadge />
+                    </p>
                     <p className="mt-0.5 text-[11px] text-muted">{t('general.notifyHint')}</p>
                   </div>
                   <Switch
@@ -1582,7 +1654,7 @@ export function SettingsPanel({
                   className="break-all rounded-md bg-surface-2 px-3 py-2 font-mono text-[11px] text-fg-mid"
                   data-testid="about-logs-dir"
                 >
-                  {logPaths?.dir ?? t('about.logsUnavailable')}
+                  {logPaths?.dir ? displayPath(logPaths.dir) : t('about.logsUnavailable')}
                 </p>
                 {nativeHint && (
                   <p
@@ -1610,11 +1682,17 @@ export function SettingsPanel({
         {/* 全局底部操作：作用于整个设置页（所有 Tab） */}
         <div className="border-t border-border-subtle/60 bg-surface/60 px-6 py-3">
           <div className="mx-auto flex max-w-2xl items-center justify-between gap-2">
-            <p className="text-[11px] text-muted">
-              {activeTab === 'general'
-                ? t('settings.saveHintGeneral')
-                : t('settings.saveHintOther')}
-            </p>
+            {/* BUG-335：保存键的**作用范围**必须写在键旁。此前只写「作用于整个设置页」，
+                而实际只有 目录/分类/网卡/代理 走显式保存，主题等开关是即时生效的 ——
+                口径不说清，用户就分不清「改了没生效」是 bug 还是没点保存。 */}
+            <div className="min-w-0">
+              <p className="text-[11px] text-muted">{t('settings.saveScope')}</p>
+              <p className="mt-0.5 text-[10px] text-muted">
+                {activeTab === 'general'
+                  ? t('settings.saveHintGeneral')
+                  : t('settings.saveHintOther')}
+              </p>
+            </div>
             <div className="flex gap-2">
               <Button variant="ghost" onClick={handleReset}>
                 {t('settings.reset')}

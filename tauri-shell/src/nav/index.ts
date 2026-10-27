@@ -174,7 +174,7 @@ export const DEFAULT_NAV: NavState = {
   view: 'files',
   dlFilter: 'all',
   fmode: 'cat-all',
-  section: 'general',
+  section: 'downloads',
   tgMode: DEFAULT_TG_MODE,
 }
 
@@ -189,8 +189,8 @@ export type SettingsSection =
   | 'about'
 
 export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
-  'general',
   'downloads',
+  'general',
   'network',
   'engine',
   'telegram',

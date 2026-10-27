@@ -5,6 +5,7 @@ import { patchSeries, setSeriesTags } from '../../api/media'
 import type { MediaSeriesDetail, MediaTag } from '../../api/media'
 import { TagPicker } from './TagManagerDialog'
 import { useTranslation } from '../../i18n'
+import { cleanTitle } from '../../lib/titleClean'
 
 /**
  * 剧集编辑面板：`title` / `description` / `year` / `tags` **一次提交**（R10）。
@@ -39,6 +40,8 @@ export function SeriesEditPanel(props: {
   const { t } = useTranslation()
   const { series, tags, onClose, onSaved, onError, onCreateTag } = props
   const [title, setTitle] = useState(series.title)
+  /** BUG-264 D1-a：清理剥空时提示「这条需要手工命名」，而不是静默保留/写空 */
+  const [cleanFellBack, setCleanFellBack] = useState(false)
   const [desc, setDesc] = useState(series.description ?? '')
   const [year, setYear] = useState(series.year != null ? String(series.year) : '')
   /**
@@ -115,6 +118,30 @@ export function SeriesEditPanel(props: {
             autoFocus
             data-testid="series-title-input"
           />
+          {/* BUG-264 D1-a（用户拍板）：清理是**用户点的按钮**，结果填回输入框，
+              可预览/手改/放弃；保存路径一行不改，所以不存在「没看清就被改名」。
+              剥空回退原值并提示，绝不写空（空标题在列表里是不可辨识条目，BUG-240）。 */}
+          <span className="flex items-center gap-2">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-6 px-2 text-[11px]"
+              onClick={() => {
+                const r = cleanTitle(title)
+                setTitle(r.text)
+                setCleanFellBack(r.fellBack)
+              }}
+              data-testid="series-title-clean"
+            >
+              {t('media.title.clean')}
+            </Button>
+            {cleanFellBack && (
+              <span className="text-[11px] text-warning" data-testid="series-title-clean-empty">
+                {t('media.title.cleanEmpty')}
+              </span>
+            )}
+          </span>
         </label>
 
         <label className="flex flex-col gap-1 text-[11px] text-muted">

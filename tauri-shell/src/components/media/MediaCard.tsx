@@ -358,13 +358,28 @@ function MediaCardBase(props: {
    * seriesEpisodeCount），故这里无需再拼上下文。此前直接 `item.title` 会让卡片名
    * 与剧集详情、播放器各说各话（BUG-310 的原象）。
    */
-  const displayName = resolveDisplayName({ item, fallback: item.title })
+  const resolved = resolveDisplayName({ item, fallback: item.title })
+  /**
+   * BUG-240：**空标题必须有可辨识兜底**。
+   *
+   * 实测 86/320 条 TG 条目 `title` 为空（入库没落 caption，上游见 BUG-232），
+   * 五层解析也取不到任何名字时卡片标题行渲染空串 ⇒ 一屏几十张「同形无字卡」，
+   * 用户直接报成「大量重复数据」（其实 id/ref 全唯一）。这里补 `未命名 · #<id>`：
+   * id 全局唯一 ⇒ 任意两张卡片的可见标题不再逐字相同（判据 1），
+   * 且 `#<id>` 与「条目 #N」的行内叫法同源，用户能据此回查。
+   * 无字节态的区分标记由下方 `item-nobytes` 区块与根节点 `data-bytes` 承担（判据 2）。
+   */
+  const displayName = resolved.trim() || `${t('player.untitled')} · #${item.id}`
 
   return (
     <div
       ref={boxRef}
       data-testid="media-card"
       data-item-id={item.id}
+      /* BUG-240 判据 2：字节态要能被机检（不读 className / 文案）。 */
+      data-bytes={playable ? 'present' : 'missing'}
+      /* BUG-240 判据 1：标题走兜底时留痕，脚本可据此断言「兜底生效」。 */
+      data-unnamed={resolved.trim() ? undefined : 'true'}
       className={[
         'group relative flex flex-col overflow-hidden rounded-lg border bg-surface transition-colors',
         selected

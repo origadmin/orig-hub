@@ -69,6 +69,33 @@ enforced-by: AGENTS.md（强制引用）+ 门禁脚本 + 验收探针
 2. 计数必须有**作用域可见性**：作用域受限的 0 必须自带解释（BUG-390）。
 3. 单一真源：同一事实（谓词/常量/口径）只有一处定义，其余引用；禁止复制粘贴式同步。
 
+## 6. 本地钩子：装了没用 ≠ 装了（BUG-158）
+
+1. 安装：`sh scripts/install-hooks.sh`。脚本**由自身位置推仓根**（不用
+   `git rev-parse --show-toplevel`），发现当前目录不是本仓的 worktree 顶层就**直接失败** ——
+   装进超仓的 `.git/hooks` 等于没装。
+2. 脚本只用 `git config --local` 把 `core.hooksPath` 钉到**本仓自己**的钩子目录，
+   绝不写 `--global` / `--system`，也不动超仓（framework）的配置。
+3. 排查任何「钩子没拦」的第一步：`git rev-parse --path-format=absolute --git-path hooks`。
+   `NUL` 是 Windows 空设备名 —— 一旦 `core.hooksPath=NUL`，git **只**去那个不存在的目录找钩子，
+   静默什么都不跑（本仓历史上就是这样恒不生效的）。
+4. 「已安装」只认可执行证据：`git hook run commit-msg -- <msgfile>` 必须真的执行；
+   用一条中文提交信息验红、一条英文验绿（同一环境内两条都要成立，只验一条会被恒拒/恒过骗过）。
+
+## 7. 文案与语种：加一个语言包，不改代码（BUG-236 / BUG-141）
+
+1. **新增语种 = 放一个文件**：`tauri-shell/src/i18n/locales/<BCP-47>.json`（如 `de-DE.json`）。
+   语言包的键集合由目录自动发现（`import.meta.glob`），语言选择列表、缺键回退链
+   （当前语种 → `zh-CN` → 调用方 fallback → key）都在 `i18n/index.ts` 一处，无需改代码。
+2. 新语种必须**键完备**：缺的键运行期会回退 `zh-CN`（不会渲染空白），但
+   `python scripts/check-i18n-keys.py` 按所有语种的并集比对，缺键即红 —— 回退是兜底，
+   不是「可以只翻一半」的许可。该门禁同时校验占位符一致（`{name}` 改名会直出花括号）与空值。
+3. **禁止硬编码文案**：`python scripts/check_i18n_hardcoded.py` 扫描非注释行的中文字面量；
+   新增/修改 UI 文案一律 `t('ns.key')` 并同时补 `zh-CN` / `en-US`。
+4. 组件内用 `useTranslation()`（订阅 `settings.language`），不要裸 `t()`
+   —— `t` 不订阅语言，被 `memo` 包住的组件切语种不会重渲染。纯函数模块可以用 `t()`
+   （调用方组件负责订阅）。
+
 ## 三级验收（BUG-402，2026-10-23 用户裁定）
 
 开发完成后的验证**只按下面三档走**，不许漫跑全量、不许凭感觉挑：

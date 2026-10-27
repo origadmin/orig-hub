@@ -257,6 +257,11 @@ export function EpisodeExpanded(props: {
           <ImagePlus className="h-3 w-3" />
           {t('media.attachImages')}
         </Button>
+        {/* BUG-430：本组件当前是**孤儿**（全仓 0 处 JSX 使用，仅注释引用），
+            故与 `SeriesDetail` 动作条的同名 testid（`episode-move-up/down`）
+            不会同时出现在 DOM 里；唯一可见入口在 `SeriesDetail`（已补可见文案 +
+            与删除动作分层）。保留本文件不删（BUG-149：撤入口不等于丢能力），
+            若日后重新启用本组件，必须删掉这里的排序按钮而不是再挂第二份 testid。 */}
         <Button
           variant="outline"
           size="sm"

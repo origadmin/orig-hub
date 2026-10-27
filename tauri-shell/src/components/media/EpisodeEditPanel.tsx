@@ -3,6 +3,7 @@ import { Button } from '../ui/button'
 import { detachEpisodeImage, mediaItemUrl, patchEpisode } from '../../api/media'
 import type { MediaEpisode, MediaSeriesDetail } from '../../api/media'
 import { useTranslation } from '../../i18n'
+import { HintBubble } from './HintBubble'
 
 /**
  * 单集编辑面板：**标题 + 介绍 + 槽位（季号/集号/结束集号）一次提交**。
@@ -43,6 +44,23 @@ export function EpisodeEditPanel(props: {
   const [busy, setBusy] = useState(false)
   /** 图片摘除进行中：禁用全部 × 按钮，避免并发摘除把缩略图列表改乱（BUG-204） */
   const [imgBusy, setImgBusy] = useState(false)
+  /** BUG-460：本剧槽位一览默认收起 —— 常态不占版面，要看序列时再展开 */
+  const [slotsOpen, setSlotsOpen] = useState(false)
+  /** BUG-460：批量顺延步长（自本集起整体后移 N 位） */
+  const [shift, setShift] = useState('1')
+
+  /**
+   * BUG-460：撞号预告。后端在目标槽被占用时**对调**两条（见 `save` 注释），
+   * 但原 UI 完全没有表达 ⇒ 用户只能保存后才发现两集换了位置。
+   * 这里只做**提示**，不拦提交（对调是后端已能正确处理的行为，拦下反而是假报错）。
+   */
+  const slotConflict = props.series.episodes.some(
+    (e) => e.id !== ep.id && e.season === Number(season) && e.episodeNo === Number(no),
+  )
+  /** 同季、集号 ≥ 本集的那些集 —— 批量顺延的作用面（按集号倒序应用，见下） */
+  const shiftTargets = props.series.episodes.filter(
+    (e) => e.season === ep.season && e.episodeNo >= ep.episodeNo,
+  )
 
   /**
    * 保存本集：**标题 + 介绍 + 槽位**一次提交。
@@ -116,6 +134,34 @@ export function EpisodeEditPanel(props: {
   }
 
   /**
+   * BUG-460：**批量应用** —— 自本集起（同季、集号 ≥ 本集）整体后移 N 位。
+   *
+   * 为什么是壳层实现：后端只有单集写（`patchEpisode`），但这属于「N 次串行提交」
+   * 的降级实现，不新增端点、不改数据模型（BUG-460 选项 A 明列该路径）。
+   * 必须**按集号倒序**提交：正序时第 3 集先挪到 4，会撞上尚未移动的第 4 集并触发
+   * 后端对调 —— 倒序保证目标槽永远空着，结果与用户预期一致。
+   */
+  const shiftFromHere = async () => {
+    const step = Number(shift)
+    if (!Number.isInteger(step) || step < 1) {
+      onError(t('media.episode.errSlot'))
+      return
+    }
+    const ordered = [...shiftTargets].sort((a, b) => b.episodeNo - a.episodeNo)
+    setBusy(true)
+    try {
+      for (const e of ordered) {
+        await patchEpisode(e.id, { episodeNo: e.episodeNo + step })
+      }
+      onSaved()
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /**
    * 摘除单张已挂接图片（BUG-204）：DELETE /api/media/episodes/:id/images/:itemId。
    * 只重取详情（`onChanged`）刷新缩略图列表，**不**退出编辑态、不丢草稿 ——
    * 否则用户刚挂好的标题/介绍一并丢失，等于「改图必须先重填本集」。
@@ -134,8 +180,11 @@ export function EpisodeEditPanel(props: {
 
   return (
     <div className="flex flex-col gap-2" data-testid="episode-edit-panel">
-      {/* P5 / R11：改写范围说明**只在面板内**，不进行态 */}
-      <p className="text-[10px] leading-relaxed text-muted">{t('media.episode.editAffectsAll')}</p>
+      {/* P5 / R11：改写范围说明**只在面板内**且**不常驻** —— BUG-461：收进带圈 ?
+          按钮，点击后短时显示（文案原样保留，不再每次打开都占一行）。 */}
+      <div className="flex items-center gap-1.5">
+        <HintBubble text={t('media.episode.editAffectsAll')} />
+      </div>
 
       {/* 可见标签：标题**可改可清空**这件事必须看得见（此前只有 placeholder，
           用户据此认为「标题不能修改」，见 BUG-200） */}
@@ -188,7 +237,85 @@ export function EpisodeEditPanel(props: {
           data-testid="episode-end-input"
           className="h-6 w-24 rounded-md border border-border-subtle bg-surface px-1.5 text-[11px] text-fg-strong"
         />
-        <span className="text-[10px] text-muted/80">{t('media.episode.endHintRow')}</span>
+        {/* BUG-461：结束集号说明从「与输入框同行的常驻小字」改为带圈 ? 短时气泡 */}
+        <HintBubble text={t('media.episode.endHintRow')} />
+      </div>
+
+      {/* BUG-460：撞号预告（只提示，不拦提交 —— 后端对调是既定行为） */}
+      {slotConflict ? (
+        <p className="text-[10px] leading-relaxed text-amber-500" data-testid="episode-slot-conflict">
+          {t('media.episode.slotTaken', { season, no })}
+        </p>
+      ) : null}
+
+      {/* BUG-460：序列视角 —— 一张「本剧槽位」一览，先看占用再改号（默认收起，不占版面） */}
+      <div className="flex flex-col gap-1">
+        <button
+          type="button"
+          onClick={() => setSlotsOpen((v) => !v)}
+          aria-expanded={slotsOpen}
+          className="self-start rounded px-1.5 py-0.5 text-[10.5px] text-accent hover:bg-accent/10"
+          data-testid="episode-slots-toggle"
+        >
+          {t('media.episode.slotsOwn')} · {props.series.episodes.length}
+        </button>
+        {slotsOpen ? (
+          <div className="flex flex-wrap gap-1" data-testid="episode-slots">
+            {props.series.episodes.map((e) => {
+              const on = e.id === ep.id
+              // 与当前输入值撞号的那一条标红：改号前就能看见「谁会被换」
+              const clash = !on && e.season === Number(season) && e.episodeNo === Number(no)
+              const label = `S${e.season}E${e.episodeNo}${
+                e.episodeNoEnd != null ? `-${e.episodeNoEnd}` : ''
+              }`
+              return (
+                <span
+                  key={e.id}
+                  title={e.title ?? ''}
+                  data-testid={`episode-slot-chip-${e.id}`}
+                  data-current={on ? '1' : '0'}
+                  data-clash={clash ? '1' : '0'}
+                  className={`rounded px-1.5 py-0.5 text-[10px] tabular-nums ${
+                    on
+                      ? 'bg-accent text-white'
+                      : clash
+                        ? 'bg-amber-500/15 text-amber-500'
+                        : 'bg-surface-2 text-muted'
+                  }`}
+                >
+                  {label}
+                </span>
+              )
+            })}
+          </div>
+        ) : null}
+      </div>
+
+      {/* BUG-460：多集编辑不再 N 次开面板 —— 自本集起整体顺延，一次应用
+          （串行 patchEpisode，倒序提交；见 `shiftFromHere` 注释） */}
+      <div className="flex flex-wrap items-center gap-1.5 border-t border-border-subtle/60 pt-2 text-[11px] text-muted">
+        <span>{t('media.episode.shiftFrom')}</span>
+        <input
+          type="number"
+          min={1}
+          value={shift}
+          onChange={(e) => setShift(e.target.value)}
+          aria-label={t('media.episode.shiftBy')}
+          data-testid="episode-shift-step"
+          className="h-6 w-14 rounded-md border border-border-subtle bg-surface px-1.5 text-[11px] text-fg-strong"
+        />
+        <span>{t('media.episode.shiftUnit')}</span>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-6 px-2 text-[11px]"
+          disabled={busy || shiftTargets.length === 0}
+          onClick={() => void shiftFromHere()}
+          title={t('media.episode.shiftHint')}
+          data-testid="episode-shift-apply"
+        >
+          {t('media.episode.shiftApply', { count: shiftTargets.length })}
+        </Button>
       </div>
 
       {/* BUG-204：图片纳入统一编辑 —— 「编辑所有内容」名实相符。

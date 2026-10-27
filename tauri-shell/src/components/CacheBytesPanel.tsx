@@ -26,7 +26,12 @@ import type { CacheClearPreview } from '../api/tg'
 
 type ScopeKey = 'all' | 'orphan' | 'stale' | 'failed'
 
-/** 待确认的清理：整档（`scope`）或勾选集合（`ids`），两者互斥（与后端契约一致）。 */
+/**
+ * 待确认的清理：整档（`scope`）或勾选集合（`ids`），两者互斥（与后端契约一致）。
+ *
+ * BUG-222：`scope` 不再是「分档按钮的默认出口」—— 分档改为**装载选择集**（`loadTier`），
+ * 整档只剩两种**无法枚举成 id** 的兜底：孤儿文件（磁盘上没有条目指向）与预览明细被截断。
+ */
 type Pending = { kind: 'scope'; scope: ScopeKey } | { kind: 'ids'; ids: number[] } | null
 
 /** 陈旧档阈值（天）。写死为常量而非输入框：多一个自由输入就多一种误清刚下内容的方式。 */
@@ -221,6 +226,46 @@ export function CacheBytesPanel(props: {
       return next
     })
 
+  /**
+   * BUG-222：分档按钮从「直接构造清理目标」改为「**装载到选择集**」。
+   *
+   * 原缺陷：分档按钮写 `pending={kind:'scope'}`，勾选集 `sel` 随即**不参与执行**——
+   * 用户先点「频道 A」chip 再点「清理全部」，执行的是 scope=all，勾选被静默丢弃，
+   * 最直觉的路径直通最危险的结果。现在一屏只有**一个选择域**（`sel`）：
+   * 分档 = 一种装载方式，与逐行勾选、整频道勾选作用于同一个集合。
+   *
+   * 两处例外必须如实说明，不能假装能装：
+   *  - **孤儿档**是「磁盘上有、库里没有任何条目指向」的文件，没有 item id 可装载
+   *    ⇒ 仍走 scope=orphan 的整档确认条（确认条会复述来源）；
+   *  - 预览明细被截断（`itemsTruncated`）或明细里一条都没有时，装载会**少清**
+   *    （用户以为清了全部、其实只清了一页）⇒ 同样退回整档确认条，绝不假装全选。
+   */
+  const loadTier = (key: ScopeKey) => {
+    if (!preview) return
+    const stat =
+      key === 'all'
+        ? preview.total
+        : key === 'orphan'
+          ? preview.orphan
+          : key === 'stale'
+            ? preview.stale
+            : preview.failed
+    const ids =
+      key === 'all'
+        ? items.map((x) => x.id)
+        : key === 'stale'
+          ? items.filter((x) => x.ageDays > preview.olderThanDays).map((x) => x.id)
+          : key === 'failed'
+            ? items.filter((x) => x.failed).map((x) => x.id)
+            : [] // 孤儿：没有可装载的 item id
+    if (key === 'orphan' || preview.itemsTruncated || (ids.length === 0 && stat.count > 0)) {
+      setPending({ kind: 'scope', scope: key })
+      return
+    }
+    setSel(new Set(ids))
+    setPending(null)
+  }
+
   /** 确认条的目标读数：按当前目标集**现算**，不沿用上一次的统计。 */
   const pendingStat = useMemo(() => {
     if (!pending || !preview) return null
@@ -296,14 +341,20 @@ export function CacheBytesPanel(props: {
         </span>
       </div>
 
-      {/* 分档清理：整档是「清哪一类」，勾选是「清哪几条」，两条路互斥且都要确认 */}
+      {/* 分档 = 「按哪一类**装载**选择集」，不是另一条清理通道（BUG-222：一屏只能
+          有一个选择域，两个并存就必须可组合或互斥可见，不能静默取其一）。
+          装好之后只有一个执行动作：「清理所选 N 项」。 */}
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
         <Button
           variant="outline"
           size="sm"
           className="h-7 px-2 text-[11px] text-destructive"
           disabled={busy || nothingToClear}
-          onClick={() => setPending({ kind: 'scope', scope: 'all' })}
+          onClick={() => loadTier('all')}
+          title={t('tg.bytesPreview', {
+            size: fmtSize(preview.total.bytes),
+            n: preview.total.count,
+          })}
           data-testid="cache-bytes-clear-all"
         >
           {t('tg.bytesClearAll')}
@@ -313,7 +364,11 @@ export function CacheBytesPanel(props: {
           size="sm"
           className="h-7 px-2 text-[11px]"
           disabled={busy || preview.orphan.count === 0}
-          onClick={() => setPending({ kind: 'scope', scope: 'orphan' })}
+          onClick={() => loadTier('orphan')}
+          title={t('tg.bytesOrphan', {
+            n: preview.orphan.count,
+            size: fmtSize(preview.orphan.bytes),
+          })}
           data-testid="cache-bytes-clear-orphan"
         >
           {t('tg.bytesClearOrphan')}
@@ -323,7 +378,14 @@ export function CacheBytesPanel(props: {
           size="sm"
           className="h-7 px-2 text-[11px]"
           disabled={busy || preview.stale.count === 0}
-          onClick={() => setPending({ kind: 'scope', scope: 'stale' })}
+          onClick={() => loadTier('stale')}
+          /* BUG-222：阈值必须可见（原为写死常量且界面不显示依据）——悬浮给出
+             「早于 N 天：几条（多大）」，与上方读数同一把尺子。 */
+          title={t('tg.bytesStale', {
+            days: preview.olderThanDays,
+            n: preview.stale.count,
+            size: fmtSize(preview.stale.bytes),
+          })}
           data-testid="cache-bytes-clear-stale"
         >
           {t('tg.bytesClearStale')}
@@ -333,7 +395,11 @@ export function CacheBytesPanel(props: {
           size="sm"
           className="h-7 px-2 text-[11px]"
           disabled={busy || preview.failed.count === 0}
-          onClick={() => setPending({ kind: 'scope', scope: 'failed' })}
+          onClick={() => loadTier('failed')}
+          title={t('tg.bytesFailed', {
+            n: preview.failed.count,
+            size: fmtSize(preview.failed.bytes),
+          })}
           data-testid="cache-bytes-clear-failed"
         >
           {t('tg.bytesClearFailed')}
@@ -341,8 +407,10 @@ export function CacheBytesPanel(props: {
       </div>
 
       {/* 按频道选定：把「只清这个频道的」从「手点 N 次」变成一次点击。
-          它只是**勾选**（选择态仍走同一套确认条），不是新的清理档 —— 危险动词不增。 */}
-      {chatGroups.length > 1 ? (
+          它只是**勾选**（选择态仍走同一套确认条），不是新的清理档 —— 危险动词不增。
+          BUG-222：**不再**用 `chatGroups.length > 1` 门控 —— 只有一个频道时「按频道
+          一键全选/取消」同样有用，整块消失等于能力在单频道场景下凭空不见。 */}
+      {chatGroups.length > 0 ? (
         <div className="mt-2 flex flex-wrap items-center gap-1.5" data-testid="cache-bytes-chats">
           <span className="text-[11px] text-fg-muted">{t('tg.bytesChatSelect')}</span>
           {chatGroups.map((g) => {
@@ -424,12 +492,31 @@ export function CacheBytesPanel(props: {
         </Button>
       </div>
 
-      {/* 确认条：单条入口与分档共用（不只是多一次点击，而是把「要清几个、释放多少」写清楚） */}
+      {/* 确认条：单条入口与分档共用（不只是多一次点击，而是把「要清几个、释放多少」写清楚）。
+          BUG-222：还必须复述**来源**（「按全部档 / 孤儿档 / 陈旧档（>N 天）/ 失败档」或
+          「所选 N 条」），否则用户无法核对「这一批是按什么选出来的」—— 复用既有 key
+          拼接，不新增文案键。 */}
       {pending && pendingStat ? (
         <div
           className="mt-2 rounded-md border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[11px] leading-relaxed text-destructive"
           data-testid="cache-bytes-confirm"
+          data-scope={pending.kind === 'scope' ? pending.scope : 'ids'}
         >
+          <div className="font-medium" data-testid="cache-bytes-confirm-source">
+            {pending.kind === 'scope'
+              ? pending.scope === 'all'
+                ? t('tg.bytesClearAll')
+                : pending.scope === 'orphan'
+                  ? t('tg.bytesClearOrphan')
+                  : pending.scope === 'stale'
+                    ? `${t('tg.bytesClearStale')}（${t('tg.bytesStale', {
+                        days: preview.olderThanDays,
+                        n: preview.stale.count,
+                        size: fmtSize(preview.stale.bytes),
+                      })}）`
+                    : t('tg.bytesClearFailed')
+              : t('tg.cacheSelectedCount', { n: pending.ids.length })}
+          </div>
           {t('tg.bytesConfirm', { n: pendingStat.n, size: fmtSize(pendingStat.bytes) })}
           <div className="mt-1.5 flex justify-end gap-2">
             <Button

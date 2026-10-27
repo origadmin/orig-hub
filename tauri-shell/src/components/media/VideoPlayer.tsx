@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   AlertTriangle,
+  ChevronDown,
+  ChevronUp,
   CloudOff,
   FastForward,
   Maximize,
@@ -651,8 +653,16 @@ export function VideoPlayer({
   const [isPlaying, setIsPlaying] = useState(false)
   const [isBuffering, setIsBuffering] = useState(false)
   const [showControls, setShowControls] = useState(true)
+  /**
+   * BUG-266：控件层的**手动覆写**。`auto` = 现状（播放中 3s 自动隐藏）；
+   * `shown` = 用户钉住（不再自动隐藏）；`hidden` = 用户强制收起（指针移动也不叫回）。
+   * 原缺陷：隐藏态整层 `display:none`（BUG-217），DOM 里没有任何可点的「显示控件」
+   * 入口，只能靠移动指针叫回，且没有主动隐藏的办法 —— 这里补的是那个交互位。
+   */
+  const [manualChrome, setManualChrome] = useState<'auto' | 'shown' | 'hidden'>('auto')
   /** 控件层是否应可见（播放中且未唤起控件时为 false）。 */
-  const controlsVisible = showControls || !isPlaying
+  const controlsVisible =
+    manualChrome === 'shown' || (manualChrome === 'auto' && (showControls || !isPlaying))
   /**
    * BUG-217：控件层是否仍参与布局 / 绘制 / 合成。
    *
@@ -911,14 +921,18 @@ export function VideoPlayer({
 
   // ---------- 控件自动隐藏 ----------
   const pokeControls = useCallback(() => {
+    // BUG-266：手动收起态下，指针移动 / 点画面**不得**把控件叫回来（否则「隐藏」
+    // 形同虚设）；手动钉住态下只显示、不排隐藏计时器。只有 `auto` 走原逻辑。
+    if (manualChrome === 'hidden') return
     setShowControls(true)
     if (hideTimer.current) window.clearTimeout(hideTimer.current)
+    if (manualChrome === 'shown') return
     const v = videoRef.current
     // 暂停或指针停在控件/菜单上时不隐藏，否则用户点不到
     if (v && !v.paused && !speedOpen && !barHover && !volOpen) {
       hideTimer.current = window.setTimeout(() => setShowControls(false), HIDE_MS)
     }
-  }, [speedOpen, barHover, volOpen])
+  }, [speedOpen, barHover, volOpen, manualChrome])
 
   useEffect(() => {
     pokeControls()
@@ -1298,6 +1312,8 @@ export function VideoPlayer({
       )}
       onMouseMove={pokeControls}
       onMouseLeave={() => {
+        // BUG-266：手动钉住/收起时不因鼠标移出而改变可见性（用户显式控制的优先级更高）。
+        if (manualChrome !== 'auto') return
         const v = videoRef.current
         if (v && !v.paused && !speedOpen) setShowControls(false)
       }}
@@ -1340,6 +1356,33 @@ export function VideoPlayer({
         onError={onError}
         onDoubleClick={() => void toggleFullscreen()}
       />
+
+      {/*
+        BUG-266：控件层的**常驻开关**（右上角）。
+        必须放在 `role="toolbar"` **之外** —— 控件层隐藏后会被 `display:none` 移出 DOM，
+        若开关在其内部就跟着一起消失（原缺陷：想叫回控件只能靠移动指针）。
+        - 与自动连播倒计时的「取消」按钮同位，故倒计时期间让位（倒计时自带遮罩与焦点）；
+        - i18n 说明：本区域不允许新增 key，暂复用 `player.controls` 作 aria-label +
+          `aria-expanded` 表达「展开/收起」；**需主控补 `player.showControls` /
+          `player.hideControls` 两个 key** 后替换。
+      */}
+      {!showCountdown && (
+        <button
+          type="button"
+          aria-label={t('player.controls')}
+          aria-expanded={controlsVisible}
+          aria-controls="player-controls-toolbar"
+          title={t('player.controls')}
+          data-testid="player-controls-toggle"
+          onClick={(e) => {
+            e.stopPropagation()
+            setManualChrome(controlsVisible ? 'hidden' : 'shown')
+          }}
+          className="absolute right-3 top-3 z-30 flex h-8 w-8 items-center justify-center rounded-full bg-black/45 text-white/90 opacity-70 transition-all hover:bg-black/70 hover:opacity-100"
+        >
+          {controlsVisible ? <ChevronDown className="h-4 w-4" /> : <ChevronUp className="h-4 w-4" />}
+        </button>
+      )}
 
       {/* 点击反馈（居中图标，1.5s 后消失） */}
       {showCenter && !isBuffering && !fatal && (
@@ -1547,6 +1590,7 @@ export function VideoPlayer({
 
       {/* 控件层 */}
       <div
+        id="player-controls-toolbar"
         role="toolbar"
         aria-label={t('player.controls')}
         className={cn(

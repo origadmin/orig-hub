@@ -27,6 +27,14 @@ const modeOf = (k: ViewerItem['kind'] | undefined): Mode =>
   k === 'photo' ? 'browse' : k === 'video' || k === 'audio' ? 'play' : 'none'
 
 /**
+ * BUG-459：右侧侧栏 TAB 的**会话内**记忆（不持久化、不写 store）。
+ *
+ * 裁定：进入播放默认「介绍」；用户手切「列表」后本次会话内记住 —— 用模块级变量
+ * 而非 state，是为了在播放器卸载/重挂载（换集、返回再进）后仍保留用户的选择。
+ */
+let sessionSideTab: 'list' | 'info' = 'info'
+
+/**
  * 全局媒体播放器页（模块无关，不带任何模块信息）：打开时独占内容区整页。
  * 返回行（← 返回 + 标题 + 位置/总数）+ 媒体区（‹ › 收在面板内侧，不会出框）+ caption 底部行。
  *
@@ -47,7 +55,7 @@ export function MediaViewer(props: {
   title?: string
   className?: string
 }) {
-  const { t } = useTranslation()
+  const { t, language } = useTranslation()
   const { items, index, onIndex, onClose, title, className } = props
   const cur = items[index]
 
@@ -80,6 +88,22 @@ export function MediaViewer(props: {
 
   const mode = modeOf(cur?.kind)
   /**
+   * BUG-459：侧栏两档 —— 「介绍」（本集/本剧正文，左对齐可滚动）/「列表」（现状分集列表）。
+   * 根因：侧栏可见性只由 `showEpisodes && seriesId`（数据结构）决定，与「此刻要不要看列表」
+   * 无关 ⇒ 播放全程 300px 恒被不看的东西占着，而要看的是底部 96px 窄条。
+   * 默认值按模式分：播放 → 「介绍」（用户原话「播放时不看列表，看文字介绍就够」）；
+   * 浏览 / 选集 → 「列表」（与改动前逐像素一致，BUG-451 回归面只落在播放态）。
+   */
+  const [sideTab, setSideTab] = useState<'list' | 'info'>(
+    mode === 'browse' ? 'list' : sessionSideTab,
+  )
+  const chooseSideTab = (k: 'list' | 'info') => {
+    setSideTab(k)
+    if (mode !== 'browse') sessionSideTab = k
+  }
+  /** 本集正文（与剧集详情同一段文本的两个来源：条目介绍优先，退回 caption） */
+  const episodeText = (cur?.description ?? '').trim() || (cur?.caption ?? '').trim()
+  /**
    * 重缓存坐标（BUG-261）：判据从「当前主源」换成「这一集的任一可用来源」。
    *
    * 主源不可缓存（local / ref 缺失）时，直接用该剧集里同一分集的 tg 备用源 ref
@@ -111,6 +135,21 @@ export function MediaViewer(props: {
   const prevItem = posInGroup > 0 ? group[posInGroup - 1] : null
   const nextItem =
     posInGroup >= 0 && posInGroup < group.length - 1 ? group[posInGroup + 1] : null
+  /**
+   * BUG-444：**自动连播**只推进「可播子集」。
+   *
+   * 原缺陷：`group` 只按 `kind` 分流，**不看有没有字节** —— 「播放全部」从可播子集起播，
+   * 但播完一集后的自动推进仍按全量组走，于是下一集可能是一条 `hasBytes === false`
+   * 的无字节视频：播放器落到「未缓存」态，连播就此停住（用户体感「连播坏在不该停的地方」）。
+   *
+   * 修法边界（刻意不做的事）：只收窄**自动推进**这一条路。分集侧栏的 `isSelectable`、
+   * ‹ › 上一条/下一条、←/→ 键位仍是**全量组** —— 用户想手动点一条无字节集查看原因，
+   * 这条通路必须留着（「可点范围」与「自动推进范围」是两回事，不能合并）。
+   */
+  const autoNext = useMemo(() => {
+    if (posInGroup < 0) return null
+    return group.slice(posInGroup + 1).find((i) => i.hasBytes !== false) ?? null
+  }, [group, posInGroup])
 
   /** 组内跳转：把目标项换算回全量 index（store 契约不变） */
   const goTo = (it: ViewerItem) => {
@@ -143,13 +182,14 @@ export function MediaViewer(props: {
   }
   const isSelectable = (itemId: number) => items.some((it) => it.messageId === itemId)
 
-  const       nextUp = nextItem
+  // BUG-444：连播的「即将播放」与预载都按 `autoNext`（可播子集），不是 `nextItem`（全量组）。
+  const       nextUp = autoNext
     ? {
-        title: nextItem.caption?.trim() || t('player.untitled'),
-        poster: nextItem.poster,
+        title: autoNext.caption?.trim() || t('player.untitled'),
+        poster: autoNext.poster,
         episodeNo:
-          nextItem.episodeNo ??
-          detail?.episodes.find((e) => e.itemId === nextItem.messageId)?.episodeNo ??
+          autoNext.episodeNo ??
+          detail?.episodes.find((e) => e.itemId === autoNext.messageId)?.episodeNo ??
           null,
       }
     : null
@@ -209,14 +249,16 @@ export function MediaViewer(props: {
       <div className="flex min-h-0 flex-1">
         {/*
           BUG-416 合并播放（连播不断档）：切到下一集前先**预载字节**。
-          这个隐藏 video 以 `nextItem.src` 为 key，跨集切换时 MediaViewer 不卸载，
+          这个隐藏 video 以 `autoNext.src` 为 key，跨集切换时 MediaViewer 不卸载，
           故预载不被打断；下一集 `<VideoPlayer>` 挂载时字节已在 HTTP 缓存中，
           切换如同单视频续播，不再「重新加载」。
+          BUG-444：预载目标与连播目标必须同一份（`autoNext`）—— 预载全量组的下一集、
+          却连播可播子集的下一集，等于每次都预载错的那条。
         */}
-        {nextItem?.src ? (
+        {autoNext?.src ? (
           <video
-            key={nextItem.src}
-            src={nextItem.src}
+            key={autoNext.src}
+            src={autoNext.src}
             preload="auto"
             muted
             playsInline
@@ -264,7 +306,8 @@ export function MediaViewer(props: {
               poster={cur.poster}
               autoPlay
               nextUp={nextUp}
-              onPlayNext={() => nextItem && goTo(nextItem)}
+              /* BUG-444：连播推进走 `autoNext`（可播子集）；`›` 按钮与 ←/→ 仍是全量组。 */
+              onPlayNext={() => autoNext && goTo(autoNext)}
               hasVideoTrack={cur.kind === 'video'}
               /*
                * 兼容流（BUG-208）：视频条目解码不支持时自动切服务端实时转码。
@@ -323,16 +366,95 @@ export function MediaViewer(props: {
         </div>
 
         {showEpisodes && seriesId && (
-          <EpisodeList
-            title={detail?.title ?? ''}
-            episodes={detail?.episodes ?? []}
-            loading={loading}
-            error={error}
-            notFound={notFound}
-            currentItemId={cur.messageId}
-            onSelect={selectEpisode}
-            isSelectable={isSelectable}
-          />
+          /* BUG-459：右侧由「恒为 300px 列表」改为「300px 两档 TAB」。宽度不变
+             （`EpisodeList` 的 `w-[300px]` 契约保留，这里显式覆盖成容器宽度），
+             面板内部多一条 TAB 行 —— 画面宽度、连播预载挂载位置都不动。 */
+          <aside
+            className="flex w-[300px] shrink-0 flex-col border-l border-border-subtle/60 bg-surface/30"
+            data-testid="viewer-side"
+            aria-label={t('player.episodes')}
+          >
+            <div
+              className="flex shrink-0 items-center gap-1 border-b border-border-subtle/60 px-2 py-1.5"
+              data-testid="viewer-side-tabs"
+            >
+              <button
+                type="button"
+                onClick={() => chooseSideTab('list')}
+                aria-pressed={sideTab === 'list'}
+                data-testid="viewer-tab-list"
+                className={cn(
+                  'rounded px-2 py-0.5 text-[11px] transition-colors',
+                  sideTab === 'list'
+                    ? 'bg-accent/15 font-medium text-accent'
+                    : 'text-muted hover:bg-surface-2 hover:text-fg-mid',
+                )}
+              >
+                {t('player.episodes')}
+              </button>
+              <button
+                type="button"
+                onClick={() => chooseSideTab('info')}
+                aria-pressed={sideTab === 'info'}
+                data-testid="viewer-tab-info"
+                className={cn(
+                  'rounded px-2 py-0.5 text-[11px] transition-colors',
+                  sideTab === 'info'
+                    ? 'bg-accent/15 font-medium text-accent'
+                    : 'text-muted hover:bg-surface-2 hover:text-fg-mid',
+                )}
+              >
+                {/* 无现成 key（不新增 i18n 键，见报告「需主控补 key」） */}
+                {language !== 'en-US' ? '介绍' : 'Info'}
+              </button>
+            </div>
+
+            {sideTab === 'list' ? (
+              <EpisodeList
+                title={detail?.title ?? ''}
+                episodes={detail?.episodes ?? []}
+                loading={loading}
+                error={error}
+                notFound={notFound}
+                currentItemId={cur.messageId}
+                onSelect={selectEpisode}
+                isSelectable={isSelectable}
+                /* 宽度交给外层 300px 容器；边框由容器承担，避免双线 */
+                embedded
+              />
+            ) : (
+              <div
+                className="min-h-0 flex-1 overflow-y-auto px-3 py-2.5"
+                data-testid="viewer-info"
+              >
+                {detail?.title ? (
+                  <p
+                    className="truncate text-[12px] font-medium text-fg-strong"
+                    title={detail.title}
+                  >
+                    {detail.title}
+                  </p>
+                ) : null}
+                <p className="mt-0.5 text-[10px] tabular-nums text-muted">
+                  {cur.episodeNo ? t('player.episodeN', { n: cur.episodeNo }) : t('player.browse')}
+                </p>
+                {/* 正文 = 与剧集详情同一段文字，左对齐、可滚动、字号一致（不是居中窄条） */}
+                <p className="mt-2 whitespace-pre-wrap break-words text-[12.5px] leading-relaxed text-muted [overflow-wrap:anywhere]">
+                  {episodeText || t('media.descEmptyEp')}
+                </p>
+                {detail?.description && detail.description.trim() !== episodeText ? (
+                  <>
+                    <p className="mt-3 text-[11px] font-medium text-fg-strong">
+                      {t('media.series.editDesc')}
+                    </p>
+                    <p className="mt-1 whitespace-pre-wrap break-words text-[12.5px] leading-relaxed text-muted [overflow-wrap:anywhere]">
+                      {detail.description}
+                    </p>
+                  </>
+                ) : null}
+              </div>
+            )}
+          </aside>
         )}
       </div>
 
@@ -347,7 +469,12 @@ export function MediaViewer(props: {
        * 介绍是多段文本，折叠换行会把分段吃掉 —— 同一段正文在剧集页有分段、
        * 在播放页变成一坨，就是「剧集对、视频错」的又一种形态。
        */}
-      {(cur.description?.trim() || cur.caption?.trim()) && (
+      {/*
+        BUG-459 裁定：底部 `viewer-text` 条撤销 —— 同一段正文在「介绍」TAB 与底部条
+        两处显示即为重复真源，只能留一个。**仅当没有侧栏「介绍」TAB 时**（无剧集归属的
+        单条内容 / 图片）才保留：那时它是正文的唯一呈现点，删掉等于丢能力（BUG-149）。
+      */}
+      {!showEpisodes && (cur.description?.trim() || cur.caption?.trim()) && (
         <p
           className="max-h-24 shrink-0 overflow-y-auto whitespace-pre-wrap break-words border-t border-border-subtle/60 bg-black px-4 py-2 text-center text-xs text-white/80 [overflow-wrap:anywhere]"
           data-testid="viewer-text"

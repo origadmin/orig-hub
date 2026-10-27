@@ -9,9 +9,9 @@
  * 默认不展开：错误不该在正常视野里堆技术细节，但必须「一按就在」。
  */
 import { useState } from 'react'
-import { useTranslation } from '../i18n'
-import { copyToClipboard } from '../lib/env'
-import { errorReport, type AppError } from '../lib/appError'
+import { useTranslation } from '../../i18n'
+import { copyToClipboard } from '../../lib/env'
+import { errorReport, type AppError } from '../../lib/appError'
 
 interface Props {
   error: AppError

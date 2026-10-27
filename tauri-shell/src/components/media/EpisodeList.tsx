@@ -42,6 +42,8 @@ export interface EpisodeListProps {
   onSelect: (itemId: number) => void
   /** 该项是否在当前列表内（否则禁用） */
   isSelectable?: (itemId: number) => boolean
+  /** BUG-459：嵌在播放页侧栏的「列表」TAB 内 —— 宽度与边框由外层 300px 容器承担 */
+  embedded?: boolean
   className?: string
 }
 
@@ -54,6 +56,7 @@ export function EpisodeList({
   notFound,
   onSelect,
   isSelectable,
+  embedded,
   className,
 }: EpisodeListProps) {
   const { t } = useTranslation()
@@ -115,7 +118,11 @@ export function EpisodeList({
   return (
     <aside
       className={cn(
-        'flex w-[300px] shrink-0 flex-col border-l border-border-subtle/60 bg-surface/30',
+        // BUG-459：独立挂载时仍是 300px + 左边框（契约不变）；嵌进播放页 TAB 时
+        // 交出宽度与边框，由外层 300px 容器统一承担（避免双线/双宽）。
+        embedded
+          ? 'flex min-h-0 w-full flex-1 flex-col bg-transparent'
+          : 'flex w-[300px] shrink-0 flex-col border-l border-border-subtle/60 bg-surface/30',
         className,
       )}
       aria-label={t('player.episodes')}

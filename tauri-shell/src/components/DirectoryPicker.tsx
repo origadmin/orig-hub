@@ -5,6 +5,7 @@ import { Input } from './ui/input'
 import { DirectoryBrowserDialog } from './DirectoryBrowserDialog'
 import { getRecentDirs, addRecentDir, removeRecentDir } from '../lib/recentDirs'
 import { isTauri } from '../lib/env'
+import { displayPath, storagePath } from '../lib/pathDisplay'
 import { useTranslation } from '../i18n'
 
 interface Props {
@@ -120,10 +121,12 @@ export function DirectoryPicker({
   return (
     <div ref={wrapRef} className="relative">
       <div className="flex gap-1.5">
+        {/* BUG-332：状态里始终是存储形式（正斜杠），这里只做展示归一化；
+            写回时再折回正斜杠 —— 两个方向成对，缺一个就会把反斜杠存进配置。 */}
         <Input
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={placeholder}
+          value={displayPath(value)}
+          onChange={(e) => onChange(storagePath(e.target.value))}
+          placeholder={displayPath(placeholder)}
           disabled={disabled}
         />
         {showHistory && recent.length > 0 && (
@@ -188,9 +191,9 @@ export function DirectoryPicker({
               key={d}
               className="group flex cursor-pointer items-center justify-between gap-2 px-3 py-1.5 text-xs hover:bg-surface-2"
               onClick={() => chooseHistory(d)}
-              title={d}
+              title={displayPath(d)}
             >
-              <span className="truncate font-mono text-fg-mid">{d}</span>
+              <span className="truncate font-mono text-fg-mid">{displayPath(d)}</span>
               <button
                 className="shrink-0 text-muted opacity-0 transition-opacity hover:text-danger group-hover:opacity-100"
                 onClick={(e) => removeOne(e, d)}

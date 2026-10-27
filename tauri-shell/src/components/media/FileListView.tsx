@@ -119,7 +119,10 @@ const FileRow = memo(function FileRow(props: {
 }) {
   const { t } = useTranslation()
   const { item, selected, onSelectToggle, onOpenDetail, onOpen, onDelete, onReveal, selectionMode = false, onViewInTg } = props
-  const name = resolveDisplayName({ item })
+  // BUG-240：空标题（TG 入库未落 caption）在行里渲染空串 ⇒ 同名空行无法分辨，
+  // 复选框的 aria-label 还会退化成「选择：」。用 `未命名 · #<id>` 兜底，与卡片同源。
+  const resolved = resolveDisplayName({ item })
+  const name = resolved.trim() || `${t('player.untitled')} · #${item.id}`
   const fullPath = item.absolutePath ?? item.filePath ?? ''
   const hasBytes = hasMediaBytes(item)
   const icon = kindIcon(item.kind)

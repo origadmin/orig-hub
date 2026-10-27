@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { fetchDownloads, fetchSources, downloadControl, removeDownload, type ActivityTask } from '../../api/daemon'
 import type { TgCacheTask } from '../../types'
+import { t as translate } from '../../i18n'
 import {
   groupIngestTasks,
   ingestActionsFor,
@@ -208,12 +209,14 @@ export function useIngestGroups(
         // 不可用，横幅须如实报「TG 与普通下载均不可用」，而非写死「普通下载不受影响」。
         const dlSrc = (health.sources ?? []).find((s) => s.kind === 'download')
         const dlDown = dlSrc != null && dlSrc.available === false
-        setDownloadUnavailable(dlDown ? (dlSrc?.error ?? '普通下载不可用') : null)
+        // BUG-141：兜底文案走 i18n（原中文字面量在 en-US 下混排中文）。
+        setDownloadUnavailable(dlDown ? (dlSrc?.error ?? translate('download.ingest.errDlUnavailable')) : null)
         if (srcUnavailable) {
           // 取到不取到都不知道 ⇒ 绝不清空已拉到的行（清空即用户观感的数据丢失），
           // 只把原因交给 banner；行继续显示为「断开前的最后快照」。
           unknownStreakRef.current = Math.min(unknownStreakRef.current + 1, 8)
-          setUnavailable(cacheSrc?.error ?? 'TG 入库任务暂时无法读取')
+          // BUG-141：同上，兜底文案走 i18n。
+          setUnavailable(cacheSrc?.error ?? translate('download.ingest.errTgUnavailable'))
           setError(null)
           return
         }
@@ -306,7 +309,8 @@ export function useIngestGroups(
     async (task: TgCacheTask, action: IngestAction) => {
       const allowed = ingestActionsFor(task.status, task.priority ?? 0)
       if (!allowed.includes(action)) {
-        throw new Error(`该入库任务当前不支持操作：${action}`)
+        // BUG-141：错误文案走 i18n（错误文本会直出到界面）。
+        throw new Error(translate('download.ingest.errActionUnsupported', { action }))
       }
       switch (action) {
         // BUG-392：统一状态变更入口 —— 行 id 带来源前缀（`tg:` = 插件入库），

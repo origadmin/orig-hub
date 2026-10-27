@@ -382,7 +382,7 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
           `gap-2.5` 与「文件 / 下载」父行图标—标题间距一致（修复原 TG/分享/设置缺 gap 的不一致）。 */}
       <div className="mt-auto border-t border-border-subtle px-2 py-2">
         <button
-          onClick={() => onNavigate('settings', { section: 'general' })}
+          onClick={() => onNavigate('settings', { section: 'downloads' })}
           title={t('nav.settings')}
           data-testid="nav-settings"
           className={cn(rowCls(view === 'settings'), 'gap-2.5', collapsed && 'justify-center px-0')}

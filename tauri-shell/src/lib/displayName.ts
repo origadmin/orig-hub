@@ -73,6 +73,25 @@ function trimOrEmpty(v: string | null | undefined): string {
 }
 
 /**
+ * BUG-367：给显名补集号后缀（**统一口径**）。
+ *
+ * 原缺陷（用户「下载标题不统一行问题，多次提出未解决」）：同一列里同一部剧的两行，
+ * 一行带 ` S1E1`、一行不带 —— 因为走「剧名+集号」那一层才拼后缀，走「用户自定义
+ * 集名/来源原文」两层就完全不拼。后缀时有时无，用户无法按末尾对齐辨认。
+ *
+ * 现在的规则只有一条：**只要这一条属于多集剧且有槽位，所有层都带后缀**；
+ * 名字里已经带同一个后缀（后端写入的）就不重复叠加。单集剧不拼（「第 1 季」
+ * 不携带区分信息，与第二层「单集用剧名」同一把尺子）。
+ *
+ * 用 ` ${label}` 全等结尾判定，不做包含匹配 —— `S1E1 重制版` 这类名字是有信息量的
+ * 补充，不能被当成「已有后缀」。
+ */
+function withSlotSuffix(name: string, slotLabel: string | null): string {
+  if (!slotLabel || !name) return name
+  return name.endsWith(` ${slotLabel}`) ? name : `${name} ${slotLabel}`
+}
+
+/**
  * 解析内容的规范显示名（三层优先级见文件头）。永不抛错，最差返回 `fallback ?? ''`。
  *
  * 输入可以只给 `item`（自带剧集派生字段），也可以给 `item` + `episode`/`series`
@@ -83,30 +102,37 @@ export function resolveDisplayName(input: DisplayNameInput): string {
   const effective = trimOrEmpty(it?.title) || trimOrEmpty(input.episode?.title)
   const source = trimOrEmpty(it?.sourceTitle) || effective
 
+  // 槽位（BUG-367：三层共用同一口径 —— 要么都带集号，要么都不带）
+  const season = input.episode?.season ?? it?.seriesSeason
+  const episodeNo = input.episode?.episodeNo ?? it?.seriesEpisodeNo
+  const episodeNoEnd = input.episode?.episodeNoEnd ?? it?.seriesEpisodeNoEnd
+  const count = input.seriesEpisodeCount ?? it?.seriesEpisodeCount
+  const hasSlot = Number.isFinite(season) && Number.isFinite(episodeNo)
+  // 「单集用剧名」：分集总数恰为 1 时只给剧名，不拼集号（「第 1 季」不携带区分信息）。
+  const single = count === 1
+  const slotLabel =
+    hasSlot && !single
+      ? episodeSlotLabel({
+          season: season as number,
+          episodeNo: episodeNo as number,
+          episodeNoEnd: episodeNoEnd ?? null,
+        })
+      : null
+
   // 1) 用户自定义集名：有效名非空，且与来源事实**不同**（被改名过）。
   //    相等 ⇒ 从未改名（TG 自动入库时 title 就是来源原文）⇒ 让位给剧名层。
-  if (effective && effective !== source) return effective
+  if (effective && effective !== source) return withSlotSuffix(effective, slotLabel)
 
   // 2) 剧名 + 集号（单集用剧名）。
   const seriesTitle = trimOrEmpty(input.series?.title) || trimOrEmpty(it?.seriesTitle)
   if (seriesTitle) {
-    const season = input.episode?.season ?? it?.seriesSeason
-    const episodeNo = input.episode?.episodeNo ?? it?.seriesEpisodeNo
-    const episodeNoEnd = input.episode?.episodeNoEnd ?? it?.seriesEpisodeNoEnd
-    const count = input.seriesEpisodeCount ?? it?.seriesEpisodeCount
-    const hasSlot = Number.isFinite(season) && Number.isFinite(episodeNo)
-    // 「单集用剧名」：分集总数恰为 1 时只用剧名，不拼集号（「第 1 季」不携带区分信息）。
-    const single = count === 1
-    if (!single && hasSlot) {
-      return `${seriesTitle} ${episodeSlotLabel({
-        season: season as number,
-        episodeNo: episodeNo as number,
-        episodeNoEnd: episodeNoEnd ?? null,
-      })}`
+    if (!single && slotLabel) {
+      return `${seriesTitle} ${slotLabel}`
     }
     return seriesTitle
   }
 
-  // 3) 来源原文。
-  return source || input.fallback || ''
+  // 3) 来源原文（BUG-367：与第 1/2 层同样带集号，避免同一部剧两行一带一不带）。
+  if (source) return withSlotSuffix(source, slotLabel)
+  return input.fallback || ''
 }

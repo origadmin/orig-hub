@@ -587,7 +587,11 @@ export function downloadControl(
 
 /**
  * 订阅 SSE 事件流（下载进度 / 状态变更）。
- * 返回取消函数；连接断开自动重连（指数退避，最长 10s）。
+ * 返回取消函数；连接断开自动重连（指数退避）。
+ *
+ * 退避上限 60s 而不是 10s（BUG-282）：daemon 全关是**常态场景**（用户没开就进了界面），
+ * 10s 封顶等于稳态 6 次/分钟的失败重连永不停，而 60s 封顶把同样的无意义流量压到 1/6。
+ * 连接一旦成功 `retryMs` 立刻回 1s，所以「服务回来了」不会因为退避而慢一拍。
  */
 export function subscribeEvents(
   onEvent: (evt: { event: string; data: DownloadStatus | DownloadStatus[] }) => void,
@@ -596,6 +600,7 @@ export function subscribeEvents(
 ): () => void {
   let closed = false
   let retryMs = 1000
+  let timer: number | undefined
   let es: EventSource | null = null
 
   // daemon 发送的是命名事件：progress/completed/error/paused/resumed/deleted
@@ -625,8 +630,8 @@ export function subscribeEvents(
       es = null
       if (!closed) {
         onError?.(new Error('SSE connection lost'))
-        setTimeout(connect, retryMs)
-        retryMs = Math.min(retryMs * 2, 10000)
+        timer = window.setTimeout(connect, retryMs)
+        retryMs = Math.min(retryMs * 2, 60000)
       }
     }
   }
@@ -634,6 +639,7 @@ export function subscribeEvents(
   connect()
   return () => {
     closed = true
+    if (timer) window.clearTimeout(timer)
     es?.close()
   }
 }

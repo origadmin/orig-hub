@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Button } from './ui/button'
+import { Button, TONE_VARIANT } from './ui/button'
 import { SelectAllButtons, SelectionBar } from './ui/selection-bar'
 import { useTranslation } from '../i18n'
 import { useStore } from '../store/useStore'
@@ -28,7 +28,7 @@ import { deleteFile, listFiles } from '../api/files'
 import type { FileFact } from '../api/files'
 import { subscribeEvents } from '../api/daemon'
 import { loadSeriesDetail, isSeriesNotFound } from '../hooks/useSeriesDetail'
-import { cacheKey, cached, invalidateCache } from '../lib/fetchCache'
+import { cacheKey, cached, invalidateCache, peek } from '../lib/fetchCache'
 import { seriesLabel } from '../lib/displayTitle'
 import { resolveDisplayName } from '../lib/displayName'
 import { revealItemPath } from '../lib/reveal'
@@ -37,6 +37,7 @@ import type {
   MediaItem,
   MediaKind,
   MediaListQuery,
+  MediaListResult,
   MediaSeries,
   MediaSeriesDetail,
   MediaTag,
@@ -47,6 +48,10 @@ import { FileListView } from './media/FileListView'
 import { SeriesDetail } from './media/SeriesDetail'
 import { SeriesCard } from './media/SeriesCard'
 import { ImportDialog } from './media/ImportDialog'
+// BUG-458：主操作改为「目录管理」（受管根集合的登记/移除/设主/对账）
+import { ManagedRootsDialog } from './media/ManagedRootsDialog'
+// BUG-461：常驻说明改为「带圈 ?」按钮 + 短时气泡
+import { HintBubble } from './media/HintBubble'
 import { BulkTagDialog, TagManagerDialog } from './media/TagManagerDialog'
 import { AddToSeriesDialog, CreateSeriesDialog, MergeSeriesDialog, MergeSeriesMultiDialog } from './media/SeriesDialog'
 import { ExportPreviewDialog } from './media/ExportPreviewDialog'
@@ -59,7 +64,8 @@ import {
   canRecacheFromSource,
   recacheFromSource,
   hasMediaBytes,
-  probeLibraryBackend,
+  // BUG-176：探活带原因（布尔探活回答不了「没有内容 vs 取不到内容」）
+  probeLibraryBackendDetail,
   ensureLibraryBackend,
   probeRecacheBackends,
   ensureSourceBackend,
@@ -199,7 +205,9 @@ function toViewerItem(i: MediaItem): ViewerItem {
  * 播放统一交给全局播放器页（openViewer），不在本面板内嵌。
  */
 export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: Props = {}) {
-  const { t } = useTranslation()
+  // BUG-176 / BUG-299：`language` 只用于尚无 locale key 的双语内联文案。
+  const { t, language } = useTranslation()
+  const zh = language.startsWith('zh')
   const {
     setError,
     openViewer,
@@ -211,38 +219,87 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   } = useStore()
 
   // ---- 资料库后端探活（**不探 TG**：TG 只是来源之一，挂了不影响库）----
-  const [alive, setAlive] = useState(false)
-  const [libRetrying, setLibRetrying] = useState(false)
   /**
-   * 库探活。函数体里两处 `probeLibraryBackend()` **不是重复调用**：
-   * 第二处只在「第一次失败 **且** 运行在 Tauri」时才到达（先 `ensureLibraryBackend()`
-   * 拉起 daemon 再复探）—— 正常路径只走第一处。二者不是同一路径上的两次，
-   * 故不合并（BUG-239 根因 1 的「单次探活发两次 stats」实测来自别处，见 `loadMeta`）。
-   * 探活本身走 `cached(cacheKey.libraryStats())`，与首屏徽标共用同一份 stats。
+   * 资料库后端三态（BUG-176）：`unknown` 未探过 / `up` 可达 / `down` 取不到。
+   *
+   * 为什么不能再用一个 `alive: boolean`：布尔值只有两个出口 —— true 就渲染库、
+   * false 就整页占位，**「取不到」于是被渲染成「没有内容」**（用户原话：
+   * 「不清楚是没有数据，还是根本性错误没有获取正确数据」）。三态 + `reason`
+   * 让「取不到」成为一条**显式来源事实**：banner 直出原因，内容保留 last-known。
    */
-  const probeLibrary = useCallback(async () => {
+  const [backend, setBackend] = useState<{
+    state: 'unknown' | 'up' | 'down'
+    reason: string | null
+  }>({ state: 'unknown', reason: null })
+  /** 自动重试的轮次（仅用于退避；后端一恢复就归零）。 */
+  const [retryRound, setRetryRound] = useState(0)
+  const [libRetrying, setLibRetrying] = useState(false)
+  const backendDown = backend.state === 'down'
+
+  /** 请求失败 → 判「取不到」的唯一入口（网络类失败才算后端挂，业务 4xx 只是这一条读不到）。 */
+  const noteLibraryError = useCallback((e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e)
+    // BUG-176：只有「连不上」才升级为整库不可读；后端可达但某条请求被拒（4xx/422）
+    // 是这一条的数据问题，不得据此把整页标成「取不到」。
+    if (/Failed to fetch|NetworkError|Load failed|ECONNREFUSED|connection|timed? ?out/i.test(msg)) {
+      setBackend({ state: 'down', reason: msg })
+      // 探活与列表共用 stats 缓存：不清掉它，续轮探活会命中旧的「成功」而谎报 up。
+      invalidateCache(cacheKey.libraryStats())
+    }
+    setError(msg)
+  }, [setError])
+  const noteLibraryOk = useCallback(() => setBackend({ state: 'up', reason: null }), [])
+
+  /**
+   * 库探活（BUG-176）。`tryStart` 只在**首次进入**与**用户点重试**时为 true：
+   * 自动续轮绝不重启宿主进程（否则后端起不来时会变成每轮重启一次）。
+   * 两处探活不是重复调用：第二处只在「第一次失败且运行在 Tauri」时到达。
+   */
+  const probeLibrary = useCallback(async (tryStart = true) => {
     const isTauri = '__TAURI_INTERNALS__' in window
-    if (await probeLibraryBackend()) {
-      setAlive(true)
+    const first = await probeLibraryBackendDetail()
+    if (first.ok) {
+      noteLibraryOk()
       return
     }
-    if (!isTauri) {
-      setAlive(false)
+    if (!isTauri || !tryStart) {
+      setBackend({ state: 'down', reason: first.reason })
       return
     }
     setLibRetrying(true)
     try {
       await ensureLibraryBackend()
-      setAlive(await probeLibraryBackend())
-    } catch {
-      setAlive(false)
+      const again = await probeLibraryBackendDetail()
+      if (again.ok) noteLibraryOk()
+      else setBackend({ state: 'down', reason: again.reason })
+    } catch (e) {
+      setBackend({ state: 'down', reason: e instanceof Error ? e.message : String(e) })
     } finally {
       setLibRetrying(false)
     }
-  }, [])
+  }, [noteLibraryOk])
+
   useEffect(() => {
     void probeLibrary()
   }, [probeLibrary])
+
+  /**
+   * 续轮重试（BUG-176）：后端不可达期间**自己会再试**，用户不必守着一个死按钮点。
+   * 退避 3s → 6s → 12s → 24s → 30s 封顶；只在 down 期间存在一条定时器，
+   * 恢复（state 变 up）即归零 —— 不是常驻轮询。
+   */
+  useEffect(() => {
+    if (!backendDown) {
+      setRetryRound(0)
+      return
+    }
+    const delay = Math.min(30000, 3000 * 2 ** Math.min(retryRound, 3))
+    const h = setTimeout(() => {
+      setRetryRound((n) => n + 1)
+      void probeLibrary(false)
+    }, delay)
+    return () => clearTimeout(h)
+  }, [backendDown, retryRound, probeLibrary])
 
   /**
    * 库级动作上标题行（BUG-317 页面结构规范 / 任务 #9）。
@@ -259,7 +316,10 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
    */
   useEffect(() => {
     setFilesActions({
-      import: () => setImportOpen(true),
+      // BUG-458：主操作由「导入目录（扫描→勾选→写库）」改为「目录管理」——
+      // 目录成为**纳管对象**（受管根），其下媒体在登记/对账后直接进文件管理。
+      // 「导入文件（勾选）」降级为目录管理面板里的次级入口，能力不删。
+      import: () => setRootsOpen(true),
       createSeries: () => setCreateOpen(true),
       export: () => setExportOpen(true),
       manageTags: () => setTagMgrOpen(true),
@@ -273,11 +333,10 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
    */
   const [sourceAlive, setSourceAlive] = useState<Record<string, boolean>>({})
   useEffect(() => {
-    // 只在**库可用之后**探来源：库都没起，探来源没有意义，且 `alive` 从 false
-    // 出发时那次探测纯属白发（BUG-239 根因 4 —— 它使 `alive` 每次翻转都重发
-    // `/api/tg/diag`）。加上 `if (!alive) return`，effect 只在「进入 alive」时
-    // 跑一次；存活态本身再由 `cached(cacheKey.tgDiag())` 复用，切走再回也不重发。
-    if (!alive) return
+    // 只在**库可达之后**探来源：库都没起，探来源没有意义，且面板挂载时那次探测
+    // 纯属白发（BUG-239 根因 4 —— 它使库状态每次翻转都重发 `/api/tg/diag`）。
+    // `up` 才探；`unknown`（探活未回）与 `down`（取不到库）都不探。
+    if (backend.state !== 'up') return
     let stop = false
     void probeRecacheBackends().then((m) => {
       if (!stop) setSourceAlive(m)
@@ -285,7 +344,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
     return () => {
       stop = true
     }
-  }, [alive])
+  }, [backend.state])
 
   // ---- 数据 ----
   /**
@@ -473,6 +532,8 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
 
   // ---- 弹窗 ----
   const [importOpen, setImportOpen] = useState(false)
+  // BUG-458：目录管理（受管根集合）弹窗 —— 主操作落点
+  const [rootsOpen, setRootsOpen] = useState(false)
   const [tagMgrOpen, setTagMgrOpen] = useState(false)
   // 导出预览（P5）：只读完备性校验，不做导出本体（P6）
   const [exportOpen, setExportOpen] = useState(false)
@@ -547,10 +608,13 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
       // `series` 是**当前显示**的（可能被标签筛过），故这里只取无条件总数当徽标，
       // 不覆盖列表 —— 否则「按标签筛剧集」会被无条件结果冲掉。
       setSeriesTotal(sr.length)
+      // BUG-176：拿到数据就是「取得到」的最强证据（探活缓存可能已过期）。
+      noteLibraryOk()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      // BUG-176：失败**不清 stats/tags**（last-known 保留），只把「取不到」显式化。
+      noteLibraryError(e)
     }
-  }, [setError])
+  }, [setError, noteLibraryOk, noteLibraryError])
 
   /**
    * 标签写操作（新建 / 重命名 / 删除）后的统一收尾。
@@ -588,30 +652,45 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
    * 代价由显式失效兜住 —— 见 `refreshTags` / `refreshAll` / `recacheItem` / `onRemoveEpisode`。
    */
   const loadItems = useCallback(async () => {
+    const query: MediaListQuery = {
+      kind: tab === 'all' ? '' : tab,
+      q: search.trim() || undefined,
+      tagId: activeTagId ?? undefined,
+      // BUG-304 / D18：文件域是「真的内容」—— 只列已落盘条目。
+      // 过滤在服务端（见 `MediaListQuery.hasBytes` 的说明），与 `total` 同源。
+      hasBytes: true,
+      sort,
+      limit: PAGE,
+      offset: 0,
+    }
+    const listKey = cacheKey.mediaList(mediaListParams(query))
+    /*
+     * BUG-176：后端不可达时不发请求，但**同一查询键**的 last-known 仍可用 ——
+     * 切分类 tab 时读到的是该 tab 自己那一份，而不是上一个 tab 的行（行集口径不能串）。
+     * 没有该键的缓存就保留现有行：banner 已声明「以下为最近一次成功读取」，
+     * 绝不用 `[]` 冒充「这个分类没有内容」。
+     */
+    if (backendDown) {
+      const hit = peek<MediaListResult>(listKey)
+      if (hit) {
+        setItems(hit.items)
+        setTotal(hit.total)
+      }
+      return
+    }
     setLoading(true)
     try {
-      const query: MediaListQuery = {
-        kind: tab === 'all' ? '' : tab,
-        q: search.trim() || undefined,
-        tagId: activeTagId ?? undefined,
-        // BUG-304 / D18：文件域是「真的内容」—— 只列已落盘条目。
-        // 过滤在服务端（见 `MediaListQuery.hasBytes` 的说明），与 `total` 同源。
-        hasBytes: true,
-        sort,
-        limit: PAGE,
-        offset: 0,
-      }
-      const r = await cached(cacheKey.mediaList(mediaListParams(query)), () =>
-        listMediaItems(query),
-      )
+      const r = await cached(listKey, () => listMediaItems(query))
       setItems(r.items)
       setTotal(r.total)
+      noteLibraryOk()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      // BUG-176：失败**不清 items/total** —— last-known 仍在屏幕上，由 banner 说明「取不到」。
+      noteLibraryError(e)
     } finally {
       setLoading(false)
     }
-  }, [tab, search, activeTagId, sort, setError])
+  }, [tab, search, activeTagId, sort, backendDown, noteLibraryOk, noteLibraryError])
 
   const loadSeries = useCallback(async () => {
     try {
@@ -629,42 +708,53 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
       // 无筛选时「显示数 == 总数」，顺手校正徽标（新增/删除剧集后不必整页刷新）。
       // 徽标与列表**同源**（BUG-125 / BUG-133：不许两处各算一套）。
       if (activeTagId == null) setSeriesTotal(visible.length)
+      noteLibraryOk()
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      // BUG-176：不清 series —— 取不到时保留 last-known，空数组不得冒充「没有剧集」。
+      noteLibraryError(e)
     }
-  }, [activeTagId, setError])
+  }, [activeTagId, noteLibraryOk, noteLibraryError])
 
+  // BUG-176：`down` 期间停止整批拉取（重试由探活的退避轮次驱动）；恢复后依赖变化即重拉。
   useEffect(() => {
-    if (!alive) return
+    if (backendDown) return
     void loadMeta()
-  }, [alive, loadMeta])
+  }, [backendDown, loadMeta])
 
+  // BUG-176：`down` 时仍进 `loadItems`（它只读同键缓存，不发请求）——分类 tab 切换
+  // 才拿得到该 tab 自己那份 last-known，而不是把别的分类的行留在屏上。
   useEffect(() => {
-    if (!alive || view !== 'items') return
+    if (view !== 'items') return
     const h = setTimeout(() => void loadItems(), 250)
     return () => clearTimeout(h)
-  }, [alive, view, loadItems])
+  }, [view, loadItems])
 
   /**
    * 受管成品读取（M2-T00a）：**只在文件域父行（cat-all）拉**。
    *
    * daemon 不可达（栈没起）时不清空媒体列表、也不抛到用户脸上——媒体条目照常
    * 展示，下载成品那一侧就是空的；错误只落到 error 通道（与 `loadItems` 同立场）。
+   *
+   * BUG-299：这里**不得**在失败时 `setDownloadFiles([])` —— 空数组会被渲染成
+   * 「文件管理里没有成品」（「取不到」≠「没有」）。失败只记录原因，保留 last-known，
+   * 由 `filesDown` 在列表上方直出。
    */
+  const [filesDown, setFilesDown] = useState<string | null>(null)
   const loadDownloadFiles = useCallback(async () => {
     try {
       const r = await listFiles()
       setDownloadFiles(r.files)
+      setFilesDown(null)
     } catch (e) {
-      setDownloadFiles([])
+      setFilesDown(e instanceof Error ? e.message : String(e))
       setError(e instanceof Error ? e.message : String(e))
     }
   }, [setError])
 
   useEffect(() => {
-    if (!alive || view !== 'items' || tab !== 'all') return
+    if (backendDown || view !== 'items' || tab !== 'all') return
     void loadDownloadFiles()
-  }, [alive, view, tab, loadDownloadFiles])
+  }, [backendDown, view, tab, loadDownloadFiles])
 
   /**
    * **下载↔文件域联动**（用户 2026-10-15 报「入库流水线和下载仍然没有联动」）：
@@ -674,18 +764,18 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
    * 复用现有 `/api/events` 通道（下载域已在用），不新建轮询、不新建 SSE。
    */
   useEffect(() => {
-    if (!alive || view !== 'items' || tab !== 'all') return
+    if (backendDown || view !== 'items' || tab !== 'all') return
     return subscribeEvents(({ event }) => {
       if (event === 'completed' || event === 'deleted') void loadDownloadFiles()
     })
-  }, [alive, view, tab, loadDownloadFiles])
+  }, [backendDown, view, tab, loadDownloadFiles])
 
   // 剧集列表跟随标签筛选：`loadSeries` 依赖 `activeTagId`，故切换标签即自动重取。
   // 这让 TG 自动归档到剧集的 `#标签` 真正可用（此前标签只能筛「内容」，筛不到剧集）。
   useEffect(() => {
-    if (!alive || view !== 'series') return
+    if (backendDown || view !== 'series') return
     void loadSeries()
-  }, [alive, view, loadSeries])
+  }, [backendDown, view, loadSeries])
 
   const openSeries = useCallback(
     async (id: number) => {
@@ -1239,8 +1329,18 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
    */
   const catAllRows = useMemo<(MediaItem & { fileFact?: FileFact; kindLabel?: string })[]>(() => {
     if (tab !== 'all') return items
+    /*
+     * BUG-386：同一列表的**过滤/排序口径必须一致** —— 搜索、标签、排序列都要作用于
+     * 本列表的**全部行**，不能只有媒体侧（服务端 `q`/`tagId`/`sort`）生效，
+     * 而前端合成的成品行各念各的经（旧实现：成品行不过标签、`sort=title|size`
+     * 点了列头不生效 —— 列头箭头在撒谎，行集与筛选条件也对不上）。
+     */
     const needle = search.trim().toLowerCase()
-    const facts = downloadFiles
+    /*
+     * 标签筛选：成品行没有标签（`tags: []`），结构上不可能匹配任何标签 ⇒ 选中标签时
+     * 整类让位（而不是无视筛选照常混入，那正是「筛选后行数 > total」的来源）。
+     */
+    const facts = (activeTagId === null ? downloadFiles : [])
       .filter((f) => !needle || f.name.toLowerCase().includes(needle))
       .map((f): MediaItem & { fileFact: FileFact; kindLabel: string } => ({
         id: factId(f.path),
@@ -1259,10 +1359,22 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
         fileFact: f,
       }))
     // 排序只动成品行（daemon 枚举本来就带 mtime）；媒体侧排序在别的 tab 上。
-    if (sort === 'recent') return facts.sort((a, b) => (b.addedAt ?? 0) - (a.addedAt ?? 0))
-    if (sort === 'oldest') return facts.sort((a, b) => (a.addedAt ?? 0) - (b.addedAt ?? 0))
-    return facts
-  }, [tab, items, downloadFiles, search, sort])
+    // BUG-386：`title`/`size` 是列头可达的排序（FileListView 的 name/size 列），
+    // 必须真的生效；`duration` 是媒体专有列（成品行没有时长）⇒ 落到名称序，
+    // 不让「点了没反应」成为另一种口径分裂。
+    switch (sort) {
+      case 'oldest':
+        return facts.sort((a, b) => (a.addedAt ?? 0) - (b.addedAt ?? 0))
+      case 'size':
+        return facts.sort((a, b) => (b.size ?? 0) - (a.size ?? 0))
+      case 'title':
+      case 'duration':
+        return facts.sort((a, b) => (a.title ?? '').localeCompare(b.title ?? ''))
+      case 'recent':
+      default:
+        return facts.sort((a, b) => (b.addedAt ?? 0) - (a.addedAt ?? 0))
+    }
+  }, [tab, items, downloadFiles, search, sort, activeTagId])
 
   /**
    * 页面提示串（BUG-403：单击看详情、勾选框选中 + 文件域范围说明）。
@@ -1279,8 +1391,23 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
       const shown = items.length
       if (shown > 0 && total > shown) parts.push(t('media.showing', { n: shown, total }))
     }
+    /*
+     * BUG-299（M2 可确定部分）：无字节条目在文件域**不占行**（BUG-304 / D18 只列成品；
+     * BUG-334 又裁定非受管/内部库条目不得流入文件管理）—— 但它们的存在必须**可见**，
+     * 否则「库里还有多少在线未落盘的内容」在文件域没有任何读数，用户只能看到成品数。
+     * 读数取 stats 的两个既有口径之差（登记条数 − 实际落盘条数），不新增请求、不新增端点；
+     * 老后端不下发 `on_disk_items` 时不出这一项（缺字段 ≠ 0）。
+     */
+    if (view === 'items' && tab === 'all' && typeof stats?.onDiskItems === 'number') {
+      const online = Math.max(0, (stats.items ?? 0) - stats.onDiskItems)
+      if (online > 0) {
+        parts.push(
+          zh ? `另有 ${online} 项在线（无本地字节）` : `${online} more online (no local bytes)`,
+        )
+      }
+    }
     useLibraryReadout.getState().setNote(parts.length > 0 ? parts.join(' · ') : null)
-  }, [view, tab, items, total, catAllRows, t])
+  }, [view, tab, items, total, catAllRows, stats, zh, t])
 
   useEffect(
     () => () => {
@@ -1294,8 +1421,8 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
    * 「全选本页」的目标集 = **当前真正可见的行**（BUG-155 语义的直接延伸：
    * 选中的必须是看得见、可被操作的行）。
    *
-   * cat-all（Explorer 列表视图）显示的是 `catAllRows`（已登记媒体 ∪ 受管下载
-   * 成品），**不是** `items` —— 若照旧取 `items.map(id)`，全选会漏掉全部受管
+   * cat-all（Explorer 列表视图）显示的是 `catAllRows`（**受管成品行**，BUG-334 裁定
+   * 不再并集媒体条目），**不是** `items` —— 若照旧取 `items.map(id)`，全选会漏掉全部
    * 成品行（合成负 id），用户在列表里看到「只选了一半」。分类子视图
    * （视频/图片/音频…）与 catAllRows 无关，仍取 `items`。
    *
@@ -1383,6 +1510,28 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   ).length
 
   /**
+   * 后端不可达时的文案与判据（BUG-176）。
+   *
+   * 两条**必须同时成立**的事实，界面缺一条就会退化成「看起来像空库」：
+   *  1. 「库内容暂不可读取」—— 明确说出**取不到**；
+   *  2. 「并非没有内容」—— 明确否认「库是空的」。
+   *
+   * `hasLastKnown` = 本会话内上一次成功读取留下的数据。有 ⇒ 照常渲染内容 + 顶部
+   * banner（旧数据 + 原因 + 重试）；无 ⇒ 只给一句**带否认**的占位，绝不画空列表。
+   *
+   * 无现成 i18n 键（locales 归主控）⇒ 沿用双语内联，待补 key：
+   * `media.backendDown` / `media.backendDownLastKnown`（见交付报告）。
+   */
+  const hasLastKnown =
+    stats !== null || items.length > 0 || series.length > 0 || detail !== null
+  const backendDownText = zh
+    ? '库内容暂不可读取（并非没有内容）'
+    : 'Library contents are temporarily unreadable — this is not an empty library'
+  const backendDownReason = backend.reason
+    ? `${zh ? '原因' : 'Reason'}：${backend.reason}`
+    : null
+
+  /**
    * 占用/登记读数（BUG-400）已迁全局状态栏：面板只把原始数字写进
    * `libraryReadout` store（见上方 effect），格式化与 BUG-133 口径回退在
    * `shell/LibraryReadout.tsx` 叶子里做。此处不再保留展示态。
@@ -1394,12 +1543,19 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
           <p className="text-sm text-muted">{loading ? t('media.loading') : t('media.empty')}</p>
           {!loading && (
             <>
-              <p className="max-w-sm text-center text-[11px] leading-relaxed text-muted">
-                {t('media.emptyHint')}
-              </p>
-              <Button size="sm" className="h-8 px-3 text-xs" onClick={() => setImportOpen(true)}>
-                {t('media.importDir')}
-              </Button>
+              {/* BUG-458：主操作 = 目录管理（登记受管根 + 完成后对账），不再是「导入目录」 */}
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  className="h-8 px-3 text-xs"
+                  onClick={() => setRootsOpen(true)}
+                  data-testid="media-empty-dir-manage"
+                >
+                  {t('downloads.managedTitle')}
+                </Button>
+                {/* BUG-461：空态长说明不再常驻整屏，收进带圈 ? 按钮的短时气泡 */}
+                <HintBubble text={t('media.emptyHint')} />
+              </div>
             </>
           )}
         </>
@@ -1407,7 +1563,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
         <>
           <p className="text-sm text-muted">{t('media.noMatch')}</p>
           {filterActive && (
-            <Button size="sm" variant="outline" className="h-8 px-3 text-xs" onClick={clearFilters}>
+            <Button size="sm" variant={TONE_VARIANT.secondary} className="h-8 px-3 text-xs" onClick={clearFilters}>
               {t('media.clearFilter')}
             </Button>
           )}
@@ -1424,36 +1580,20 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
       {/* `relative` 是动作条（BUG-214）的定位锚：动作条 `absolute bottom-4` 相对**内容区**
           （不是视口），故不会被 .fixed 的祖先 transform/backdrop 影响定位。 */}
       <div className="relative flex min-w-0 flex-1 flex-col">
-        {/* 工具条 */}
+        {/*
+          BUG-463：详情态工具条整行只有一个「← 返回」，与上下文栏面包屑重复且白占 ≈44px；
+          返回已并入 SeriesDetail 左栏动作行（`series-back` testid 随迁，行为不变）。
+          BUG-467：剧集墙态这条 header 零控件仍渲染出 ~17px 空白条 —— 同一判据
+          （「只剩一个控件的整行是多余的栏」，零控件更不该存在）⇒ 仅在真的有控件时渲染。
+        */}
+        {view === 'items' && tab !== 'all' ? (
         <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border-subtle/60 px-3 py-2">
-          {/* 详情态：返回是**页面导航** ⇒ 属工具栏作用域（v3 W mock 头部行同位）。
-              剧集实体的合并/导出/删除**不进工具栏** —— 它们落在 SeriesDetail
-              总览卡（实体表面）。工具栏恒为库级语义，全视图一致。 */}
-          {view === 'seriesDetail' && detail ? (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-7 shrink-0 px-2 text-[11px]"
-              data-testid="series-back"
-              onClick={() => {
-                setView('series')
-                setDetail(null)
-                setActiveSeriesId(null)
-                appliedFmode.current = 'lib-series'
-                onFmodeChange?.('lib-series')
-                void loadSeries()
-              }}
-            >
-              ← {t('media.series.back')}
-            </Button>
-          ) : null}
           {/* BUG-400（用户裁定 2026-10-23）：搜索框上移标题栏（FilesGlobalSearch），
               占用/登记读数下沉页脚状态栏 —— 本工具条不再承载它们。
               排序下拉只对**网格分类视图**（tab!=='all'）保留：cat-all 是 Explorer
               列表，排序溶入列头（FileListView 列头点击），整行工具条随之撤销 ——
               只剩一个控件的整行就是「多余的栏」。 */}
-          {view === 'items' && tab !== 'all' ? (
-            <select
+          <select
               data-testid="media-sort-select"
               value={sort}
               onChange={(e) => setSort(e.target.value as typeof sort)}
@@ -1465,12 +1605,12 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
               <option value="duration">{t('media.sortDuration')}</option>
               <option value="size">{t('media.sortSize')}</option>
             </select>
-          ) : null}
           {/* BUG-304 / D18：原「只看散片（未归入剧集）」勾选框删除 —— 「未归档」状态本身
               取消（视频=剧集 ⇒ 单集即单集剧集），该筛选永远只会返回空集。
               后端 `?unassigned=` 参数保留（BUG-138 缓存键判据仍在用），只是前端不再有入口。 */}
 
         </header>
+        ) : null}
         {/*
          * M0-T03：标签云从左栏搬迁到内容区。
          * BUG-304 / D18：导航不再有「标签」树项（标签是**过滤维度**不是目的地），
@@ -1478,7 +1618,12 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
          * **列表上方、常态可见** —— 原位置自相矛盾（要筛就得先滚过全部标签，
          * 而滚完已经看见了全部）。BUG-259 的截断/展开两条规则保留，testid 不变。
          */}
-        {view === "series" && (
+        {/*
+          BUG-467：过滤标签在「没有可筛内容」时仍占位是「恒渲染但恒无效」的控件撒谎
+          （BUG-131 同源判据）。剧集墙为空 ⇒ 标签条与标签云整体不渲染，空态由下方
+          `series.length === 0` 分支承担。testid 定义不删（空态不渲染 ≠ 删能力）。
+        */}
+        {view === "series" && series.length > 0 && (
           <>
                     <div className="flex items-center gap-2 px-2 pt-3">
                       {/* BUG-405 修正：原设计「标签」文字 + 撑满长输入框是**两个组件**，且输入框
@@ -1616,11 +1761,55 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
         )}
 
         {/*
+          资料库后端**不可达**（BUG-176）：这是「取不到」，**不是**「没有内容」。
+          有 last-known ⇒ 内容照常渲染 + 本 banner 直出原因（用户能判断库里仍有多少东西）；
+          无 last-known ⇒ 下方占位（同样带「并非没有内容」的否认）。
+          重试走 `probeLibrary(true)`（会请 daemon 重启库宿主进程），另有退避续轮。
+        */}
+        {backendDown && hasLastKnown ? (
+          <div
+            className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-600 dark:text-amber-400"
+            data-testid="media-backend-down-banner"
+          >
+            <span className="min-w-0 flex-1 truncate" title={backend.reason ?? undefined}>
+              {backendDownText}
+              {backendDownReason ? ` · ${backendDownReason}` : ''}
+            </span>
+            <Button
+              size="sm"
+              variant={TONE_VARIANT.secondary}
+              className="h-6 px-2 text-[11px]"
+              disabled={libRetrying}
+              onClick={() => void probeLibrary(true)}
+              data-testid="media-backend-retry"
+            >
+              {libRetrying ? t('media.connecting') : t('media.retryConnect')}
+            </Button>
+          </div>
+        ) : null}
+
+        {/*
+          文件事实（daemon）读取失败（BUG-299）：同理不得把失败渲染成「没有成品」。
+          只在 cat-all 且有原因时出现；行集保留 last-known。
+        */}
+        {view === 'items' && tab === 'all' && filesDown ? (
+          <div
+            className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-600 dark:text-amber-400"
+            data-testid="media-files-down-banner"
+          >
+            <span className="min-w-0 flex-1 truncate" title={filesDown}>
+              {zh ? '文件清单暂不可读取（并非没有文件）' : 'File list is temporarily unreadable — not an empty folder'}
+              {` · ${zh ? '原因' : 'Reason'}：${filesDown}`}
+            </span>
+          </div>
+        ) : null}
+
+        {/*
           来源后端不可用的**非阻断**提示（S3）：
           TG 没起只意味着「暂时不能原路取回字节」，库本身照常可浏览可管理。
           这里写死成整页占位是错的——那是把「一个来源不可用」渲染成「库不可用」。
         */}
-        {alive && hasDownSource ? (
+        {!backendDown && hasDownSource ? (
           <div
             className="flex shrink-0 items-center gap-2 border-b border-border-subtle/60 bg-surface-2/50 px-3 py-1.5 text-[11px] text-muted"
             data-testid="media-source-offline-banner"
@@ -1630,7 +1819,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             </span>
             <Button
               size="sm"
-              variant="outline"
+              variant={TONE_VARIANT.secondary}
               className="h-6 px-2 text-[11px]"
               onClick={() => void reconnectSources()}
             >
@@ -1640,15 +1829,29 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
         ) : null}
 
         {/* 内容区 */}
-        {!alive ? (
-          <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-10">
-            <p className="text-sm text-muted">{t('media.offline')}</p>
+        {/*
+          BUG-176：`down` **且无 last-known** 时才占位 —— 而且必须说清「取不到 ≠ 没有」。
+          旧实现无论有没有数据都整页替换成「媒体服务未运行」，用户就此失去「库里到底
+          有没有内容」的全部线索（缺陷档原话：数据完全丢失、不清楚是没数据还是取错）。
+        */}
+        {backendDown && !hasLastKnown ? (
+          <div
+            className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-10"
+            data-testid="media-service-down"
+          >
+            <p className="text-sm text-fg-strong">{backendDownText}</p>
+            {backendDownReason ? (
+              <p className="max-w-md truncate text-[11px] text-muted" title={backend.reason ?? undefined}>
+                {backendDownReason}
+              </p>
+            ) : null}
             <Button
               size="sm"
-              variant="outline"
+              variant={TONE_VARIANT.secondary}
               className="h-7 px-3 text-xs"
               disabled={libRetrying}
-              onClick={() => void probeLibrary()}
+              onClick={() => void probeLibrary(true)}
+              data-testid="media-backend-retry"
             >
               {libRetrying ? t('media.connecting') : t('media.retryConnect')}
             </Button>
@@ -1754,7 +1957,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
                     <p className="text-sm text-muted">{t('media.noMatch')}</p>
                     <Button
                       size="sm"
-                      variant="outline"
+                      variant={TONE_VARIANT.secondary}
                       className="h-8 px-3 text-xs"
                       onClick={clearFilters}
                     >
@@ -1809,7 +2012,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
            * 音频）仍是各自类型的浏览墙（MediaCard），只有「全部」这个**域级**父行
            * 用列表。
            *
-           * 行集 = `catAllRows`（已登记媒体 ∪ 受管下载成品，M2-T00a）——判据 7
+           * 行集 = `catAllRows`（**受管成品**，BUG-334 裁定只认 daemon 枚举）——判据 7
            * 的「共通性」就在这一行：zip/exe/pdf 与媒体同列表、同动作。
            */
           <FileListView
@@ -1831,8 +2034,54 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             // （与 SeriesDetail 来源块入口同一个 `viewInTg` 回调、同一套坐标门控）。
             onViewInTg={viewInTg}
           />
-        ) : items.length === 0 && !loading ? (
+        ) : items.length === 0 && (loading || backend.state === 'unknown') ? (
+          /*
+           * BUG-176：探活未回 / 首屏加载中**不得**落到「文件管理里还没有内容」——
+           * 那是把「还不知道」渲染成「确认没有」。等结果，不猜。
+           */
+          <div
+            className="flex min-h-0 flex-1 items-center justify-center p-10 text-sm text-muted"
+            data-testid="media-loading"
+          >
+            {t('media.loading')}
+          </div>
+        ) : items.length === 0 ? (
           emptyState
+        ) : view === 'items' && tab === 'all' ? (
+          /*
+           * BUG-386：cat-all 的行集**只有**受管成品（BUG-334 裁定：内部库与非受管文件
+           * 不得流入文件管理）。旧实现在「有媒体条目、无受管成品」时落回海报墙网格 ——
+           * 同一父行一会儿是文件列表、一会儿是内部库海报墙，行集口径当场分裂。
+           * 这里如实给「受管目录下还没有文件」，并给出登记受管根的入口。
+           */
+          <div
+            className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-10"
+            data-testid="file-list-empty"
+          >
+            {/* BUG-386：筛选态下为空 ≠ 「受管目录下没文件」—— 两个事实必须分开说。 */}
+            {filterActive ? (
+              <>
+                <p className="text-sm text-muted">{t('media.noMatch')}</p>
+                <Button
+                  size="sm"
+                  variant={TONE_VARIANT.secondary}
+                  className="h-8 px-3 text-xs"
+                  onClick={clearFilters}
+                >
+                  {t('media.clearFilter')}
+                </Button>
+              </>
+            ) : (
+              <>
+                <p className="text-sm text-muted">
+                  {zh ? '受管目录下还没有文件' : 'No files under the managed roots yet'}
+                </p>
+                <Button size="sm" className="h-8 px-3 text-xs" onClick={() => setRootsOpen(true)}>
+                  {t('downloads.managedTitle')}
+                </Button>
+              </>
+            )}
+          </div>
         ) : (
           <>
             <div className="min-h-0 flex-1 overflow-y-auto p-3">
@@ -1909,7 +2158,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
               {t('media.seriesMergeOpen')}
             </Button>
             <Button
-              variant="outline"
+              variant={TONE_VARIANT.secondary}
               size="sm"
               className="h-7 px-2 text-[11px]"
               data-testid="series-bulk-tag"
@@ -1918,7 +2167,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
               {t('media.series.bulkTag')}
             </Button>
             <Button
-              variant="outline"
+              variant={TONE_VARIANT.secondary}
               size="sm"
               className="h-7 px-2 text-[11px]"
               data-testid="series-bulk-export"
@@ -1931,7 +2180,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
               {t('media.series.bulkExport')}
             </Button>
             <Button
-              variant="outline"
+              variant={TONE_VARIANT.secondary}
               size="sm"
               className="h-7 px-2 text-[11px] text-destructive"
               data-testid="series-bulk-remove"
@@ -1941,8 +2190,10 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             >
               {t('media.series.bulkRemove')}
             </Button>
+            {/* BUG-269：同一动作条内「取消选择」是次要动作，与左侧 outline 按钮同形，
+                此前写成 ghost（无背景无边框）⇒ 同排两种形态。 */}
             <Button
-              variant="ghost"
+              variant={TONE_VARIANT.secondary}
               size="sm"
               className="h-7 px-2 text-[11px]"
               data-testid="series-selection-clear"
@@ -1991,7 +2242,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             />
             {/* 剧集收 video / photo（图片入浏览位）。含 audio/未知类型时禁用（后端 422 兜底） */}
             <Button
-              variant="outline"
+              variant={TONE_VARIANT.secondary}
               size="sm"
               className="h-7 px-2 text-[11px]"
               data-testid="items-add-to-series"
@@ -2002,7 +2253,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
               {t('media.addToSeries')}
             </Button>
             <Button
-              variant="outline"
+              variant={TONE_VARIANT.secondary}
               size="sm"
               className="h-7 px-2 text-[11px]"
               data-testid="items-bulk-tag"
@@ -2012,7 +2263,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             </Button>
             {/* 批量整理（D24-A / BUG-311）：把选中条目按模板铺成可读名的硬链接/副本。 */}
             <Button
-              variant="outline"
+              variant={TONE_VARIANT.secondary}
               size="sm"
               className="h-7 px-2 text-[11px]"
               data-testid="media-organize"
@@ -2021,7 +2272,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
               {t('media.organize.open')}
             </Button>
             <Button
-              variant="outline"
+              variant={TONE_VARIANT.secondary}
               size="sm"
               className="h-7 px-2 text-[11px] text-destructive"
               data-testid="items-bulk-remove"
@@ -2029,8 +2280,9 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             >
               {t('media.remove')}
             </Button>
+            {/* BUG-269：同 `series-selection-clear` —— 次要动作统一 outline。 */}
             <Button
-              variant="ghost"
+              variant={TONE_VARIANT.secondary}
               size="sm"
               className="h-7 px-2 text-[11px]"
               data-testid="items-selection-clear"
@@ -2043,6 +2295,23 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
       </div>
 
       {/* ───────── 弹窗 ───────── */}
+      {/* BUG-458：目录管理（受管根登记/移除/设主 + 完成时对账一次） */}
+      {rootsOpen ? (
+        <ManagedRootsDialog
+          onClose={() => setRootsOpen(false)}
+          onReconciled={async (n) => {
+            clearSelection()
+            await refreshAll()
+            if (n > 0) setError(t('media.library.imported', { n }))
+          }}
+          onOpenImport={() => {
+            setRootsOpen(false)
+            setImportOpen(true)
+          }}
+          onError={(m) => setError(m)}
+        />
+      ) : null}
+
       {importOpen ? (
         <ImportDialog
           onClose={() => setImportOpen(false)}
@@ -2329,7 +2598,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
             ) : null}
             <div className="mt-4 flex justify-end gap-2">
               <Button
-                variant="outline"
+                variant={TONE_VARIANT.secondary}
                 size="sm"
                 className="h-8 px-3 text-xs"
                 onClick={() => setConfirmDelete(null)}
