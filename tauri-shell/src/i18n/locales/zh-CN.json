@@ -1015,6 +1015,7 @@
   "tg.filterHeading": "文字筛选",
   "tg.filterHits": "{n} 条",
   "tg.filterIngest": "入库选中（{n}）",
+  "tg.filterSubmittedTag": "已提交入库",
   "tg.filterIngestDone": "已提交 {n} 条入库",
   "tg.filterIngestNone": "没有可入库的条目（选中的都已入库或不可入库）",
   "tg.filterIngesting": "入库中…",

@@ -49,6 +49,7 @@
 | _probe_bug355_download_scope.cjs | download | S2 |
 | _probe_bug483_stale_failure.cjs | tg | S2 |
 | _probe_bug484_ingest_by_title.cjs | tg | S2 |
+| _probe_bug485_ingest_terminal_state.cjs | tg | S2 |
 | _probe_episode_actions.cjs | files | S2 |
 | _probe_cache_dialog_geom.cjs | misc | S2 |
 | _probe_cache_panel.cjs | misc | S2 |

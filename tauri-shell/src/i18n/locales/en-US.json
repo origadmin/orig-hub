@@ -1015,6 +1015,7 @@
   "tg.filterHeading": "Text filters",
   "tg.filterHits": "{n} items",
   "tg.filterIngest": "Ingest selected ({n})",
+  "tg.filterSubmittedTag": "Submitted",
   "tg.filterIngestDone": "Queued {n} item(s) for ingest",
   "tg.filterIngestNone": "Nothing to ingest (selected items are already ingested or not ingestible)",
   "tg.filterIngesting": "Ingesting…",

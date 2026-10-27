@@ -131,6 +131,9 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
   /** 用户显式改过勾选的单元（BUG-341：翻页把同一相册的后续成员带回来时，
    *  不得把用户减掉的勾选静默还原——增量只补没被用户碰过的单元）。 */
   const touchedRef = useRef<Set<string>>(new Set())
+  /** 本会话内已提交入库的单元键（BUG-485）。提交即终态：不再是待办、不可再勾、
+   *  翻页/新命中并入也不得勾回——重复提交只靠后端幂等兜底 = 让错误状态可表达。 */
+  const [submitted, setSubmitted] = useState<Set<string>>(new Set())
 
   const units = useMemo(() => groupHits(hits), [hits])
   /**
@@ -181,10 +184,12 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
         return next
       })
       // 与 loadMore 同一把尺子：缺字节 = 要下载的 ⇒ 默认入选，用户碰过的不还原。
+      // BUG-485：已提交单元同属终态，并入时也不得勾回。
       setSelected((prev) => {
         const next = new Set(prev)
         for (const u of fresh) {
           if (touchedRef.current.has(u.key)) continue
+          if (submitted.has(u.key)) continue
           if (u.members.some((m) => !m.downloaded)) next.add(u.key)
         }
         return next
@@ -194,7 +199,7 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
     } finally {
       headBusyRef.current = false
     }
-  }, [filter.id])
+  }, [filter.id, submitted])
 
   /**
    * BUG-437：监控推来的新命中**就地并入**，不再让用户「退出重进」才看得到。
@@ -222,6 +227,7 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
     // 视觉强调会随新列表延续下来），等首屏到位后重来（见下方 didInitSelect）。
     didInitSelect.current = false
     touchedRef.current = new Set()
+    setSubmitted(new Set()) // BUG-485：submitted 是工作台态，随换规则复位
     hitsBaselineRef.current = null
     void (async () => {
       try {
@@ -272,6 +278,7 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
         const next = new Set(prev)
         for (const u of fresh) {
           if (touchedRef.current.has(u.key)) continue
+          if (submitted.has(u.key)) continue // BUG-485：已提交单元是终态，不得勾回
           if (u.members.some((m) => !m.downloaded)) next.add(u.key)
         }
         return next
@@ -284,7 +291,7 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
     } finally {
       setLoadingMore(false)
     }
-  }, [hits, loadingMore, hasMore, filter.id])
+  }, [hits, loadingMore, hasMore, filter.id, submitted])
 
   const toggleExpand = useCallback((key: string) => {
     setExpanded((prev) => {
@@ -295,11 +302,11 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
     })
   }, [])
 
-  /** 可勾选 = 组内还有缺字节成员的单元（图片同样可下载；是否进「剧集」由后端
-   *  kind 预切决定）。整组都已入库的单元不再可勾。 */
+  /** 可勾选 = 组内还有缺字节成员、且本会话尚未提交过的单元（图片同样可下载；
+   *  是否进「剧集」由后端 kind 预切决定）。整组已入库或已提交的单元不再可勾。 */
   const selectableUnits = useMemo(
-    () => units.filter((u) => u.members.some((m) => !m.downloaded)),
-    [units],
+    () => units.filter((u) => !submitted.has(u.key) && u.members.some((m) => !m.downloaded)),
+    [units, submitted],
   )
 
   // 默认全选可入库单元（BUG-327 裁定：选中的 = 要下载的，用户只做减法）。
@@ -360,6 +367,7 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
     setNotice(null)
     let queued = 0
     const failures: string[] = []
+    const succeededKeys: string[] = []
     for (const u of picked) {
       // 组 = 入库单位：整组缺字节成员一次入队（不是「匹配到的那一条」）。
       const ids = u.members.filter((m) => !m.downloaded).map((m) => m.messageId)
@@ -382,6 +390,7 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
           seriesKey: `tg:filter:${filter.id}`,
           seriesHint: filter.label || filter.keyword,
         })
+        succeededKeys.push(u.key)
         if (!r?.alreadyIngested) queued += ids.length
       } catch (e) {
         failures.push(e instanceof Error ? e.message : String(e))
@@ -393,9 +402,19 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
       setNotice(failures[0])
       return
     }
+    // BUG-485：提交成功 = 这些单元在本面板的终态。移出选中（计数与按钮随之归零，
+    // 「入库选中」不再可点）、记入 submitted（不可再勾、翻页/并入不得勾回、行级徽标）。
+    if (succeededKeys.length > 0) {
+      setSubmitted((prev) => new Set([...prev, ...succeededKeys]))
+      setSelected((prev) => {
+        const next = new Set(prev)
+        for (const k of succeededKeys) next.delete(k)
+        return next
+      })
+    }
     setNotice(queued === 0 ? t('tg.filterIngestNone') : t('tg.filterIngestDone', { n: queued }))
     onIngested?.(queued)
-  }, [units, selected, onIngested])
+  }, [units, selected, onIngested, t])
 
   return (
     <div className="flex min-h-0 flex-1 flex-col" data-testid="tg-filter-panel">
@@ -438,8 +457,9 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
             const checked = selected.has(k)
             const open = expanded.has(k)
             const isAlbum = u.groupId != null
-            // 可勾 = 组内还有缺字节成员（整组已入库的不可勾）。
-            const pickable = u.members.some((m) => !m.downloaded)
+            // 可勾 = 组内还有缺字节成员、且本会话未提交（BUG-485：已提交 = 终态，
+            // 与整组已入库同属不可勾；并给「已提交」徽标，不静默装没发生）。
+            const pickable = !submitted.has(k) && u.members.some((m) => !m.downloaded)
             const isNew = newUnitKeys.has(k)
             const newest = u.members.reduce<TgMonitorFilterHit | null>(
               (acc, m) => (acc == null || (m.date ?? 0) > (acc.date ?? 0) ? m : acc),
@@ -513,7 +533,16 @@ export function TgFilterPanel({ filter, onClose, onIngested }: Props) {
                         {newest?.date != null ? (
                           <span className="tabular-nums">{fmtTime(newest.date)}</span>
                         ) : null}
-                        {!pickable ? (
+                        {/* BUG-485：不可勾有两种语义，不混成一个「已下载」——
+                            本会话提交过 = 「已提交」（等后台落盘），整组已有字节 = 「已下载」。 */}
+                        {submitted.has(k) ? (
+                          <span
+                            className="text-success"
+                            data-testid="tg-filter-submitted"
+                          >
+                            {t('tg.filterSubmittedTag')}
+                          </span>
+                        ) : !pickable ? (
                           <span className="text-success">{t('tg.downloaded')}</span>
                         ) : null}
                       </p>
