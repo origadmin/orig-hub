@@ -533,7 +533,7 @@ export function TgPanel(
    */
   const [filters, setFilters] = useState<TgMonitorFilter[]>([])
   /**
-   * BUG-470：「加入筛选并缓存」的目标（null = 未打开）。
+   * BUG-470/484：「缓存入库」的目标（null = 未打开）。
    *
    * 定稿语义：筛选名 = 入库后这批内容的标题 = 剧集名，三者同一字符串。
    * 单条与整组共用同一个面板，只是提交时 `messageIds` 不同 —— 不存在「给条目还是给剧」的分支。
@@ -1942,27 +1942,23 @@ export function TgPanel(
   }
 
   /**
-   * BUG-470：**加入筛选 + 缓存入库**合并为一次提交（单条与整组共用）。
+   * BUG-470：**缓存入库**一次提交（单条与整组共用）。
    *
-   * 定稿：筛选名 = 入库后这批内容的标题 = 归属剧集名 ⇒ 同一个字符串同时下发
-   * `titleHint`（条目显示名）与 `seriesHint`（剧名），`seriesKey = tg:filter:{id}`
-   * 作幂等轴（BUG-438）。引擎零改动：仍是既有 `POST /api/tg/cache/tasks`。
-   * 「新建筛选」也只是把名字登记成一条筛选（`addTgMonitorFilter`，keyword 与 label
-   * 同值 —— 谓词只是「以后自动投进这个筛选」的来源，不参与本次显式归入）。
+   * BUG-484 裁定：不存在「加入筛选」这个显式动作——筛选按标题匹配，标题本来就在
+   * 消息上。入库时按标题**精确匹配**复用已有筛选（`label === title || keyword === title`）
+   * 作 `seriesKey`（BUG-438 轴，筛选面板与 TG 面板同轴）；没有才落一条新规则
+   * （`addTgMonitorFilter`，keyword 与 label 同值）。三者同一不变：
+   * 标题 = 入库后内容的标题 = 剧集名，同时下发 `titleHint` / `seriesHint`。
+   * 引擎零改动：仍是既有 `POST /api/tg/cache/tasks`。
    */
-  const submitFilterCache = async (name: string, filterId: number | null) => {
+  const submitFilterCache = async (name: string) => {
     if (!filterCache) return
-    const picked = filterId != null ? filters.find((f) => f.id === filterId) : undefined
-    // 选了已有筛选 ⇒ 名字以筛选为准（改名不影响已入库的键，但本次归属必须同源）
-    const label = (picked?.label || picked?.keyword || name).trim()
+    const label = name.trim()
     if (!label) return
     try {
-      let id = filterId
-      if (id == null) {
-        const created = await addTgMonitorFilter({ keyword: label, label })
-        id = created.id
-        setFilters(await listTgMonitorFilters())
-      }
+      const picked = filters.find((f) => f.label === label || f.keyword === label)
+      const id = picked ? picked.id : (await addTgMonitorFilter({ keyword: label, label })).id
+      if (!picked) setFilters(await listTgMonitorFilters())
       const target =
         filterCache.kind === 'item'
           ? { chatId: filterCache.item.chatId, messageIds: [filterCache.item.messageId] }
@@ -2030,11 +2026,11 @@ export function TgPanel(
   const onBubbleOpen = useEvent((item: FeedItem) => void openDownloaded(item))
   const onBubblePreview = useEvent((item: FeedItem) => openPlayable(item, [item], 0))
   const onAlbumDownload = useEvent((items: FeedItem[]) => void downloadAlbum(items))
-  /* BUG-470：单条 / 整组「加入筛选并缓存」的入口回调（恒定引用，保住子气泡的 memo） */
-  const onBubbleAddToFilter = useEvent((item: FeedItem) =>
+  /* BUG-470 → BUG-484：单条 / 整组「缓存入库」的入口回调（恒定引用，保住子气泡的 memo） */
+  const onBubbleCacheIngest = useEvent((item: FeedItem) =>
     setFilterCache({ kind: 'item', item }),
   )
-  const onAlbumAddToFilter = useEvent((items: FeedItem[]) => {
+  const onAlbumCacheIngest = useEvent((items: FeedItem[]) => {
     if (items.length > 0) setFilterCache({ kind: 'album', items })
   })
   const onAlbumCancel = useEvent((items: FeedItem[]) =>
@@ -2977,7 +2973,7 @@ export function TgPanel(
                                 state={entryStateFor(item)}
                                 downloadedPath={downloadedPaths.get(item.key)}
                                 onDownload={onBubbleDownload}
-                                onAddToFilter={onBubbleAddToFilter}
+                                onCacheIngest={onBubbleCacheIngest}
                                 onOpenDownloaded={onBubbleOpen}
                                 onPreview={onBubblePreview}
                               />
@@ -3201,7 +3197,7 @@ export function TgPanel(
                         progress={singleProgress.get(unit[0].messageId)}
                         highlighted={highlightKey === unit[0].key}
                         onDownload={onBubbleDownload}
-                        onAddToFilter={onBubbleAddToFilter}
+                        onCacheIngest={onBubbleCacheIngest}
                         onOpenDownloaded={onBubbleOpen}
                         onPreview={onBubblePreview}
                       />
@@ -3235,7 +3231,7 @@ export function TgPanel(
                           return live ?? (stillCaching ? held : undefined)
                         })()}
                         onDownload={onAlbumDownload}
-                        onAddToFilter={onAlbumAddToFilter}
+                        onCacheIngest={onAlbumCacheIngest}
                         onCancel={onAlbumCancel}
                         onPreview={onAlbumPreview}
                       />
@@ -3283,10 +3279,10 @@ export function TgPanel(
           onOpenMedia={onOpenMedia}
         />
       ) : null}
-      {/* BUG-470：单条 / 整组共用同一个「加入筛选并缓存」面板（预填 caption 兜底名） */}
+      {/* BUG-470：单条 / 整组共用同一个「缓存入库」面板（预填 caption 兜底名）；
+          BUG-484：无模式选择，按标题自动归属 */}
       {filterCache ? (
         <FilterCacheDialog
-          filters={filters}
           defaultName={
             filterCache.kind === 'item'
               ? (filterCache.item.caption ?? '')
@@ -3294,7 +3290,7 @@ export function TgPanel(
           }
           count={filterCache.kind === 'item' ? 1 : filterCache.items.length}
           onCancel={() => setFilterCache(null)}
-          onSubmit={(name, id) => void submitFilterCache(name, id)}
+          onSubmit={(name) => void submitFilterCache(name)}
         />
       ) : null}
     </div>
@@ -3335,8 +3331,8 @@ const MessageBubble = memo(function MessageBubble(props: {
    */
   highlighted?: boolean
   onDownload: (item: FeedItem) => void
-  /** BUG-470：加入筛选并缓存（缺省不渲染 —— 不给点不动的入口） */
-  onAddToFilter?: (item: FeedItem) => void
+  /** BUG-484：缓存入库（缺省不渲染 —— 不给点不动的入口） */
+  onCacheIngest?: (item: FeedItem) => void
   onOpenDownloaded: (item: FeedItem) => void
   onPreview: (item: FeedItem) => void
 }) {
@@ -3347,12 +3343,12 @@ const MessageBubble = memo(function MessageBubble(props: {
     progress,
     highlighted = false,
     onDownload,
-    onAddToFilter,
+    onCacheIngest,
     onOpenDownloaded,
     onPreview,
   } = props
   const { t, language } = useTranslation()
-  /** BUG-470：入口文案按当前语言取（本轮不新增 i18n 键，需主控补 `tg.addToFilterCache`） */
+  /** 入口文案按当前语言取（BUG-484 定稿「缓存入库」，内联双语文案） */
   const zh = language !== 'en-US'
   const cached = state === 'cached'
   const caching = state === 'caching'
@@ -3444,7 +3440,23 @@ const MessageBubble = memo(function MessageBubble(props: {
           size="sm"
           className="h-6 px-2 text-[12px]"
           disabled={caching || queued}
-          onClick={() => onDownload(m)}
+          onClick={() => {
+            // BUG-484：未落盘 = 唯一「缓存入库」（标题即剧集名，同名自动归入）；
+            // 重试态（缺字节/失败）保留纯重试——不弹命名框（字节重取不改变归属）。
+            if (state === 'bytesMissing' || state === 'failed' || !onCacheIngest) {
+              onDownload(m)
+            } else {
+              onCacheIngest(m)
+            }
+          }}
+          title={
+            state === 'bytesMissing' || state === 'failed'
+              ? undefined
+              : zh
+                ? '标题即剧集名：同名内容自动归入同一剧集'
+                : 'Title = series name; same titles merge into one series'
+          }
+          data-testid="bubble-cache-ingest"
         >
           {/* 缺字节/失败 = 条目在、字节未就绪 → 动词是「重试缓存」（BUG-170 语义定稿）；
               排队中（BUG-181）= 在单飞队列等待，禁用按钮防止重复入队误导。 */}
@@ -3454,25 +3466,11 @@ const MessageBubble = memo(function MessageBubble(props: {
               ? t('tg.queued')
               : state === 'bytesMissing' || state === 'failed'
                 ? t('tg.retryCache')
-                : t('tg.download')}
+                : zh
+                  ? '缓存入库'
+                  : 'Cache & ingest'}
         </Button>
       )}
-      {/* BUG-470：与「缓存」并列的合并入口 —— 一次提交同时完成「加入筛选」与「入队」。
-          只在未落盘时出现：已入库的条目后端会拦成 alreadyIngested，那颗按钮点了
-          只会提示「已入库」，等于给一个承诺不了的出口。 */}
-      {!(downloadedPath || m.downloaded) && onAddToFilter ? (
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-6 px-2 text-[12px] text-accent"
-          disabled={caching || queued}
-          onClick={() => onAddToFilter(m)}
-          title={zh ? '筛选名 = 这批内容的标题 = 剧集名' : 'Filter name = title = series name'}
-          data-testid="bubble-add-to-filter"
-        >
-          {zh ? '加入筛选并缓存' : 'Add to filter & cache'}
-        </Button>
-      ) : null}
     </div>
   )
   return (
@@ -3562,48 +3560,37 @@ const MessageBubble = memo(function MessageBubble(props: {
 })
 
 /**
- * BUG-470：单条 / 整组共用的「加入筛选并缓存」轻量面板。
+ * BUG-470：单条 / 整组共用的「缓存入库」轻量面板。
  *
- * 只做一件事：定一个筛选名（= 入库后这批内容的标题 = 归属剧集名），然后提交。
- * 名字可预填 caption 兜底、现场可改；**留空不提交**并显式说明原因 ——
- * 「没有名字的内容在库里认不出来」正是现状产生无名批次的原因。
- * 「选已有筛选」只是复用其 id 作 `seriesKey`，不新增任何筛选模型字段。
+ * BUG-484 裁定：不存在「加入筛选」的显式动作——筛选按标题匹配，标题本来就在
+ * 消息上，同名自动归入（提交时按标题精确匹配复用，见 `submitFilterCache`）。
+ * 因此这里**只有一件事**：确认/编辑标题（预填 caption），没有「新建/已有」模式、
+ * 没有规则下拉。留空不提交并显式说明原因——「没有名字的内容在库里认不出来」。
  */
 function FilterCacheDialog(props: {
-  filters: TgMonitorFilter[]
   /** 预填名（caption 兜底，可为空 ⇒ 用户必须自己起名） */
   defaultName: string
   /** 本次涉及的条目数（1 = 单条） */
   count: number
   onCancel: () => void
-  onSubmit: (name: string, filterId: number | null) => void
+  onSubmit: (name: string) => void
 }) {
   const { t, language } = useTranslation()
   const zh = language !== 'en-US'
-  const { filters, defaultName, count } = props
-  const [mode, setMode] = useState<'new' | 'existing'>(filters.length > 0 ? 'existing' : 'new')
+  const { defaultName, count } = props
   const [name, setName] = useState(defaultName)
-  const [pickedId, setPickedId] = useState<number | null>(filters[0]?.id ?? null)
   const [err, setErr] = useState<string | null>(null)
 
   const submit = () => {
-    if (mode === 'existing') {
-      if (pickedId == null) {
-        setErr(zh ? '请选择一条筛选' : 'Pick a filter')
-        return
-      }
-      props.onSubmit('', pickedId)
-      return
-    }
     if (!name.trim()) {
       setErr(
         zh
-          ? '筛选名必填：没有名字的内容在库里认不出来'
-          : 'Name required — unnamed content cannot be recognized in the library',
+          ? '标题必填：没有名字的内容在库里认不出来'
+          : 'Title required — unnamed content cannot be recognized in the library',
       )
       return
     }
-    props.onSubmit(name.trim(), null)
+    props.onSubmit(name.trim())
   }
 
   return (
@@ -3617,66 +3604,26 @@ function FilterCacheDialog(props: {
         data-testid="tg-filter-cache-dialog"
       >
         <h2 className="text-sm font-semibold text-fg-strong">
-          {zh ? '加入筛选并缓存' : 'Add to filter & cache'}
+          {zh ? '缓存入库' : 'Cache & ingest'}
         </h2>
         <p className="mt-1 text-[12px] leading-relaxed text-muted">
           {zh
-            ? `筛选名 = 这批${count} 条内容的标题 = 剧集名；一次提交同时完成归类与入库。`
-            : `Filter name = title of these ${count} item(s) = series name; one submit does both.`}
+            ? `标题 = 这批 ${count} 条内容的标题 = 剧集名；同名自动归入同一剧集，不会重复建。`
+            : `Title of these ${count} item(s) = series name; items with the same title merge into one series automatically.`}
         </p>
 
-        <div className="mt-3 flex items-center gap-3 text-[12px] text-fg-mid">
-          <label className="flex items-center gap-1.5">
-            <input
-              type="radio"
-              checked={mode === 'new'}
-              onChange={() => setMode('new')}
-              data-testid="tg-filter-cache-new"
-            />
-            {zh ? '新建筛选' : 'New filter'}
-          </label>
-          <label className="flex items-center gap-1.5">
-            <input
-              type="radio"
-              checked={mode === 'existing'}
-              onChange={() => setMode('existing')}
-              disabled={filters.length === 0}
-              data-testid="tg-filter-cache-existing"
-            />
-            {zh ? '选已有筛选' : 'Existing filter'}
-          </label>
-        </div>
-
-        {mode === 'new' ? (
-          <Input
-            value={name}
-            onChange={(e) => {
-              setName(e.target.value)
-              setErr(null)
-            }}
-            placeholder={zh ? '筛选名（必填）' : 'Filter name (required)'}
-            className="mt-2 h-8 text-xs"
-            spellCheck={false}
-            autoFocus
-            data-testid="tg-filter-cache-name"
-          />
-        ) : (
-          <select
-            value={pickedId ?? ''}
-            onChange={(e) => {
-              setPickedId(Number(e.target.value))
-              setErr(null)
-            }}
-            className="mt-2 h-8 w-full rounded-md border border-border-subtle bg-surface px-2 text-xs text-fg-strong"
-            data-testid="tg-filter-cache-select"
-          >
-            {filters.map((f) => (
-              <option key={f.id} value={f.id}>
-                {f.label || f.keyword}
-              </option>
-            ))}
-          </select>
-        )}
+        <Input
+          value={name}
+          onChange={(e) => {
+            setName(e.target.value)
+            setErr(null)
+          }}
+          placeholder={zh ? '标题（必填）' : 'Title (required)'}
+          className="mt-3 h-8 text-xs"
+          spellCheck={false}
+          autoFocus
+          data-testid="tg-filter-cache-name"
+        />
 
         {err ? (
           <p className="mt-2 text-[12px] text-danger" data-testid="tg-filter-cache-error">
@@ -3700,7 +3647,7 @@ function FilterCacheDialog(props: {
             onClick={submit}
             data-testid="tg-filter-cache-submit"
           >
-            {zh ? '加入并缓存' : 'Add & cache'}
+            {zh ? '入库' : 'Ingest'}
           </Button>
         </div>
       </div>
@@ -3781,8 +3728,8 @@ const AlbumBubble = memo(function AlbumBubble(props: {
    */
   highlighted?: boolean
   onDownload: (items: FeedItem[]) => void
-  /** BUG-470：加入筛选并缓存（缺省不渲染 —— 不呈现点不动的入口） */
-  onAddToFilter?: (items: FeedItem[]) => void
+  /** BUG-484：缓存入库（缺省不渲染 —— 不呈现点不动的入口） */
+  onCacheIngest?: (items: FeedItem[]) => void
   /** 取消整组缓存（进行中时操作行显示「取消」） */
   onCancel?: (items: FeedItem[]) => void
   onPreview: (index: number, items: FeedItem[]) => void
@@ -3810,14 +3757,14 @@ const AlbumBubble = memo(function AlbumBubble(props: {
     progress,
     highlighted = false,
     onDownload,
-    onAddToFilter,
+    onCacheIngest,
     onCancel,
     onPreview,
     expanded = false,
     onToggleExpand,
   } = props
   const { t, language } = useTranslation()
-  /** BUG-470：入口文案按当前语言取（本轮不新增 i18n 键，需主控补 `tg.addToFilterCache`） */
+  /** 入口文案按当前语言取（BUG-484 定稿「缓存入库」，内联双语文案） */
   const zh = language !== 'en-US'
   /* BUG-352：完成判据只有一条 —— **全部条目都有字节**。此前按组构成分叉
      （纯图组改判「图片是否已入库」），那是因为图片当时不落盘；现在图片与视频同样
@@ -4102,32 +4049,33 @@ const AlbumBubble = memo(function AlbumBubble(props: {
             /* BUG-352：按钮语义不再按组构成分叉 —— 整组一个出口 `onDownload`
                （worker 落盘，图片与视频同等）。部分已下时给「继续 n/N」，
                分子分母同源（都按字节真值派生），没有任务时不会出现「继续 1/6」。
-               BUG-470：并列加一颗「加入筛选并缓存」—— 一次提交同时完成归属与入队；
-               只在**尚未全部落盘**时给（已入库的组后端会直接拦下，那颗按钮点了只会
-               提示「已入库」，属于承诺不了的入口）。 */
+               BUG-484：未落盘的组 = 唯一「缓存入库」（标题即剧集名，同名自动归入）；
+               部分已下（cachedTargets > 0）保留「继续 n/N」纯续传——不再并列两颗
+               语义重叠的入库按钮（无名入库的「下载」正是无名批次的来源）。 */
             <div className="ml-auto flex flex-wrap items-center gap-2">
-              {onAddToFilter ? (
+              {onCacheIngest && cachedTargets === 0 ? (
                 <Button
                   variant="secondary"
                   size="sm"
                   className="h-6 px-2 text-[12px]"
-                  onClick={() => onAddToFilter(items)}
-                  title={zh ? '筛选名 = 这批内容的标题 = 剧集名' : 'Filter name = title = series name'}
-                  data-testid="album-add-to-filter"
+                  onClick={() => onCacheIngest(items)}
+                  title={zh ? '标题即剧集名：同名内容自动归入同一剧集' : 'Title = series name; same titles merge into one series'}
+                  data-testid="album-cache-ingest"
                 >
-                  {zh ? '加入筛选并缓存' : 'Add to filter & cache'}
+                  {zh ? '缓存入库' : 'Cache & ingest'}
                 </Button>
-              ) : null}
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-6 px-2 text-[12px]"
-              onClick={() => onDownload(items)}
-            >
-              {cachedTargets > 0
-                ? `${t('tg.continue')} ${cachedTargets}/${cacheTargets}`
-                : t('tg.download')}
-            </Button>
+              ) : (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-6 px-2 text-[12px]"
+                  onClick={() => onDownload(items)}
+                >
+                  {cachedTargets > 0
+                    ? `${t('tg.continue')} ${cachedTargets}/${cacheTargets}`
+                    : t('tg.download')}
+                </Button>
+              )}
             </div>
           ) : (
             /* BUG-185：完成态**不得落 null** —— 此前整行消失，用户无法区分

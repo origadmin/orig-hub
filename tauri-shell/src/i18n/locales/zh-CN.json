@@ -1178,7 +1178,6 @@
   "tg.backfillInvalidDate": "请选择日期",
   "tg.albumExpandHint": "点击展开 {n} 项",
   "tg.albumCollapse": "收起",
-  "tg.addToFilterCache": "加入筛选并缓存",
   "tg.openWithSystem": "用系统播放器打开",
   "media.episode.playFromHere": "从本集开始播放",
   "media.episode.removeFromSeriesHint": "只把这一集移出剧集；内容条目保留在资料库，不删文件",
