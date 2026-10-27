@@ -132,9 +132,18 @@
 | BUG-444 | 「播放全部」起点取可播子集但播放序列是全量集序列——自动连播遍历非可播集 | open | shell |
 | BUG-453 | dev 与 release 互相干扰、无统一控制脚本，dev 进程每次构建都被杀（dev-stack 副本隔离 + 统一 hub.py） | fixed | shell |
 | BUG-454 | TG 频道行 ICON 未取真实头像，fallback 成标题首字母（types.ts 无 photo 字段） | open | shell |
-| BUG-455 | 下载域「全部下载」页文案丢失：DownloadPanel 引用的 download.panel.*/list.* key 在 zh-CN/en-US 均缺失 | open | shell |
+| BUG-455 | 下载域「全部下载」页文案丢失：DownloadPanel 引用的 download.panel.*/list.* key 在 zh-CN/en-US 均缺失（已补 key，待 GUI 复验） | in_progress | shell |
 | BUG-456 | 文件管理侧栏分类子项无状态数字：counts 无 per-category 计数源 | open | shell |
 | BUG-457 | 频道回溯无进度、未按天分配、读取进度不可见（状态栏监控下拉按天显示 doneDays/totalDays + reading 态） | open | engine+shell |
+| BUG-458 | 文件管理主操作「导入目录」语义错——应为「添加目录」，目录下媒体直接进文件管理（现状只登记勾选的文件，目录不被记住） | open | shell |
+| BUG-459 | 播放态不切换呈现模式——左栏 340px 列表常驻占位，缺「列表 / 播放（介绍）」TAB 切换 | open | shell |
+| BUG-466 | 下载主列表误用 /api/downloads/native（引擎单源）而非统一 /api/downloads（全来源），BUG-392 回归 | open | engine+shell |
+| BUG-460 | 季号 / 集号 / 多集编辑不人性化——三个裸数字框 + 逐集单点保存，无序列视角与批量应用 | open | shell |
+| BUG-461 | 常驻占位说明应改为带圈功能按钮——点击后短时高亮，不常驻（优先级低） | open | shell |
+| BUG-462 | 本集介绍输入框只有 2 行（应 ≥3 行），本集标题保持 2 行 | open | shell |
+| BUG-463 | 详情态工具条整行只放一个「← 返回」，与上下文栏面包屑重复且白占一行 | open | shell |
+| BUG-464 | 本集图组瓦片尺寸硬编码（88×120 / 编辑态 80×112），宽容器右侧留大片空白 | open | shell |
+| BUG-465 | 文件管理按钮入口混乱——库级与剧集级动作同屏混排、同义入口重复（标签/导出各 2 个）、播放类落位缺失 | open | shell |
 
 ## 已完成
 
