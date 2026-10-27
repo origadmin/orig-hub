@@ -600,8 +600,9 @@ export function SeriesDetail(props: {
             {t('media.series.back')}
           </Button>
           {/* 总览海报：宽高比 ≥ 16:9 + self-start（§3.1.1 / BUG-171 根因 2 沿用）。
-              BUG-476e：播放钮从动作区迁到**封面右下角**（媒体产品通识：海报即播放入口；
-              此前全宽 primary 行与下方管理堆争体量，用户判「位置不对」）。有可播集才出现。 */}
+              BUG-486：封面**不再**放播放覆盖钮 —— 用户两次明示「播放全部放在下面、
+              和单集播放距离不是很远」（见选集器列表下方那颗 `series-play-all`）；
+              BUG-476e 的「海报即播放入口」形态创新违背明示位置语义，撤销。 */}
           <div
             className="relative aspect-video w-full overflow-hidden rounded-lg bg-surface-2 self-start"
             data-testid="series-cover"
@@ -622,46 +623,19 @@ export function SeriesDetail(props: {
                 )}
               </span>
             )}
-            {playEps.length > 0 ? (
-              <Button
-                variant={TONE_VARIANT.primary}
-                size="sm"
-                className="absolute bottom-2 right-2 h-9 w-9 rounded-full p-0"
-                onClick={() => {
-                  // 起点 = 首个可播集在**全量序列**里的下标（父层 onPlay 收的是它）
-                  const first = playEps[0]
-                  if (first) props.onPlay(detail.episodes.indexOf(first))
-                }}
-                title={t('media.series.playAllHint')}
-                data-testid="series-play-all"
-              >
-                <Play className="h-4 w-4" />
-              </Button>
-            ) : null}
           </div>
 
           {/* 标题：**单行省略**（§6.2 用户原话：标题控制好宽度一行显示超出处理）。
-              BUG-476e：编辑钮归标题行（icon-only outline）—— 编辑的对象就是这张
-              总览卡的内容（标题/介绍/年份/标签），语义归位；不再占动作区一格。 */}
-          <div className="flex items-start justify-between gap-2">
-            <h3
-              className="min-w-0 flex-1 truncate text-[15px] font-semibold leading-snug text-fg-strong"
-              title={detail.title}
-              data-testid="series-title"
-            >
-              {detail.title}
-            </h3>
-            <Button
-              variant={TONE_VARIANT.secondary}
-              size="sm"
-              className="h-7 w-7 shrink-0 p-0"
-              onClick={() => setEditingSeries(true)}
-              title={t('media.series.editMeta')}
-              data-testid="series-edit"
-            >
-              <Pencil className="h-3.5 w-3.5" />
-            </Button>
-          </div>
+              BUG-486：行尾不再放 7x7 icon 孤框编辑钮 —— 无文字无对象语境的悬空
+              圆框违反动作可读性底线（用户「什么逻辑,给个框? 什么设计,标准呢?」）。
+              剧集编辑入口迁到介绍块（编辑对象 = 这张总览卡的内容，见下方）。 */}
+          <h3
+            className="min-w-0 truncate text-[15px] font-semibold leading-snug text-fg-strong"
+            title={detail.title}
+            data-testid="series-title"
+          >
+            {detail.title}
+          </h3>
           <p className="text-[11px] text-muted" data-testid="series-meta">
             {kindLabel(detail.kind)}
             {detail.year ? ` · ${detail.year}` : ''} ·{' '}
@@ -712,10 +686,20 @@ export function SeriesDetail(props: {
                 >
                   {detail.description}
                 </p>
-                {/* 编辑入口统一收口到右栏动作条的 `series-edit`（同一个
-                    `SeriesEditPanel`，含介绍/标题/类型/年份/标签），此处不再放第二颗
-                    「编辑」—— 否则与动作条那颗逐字同文案、功能完全重叠（用户
-                    2026-10-24 报「两个编辑按钮」）。长文仍可展开。 */}
+                {/* BUG-486：剧集编辑入口归介绍块（编辑对象 = 这张总览卡：标题/介绍/
+                    年份/标签，同一 `SeriesEditPanel`）。有文字有语境的小字钮，不是
+                    标题行孤框；与右侧展开/收起同款 disclosure 外观。空态走下方
+                    「+ 添加剧集介绍」（同一 testid `series-desc-edit`）。 */}
+                <button
+                  type="button"
+                  onClick={() => setEditingSeries(true)}
+                  className="shrink-0 self-start rounded px-1.5 py-0.5 text-[10.5px] font-normal text-accent hover:bg-accent/10"
+                  title={t('media.series.editMeta')}
+                  data-testid="series-desc-edit"
+                >
+                  <Pencil className="mr-0.5 inline h-3 w-3 align-[-1px]" />
+                  {t('media.series.editMeta')}
+                </button>
                 {descOverflowing ? (
                   <button
                     type="button"
@@ -1136,6 +1120,26 @@ export function SeriesDetail(props: {
               )
             })}
           </div>
+          {/* BUG-486：播放全部 = **选集器列表下方**（用户两次明示「放在下面,和单集
+              播放应该距离不是很远」——行内 ▶ 的正下方，同列区同语义）。起点 =
+              首个可播集（BUG-262 裁定原文）；列表收起时仍可用（播放不依赖展开）。
+              BUG-476e 的封面覆盖圆钮随本轮撤销。testid `series-play-all` 保留。 */}
+          {playEps.length > 0 ? (
+            <Button
+              variant={TONE_VARIANT.secondary}
+              size="xs"
+              className="mt-0.5 h-7 w-fit gap-1 self-start px-2 text-[12px]"
+              onClick={() => {
+                const first = playEps[0]
+                if (first) props.onPlay(detail.episodes.indexOf(first))
+              }}
+              title={t('media.series.playAllHint')}
+              data-testid="series-play-all"
+            >
+              <Play className="h-3.5 w-3.5" />
+              {t('media.series.playAll')}
+            </Button>
+          ) : null}
         </aside>
 
         {/* ============ 右栏：当前单集显示与编辑 ============ */}
@@ -1325,21 +1329,22 @@ export function SeriesDetail(props: {
                           )
                         })()
                       : null}
+                    {/* BUG-486：危险动作并入工具带行（danger 文字钮、`ml-auto` 靠右），
+                        不再 `w-full` 独占一行 —— 用户第二次否决「一个按钮占一整行」。
+                        危险语义由破坏性色承担，体量与相邻钮一致。testid `episode-remove`
+                        保留（探针/verify 依赖）。 */}
+                    <Button
+                      variant={TONE_VARIANT.toolbar}
+                      size="xs"
+                      className="ml-auto h-7 gap-1 px-2 text-[12px] text-destructive hover:text-destructive"
+                      onClick={() => props.onRemoveEpisode(cur)}
+                      title={t('media.episode.removeFromSeriesHint')}
+                      data-testid="episode-remove"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      {t('media.episode.removeFromSeries')}
+                    </Button>
                   </div>
-                </div>
-                {/* ④ 危险：独立末位，分隔线 + danger 实心，绝不与次级按钮混排 */}
-                <div className="border-t border-border-subtle/60 pt-2.5">
-                  <Button
-                    variant={TONE_VARIANT.danger}
-                    size="sm"
-                    className="h-8 w-full text-[12px]"
-                    onClick={() => props.onRemoveEpisode(cur)}
-                    title={t('media.episode.removeFromSeriesHint')}
-                    data-testid="episode-remove"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                    {t('media.episode.removeFromSeries')}
-                  </Button>
                 </div>
               </div>
 

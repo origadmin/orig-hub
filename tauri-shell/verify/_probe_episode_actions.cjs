@@ -102,11 +102,13 @@ async function openSeriesDetail(page) {
     }
     await delay(800)
 
-    // A1. 左栏剧集动作几何（BUG-476e 后 IA）：播放=封面覆盖钮、编辑=标题行 icon、
-    //     安静行=合并/拆分/删除、卡片级导出/标签入口应不存在 ⇒ 页级探测（不局限 actions 容器）
+    // A1. 左栏剧集动作几何（BUG-486 后 IA）：播放=选集器列表下方、编辑=介绍块小字钮
+    //     （标题行孤框已撤）、安静行=合并/拆分/删除、卡片级导出/标签入口应不存在 ⇒ 页级探测
     const series = await page.evaluate(() => {
       const zone = document.querySelector('[data-testid="series-actions"]')
       const cover = document.querySelector('[data-testid="series-cover"]')
+      const picker = document.querySelector('[data-testid="episode-picker"]')
+      const title = document.querySelector('[data-testid="series-title"]')
       const zr = zone ? zone.getBoundingClientRect() : null
       const g = (tid) => {
         const b = document.querySelector(`[data-testid="${tid}"]`)
@@ -117,9 +119,16 @@ async function openSeriesDetail(page) {
       return {
         zoneW: zr ? Math.round(zr.width) : 0,
         zoneY: zr ? Math.round(zr.y) : null,
-        coverW: cover ? Math.round(cover.getBoundingClientRect().width) : 0,
+        coverRect: cover
+          ? (({ x, y, w, h }) => ({ x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) }))(cover.getBoundingClientRect())
+          : null,
+        pickerBottom: picker ? Math.round(picker.getBoundingClientRect().bottom) : null,
+        titleRect: title
+          ? (({ x, y, w, h }) => ({ x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) }))(title.getBoundingClientRect())
+          : null,
         play: g('series-play-all'),
-        edit: g('series-edit'),
+        edit: g('series-desc-edit'),
+        editOrphan: g('series-edit'),
         merge: g('series-merge'),
         split: g('series-split'),
         del: g('series-delete'),
@@ -196,18 +205,22 @@ async function openSeriesDetail(page) {
       editRow.length === 1 && gotoRow.length === 1 && upRow.length === 1 && downRow.length === 1
       && editRow[0] === gotoRow[0] && gotoRow[0] === upRow[0] && upRow[0] === downRow[0]])
     checks.push(['挂图独立按钮已撤销', !joined.includes('episode-attach-images')])
-    checks.push(['危险按钮独立于动作网格（在 zone 外独立段）', !joined.includes('episode-remove(')])
-    // 左栏（BUG-476e 后 IA）：播放=封面覆盖钮；编辑=标题行 icon；
+    // BUG-486：移除本集并入工具带行（与 move-down 同行），不再 w-full 独占一行
+    const removeRow = rowOf('episode-remove')
+    checks.push([`移除本集并入工具带行 (remove=${removeRow} down=${downRow})`,
+      removeRow.length === 1 && downRow.length === 1 && removeRow[0] === downRow[0]])
+    // 左栏（BUG-486 后 IA）：播放=选集器列表下方（非封面覆盖）；编辑=介绍块小字钮；
     // 卡片底部安静行 = 合并/拆分/删除 同行；导出/标签入口已拆除
     if (series) {
       const quiet = [series.merge, series.split, series.del]
-      checks.push(['左栏播放钮存在且为封面覆盖形态（小圆钮，非全宽）',
-        !!series.play && series.play.w <= 48 && series.coverW > 0 && series.play.w < series.coverW * 0.5])
+      checks.push(['播放钮在选集器下方且非覆盖形态（y > picker 底部、h ≤ 32 非圆钮）',
+        !!series.play && series.pickerBottom != null && series.play.y >= series.pickerBottom - 2 && series.play.h <= 32])
       checks.push([`左栏底部安静行同处一行 (y=${quiet.map((b) => (b ? b.y : 'missing')).join('/')})`,
         quiet.every(Boolean) && quiet.every((b) => Math.abs(b.y - quiet[0].y) <= 10)])
       checks.push(['左栏删除为行内安静形态（宽度 <70% 动作区）',
         !!series.del && series.del.w < series.zoneW * 0.7])
-      checks.push(['编辑钮存在（标题行）', !!series.edit])
+      checks.push(['标题行无孤框编辑钮（series-edit 不存在）', !series.editOrphan])
+      checks.push(['介绍块编辑入口存在（series-desc-edit）', !!series.edit])
       checks.push(['卡片级导出入口已拆除', !series.exportBtn])
       checks.push(['卡片级标签入口已拆除', !series.tagEdit])
     } else {
