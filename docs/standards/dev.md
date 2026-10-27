@@ -36,9 +36,10 @@ enforced-by: AGENTS.md（强制引用）+ 门禁脚本 + 验收探针
    > 任一方被停都让另一方失去后端。故 dev 栈端口整体上移到 29786/29787。
    > **数据根共用**（`%APPDATA%\com.origadmin.orighub`：`tg/store.db`、媒体文件、
    > `download-engine.toml`），**运行态分离**：`daemon.dev.endpoint` /
-   > `engine_tasks.dev.db` / `tg/session.dev.session` / `logs/dev/`。
-   > 会话必须分离——同一 `session.session` 被两个 orig-tg 同时写会损坏，同 auth key
-   > 双连接还会被 Telegram 互踢；dev 首次需独立登录一次。
+   > `engine_tasks.dev.db` / `logs/dev/`。
+   > 会话**不分离**（2026-10-28 反转 BUG-474 的隔离设计）：dev 与 release 共用真实
+   > `tg/session.session`（同一份登录凭证）。注意：dev 与 release 两套 orig-tg 同时在线
+   > 会触发同一 auth key 双连接被 Telegram 互踢，故不要同时跑两套栈。
 2. UI 结论必须 `tauri-shell/verify/lib/cdp.cjs` 真实截图 + **量化断言**（几何读
    `getBoundingClientRect`，不读 className）；贴边/居中一律**视口相对**，禁止父容器相对。
 3. 新断言必须**验牙**：装回旧实现确认必红、还原后复绿（还原后比对文件指纹一致）。
