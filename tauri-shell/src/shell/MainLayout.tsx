@@ -13,7 +13,6 @@ import { TitleBar } from './TitleBar'
 import { ContextBar } from './ContextBar'
 import { LibraryReadout } from './LibraryReadout'
 import { TgCacheEntry } from '../components/TgCacheEntry'
-import { StatusBarMonitor } from './StatusBarMonitor'
 import { StatusBarDebug } from './StatusBarDebug'
 import { useStore } from '../store/useStore'
 import { selectActiveSpeedLabel, selectHasActiveSpeed } from '../store/selectors'
@@ -445,8 +444,6 @@ function fmtClock(ts: number): string {
               <LibraryReadout />
             </div>
             <div className="flex shrink-0 items-center gap-2">
-              {/* D2/D3：TG 监控态 → 底部常驻单按钮 + 下拉明细（fd 风格，不论监控数多少都显示） */}
-              <StatusBarMonitor />
               {/* D1：入库流水线入口 + 简易状态，从顶栏 ContextBar 迁入底部状态栏 */}
               <TgCacheEntry overview={overview} unavailable={ingest.unavailable} />
               {/* D4.1：调试面板入口（接口调用 / 错误追踪可见，app 态不再黑盒） */}

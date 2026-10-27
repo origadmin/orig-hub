@@ -98,42 +98,18 @@ async function main() {
     `series-delete 文案=${JSON.stringify(del.series && del.series.text)} title=${JSON.stringify(del.series && del.series.title)}`,
   )
 
-  // ---- 410 导出作用域 ----
-  const scope = await page.evaluate(async () => {
-    const btn = document.querySelector('[data-testid="series-export"]')
-    if (!btn) return { err: 'no series-export' }
-    const id = Number((location.hash || '').replace('#', '')) || null
-    btn.click()
-    return { clicked: true, id }
+  // ---- 410 导出作用域（BUG-476e 后语义更新）----
+  // 卡片级 `series-export` 已拆除（与右上角库级导出同对话框，伪差异不构成第二颗按钮）。
+  // 现断言：① 详情卡无导出按钮（重复入口已消失）② 右上角库级导出入口存在。
+  const scope = await page.evaluate(() => {
+    const cardExport = document.querySelector('[data-testid="series-export"]')
+    return { cardExportGone: !cardExport }
   })
-  await delay(1500)
-  const exp = await page.evaluate(() => {
-    const dlg = document.querySelector('[data-testid="export-preview-dialog"]')
-    if (!dlg) return { dialog: false }
-    const boxes = Array.from(dlg.querySelectorAll('input[type="checkbox"]'))
-    const checked = boxes.filter((b) => b.checked).length
-    const total = boxes.length
-    const sub = document.querySelector('[data-testid="context-bar-sub"]')
-    return {
-      dialog: true,
-      total,
-      checked,
-      sub: sub ? sub.textContent.trim() : null,
-    }
-  })
-  chk('410-A', exp.dialog === true, `export dialog 打开=${exp.dialog}`)
   chk(
-    '410-B',
-    exp.dialog && exp.total > 1 && exp.checked === 1,
-    `候选 ${exp.total} 部，预勾 ${exp.checked} 部（期望恰好 1 = 当前剧集）`,
+    '410-A',
+    scope.cardExportGone,
+    `卡片级导出入口已拆除=${scope.cardExportGone}（一语义一入口：导出只留右上角库级）`,
   )
-
-  await page.evaluate(() => {
-    const dlg = document.querySelector('[data-testid="export-preview-dialog"]')
-    const close = dlg && dlg.parentElement
-    if (close) close.click()
-  })
-  await delay(600)
 
   // ---- 409-D 返回剧集墙后尾节清空 ----
   await page.evaluate(() => {

@@ -236,14 +236,19 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   const [libRetrying, setLibRetrying] = useState(false)
   const backendDown = backend.state === 'down'
 
-  /** 请求失败 → 判「取不到」的唯一入口（网络类失败才算后端挂，业务 4xx 只是这一条读不到）。 */
+  /**
+   * 请求失败 → 判「取不到」的唯一入口。
+   *
+   * BUG-176：判据是「后端**明确拒绝**这一条查询」（`4xx`）与「这次读不到」的分界 ——
+   * 网络失败 / 5xx 都是「库当前取不到」⇒ 显式降级（banner 直出原因），而业务 4xx
+   * 只是这一条查询的数据问题，不得据此把整页标成「取不到」。
+   * 降级时**作废 stats 缓存**：续轮探活与列表共用它，不清掉会命中旧的成功而谎报 up。
+   */
   const noteLibraryError = useCallback((e: unknown) => {
     const msg = e instanceof Error ? e.message : String(e)
-    // BUG-176：只有「连不上」才升级为整库不可读；后端可达但某条请求被拒（4xx/422）
-    // 是这一条的数据问题，不得据此把整页标成「取不到」。
-    if (/Failed to fetch|NetworkError|Load failed|ECONNREFUSED|connection|timed? ?out/i.test(msg)) {
+    const businessReject = /^4\d\d\b/.test(msg)
+    if (!businessReject) {
       setBackend({ state: 'down', reason: msg })
-      // 探活与列表共用 stats 缓存：不清掉它，续轮探活会命中旧的「成功」而谎报 up。
       invalidateCache(cacheKey.libraryStats())
     }
     setError(msg)
@@ -251,24 +256,25 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
   const noteLibraryOk = useCallback(() => setBackend({ state: 'up', reason: null }), [])
 
   /**
-   * 库探活（BUG-176）。`tryStart` 只在**首次进入**与**用户点重试**时为 true：
-   * 自动续轮绝不重启宿主进程（否则后端起不来时会变成每轮重启一次）。
+   * 库探活（BUG-176）。`startHost` **只在用户显式点「重试连接」时**为 true：
+   * 挂载与自动续轮只拉起 daemon —— 重启资料库宿主会打断它正在跑的缓存任务，
+   * 不该由自动路径发起（也不能变成「后端起不来就每轮重启一次」）。
    * 两处探活不是重复调用：第二处只在「第一次失败且运行在 Tauri」时到达。
    */
-  const probeLibrary = useCallback(async (tryStart = true) => {
+  const probeLibrary = useCallback(async (startHost = false) => {
     const isTauri = '__TAURI_INTERNALS__' in window
     const first = await probeLibraryBackendDetail()
     if (first.ok) {
       noteLibraryOk()
       return
     }
-    if (!isTauri || !tryStart) {
+    if (!isTauri) {
       setBackend({ state: 'down', reason: first.reason })
       return
     }
     setLibRetrying(true)
     try {
-      await ensureLibraryBackend()
+      await ensureLibraryBackend(startHost)
       const again = await probeLibraryBackendDetail()
       if (again.ok) noteLibraryOk()
       else setBackend({ state: 'down', reason: again.reason })
@@ -1904,20 +1910,11 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
               }
             }}
             /*
-             * BUG-410（用户 2026-10-23）：「内容详情主卡片上的功能（如『导出浏览』）
-             * 当前呈现/作用的是『总的浏览』，但当前上下文是单个视频详情。所有功能
-             * 应针对『当前视频 / 当前剧集』而非全局，作用域错配。」
-             *
-             * 原来这里只 `setExportOpen(true)`，`exportPreselect` 为 null ⇒ 导出预览
-             * 打开时**一部剧都没勾**，看起来就是「总浏览」。现在把当前剧集预勾上：
-             * 候选集仍是全库（`ExportPreviewDialog` 的 `series` 恒为全库，见该处注释），
-             * 只是初值从「全不勾」变成「勾当前这部剧」—— 作用域对齐当前上下文，
-             * 同时不剥夺「顺手多导几部」的能力。
+             * BUG-476e：详情卡不再有 `onExport` —— 卡片级导出入口已拆除。
+             * 它打开的是与右上角库级导出同一个 `ExportPreviewDialog`，唯一差别
+             * 是预勾当前剧（BUG-410 的修法）—— 伪差异不构成第二颗按钮（一语义一入口）。
+             * 导出本剧 = 打开右上角导出 → 勾选这部剧（对话框候选恒为全库）。
              */
-            onExport={() => {
-              setExportPreselect([detail.id])
-              setExportOpen(true)
-            }}
             onViewInTg={viewInTg}
             onPreviewSource={previewSourceItem}
             onGotoItem={(itemId) => {

@@ -73,7 +73,9 @@ async function main() {
       const c = document.querySelector('[data-testid="series-card"]')
       if (c) { c.scrollIntoView({ block: 'center' }); c.click() }
     })
-    await waitTid(page, 'series-tag-edit', 15000)
+    // BUG-476e：独立「本剧标签」入口已拆除（标签编辑唯一入口 = SeriesEditPanel），
+    // 详情就绪信号改用 `series-edit`（标题行编辑钮）。
+    await waitTid(page, 'series-edit', 15000)
     await delay(1000)
     await page.evaluate(() => { const p = document.querySelector('[data-testid="episode-pick"]'); if (p) p.click() })
     await delay(600)
