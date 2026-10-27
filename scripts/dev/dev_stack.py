@@ -40,6 +40,7 @@ import ctypes
 import hashlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -55,12 +56,54 @@ sys.path.insert(0, str(SCRIPTS))
 # 复用既有启动器的 DETACHED 常量、探活与 daemon 拉起逻辑，避免两套实现漂移。
 import dev_services as ds  # noqa: E402
 
-DAEMON_PORT = 19786
-TG_PORT = 19787
+# dev 栈端口刻意与 release 壳错开（壳从 19786 起扫 64 个，见 lib.rs DAEMON_PORT）。
+#
+# 为什么不能用 19786：壳的 `ensure_daemon` 一旦在 19786 发现健康 daemon 就直接复用，
+# 于是 release 壳连的是 dev 的实例；dev 一停，APP 跟着没后端（lib.rs 注释记录的
+# 2026-10-20 事故）。29786 落在壳的扫描区间（19786–19849）之外，两边互不可见。
+DAEMON_PORT = 29786
+TG_PORT = 29787
 VITE_PORT = 5180
 VITE_DIR = REPO / "tauri-shell"
 ENGINE_DIR = REPO / "download-engine"
 VITE_LOG = Path(os.environ.get("TEMP", str(REPO))) / "orighub-vite.log"
+
+# **关键隔离**：dev 的运行二进制放在 cargo 输出目录之外的专用副本目录。
+# `cargo build` 只写 `download-engine/target/release/*`；dev 进程跑 `target/dev-stack/*`
+# ⇒ 构建再也锁不到运行中的 dev 进程，dev 不必为每次构建停栈（BUG-453 根因修复）。
+# daemon 从副本目录启动后，会经 `tg_binary_path()` 用 `current_exe().parent()` 找到同目录的
+# orig-tg（state.rs:1243），整条 dev 链自洽，且与 release 副本（target/release）完全无关。
+DEV_BIN_DIR = ENGINE_DIR / "target" / "dev-stack"
+# cargo 产物名（含 Tauri externalBin 用的 triple 变体，一并同步进位，保证两套构建口径一致）。
+ENGINE_EXES = (
+    "orig-daemon.exe",
+    "orig-daemon-x86_64-pc-windows-msvc.exe",
+    "orig-tg.exe",
+    "orig-tg-x86_64-pc-windows-msvc.exe",
+)
+
+
+def ensure_dev_bins(force: bool = False) -> list[tuple[str, bool, str | None]]:
+    """把 cargo 产物复制到 dev 专用副本目录。返回 (文件名, 是否成功, 失败原因)。
+
+    - 已有且不旧时跳过（除非 force）。
+    - 运行中文件被锁（PermissionError）→ 跳过并记录，不视为失败（热更新路径稍后处理）。
+    """
+    DEV_BIN_DIR.mkdir(parents=True, exist_ok=True)
+    out: list[tuple[str, bool, str | None]] = []
+    for name in ENGINE_EXES:
+        src = REPO / "download-engine/target/release" / name
+        dst = DEV_BIN_DIR / name
+        if not src.is_file():
+            continue
+        if not force and dst.is_file() and src.stat().st_mtime <= dst.stat().st_mtime + 1.0:
+            continue
+        try:
+            shutil.copy2(src, dst)
+            out.append((name, True, None))
+        except (OSError, PermissionError) as e:
+            out.append((name, False, str(e)))
+    return out
 
 # 四处副本（与 sync-sidecars.sh 的清单一致；这里只用于展示指纹，不做写入）。
 COPIES = (
@@ -71,6 +114,33 @@ COPIES = (
     "tauri-shell/src-tauri/target/debug/orig-tg.exe",
     "tauri-shell/src-tauri/target/release/orig-tg.exe",
 )
+
+
+def dev_runtime_env(data_dir: Path) -> dict[str, str]:
+    """dev 栈相对 release 壳需要分离的运行态。
+
+    **共用**（刻意不覆盖）：`ORIG_TG_DATA` 指向同一数据根 ⇒ `tg/store.db`、下载的
+    媒体文件、`download-engine.toml` 两边看到的是同一份。dev 对真实数据调试，
+    不会因为对着空壳库而把「数据为空」误判成「功能坏了」（state.rs 里记着这条教训）。
+
+    **分离**（必须，否则互相踩）：
+
+    - `ORIG_DAEMON_PORT` / `ORIG_TG_PORT`：壳从 19786 起扫，dev 必须错开。
+    - `ORIG_DAEMON_ENDPOINT_FILE`：端点文件是壳的端口真源，同名会互相覆盖 ⇒ 连错实例。
+    - `ORIG_ENGINE_TASKS_DB`：任务列表是运行态，共用会让 dev 的测试任务出现在
+      release 列表里，进度也会互相覆盖。
+    - `ORIG_TG_SESSION`：会话文件没有文件锁，两个 orig-tg 同时写会损坏；即便不损坏，
+      同一 auth key 双连接会被 Telegram 互踢。dev 需独立登录一次（一次性成本）。
+    - `ORIG_LOG_DIR`：日志同目录会交错追加，排障时分不清某行是谁写的。
+    """
+    return {
+        "ORIG_DAEMON_PORT": str(DAEMON_PORT),
+        "ORIG_TG_PORT": str(TG_PORT),
+        "ORIG_DAEMON_ENDPOINT_FILE": str(data_dir / "daemon.dev.endpoint"),
+        "ORIG_ENGINE_TASKS_DB": str(data_dir / "engine_tasks.dev.db"),
+        "ORIG_TG_SESSION": str(data_dir / "tg" / "session.dev.session"),
+        "ORIG_LOG_DIR": str(data_dir / "logs" / "dev"),
+    }
 
 
 # ── 基础工具 ──────────────────────────────────────────────────────────────
@@ -338,6 +408,9 @@ def ensure_vite() -> tuple[bool, str]:
 
 
 def do_start(force: bool, with_vite: bool) -> int:
+    # BUG-453：dev 跑在 cargo 输出目录之外的副本目录，构建不再锁住运行中的 dev 进程。
+    ds.DAEMON_EXE = DEV_BIN_DIR / "orig-daemon.exe"
+    ensure_dev_bins()
     pid = pid_on_port(DAEMON_PORT)
     cfg = ds.probe(DAEMON_PORT)
     if pid and cfg is not None and not force:
@@ -348,8 +421,15 @@ def do_start(force: bool, with_vite: bool) -> int:
             kill_tree(pid, "orig-daemon(+orig-tg)")
             time.sleep(1.0)
         data_dir = ds.resolve_data_dir(None)
+        env_extra = dev_runtime_env(data_dir)
         print(f"起 orig-daemon（ORIG_TG_DATA={data_dir}）")
-        proc = ds.start_daemon(data_dir, DAEMON_PORT)
+        print(
+            f"  端口 {DAEMON_PORT}/{TG_PORT}（壳在 19786 起扫，互不可见）；"
+            f"运行态分离：endpoint={Path(env_extra['ORIG_DAEMON_ENDPOINT_FILE']).name} "
+            f"tasks={Path(env_extra['ORIG_ENGINE_TASKS_DB']).name} "
+            f"session={Path(env_extra['ORIG_TG_SESSION']).name}"
+        )
+        proc = ds.start_daemon(data_dir, DAEMON_PORT, extra_env=env_extra)
         if proc is None:
             print("  失败：二进制缺失，先跑 dev_stack.py build")
             return 1
@@ -374,14 +454,37 @@ def run_cmd(cmd: list[str], cwd: Path) -> int:
     return r.returncode
 
 
-def do_build(only_tg: bool) -> int:
-    # 顺序不可换：运行中的 exe 锁着文件，先构建会直接失败。
-    print("① 停掉正在运行的 dev 进程（释放 exe 文件锁）")
-    do_stop()
-    time.sleep(1.0)
+def _copy_dev_exe(name: str, max_retry: float = 30.0) -> bool:
+    """把 target/release 的新 exe 复制进 dev 副本目录；运行中文件被锁时按 0.3s 间隔重试。
 
-    print()
-    print("② 构建")
+    返回是否成功写入。race 处理：daemon 的 tg_supervise 在 kill 后要先 sleep
+    `TG_SUPERVISE_INTERVAL` 再检测，本函数趁窗口期反复尝试，确保新 orig-tg.exe 落盘。
+    """
+    src = REPO / "download-engine/target/release" / name
+    dst = DEV_BIN_DIR / name
+    if not src.is_file():
+        return False
+    deadline = time.monotonic() + max_retry
+    last_err = None
+    while time.monotonic() < deadline:
+        try:
+            shutil.copy2(src, dst)
+            return True
+        except (OSError, PermissionError) as e:
+            last_err = str(e)
+            # 文件被运行进程锁住 → 先放倒占用者再试（仅 dev 端口 29787 的 orig-tg）。
+            tpid = pid_on_port(TG_PORT)
+            if tpid:
+                kill_tree(tpid, "orig-tg(锁住副本)")
+            time.sleep(0.3)
+    print(f"    ⚠ 复制 {name} 失败（{last_err}）；daemon 下次重启会拾取旧 exe，必要时 dev restart")
+    return False
+
+
+def do_build(only_tg: bool) -> int:
+    # BUG-453：dev 进程不再为构建停栈。cargo 写 target/release，dev 跑 target/dev-stack，
+    # 二者物理分离；仅当 daemon 本体二进制变更（极少见）才重启 dev daemon。
+    print("① 构建（dev 进程不停止：cargo 写 target/release，dev 跑 target/dev-stack）")
     pkgs = ["-p", "orig-tg"] if only_tg else ["-p", "orig-daemon", "-p", "orig-tg"]
     rc = run_cmd(["cargo", "build", "--release", *pkgs], ENGINE_DIR)
     if rc != 0:
@@ -389,24 +492,54 @@ def do_build(only_tg: bool) -> int:
         return rc
 
     print()
-    print("③ 同步四处副本（含陈旧检测）")
+    print("② 同步 release 外部二进制（仅用于 release app 打包，不碰 dev 进程）")
     bash = shutil_which_bash()
     if bash is None:
-        print("  跳过：找不到 bash。手动执行 sh scripts/sync-sidecars.sh")
+        print("  跳过：找不到 bash。release 打包前请手动执行 sh scripts/sync-sidecars.sh")
     else:
-        rc = run_cmd([bash, "scripts/sync-sidecars.sh"], REPO)
-        if rc != 0:
-            print(f"  同步失败（exit {rc}）—— 若提示被占用，先 dev_stack.py stop")
-            return rc
+        run_cmd([bash, "scripts/sync-sidecars.sh"], REPO)
+
+    dpid = pid_on_port(DAEMON_PORT)
+    if dpid:
+        print()
+        print("③ dev daemon 在线 ⇒ 热更新（kill orig-tg → 复制新 exe → daemon 自愈重启）")
+        # 先确保 daemon 副本目录存在且 daemon 本体到位（若 daemon 未变则跳过）。
+        _copy_dev_exe("orig-daemon.exe")
+        _copy_dev_exe("orig-daemon-x86_64-pc-windows-msvc.exe")
+        ok = _copy_dev_exe("orig-tg.exe") and _copy_dev_exe("orig-tg-x86_64-pc-windows-msvc.exe")
+        # 等 daemon 的 tg_supervise 重启 orig-tg（受 TG_SUPERVISE_INTERVAL 与 60s 冷却约束）。
+        deadline = time.monotonic() + 75.0
+        back = False
+        while time.monotonic() < deadline:
+            if pid_on_port(TG_PORT):
+                back = True
+                break
+            time.sleep(1.0)
+        print(f"   orig-tg 自愈：{'已恢复↑' if back else '超时未恢复（daemon 会按冷却重试）'}")
+        if not ok:
+            print("   ⚠ orig-tg 副本未更新；如要立刻生效：dev_stack.py restart")
+        # daemon 本体是否变更？（极少）变更则必须重启 dev daemon。
+        src = REPO / "download-engine/target/release/orig-daemon.exe"
+        dst = DEV_BIN_DIR / "orig-daemon.exe"
+        if src.is_file() and dst.is_file() and file_fingerprint(src)["sha12"] != file_fingerprint(dst)["sha12"]:
+            print("   daemon 二进制已变更 ⇒ 重启 dev daemon（dev 唯一会整段重启的情形）")
+            do_stop()
+            ensure_dev_bins(force=True)
+            # 重启时连同 vite 一起恢复（脚本统一管理 dev 进程，不应让 vite 掉线）。
+            do_start(force=False, with_vite=True)
+    else:
+        print()
+        print("③ dev daemon 未运行 ⇒ 仅同步副本目录，start 即生效")
+        ensure_dev_bins(force=True)
 
     print()
-    print("④ 新产物指纹")
+    print("④ 新产物指纹（target/release）")
     for rel in COPIES:
         fp = file_fingerprint(REPO / rel)
         if fp:
             print(f"    {fp['sha12']}  {fp['size']:>10,}B  {fmt_time(fp['mtime'])}  {rel}")
     print()
-    print("构建完成。起栈：dev_stack.py start")
+    print("构建完成。dev 进程未被杀（如有旋转，见上面③）。起栈：dev_stack.py start")
     return 0
 
 
