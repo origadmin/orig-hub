@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import type { ReactNode } from 'react'
 import { ChevronDown, ChevronRight, ChevronUp, Plus, Search } from 'lucide-react'
 import { Button } from './ui/button'
+import { TgAvatar } from './TgAvatar'
 import { Input } from './ui/input'
 import { Switch } from './ui/switch'
 import { useTranslation } from '../i18n'
@@ -2365,9 +2366,8 @@ export function TgPanel(
                           data-testid="tg-monitor-row"
                           className="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left"
                         >
-                          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-surface-2 text-xs font-semibold text-fg-mid">
-                            {(ch.title || '?').charAt(0).toUpperCase()}
-                          </div>
+                          {/* BUG-454：头像只取可辨识字符，装饰符号（「【」等）不再当头像 */}
+                          <TgAvatar id={ch.id} title={ch.title} />
                           <div className="min-w-0 flex-1">
                             <p className="truncate text-[13px] font-medium text-fg-strong">
                               {ch.title}
@@ -2850,9 +2850,7 @@ export function TgPanel(
                         }}
                         className="flex min-w-0 flex-1 items-center gap-2 text-left"
                       >
-                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-surface-2 text-xs font-semibold text-fg-mid">
-                          {(ch.title || '?').charAt(0).toUpperCase()}
-                        </div>
+                        <TgAvatar id={ch.id} title={ch.title} />
                         <div className="min-w-0 flex-1">
                           <p className="truncate text-[13px] font-medium text-fg-strong">
                             {ch.title}
@@ -2897,9 +2895,7 @@ export function TgPanel(
                   ← {t('tg.backToFeed')}
                 </Button>
               )}
-              <div className="flex h-9 w-9 items-center justify-center rounded-full bg-surface-2 text-sm font-semibold text-fg-mid">
-                {(selectedChannel.title || '?').charAt(0).toUpperCase()}
-              </div>
+              <TgAvatar id={selectedChannel.id} title={selectedChannel.title} size={9} />
               <div className="min-w-0 flex-1">
                 <p className="truncate text-sm font-semibold text-fg-strong">
                   {selectedChannel.title}

@@ -157,6 +157,16 @@ export interface SidebarCounts {
   series: number
   /** 标签数（资料库组） */
   tags: number
+  /**
+   * 各分类子项的**事实计数**（BUG-456）。键取 `FILE_CATEGORIES` 的值
+   * （`video/music/image/doc/archive/other`），由域面板与分类视图**同一真源**上报。
+   *
+   * 真源纪律（BUG-125 / BUG-133）：分类视图（`cat:<x>`）的行来自媒体库按 `kind`
+   * 过滤，故这里的数**必须**是同一份按 kind 的计数，不许侧栏另数一遍。
+   * **缺失的键 = 该分类无数据**，渲染侧按「0 不渲染」处理（0 = 确认没有，
+   * 与「不知道」是两件事）—— 因此没有真源的分类**不填**，而不是填 0 冒充。
+   */
+  byCategory?: Record<string, number>
 }
 
 /** 默认落地：文件域 · 全部成品。原 `useState<ViewId>('all')` 的等价物。 */

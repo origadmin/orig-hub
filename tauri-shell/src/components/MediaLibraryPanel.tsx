@@ -415,13 +415,24 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
    * （`LibraryStats` 无该字段，拿分页列表长度当总数属于编造），现在连侧栏那一项都不存在了，
    * BUG-298 残余②「未归档计数缺位」由此关闭。
    */
-  const countsKey = `${stats?.items ?? ''}|${seriesTotal}|${stats?.tags ?? ''}`
+  // BUG-456：分类计数与分类视图（`cat:<x>`）**同一真源** —— 后者按 `kind` 过滤
+  // 媒体条目，故这里的数只能来自同一份按 kind 的统计（`LibraryStats`）。
+  // 无真源的分类（doc/archive/other：媒体库不登记非媒体 kind）**不填键**，
+  // 由渲染侧按「缺失 = 无数据」处理，不填 0 冒充（0 是「确认没有」的断言）。
+  const countsKey = `${stats?.items ?? ''}|${seriesTotal}|${stats?.tags ?? ''}|${stats?.videos ?? ''}|${stats?.photos ?? ''}|${stats?.audios ?? ''}`
   useEffect(() => {
     if (!onCounts) return
+    const byCategory: Record<string, number> = {}
+    if (stats) {
+      if (stats.videos > 0) byCategory.video = stats.videos
+      if (stats.photos > 0) byCategory.image = stats.photos
+      if (stats.audios > 0) byCategory.music = stats.audios
+    }
     onCounts({
       files: stats?.items ?? 0,
       series: seriesTotal,
       tags: stats?.tags ?? 0,
+      byCategory,
     })
     // countsKey 是上面三个值的组合：变了的才推（eslint 需要显式依赖）
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2038,7 +2049,7 @@ export function MediaLibraryPanel({ fmode, onFmodeChange, onCounts, onOpenTg }: 
           onImported={async (n) => {
             clearSelection()
             await refreshAll()
-            setError(`已导入 ${n} 项`)
+            setError(t('media.library.imported', { n }))
           }}
           onError={(m) => setError(m)}
         />

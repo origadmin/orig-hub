@@ -39,6 +39,11 @@ interface Props {
     completed: number
     series: number
     tags: number
+    /**
+     * 各分类子项计数（BUG-456）。键 = `FILE_CATEGORIES` 的值；**缺键 = 该分类无真源**，
+     * 渲染侧不渲染数字（0 是「确认没有」的断言，缺键是「没有数可陈」）。
+     */
+    byCategory?: Record<string, number>
   }
 }
 
@@ -260,6 +265,10 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
                 className={childCls(isNavChildActive(view, fmode, dlFilter, { fmode: 'cat:video' }))}
               >
                 <span className="min-w-0 flex-1 truncate text-left">{t('files.cat.video')}</span>
+                {/* 数字与分类视图同源（BUG-456）：有真源才渲染，缺键/0 不渲染。 */}
+                {counts.byCategory?.video ? (
+                  <span className="shrink-0 text-[10px] text-muted">{counts.byCategory.video}</span>
+                ) : null}
               </button>
               {/* 其余分类子项（不含 video，已上方单独渲染）。 */}
               {FILE_CATEGORIES.filter((cat) => cat !== 'video').map((cat) => (
@@ -272,6 +281,10 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
                   className={childCls(isNavChildActive(view, fmode, dlFilter, { fmode: `cat:${cat}` }))}
                 >
                   <span className="min-w-0 flex-1 truncate text-left">{t(CATEGORY_KEY[cat])}</span>
+                  {/* 同上：仅在该分类有真源计数时渲染（BUG-456）。 */}
+                  {counts.byCategory?.[cat] ? (
+                    <span className="shrink-0 text-[10px] text-muted">{counts.byCategory[cat]}</span>
+                  ) : null}
                 </button>
               ))}
             </div>

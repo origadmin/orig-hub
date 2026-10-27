@@ -25,6 +25,15 @@
     python scripts/hub.py release run               # 起 orig-hub.exe（DETACHED）
     python scripts/hub.py release stop
     python scripts/hub.py release status
+    python scripts/hub.py release version 1.2.1     # 版本号写进两处真源（发布由人决定）
+
+sh 系另有等价入口 `./scripts/hub …`（与 `scripts/hub.cmd` 同一份 `hub.py`）。
+
+发布（版本何时发布由人决定，CI 只认 tag）：
+
+    ./scripts/hub release version 1.2.1   # 改 tauri.conf.json + src-tauri/Cargo.toml
+    git commit -am "chore(release): bump version to 1.2.1" && git tag v1.2.1
+    git push origin <branch> && git push origin v1.2.1   # CI 以 tag v* 触发自动发布
 
     python scripts/hub.py status                    # dev + release + vite 总览
 """
@@ -33,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -207,6 +217,65 @@ def release_status() -> int:
     return 0 if (alive or exe) else 1
 
 
+# ── 版本号（单一真源：tauri.conf.json + src-tauri/Cargo.toml）────────────────────
+
+
+TAURI_CONF = REPO / "tauri-shell" / "src-tauri" / "tauri.conf.json"
+TAURI_CARGO = REPO / "tauri-shell" / "src-tauri" / "Cargo.toml"
+
+# 只认 `x.y.z`：CI 的 tag 门禁与 `tauri.conf.json` 做**逐字相等**比较，
+# 预发布后缀（`1.2.1-beta.1`）会让 tag `v1.2.1-beta.1` 与 `version=1.2.1` 永远对不上。
+SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def current_version() -> str:
+    m = re.search(
+        r'^\s*"version"\s*:\s*"([^"]+)"', TAURI_CONF.read_text(encoding="utf-8", newline=""), re.M
+    )
+    return m.group(1) if m else "?"
+
+
+def release_version(ver: str) -> int:
+    """把版本号一次写进两处真源，并打印「发布动作」清单。
+
+    **不 commit、不 tag、不 push** —— 版本何时发布由人决定，本脚本只保证
+    「决定之后那一步不会漏改一处版本」。CI（`.github/workflows/release.yml`）
+    以 tag `v*` 触发，且校验 tag 版本与 `tauri.conf.json` 逐字相等。
+    """
+    if not SEMVER.match(ver):
+        print(f"版本号必须是 x.y.z（当前 tauri.conf.json = {current_version()}）")
+        return 2
+
+    # `newline=""`：**不改写行尾**。Windows 仓库这两个文件是 CRLF，按默认
+    # 文本模式读回会变成 LF，一次 bump 就把整文件的行尾翻一遍 —— 与版本无关
+    # 的巨大 diff 会让「这次只改了版本号」这句话无法核对。
+    conf = TAURI_CONF.read_text(encoding="utf-8", newline="")
+    new_conf, n1 = re.subn(
+        r'^(\s*"version"\s*:\s*)"[^"]+"', lambda m: f'{m.group(1)}"{ver}"', conf, count=1, flags=re.M
+    )
+    cargo = TAURI_CARGO.read_text(encoding="utf-8", newline="")
+    new_cargo, n2 = re.subn(
+        r'^(version\s*=\s*)"[^"]+"', lambda m: f'{m.group(1)}"{ver}"', cargo, count=1, flags=re.M
+    )
+    if n1 != 1 or n2 != 1:
+        print(f"版本写入失败：tauri.conf.json 命中 {n1} 处、Cargo.toml 命中 {n2} 处（期望各 1）")
+        return 1
+
+    TAURI_CONF.write_text(new_conf, encoding="utf-8", newline="")
+    TAURI_CARGO.write_text(new_cargo, encoding="utf-8", newline="")
+    print(f"版本已置为 {ver}（tauri.conf.json + src-tauri/Cargo.toml）")
+    print()
+    print("发布动作（由你决定何时执行；本脚本不做）：")
+    print(f"  git add {TAURI_CONF.relative_to(REPO).as_posix()} {TAURI_CARGO.relative_to(REPO).as_posix()}")
+    print(f'  git commit -m "chore(release): bump version to {ver}"')
+    print(f"  git tag v{ver}")
+    print(f"  git push origin <branch> && git push origin v{ver}")
+    print()
+    print("push 后 CI（.github/workflows/release.yml）以 tag v* 触发：校验版本一致 →")
+    print("构建 sidecar → tauri build → 发布 GitHub Release（MSI/NSIS）。")
+    return 0
+
+
 # ── dev 子命令（委托 dev_stack）──────────────────────────────────────────────────
 
 
@@ -274,6 +343,8 @@ def main() -> int:
     rs.add_parser("run")
     rs.add_parser("stop")
     rs.add_parser("status")
+    p_ver = rs.add_parser("version", help="把版本号写进两处真源（不 commit / 不 tag / 不 push）")
+    p_ver.add_argument("version", help="x.y.z（与发布 tag v<version> 逐字对应）")
 
     sub.add_parser("status", help="dev + release 总览")
 
@@ -315,6 +386,8 @@ def main() -> int:
             return release_stop()
         if args.cmd == "status":
             return release_status()
+        if args.cmd == "version":
+            return release_version(args.version)
         return 2
 
     if args.world == "status":

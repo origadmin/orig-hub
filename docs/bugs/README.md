@@ -131,9 +131,9 @@
 | BUG-443 | serve_local_file 的 ETag/Last-Modified 全由 mtime 派生——LRU 触摸即失效、跨盘迁移击穿缓存 | open | engine |
 | BUG-444 | 「播放全部」起点取可播子集但播放序列是全量集序列——自动连播遍历非可播集 | open | shell |
 | BUG-453 | dev 与 release 互相干扰、无统一控制脚本，dev 进程每次构建都被杀（dev-stack 副本隔离 + 统一 hub.py） | fixed | shell |
-| BUG-454 | TG 频道行 ICON 未取真实头像，fallback 成标题首字母（types.ts 无 photo 字段） | open | shell |
+| BUG-454 | TG 频道行 ICON 未取真实头像，fallback 成标题首字母（types.ts 无 photo 字段） | in_progress | shell |
 | BUG-455 | 下载域「全部下载」页文案丢失：DownloadPanel 引用的 download.panel.*/list.* key 在 zh-CN/en-US 均缺失（已补 key，待 GUI 复验） | in_progress | shell |
-| BUG-456 | 文件管理侧栏分类子项无状态数字：counts 无 per-category 计数源 | open | shell |
+| BUG-456 | 文件管理侧栏分类子项无状态数字：counts 无 per-category 计数源 | in_progress | shell |
 | BUG-457 | 频道回溯无进度、未按天分配、读取进度不可见（状态栏监控下拉按天显示 doneDays/totalDays + reading 态） | open | engine+shell |
 | BUG-458 | 文件管理主操作「导入目录」语义错——应为「目录管理」（受管根集合登记/移除/设主目录/手动对账），目录下媒体直接进文件管理（现状只登记勾选的文件，目录不被记住） | open | shell |
 | BUG-459 | 播放界面右侧恒为 300px 分集列表、介绍被压在底部 96px 窄条——播放态应可切到「介绍」（初版误写为剧集详情左栏，已更正） | open | shell |
@@ -147,7 +147,8 @@
 | BUG-467 | 文件管理与正式内容之间有一条空白条（剧集墙态 header 零控件仍渲染）；过滤标签在无内容可筛时仍占位 | open | shell |
 | BUG-468 | 文件位置变更是否需要与库关联——下载 / 管理路径 / 库存储 / 位置移动整链路评估 | open | engine+shell |
 | BUG-469 | 缺「剧集文件整理」——以剧集为单位把内容（文字）/ 视频（多集）/ 图片按需求归位（现只有条目级 OrganizeWizard） | open | engine+shell |
-| BUG-470 | 入库即「加入筛选」——筛选名 = 标题 = 剧集名（三者同一）；当前 TG 面板入库（`downloadAlbum`/`doDownload`）既无筛选入口也无命名入口，命名只存在于筛选面板链路 | open | engine+shell |
+| BUG-470 | 单条 / 整组数据缺「加入筛选 + 缓存入库」合并快捷入口（核心逻辑不变：筛选名 = 标题 = 剧集名；仅壳层加入口，引擎零改动） | open | shell |
+| BUG-471 | 目录管理缺第三个动词「迁移」——清盘场景下无法把旧根字节堆入主目录（只能丢库或永不清盘）；含「不写用户磁盘」红线的唯一例外条件 | open | engine+shell |
 
 ## 已完成
 

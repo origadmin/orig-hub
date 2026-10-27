@@ -51,6 +51,7 @@ export function MainLayout() {
     files: 0,
     series: 0,
     tags: 0,
+    byCategory: {},
   })
   const { t } = useTranslation()
   /** 连接状态点唯一渲染点（BUG-169 终裁=右下角）：真源 `store/connState.ts`。 */
@@ -300,6 +301,8 @@ function fmtClock(ts: number): string {
             completed: completedCount + overview.done,
             series: filesCounts.series,
             tags: filesCounts.tags,
+            // BUG-456：分类子项计数由文件域面板上报，本处只中转（不许另算）。
+            byCategory: filesCounts.byCategory ?? {},
           }}
         />
 

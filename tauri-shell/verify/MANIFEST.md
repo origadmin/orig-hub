@@ -186,6 +186,14 @@
 | verify_bug_271_slow_stream.cjs | playback | S2 |
 | verify_bug_277_queue_priority.cjs | download | S2 |
 | verify_bug_281_episode_desc.cjs | files | S2 |
+| verify_bug448_startup_readiness.cjs | engine | S2 |
+| verify_bug450_progress_denominator.cjs | playback | S2 |
+| verify_bug450_real_stream.cjs | playback | S2 |
+| verify_bug451_ctxbar_no_overlap.cjs | files | S2 |
+| verify_bug454_avatar_initial.cjs | tg | S2 |
+| verify_bug456_category_counts.cjs | files | S2 |
+| _diag_contextbar_overlap.cjs | files | S2 |
+| _diag_ctxbar_candidates.cjs | files | S2 |
 | verify_cache_queue_visibility.cjs | download | S2 |
 | verify_cache_stall.cjs | misc | S2 |
 | verify_card_kind_signal.cjs | misc | S2 |
