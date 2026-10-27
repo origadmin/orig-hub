@@ -6,8 +6,6 @@ import { ContextBarFilesActions } from './ContextBarFilesActions'
 import { ContextBarStatus } from './ContextBarStatus'
 import { FilesGlobalSearch } from './FilesGlobalSearch'
 import { TgGlobalSearch } from '../components/TgGlobalSearch'
-import { TgCacheEntry } from '../components/TgCacheEntry'
-import type { IngestOverview } from '../domains/download/ingestGroups'
 import { useTranslation } from '../i18n'
 import { useStore } from '../store/useStore'
 import { cn } from '../lib/utils'
@@ -44,16 +42,6 @@ export interface ContextBarProps {
   onPauseAll: OnAction
   onResumeAll: OnAction
   onClearCompleted: OnAction
-  /**
-   * 入库概览（在传/待处理/已缓存）：只读快照，供 TG 入口上的简易状态。
-   *
-   * 本栏**不持有**任何跨域跳转回调：入口上不挂跳转（2026-10-17 用户续裁
-   * 「下载状态 / 去媒体库查看 都属于具体条目」），跨域仍只由 `Sidebar` 走
-   * `navigate()` 唯一通道。
-   */
-  ingestOverview?: IngestOverview
-  /** 「取不到」原因（BUG-318）；非空时入口计数显示为不可用而不是假 0 */
-  ingestUnavailable?: string | null
 }
 
 /** 视图 → 形态（唯一真源，禁止在 JSX 里散写三元）。
@@ -153,8 +141,6 @@ export const ContextBar = memo(function ContextBar({
   onPauseAll,
   onResumeAll,
   onClearCompleted,
-  ingestOverview,
-  ingestUnavailable,
 }: ContextBarProps) {
   const { t } = useTranslation()
   const { view, dlFilter } = nav
@@ -179,12 +165,29 @@ export const ContextBar = memo(function ContextBar({
    *
    * 断点 1100px 的来历：`1fr` 轨道 ≥ 232px 要求窗口 ≥ 232*2+320+24+192+32 ≈ 1032，
    * 取 1100 留出计数进位（三位数，+22px）的余量。宽窗下形态与改动前**逐像素一致**。
+   *
+   * **文件域 + 窄窗的同一类缺陷**（BUG-451，2026-10-27 用户截图）：文件域右槽是
+   * **库级动作组四件套**（导入目录 / 新建剧集 / 导出 / 标签管理），实测宽 **≈358px**，
+   * 比 TG 的 232px 还宽 126px。原 `gridCls` 的窄窗修复**只给了 `view==='tg'`**，
+   * 文件域仍走 `1fr auto 1fr` ⇒ 右槽 `1fr` 轨道在 1200/1100/1000/900px 窗口下被
+   * 358px 的内容撑爆，**向左溢出压住中槽 `w-80` 搜索框**（实测重叠 30/80/130/180px）。
+   *
+   * 修法（与 TG 同族、断点更宽）：窄窗下把右槽改 `auto`、中槽改 `minmax(0,1fr)`
+   * （即 `1fr-1fr-auto`），右槽按内容取宽永不溢出，中槽吸收剩余空间让搜索框
+   * 自动收缩（`min-w-0`）。窄窗候选实测**全宽度无重叠、无右溢出**
+   * （见 `verify/verify_bug451_ctxbar_no_overlap.cjs`）。
+   *
+   * 断点选 1300px（而非 TG 的 1100）：文件域右槽更宽，需窗口更宽才放得下
+   * `1fr auto 1fr` 的居中形态——实测 `1fr auto 1fr` 在内容宽 ≈1036px（窗口≈1260，
+   * 侧栏展开）以下开始重叠，取 1300 留足余量；宽窗仍保持真居中（与改动前一致）。
    */
   const gridCls = cn(
     'grid min-w-0 flex-1 items-center gap-3',
     view === 'tg'
       ? 'grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] max-[1100px]:grid-cols-[auto_minmax(0,1fr)_auto]'
-      : 'grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]',
+      : view === 'files'
+        ? 'grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] max-[1300px]:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]'
+        : 'grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]',
   )
 
   return (
@@ -207,14 +210,6 @@ export const ContextBar = memo(function ContextBar({
         <FilesGlobalSearch />
       ) : null}
       <div className="col-start-3 flex shrink-0 items-center justify-end gap-3">
-        {/* TG 入口（2026-10-17 终裁）：**只有入口按钮本身** —— 点它开最初的
-            「入库流水线」面板（功能一个不删），按钮上挂「在传/待处理/已缓存」
-            简易计数。**不挂跳转**：`下载状态` / `去媒体库查看` 都是条目级动作，
-            只留在条目行上（面板每行 / 下载域行内）。计数来自 MainLayout 的唯一
-            轮询点，本栏只转发。 */}
-        {view === 'tg' ? (
-          <TgCacheEntry overview={ingestOverview} unavailable={ingestUnavailable} />
-        ) : null}
         {kind === 'download' ? (
           <ContextBarActions
             showClear={showClear}

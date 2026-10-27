@@ -131,6 +131,10 @@
 | BUG-443 | serve_local_file 的 ETag/Last-Modified 全由 mtime 派生——LRU 触摸即失效、跨盘迁移击穿缓存 | open | engine |
 | BUG-444 | 「播放全部」起点取可播子集但播放序列是全量集序列——自动连播遍历非可播集 | open | shell |
 | BUG-453 | dev 与 release 互相干扰、无统一控制脚本，dev 进程每次构建都被杀（dev-stack 副本隔离 + 统一 hub.py） | fixed | shell |
+| BUG-454 | TG 频道行 ICON 未取真实头像，fallback 成标题首字母（types.ts 无 photo 字段） | open | shell |
+| BUG-455 | 下载域「全部下载」页文案丢失：DownloadPanel 引用的 download.panel.*/list.* key 在 zh-CN/en-US 均缺失 | open | shell |
+| BUG-456 | 文件管理侧栏分类子项无状态数字：counts 无 per-category 计数源 | open | shell |
+| BUG-457 | 频道回溯无进度、未按天分配、读取进度不可见（状态栏监控下拉按天显示 doneDays/totalDays + reading 态） | open | engine+shell |
 
 ## 已完成
 

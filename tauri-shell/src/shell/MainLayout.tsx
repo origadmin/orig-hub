@@ -12,6 +12,9 @@ import { ErrorBoundary } from '../components/ui/ErrorBoundary'
 import { TitleBar } from './TitleBar'
 import { ContextBar } from './ContextBar'
 import { LibraryReadout } from './LibraryReadout'
+import { TgCacheEntry } from '../components/TgCacheEntry'
+import { StatusBarMonitor } from './StatusBarMonitor'
+import { StatusBarDebug } from './StatusBarDebug'
 import { useStore } from '../store/useStore'
 import { selectActiveSpeedLabel, selectHasActiveSpeed } from '../store/selectors'
 import { CONN_DOT, CONN_LABEL, useConnState } from '../store/connState'
@@ -26,7 +29,7 @@ import {
   type ViewId,
 } from '../nav'
 import { SharePanel } from '../domains/share/SharePanel'
-import { ensureDaemon, daemonStatus } from '../api/tauri'
+import { ensureDaemonReady, daemonStatus } from '../api/tauri'
 import { health, setDaemonPort } from '../api/daemon'
 import { cn } from '../lib/utils'
 
@@ -69,7 +72,7 @@ export function MainLayout() {
      * 故 Tauri 路径不可用时退到**一次** HTTP 健康探测播种 alive —— 启动期一次性请求，
      * 不是轮询；此后的存活完全由既有请求的成功/失败反推（见 store.refresh / SSE onOpen）。
      */
-    ensureDaemon()
+    ensureDaemonReady()
       .then(() => daemonStatus())
       .then((d) => {
         // daemon 实际端口（可能顺延）：先校准 base，再让后续请求打到真服务上（BUG-178）。
@@ -315,8 +318,6 @@ function fmtClock(ts: number): string {
               onPauseAll={handlePauseAll}
               onResumeAll={handleResumeAll}
               onClearCompleted={handleClearCompleted}
-              ingestOverview={overview}
-              ingestUnavailable={ingest.unavailable}
             />
           </header>
 
@@ -376,7 +377,7 @@ function fmtClock(ts: number): string {
 
           {/* 全局聚合进度条（BUG-004） */}
           {aggregate.length > 0 && (
-            <div className="h-0.5 w-full bg-border-subtle" title={`全局进度 ${globalProgress.toFixed(1)}%`}>
+            <div className="h-0.5 w-full bg-border-subtle" title={t('main.globalProgress', { p: globalProgress.toFixed(1) })}>
               <div
                 className="h-full bg-accent transition-all duration-300"
                 style={{ width: `${globalProgress}%` }}
@@ -384,9 +385,9 @@ function fmtClock(ts: number): string {
             </div>
           )}
 
-          {/* Status bar */}
-          <footer className="flex h-8 shrink-0 items-center justify-between border-t border-border-subtle px-4 text-[11px] text-muted">
-            <span>
+          {/* Status bar（fd 模式：常规状态全部收敛到底栏；监控/入库/调试为常驻按钮，不论数据量都显示） */}
+          <footer className="flex h-8 shrink-0 items-center justify-between gap-3 border-t border-border-subtle px-4 text-[11px] text-muted">
+            <div className="flex min-w-0 items-center gap-3">
               {/*
                 注意：这里的键名 `active` 是 **i18n 模板占位符契约**（对应 zh/en
                 双语模板 `main.status` 里的 `{active}`），**不得**与 <Sidebar counts>
@@ -396,39 +397,49 @@ function fmtClock(ts: number): string {
                 改任一侧都需要**同步双语模板**：占位符缺失不会报错、只显示空字符串，
                 状态栏这个数会静默消失而 tsc 照样绿（典型假绿）。
               */}
-              {t('main.status', {
-                // M3/BUG-300：状态栏与侧栏徽标、下载域树档三处同源（含入库任务）
-                active: downloadingCount + overview.active,
-                paused: pausedCount + overview.stalled + overview.cancelled,
-                completed: completedCount + overview.done,
-                failed: failed.length + overview.stalled,
-              })}
-            </span>
-            {/*
-              文件域页面级读数（BUG-400 用户裁定：占用/登记「应该在底栏显示状态」）。
-              「底栏」= 本全局状态栏 —— 不是面板内再造一条（面板内叠一条就是双底栏，
-              正是「多余的栏」）。数据由 MediaLibraryPanel 经 `libraryReadout` store
-              写入，本叶子自订阅（低频），MainLayout 不订阅、不因读数重渲染。
-            */}
-            <LibraryReadout />
-            {/*
-              连接状态点**唯一渲染点**（BUG-169 终裁 = 右下角）：全应用只有这里一个
-              连接指示。底栏在 MainLayout 根部单次渲染、不按视图分叉——顶栏灯在
-              BUG-164 出过「下载分支整类视图漏接」事故，侧栏/顶栏重复指示已被
-              三处收敛全部移除。真源唯一（`useConnState`）+ 渲染唯一（本处）+
-              无旁路断言（BUG-167）。速度读数同处展示（BUG-134，来源不变）。
-            */}
-            <span
-              className="flex items-center gap-1.5"
-              data-testid="statusbar-conn"
-              data-conn-state={connState}
-            >
-              <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', CONN_DOT[connState])} />
-              {t(CONN_LABEL[connState])}
-              {hasActiveSpeed && (
-                <span className="font-mono text-accent">{activeSpeedLabel}</span>
-              )}
-            </span>
+              <span>
+                {t('main.status', {
+                  // M3/BUG-300：状态栏与侧栏徽标、下载域树档三处同源（含入库任务）
+                  active: downloadingCount + overview.active,
+                  paused: pausedCount + overview.stalled + overview.cancelled,
+                  completed: completedCount + overview.done,
+                  failed: failed.length + overview.stalled,
+                })}
+              </span>
+              {/*
+                文件域页面级读数（BUG-400 用户裁定：占用/登记「应该在底栏显示状态」）。
+                「底栏」= 本全局状态栏 —— 不是面板内再造一条（面板内叠一条就是双底栏，
+                正是「多余的栏」）。数据由 MediaLibraryPanel 经 `libraryReadout` store
+                写入，本叶子自订阅（低频），MainLayout 不订阅、不因读数重渲染。
+              */}
+              <LibraryReadout />
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              {/* D2/D3：TG 监控态 → 底部常驻单按钮 + 下拉明细（fd 风格，不论监控数多少都显示） */}
+              <StatusBarMonitor />
+              {/* D1：入库流水线入口 + 简易状态，从顶栏 ContextBar 迁入底部状态栏 */}
+              <TgCacheEntry overview={overview} unavailable={ingest.unavailable} />
+              {/* D4.1：调试面板入口（接口调用 / 错误追踪可见，app 态不再黑盒） */}
+              <StatusBarDebug />
+              {/*
+                连接状态点**唯一渲染点**（BUG-169 终裁 = 右下角）：全应用只有这里一个
+                连接指示。底栏在 MainLayout 根部单次渲染、不按视图分叉——顶栏灯在
+                BUG-164 出过「下载分支整类视图漏接」事故，侧栏/顶栏重复指示已被
+                三处收敛全部移除。真源唯一（`useConnState`）+ 渲染唯一（本处）+
+                无旁路断言（BUG-167）。速度读数同处展示（BUG-134，来源不变）。
+              */}
+              <span
+                className="flex items-center gap-1.5"
+                data-testid="statusbar-conn"
+                data-conn-state={connState}
+              >
+                <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', CONN_DOT[connState])} />
+                {t(CONN_LABEL[connState])}
+                {hasActiveSpeed && (
+                  <span className="font-mono text-accent">{activeSpeedLabel}</span>
+                )}
+              </span>
+            </div>
           </footer>
         </div>
       </div>
