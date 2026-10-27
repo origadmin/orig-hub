@@ -198,14 +198,20 @@ export function EpisodeEditPanel(props: {
       <span className="text-[11px] font-medium text-fg-strong">
         {t('media.episode.sectionImages')}
       </span>
+      {/* BUG-464：编辑态缩略图同样改成「列数 × 容器宽度」驱动（原 `h-20 w-28`
+          是像素常量，`flex-wrap` 只决定一行放几个、剩余宽度全变死白）。
+          下限 88px 略小于显示态 96px：编辑态带 × 钮，格子略紧更好按。 */}
       {(ep.images ?? []).length === 0 ? (
         <p className="text-[11px] text-muted/70" data-testid="episode-edit-images-empty">
           {t('media.episode.noImagesAttached')}
         </p>
       ) : (
-        <div className="flex flex-wrap gap-2" data-testid="episode-edit-images">
+        <div
+          className="grid grid-cols-[repeat(auto-fill,minmax(88px,1fr))] gap-2"
+          data-testid="episode-edit-images"
+        >
           {(ep.images ?? []).map((img) => (
-            <span key={img.itemId} className="group relative inline-block">
+            <span key={img.itemId} className="group relative block">
               {/* BUG-429（用户 2026-10-26：「编辑中的图片展示也需要稍微放大点，
                   这是图片不是ICON」）：原 `h-14 w-20` = 56×80，接近图标尺寸，
                   认不出画面内容。放大到 80×112（+43%），比例不变。 */}
@@ -213,7 +219,7 @@ export function EpisodeEditPanel(props: {
                 src={img.poster ?? mediaItemUrl(img.itemId)}
                 alt=""
                 loading="lazy"
-                className="h-20 w-28 rounded border border-border-subtle object-cover"
+                className="aspect-[3/4] w-full rounded border border-border-subtle object-cover"
               />
               {/* M0-T04 / BUG-040 / BUG-112：× **常驻半透明**，禁纯 hover 显露
                   （原型 `.sd-remove` 口径：22×22 圆钮、rgba(0,0,0,.65)、opacity .65；
@@ -249,7 +255,10 @@ export function EpisodeEditPanel(props: {
         </Button>
       </div>
 
-      {/* BUG-412：介绍在图片**之后** —— 与显示态同一顺序，消除「图文相反」。 */}
+      {/* BUG-412：介绍在图片**之后** —— 与显示态同一顺序，消除「图文相反」。
+          BUG-462：介绍是长字段（几十到几百字），与短字段标题共用 `rows={2}` 只会让
+          编辑者靠光标在 2 行里读整段。标题保持 2 行（短字段），介绍给 3 行，并把
+          `resize-none` 换成 `resize-y` —— 内容再长时用户还有拉高的补救路径。 */}
       <span className="text-[11px] font-medium text-fg-strong">
         {t('media.episode.sectionDesc')}
       </span>
@@ -259,8 +268,8 @@ export function EpisodeEditPanel(props: {
         placeholder={t('media.descEmptyEp')}
         aria-label={t('media.episode.sectionDesc')}
         data-testid="episode-desc-input"
-        rows={2}
-        className="w-full resize-none rounded-md border border-border-subtle bg-surface px-2 py-1 text-[11px] text-fg-strong"
+        rows={3}
+        className="w-full resize-y rounded-md border border-border-subtle bg-surface px-2 py-1 text-[11px] text-fg-strong"
       />
 
       <div className="flex gap-2">

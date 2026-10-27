@@ -150,8 +150,15 @@ export function EpisodeExpanded(props: {
         <span className="text-[11px] font-medium text-fg-strong">
           {t('media.episode.imagesCount', { n: (ep.images ?? []).length })}
         </span>
+        {/* BUG-464：瓦片尺寸不再是像素常量，而是「列数 × 容器宽度」的函数 ——
+            `auto-fill` + `minmax(96px, 1fr)` 让剩余宽度分配给瓦片本身，
+            宽右栏里不再出现「排完 4 张、右边整片死白」。96px 是下限（保证认出画面），
+            上限不设 —— 容器越宽瓦片越大，这正是不再浪费空间的含义。 */}
         {imgs.length > 0 ? (
-          <div className="flex items-start gap-2 overflow-x-auto pb-1" data-testid="episode-images">
+          <div
+            className="grid grid-cols-[repeat(auto-fill,minmax(96px,1fr))] items-start gap-2 pb-1"
+            data-testid="episode-images"
+          >
             {imgs.map((img, i) => (
               <ImageTile
                 key={img.itemId}
@@ -172,7 +179,7 @@ export function EpisodeExpanded(props: {
                     : t('media.episode.imagesMore', { n: allImgs.length - IMAGE_INLINE })
                 }
                 data-testid="episode-images-toggle"
-                className="shrink-0 self-center rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid"
+                className="self-center justify-self-start rounded border border-border-subtle/70 px-1.5 py-0.5 text-[10px] text-muted transition-colors hover:bg-surface-2 hover:text-fg-mid"
               >
                 {imgsExpanded
                   ? t('media.episode.imagesCollapse')
@@ -368,7 +375,7 @@ function ImageTile(props: {
   const { img, onOpen, onRemove } = props
   const src = img.poster ?? mediaItemUrl(img.itemId)
   return (
-    <div className="group/img relative h-[120px] w-[88px] shrink-0 overflow-hidden rounded border border-border-subtle bg-surface-2">
+    <div className="group/img relative aspect-[3/4] w-full overflow-hidden rounded border border-border-subtle bg-surface-2">
       <button
         type="button"
         onClick={onOpen}
