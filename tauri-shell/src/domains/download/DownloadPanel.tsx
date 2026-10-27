@@ -4,8 +4,8 @@ import type { DlFilter } from '../../nav'
 import { DownloadItem } from './DownloadItem'
 import { IngestGroupRow } from './IngestGroupRow'
 import type { UseIngestGroupsResult } from './useIngestGroups'
-import { groupInBucket, ingestActionsFor } from './ingestGroups'
-import { engineRowsInBucket } from './dlBuckets'
+import { groupInBucket, ingestActionsFor, isCacheActive, isCacheStalled } from './ingestGroups'
+import { engineRowsInBucket, engineSection, type DlSection } from './dlBuckets'
 import { useStore } from '../../store/useStore'
 import { useGoLibrary } from '../../hooks/useGoLibrary'
 import { enqueueCacheTask } from '../../api/tg'
@@ -77,14 +77,15 @@ interface Props {
  * 只有入库那一条窄条能滚，engine 区是滚不动死区。
  */
 type DLRow =
+  | { kind: 'section'; section: DlSection; count: number; retryable: number; interrupted: number }
   | { kind: 'engine'; item: DownloadStatus }
   | { kind: 'ingest'; group: IngestGroup }
 
 export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
   /* 计数文案走 i18n（BUG-406）：裸数字「2」没有上下文，用户不知道它数的是什么。
      本文件其余按钮文案仍是历史硬编码中文（不在本条范围），新文案不再添一份。 */
-  const { t } = useTranslation()
-  const { setError, cancel } = useStore()
+  const { t, language } = useTranslation()
+  const { setError, cancel, retry } = useStore()
   const { groups, loading, error, unavailable, downloadUnavailable, refresh, run, remove } = ingest
   /**
    * BUG-353：下载域的**选中**控制面。
@@ -136,18 +137,69 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
   /**
    * BUG-372：engine 行 + 入库行合成**一个**窗口化列表（见 `DLRow` 注释）。
    * 行键带 `e:`/`i:` 前缀，与选中集合 `selected` 同一套命名空间。
+   *
+   * BUG-295：两张来源的行先各自归入**分区**（在传 / 待处理 / 已结束），分区标题
+   * 作为独立行插进同一个列表 —— 116 行扁平列表里「还有几件要处理」必须一眼可见，
+   * 且重启后从「下载中」降级成「已中断」的那条必须仍在第一屏（不再被 90 条 done 埋掉）。
    */
-  const dlRows = useMemo<DLRow[]>(
-    () => [
-      ...engineRows.map((item): DLRow => ({ kind: 'engine', item })),
-      ...ingestRows.map((group): DLRow => ({ kind: 'ingest', group })),
-    ],
-    [engineRows, ingestRows],
-  )
+  const dlRows = useMemo<DLRow[]>(() => {
+    const buckets: Record<DlSection, DLRow[]> = { active: [], action: [], settled: [] }
+    for (const item of engineRows) {
+      buckets[engineSection(item.status)].push({ kind: 'engine', item })
+    }
+    for (const group of ingestRows) {
+      const s = group.latest.status
+      // BUG-295：入库侧分区与引擎侧同构（active / stalled / settled）
+      const section: DlSection = isCacheActive(s) ? 'active' : isCacheStalled(s) ? 'action' : 'settled'
+      buckets[section].push({ kind: 'ingest', group })
+    }
+    const rows: DLRow[] = []
+    for (const section of ['active', 'action', 'settled'] as const) {
+      const bucket = buckets[section]
+      if (bucket.length === 0) continue
+      let retryable = 0
+      let interrupted = 0
+      for (const r of bucket) {
+        // BUG-249：分区的「可重试 N」必须与逐行按钮同一判据（actions / ingestActionsFor），
+        // 不能另写一份 status 判断 —— 否则会出现「标题说 3 条可重试，行上只有 2 个重试钮」。
+        const acts =
+          r.kind === 'engine'
+            ? (r.item.actions ?? [])
+            : r.kind === 'ingest'
+              ? ingestActionsFor(r.group.latest.status, r.group.latest.priority ?? 0)
+              : []
+        if (acts.includes('retry')) retryable += 1
+        const status =
+          r.kind === 'engine' ? r.item.status : r.kind === 'ingest' ? r.group.latest.status : 'settled'
+        if (status === 'interrupted') interrupted += 1
+      }
+      rows.push({ kind: 'section', section, count: bucket.length, retryable, interrupted }, ...bucket)
+    }
+    return rows
+  }, [engineRows, ingestRows])
 
   // BUG-366：来源切片与概览两块常驻占位已撤（用户 2026-10-22：「上面死占2垃圾」）。
   // 实测两块合计占 61px 首屏纵向空间，且全 0 时仍原样占位。撤后列表直接置顶。
   const total = engineRows.length + ingestRows.length
+
+  /**
+   * 分区标题文案（BUG-295）。
+   *
+   * 「在传 / 已完成」复用已有键；「待处理」「已结束」locales 里没有对应 key，
+   * 按本仓双语内联模式（与 TgPanel 一致）就地给 —— 需补 key：`download.panel.sectionAction`
+   * / `download.panel.sectionSettled`（locales 归主控，本条不新增）。
+   */
+  const zh = language === 'zh-CN'
+  const sectionLabel = (s: DlSection): string =>
+    s === 'active'
+      ? t('download.running')
+      : s === 'settled'
+        ? zh
+          ? '已完成 / 已取消'
+          : 'Finished / cancelled'
+        : zh
+          ? '待处理 · 可重试'
+          : 'Needs attention · retryable'
 
   /**
    * 来源健康：orig-tg 不可达 ⇒ 拉取必然失败。
@@ -223,6 +275,8 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
   const selectAllVisible = () => {
     const next = new Set(selected)
     for (const r of dlRows) {
+      // BUG-295：分区标题行不是可选项（它没有 id/key），跳过。
+      if (r.kind === 'section') continue
       next.add(r.kind === 'engine' ? `e:${r.item.id}` : `i:${r.group.key}`)
     }
     setSelected(next)
@@ -266,6 +320,75 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
       setSelected(new Set())
       refresh()
       if (skipped > 0) setError(t('download.panel.cancelSkipped', { n: skipped }))
+    } catch (e) {
+      fail(e)
+    }
+  }
+
+  /** 选中集里**真实可重试**的子集（BUG-249：判据与行内按钮同源，不另写一套）。 */
+  const retryableSelected = useMemo(() => {
+    const keys: string[] = []
+    for (const k of selected) {
+      if (k.startsWith('e:')) {
+        const it = engineRows.find((d) => d.id === k.slice(2))
+        if (it && (it.actions ?? []).includes('retry')) keys.push(k)
+      } else if (k.startsWith('i:')) {
+        const g = groups.find((x) => x.key === k.slice(2))
+        if (g && ingestActionsFor(g.latest.status, g.latest.priority ?? 0).includes('retry')) {
+          keys.push(k)
+        }
+      }
+    }
+    return keys
+  }, [selected, engineRows, groups])
+
+  /**
+   * BUG-249：批量重试**选中的可重试子集**。
+   *
+   * 只发可操作的子集（不可重试的选中项不静默跳过 —— 选择条上的
+   * 「可重试 M / 已选 N」就是这份差异的如实读数），按钮文案直出 M，
+   * 满足「必须显示将影响多少条」。
+   */
+  const retrySelected = async () => {
+    const ops: Array<() => Promise<unknown>> = []
+    for (const k of retryableSelected) {
+      if (k.startsWith('e:')) ops.push(() => retry(k.slice(2)))
+      else if (k.startsWith('i:')) {
+        const g = groups.find((x) => x.key === k.slice(2))
+        if (g) ops.push(() => run(g.latest, 'retry'))
+      }
+    }
+    if (ops.length === 0) return
+    try {
+      await Promise.all(ops.map((o) => o()))
+      setSelected(new Set())
+      refresh()
+    } catch (e) {
+      fail(e)
+    }
+  }
+
+  /**
+   * BUG-249：批量重试**当前筛选出的集合**（需求原话「批量入口要作用于当前筛选出的集合」）。
+   *
+   * 作用域 = 当前树档 + 当前分区里所有具备 retry 能力的行（引擎 `actions` /
+   * 入库 `ingestActionsFor`），不要求逐条勾选 —— 几十条失败逐条点重试就是本条缺陷。
+   */
+  const retryActionable = async () => {
+    const ops: Array<() => Promise<unknown>> = []
+    for (const item of engineRows) {
+      if ((item.actions ?? []).includes('retry')) ops.push(() => retry(item.id))
+    }
+    for (const g of ingestRows) {
+      if (ingestActionsFor(g.latest.status, g.latest.priority ?? 0).includes('retry')) {
+        ops.push(() => run(g.latest, 'retry'))
+      }
+    }
+    if (ops.length === 0) return
+    try {
+      await Promise.all(ops.map((o) => o()))
+      setSelected(new Set())
+      refresh()
     } catch (e) {
       fail(e)
     }
@@ -349,6 +472,30 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
         >
           {t('download.panel.clear')}
         </Button>
+        {/*
+          BUG-249：批量重试选中项 —— 按钮上的数字 = **实际会被重试的条数**
+          （可重试子集，不是 selected.size）。几十条同因失败逐条点重试正是本条缺陷。
+        */}
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7 px-2 text-[11px]"
+          onClick={() => void retrySelected()}
+          disabled={retryableSelected.length === 0}
+          data-testid="dl-batch-retry"
+          title={
+            zh
+              ? `重试选中的可重试任务（将影响 ${retryableSelected.length} 条）`
+              : `Retry the selected retryable tasks (${retryableSelected.length} affected)`
+          }
+        >
+          {t('download.item.retry')} {retryableSelected.length}
+        </Button>
+        <span className="text-[10px] text-muted" data-testid="dl-batch-retryable">
+          {zh
+            ? `可重试 ${retryableSelected.length} / 已选 ${selected.size}`
+            : `${retryableSelected.length} retryable / ${selected.size} selected`}
+        </span>
         <Button
           size="sm"
           variant="default"
@@ -409,10 +556,67 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
           items={dlRows}
           estimate={116}
           overscan={6}
-          keyOf={(r) => (r.kind === 'engine' ? `e:${r.item.id}` : `i:${r.group.key}`)}
+          keyOf={(r) =>
+            r.kind === 'section'
+              ? `s:${r.section}`
+              : r.kind === 'engine'
+                ? `e:${r.item.id}`
+                : `i:${r.group.key}`
+          }
           rowClassName="pb-2.5"
-          renderItem={(r) =>
-            r.kind === 'engine' ? (
+          renderItem={(r) => {
+            /*
+             * BUG-295：分区标题 —— 116 行扁平列表里「还有几件要处理」必须一眼可见。
+             * 标题同时给出「已中断 N」（重启把 running 降级成 interrupted 的那一类），
+             * 以及「待处理」分区上的批量重试（BUG-249：作用于当前筛选出的集合，
+             * 数字直出将影响多少条）。
+             */
+            if (r.kind === 'section') {
+              return (
+                <div
+                  className="flex items-center gap-2 px-1 pt-1 text-[11px]"
+                  data-testid={`dl-section-${r.section}`}
+                  data-count={r.count}
+                  data-retryable={r.retryable}
+                  data-interrupted={r.interrupted}
+                >
+                  <span className="font-semibold uppercase tracking-wide text-fg-mid">
+                    {sectionLabel(r.section)}
+                  </span>
+                  <span className="tabular-nums text-muted">{r.count}</span>
+                  {r.interrupted > 0 && (
+                    <span
+                      className="rounded bg-warning/15 px-1.5 py-0.5 text-[10px] text-warning"
+                      data-testid="dl-section-interrupted"
+                      title={
+                        zh
+                          ? '应用重启会把「下载中」降级为「已中断」：已传字节保留，点重试继续'
+                          : 'A restart downgrades "Downloading" to "Interrupted"; transferred data is kept, retry to continue'
+                      }
+                    >
+                      {t('download.item.status.interrupted')} {r.interrupted}
+                    </span>
+                  )}
+                  {r.section === 'action' && r.retryable > 0 && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="ml-auto h-6 px-2 text-[11px]"
+                      onClick={() => void retryActionable()}
+                      data-testid="dl-section-retry"
+                      title={
+                        zh
+                          ? `重试当前列表里全部 ${r.retryable} 条可重试任务`
+                          : `Retry all ${r.retryable} retryable tasks in the current list`
+                      }
+                    >
+                      {t('download.item.retry')} {r.retryable}
+                    </Button>
+                  )}
+                </div>
+              )
+            }
+            return r.kind === 'engine' ? (
               <DownloadItem
                 item={r.item}
                 selected={engineSel.has(r.item.id)}
@@ -437,7 +641,7 @@ export function DownloadPanel({ dlFilter, items, ingest, onOpenMedia }: Props) {
                 }}
               />
             )
-          }
+          }}
         />
       )}
     </div>

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { cn } from '../lib/utils'
 import { useTranslation } from '../i18n'
+import { useStore } from '../store/useStore'
 import {
   DL_FILTERS,
   FILE_CATEGORIES,
@@ -117,6 +118,9 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
   const { t } = useTranslation()
   const [filesOpen, setFilesOpen] = useState(true)
   const [dlOpen, setDlOpen] = useState(true)
+  // BUG-474 / BUG-094：daemon 不可达（!known）时隐藏 TG 入口，对齐「不可达才隐藏」。
+  // 注意：仅按 `known` 隐藏，known 但没起来（!running）仍常驻（M0-T05，面板内空态分流）。
+  const tgService = useStore((s) => s.tgService)
 
   const { view, fmode, dlFilter } = nav
   /**
@@ -353,16 +357,20 @@ export function Sidebar({ nav, onNavigate, collapsed, onToggle, counts }: Props)
           )}
         </div>
 
-        <GroupLabel>{t('nav.group.plugins')}</GroupLabel>
-        <button
-          onClick={() => onNavigate('tg')}
-          title={t('nav.tg')}
-          data-testid="nav-tg"
-          className={cn(rowCls(view === 'tg'), 'gap-2.5', collapsed && 'justify-center px-0')}
-        >
-          <span className="shrink-0">{TgIcon}</span>
-          {!collapsed && <span className="min-w-0 flex-1 truncate text-left">{t('nav.tg')}</span>}
-        </button>
+        {tgService.known && (
+          <>
+            <GroupLabel>{t('nav.group.plugins')}</GroupLabel>
+            <button
+              onClick={() => onNavigate('tg')}
+              title={t('nav.tg')}
+              data-testid="nav-tg"
+              className={cn(rowCls(view === 'tg'), 'gap-2.5', collapsed && 'justify-center px-0')}
+            >
+              <span className="shrink-0">{TgIcon}</span>
+              {!collapsed && <span className="min-w-0 flex-1 truncate text-left">{t('nav.tg')}</span>}
+            </button>
+          </>
+        )}
 
         <GroupLabel>{t('nav.group.external')}</GroupLabel>
         <button

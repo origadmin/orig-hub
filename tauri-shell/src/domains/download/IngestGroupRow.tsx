@@ -308,6 +308,16 @@ export function IngestGroupRow({
               {latest.error}
             </span>
           )}
+          {/*
+            BUG-295：重启把 running 降级成 interrupted 这件事必须说出来。后端大多数
+            情况已把原因写进 error（上面那条），但老记录 / 迁移前的中断行可能是空的
+            —— 空着就等于「无缘无故停了」，用户没法判断该重试还是该删。
+          */}
+          {latest.status === 'interrupted' && !latest.error && (
+            <span className="truncate text-warning" data-testid="ingest-group-interrupted-reason">
+              {t('tg.reasonRestarted')}
+            </span>
+          )}
         </div>
       </div>
 

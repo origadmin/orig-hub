@@ -384,7 +384,10 @@ export function TgPanel(
    * 此时渲染引导区而不是频道列表 —— 频道列表在没有会话时必然是空的，
    * 空列表会把「没登录 / 连不上」伪装成「没有内容」。
    */
-  const tgUnbound = tgServiceUp && !accounts.tg.bound && tgLink.state !== 'needs_config'
+  // BUG-474：daemon 不可达（!known）时绝不算「未绑定」——「未绑定」是「没登录」语义，
+  // 与「服务挂了」是两回事。!known 一律落面板 daemonDown 空态，不抢 unbound 卡。
+  const tgUnbound =
+    tgService.known && tgServiceUp && !accounts.tg.bound && tgLink.state !== 'needs_config'
   /**
    * M0-T05：**入口常驻**（BUG-094 口径改变）后，门控判据移入本面板自己算。
    *
@@ -3395,18 +3398,20 @@ const MessageBubble = memo(function MessageBubble(props: {
           <Button
             variant="secondary"
             size="sm"
-            className="h-6 px-2 text-[12px]"
+            /* BUG-139：主入口升为 h-7（28px）——12px 文字塞进 24px 高按钮时上下不足 2px，
+               是「点了像没点」的物理成因之一；只放大不缩小。 */
+            className="h-7 px-2.5 text-[12px]"
             data-testid="bubble-open-system"
             onClick={() => onOpenDownloaded(m)}
           >
-            {zh ? '用系统播放器打开' : 'Open with system player'}
+            {t('tg.openWithSystem')}
           </Button>
         ) : (
           <>
             <Button
               variant="secondary"
               size="sm"
-              className="h-6 px-2 text-[12px]"
+              className="h-7 px-2.5 text-[12px]"
               data-testid="bubble-open"
               onClick={() => onPreview(m)}
             >
@@ -3421,7 +3426,7 @@ const MessageBubble = memo(function MessageBubble(props: {
                 onClick={() => onOpenDownloaded(m)}
                 className="text-[12px] text-muted underline-offset-2 hover:text-fg-mid hover:underline"
               >
-                {zh ? '用系统播放器打开' : 'Open with system player'}
+                {t('tg.openWithSystem')}
               </button>
             ) : null}
           </>

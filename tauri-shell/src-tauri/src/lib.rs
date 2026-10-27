@@ -579,6 +579,13 @@ fn tg_save_config(
 /// 好让 `setup` 阶段也能直接调用（BUG-094）。
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // BUG-446：release 壳「打开即无响应、WebView2 进程从未创建」在壳侧**完全不可观测**
+    // （GUI 子系统丢弃 stderr，挂起时连一行日志都没有）。这两条 trace 是**判定边界**：
+    //   有 `run() entered` 但**没有** `setup hook entered` ⇒ 主线程卡在
+    //   `WebViewWindowBuilder::build()` 的 webview 创建里（tauri 2.11.5 在 setup
+    //   **之前**创建配置窗口，见 `tauri::app::setup`）—— 即 WebView2 环境初始化，
+    //   与本文件后续的 setup/托盘代码无关；反之则卡在启动更早的阶段。
+    shell_trace("[shell] run() entered; building tauri app (windows are created before setup)");
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -597,6 +604,12 @@ pub fn run() {
             child: Mutex::new(None),
         })
         .setup(|app| {
+            // BUG-446：能走到这里 = webview 已创建成功（tauri 先建窗口再跑 setup）。
+            // 连它都没打印 ⇒ 挂起点在 WebView2 环境初始化，不在下面的托盘/命令注册。
+            shell_trace(&format!(
+                "[shell] setup hook entered (webview created); app_local_data_dir={:?}",
+                app.path().app_local_data_dir().ok()
+            ));
             // 系统托盘：显示主窗 / 退出
             use tauri::menu::{Menu, MenuItem};
             let show = MenuItem::with_id(app, "show", "显示 Orig Hub", true, None::<&str>)?;
@@ -620,6 +633,7 @@ pub fn run() {
                 })
                 .build(app)?;
             let _ = _tray;
+            shell_trace("[shell] setup complete (tray built)");
 
             Ok(())
         })

@@ -755,8 +755,24 @@ export const useStore = create<DownloadState>((set, get) => ({
     try {
       cfg = await getConfig()
     } catch (e) {
-      // daemon 不可达：服务层保持上次值（「不知道」不等于「停了」），原文只进日志
+      // BUG-474：daemon 不可达 = 配置未确认。必须置 known:false，否则 stale 的
+      // known:true / running:true 会让 resolveTgSwitch 走不到 unavailable（navVisible:false），
+      // 并让 TgPanel 误渲染「未绑定」引导卡。对齐 BUG-094「不可达才隐藏」：
+      // known:false ⇒ 面板落 daemonDown、侧栏隐藏 TG 入口，绝不显示「未绑定」。
       logTgReason(e instanceof Error ? e.message : String(e), 'tg-config')
+      const prev = get().tgService
+      if (prev.known) {
+        set({
+          tgService: {
+            ...prev,
+            known: false,
+            running: false,
+            port: null,
+            link: null,
+            lastError: e instanceof Error ? e.message : String(e),
+          },
+        })
+      }
       return
     }
     // 端口真源：daemon 可能顺延，两个 base 都必须跟着它走。

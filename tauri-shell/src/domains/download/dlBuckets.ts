@@ -39,6 +39,37 @@ export const ENGINE_STOPPED: readonly DownloadStatusValue[] = [
   'interrupted',
 ]
 
+/**
+ * 引擎任务的**列表分区**（BUG-295）。
+ *
+ * 用户原话「下载中任务找不到，感觉还是要置顶。内容太多了」——「找不到」的机制是
+ * 双层：①「在传」的语义集合漏了 `interrupted`（重启后 running→interrupted 就掉出
+ * 第一屏）；② 116 行扁平列表没有分区，用户无法一眼数出「还有几件要处理」。
+ *
+ * 这里只做**呈现层**的分区，不改 `CACHE_TASK_ACTIVE_STATES` / `ENGINE_ACTIVE`
+ * 这类被入队去重与运行判据依赖的契约常量：
+ *   - `active`  在传（要跟进度）；
+ *   - `action`  待处理（中断 / 失败 / 已暂停 —— 必须有人点重试或恢复）；
+ *   - `settled` 已结束（完成 / 取消 —— 只作历史）。
+ */
+export type DlSection = 'active' | 'action' | 'settled'
+
+/** 待处理：不推进、且**用户有动作可做**的状态（`cancelled` 不算，它已结束）。 */
+export const ENGINE_ACTIONABLE: readonly DownloadStatusValue[] = [
+  'interrupted',
+  'error',
+  'paused',
+]
+
+/** 引擎任务归入哪个列表分区（BUG-295：未知状态归「待处理」，绝不从所有分区消失）。 */
+export function engineSection(status: DownloadStatusValue): DlSection {
+  if (ENGINE_ACTIVE.includes(status)) return 'active'
+  if (status === 'completed' || status === 'cancelled') return 'settled'
+  // 余下 = ENGINE_ACTIONABLE ∪ 未知状态。未知状态进「待处理」而不是静默丢弃：
+  // 它既没跑完也不在传，正是需要用户看见的那一类。
+  return 'action'
+}
+
 /** 引擎任务是否属于该树档。 */
 export function engineInBucket(status: DownloadStatusValue, f: DlFilter): boolean {
   switch (f) {

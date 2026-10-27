@@ -179,6 +179,8 @@ async function main() {
           [
             'tg-onboard-disabled',
             'tg-onboard-starting',
+            'tg-onboard-daemon-down',
+            'tg-onboard-plugin-down',
             'tg-unbound-guide',
             'tg-panel-broken',
             'tg-monitor-list',
@@ -190,6 +192,8 @@ async function main() {
       [
         'tg-onboard-disabled',
         'tg-onboard-starting',
+        'tg-onboard-daemon-down',
+        'tg-onboard-plugin-down',
         'tg-unbound-guide',
         'tg-panel-broken',
         'tg-monitor-list',
