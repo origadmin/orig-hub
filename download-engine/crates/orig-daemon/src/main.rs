@@ -147,14 +147,27 @@ async fn main() {
         store.map(Arc::new),
     ));
 
-    // TG 可选插件：启动时按配置拉起 orig-tg 子进程（注入主配置代理）。
+    // TG 可选插件：按配置拉起 orig-tg 子进程（注入主配置代理）。
+    //
+    // ★ BUG-448：**必须 spawn，不能 await。** `tg_start()` 内部会等 orig-tg 真的开始
+    // 监听，上限 `TG_START_WAIT_TIMEOUT = 30s`（state.rs:56）。原先它挡在 `axum::serve`
+    // 之前 ⇒ 端口已 bind 但**不应答 `/health`**，最长 30 秒；而桌面壳只等 5 秒
+    // （`lib.rs::spawn_daemon`）⇒ 每次都判超时、丢弃子进程句柄（不 kill）⇒ 孤儿 daemon
+    // 与新实例抢端口，后起者 `panic!` 退出。用户侧看到的就是「一开就死 / 卡很久才活」。
+    //
+    // 纪律：**核心服务（下载内核）的可用性不得由可选插件（TG）的可用性决定。**
+    // `/health` 回答的是「内核在不在」，与「Telegram 连没连上」无关。
+    // 插件拉起失败不影响内核：原因进 `tg_last_error`（设置页可见），由下方 `tg_supervise`
+    // 巡检自愈 —— 后者本来就是这条腿的长期负责人。
     if config.tg_enabled {
-        match state.tg_start().await {
-            Ok(_) => eprintln!("orig-tg plugin started"),
-            // BUG-177：拉起失败必须**留痕**（原因已进 `tg_last_error`，设置页可见）。
-            // 这里不退出进程：下载内核与 daemon 本身仍然可用，只是 TG 模块不显示。
-            Err(e) => eprintln!("failed to start orig-tg plugin: {e}"),
-        }
+        let st = state.clone();
+        tokio::spawn(async move {
+            match st.tg_start().await {
+                Ok(_) => eprintln!("orig-tg plugin started"),
+                // BUG-177：拉起失败必须**留痕**（原因已进 `tg_last_error`，设置页可见）。
+                Err(e) => eprintln!("failed to start orig-tg plugin: {e}"),
+            }
+        });
     }
     // TG 托管巡检：daemon 是 orig-tg 的唯一所有者，开启却没在服务要自愈。
     // 与上面这一次性拉起互补 —— 后者覆盖启动瞬间，前者覆盖运行期崩溃/退出。

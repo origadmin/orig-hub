@@ -151,7 +151,17 @@ pub async fn select_bindable_port(start: u16) -> Option<u16> {
 ///
 /// 为什么需要它（BUG-178）：daemon 端口可能顺延（保留区），壳与前端都不得再猜
 /// 9876。写文件是唯一真源，壳读它；`/api/config` 的 `port` 是同一真源的 HTTP 面。
+///
+/// 可被 `ORIG_DAEMON_ENDPOINT_FILE` 覆盖：dev 栈与 release 壳共用同一数据根时，
+/// 两者的端点文件若同名就会互相覆盖 —— 后写的一方把对方的端口顶掉，于是壳连到
+/// dev 的实例（或反之）。分离文件名是「共用库、互不影响」的必要条件。
 pub fn daemon_endpoint_file() -> PathBuf {
+    if let Ok(p) = std::env::var("ORIG_DAEMON_ENDPOINT_FILE") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     tg_data_dir().join("daemon.endpoint")
 }
 
@@ -535,8 +545,8 @@ impl AppState {
         if let Err(e) = std::fs::create_dir_all(&data_dir) {
             return Err(e);
         }
-        cmd.env("ORIG_TG_SESSION", data_dir.join("tg/session.session"));
-        cmd.env("ORIG_TG_DB", data_dir.join("tg/store.db"));
+        cmd.env("ORIG_TG_SESSION", tg_session_path(&data_dir));
+        cmd.env("ORIG_TG_DB", tg_db_path(&data_dir));
         // 凭据/代理：`download-engine.toml` 的 `[tg]`/`[proxy]` 段优先；缺失时回退
         // 同数据目录下的 `tg/config.json`（桌面壳写凭据的地方）—— 见 `resolve_tg_env`。
         let inject = resolve_tg_env(&cfg, &data_dir);
@@ -1064,8 +1074,53 @@ pub fn tg_data_dir() -> PathBuf {
 ///
 /// 与 `tg_data_dir()` 同源 ⇒ 调试/生产/壳三方看到的是同一个目录，用户按
 /// 设置-关于里给出的路径就能直接翻到日志，不需要问「日志在哪」。
+///
+/// 可被 `ORIG_LOG_DIR` 覆盖：dev 与 release 共用数据根时，若日志也同目录，
+/// 两边的 `orig-tg.log` 会交错追加 —— 文件不会损坏（追加写），但排障时无法分辨
+/// 某一行是谁写的，会把 release 的失败读成 dev 的、或反之。
 pub fn log_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("ORIG_LOG_DIR") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     tg_data_dir().join("logs")
+}
+
+/// MTProto 会话文件路径（默认 `<数据目录>/tg/session.session`）。
+///
+/// **可被 `ORIG_TG_SESSION` 覆盖，且外部值优先。** 覆盖能力是「共用媒体库、
+/// 互不影响」的硬前提：会话文件没有文件锁，两个 orig-tg 同时写入会损坏它；
+/// 即便不损坏，同一 auth key 双连接也会被 Telegram 服务端互踢。因此 dev 栈必须
+/// 用独立的会话文件（独立登录一次），不能与 release 共用。
+///
+/// 注意方向：这里是**读**外部 env 再**写**给子进程。此前是无条件覆盖，等于把
+/// 外部配置静默丢弃 —— 那种实现下「设了 env 也不生效」，排查时极易误判成
+/// 「env 没传进去」。
+fn tg_session_path(data_dir: &Path) -> PathBuf {
+    if let Ok(p) = std::env::var("ORIG_TG_SESSION") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    data_dir.join("tg/session.session")
+}
+
+/// 媒体条目库路径（默认 `<数据目录>/tg/store.db`）。
+///
+/// 可被 `ORIG_TG_DB` 覆盖。默认不设 ⇒ dev 与 release 指向**同一个** store.db，
+/// 这正是「库共用」想要的：dev 对真实数据调试，不会因为对着空壳库而把
+/// 「数据为空」误判成「功能坏了」。
+fn tg_db_path(data_dir: &Path) -> PathBuf {
+    if let Ok(p) = std::env::var("ORIG_TG_DB") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    data_dir.join("tg/store.db")
 }
 
 /// 单个日志文件的滚动上限（8 MiB，只留一代 `.1`）。

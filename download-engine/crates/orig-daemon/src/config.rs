@@ -321,7 +321,17 @@ impl Config {
                 cfg.token = Some(t);
             }
         }
-        if let Ok(p) = std::env::var("PORT") {
+        // 监听端口：`ORIG_DAEMON_PORT` 优先于泛化的 `PORT`。
+        //
+        // 为什么需要专用名：`PORT` 是极常见的通用变量，任何第三方工具（或用户自己的
+        // shell 配置）都可能设置它。侧边进程继承桌面壳的环境，一旦命中，daemon 会绑到
+        // 一个壳根本不扫描的端口 —— 表现是「APP 打开没有后端」，而根因在环境变量。
+        // `PORT` 保留为兜底，不破坏既有的容器/远程部署用法。
+        if let Ok(p) = std::env::var("ORIG_DAEMON_PORT") {
+            if let Ok(v) = p.trim().parse() {
+                cfg.port = v;
+            }
+        } else if let Ok(p) = std::env::var("PORT") {
             if let Ok(v) = p.parse() {
                 cfg.port = v;
             }

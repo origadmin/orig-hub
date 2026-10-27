@@ -185,6 +185,19 @@ fn daemon_tg_data_dir(app: &tauri::AppHandle) -> Option<String> {
 /// 用 Tauri sidecar 拉起 daemon（阻塞直到端口就绪或超时）。
 ///
 /// 返回 `(子进程句柄, 实际端口)`：端口由 daemon 自己写在端点文件里，壳不猜。
+///
+/// ★ BUG-448：就绪等待的时限必须**大于 daemon 侧最长的启动阻塞**，否则「等得不够」
+/// 会被读成「起不来」。原值是 5s，而 daemon 曾把 TG 插件拉起（上限
+/// `TG_START_WAIT_TIMEOUT = 30s`，`state.rs:56`）挡在 `axum::serve` 之前 ⇒ 5 < 30，
+/// 每次必然误判超时。daemon 侧已把插件移出就绪路径（`main.rs`），这里同时把
+/// 时限提到 35s 作为**兜底**（防的是将来又有人在启动路径上加了慢动作）。
+///
+/// ★ 超时**必须杀掉子进程**。`CommandChild` 的 `Drop` 不杀进程：原实现返回 `Err`
+/// 时只丢掉句柄，那个 daemon 会继续跑、稍后自己 bind 成功，而壳已不认识它
+/// （`state.child` 仍是 `None`）；下次再 spawn 就变成两个 daemon 抢同一端口，
+/// 后起者走 `bind_with_fallback` 的 `panic!`（`main.rs:46`）——用户看到「一开就死」。
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(35);
+
 fn spawn_daemon(app: &tauri::AppHandle) -> Result<(CommandChild, u16), String> {
     let sidecar = app
         .shell()
@@ -199,11 +212,18 @@ fn spawn_daemon(app: &tauri::AppHandle) -> Result<(CommandChild, u16), String> {
         .spawn()
         .map_err(|e| format!("sidecar spawn failed: {e}"))?;
 
-    // 等待就绪（最多 5s）：端点文件里的端口优先，其次扫起始段。
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // 等待就绪：端点文件里的端口优先，其次扫起始段。
+    let started = std::time::Instant::now();
+    let deadline = started + DAEMON_READY_TIMEOUT;
+    // 进度留痕的节流：每 500ms 一行，既能看到「等了多久」，又不会把日志刷满。
+    let mut last_note = 0u64;
     while std::time::Instant::now() < deadline {
         if let Some(p) = read_daemon_endpoint(app) {
             if daemon_alive_on(p) {
+                shell_trace(&format!(
+                    "[ensure_daemon] daemon ready on {p} after {}ms",
+                    started.elapsed().as_millis()
+                ));
                 return Ok((child, p));
             }
         }
@@ -213,14 +233,39 @@ fn spawn_daemon(app: &tauri::AppHandle) -> Result<(CommandChild, u16), String> {
                 break;
             }
             if daemon_alive_on(p) {
+                shell_trace(&format!(
+                    "[ensure_daemon] daemon ready on {p} after {}ms",
+                    started.elapsed().as_millis()
+                ));
                 return Ok((child, p));
             }
         }
-        std::thread::sleep(Duration::from_millis(100));
-        // 消费子进程输出，避免管道阻塞
+        // 消费子进程输出，避免管道阻塞（同时也是「进程是否已退出」的间接信号）
         let _ = rx.try_recv();
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms >= last_note + 500 {
+            last_note = elapsed_ms;
+            shell_trace(&format!("[ensure_daemon] waiting for daemon… {elapsed_ms}ms"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
-    Err("daemon did not become ready within 5s".into())
+
+    // ★ 超时：先杀再报。不杀 = 留下一个「壳不认识但还活着」的 daemon。
+    let pid = child.pid();
+    match child.kill() {
+        Ok(()) => shell_trace(&format!(
+            "[ensure_daemon] spawn timeout after {}ms, killed pid={pid}",
+            started.elapsed().as_millis()
+        )),
+        Err(e) => shell_trace(&format!(
+            "[ensure_daemon] spawn timeout after {}ms, kill pid={pid} failed: {e}",
+            started.elapsed().as_millis()
+        )),
+    }
+    Err(format!(
+        "daemon did not become ready within {}s (child killed)",
+        DAEMON_READY_TIMEOUT.as_secs()
+    ))
 }
 
 /// 前端查询：daemon 是否存活 + **实际**端口。
@@ -239,7 +284,12 @@ fn daemon_status(app: tauri::AppHandle, state: tauri::State<'_, DaemonState>) ->
 /// 前端命令：确保 daemon 运行（幂等）。
 /// 若端口被占用但 /health 不可用（进程活着但 handler 坏了），
 /// 先杀掉旧实例再拉起新实例，避免前端 Failed to fetch。
-#[tauri::command]
+///
+/// ★ BUG-448：`#[tauri::command(async)]` 不是装饰 —— 不加它，本函数在**主线程**执行，
+/// 而它内部有 `spawn_daemon` 的就绪等待循环（`thread::sleep` × N 次 + 64 端口扫描）
+/// 与 `netstat`/`tasklist` 进程 spawn。实测一次失败路径就冻结窗口 **5 秒**（旧时限），
+/// 用户体感是「一开就死」。加上之后阻塞工作跑在运行时线程池，UI 照常响应。
+#[tauri::command(async)]
 fn ensure_daemon(app: tauri::AppHandle, state: tauri::State<'_, DaemonState>) -> Result<serde_json::Value, String> {
     // 端口以 daemon 自己写下的为准（可能顺延），不是常量。
     let port = resolve_daemon_port(&app);
@@ -572,6 +622,24 @@ pub fn run() {
             let _ = _tray;
 
             Ok(())
+        })
+        .on_window_event(|app, event| {
+            // BUG-452（2026-10-27 用户截图）：作为下载工具，点 X / 标题栏关闭应「最小化到托盘」，
+            // 下载继续、托盘常驻、daemon 不杀。原实现缺 CloseRequested 处理 ⇒ 关最后窗口即
+            // app.exit、托盘销毁、daemon 变孤儿（见 roadmap T-1「关窗不退出」）。
+            //
+            // 处理：拦截关闭、改 hide —— 进程不退出，前端与 daemon sidecar 继续存活。
+            // 真正退出只走托盘「退出」菜单（app.exit(0) ⇒ RunEvent::ExitRequested，
+            // 由 tauri-plugin-shell 的退出处理器杀掉托管的 sidecar）。
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+                shell_trace(
+                    "[on_window_event] CloseRequested → prevent_close + hide (tray resident, downloads continue)",
+                );
+            }
         })
         .invoke_handler(tauri::generate_handler![
             daemon_status,

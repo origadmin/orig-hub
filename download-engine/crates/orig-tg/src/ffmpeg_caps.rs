@@ -816,12 +816,22 @@ pub fn describe_with_errors(cfg: &FfmpegConfig, errors: &[String]) -> String {
 async fn run_capture<P: AsRef<OsStr>>(program: P, args: &[&str]) -> Result<String, String> {
     let display = Path::new(program.as_ref()).to_string_lossy().to_string();
 
-    let child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null()) // 不给 stdin：探测命令不该等输入
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true) // 超时取消时把子进程一并带走，不留孤儿
+        .kill_on_drop(true); // 超时取消时把子进程一并带走，不留孤儿
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW（BUG-449）：orig-tg 本身无控制台，探测子进程若不给这个标志
+        // 会各自分配一个新控制台 —— 首次播放时 `-hwaccels`/`-encoders`/`nvidia-smi`/
+        // `powershell` 四条命令一起闪出 4 个黑窗，用户完全不知道它们是什么。
+        // 与转码命令（`routes.rs::transcode_pump`）和 `orig-net/src/probe.rs` 同一写法。
+        command.creation_flags(0x0800_0000);
+    }
+    let child = command
         .spawn()
         .map_err(|e| format!("无法启动 {display}（{e}）"))?;
 

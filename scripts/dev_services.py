@@ -120,7 +120,9 @@ def free_port(port: int) -> None:
         pass
 
 
-def start_daemon(data_dir: Path, port: int) -> subprocess.Popen | None:
+def start_daemon(
+    data_dir: Path, port: int, extra_env: dict[str, str] | None = None
+) -> subprocess.Popen | None:
     if not DAEMON_EXE.exists():
         print(
             f"[dev-services] daemon binary missing: {DAEMON_EXE}\n"
@@ -133,6 +135,11 @@ def start_daemon(data_dir: Path, port: int) -> subprocess.Popen | None:
     free_port(port + 1)
     env = os.environ.copy()
     env["ORIG_TG_DATA"] = str(data_dir)
+    # dev 栈与 release 壳共用数据根时，运行态（端口/端点文件/任务库/会话）必须分开，
+    # 否则两边互相覆盖：端点文件决定壳连谁，会话文件决定 TG 登录态，任务库决定列表。
+    # 调用方显式给出，本函数不猜。
+    if extra_env:
+        env.update({k: str(v) for k, v in extra_env.items()})
     log_handle = LOG_FILE.open("a", encoding="utf-8", errors="replace", buffering=1)
     try:
         proc = subprocess.Popen(

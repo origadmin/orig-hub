@@ -293,7 +293,17 @@ impl TaskStore {
 }
 
 /// 库文件路径：与 TG 库同目录、不同文件（避免互相抢写锁）。
+///
+/// 可被 `ORIG_ENGINE_TASKS_DB` 覆盖。dev 栈必须用它把任务库分开：任务记录是
+/// 「当前进程正在跑什么」的运行态，两个实例共用一个库时，dev 的测试任务会出现在
+/// release 的列表里、进度也会互相覆盖 —— 那是共用媒体库时唯一必须切开的部分。
 pub fn db_path(data_dir: &Path) -> PathBuf {
+    if let Ok(p) = std::env::var("ORIG_ENGINE_TASKS_DB") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     data_dir.join("engine_tasks.db")
 }
 

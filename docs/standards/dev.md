@@ -28,8 +28,17 @@ enforced-by: AGENTS.md（强制引用）+ 门禁脚本 + 验收探针
 
 ## 2. 验收：真实运行栈 + 自动化，绝不甩给用户手点
 
-1. 真实栈：`python scripts/dev_services.py --start`（daemon 19786 + orig-tg 19787 + vite 5180）。
+1. 真实栈：`python scripts/dev/dev_stack.py start`（dev 侧 daemon **29786** + orig-tg **29787** + vite 5180）。
    端口一律从 `/api/config` 的 `tg_port` 解析，**禁止硬编码**。
+   > **dev 与 release 并存（2026-10-27）**：release 壳固定 `19786` 起扫 64 个端口
+   > （`tauri-shell/src-tauri/src/lib.rs::DAEMON_PORT`），dev 栈若也用 19786，壳的
+   > `ensure_daemon` 会把 dev 的 daemon 当成自己的复用之（`already-running`），
+   > 任一方被停都让另一方失去后端。故 dev 栈端口整体上移到 29786/29787。
+   > **数据根共用**（`%APPDATA%\com.origadmin.orighub`：`tg/store.db`、媒体文件、
+   > `download-engine.toml`），**运行态分离**：`daemon.dev.endpoint` /
+   > `engine_tasks.dev.db` / `tg/session.dev.session` / `logs/dev/`。
+   > 会话必须分离——同一 `session.session` 被两个 orig-tg 同时写会损坏，同 auth key
+   > 双连接还会被 Telegram 互踢；dev 首次需独立登录一次。
 2. UI 结论必须 `tauri-shell/verify/lib/cdp.cjs` 真实截图 + **量化断言**（几何读
    `getBoundingClientRect`，不读 className）；贴边/居中一律**视口相对**，禁止父容器相对。
 3. 新断言必须**验牙**：装回旧实现确认必红、还原后复绿（还原后比对文件指纹一致）。

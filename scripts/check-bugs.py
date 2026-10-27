@@ -120,7 +120,7 @@ def parse_index_row(line: str) -> tuple[int, str, str] | None:
 # `download-engine/crates`、`download-engine/verify` —— 这些在任何克隆里都在，
 # 属于「跨机器可核」的证据；`verify_shots` 单列（不入库，见第 6 条）。
 PATH_RE = re.compile(
-    r"(?:verify_shots|scripts|download-engine/(?:verify|crates)|docs|tauri-shell/(?:src|verify))/"
+    r"(?:verify_shots|scripts|download-engine/(?:verify|crates)|docs|tauri-shell/(?:src|verify|src-tauri))/"
     r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]+"
 )
 HASH_RE = re.compile(r"`([0-9a-f]{7,40})`")
