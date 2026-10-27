@@ -267,6 +267,20 @@ def wait_healthy(port: int, timeout_s: float) -> dict | None:
     return None
 
 
+def tg_plugin_of(cfg: dict) -> dict | None:
+    """从 /api/config 的 plugins[] 按 id 取 TG 插件运行态（与前端 findPlugin 同一真源）。
+
+    BUG-481 追记：config 顶层从来只有 `plugins[]`，旧代码读的顶层 `tg_port/tg_running`
+    是不存在的字段 —— 永远 null 的假 WARN 就来自这里。
+    """
+    plugins = cfg.get("plugins")
+    if isinstance(plugins, list):
+        for p in plugins:
+            if isinstance(p, dict) and p.get("id") == "tg":
+                return p
+    return None
+
+
 def emit_status(port: int, cfg: dict | None) -> int:
     if cfg is None:
         print(json.dumps({"ready": False, "port": port}, ensure_ascii=False))
@@ -274,18 +288,20 @@ def emit_status(port: int, cfg: dict | None) -> int:
     pid = listener_pid(port)
     exe = exe_of(pid) if pid else ""
     owner = classify_owner(exe)
+    tg = tg_plugin_of(cfg)
+    tg_running = bool(tg.get("running")) if tg else False
     print(
         json.dumps(
             {
-                "ready": owner == "dev" and bool(cfg.get("tg_running")),
+                "ready": owner == "dev" and tg_running,
                 "owner": owner,
                 "holder_pid": pid,
                 "holder_exe": exe,
                 "port": cfg.get("port"),
-                "tg_port": cfg.get("tg_port"),
-                "tg_enabled": cfg.get("tg_enabled"),
-                "tg_running": cfg.get("tg_running"),
-                "tg_last_error": cfg.get("tg_last_error"),
+                "tg_port": tg.get("port") if tg else None,
+                "tg_enabled": tg.get("enabled") if tg else None,
+                "tg_running": tg_running,
+                "tg_last_error": tg.get("lastError") if tg else None,
                 "default_download_dir": cfg.get("default_download_dir"),
             },
             ensure_ascii=False,
@@ -300,7 +316,7 @@ def emit_status(port: int, cfg: dict | None) -> int:
             file=sys.stderr,
         )
         return 7
-    if not cfg.get("tg_running"):
+    if not tg_running:
         print("[dev-services] WARN: orig-tg not running; check logs/orig-daemon.log", file=sys.stderr)
         return 5
     return 0
